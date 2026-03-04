@@ -271,6 +271,8 @@ pub fn py_ucan_mint(
             not_before: None,
             proofs: proofs.unwrap_or_default(),
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let result = rt.block_on(async { mint_ucan(&params, entry.custody.as_ref()).await });
@@ -374,6 +376,8 @@ pub fn py_ucan_delegate(
             attenuated_capabilities: &attenuations,
             lifetime_secs: 3600,
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let result = rt.block_on(async { delegate_ucan(&params, entry.custody.as_ref()).await });

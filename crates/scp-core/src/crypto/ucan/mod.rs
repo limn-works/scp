@@ -50,7 +50,8 @@ use serde::{Deserialize, Serialize};
 
 pub use capability::CapabilityUri;
 pub use spending::{
-    Amount, BudgetTracker, CurrencyCode, SpendingCapability, SpendingError, SpendingScope,
+    Amount, BudgetTracker, CurrencyCode, DEFAULT_SPENDING_KEY_SCOPE, MintSpendingParams,
+    SpendingCapability, SpendingError, SpendingScope,
 };
 
 // ---------------------------------------------------------------------------
@@ -168,6 +169,38 @@ pub enum UcanError {
     #[error("token revoked: {0}")]
     TokenRevoked(String),
 
+    /// The key used to sign the token does not match the `scp_key_scope`
+    /// declared in the token's facts. For example, a token scoped to
+    /// `#agent` was signed by the `#active` key.
+    ///
+    /// See ADR-039 acceptance criterion 7 and SCP-AB-013.
+    #[error("key scope mismatch: token scoped to {expected_scope} but signed by {actual_kid}")]
+    KeyScopeMismatch {
+        /// The scope declared in `fct.scp_key_scope` (e.g., `"#agent"`).
+        expected_scope: String,
+        /// The `kid` header value or default key ID (e.g., `"#active"`).
+        actual_kid: String,
+    },
+
+    /// Self-delegation (`iss == aud`) is not permitted without a key scope.
+    ///
+    /// Self-delegation is only valid when `fct.scp_key_scope` is present,
+    /// indicating key-specific delegation within a shared DID (ADR-039).
+    /// Without key scope, `iss == aud` is a safety violation — a DID should
+    /// not delegate to itself without purpose.
+    ///
+    /// See ADR-039 and SCP-AB-013.
+    #[error("self-delegation (iss == aud) requires scp_key_scope in facts")]
+    SelfDelegationWithoutKeyScope,
+
+    /// An agent key (`#agent`) attempted a Category A action (DID document
+    /// modification). The action was rejected and a custody violation
+    /// attestation was generated.
+    ///
+    /// See ADR-039 and SCP-AB-020.
+    #[error("Category A violation: {0}")]
+    CategoryAViolation(String),
+
     /// The revoker is not authorized to revoke the token (must be the token's
     /// issuer or the context creator).
     #[error("revocation unauthorized: {0}")]
@@ -205,6 +238,12 @@ impl From<crate::time::ClockError> for UcanError {
 /// specification version 0.10.0. The header is serialized as the first
 /// segment of the JWT.
 ///
+/// The optional `kid` field (Key ID, per RFC 7515) identifies which
+/// verification method on the issuer's DID document signed this token.
+/// When present, verifiers resolve the public key from the specified
+/// verification method (e.g., `"#active"` or `"#agent"`). When absent,
+/// verifiers default to `#active`. See ADR-039 acceptance criterion 6.
+///
 /// See ADR-016 acceptance criterion 2.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UcanHeader {
@@ -214,6 +253,13 @@ pub struct UcanHeader {
     pub typ: String,
     /// UCAN specification version. Always `"0.10.0"`.
     pub ucv: String,
+    /// Optional Key ID per RFC 7515 (ADR-039). Identifies which verification
+    /// method on the issuer's DID document signed this token. Values are
+    /// verification method fragment identifiers: `"#active"` for the human
+    /// signing key, `"#agent"` for the agent signing key. When absent,
+    /// verifiers default to `#active`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kid: Option<String>,
 }
 
 impl UcanHeader {
@@ -228,6 +274,36 @@ impl UcanHeader {
             alg: "EdDSA".to_owned(),
             typ: "JWT".to_owned(),
             ucv: "0.10.0".to_owned(),
+            kid: None,
+        }
+    }
+
+    /// Creates a new UCAN header with a Key ID (ADR-039).
+    ///
+    /// The `kid` identifies which verification method on the issuer's DID
+    /// document signed this token (e.g., `"#active"` or `"#agent"`).
+    #[must_use]
+    pub fn with_kid(kid: impl Into<String>) -> Self {
+        Self {
+            alg: "EdDSA".to_owned(),
+            typ: "JWT".to_owned(),
+            ucv: "0.10.0".to_owned(),
+            kid: Some(kid.into()),
+        }
+    }
+
+    /// Returns the [`SigningKeyId`] corresponding to this header's `kid` field.
+    ///
+    /// Returns [`SigningKeyId::Active`] when `kid` is `None` or `"#active"`,
+    /// [`SigningKeyId::Agent`] when `kid` is `"#agent"`.
+    ///
+    /// Unknown `kid` values default to [`SigningKeyId::Active`] for backward
+    /// compatibility (fail-open on identification, fail-closed on enforcement).
+    #[must_use]
+    pub fn signing_key_id(&self) -> crate::identity::SigningKeyId {
+        match self.kid.as_deref() {
+            Some("#agent") => crate::identity::SigningKeyId::Agent,
+            _ => crate::identity::SigningKeyId::Active,
         }
     }
 
@@ -356,6 +432,7 @@ mod tests {
         assert_eq!(header.alg, "EdDSA");
         assert_eq!(header.typ, "JWT");
         assert_eq!(header.ucv, "0.10.0");
+        assert!(header.kid.is_none(), "kid must be None by default");
     }
 
     #[test]
@@ -375,6 +452,7 @@ mod tests {
             alg: "RS256".to_owned(),
             typ: "JWT".to_owned(),
             ucv: "0.10.0".to_owned(),
+            kid: None,
         };
         let err = header.validate().unwrap_err();
         assert!(matches!(err, UcanError::UnsupportedAlgorithm(ref a) if a == "RS256"));
@@ -386,6 +464,7 @@ mod tests {
             alg: "EdDSA".to_owned(),
             typ: "JWT".to_owned(),
             ucv: "0.9.0".to_owned(),
+            kid: None,
         };
         let err = header.validate().unwrap_err();
         assert!(matches!(err, UcanError::UnsupportedVersion(ref v) if v == "0.9.0"));
@@ -397,6 +476,57 @@ mod tests {
         let json = serde_json::to_string(&header).unwrap();
         let deserialized: UcanHeader = serde_json::from_str(&json).unwrap();
         assert_eq!(header, deserialized);
+    }
+
+    #[test]
+    fn ucan_header_with_kid_sets_kid() {
+        let header = UcanHeader::with_kid("#agent".to_owned());
+        assert_eq!(header.alg, "EdDSA");
+        assert_eq!(header.typ, "JWT");
+        assert_eq!(header.ucv, "0.10.0");
+        assert_eq!(header.kid, Some("#agent".to_owned()));
+    }
+
+    #[test]
+    fn ucan_header_with_kid_validates_successfully() {
+        let header = UcanHeader::with_kid("#active".to_owned());
+        assert!(header.validate().is_ok());
+    }
+
+    #[test]
+    fn ucan_header_kid_omitted_from_json_when_none() {
+        let header = UcanHeader::new();
+        let json = serde_json::to_string(&header).unwrap();
+        assert!(
+            !json.contains("kid"),
+            "kid must not appear in JSON when None"
+        );
+    }
+
+    #[test]
+    fn ucan_header_kid_included_in_json_when_present() {
+        let header = UcanHeader::with_kid("#agent".to_owned());
+        let json = serde_json::to_string(&header).unwrap();
+        assert!(
+            json.contains(r##""kid":"#agent""##),
+            "kid must appear in JSON: {json}"
+        );
+    }
+
+    #[test]
+    fn ucan_header_with_kid_serialization_roundtrip() {
+        let header = UcanHeader::with_kid("#agent".to_owned());
+        let json = serde_json::to_string(&header).unwrap();
+        let deserialized: UcanHeader = serde_json::from_str(&json).unwrap();
+        assert_eq!(header, deserialized);
+    }
+
+    #[test]
+    fn ucan_header_deserializes_without_kid_field() {
+        // Backward compatibility: JSON without kid field deserializes to kid: None.
+        let json = r#"{"alg":"EdDSA","typ":"JWT","ucv":"0.10.0"}"#;
+        let header: UcanHeader = serde_json::from_str(json).unwrap();
+        assert!(header.kid.is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -625,6 +755,24 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "nonce tracker full: capacity 100000 reached with no expired entries to prune"
+        );
+    }
+
+    #[test]
+    fn ucan_error_display_key_scope_variants() {
+        let err = UcanError::KeyScopeMismatch {
+            expected_scope: "#agent".to_owned(),
+            actual_kid: "#active".to_owned(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "key scope mismatch: token scoped to #agent but signed by #active"
+        );
+
+        let err = UcanError::SelfDelegationWithoutKeyScope;
+        assert_eq!(
+            err.to_string(),
+            "self-delegation (iss == aud) requires scp_key_scope in facts"
         );
     }
 }

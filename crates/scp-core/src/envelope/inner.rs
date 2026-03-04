@@ -21,6 +21,7 @@ use scp_platform::traits::{KeyCustody, KeyHandle};
 
 use super::EnvelopeError;
 use super::padding::pad_to_bucket;
+use crate::identity::SigningKeyId;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -109,6 +110,12 @@ pub struct InnerEnvelope {
     #[serde(with = "serde_bytes")]
     pub provenance_hash: Vec<u8>,
 
+    /// Identifies which DID verification method (`#active` or `#agent`)
+    /// produced the signature. Defaults to `Active` for backward compatibility
+    /// with envelopes created before agent binding (ADR-039).
+    #[serde(default)]
+    pub signing_key_id: SigningKeyId,
+
     /// Ed25519 signature over the canonical hash of all critical fields.
     #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
@@ -142,6 +149,9 @@ pub struct InnerEnvelopeParams<'a> {
     pub payload: &'a [u8],
     /// Optional provenance metadata.
     pub provenance: Option<Provenance>,
+    /// Which DID verification method produced the signature.
+    /// Defaults to `Active` for backward compatibility.
+    pub signing_key_id: SigningKeyId,
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +210,7 @@ pub async fn create_inner_envelope(
         payload: padded_payload,
         provenance: params.provenance.clone(),
         provenance_hash: provenance_hash.to_vec(),
+        signing_key_id: params.signing_key_id,
         signature: signature.into_bytes(),
     })
 }
@@ -213,6 +224,12 @@ pub async fn create_inner_envelope(
 ///
 /// Recomputes the canonical hash from the envelope's fields (using the stored
 /// `payload_hash`, not the padded payload) and verifies the signature.
+///
+/// **Key resolution:** Callers must inspect `inner.signing_key_id` to
+/// determine which verification method public key to pass as
+/// `sender_public_key`. For [`SigningKeyId::Active`], use the `#active`
+/// verification method. For [`SigningKeyId::Agent`], use the `#agent`
+/// verification method from the sender's DID document.
 ///
 /// # Errors
 ///
@@ -237,6 +254,7 @@ pub fn verify_inner_signature(
         timestamp: inner.timestamp,
         payload: &[],
         provenance: inner.provenance.clone(),
+        signing_key_id: inner.signing_key_id,
     };
 
     // Recompute the canonical hash.
@@ -267,6 +285,52 @@ pub fn verify_inner_signature(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Category A enforcement (ADR-039, SCP-AB-020)
+// ---------------------------------------------------------------------------
+
+/// Enforces Category A restrictions on a verified inner envelope.
+///
+/// Call this **after** [`verify_inner_signature`] returns `Ok(true)`. If the
+/// envelope's `signing_key_id` is [`SigningKeyId::Agent`] and the
+/// `action_resource` is a Category A resource (DID document modification),
+/// returns `Err` with the violation details. The caller should reject the
+/// envelope and optionally persist/broadcast the custody violation
+/// attestation.
+///
+/// For Category B actions or Active-key signatures, returns `Ok(())`.
+///
+/// # Arguments
+///
+/// * `inner` — The verified inner envelope.
+/// * `action_resource` — The UCAN capability resource type of the action
+///   this envelope carries (e.g., `"messages"`, `"did_document"`). This is
+///   determined by the caller from the application-layer context.
+///
+/// # Errors
+///
+/// Returns [`EnvelopeError::CategoryAViolation`] if an agent key attempted
+/// a DID document modification.
+pub fn enforce_inner_envelope_category_a(
+    inner: &InnerEnvelope,
+    action_resource: &str,
+) -> Result<(), EnvelopeError> {
+    use crate::trust::custody_violation::{classify_action, enforce_category_a};
+
+    let category = classify_action(action_resource);
+    if let Err(violation) = enforce_category_a(
+        inner.signing_key_id,
+        category,
+        &inner.sender_did,
+        &format!("inner envelope action: {action_resource}"),
+        &inner.signature,
+    ) {
+        return Err(EnvelopeError::CategoryAViolation(violation.error_message));
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -311,7 +375,8 @@ fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<[u8; 32], 
 ///         || len(sender_did) || sender_did || epoch_BE
 ///         || generation_BE || sequence_BE || timestamp_BE
 ///         || len(payload_hash) || payload_hash
-///         || len(provenance_hash) || provenance_hash)
+///         || len(provenance_hash) || provenance_hash
+///         || len(signing_key_id) || signing_key_id)
 /// ```
 fn compute_canonical_hash(
     params: &InnerEnvelopeParams<'_>,
@@ -338,6 +403,11 @@ fn compute_canonical_hash(
 
     len_prefix(&mut hasher, payload_hash);
     len_prefix(&mut hasher, provenance_hash);
+
+    // Bind signing_key_id to the signature to prevent key confusion attacks
+    // (ADR-039). Length-prefixed like other variable-length fields.
+    len_prefix(&mut hasher, params.signing_key_id.as_bytes());
+
     hasher.finalize().to_vec()
 }
 
@@ -371,6 +441,7 @@ mod tests {
                 timestamp: 1_700_000_000,
                 payload: b"hello world",
                 provenance: None,
+                signing_key_id: SigningKeyId::Active,
             },
             &custody,
             &signing_key,
@@ -381,6 +452,9 @@ mod tests {
         // Verify the signature.
         let valid = verify_inner_signature(&envelope, pubkey.as_bytes()).unwrap();
         assert!(valid, "signature should be valid");
+
+        // Verify signing_key_id is preserved.
+        assert_eq!(envelope.signing_key_id, SigningKeyId::Active);
 
         // Verify payload_hash matches original payload.
         let expected_hash = Sha256::digest(b"hello world").to_vec();
@@ -414,6 +488,7 @@ mod tests {
                 timestamp: 1_700_000_000,
                 payload: b"payload with provenance",
                 provenance: Some(provenance.clone()),
+                signing_key_id: SigningKeyId::Active,
             },
             &custody,
             &signing_key,
@@ -444,6 +519,7 @@ mod tests {
                 timestamp: 1_700_000_000,
                 payload: b"hello",
                 provenance: None,
+                signing_key_id: SigningKeyId::Active,
             },
             &custody,
             &signing_key,
@@ -470,6 +546,7 @@ mod tests {
                 timestamp: 1_700_000_000,
                 payload: b"original",
                 provenance: None,
+                signing_key_id: SigningKeyId::Active,
             },
             &custody,
             &signing_key,
@@ -504,6 +581,7 @@ mod tests {
                 timestamp: 1_700_000_000,
                 payload: b"data",
                 provenance: Some(provenance),
+                signing_key_id: SigningKeyId::Active,
             },
             &custody,
             &signing_key,
@@ -533,6 +611,7 @@ mod tests {
                 timestamp: 1_700_000_000,
                 payload: b"data",
                 provenance: None,
+                signing_key_id: SigningKeyId::Active,
             },
             &custody,
             &signing_key,
@@ -573,6 +652,7 @@ mod tests {
                 timestamp: 1_700_000_000,
                 payload: b"msgpack test",
                 provenance: None,
+                signing_key_id: SigningKeyId::Active,
             },
             &custody,
             &signing_key,
@@ -587,6 +667,7 @@ mod tests {
         assert_eq!(envelope.sender_did, deserialized.sender_did);
         assert_eq!(envelope.epoch, deserialized.epoch);
         assert_eq!(envelope.payload_hash, deserialized.payload_hash);
+        assert_eq!(envelope.signing_key_id, deserialized.signing_key_id);
         assert_eq!(envelope.signature, deserialized.signature);
     }
 
@@ -604,6 +685,7 @@ mod tests {
                 timestamp: 1_700_000_000,
                 payload: b"test",
                 provenance: None,
+                signing_key_id: SigningKeyId::Active,
             },
             &custody,
             &signing_key,
@@ -630,6 +712,7 @@ mod tests {
             timestamp: 1_700_000_000,
             payload: b"test",
             provenance: None,
+            signing_key_id: SigningKeyId::Active,
         };
         let hash_with_domain = compute_canonical_hash(&params, &payload_hash, &provenance_hash);
 
@@ -679,6 +762,342 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------
+    // SigningKeyId-specific tests (ADR-039)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn create_and_verify_inner_envelope_with_active_signing_key() {
+        let (custody, signing_key) = setup().await;
+        let pubkey = custody.public_key(&signing_key).await.unwrap();
+
+        let envelope = create_inner_envelope(
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                payload: b"active key message",
+                provenance: None,
+                signing_key_id: SigningKeyId::Active,
+            },
+            &custody,
+            &signing_key,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(envelope.signing_key_id, SigningKeyId::Active);
+        let valid = verify_inner_signature(&envelope, pubkey.as_bytes()).unwrap();
+        assert!(valid, "Active signing key envelope should verify");
+    }
+
+    #[tokio::test]
+    async fn create_and_verify_inner_envelope_with_agent_signing_key() {
+        let (custody, signing_key) = setup().await;
+        let pubkey = custody.public_key(&signing_key).await.unwrap();
+
+        let envelope = create_inner_envelope(
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                payload: b"agent key message",
+                provenance: None,
+                signing_key_id: SigningKeyId::Agent,
+            },
+            &custody,
+            &signing_key,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(envelope.signing_key_id, SigningKeyId::Agent);
+        let valid = verify_inner_signature(&envelope, pubkey.as_bytes()).unwrap();
+        assert!(valid, "Agent signing key envelope should verify");
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_tampered_signing_key_id() {
+        let (custody, signing_key) = setup().await;
+        let pubkey = custody.public_key(&signing_key).await.unwrap();
+
+        let mut envelope = create_inner_envelope(
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                payload: b"signed as active",
+                provenance: None,
+                signing_key_id: SigningKeyId::Active,
+            },
+            &custody,
+            &signing_key,
+        )
+        .await
+        .unwrap();
+
+        // Tamper: flip signing_key_id from Active to Agent.
+        envelope.signing_key_id = SigningKeyId::Agent;
+
+        let valid = verify_inner_signature(&envelope, pubkey.as_bytes()).unwrap();
+        assert!(
+            !valid,
+            "tampering with signing_key_id must invalidate signature"
+        );
+    }
+
+    #[tokio::test]
+    async fn different_signing_key_ids_produce_different_signatures() {
+        let (custody, signing_key) = setup().await;
+
+        let active_envelope = create_inner_envelope(
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                payload: b"same payload",
+                provenance: None,
+                signing_key_id: SigningKeyId::Active,
+            },
+            &custody,
+            &signing_key,
+        )
+        .await
+        .unwrap();
+
+        let agent_envelope = create_inner_envelope(
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                payload: b"same payload",
+                provenance: None,
+                signing_key_id: SigningKeyId::Agent,
+            },
+            &custody,
+            &signing_key,
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(
+            active_envelope.signature, agent_envelope.signature,
+            "different signing_key_id must produce different signatures"
+        );
+    }
+
+    #[tokio::test]
+    async fn inner_envelope_serde_defaults_signing_key_id_to_active() {
+        // Simulate an old-format envelope by serializing without signing_key_id
+        // then deserializing — serde(default) should give Active.
+        let (custody, signing_key) = setup().await;
+
+        let envelope = create_inner_envelope(
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                payload: b"compat test",
+                provenance: None,
+                signing_key_id: SigningKeyId::Active,
+            },
+            &custody,
+            &signing_key,
+        )
+        .await
+        .unwrap();
+
+        // Serialize to JSON, remove signing_key_id, deserialize back.
+        let mut json_val: serde_json::Value = serde_json::to_value(&envelope).unwrap();
+        json_val.as_object_mut().unwrap().remove("signing_key_id");
+        let deserialized: InnerEnvelope = serde_json::from_value(json_val).unwrap();
+
+        assert_eq!(
+            deserialized.signing_key_id,
+            SigningKeyId::Active,
+            "missing signing_key_id should default to Active"
+        );
+    }
+
+    #[tokio::test]
+    async fn signing_key_id_msgpack_roundtrip() {
+        let (custody, signing_key) = setup().await;
+
+        for key_id in [SigningKeyId::Active, SigningKeyId::Agent] {
+            let envelope = create_inner_envelope(
+                &InnerEnvelopeParams {
+                    context_id: "ctx-1",
+                    sender_did: "did:dht:alice",
+                    epoch: 1,
+                    generation: 0,
+                    sequence: 1,
+                    timestamp: 1_700_000_000,
+                    payload: b"msgpack roundtrip",
+                    provenance: None,
+                    signing_key_id: key_id,
+                },
+                &custody,
+                &signing_key,
+            )
+            .await
+            .unwrap();
+
+            let bytes = rmp_serde::to_vec_named(&envelope).unwrap();
+            let deserialized: InnerEnvelope = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(deserialized.signing_key_id, key_id);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Category A enforcement tests (ADR-039, SCP-AB-020)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn enforce_rejects_agent_key_category_a() {
+        let (custody, signing_key) = setup().await;
+
+        let envelope = create_inner_envelope(
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                payload: b"modify DID doc",
+                provenance: None,
+                signing_key_id: SigningKeyId::Agent,
+            },
+            &custody,
+            &signing_key,
+        )
+        .await
+        .unwrap();
+
+        // Category A action signed by agent key → rejected.
+        let result = enforce_inner_envelope_category_a(&envelope, "did_document");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, super::super::EnvelopeError::CategoryAViolation(_)),
+            "expected CategoryAViolation, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn enforce_accepts_agent_key_category_b() {
+        let (custody, signing_key) = setup().await;
+
+        let envelope = create_inner_envelope(
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                payload: b"send message",
+                provenance: None,
+                signing_key_id: SigningKeyId::Agent,
+            },
+            &custody,
+            &signing_key,
+        )
+        .await
+        .unwrap();
+
+        // Category B action signed by agent key → accepted.
+        let result = enforce_inner_envelope_category_a(&envelope, "messages");
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn enforce_accepts_active_key_category_a() {
+        let (custody, signing_key) = setup().await;
+
+        let envelope = create_inner_envelope(
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                payload: b"modify DID doc",
+                provenance: None,
+                signing_key_id: SigningKeyId::Active,
+            },
+            &custody,
+            &signing_key,
+        )
+        .await
+        .unwrap();
+
+        // Category A action signed by active key → accepted.
+        let result = enforce_inner_envelope_category_a(&envelope, "did_document");
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn enforce_rejects_agent_key_all_category_a_resources() {
+        let (custody, signing_key) = setup().await;
+
+        let envelope = create_inner_envelope(
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                payload: b"test",
+                provenance: None,
+                signing_key_id: SigningKeyId::Agent,
+            },
+            &custody,
+            &signing_key,
+        )
+        .await
+        .unwrap();
+
+        let category_a_resources = [
+            "did_document",
+            "verification_method",
+            "identity",
+            "pre_rotation",
+            "service",
+            "relay_config",
+            "did_migration",
+            "key_management",
+        ];
+
+        for resource in &category_a_resources {
+            let result = enforce_inner_envelope_category_a(&envelope, resource);
+            assert!(
+                result.is_err(),
+                "agent key should be rejected for Category A resource: {resource}"
+            );
+        }
+    }
+
     mod proptest_inner {
         use proptest::prelude::*;
 
@@ -702,6 +1121,7 @@ mod tests {
                             timestamp: 1_700_000_000,
                             payload: &payload,
                             provenance: None,
+                            signing_key_id: SigningKeyId::Active,
                         },
                         &custody,
                         &signing_key,

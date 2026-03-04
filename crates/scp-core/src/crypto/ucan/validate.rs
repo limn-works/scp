@@ -11,6 +11,8 @@
 //! 3. **Chain** — Verify delegation chain integrity.
 //! 4. **Root issuer** — Verify root token's `iss` is the context creator.
 //! 5. **Audience** — Verify `aud` matches the presenting agent.
+//!    5a. **Self-delegation** — Reject `iss == aud` unless `scp_key_scope` present (ADR-039).
+//!    5b. **Key scope** — If `fct.scp_key_scope` present, verify signing key matches scope (ADR-039).
 //! 6. **Capability match** — Verify `att` includes required capability.
 //! 7. **Attenuation** — Verify delegations narrow or preserve.
 //! 8. **Ceiling** — Verify capability is within context ceiling.
@@ -56,13 +58,47 @@ const MAX_CHAIN_DEPTH: usize = 32;
 /// Implementations look up the public key for a given DID. For testing, this
 /// can be a simple in-memory map. For production, this resolves DIDs via the
 /// DHT or a local cache.
+///
+/// The `resolve_public_key_by_kid` method supports ADR-039's shared-DID model
+/// where a single DID has multiple verification methods (`#active`, `#agent`).
+/// When a UCAN header includes a `kid` field, the validator uses this method
+/// to resolve the specific verification method's public key.
 pub trait DidResolver {
     /// Resolves a DID to its Ed25519 public key (32 bytes).
+    ///
+    /// Returns the default (`#active`) public key for the DID.
     ///
     /// # Errors
     ///
     /// Returns [`UcanError::MalformedToken`] if the DID cannot be resolved.
     fn resolve_public_key(&self, did: &str) -> Result<[u8; 32], UcanError>;
+
+    /// Resolves a specific verification method on a DID document by `kid`
+    /// (Key ID) fragment identifier (ADR-039, SCP-AB-013).
+    ///
+    /// The `kid` is a verification method fragment identifier such as
+    /// `"#active"` or `"#agent"`. Implementations should look up the
+    /// verification method matching this fragment on the DID document and
+    /// return its Ed25519 public key bytes.
+    ///
+    /// The default implementation falls back to [`resolve_public_key`] when
+    /// `kid` is `"#active"` (the default key), making this backward-compatible
+    /// with existing implementations that only support single-key DIDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UcanError::MalformedToken`] if the DID or verification
+    /// method cannot be resolved.
+    fn resolve_public_key_by_kid(&self, did: &str, kid: &str) -> Result<[u8; 32], UcanError> {
+        if kid == "#active" {
+            self.resolve_public_key(did)
+        } else {
+            Err(UcanError::MalformedToken(format!(
+                "verification method '{kid}' not found on DID '{did}' \
+                 (default resolver only supports #active)"
+            )))
+        }
+    }
 }
 
 /// Tracks nonces to prevent replay attacks.
@@ -109,12 +145,28 @@ pub trait ProofResolver {
 // In-memory implementations for testing and Phase 2
 // ---------------------------------------------------------------------------
 
-/// In-memory [`DidResolver`] backed by a `HashMap`.
+/// In-memory [`DidResolver`] backed by `HashMap`s.
 ///
-/// Maps DID strings to Ed25519 public key bytes. Useful for testing.
+/// Maps DID strings to Ed25519 public key bytes. Supports both default key
+/// resolution and `kid`-based resolution for shared-DID models (ADR-039).
 pub struct InMemoryDidResolver {
-    /// Map of DID string to 32-byte Ed25519 public key.
+    /// Map of DID string to 32-byte Ed25519 public key (default / `#active`).
     pub keys: std::collections::HashMap<String, [u8; 32]>,
+    /// Map of `(DID, kid)` to 32-byte Ed25519 public key for specific
+    /// verification methods (e.g., `#agent`). Used by
+    /// [`resolve_public_key_by_kid`] when `kid` is not `#active`.
+    pub kid_keys: std::collections::HashMap<(String, String), [u8; 32]>,
+}
+
+impl InMemoryDidResolver {
+    /// Creates a new resolver with the given default keys and no kid-specific keys.
+    #[must_use]
+    pub fn from_keys(keys: std::collections::HashMap<String, [u8; 32]>) -> Self {
+        Self {
+            keys,
+            kid_keys: std::collections::HashMap::new(),
+        }
+    }
 }
 
 impl DidResolver for InMemoryDidResolver {
@@ -123,6 +175,20 @@ impl DidResolver for InMemoryDidResolver {
             .get(did)
             .copied()
             .ok_or_else(|| UcanError::MalformedToken(format!("DID not found: {did}")))
+    }
+
+    fn resolve_public_key_by_kid(&self, did: &str, kid: &str) -> Result<[u8; 32], UcanError> {
+        // First check kid_keys for an explicit entry.
+        if let Some(pk) = self.kid_keys.get(&(did.to_owned(), kid.to_owned())) {
+            return Ok(*pk);
+        }
+        // Fall back: if kid is #active, use the default key.
+        if kid == "#active" {
+            return self.resolve_public_key(did);
+        }
+        Err(UcanError::MalformedToken(format!(
+            "verification method '{kid}' not found on DID '{did}'"
+        )))
     }
 }
 
@@ -443,6 +509,10 @@ where
         });
     }
 
+    // Steps 5a/5b: Key scope validation (ADR-039, SCP-AB-013).
+    // Rejects self-delegation without key_scope and key_scope/kid mismatches.
+    validate_key_scope(token)?;
+
     // Step 6: Capability match — verify att includes required capability.
     // SECURITY: fail-closed — any unparseable attestation URI rejects the entire token.
     let granted_caps: Vec<CapabilityUri> = token
@@ -495,7 +565,9 @@ where
 /// manages nonce tracking and revocation externally, or for quick signature
 /// and structure checks.
 ///
-/// Performs steps 1, 2, 4, 5, 6, 8, and 11 of the 11-step pipeline.
+/// Performs steps 1, 2, 4, 5, 5a, 5b, 6, 8, and 11 of the 11-step pipeline.
+/// Steps 5a (self-delegation without key scope) and 5b (key scope / kid
+/// mismatch) are enforced via [`validate_key_scope`].
 ///
 /// # Errors
 ///
@@ -535,6 +607,9 @@ where
         });
     }
 
+    // Steps 5a/5b: Key scope validation (ADR-039, SCP-AB-013).
+    validate_key_scope(token)?;
+
     // Step 6: Capability match.
     // SECURITY: fail-closed — any unparseable attestation URI rejects the entire token.
     let granted_caps: Vec<CapabilityUri> = token
@@ -565,7 +640,70 @@ where
 // Individual validation steps
 // ---------------------------------------------------------------------------
 
+/// Extracts the `scp_key_scope` value from a UCAN payload's facts.
+///
+/// Returns `Some(scope)` if `fct.scp_key_scope` exists and is a string,
+/// `None` otherwise (backward compatibility — legacy tokens without key
+/// scope skip step 5b).
+///
+/// See ADR-039 and SCP-AB-013.
+fn extract_key_scope(payload: &UcanPayload) -> Option<String> {
+    payload
+        .fct
+        .as_ref()
+        .and_then(|fct| fct.get("scp_key_scope"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
+/// Validates key scope constraints on a UCAN token (steps 5a and 5b).
+///
+/// This function enforces two ADR-039 / SCP-AB-013 rules:
+///
+/// - **Step 5a (self-delegation):** If `iss == aud` and no `scp_key_scope`
+///   is present in `fct`, the token is rejected with
+///   [`UcanError::SelfDelegationWithoutKeyScope`]. Self-delegation is only
+///   meaningful when scoping to a specific verification method.
+///
+/// - **Step 5b (key scope match):** If `fct.scp_key_scope` is present, the
+///   `kid` header (defaulting to `#active` when absent) must match the
+///   declared scope. Mismatch yields [`UcanError::KeyScopeMismatch`].
+///
+/// This function is called on both the presented token and on every parent
+/// token in the delegation chain, ensuring an attacker cannot smuggle an
+/// invalid self-delegation or key scope mismatch into a parent.
+///
+/// # Errors
+///
+/// Returns [`UcanError::SelfDelegationWithoutKeyScope`] or
+/// [`UcanError::KeyScopeMismatch`] on violation.
+fn validate_key_scope(token: &UcanToken) -> Result<(), UcanError> {
+    let key_scope = extract_key_scope(&token.payload);
+
+    // Step 5a: Self-delegation without key_scope is a safety violation.
+    if token.payload.iss == token.payload.aud && key_scope.is_none() {
+        return Err(UcanError::SelfDelegationWithoutKeyScope);
+    }
+
+    // Step 5b: If key_scope is present, verify kid matches.
+    if let Some(ref scope) = key_scope {
+        let actual_kid = token.header.kid.as_deref().unwrap_or("#active");
+        if actual_kid != scope {
+            return Err(UcanError::KeyScopeMismatch {
+                expected_scope: scope.clone(),
+                actual_kid: actual_kid.to_owned(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Step 2: Verify the Ed25519 signature over `base64url(header).base64url(payload)`.
+///
+/// When the token header includes a `kid` field (ADR-039), the public key is
+/// resolved from the specific verification method on the issuer's DID document.
+/// Otherwise, the default (`#active`) key is used.
 ///
 /// # Errors
 ///
@@ -573,7 +711,12 @@ where
 /// Returns [`UcanError::MalformedToken`] if the DID cannot be resolved or
 /// the public key / signature bytes are malformed.
 fn verify_signature(token: &UcanToken, did_resolver: &impl DidResolver) -> Result<(), UcanError> {
-    let pk_bytes = did_resolver.resolve_public_key(&token.payload.iss)?;
+    // When kid is present in the header, resolve the specific verification
+    // method from the DID document (ADR-039, SCP-AB-013).
+    let pk_bytes = match &token.header.kid {
+        Some(kid) => did_resolver.resolve_public_key_by_kid(&token.payload.iss, kid)?,
+        None => did_resolver.resolve_public_key(&token.payload.iss)?,
+    };
 
     // Extract signing input from encoded token: everything before the last '.'
     let signing_input = token
@@ -687,6 +830,11 @@ fn verify_chain_recursive(
                 parent.payload.aud, token.payload.iss
             )));
         }
+
+        // Steps 5a/5b: Validate key scope on parent token (ADR-039, SCP-AB-013).
+        // An attacker could craft a parent with iss==aud and no key_scope that
+        // would pass chain checks if only the presented token were validated.
+        validate_key_scope(&parent)?;
 
         // Verify parent's signature.
         verify_signature(&parent, did_resolver)?;
@@ -951,12 +1099,15 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+            kid_keys: std::collections::HashMap::new(),
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
@@ -994,6 +1145,8 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let mut token = mint_ucan(&params, &custody).await.unwrap();
@@ -1007,6 +1160,7 @@ mod tests {
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+            kid_keys: std::collections::HashMap::new(),
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
@@ -1063,6 +1217,8 @@ mod tests {
                 not_before: None,
                 proofs: vec![],
                 facts: None,
+                key_scope: None,
+                signing_key_id: None,
             },
             &custody_creator,
         )
@@ -1084,6 +1240,8 @@ mod tests {
                 }],
                 lifetime_secs: 1800,
                 facts: None,
+                key_scope: None,
+                signing_key_id: None,
             },
             &custody_delegator,
         )
@@ -1098,6 +1256,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            kid_keys: std::collections::HashMap::new(),
         };
 
         let proof_resolver = InMemoryProofResolver {
@@ -1147,6 +1306,8 @@ mod tests {
                 not_before: None,
                 proofs: vec![],
                 facts: None,
+                key_scope: None,
+                signing_key_id: None,
             },
             &custody_creator,
         )
@@ -1168,6 +1329,8 @@ mod tests {
                 not_before: None,
                 proofs: vec![root_cid.clone()],
                 facts: None,
+                key_scope: None,
+                signing_key_id: None,
             },
             &custody_b,
         )
@@ -1178,6 +1341,7 @@ mod tests {
             keys: [(creator_did.clone(), pk_creator), (did_b.clone(), pk_b)]
                 .into_iter()
                 .collect(),
+            kid_keys: std::collections::HashMap::new(),
         };
 
         let proof_resolver = InMemoryProofResolver {
@@ -1223,6 +1387,8 @@ mod tests {
                 not_before: None,
                 proofs: vec!["bafyrei-nonexistent".to_owned()],
                 facts: None,
+                key_scope: None,
+                signing_key_id: None,
             },
             &custody,
         )
@@ -1231,6 +1397,7 @@ mod tests {
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+            kid_keys: std::collections::HashMap::new(),
         };
 
         let proof_resolver = InMemoryProofResolver::new();
@@ -1276,12 +1443,15 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+            kid_keys: std::collections::HashMap::new(),
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
@@ -1334,6 +1504,8 @@ mod tests {
                 not_before: None,
                 proofs: vec![],
                 facts: None,
+                key_scope: None,
+                signing_key_id: None,
             },
             &custody_non_creator,
         )
@@ -1355,6 +1527,8 @@ mod tests {
                 }],
                 lifetime_secs: 1800,
                 facts: None,
+                key_scope: None,
+                signing_key_id: None,
             },
             &custody_delegator,
         )
@@ -1368,6 +1542,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            kid_keys: std::collections::HashMap::new(),
         };
 
         let proof_resolver = InMemoryProofResolver {
@@ -1416,12 +1591,15 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+            kid_keys: std::collections::HashMap::new(),
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
@@ -1467,12 +1645,15 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+            kid_keys: std::collections::HashMap::new(),
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
@@ -1515,6 +1696,8 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -1524,6 +1707,7 @@ mod tests {
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+            kid_keys: std::collections::HashMap::new(),
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
@@ -1576,6 +1760,8 @@ mod tests {
                 not_before: None,
                 proofs: vec![],
                 facts: None,
+                key_scope: None,
+                signing_key_id: None,
             },
             &custody_creator,
         )
@@ -1597,6 +1783,8 @@ mod tests {
                 not_before: None,
                 proofs: vec![root_cid.clone()],
                 facts: None,
+                key_scope: None,
+                signing_key_id: None,
             },
             &custody_delegator,
         )
@@ -1610,6 +1798,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            kid_keys: std::collections::HashMap::new(),
         };
 
         let proof_resolver = InMemoryProofResolver {
@@ -1657,12 +1846,15 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+            kid_keys: std::collections::HashMap::new(),
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
@@ -1711,12 +1903,15 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+            kid_keys: std::collections::HashMap::new(),
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
@@ -1773,12 +1968,15 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+            kid_keys: std::collections::HashMap::new(),
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
 
@@ -1824,6 +2022,8 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -1831,6 +2031,7 @@ mod tests {
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+            kid_keys: std::collections::HashMap::new(),
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
 
@@ -1878,6 +2079,8 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -1887,6 +2090,7 @@ mod tests {
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+            kid_keys: std::collections::HashMap::new(),
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
@@ -2144,6 +2348,8 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let minted = mint_ucan(&params, &custody).await.unwrap();
@@ -2157,6 +2363,7 @@ mod tests {
         // Validate the parsed token.
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+            kid_keys: std::collections::HashMap::new(),
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
@@ -2197,12 +2404,15 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+            kid_keys: std::collections::HashMap::new(),
         };
         let ceiling = default_ceiling();
         let required_cap = CapabilityUri::new("ctx-stateless", "messages", "write");
@@ -2252,6 +2462,8 @@ mod tests {
                 not_before: None,
                 proofs: vec![],
                 facts: None,
+                key_scope: None,
+                signing_key_id: None,
             },
             &custody_creator,
         )
@@ -2279,6 +2491,8 @@ mod tests {
                 ],
                 lifetime_secs: 1800,
                 facts: None,
+                key_scope: None,
+                signing_key_id: None,
             },
             &custody_delegator,
         )
@@ -2299,6 +2513,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            kid_keys: std::collections::HashMap::new(),
         };
 
         let proof_resolver = InMemoryProofResolver {
@@ -2463,6 +2678,36 @@ mod tests {
     // Circular delegation detection (SCP-191)
     // -----------------------------------------------------------------------
 
+    /// Helper: mint a UCAN token with default options for chain tests.
+    async fn mint_chain_token(
+        issuer_did: &str,
+        issuer_key: &scp_platform::traits::KeyHandle,
+        audience_did: &str,
+        context_id: &str,
+        caps: &[String],
+        proofs: Vec<String>,
+        custody: &InMemoryKeyCustody,
+    ) -> UcanToken {
+        mint_ucan(
+            &MintParams {
+                issuer_did,
+                issuer_key,
+                audience_did,
+                context_id,
+                capabilities: caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs,
+                facts: None,
+                key_scope: None,
+                signing_key_id: None,
+            },
+            custody,
+        )
+        .await
+        .unwrap()
+    }
+
     /// A->B->C->A cycle must be rejected with `CircularDelegation`.
     #[tokio::test]
     async fn validate_ucan_rejects_circular_delegation_a_b_c_a() {
@@ -2472,76 +2717,52 @@ mod tests {
 
         let caps = vec!["messages:write".to_owned()];
 
-        let token_a_to_b = mint_ucan(
-            &MintParams {
-                issuer_did: &did_a,
-                issuer_key: &key_a,
-                audience_did: &did_b,
-                context_id: "ctx-cycle",
-                capabilities: &caps,
-                lifetime_secs: 3600,
-                not_before: None,
-                proofs: vec![],
-                facts: None,
-            },
+        let token_a_to_b = mint_chain_token(
+            &did_a,
+            &key_a,
+            &did_b,
+            "ctx-cycle",
+            &caps,
+            vec![],
             &custody_a,
         )
-        .await
-        .unwrap();
+        .await;
         let cid_a_to_b = compute_cid(&token_a_to_b);
 
-        let token_b_to_c = mint_ucan(
-            &MintParams {
-                issuer_did: &did_b,
-                issuer_key: &key_b,
-                audience_did: &did_c,
-                context_id: "ctx-cycle",
-                capabilities: &caps,
-                lifetime_secs: 3600,
-                not_before: None,
-                proofs: vec![cid_a_to_b.clone()],
-                facts: None,
-            },
+        let token_b_to_c = mint_chain_token(
+            &did_b,
+            &key_b,
+            &did_c,
+            "ctx-cycle",
+            &caps,
+            vec![cid_a_to_b.clone()],
             &custody_b,
         )
-        .await
-        .unwrap();
+        .await;
         let cid_b_to_c = compute_cid(&token_b_to_c);
 
-        let token_c_to_a = mint_ucan(
-            &MintParams {
-                issuer_did: &did_c,
-                issuer_key: &key_c,
-                audience_did: &did_a,
-                context_id: "ctx-cycle",
-                capabilities: &caps,
-                lifetime_secs: 3600,
-                not_before: None,
-                proofs: vec![cid_b_to_c.clone()],
-                facts: None,
-            },
+        let token_c_to_a = mint_chain_token(
+            &did_c,
+            &key_c,
+            &did_a,
+            "ctx-cycle",
+            &caps,
+            vec![cid_b_to_c.clone()],
             &custody_c,
         )
-        .await
-        .unwrap();
+        .await;
         let cid_c_to_a = compute_cid(&token_c_to_a);
 
-        let token_presenting = mint_ucan(
-            &MintParams {
-                issuer_did: &did_a,
-                issuer_key: &key_a,
-                audience_did: "did:dht:z6MkPresenter",
-                context_id: "ctx-cycle",
-                capabilities: &caps,
-                lifetime_secs: 3600,
-                not_before: None,
-                proofs: vec![cid_c_to_a.clone()],
-                facts: None,
-            },
+        let token_presenting = mint_chain_token(
+            &did_a,
+            &key_a,
+            "did:dht:z6MkPresenter",
+            "ctx-cycle",
+            &caps,
+            vec![cid_c_to_a.clone()],
             &custody_a,
         )
-        .await
-        .unwrap();
+        .await;
 
         let resolver = InMemoryDidResolver {
             keys: [
@@ -2551,6 +2772,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            kid_keys: std::collections::HashMap::new(),
         };
 
         let proof_resolver = InMemoryProofResolver {
@@ -2598,6 +2820,8 @@ mod tests {
                 not_before: None,
                 proofs: vec![],
                 facts: None,
+                key_scope: None,
+                signing_key_id: None,
             },
             &custody_a,
         )
@@ -2617,6 +2841,8 @@ mod tests {
                 }],
                 lifetime_secs: 1800,
                 facts: None,
+                key_scope: None,
+                signing_key_id: None,
             },
             &custody_b,
         )
@@ -2627,6 +2853,7 @@ mod tests {
             keys: [(did_a.clone(), pk_a), (did_b.clone(), pk_b)]
                 .into_iter()
                 .collect(),
+            kid_keys: std::collections::HashMap::new(),
         };
 
         let proof_resolver = InMemoryProofResolver {
@@ -2646,49 +2873,91 @@ mod tests {
     }
 
     /// Self-delegation A->A must be rejected with `CircularDelegation`.
+    ///
+    /// Note: `mint_ucan` now rejects self-delegation without `key_scope` at
+    /// mint time (ADR-039), so we construct the invalid token manually to
+    /// verify the validation layer also catches it independently.
     #[tokio::test]
     async fn validate_ucan_rejects_self_delegation_a_to_a() {
+        use crate::crypto::ucan::nonce::generate_nonce;
+
         let (custody_a, key_a, did_a, pk_a) = setup_identity().await;
 
-        let caps = vec!["messages:write".to_owned()];
-
-        let root_token = mint_ucan(
-            &MintParams {
-                issuer_did: &did_a,
-                issuer_key: &key_a,
-                audience_did: &did_a,
-                context_id: "ctx-self",
-                capabilities: &caps,
-                lifetime_secs: 3600,
-                not_before: None,
-                proofs: vec![],
-                facts: None,
-            },
-            &custody_a,
-        )
-        .await
-        .unwrap();
+        // Manually build a self-delegation root token (iss == aud, no key_scope)
+        // bypassing mint_ucan which would now reject this.
+        let now = crate::time::now_secs().unwrap();
+        let root_header = UcanHeader::new();
+        let root_payload = UcanPayload {
+            iss: did_a.clone(),
+            aud: did_a.clone(),
+            exp: now + 3600,
+            nbf: None,
+            nnc: generate_nonce().unwrap(),
+            att: vec![crate::crypto::ucan::Attenuation {
+                with: "scp:ctx:ctx-self/messages:write".to_owned(),
+                can: "write".to_owned(),
+            }],
+            prf: vec![],
+            fct: None,
+        };
+        let header_json = serde_json::to_vec(&root_header).unwrap();
+        let payload_json = serde_json::to_vec(&root_payload).unwrap();
+        let header_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&header_json);
+        let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload_json);
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let sig = custody_a
+            .sign(&key_a, signing_input.as_bytes())
+            .await
+            .unwrap();
+        let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.as_bytes());
+        let root_encoded = format!("{signing_input}.{sig_b64}");
+        let root_token = UcanToken {
+            header: root_header,
+            payload: root_payload,
+            signature: sig.into_bytes(),
+            encoded: root_encoded,
+        };
         let root_cid = compute_cid(&root_token);
 
-        let child_token = mint_ucan(
-            &MintParams {
-                issuer_did: &did_a,
-                issuer_key: &key_a,
-                audience_did: "did:dht:z6MkSomeone",
-                context_id: "ctx-self",
-                capabilities: &caps,
-                lifetime_secs: 3600,
-                not_before: None,
-                proofs: vec![root_cid.clone()],
-                facts: None,
-            },
-            &custody_a,
-        )
-        .await
-        .unwrap();
+        // Build a child token from did_a -> someone, referencing the self-delegation root.
+        let child_header = UcanHeader::new();
+        let child_payload = UcanPayload {
+            iss: did_a.clone(),
+            aud: "did:dht:z6MkSomeone".to_owned(),
+            exp: now + 3600,
+            nbf: None,
+            nnc: generate_nonce().unwrap(),
+            att: vec![crate::crypto::ucan::Attenuation {
+                with: "scp:ctx:ctx-self/messages:write".to_owned(),
+                can: "write".to_owned(),
+            }],
+            prf: vec![root_cid.clone()],
+            fct: None,
+        };
+        let child_header_json = serde_json::to_vec(&child_header).unwrap();
+        let child_payload_json = serde_json::to_vec(&child_payload).unwrap();
+        let child_header_b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&child_header_json);
+        let child_payload_b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&child_payload_json);
+        let child_signing_input = format!("{child_header_b64}.{child_payload_b64}");
+        let child_sig = custody_a
+            .sign(&key_a, child_signing_input.as_bytes())
+            .await
+            .unwrap();
+        let child_sig_b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(child_sig.as_bytes());
+        let child_encoded = format!("{child_signing_input}.{child_sig_b64}");
+        let child_token = UcanToken {
+            header: child_header,
+            payload: child_payload,
+            signature: child_sig.into_bytes(),
+            encoded: child_encoded,
+        };
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((did_a.clone(), pk_a)).collect(),
+            kid_keys: std::collections::HashMap::new(),
         };
 
         let proof_resolver = InMemoryProofResolver {
@@ -2730,6 +2999,7 @@ mod tests {
 
         let resolver = InMemoryDidResolver {
             keys: std::collections::HashMap::new(),
+            kid_keys: std::collections::HashMap::new(),
         };
         let proof_resolver = InMemoryProofResolver::new();
         let revocation_checker = InMemoryRevocationChecker::new();
@@ -2996,5 +3266,926 @@ mod tests {
     #[test]
     fn default_clock_skew_tolerance_is_five_minutes() {
         assert_eq!(DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, 300);
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 5a: Self-delegation safety check (SCP-AB-013)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn validate_ucan_rejects_self_delegation_without_key_scope() {
+        use crate::crypto::ucan::nonce::generate_nonce;
+
+        // iss == aud without scp_key_scope must be rejected at validation level.
+        // mint_ucan now also rejects this at mint time, so we construct the
+        // invalid token manually to verify the validation layer independently.
+        let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
+
+        let now = crate::time::now_secs().unwrap();
+        let header = UcanHeader::new();
+        let payload = UcanPayload {
+            iss: issuer_did.clone(),
+            aud: issuer_did.clone(),
+            exp: now + 3600,
+            nbf: None,
+            nnc: generate_nonce().unwrap(),
+            att: vec![crate::crypto::ucan::Attenuation {
+                with: "scp:ctx:ctx-self/messages:write".to_owned(),
+                can: "write".to_owned(),
+            }],
+            prf: vec![],
+            fct: None,
+        };
+        let header_json = serde_json::to_vec(&header).unwrap();
+        let payload_json = serde_json::to_vec(&payload).unwrap();
+        let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
+        let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let sig = custody
+            .sign(&key_handle, signing_input.as_bytes())
+            .await
+            .unwrap();
+        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.as_bytes());
+        let encoded = format!("{signing_input}.{sig_b64}");
+        let token = UcanToken {
+            header,
+            payload,
+            signature: sig.into_bytes(),
+            encoded,
+        };
+
+        let resolver = InMemoryDidResolver {
+            keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+            kid_keys: std::collections::HashMap::new(),
+        };
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
+        let ceiling = default_ceiling();
+
+        let required_cap = CapabilityUri::new("ctx-self", "messages", "write");
+
+        let mut ctx = build_context(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &proof_resolver,
+            &ceiling,
+            &issuer_did,
+            &issuer_did, // presenting agent is the same DID
+        );
+
+        let result = validate_ucan(&token, &required_cap, &mut ctx);
+        assert!(
+            matches!(result, Err(UcanError::SelfDelegationWithoutKeyScope)),
+            "iss == aud without key_scope must be rejected: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_ucan_accepts_self_delegation_with_key_scope() {
+        // iss == aud WITH scp_key_scope must be accepted.
+        let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        // Mint a self-delegation token with key_scope.
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: &issuer_did, // self-delegation
+            context_id: "ctx-self",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: Some("#active".to_owned()),
+            signing_key_id: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        // The default key IS the #active key, so register it under both
+        // the default and the kid_keys paths.
+        let resolver = InMemoryDidResolver {
+            keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+            kid_keys: [((issuer_did.clone(), "#active".to_owned()), pk_bytes)]
+                .into_iter()
+                .collect(),
+        };
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
+        let ceiling = default_ceiling();
+
+        let required_cap = CapabilityUri::new("ctx-self", "messages", "write");
+
+        let mut ctx = build_context(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &proof_resolver,
+            &ceiling,
+            &issuer_did,
+            &issuer_did, // presenting agent is the same DID
+        );
+
+        let result = validate_ucan(&token, &required_cap, &mut ctx);
+        assert!(
+            result.is_ok(),
+            "iss == aud with key_scope must be accepted: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 5b: Key scope verification (SCP-AB-013)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn validate_ucan_accepts_matching_key_scope() {
+        // Token with key_scope="#agent", signed by #agent key -> accepted.
+        let (custody, _key_active, issuer_did, pk_active) = setup_identity().await;
+
+        // Generate a second key pair for the agent key.
+        let agent_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let agent_pubkey = custody.public_key(&agent_key).await.unwrap();
+        let pk_agent: [u8; 32] = agent_pubkey.as_bytes().try_into().unwrap();
+
+        let caps = vec!["messages:write".to_owned()];
+
+        // Mint a token with key_scope="#agent", signed by the agent key.
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &agent_key,    // Signed by agent key
+            audience_did: &issuer_did, // self-delegation
+            context_id: "ctx-scope",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: Some("#agent".to_owned()),
+            signing_key_id: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        // kid should be "#agent" in the header.
+        assert_eq!(token.header.kid, Some("#agent".to_owned()));
+
+        // Register the agent key under the kid_keys resolver.
+        let resolver = InMemoryDidResolver {
+            keys: std::iter::once((issuer_did.clone(), pk_active)).collect(),
+            kid_keys: [((issuer_did.clone(), "#agent".to_owned()), pk_agent)]
+                .into_iter()
+                .collect(),
+        };
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
+        let ceiling = default_ceiling();
+
+        let required_cap = CapabilityUri::new("ctx-scope", "messages", "write");
+
+        let mut ctx = build_context(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &proof_resolver,
+            &ceiling,
+            &issuer_did,
+            &issuer_did, // self-delegation
+        );
+
+        let result = validate_ucan(&token, &required_cap, &mut ctx);
+        assert!(
+            result.is_ok(),
+            "matching key_scope (#agent signed by #agent) must pass: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_ucan_rejects_mismatched_key_scope() {
+        // Token declares key_scope="#agent" but was signed by #active key.
+        // The token's kid header will say "#agent" (set by mint), but the
+        // signature was actually made by the #active key. When the validator
+        // resolves #agent's public key and tries to verify, it will fail
+        // because a different key signed it.
+        let (custody, key_active, issuer_did, pk_active) = setup_identity().await;
+
+        // Generate a separate agent keypair.
+        let agent_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let agent_pubkey = custody.public_key(&agent_key).await.unwrap();
+        let pk_agent: [u8; 32] = agent_pubkey.as_bytes().try_into().unwrap();
+
+        let caps = vec!["messages:write".to_owned()];
+
+        // Mint with key_scope="#agent" but sign with the ACTIVE key.
+        // This creates a token where kid="#agent" but the signature is from
+        // the #active key -- a mismatch that the validator must catch.
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_active, // WRONG key: signing with #active
+            audience_did: &issuer_did,
+            context_id: "ctx-scope",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: Some("#agent".to_owned()), // Says #agent
+            signing_key_id: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        // Register both keys. The #agent key is different from #active.
+        let resolver = InMemoryDidResolver {
+            keys: std::iter::once((issuer_did.clone(), pk_active)).collect(),
+            kid_keys: [(
+                (issuer_did.clone(), "#agent".to_owned()),
+                pk_agent, // Different from the key that actually signed
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
+        let ceiling = default_ceiling();
+
+        let required_cap = CapabilityUri::new("ctx-scope", "messages", "write");
+
+        let mut ctx = build_context(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &proof_resolver,
+            &ceiling,
+            &issuer_did,
+            &issuer_did,
+        );
+
+        let result = validate_ucan(&token, &required_cap, &mut ctx);
+        // The signature verification (step 2) will fail because kid="#agent"
+        // causes the validator to resolve the #agent public key, which doesn't
+        // match the signature made by the #active key.
+        assert!(
+            matches!(result, Err(UcanError::SignatureInvalid)),
+            "token signed by wrong key must fail signature verification: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_ucan_rejects_scope_kid_mismatch_in_facts() {
+        // Token where kid="#active" but fct.scp_key_scope="#agent".
+        // This tests step 5b specifically: the scope declared in facts
+        // doesn't match the kid in the header.
+        let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        // We need to construct a token where kid="#active" but
+        // fct.scp_key_scope="#agent". The mint function always sets
+        // scp_key_scope from key_scope, so we must manually construct
+        // a tampered token.
+        //
+        // Strategy: mint with key_scope="#active" (so kid="#active",
+        // scp_key_scope="#active"), then re-sign with scp_key_scope
+        // changed to "#agent".
+        let base_params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: &issuer_did,
+            context_id: "ctx-scope",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: Some("#active".to_owned()),
+            signing_key_id: None,
+        };
+
+        let base_token = mint_ucan(&base_params, &custody).await.unwrap();
+
+        // Tamper: change fct.scp_key_scope to "#agent" while keeping
+        // kid="#active".
+        let mut tampered_payload = base_token.payload.clone();
+        if let Some(ref mut fct) = tampered_payload.fct {
+            if let Some(obj) = fct.as_object_mut() {
+                obj.insert(
+                    "scp_key_scope".to_owned(),
+                    serde_json::Value::String("#agent".to_owned()),
+                );
+            }
+        }
+
+        // Re-encode and re-sign the tampered payload.
+        let header_json = serde_json::to_vec(&base_token.header).unwrap();
+        let payload_json = serde_json::to_vec(&tampered_payload).unwrap();
+        let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
+        let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+        let signing_input = format!("{header_b64}.{payload_b64}");
+
+        let sig = custody
+            .sign(&key_handle, signing_input.as_bytes())
+            .await
+            .unwrap();
+
+        let sig_bytes = sig.into_bytes();
+        let sig_b64 = URL_SAFE_NO_PAD.encode(&sig_bytes);
+        let encoded = format!("{signing_input}.{sig_b64}");
+
+        let tampered_token = UcanToken {
+            header: base_token.header.clone(), // kid="#active"
+            payload: tampered_payload,         // fct.scp_key_scope="#agent"
+            signature: sig_bytes,
+            encoded,
+        };
+
+        let resolver = InMemoryDidResolver {
+            keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+            kid_keys: [((issuer_did.clone(), "#active".to_owned()), pk_bytes)]
+                .into_iter()
+                .collect(),
+        };
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
+        let ceiling = default_ceiling();
+
+        let required_cap = CapabilityUri::new("ctx-scope", "messages", "write");
+
+        let mut ctx = build_context(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &proof_resolver,
+            &ceiling,
+            &issuer_did,
+            &issuer_did,
+        );
+
+        let result = validate_ucan(&tampered_token, &required_cap, &mut ctx);
+        assert!(
+            matches!(
+                result,
+                Err(UcanError::KeyScopeMismatch {
+                    ref expected_scope,
+                    ref actual_kid,
+                }) if expected_scope == "#agent" && actual_kid == "#active"
+            ),
+            "kid/scope mismatch must return KeyScopeMismatch: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_ucan_skips_key_scope_check_when_absent() {
+        // Token without scp_key_scope in facts: step 5b is skipped.
+        // This is the backward-compatibility case.
+        let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-compat",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None, // No key scope: legacy token
+            signing_key_id: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        let resolver = InMemoryDidResolver {
+            keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+            kid_keys: std::collections::HashMap::new(),
+        };
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
+        let ceiling = default_ceiling();
+
+        let required_cap = CapabilityUri::new("ctx-compat", "messages", "write");
+
+        let mut ctx = build_context(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &proof_resolver,
+            &ceiling,
+            &issuer_did,
+            "did:dht:z6MkMember",
+        );
+
+        let result = validate_ucan(&token, &required_cap, &mut ctx);
+        assert!(
+            result.is_ok(),
+            "token without key_scope must pass (backward compat): {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_ucan_scoped_ucan_cannot_be_exercised_by_wrong_key() {
+        // End-to-end: mint a UCAN scoped to #agent, but present it with a
+        // resolver that maps #agent to a different key than what signed it.
+        // This verifies that a scoped UCAN cannot be exercised by the wrong key.
+        let (custody, key_handle, issuer_did, pk_active) = setup_identity().await;
+
+        // Generate a different key that represents the "real" agent key.
+        let real_agent_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let real_agent_pubkey = custody.public_key(&real_agent_key).await.unwrap();
+        let pk_real_agent: [u8; 32] = real_agent_pubkey.as_bytes().try_into().unwrap();
+
+        let caps = vec!["messages:write".to_owned()];
+
+        // Mint with key_scope="#agent" signed by the active key (not the real agent key).
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle, // #active key signing
+            audience_did: &issuer_did,
+            context_id: "ctx-wrong",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: Some("#agent".to_owned()),
+            signing_key_id: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        // The resolver maps #agent to the REAL agent key (different from #active).
+        let resolver = InMemoryDidResolver {
+            keys: std::iter::once((issuer_did.clone(), pk_active)).collect(),
+            kid_keys: [(
+                (issuer_did.clone(), "#agent".to_owned()),
+                pk_real_agent, // Different from the key that actually signed
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
+        let ceiling = default_ceiling();
+
+        let required_cap = CapabilityUri::new("ctx-wrong", "messages", "write");
+
+        let mut ctx = build_context(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &proof_resolver,
+            &ceiling,
+            &issuer_did,
+            &issuer_did,
+        );
+
+        let result = validate_ucan(&token, &required_cap, &mut ctx);
+        assert!(
+            matches!(result, Err(UcanError::SignatureInvalid)),
+            "scoped UCAN exercised by wrong key must fail: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_key_scope unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_key_scope_returns_scope_when_present() {
+        let payload = UcanPayload {
+            iss: "did:dht:z6MkTest".to_owned(),
+            aud: "did:dht:z6MkTest".to_owned(),
+            exp: 0,
+            nbf: None,
+            nnc: String::new(),
+            att: vec![],
+            prf: vec![],
+            fct: Some(serde_json::json!({"scp_key_scope": "#agent"})),
+        };
+        assert_eq!(extract_key_scope(&payload), Some("#agent".to_owned()));
+    }
+
+    #[test]
+    fn extract_key_scope_returns_none_when_absent() {
+        let payload = UcanPayload {
+            iss: "did:dht:z6MkTest".to_owned(),
+            aud: "did:dht:z6MkTest".to_owned(),
+            exp: 0,
+            nbf: None,
+            nnc: String::new(),
+            att: vec![],
+            prf: vec![],
+            fct: None,
+        };
+        assert_eq!(extract_key_scope(&payload), None);
+    }
+
+    #[test]
+    fn extract_key_scope_returns_none_when_fct_has_no_key_scope() {
+        let payload = UcanPayload {
+            iss: "did:dht:z6MkTest".to_owned(),
+            aud: "did:dht:z6MkTest".to_owned(),
+            exp: 0,
+            nbf: None,
+            nnc: String::new(),
+            att: vec![],
+            prf: vec![],
+            fct: Some(serde_json::json!({"other_fact": "value"})),
+        };
+        assert_eq!(extract_key_scope(&payload), None);
+    }
+
+    #[test]
+    fn extract_key_scope_returns_none_when_scope_is_not_string() {
+        let payload = UcanPayload {
+            iss: "did:dht:z6MkTest".to_owned(),
+            aud: "did:dht:z6MkTest".to_owned(),
+            exp: 0,
+            nbf: None,
+            nnc: String::new(),
+            att: vec![],
+            prf: vec![],
+            fct: Some(serde_json::json!({"scp_key_scope": 42})),
+        };
+        assert_eq!(extract_key_scope(&payload), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Steps 5a/5b applied to parent tokens in delegation chain (SCP-AB-013)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn chain_rejects_parent_self_delegation_without_key_scope() {
+        // A parent token with iss==aud and no key_scope should be rejected.
+        //
+        // Note: In the current chain walk, the circular delegation detector
+        // fires first because parent.iss == parent.aud == child.iss (required
+        // for aud/iss linkage). The validate_key_scope check provides
+        // defense-in-depth — if the circular delegation check were ever
+        // relaxed or reordered, this would become the primary guard.
+        //
+        // We verify that the chain is rejected (either SelfDelegationWithoutKeyScope
+        // or CircularDelegation) — both are correct rejections.
+        use crate::crypto::ucan::nonce::generate_nonce;
+
+        let (custody_creator, key_creator, creator_did, pk_creator) = setup_identity().await;
+        let (_custody_agent, _key_agent, agent_did, _pk_agent) = setup_identity().await;
+
+        let now = crate::time::now_secs().unwrap();
+        let caps = vec!["messages:write".to_owned()];
+
+        // Manually construct a parent token where iss==aud and no key_scope.
+        let parent_header = UcanHeader::new();
+        let parent_payload = UcanPayload {
+            iss: creator_did.clone(),
+            aud: creator_did.clone(), // iss == aud, no key_scope
+            exp: now + 3600,
+            nbf: None,
+            nnc: generate_nonce().unwrap(),
+            att: vec![crate::crypto::ucan::Attenuation {
+                with: "scp:ctx:ctx-chain/messages:write".to_owned(),
+                can: "write".to_owned(),
+            }],
+            prf: vec![],
+            fct: None, // No key_scope — invalid self-delegation
+        };
+        let parent_header_json = serde_json::to_vec(&parent_header).unwrap();
+        let parent_payload_json = serde_json::to_vec(&parent_payload).unwrap();
+        let parent_header_b64 = URL_SAFE_NO_PAD.encode(&parent_header_json);
+        let parent_payload_b64 = URL_SAFE_NO_PAD.encode(&parent_payload_json);
+        let parent_signing_input = format!("{parent_header_b64}.{parent_payload_b64}");
+        let parent_sig = custody_creator
+            .sign(&key_creator, parent_signing_input.as_bytes())
+            .await
+            .unwrap();
+        let parent_sig_b64 = URL_SAFE_NO_PAD.encode(parent_sig.as_bytes());
+        let parent_encoded = format!("{parent_signing_input}.{parent_sig_b64}");
+        let parent_token = UcanToken {
+            header: parent_header,
+            payload: parent_payload,
+            signature: parent_sig.into_bytes(),
+            encoded: parent_encoded,
+        };
+
+        let parent_cid = crate::crypto::ucan::mint::compute_cid(&parent_token);
+
+        // Child from creator_did -> agent_did, referencing the malformed parent.
+        let child_params = MintParams {
+            issuer_did: &creator_did,
+            issuer_key: &key_creator,
+            audience_did: &agent_did,
+            context_id: "ctx-chain",
+            capabilities: &caps,
+            lifetime_secs: 1800,
+            not_before: None,
+            proofs: vec![parent_cid.clone()],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+        };
+        let child_token = mint_ucan(&child_params, &custody_creator).await.unwrap();
+
+        let resolver = InMemoryDidResolver {
+            keys: std::iter::once((creator_did.clone(), pk_creator)).collect(),
+            kid_keys: std::collections::HashMap::new(),
+        };
+        let proof_resolver = InMemoryProofResolver {
+            proofs: std::iter::once((parent_cid, parent_token)).collect(),
+        };
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let ceiling = default_ceiling();
+        let required_cap = CapabilityUri::new("ctx-chain", "messages", "write");
+
+        let mut ctx = build_context(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &proof_resolver,
+            &ceiling,
+            &creator_did,
+            &agent_did,
+        );
+
+        let result = validate_ucan(&child_token, &required_cap, &mut ctx);
+        // Either CircularDelegation (fires first due to iss tracking) or
+        // SelfDelegationWithoutKeyScope (defense-in-depth). Both are correct
+        // rejections of this invalid chain.
+        assert!(
+            matches!(
+                result,
+                Err(UcanError::CircularDelegation(_))
+                    | Err(UcanError::SelfDelegationWithoutKeyScope)
+            ),
+            "parent with iss==aud and no key_scope must be rejected: {result:?}"
+        );
+    }
+
+    /// Also verify validate_key_scope directly catches the self-delegation case,
+    /// independent of chain machinery.
+    #[test]
+    fn validate_key_scope_rejects_self_delegation_without_scope() {
+        let token = UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:zSameDid".to_owned(),
+                aud: "did:dht:zSameDid".to_owned(),
+                exp: 0,
+                nbf: None,
+                nnc: String::new(),
+                att: vec![],
+                prf: vec![],
+                fct: None,
+            },
+            signature: vec![],
+            encoded: String::new(),
+        };
+        assert!(matches!(
+            validate_key_scope(&token),
+            Err(UcanError::SelfDelegationWithoutKeyScope)
+        ));
+    }
+
+    #[test]
+    fn validate_key_scope_rejects_kid_scope_mismatch() {
+        let token = UcanToken {
+            header: UcanHeader::new(), // kid = None → defaults to "#active"
+            payload: UcanPayload {
+                iss: "did:dht:zIssuer".to_owned(),
+                aud: "did:dht:zAudience".to_owned(),
+                exp: 0,
+                nbf: None,
+                nnc: String::new(),
+                att: vec![],
+                prf: vec![],
+                fct: Some(serde_json::json!({"scp_key_scope": "#agent"})),
+            },
+            signature: vec![],
+            encoded: String::new(),
+        };
+        assert!(matches!(
+            validate_key_scope(&token),
+            Err(UcanError::KeyScopeMismatch { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn chain_rejects_parent_key_scope_kid_mismatch() {
+        // A parent token (iss != aud) with fct.scp_key_scope="#agent" but
+        // kid="#active" must cause the chain to be rejected with
+        // KeyScopeMismatch. This is the primary exploit path that was not
+        // caught before adding validate_key_scope to verify_chain_recursive.
+        use crate::crypto::ucan::nonce::generate_nonce;
+
+        // Three identities: creator (root), delegator (middle), agent (leaf).
+        let (custody_creator, key_creator, creator_did, pk_creator) = setup_identity().await;
+        let (custody_delegator, key_delegator, delegator_did, pk_delegator) =
+            setup_identity().await;
+        let (_custody_agent, _key_agent, agent_did, _pk_agent) = setup_identity().await;
+
+        let now = crate::time::now_secs().unwrap();
+        let caps = vec!["messages:write".to_owned()];
+
+        // Parent: creator -> delegator, with a key_scope/kid mismatch.
+        // kid is absent (defaults to #active), but scp_key_scope says #agent.
+        let parent_header = UcanHeader::new(); // kid = None → "#active"
+        let parent_payload = UcanPayload {
+            iss: creator_did.clone(),
+            aud: delegator_did.clone(), // iss != aud, normal delegation
+            exp: now + 3600,
+            nbf: None,
+            nnc: generate_nonce().unwrap(),
+            att: vec![crate::crypto::ucan::Attenuation {
+                with: "scp:ctx:ctx-chain/messages:write".to_owned(),
+                can: "write".to_owned(),
+            }],
+            prf: vec![],
+            fct: Some(serde_json::json!({"scp_key_scope": "#agent"})), // Mismatch!
+        };
+        let parent_header_json = serde_json::to_vec(&parent_header).unwrap();
+        let parent_payload_json = serde_json::to_vec(&parent_payload).unwrap();
+        let parent_header_b64 = URL_SAFE_NO_PAD.encode(&parent_header_json);
+        let parent_payload_b64 = URL_SAFE_NO_PAD.encode(&parent_payload_json);
+        let parent_signing_input = format!("{parent_header_b64}.{parent_payload_b64}");
+        let parent_sig = custody_creator
+            .sign(&key_creator, parent_signing_input.as_bytes())
+            .await
+            .unwrap();
+        let parent_sig_b64 = URL_SAFE_NO_PAD.encode(parent_sig.as_bytes());
+        let parent_encoded = format!("{parent_signing_input}.{parent_sig_b64}");
+        let parent_token = UcanToken {
+            header: parent_header,
+            payload: parent_payload,
+            signature: parent_sig.into_bytes(),
+            encoded: parent_encoded,
+        };
+
+        let parent_cid = crate::crypto::ucan::mint::compute_cid(&parent_token);
+
+        // Child: delegator -> agent, referencing the malformed parent.
+        let child_params = MintParams {
+            issuer_did: &delegator_did,
+            issuer_key: &key_delegator,
+            audience_did: &agent_did,
+            context_id: "ctx-chain",
+            capabilities: &caps,
+            lifetime_secs: 1800,
+            not_before: None,
+            proofs: vec![parent_cid.clone()],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+        };
+        let child_token = mint_ucan(&child_params, &custody_delegator).await.unwrap();
+
+        let resolver = InMemoryDidResolver {
+            keys: [
+                (creator_did.clone(), pk_creator),
+                (delegator_did.clone(), pk_delegator),
+            ]
+            .into_iter()
+            .collect(),
+            kid_keys: std::collections::HashMap::new(),
+        };
+        let proof_resolver = InMemoryProofResolver {
+            proofs: std::iter::once((parent_cid, parent_token)).collect(),
+        };
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let ceiling = default_ceiling();
+        let required_cap = CapabilityUri::new("ctx-chain", "messages", "write");
+
+        let mut ctx = build_context(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &proof_resolver,
+            &ceiling,
+            &creator_did,
+            &agent_did,
+        );
+
+        let result = validate_ucan(&child_token, &required_cap, &mut ctx);
+        assert!(
+            matches!(
+                result,
+                Err(UcanError::KeyScopeMismatch {
+                    expected_scope: _,
+                    actual_kid: _
+                })
+            ),
+            "parent with key_scope/kid mismatch must be rejected: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_accepts_parent_with_valid_key_scope() {
+        // A parent token with a valid key_scope (matching kid) must be accepted
+        // in the delegation chain.
+        use crate::crypto::ucan::nonce::generate_nonce;
+
+        // Three identities: creator (root), delegator (middle), agent (leaf).
+        let (custody_creator, key_creator, creator_did, pk_creator) = setup_identity().await;
+        let (custody_delegator, key_delegator, delegator_did, pk_delegator) =
+            setup_identity().await;
+        let (_custody_agent, _key_agent, agent_did, _pk_agent) = setup_identity().await;
+
+        let now = crate::time::now_secs().unwrap();
+
+        // Parent: creator -> delegator, with valid key_scope="#active" and
+        // kid="#active" (matching).
+        let mut parent_header = UcanHeader::new();
+        parent_header.kid = Some("#active".to_owned());
+        let parent_payload = UcanPayload {
+            iss: creator_did.clone(),
+            aud: delegator_did.clone(),
+            exp: now + 3600,
+            nbf: None,
+            nnc: generate_nonce().unwrap(),
+            att: vec![crate::crypto::ucan::Attenuation {
+                with: "scp:ctx:ctx-chain/messages:write".to_owned(),
+                can: "write".to_owned(),
+            }],
+            prf: vec![],
+            fct: Some(serde_json::json!({"scp_key_scope": "#active"})),
+        };
+        let parent_header_json = serde_json::to_vec(&parent_header).unwrap();
+        let parent_payload_json = serde_json::to_vec(&parent_payload).unwrap();
+        let parent_header_b64 = URL_SAFE_NO_PAD.encode(&parent_header_json);
+        let parent_payload_b64 = URL_SAFE_NO_PAD.encode(&parent_payload_json);
+        let parent_signing_input = format!("{parent_header_b64}.{parent_payload_b64}");
+        let parent_sig = custody_creator
+            .sign(&key_creator, parent_signing_input.as_bytes())
+            .await
+            .unwrap();
+        let parent_sig_b64 = URL_SAFE_NO_PAD.encode(parent_sig.as_bytes());
+        let parent_encoded = format!("{parent_signing_input}.{parent_sig_b64}");
+        let parent_token = UcanToken {
+            header: parent_header,
+            payload: parent_payload,
+            signature: parent_sig.into_bytes(),
+            encoded: parent_encoded,
+        };
+
+        let parent_cid = crate::crypto::ucan::mint::compute_cid(&parent_token);
+
+        // Child: delegator -> agent, referencing the well-formed parent.
+        let child_params = MintParams {
+            issuer_did: &delegator_did,
+            issuer_key: &key_delegator,
+            audience_did: &agent_did,
+            context_id: "ctx-chain",
+            capabilities: &["messages:write".to_owned()],
+            lifetime_secs: 1800,
+            not_before: None,
+            proofs: vec![parent_cid.clone()],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+        };
+        let child_token = mint_ucan(&child_params, &custody_delegator).await.unwrap();
+
+        let resolver = InMemoryDidResolver {
+            keys: [
+                (creator_did.clone(), pk_creator),
+                (delegator_did.clone(), pk_delegator),
+            ]
+            .into_iter()
+            .collect(),
+            kid_keys: std::iter::once(((creator_did.clone(), "#active".to_owned()), pk_creator))
+                .collect(),
+        };
+        let proof_resolver = InMemoryProofResolver {
+            proofs: std::iter::once((parent_cid, parent_token)).collect(),
+        };
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let ceiling = default_ceiling();
+        let required_cap = CapabilityUri::new("ctx-chain", "messages", "write");
+
+        let mut ctx = build_context(
+            &resolver,
+            &mut nonce_tracker,
+            &revocation_checker,
+            &proof_resolver,
+            &ceiling,
+            &creator_did,
+            &agent_did,
+        );
+
+        let result = validate_ucan(&child_token, &required_cap, &mut ctx);
+        assert!(
+            result.is_ok(),
+            "chain with validly scoped parent must be accepted: {result:?}"
+        );
     }
 }

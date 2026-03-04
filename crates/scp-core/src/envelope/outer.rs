@@ -405,10 +405,16 @@ mod seal_open_tests {
     use crate::crypto::sender_keys::generate_sender_key;
     use crate::envelope::inner::{InnerEnvelopeParams, Provenance, create_inner_envelope};
     use crate::envelope::padding::strip_padding;
+    use crate::identity::SigningKeyId;
 
     #[allow(clippy::unwrap_used)]
     fn test_credential(name: &str) -> ScpCredential {
-        ScpCredential::new(format!("did:dht:z6Mk{name}"), None).unwrap()
+        ScpCredential::new(
+            format!("did:dht:z6Mk{name}"),
+            None,
+            scp_identity::SigningKeyId::Active,
+        )
+        .unwrap()
     }
 
     /// Sets up Alice and Bob in a shared MLS group.
@@ -470,6 +476,7 @@ mod seal_open_tests {
                 timestamp: 1_700_000_000,
                 payload,
                 provenance,
+                signing_key_id: SigningKeyId::Active,
             },
             &custody,
             &signing_key,
@@ -494,6 +501,7 @@ mod seal_open_tests {
                 timestamp: 1_700_000_000,
                 payload,
                 provenance: None,
+                signing_key_id: SigningKeyId::Active,
             },
             &custody,
             &signing_key,
@@ -708,6 +716,7 @@ mod seal_open_tests {
                 timestamp: 1_700_000_000,
                 payload: b"original data",
                 provenance: None,
+                signing_key_id: SigningKeyId::Active,
             },
             &custody,
             &signing_key,
@@ -946,6 +955,7 @@ mod seal_open_tests {
                 timestamp: 1_700_000_000,
                 payload: b"from unknown sender",
                 provenance: None,
+                signing_key_id: SigningKeyId::Active,
             },
             &custody,
             &signing_key,

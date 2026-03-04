@@ -35,6 +35,7 @@
 //! See ADR-003 and ADR-039 in `.docs/adrs/phase-1.md`.
 
 use super::IdentityError;
+use super::attestation::ScpKeyCustodyAttestation;
 use serde::{Deserialize, Serialize};
 
 /// Custom serde module for `[u8; 64]` fields.
@@ -411,6 +412,54 @@ impl DidDocument {
             self.service.push(service);
         }
 
+        Ok(())
+    }
+
+    /// Returns the key custody attestation from this DID document, if present.
+    ///
+    /// Searches the service entries for one with type `ScpKeyCustodyAttestation`
+    /// and parses the attestation data from its endpoint. Returns `None` if no
+    /// custody attestation service entry exists.
+    ///
+    /// Absence of attestation is a valid state — it signals that the DID owner
+    /// has not declared their key custody model (ADR-039 Layer 4).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::DocumentDeserializationError`] if a custody
+    /// attestation service entry exists but contains invalid data.
+    pub fn custody_attestation(&self) -> Result<Option<ScpKeyCustodyAttestation>, IdentityError> {
+        let entry = self
+            .service
+            .iter()
+            .find(|s| s.service_type == "ScpKeyCustodyAttestation");
+
+        entry.map_or(Ok(None), |service| {
+            ScpKeyCustodyAttestation::from_service_entry(service).map(Some)
+        })
+    }
+
+    /// Sets or replaces the key custody attestation in this DID document.
+    ///
+    /// Adds a service entry with type `ScpKeyCustodyAttestation` containing the
+    /// attestation data. If an existing custody attestation entry exists, it is
+    /// replaced. Other service entries are preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::DocumentSerializationError`] if the attestation
+    /// cannot be serialized (should not happen for well-formed data).
+    pub fn set_custody_attestation(
+        &mut self,
+        attestation: &ScpKeyCustodyAttestation,
+    ) -> Result<(), IdentityError> {
+        // Remove any existing custody attestation entry.
+        self.service
+            .retain(|s| s.service_type != "ScpKeyCustodyAttestation");
+
+        // Add the new entry.
+        let service = attestation.to_service_entry(&self.id)?;
+        self.service.push(service);
         Ok(())
     }
 
@@ -1548,5 +1597,133 @@ mod tests {
         let vm_agent = doc.verification_method_by_fragment("agent").unwrap();
         assert_eq!(vm_agent.id, format!("{did}#agent"));
         doc.validate_agent_keys().unwrap();
+    }
+
+    // --- Custody attestation DID document integration tests (SCP-AB-018) ---
+
+    #[test]
+    fn did_document_without_attestation_returns_none() {
+        let did = "did:dht:zNoAttestation";
+        let doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        let attestation = doc.custody_attestation().unwrap();
+        assert!(
+            attestation.is_none(),
+            "document without attestation should return None"
+        );
+    }
+
+    #[test]
+    fn did_document_set_and_get_custody_attestation() {
+        use crate::attestation::{KeyCustodyModel, Platform, ScpKeyCustodyAttestation};
+
+        let did = "did:dht:zWithAttestation";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        let attestation = ScpKeyCustodyAttestation {
+            active_key_custody: KeyCustodyModel::HardwareBiometric,
+            agent_key_custody: Some(KeyCustodyModel::Software),
+            platform: Platform::Ios,
+            platform_attestation: None,
+            created_at: 1_700_000_000,
+        };
+
+        doc.set_custody_attestation(&attestation).unwrap();
+
+        let retrieved = doc.custody_attestation().unwrap().unwrap();
+        assert_eq!(retrieved, attestation);
+    }
+
+    #[test]
+    fn did_document_set_custody_attestation_replaces_existing() {
+        use crate::attestation::{KeyCustodyModel, Platform, ScpKeyCustodyAttestation};
+
+        let did = "did:dht:zReplaceAttestation";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        let first = ScpKeyCustodyAttestation {
+            active_key_custody: KeyCustodyModel::Software,
+            agent_key_custody: None,
+            platform: Platform::Desktop,
+            platform_attestation: None,
+            created_at: 1_700_000_000,
+        };
+        doc.set_custody_attestation(&first).unwrap();
+
+        let second = ScpKeyCustodyAttestation {
+            active_key_custody: KeyCustodyModel::HardwareBiometric,
+            agent_key_custody: Some(KeyCustodyModel::HardwarePin),
+            platform: Platform::Ios,
+            platform_attestation: None,
+            created_at: 1_700_000_001,
+        };
+        doc.set_custody_attestation(&second).unwrap();
+
+        let attestation_count = doc
+            .service
+            .iter()
+            .filter(|s| s.service_type == "ScpKeyCustodyAttestation")
+            .count();
+        assert_eq!(
+            attestation_count, 1,
+            "should have exactly one custody attestation entry"
+        );
+
+        let retrieved = doc.custody_attestation().unwrap().unwrap();
+        assert_eq!(retrieved, second);
+    }
+
+    #[test]
+    fn did_document_custody_attestation_preserves_other_services() {
+        use crate::attestation::{KeyCustodyModel, Platform, ScpKeyCustodyAttestation};
+
+        let did = "did:dht:zPreserveServices";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        doc.add_relay_service("wss://relay.example.com/scp/v1")
+            .unwrap();
+
+        let attestation = ScpKeyCustodyAttestation {
+            active_key_custody: KeyCustodyModel::HardwareBiometric,
+            agent_key_custody: None,
+            platform: Platform::Ios,
+            platform_attestation: None,
+            created_at: 1_700_000_000,
+        };
+        doc.set_custody_attestation(&attestation).unwrap();
+
+        // Should have: PreRotationCommitment + SCPRelay + ScpKeyCustodyAttestation.
+        assert_eq!(doc.service.len(), 3);
+        assert!(doc.pre_rotation_service().is_some());
+        assert_eq!(doc.relay_service_urls().len(), 1);
+        assert!(doc.custody_attestation().unwrap().is_some());
+    }
+
+    #[test]
+    fn did_document_custody_attestation_survives_json_roundtrip() {
+        use crate::attestation::{
+            AttestationPlatform, KeyCustodyModel, Platform, PlatformAttestation,
+            ScpKeyCustodyAttestation,
+        };
+
+        let did = "did:dht:zJsonRoundtrip";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        let attestation = ScpKeyCustodyAttestation {
+            active_key_custody: KeyCustodyModel::HardwareBiometric,
+            agent_key_custody: Some(KeyCustodyModel::Software),
+            platform: Platform::Ios,
+            platform_attestation: Some(PlatformAttestation {
+                platform: AttestationPlatform::AppleAppAttest,
+                proof: vec![0xCA, 0xFE, 0xBA, 0xBE],
+            }),
+            created_at: 1_700_000_000,
+        };
+        doc.set_custody_attestation(&attestation).unwrap();
+
+        let json = doc.to_json().unwrap();
+        let parsed = DidDocument::from_json(&json).unwrap();
+
+        let retrieved = parsed.custody_attestation().unwrap().unwrap();
+        assert_eq!(retrieved, attestation);
     }
 }

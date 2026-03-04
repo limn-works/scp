@@ -53,12 +53,19 @@
 //! - [`RenewalError`] -- Error type for attestation renewal.
 //! - [`RenewalChecker`] -- Trait for platform-specific renewal scheduling.
 //! - [`DefaultRenewalChecker`] -- Default renewal checker implementation.
+//! - [`ActionCategory`] -- Classification of a protocol action (Category A or B).
+//! - [`CustodyViolationType`] -- Unambiguous custody violation categories.
+//! - [`ScpCustodyViolationAttestation`] -- Permanent violation record.
+//! - [`CounterAttestation`] -- Counter-evidence for reputation restoration.
+//! - [`CustodyViolationError`] -- Validation errors for custody violation types.
+//! - [`CustodyViolationResult`] -- Result of a Category A enforcement check.
 
 pub mod aggregate;
 pub mod attestation;
 pub mod behavioral;
 pub mod challenge;
 pub mod consequence;
+pub mod custody_violation;
 pub mod renewal;
 
 use std::collections::HashMap;
@@ -81,6 +88,10 @@ pub use challenge::{
 pub use consequence::{
     ConsequenceAction, ConsequenceEvidence, ConsequenceRule, ConsequenceTrigger,
     TriggeredConsequence, evaluate_consequence_rules,
+};
+pub use custody_violation::{
+    ActionCategory, CounterAttestation, CustodyViolationError, CustodyViolationResult,
+    CustodyViolationType, ScpCustodyViolationAttestation, classify_action, enforce_category_a,
 };
 pub use renewal::{DefaultRenewalChecker, RenewalChecker, RenewalError, renew_attestation};
 

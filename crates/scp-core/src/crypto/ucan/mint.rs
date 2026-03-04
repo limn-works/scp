@@ -34,9 +34,81 @@ use scp_platform::traits::{KeyCustody, KeyHandle};
 use super::capability::CapabilityUri;
 use super::nonce::generate_nonce;
 use super::{Attenuation, UcanError, UcanHeader, UcanPayload, UcanToken};
+use crate::identity::SigningKeyId;
 
 /// Maximum token lifetime: 24 hours in seconds (spec section 9.5).
 const MAX_EXPIRY_SECS: u64 = 24 * 60 * 60;
+
+/// Validates `key_scope` format: must start with `#` (verification method fragment).
+///
+/// Returns `Ok(())` if `key_scope` is `None` or a valid fragment.
+fn validate_key_scope(key_scope: Option<&String>) -> Result<(), UcanError> {
+    if let Some(scope) = key_scope
+        && !scope.starts_with('#')
+    {
+        return Err(UcanError::MalformedToken(format!(
+            "key_scope must be a verification method fragment starting with '#', got: {scope}"
+        )));
+    }
+    Ok(())
+}
+
+/// Rejects self-delegation (iss == aud) without `key_scope` (ADR-039).
+///
+/// Self-delegation is the mechanism for human-to-agent key delegation on the
+/// same DID. Without `key_scope`, such tokens always fail validation.
+fn reject_self_delegation_without_scope(
+    issuer: &str,
+    audience: &str,
+    key_scope: Option<&String>,
+) -> Result<(), UcanError> {
+    if issuer == audience && key_scope.is_none() {
+        return Err(UcanError::MalformedToken(
+            "self-delegation (iss == aud) requires key_scope (ADR-039)".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Builds the `fct` (facts) section, merging `scp_key_scope` when present.
+///
+/// Returns an error if `facts` already contains an `scp_key_scope` value that
+/// conflicts with the `key_scope` parameter.
+fn build_facts_with_key_scope(
+    facts: Option<&serde_json::Value>,
+    key_scope: Option<&String>,
+) -> Result<Option<serde_json::Value>, UcanError> {
+    match key_scope {
+        Some(scope) => {
+            let mut facts_obj = match facts {
+                Some(serde_json::Value::Object(map)) => map.clone(),
+                Some(val) => {
+                    // If facts is a non-object value, wrap it: preserve the
+                    // original under "_original" and add scp_key_scope at the
+                    // top level. This is defensive — callers should pass objects.
+                    let mut map = serde_json::Map::new();
+                    map.insert("_original".to_owned(), val.clone());
+                    map
+                }
+                None => serde_json::Map::new(),
+            };
+            let old = facts_obj.insert(
+                "scp_key_scope".to_owned(),
+                serde_json::Value::String(scope.clone()),
+            );
+            if old
+                .as_ref()
+                .is_some_and(|existing| *existing != serde_json::Value::String(scope.clone()))
+            {
+                return Err(UcanError::MalformedToken(
+                    "facts.scp_key_scope conflicts with key_scope parameter".to_owned(),
+                ));
+            }
+            Ok(Some(serde_json::Value::Object(facts_obj)))
+        }
+        None => Ok(facts.cloned()),
+    }
+}
 
 /// Parameters for minting a new UCAN token.
 ///
@@ -44,7 +116,20 @@ const MAX_EXPIRY_SECS: u64 = 24 * 60 * 60;
 /// token. The caller provides the issuer's signing key handle, the audience
 /// DID, the context ID, the capabilities to grant, and the desired expiry.
 ///
-/// See ADR-016 acceptance criterion 3.
+/// # Key scope delegation (ADR-039)
+///
+/// When `key_scope` is set (e.g., `Some("#agent".to_owned())`), the minted
+/// token includes:
+/// - `kid` in the JWT header — identifies which verification method signed
+///   the token (RFC 7515).
+/// - `scp_key_scope` in the `fct` (facts) section — scopes the delegation
+///   to the specified key.
+///
+/// Self-delegation (`iss == aud`, same DID) with `key_scope` is explicitly
+/// valid per ADR-039 acceptance criterion 8. This is the mechanism by which
+/// a human delegates permissions to their agent key on the same DID.
+///
+/// See ADR-016 acceptance criterion 3 and ADR-039 acceptance criterion 6.
 pub struct MintParams<'a> {
     /// The issuer's DID string (context creator).
     pub issuer_did: &'a str,
@@ -66,6 +151,29 @@ pub struct MintParams<'a> {
     pub proofs: Vec<String>,
     /// Optional facts to attach to the token.
     pub facts: Option<serde_json::Value>,
+    /// Optional key scope for key-specific delegation (ADR-039).
+    ///
+    /// When set, identifies which verification method on the issuer's DID
+    /// document this token is scoped to (e.g., `"#active"` or `"#agent"`).
+    /// The value is included as `scp_key_scope` in the payload `fct` section
+    /// and also sets `kid` in the JWT header (unless overridden by
+    /// `signing_key_id`).
+    ///
+    /// Self-delegation (`iss == aud`) is valid when `key_scope` is present.
+    pub key_scope: Option<String>,
+    /// Optional signing key identity for the JWT `kid` header (ADR-039).
+    ///
+    /// When set, explicitly identifies which verification method signed this
+    /// token. This ensures agent-signed UCANs have `kid: "#agent"` in the
+    /// header, enabling Category A enforcement during validation.
+    ///
+    /// If both `signing_key_id` and `key_scope` are set, `signing_key_id`
+    /// takes precedence for the `kid` header value, while `key_scope` is
+    /// still used for the `scp_key_scope` fact.
+    ///
+    /// If neither is set, the header has no `kid` field, which verifiers
+    /// interpret as `#active` (the default human key).
+    pub signing_key_id: Option<SigningKeyId>,
 }
 
 /// Returns the current Unix timestamp in seconds.
@@ -101,11 +209,18 @@ fn now_secs() -> Result<u64, UcanError> {
 /// Returns [`UcanError::ExpiryTooFar`] if `lifetime_secs` exceeds 24 hours.
 /// Returns [`UcanError::MalformedToken`] if serialization or signing fails.
 ///
-/// See ADR-016 acceptance criterion 3.
+/// See ADR-016 acceptance criterion 3 and ADR-039 acceptance criterion 6.
 pub async fn mint_ucan(
     params: &MintParams<'_>,
     custody: &impl KeyCustody,
 ) -> Result<UcanToken, UcanError> {
+    validate_key_scope(params.key_scope.as_ref())?;
+    reject_self_delegation_without_scope(
+        params.issuer_did,
+        params.audience_did,
+        params.key_scope.as_ref(),
+    )?;
+
     // Enforce 24-hour maximum expiry.
     if params.lifetime_secs > MAX_EXPIRY_SECS {
         return Err(UcanError::ExpiryTooFar(params.lifetime_secs));
@@ -132,7 +247,22 @@ pub async fn mint_ucan(
         })
         .collect::<Result<Vec<_>, UcanError>>()?;
 
-    let header = UcanHeader::new();
+    // Build header — include kid when signing_key_id or key_scope is present
+    // (ADR-039). signing_key_id takes precedence over key_scope for the kid
+    // header value.
+    let header = if let Some(ref signing_key_id) = params.signing_key_id {
+        UcanHeader::with_kid(signing_key_id.as_fragment().to_owned())
+    } else {
+        match &params.key_scope {
+            Some(scope) => UcanHeader::with_kid(scope.clone()),
+            None => UcanHeader::new(),
+        }
+    };
+
+    // Build facts — merge scp_key_scope into existing facts when key_scope
+    // is present (ADR-039 acceptance criterion 6).
+    let fct = build_facts_with_key_scope(params.facts.as_ref(), params.key_scope.as_ref())?;
+
     let payload = UcanPayload {
         iss: params.issuer_did.to_owned(),
         aud: params.audience_did.to_owned(),
@@ -141,7 +271,7 @@ pub async fn mint_ucan(
         nnc: generate_nonce()?,
         att,
         prf: params.proofs.clone(),
-        fct: params.facts.clone(),
+        fct,
     };
 
     // Encode header and payload as base64url JSON.
@@ -236,6 +366,21 @@ pub struct DelegateParams<'a> {
     pub lifetime_secs: u64,
     /// Optional facts to attach to the delegated token.
     pub facts: Option<serde_json::Value>,
+    /// Optional key scope for key-specific delegation (ADR-039).
+    ///
+    /// When set, identifies which verification method on the delegator's DID
+    /// document signed this token (e.g., `"#active"` or `"#agent"`). Included
+    /// as `scp_key_scope` in the payload `fct` and also sets `kid` in the
+    /// JWT header (unless overridden by `signing_key_id`).
+    pub key_scope: Option<String>,
+    /// Optional signing key identity for the JWT `kid` header (ADR-039).
+    ///
+    /// When set, explicitly identifies which verification method signed this
+    /// delegated token. Takes precedence over `key_scope` for the `kid`
+    /// header value.
+    ///
+    /// See [`MintParams::signing_key_id`] for full documentation.
+    pub signing_key_id: Option<SigningKeyId>,
 }
 
 /// Creates a delegated UCAN token from a parent token.
@@ -272,6 +417,13 @@ pub async fn delegate_ucan(
     params: &DelegateParams<'_>,
     custody: &impl KeyCustody,
 ) -> Result<UcanToken, UcanError> {
+    validate_key_scope(params.key_scope.as_ref())?;
+    reject_self_delegation_without_scope(
+        params.delegator_did,
+        params.delegatee_did,
+        params.key_scope.as_ref(),
+    )?;
+
     // Step 1: Verify delegator DID matches parent token's audience.
     if params.delegator_did != params.parent_token.payload.aud {
         return Err(UcanError::AudienceMismatch {
@@ -330,7 +482,21 @@ pub async fn delegate_ucan(
     let mut proofs = params.parent_token.payload.prf.clone();
     proofs.push(parent_cid);
 
-    let header = UcanHeader::new();
+    // Build header — include kid when signing_key_id or key_scope is present
+    // (ADR-039). signing_key_id takes precedence.
+    let header = if let Some(ref signing_key_id) = params.signing_key_id {
+        UcanHeader::with_kid(signing_key_id.as_fragment().to_owned())
+    } else {
+        match &params.key_scope {
+            Some(scope) => UcanHeader::with_kid(scope.clone()),
+            None => UcanHeader::new(),
+        }
+    };
+
+    // Build facts — merge scp_key_scope into existing facts when key_scope
+    // is present (ADR-039).
+    let fct = build_facts_with_key_scope(params.facts.as_ref(), params.key_scope.as_ref())?;
+
     let payload = UcanPayload {
         iss: params.delegator_did.to_owned(),
         aud: params.delegatee_did.to_owned(),
@@ -339,7 +505,7 @@ pub async fn delegate_ucan(
         nnc: generate_nonce()?,
         att: params.attenuated_capabilities.to_vec(),
         prf: proofs,
-        fct: params.facts.clone(),
+        fct,
     };
 
     // Encode header and payload as base64url JSON.
@@ -403,6 +569,8 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -450,6 +618,8 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -489,6 +659,8 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -524,6 +696,8 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let token1 = mint_ucan(&params, &custody).await.unwrap();
@@ -550,6 +724,8 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let err = mint_ucan(&params, &custody).await.unwrap_err();
@@ -571,6 +747,8 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         assert!(mint_ucan(&params, &custody).await.is_ok());
@@ -595,6 +773,8 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -629,6 +809,8 @@ mod tests {
             not_before: Some(1_700_000_000),
             proofs: vec!["bafyreiabc123".to_owned()],
             facts: Some(serde_json::json!({"role": "member"})),
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -656,6 +838,8 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -691,6 +875,8 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -717,6 +903,8 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -741,6 +929,8 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let token1 = mint_ucan(&params, &custody).await.unwrap();
@@ -770,6 +960,8 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -809,6 +1001,8 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
         mint_ucan(&params, custody).await.unwrap()
     }
@@ -845,6 +1039,8 @@ mod tests {
             attenuated_capabilities: &attenuated,
             lifetime_secs: 1800,
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
@@ -898,6 +1094,8 @@ mod tests {
             attenuated_capabilities: &attenuated,
             lifetime_secs: 1800,
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
@@ -938,6 +1136,8 @@ mod tests {
             attenuated_capabilities: &attenuated,
             lifetime_secs: 1800,
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
@@ -992,6 +1192,8 @@ mod tests {
             attenuated_capabilities: &attenuated,
             lifetime_secs: 1800,
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
@@ -1032,6 +1234,8 @@ mod tests {
             attenuated_capabilities: &attenuated,
             lifetime_secs: 1800,
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
@@ -1068,6 +1272,8 @@ mod tests {
             attenuated_capabilities: &attenuated,
             lifetime_secs: 1800,
             facts: Some(serde_json::json!({"delegated_by": "bob"})),
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
@@ -1106,6 +1312,8 @@ mod tests {
             attenuated_capabilities: &attenuated,
             lifetime_secs: 1800,
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let d1 = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
@@ -1163,6 +1371,8 @@ mod tests {
             attenuated_capabilities: &bob_attenuated,
             lifetime_secs: 1800,
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let bob_to_carol = delegate_ucan(&bob_delegate_params, &bob_custody)
@@ -1188,6 +1398,8 @@ mod tests {
             attenuated_capabilities: &carol_attenuated,
             lifetime_secs: 900,
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let carol_to_dave = delegate_ucan(&carol_delegate_params, &carol_custody)
@@ -1236,6 +1448,8 @@ mod tests {
             attenuated_capabilities: &attenuated,
             lifetime_secs: 1800,
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let err = delegate_ucan(&delegate_params, &eve_custody)
@@ -1278,6 +1492,8 @@ mod tests {
             attenuated_capabilities: &attenuated,
             lifetime_secs: 1800,
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let err = delegate_ucan(&delegate_params, &bob_custody)
@@ -1325,6 +1541,8 @@ mod tests {
             attenuated_capabilities: &attenuated,
             lifetime_secs: 1800,
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let err = delegate_ucan(&delegate_params, &bob_custody)
@@ -1366,6 +1584,8 @@ mod tests {
             attenuated_capabilities: &attenuated,
             lifetime_secs: 1800,
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let err = delegate_ucan(&delegate_params, &bob_custody)
@@ -1406,6 +1626,8 @@ mod tests {
             attenuated_capabilities: &attenuated,
             lifetime_secs: MAX_EXPIRY_SECS + 1,
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let err = delegate_ucan(&delegate_params, &bob_custody)
@@ -1446,6 +1668,8 @@ mod tests {
             attenuated_capabilities: &attenuated,
             lifetime_secs: 1800,
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let err = delegate_ucan(&delegate_params, &bob_custody)
@@ -1484,6 +1708,8 @@ mod tests {
             attenuated_capabilities: &attenuated,
             lifetime_secs: 1800,
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
@@ -1513,6 +1739,8 @@ mod tests {
             not_before: None,
             proofs: vec![],
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
         let mut root_token = mint_ucan(&params, &alice_custody).await.unwrap();
         // Overwrite att to use the explicitly wildcard form.
@@ -1532,12 +1760,769 @@ mod tests {
             attenuated_capabilities: &attenuated,
             lifetime_secs: 1800,
             facts: None,
+            key_scope: None,
+            signing_key_id: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
         assert_eq!(
             delegated.payload.att[0].with,
             "scp:ctx:ctx-specific/messages:write"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // key_scope / kid tests (ADR-039)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn mint_ucan_without_key_scope_has_no_kid_in_header() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-1",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        // Header must not have kid.
+        assert!(
+            token.header.kid.is_none(),
+            "kid must be None without key_scope"
+        );
+
+        // Facts must not contain scp_key_scope.
+        assert!(
+            token.payload.fct.is_none(),
+            "fct must be None without key_scope and no explicit facts"
+        );
+
+        // Serialized JWT header must not contain "kid".
+        let parts: Vec<&str> = token.encoded.split('.').collect();
+        let header_json = URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
+        let header_str = String::from_utf8(header_json).unwrap();
+        assert!(
+            !header_str.contains("kid"),
+            "serialized header must not contain kid: {header_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_ucan_with_key_scope_agent_sets_kid_in_header() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-1",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: Some("#agent".to_owned()),
+            signing_key_id: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        // Header must have kid="#agent".
+        assert_eq!(
+            token.header.kid,
+            Some("#agent".to_owned()),
+            "kid must be #agent"
+        );
+
+        // Facts must contain scp_key_scope="#agent".
+        let fct = token
+            .payload
+            .fct
+            .as_ref()
+            .expect("fct must be present with key_scope");
+        assert_eq!(
+            fct.get("scp_key_scope").and_then(|v| v.as_str()),
+            Some("#agent"),
+            "fct.scp_key_scope must be #agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_ucan_with_key_scope_active_sets_kid_in_header() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-1",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: Some("#active".to_owned()),
+            signing_key_id: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        assert_eq!(
+            token.header.kid,
+            Some("#active".to_owned()),
+            "kid must be #active"
+        );
+
+        let fct = token
+            .payload
+            .fct
+            .as_ref()
+            .expect("fct must be present with key_scope");
+        assert_eq!(
+            fct.get("scp_key_scope").and_then(|v| v.as_str()),
+            Some("#active"),
+            "fct.scp_key_scope must be #active"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_ucan_self_delegation_with_key_scope_succeeds() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned(), "messages:read".to_owned()];
+
+        // Self-delegation: iss == aud, same DID. Per ADR-039 acceptance
+        // criterion 8, this is explicitly valid when key_scope is present.
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: &issuer_did,
+            context_id: "ctx-self",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: Some("#agent".to_owned()),
+            signing_key_id: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        // Verify self-delegation fields.
+        assert_eq!(token.payload.iss, issuer_did);
+        assert_eq!(token.payload.aud, issuer_did);
+        assert_eq!(token.header.kid, Some("#agent".to_owned()));
+
+        let fct = token.payload.fct.as_ref().expect("fct must be present");
+        assert_eq!(
+            fct.get("scp_key_scope").and_then(|v| v.as_str()),
+            Some("#agent"),
+        );
+
+        // Verify JWT structure is valid (3 segments, signature verifies).
+        assert_eq!(token.encoded.split('.').count(), 3);
+        assert_eq!(token.signature.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn mint_ucan_kid_appears_in_serialized_jwt_header() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-1",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: Some("#agent".to_owned()),
+            signing_key_id: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        // Decode the header segment from the JWT.
+        let parts: Vec<&str> = token.encoded.split('.').collect();
+        let header_bytes = URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
+        let header_value: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap();
+
+        assert_eq!(
+            header_value.get("kid").and_then(|v| v.as_str()),
+            Some("#agent"),
+            "kid must appear in serialized JWT header"
+        );
+        assert_eq!(
+            header_value.get("alg").and_then(|v| v.as_str()),
+            Some("EdDSA"),
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_ucan_scp_key_scope_appears_in_deserialized_fct() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-1",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: Some("#agent".to_owned()),
+            signing_key_id: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        // Decode the payload segment from the JWT and verify fct.scp_key_scope.
+        let parts: Vec<&str> = token.encoded.split('.').collect();
+        let payload_bytes = URL_SAFE_NO_PAD.decode(parts[1]).unwrap();
+        let payload_value: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
+
+        let fct = payload_value
+            .get("fct")
+            .expect("fct must be present in serialized payload");
+        assert_eq!(
+            fct.get("scp_key_scope").and_then(|v| v.as_str()),
+            Some("#agent"),
+            "scp_key_scope must appear in deserialized fct"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_ucan_key_scope_roundtrip_serialize_parse() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-1",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: Some("#agent".to_owned()),
+            signing_key_id: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        // Round-trip: serialize the token, then parse header and payload back.
+        let parts: Vec<&str> = token.encoded.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT must have 3 segments");
+
+        // Parse header.
+        let header_bytes = URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
+        let parsed_header: UcanHeader = serde_json::from_slice(&header_bytes).unwrap();
+        assert_eq!(parsed_header.kid, Some("#agent".to_owned()));
+        assert_eq!(parsed_header.alg, "EdDSA");
+        assert_eq!(parsed_header.typ, "JWT");
+        assert_eq!(parsed_header.ucv, "0.10.0");
+
+        // Parse payload.
+        let payload_bytes = URL_SAFE_NO_PAD.decode(parts[1]).unwrap();
+        let parsed_payload: UcanPayload = serde_json::from_slice(&payload_bytes).unwrap();
+        assert_eq!(parsed_payload.iss, issuer_did);
+        assert_eq!(parsed_payload.aud, "did:dht:z6MkMember");
+
+        let fct = parsed_payload.fct.expect("fct must be present");
+        assert_eq!(
+            fct.get("scp_key_scope").and_then(|v| v.as_str()),
+            Some("#agent"),
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_ucan_key_scope_merges_with_existing_facts() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-1",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: Some(serde_json::json!({"role": "admin", "note": "test"})),
+            key_scope: Some("#agent".to_owned()),
+            signing_key_id: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        let fct = token.payload.fct.as_ref().expect("fct must be present");
+
+        // scp_key_scope must be present.
+        assert_eq!(
+            fct.get("scp_key_scope").and_then(|v| v.as_str()),
+            Some("#agent"),
+        );
+
+        // Original facts must be preserved.
+        assert_eq!(fct.get("role").and_then(|v| v.as_str()), Some("admin"),);
+        assert_eq!(fct.get("note").and_then(|v| v.as_str()), Some("test"),);
+    }
+
+    #[tokio::test]
+    async fn mint_ucan_backward_compat_no_key_scope_no_scp_key_scope_fact() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        // Explicit facts but no key_scope — scp_key_scope must NOT be added.
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-1",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: Some(serde_json::json!({"role": "member"})),
+            key_scope: None,
+            signing_key_id: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        let fct = token.payload.fct.as_ref().expect("fct must be present");
+        assert!(
+            fct.get("scp_key_scope").is_none(),
+            "scp_key_scope must not appear without key_scope"
+        );
+        assert_eq!(fct.get("role").and_then(|v| v.as_str()), Some("member"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Bug fix tests: key_scope validation guards (AB-012 review)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn mint_ucan_rejects_conflicting_scp_key_scope_in_facts() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        // facts already contains scp_key_scope with a DIFFERENT value than key_scope.
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-1",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: Some(serde_json::json!({"scp_key_scope": "#wrong"})),
+            key_scope: Some("#agent".to_owned()),
+            signing_key_id: None,
+        };
+
+        let err = mint_ucan(&params, &custody).await.unwrap_err();
+        assert!(
+            matches!(err, UcanError::MalformedToken(ref msg) if msg.contains("conflicts")),
+            "conflicting scp_key_scope must be rejected: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_ucan_accepts_matching_scp_key_scope_in_facts() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        // facts already contains scp_key_scope with the SAME value — should succeed.
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-1",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: Some(serde_json::json!({"scp_key_scope": "#agent"})),
+            key_scope: Some("#agent".to_owned()),
+            signing_key_id: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+        let fct = token.payload.fct.as_ref().expect("fct must be present");
+        assert_eq!(
+            fct.get("scp_key_scope").and_then(|v| v.as_str()),
+            Some("#agent")
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_ucan_rejects_self_delegation_without_key_scope() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: &issuer_did,
+            context_id: "ctx-1",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+        };
+
+        let err = mint_ucan(&params, &custody).await.unwrap_err();
+        assert!(
+            matches!(err, UcanError::MalformedToken(ref msg) if msg.contains("self-delegation")),
+            "self-delegation without key_scope must be rejected: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_ucan_allows_self_delegation_with_key_scope() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: &issuer_did,
+            context_id: "ctx-1",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: Some("#agent".to_owned()),
+            signing_key_id: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+        assert_eq!(token.payload.iss, token.payload.aud);
+    }
+
+    #[tokio::test]
+    async fn mint_ucan_rejects_key_scope_without_hash_prefix() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-1",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: Some("agent".to_owned()),
+            signing_key_id: None,
+        };
+
+        let err = mint_ucan(&params, &custody).await.unwrap_err();
+        assert!(
+            matches!(err, UcanError::MalformedToken(ref msg) if msg.contains("'#'")),
+            "key_scope without '#' prefix must be rejected: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_ucan_rejects_key_scope_without_hash_prefix() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let (custody_b, key_b, audience_did) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        // First mint a valid root token.
+        let root_token = mint_ucan(
+            &MintParams {
+                issuer_did: &issuer_did,
+                issuer_key: &key_handle,
+                audience_did: &audience_did,
+                context_id: "ctx-1",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![],
+                facts: None,
+                key_scope: None,
+                signing_key_id: None,
+            },
+            &custody,
+        )
+        .await
+        .unwrap();
+
+        let err = delegate_ucan(
+            &DelegateParams {
+                parent_token: &root_token,
+                delegator_did: &audience_did,
+                delegator_key: &key_b,
+                delegatee_did: "did:dht:z6MkSomeone",
+                attenuated_capabilities: &root_token.payload.att,
+                lifetime_secs: 1800,
+                facts: None,
+                key_scope: Some("no-hash".to_owned()),
+                signing_key_id: None,
+            },
+            &custody_b,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, UcanError::MalformedToken(ref msg) if msg.contains("'#'")),
+            "delegate_ucan must reject key_scope without '#' prefix: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_ucan_rejects_self_delegation_without_key_scope() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let (custody_b, key_b, did_b) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        let root_token = mint_ucan(
+            &MintParams {
+                issuer_did: &issuer_did,
+                issuer_key: &key_handle,
+                audience_did: &did_b,
+                context_id: "ctx-1",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![],
+                facts: None,
+                key_scope: None,
+                signing_key_id: None,
+            },
+            &custody,
+        )
+        .await
+        .unwrap();
+
+        let err = delegate_ucan(
+            &DelegateParams {
+                parent_token: &root_token,
+                delegator_did: &did_b,
+                delegator_key: &key_b,
+                delegatee_did: &did_b,
+                attenuated_capabilities: &root_token.payload.att,
+                lifetime_secs: 1800,
+                facts: None,
+                key_scope: None,
+                signing_key_id: None,
+            },
+            &custody_b,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, UcanError::MalformedToken(ref msg) if msg.contains("self-delegation")),
+            "delegate_ucan must reject self-delegation without key_scope: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_ucan_rejects_conflicting_scp_key_scope_in_facts() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let (custody_b, key_b, did_b) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        let root_token = mint_ucan(
+            &MintParams {
+                issuer_did: &issuer_did,
+                issuer_key: &key_handle,
+                audience_did: &did_b,
+                context_id: "ctx-1",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![],
+                facts: None,
+                key_scope: None,
+                signing_key_id: None,
+            },
+            &custody,
+        )
+        .await
+        .unwrap();
+
+        let err = delegate_ucan(
+            &DelegateParams {
+                parent_token: &root_token,
+                delegator_did: &did_b,
+                delegator_key: &key_b,
+                delegatee_did: "did:dht:z6MkSomeone",
+                attenuated_capabilities: &root_token.payload.att,
+                lifetime_secs: 1800,
+                facts: Some(serde_json::json!({"scp_key_scope": "#wrong"})),
+                key_scope: Some("#agent".to_owned()),
+                signing_key_id: None,
+            },
+            &custody_b,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, UcanError::MalformedToken(ref msg) if msg.contains("conflicts")),
+            "delegate_ucan must reject conflicting scp_key_scope: {err:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // signing_key_id — Category A enforcement
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn mint_ucan_with_agent_signing_key_id_sets_kid_header() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-1",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: Some(SigningKeyId::Agent),
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        // Header must have kid="#agent" from signing_key_id.
+        assert_eq!(
+            token.header.kid,
+            Some("#agent".to_owned()),
+            "signing_key_id=Agent must set kid=#agent in header"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_ucan_with_active_signing_key_id_sets_kid_header() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-1",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: Some(SigningKeyId::Active),
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        // Header must have kid="#active" from signing_key_id.
+        assert_eq!(
+            token.header.kid,
+            Some("#active".to_owned()),
+            "signing_key_id=Active must set kid=#active in header"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_ucan_signing_key_id_takes_precedence_over_key_scope() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        // Self-delegation with key_scope="#active" but signing_key_id=Agent.
+        // signing_key_id should win for the kid header, while key_scope still
+        // populates scp_key_scope in facts.
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: &issuer_did,
+            context_id: "ctx-1",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: Some("#active".to_owned()),
+            signing_key_id: Some(SigningKeyId::Agent),
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        // kid header comes from signing_key_id, not key_scope.
+        assert_eq!(
+            token.header.kid,
+            Some("#agent".to_owned()),
+            "signing_key_id must take precedence over key_scope for kid"
+        );
+
+        // scp_key_scope in facts comes from key_scope.
+        let fct = token.payload.fct.as_ref().unwrap();
+        assert_eq!(
+            fct.get("scp_key_scope"),
+            Some(&serde_json::Value::String("#active".to_owned())),
+            "scp_key_scope must come from key_scope parameter"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_ucan_without_signing_key_id_has_no_kid_header() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-1",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+        };
+
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        // Without signing_key_id or key_scope, kid must be absent.
+        assert_eq!(
+            token.header.kid, None,
+            "kid must be None when neither signing_key_id nor key_scope is set"
         );
     }
 }

@@ -31,6 +31,7 @@
 //!
 //! See ADR-003 and ADR-039 in `.docs/adrs/phase-1.md` for the full design.
 
+pub mod attestation;
 pub mod cache;
 pub mod dht;
 pub mod dht_client;
@@ -39,6 +40,9 @@ pub mod republish;
 pub mod resolution;
 pub mod resolver;
 
+pub use attestation::{
+    AttestationPlatform, KeyCustodyModel, Platform, PlatformAttestation, ScpKeyCustodyAttestation,
+};
 pub use cache::{DidCache, DidResolutionResult, Staleness};
 pub use dht::{
     DidDht, did_from_ed25519_public_key, extract_public_key, verify_bep44_signature,
@@ -159,7 +163,25 @@ pub enum SigningKeyId {
 }
 
 impl SigningKeyId {
-    /// Returns the DID document fragment for this signing key (e.g., `"active"` or `"agent"`).
+    /// Returns the full DID document fragment reference (e.g., `"#active"` or `"#agent"`).
+    ///
+    /// This is the canonical string representation used in serialization,
+    /// display, and hash preimages.
+    #[must_use]
+    pub const fn as_fragment(&self) -> &'static str {
+        match self {
+            Self::Active => "#active",
+            Self::Agent => "#agent",
+        }
+    }
+
+    /// Alias for [`as_fragment`](Self::as_fragment).
+    #[must_use]
+    pub const fn fragment_ref(&self) -> &'static str {
+        self.as_fragment()
+    }
+
+    /// Returns the bare fragment name without the `#` prefix (e.g., `"active"` or `"agent"`).
     #[must_use]
     pub const fn fragment(&self) -> &'static str {
         match self {
@@ -168,19 +190,30 @@ impl SigningKeyId {
         }
     }
 
-    /// Returns the full DID document fragment reference (e.g., `"#active"` or `"#agent"`).
+    /// Returns the canonical byte representation for inclusion in hash
+    /// preimages.
+    ///
+    /// This is the UTF-8 encoding of [`as_fragment`](Self::as_fragment).
     #[must_use]
-    pub const fn fragment_ref(&self) -> &'static str {
+    pub const fn as_bytes(&self) -> &'static [u8] {
         match self {
-            Self::Active => "#active",
-            Self::Agent => "#agent",
+            Self::Active => b"#active",
+            Self::Agent => b"#agent",
         }
+    }
+}
+
+impl Default for SigningKeyId {
+    /// Defaults to [`SigningKeyId::Active`] for backward compatibility with
+    /// envelopes and protocol messages created before agent binding (ADR-039).
+    fn default() -> Self {
+        Self::Active
     }
 }
 
 impl fmt::Display for SigningKeyId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.fragment_ref())
+        f.write_str(self.as_fragment())
     }
 }
 
@@ -189,7 +222,7 @@ impl Serialize for SigningKeyId {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(self.fragment_ref())
+        serializer.serialize_str(self.as_fragment())
     }
 }
 

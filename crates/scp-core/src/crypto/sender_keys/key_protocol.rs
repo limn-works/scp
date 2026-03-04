@@ -34,6 +34,7 @@ use zeroize::Zeroizing;
 use scp_platform::traits::{KeyCustody, KeyHandle, KeyType};
 
 use super::{SenderKey, SenderKeyError, generate_sender_key};
+use crate::identity::SigningKeyId;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -72,13 +73,18 @@ const NONCE_DEDUP_CAPACITY: usize = 10_000;
 /// the actual key material via [`SenderKeyRequest`]. **O(1) cost** regardless
 /// of group size.
 ///
-/// Signature payload: `SHA-256(context_id || sender_did || "key_epoch" || epoch_BE)`.
+/// Signature payload: `SHA-256(context_id || sender_did || "key_epoch" || epoch_BE || signer_key_ref)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SenderKeyEpochAdvance {
     /// The DID of the sender who rotated their key.
     pub sender_did: String,
     /// The new epoch number for this sender's key.
     pub epoch: u64,
+    /// Identifies which DID verification method (`#active` or `#agent`)
+    /// produced the signature. Defaults to `Active` for backward
+    /// compatibility with epoch advances created before ADR-039.
+    #[serde(default)]
+    pub signer_key_ref: SigningKeyId,
     /// Ed25519 signature over the epoch advance payload.
     #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
@@ -193,8 +199,8 @@ pub struct SenderKeyRequestResult {
 /// Constructs a signed [`SenderKeyEpochAdvance`] and serializes it for
 /// transmission as an MLS application message.
 ///
-/// The sender signs `SHA-256(context_id || sender_did || "key_epoch" || epoch_BE)`
-/// with their Active Signing Key.
+/// The sender signs `SHA-256(context_id || sender_did || "key_epoch" || epoch_BE || signer_key_ref)`
+/// with their signing key (Active or Agent, as specified by `signer_key_ref`).
 ///
 /// # Errors
 ///
@@ -206,8 +212,9 @@ pub async fn publish_sender_key_epoch_advance(
     context_id: &str,
     sender_did: &str,
     epoch: u64,
+    signer_key_ref: SigningKeyId,
 ) -> Result<Vec<u8>, SenderKeyError> {
-    let hash = compute_epoch_advance_hash(context_id, sender_did, epoch);
+    let hash = compute_epoch_advance_hash(context_id, sender_did, epoch, signer_key_ref);
 
     let signature = key_custody
         .sign(signing_key, &hash)
@@ -217,6 +224,7 @@ pub async fn publish_sender_key_epoch_advance(
     let advance = SenderKeyEpochAdvance {
         sender_did: sender_did.to_owned(),
         epoch,
+        signer_key_ref,
         signature: signature.into_bytes(),
     };
 
@@ -228,6 +236,12 @@ pub async fn publish_sender_key_epoch_advance(
 /// The caller must provide the `context_id` since it is not embedded in the
 /// advance message (it is known from the MLS group context).
 ///
+/// **Key resolution:** Callers must inspect `advance.signer_key_ref` to
+/// determine which verification method public key to pass as
+/// `sender_public_key`. For [`SigningKeyId::Active`], use the `#active`
+/// verification method. For [`SigningKeyId::Agent`], use the `#agent`
+/// verification method from the sender's DID document.
+///
 /// # Errors
 ///
 /// Returns [`SenderKeyError::VerificationFailed`] if the public key or
@@ -238,8 +252,54 @@ pub fn verify_epoch_advance(
     context_id: &str,
     sender_public_key: &[u8],
 ) -> Result<bool, SenderKeyError> {
-    let hash = compute_epoch_advance_hash(context_id, &advance.sender_did, advance.epoch);
+    let hash = compute_epoch_advance_hash(
+        context_id,
+        &advance.sender_did,
+        advance.epoch,
+        advance.signer_key_ref,
+    );
     verify_ed25519_signature(sender_public_key, &hash, &advance.signature)
+}
+
+// ---------------------------------------------------------------------------
+// Category A enforcement for sender key operations (ADR-039, SCP-AB-020)
+// ---------------------------------------------------------------------------
+
+/// Enforces Category A restrictions on a sender key operation.
+///
+/// Call this when a sender key protocol message (epoch advance, block
+/// notification, etc.) is associated with a DID-modifying action. If the
+/// `signer_key_ref` is [`SigningKeyId::Agent`] and the `action_resource`
+/// is a Category A resource, returns `Err` with the violation details.
+///
+/// Sender key rotation itself is Category B (operational), so this function
+/// should only be called when the caller knows the sender key operation is
+/// part of a larger DID-modification flow.
+///
+/// # Errors
+///
+/// Returns [`SenderKeyError::CategoryAViolation`] if an agent key attempted
+/// a DID document modification via the sender key protocol.
+pub fn enforce_sender_key_category_a(
+    signer_key_ref: SigningKeyId,
+    sender_did: &str,
+    action_resource: &str,
+    evidence_signature: &[u8],
+) -> Result<(), SenderKeyError> {
+    use crate::trust::custody_violation::{classify_action, enforce_category_a};
+
+    let category = classify_action(action_resource);
+    if let Err(violation) = enforce_category_a(
+        signer_key_ref,
+        category,
+        sender_did,
+        &format!("sender key operation: {action_resource}"),
+        evidence_signature,
+    ) {
+        return Err(SenderKeyError::CategoryAViolation(violation.error_message));
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -651,6 +711,24 @@ pub fn verify_block_notification(
 // Rotate sender key for block
 // ---------------------------------------------------------------------------
 
+/// Parameters for [`rotate_sender_key_for_block`].
+///
+/// Groups the non-cryptographic parameters that describe the rotation
+/// context, avoiding the excessive argument count that would otherwise
+/// trigger `clippy::too_many_arguments`.
+pub struct RotateForBlockParams<'a> {
+    /// The SCP context identifier.
+    pub context_id: &'a str,
+    /// The sender's full DID.
+    pub sender_did: &'a str,
+    /// The current epoch number before rotation.
+    pub current_epoch: u64,
+    /// The DID being blocked.
+    pub blocked_did: &'a str,
+    /// Which DID verification method produced the signature.
+    pub signer_key_ref: SigningKeyId,
+}
+
 /// Generates a new sender key, increments the epoch, publishes a
 /// [`SenderKeyEpochAdvance`], and adds the blocked DID to the block list.
 ///
@@ -668,28 +746,27 @@ pub fn verify_block_notification(
 pub async fn rotate_sender_key_for_block<S: BuildHasher + Send + Sync>(
     key_custody: &impl KeyCustody,
     signing_key: &KeyHandle,
-    context_id: &str,
-    sender_did: &str,
-    current_epoch: u64,
-    blocked_did: &str,
+    params: &RotateForBlockParams<'_>,
     block_list: &mut HashSet<String, S>,
 ) -> Result<RotateForBlockResult, SenderKeyError> {
     // Generate new sender key.
     let new_key = generate_sender_key();
-    let new_epoch = current_epoch
+    let new_epoch = params
+        .current_epoch
         .checked_add(1)
         .ok_or(SenderKeyError::EpochOverflow)?;
 
     // Add blocked DID to block list.
-    block_list.insert(blocked_did.to_owned());
+    block_list.insert(params.blocked_did.to_owned());
 
     // Publish epoch advance notification.
     let epoch_advance_message = publish_sender_key_epoch_advance(
         key_custody,
         signing_key,
-        context_id,
-        sender_did,
+        params.context_id,
+        params.sender_did,
         new_epoch,
+        params.signer_key_ref,
     )
     .await?;
 
@@ -838,12 +915,18 @@ fn aes128gcm_decrypt(key: &[u8; 16], sealed: &[u8]) -> Result<Vec<u8>, SenderKey
 // ---------------------------------------------------------------------------
 
 /// Computes `SHA-256("SCP-EPOCH-ADVANCE-V1:" || len(context_id) || context_id
-///   || len(sender_did) || sender_did || "key_epoch" || epoch_BE)`.
+///   || len(sender_did) || sender_did || "key_epoch" || epoch_BE
+///   || len(signer_key_ref) || signer_key_ref)`.
 ///
 /// Variable-length fields are prefixed with their length as a 4-byte
 /// big-endian u32 to prevent field-boundary ambiguity. The domain separator
 /// prevents cross-protocol hash confusion.
-fn compute_epoch_advance_hash(context_id: &str, sender_did: &str, epoch: u64) -> Vec<u8> {
+fn compute_epoch_advance_hash(
+    context_id: &str,
+    sender_did: &str,
+    epoch: u64,
+    signer_key_ref: SigningKeyId,
+) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(b"SCP-EPOCH-ADVANCE-V1:");
     // DID and key bytes are always < 4 GiB; length prefix fits in u32.
@@ -856,6 +939,8 @@ fn compute_epoch_advance_hash(context_id: &str, sender_did: &str, epoch: u64) ->
     length_prefix(&mut hasher, sender_did.as_bytes());
     hasher.update(b"key_epoch");
     hasher.update(epoch.to_be_bytes());
+    // Bind signer_key_ref to prevent key confusion attacks (ADR-039).
+    length_prefix(&mut hasher, signer_key_ref.as_bytes());
     hasher.finalize().to_vec()
 }
 
@@ -991,14 +1076,21 @@ mod tests {
         let (custody, signing_key) = setup().await;
         let pubkey = custody.public_key(&signing_key).await.unwrap();
 
-        let message =
-            publish_sender_key_epoch_advance(&custody, &signing_key, "ctx-1", "did:dht:alice", 5)
-                .await
-                .unwrap();
+        let message = publish_sender_key_epoch_advance(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            5,
+            SigningKeyId::Active,
+        )
+        .await
+        .unwrap();
 
         let advance: SenderKeyEpochAdvance = serde_json::from_slice(&message).unwrap();
         assert_eq!(advance.sender_did, "did:dht:alice");
         assert_eq!(advance.epoch, 5);
+        assert_eq!(advance.signer_key_ref, SigningKeyId::Active);
 
         let valid = verify_epoch_advance(&advance, "ctx-1", pubkey.as_bytes()).unwrap();
         assert!(valid, "epoch advance signature should be valid");
@@ -1009,10 +1101,16 @@ mod tests {
         let (custody, signing_key) = setup().await;
         let pubkey = custody.public_key(&signing_key).await.unwrap();
 
-        let message =
-            publish_sender_key_epoch_advance(&custody, &signing_key, "ctx-1", "did:dht:alice", 5)
-                .await
-                .unwrap();
+        let message = publish_sender_key_epoch_advance(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            5,
+            SigningKeyId::Active,
+        )
+        .await
+        .unwrap();
 
         let advance: SenderKeyEpochAdvance = serde_json::from_slice(&message).unwrap();
 
@@ -1027,14 +1125,97 @@ mod tests {
         let other_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let wrong_pubkey = custody.public_key(&other_key).await.unwrap();
 
-        let message =
-            publish_sender_key_epoch_advance(&custody, &signing_key, "ctx-1", "did:dht:alice", 5)
-                .await
-                .unwrap();
+        let message = publish_sender_key_epoch_advance(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            5,
+            SigningKeyId::Active,
+        )
+        .await
+        .unwrap();
 
         let advance: SenderKeyEpochAdvance = serde_json::from_slice(&message).unwrap();
         let valid = verify_epoch_advance(&advance, "ctx-1", wrong_pubkey.as_bytes()).unwrap();
         assert!(!valid, "wrong public key should invalidate signature");
+    }
+
+    #[tokio::test]
+    async fn epoch_advance_with_agent_signing_key() {
+        let (custody, signing_key) = setup().await;
+        let pubkey = custody.public_key(&signing_key).await.unwrap();
+
+        let message = publish_sender_key_epoch_advance(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            3,
+            SigningKeyId::Agent,
+        )
+        .await
+        .unwrap();
+
+        let advance: SenderKeyEpochAdvance = serde_json::from_slice(&message).unwrap();
+        assert_eq!(advance.signer_key_ref, SigningKeyId::Agent);
+
+        let valid = verify_epoch_advance(&advance, "ctx-1", pubkey.as_bytes()).unwrap();
+        assert!(valid, "Agent signing key epoch advance should verify");
+    }
+
+    #[tokio::test]
+    async fn epoch_advance_rejects_tampered_signer_key_ref() {
+        let (custody, signing_key) = setup().await;
+        let pubkey = custody.public_key(&signing_key).await.unwrap();
+
+        let message = publish_sender_key_epoch_advance(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            3,
+            SigningKeyId::Active,
+        )
+        .await
+        .unwrap();
+
+        let mut advance: SenderKeyEpochAdvance = serde_json::from_slice(&message).unwrap();
+        // Tamper: flip signer_key_ref from Active to Agent.
+        advance.signer_key_ref = SigningKeyId::Agent;
+
+        let valid = verify_epoch_advance(&advance, "ctx-1", pubkey.as_bytes()).unwrap();
+        assert!(
+            !valid,
+            "tampering with signer_key_ref must invalidate signature"
+        );
+    }
+
+    #[tokio::test]
+    async fn epoch_advance_serde_defaults_signer_key_ref_to_active() {
+        let (custody, signing_key) = setup().await;
+
+        let message = publish_sender_key_epoch_advance(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            5,
+            SigningKeyId::Active,
+        )
+        .await
+        .unwrap();
+
+        // Simulate an old-format message by removing signer_key_ref.
+        let mut json_val: serde_json::Value = serde_json::from_slice(&message).unwrap();
+        json_val.as_object_mut().unwrap().remove("signer_key_ref");
+        let deserialized: SenderKeyEpochAdvance = serde_json::from_value(json_val).unwrap();
+
+        assert_eq!(
+            deserialized.signer_key_ref,
+            SigningKeyId::Active,
+            "missing signer_key_ref should default to Active"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -1540,10 +1721,13 @@ mod tests {
         let result = rotate_sender_key_for_block(
             &custody,
             &signing_key,
-            "ctx-1",
-            "did:dht:alice",
-            current_epoch,
-            "did:dht:dave",
+            &RotateForBlockParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                current_epoch,
+                blocked_did: "did:dht:dave",
+                signer_key_ref: SigningKeyId::Active,
+            },
             &mut block_list,
         )
         .await
@@ -1577,10 +1761,13 @@ mod tests {
         let result1 = rotate_sender_key_for_block(
             &custody,
             &signing_key,
-            "ctx-1",
-            "did:dht:alice",
-            0,
-            "did:dht:dave",
+            &RotateForBlockParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                current_epoch: 0,
+                blocked_did: "did:dht:dave",
+                signer_key_ref: SigningKeyId::Active,
+            },
             &mut block_list,
         )
         .await
@@ -1589,10 +1776,13 @@ mod tests {
         let result2 = rotate_sender_key_for_block(
             &custody,
             &signing_key,
-            "ctx-1",
-            "did:dht:alice",
-            result1.new_epoch,
-            "did:dht:eve",
+            &RotateForBlockParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                current_epoch: result1.new_epoch,
+                blocked_did: "did:dht:eve",
+                signer_key_ref: SigningKeyId::Active,
+            },
             &mut block_list,
         )
         .await
@@ -1629,10 +1819,13 @@ mod tests {
         let rotate_result = rotate_sender_key_for_block(
             &alice_custody,
             &alice_signing_key,
-            "ctx-1",
-            "did:dht:alice",
-            0,
-            "did:dht:dave",
+            &RotateForBlockParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                current_epoch: 0,
+                blocked_did: "did:dht:dave",
+                signer_key_ref: SigningKeyId::Active,
+            },
             &mut block_list,
         )
         .await
@@ -1683,10 +1876,13 @@ mod tests {
         let result = rotate_sender_key_for_block(
             &custody,
             &signing_key,
-            "ctx-1",
-            "did:dht:alice",
-            u64::MAX,
-            "did:dht:dave",
+            &RotateForBlockParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                current_epoch: u64::MAX,
+                blocked_did: "did:dht:dave",
+                signer_key_ref: SigningKeyId::Active,
+            },
             &mut block_list,
         )
         .await;
@@ -1943,8 +2139,8 @@ mod tests {
 
     #[test]
     fn epoch_advance_hash_boundary_shift_produces_different_hash() {
-        let hash_a = compute_epoch_advance_hash("ctx-AB", "did:key:CD", 1);
-        let hash_b = compute_epoch_advance_hash("ctx-ABC", "did:key:D", 1);
+        let hash_a = compute_epoch_advance_hash("ctx-AB", "did:key:CD", 1, SigningKeyId::Active);
+        let hash_b = compute_epoch_advance_hash("ctx-ABC", "did:key:D", 1, SigningKeyId::Active);
         assert_ne!(
             hash_a, hash_b,
             "shifting bytes between context_id and sender_did must produce different hashes"
@@ -1970,5 +2166,104 @@ mod tests {
             hash_a, hash_b,
             "shifting bytes between blocker_did and blocked_did must produce different hashes"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Category A enforcement tests (ADR-039, SCP-AB-020)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn enforce_rejects_agent_key_category_a_did_document() {
+        let result = enforce_sender_key_category_a(
+            SigningKeyId::Agent,
+            "did:dht:alice",
+            "did_document",
+            &[0xAB; 64],
+        );
+        assert!(
+            result.is_err(),
+            "agent key should be rejected for did_document"
+        );
+        assert!(matches!(
+            result.unwrap_err(),
+            SenderKeyError::CategoryAViolation(_)
+        ));
+    }
+
+    #[test]
+    fn enforce_rejects_agent_key_category_a_verification_method() {
+        let result = enforce_sender_key_category_a(
+            SigningKeyId::Agent,
+            "did:dht:alice",
+            "verification_method",
+            &[0xAB; 64],
+        );
+        assert!(
+            result.is_err(),
+            "agent key should be rejected for verification_method"
+        );
+    }
+
+    #[test]
+    fn enforce_accepts_agent_key_category_b_messages() {
+        let result = enforce_sender_key_category_a(
+            SigningKeyId::Agent,
+            "did:dht:alice",
+            "messages",
+            &[0xAB; 64],
+        );
+        assert!(result.is_ok(), "agent key should be accepted for messages");
+    }
+
+    #[test]
+    fn enforce_accepts_active_key_category_a() {
+        let result = enforce_sender_key_category_a(
+            SigningKeyId::Active,
+            "did:dht:alice",
+            "did_document",
+            &[0xAB; 64],
+        );
+        assert!(
+            result.is_ok(),
+            "active key should be accepted for did_document"
+        );
+    }
+
+    #[test]
+    fn enforce_accepts_active_key_category_b() {
+        let result = enforce_sender_key_category_a(
+            SigningKeyId::Active,
+            "did:dht:alice",
+            "messages",
+            &[0xAB; 64],
+        );
+        assert!(result.is_ok(), "active key should be accepted for messages");
+    }
+
+    #[test]
+    fn enforce_rejects_agent_key_all_category_a_resources() {
+        let category_a_resources = [
+            "did_document",
+            "verification_method",
+            "identity",
+            "pre_rotation",
+            "service",
+            "relay_config",
+            "did_migration",
+            "key_management",
+        ];
+
+        for resource in &category_a_resources {
+            let result = enforce_sender_key_category_a(
+                SigningKeyId::Agent,
+                "did:dht:alice",
+                resource,
+                &[0xAB; 64],
+            );
+            assert!(
+                result.is_err(),
+                "agent key should be rejected for Category A resource: {resource}"
+            );
+        }
     }
 }

@@ -29,7 +29,7 @@ pub mod pseudonym;
 // Re-export primary types and functions at the envelope module level.
 pub use inner::{
     InnerEnvelope, InnerEnvelopeParams, MessageType, Provenance, create_inner_envelope,
-    verify_inner_signature,
+    enforce_inner_envelope_category_a, verify_inner_signature,
 };
 pub use outer::{OuterEnvelope, create_outer_envelope, open_envelope, seal_envelope};
 pub use padding::{BUCKET_SIZES, pad_to_bucket, strip_padding};
@@ -98,6 +98,14 @@ pub enum EnvelopeError {
     /// `SHA-256(stripped_payload)`.
     #[error("content integrity failed: payload_hash mismatch")]
     ContentIntegrityFailed,
+
+    /// An agent key (`#agent`) attempted a Category A action (DID document
+    /// modification) via an inner envelope. The action was rejected and a
+    /// custody violation attestation was generated.
+    ///
+    /// See ADR-039 and SCP-AB-020.
+    #[error("Category A violation: {0}")]
+    CategoryAViolation(String),
 
     /// The inner envelope signature is valid in form but does not match the
     /// sender's public key — the message has been tampered with or was not

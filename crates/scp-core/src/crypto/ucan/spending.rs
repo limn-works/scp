@@ -636,12 +636,24 @@ impl BudgetTracker {
 // Mint spending UCAN
 // ---------------------------------------------------------------------------
 
+/// Default key scope for spending UCANs (agent verification method).
+///
+/// Per ADR-039, the shared-DID model uses `#agent` as the default key scope
+/// for agent-issued spending UCANs (self-delegation).
+pub const DEFAULT_SPENDING_KEY_SCOPE: &str = "#agent";
+
 /// Parameters for minting a spending UCAN.
+///
+/// Under the shared-DID model (ADR-039), human and agent share one DID with
+/// distinct verification methods (`#active` for human, `#agent` for agent).
+/// The spending UCAN is a self-delegation (`iss == aud == did`) with
+/// `fct.scp_key_scope` indicating which key signs.
 pub struct MintSpendingParams<'a> {
-    /// The human principal's DID (issuer).
-    pub issuer_did: &'a str,
-    /// The agent's DID (audience).
-    pub agent_did: &'a str,
+    /// The shared DID (used as both issuer and audience for self-delegation).
+    pub did: &'a str,
+    /// The key scope identifying the signing verification method (e.g., `"#agent"`).
+    /// Defaults to [`DEFAULT_SPENDING_KEY_SCOPE`] (`"#agent"`).
+    pub key_scope: &'a str,
     /// The spending scope (context-specific or global).
     pub scope: &'a SpendingScope,
     /// The spending capability to grant.
@@ -652,18 +664,21 @@ pub struct MintSpendingParams<'a> {
     pub not_before: Option<u64>,
 }
 
-/// Creates a spending UCAN payload from human DID to agent DID.
+/// Creates a spending UCAN payload as a self-delegation under the shared-DID
+/// model (ADR-039).
 ///
-/// This builds a [`UcanPayload`] with the spending capability encoded in the
-/// `fct` field and a spending attestation in `att`. The caller is responsible
-/// for signing the payload and constructing the full [`UcanToken`].
+/// The spending UCAN uses `iss == aud == did` (self-delegation) with
+/// `fct.scp_key_scope` set to the agent's key scope. This builds a
+/// [`UcanPayload`] with the spending capability encoded in the `fct` field
+/// and a spending attestation in `att`. The caller is responsible for signing
+/// the payload and constructing the full [`UcanToken`].
 ///
 /// # Errors
 ///
 /// Returns [`SpendingError::ExpiryTooLong`] if `lifetime_secs` exceeds 24
 /// hours.
 ///
-/// See spec section 19.5 and SDK surface `SCP.Identity.grantSpending`.
+/// See spec section 19.5, ADR-039, and SDK surface `SCP.Identity.grantSpending`.
 pub fn mint_spending_ucan_payload(
     params: &MintSpendingParams<'_>,
 ) -> Result<UcanPayload, SpendingError> {
@@ -682,18 +697,29 @@ pub fn mint_spending_ucan_payload(
     // Build the spending attestation.
     let att = vec![SpendingCapability::to_attenuation(params.scope)];
 
-    // Encode the spending capability as a UCAN fact.
-    let fct = params
-        .capability
-        .to_fact_value()
-        .map(|v| serde_json::json!({ SPENDING_CAPABILITY_FACT_KEY: v }));
+    // Encode the spending capability and key scope as UCAN facts.
+    // The key scope enables self-delegation validation (AB-012/AB-013).
+    let fct = {
+        let mut facts = serde_json::Map::new();
+        let cap_value = params.capability.to_fact_value().ok_or_else(|| {
+            SpendingError::SpendingCapabilityRequired(
+                "failed to serialize spending capability to UCAN facts".to_owned(),
+            )
+        })?;
+        facts.insert(SPENDING_CAPABILITY_FACT_KEY.to_owned(), cap_value);
+        facts.insert(
+            "scp_key_scope".to_owned(),
+            serde_json::Value::String(params.key_scope.to_owned()),
+        );
+        Some(serde_json::Value::Object(facts))
+    };
 
     // Generate a nonce.
     let nonce = generate_spending_nonce()?;
 
     Ok(UcanPayload {
-        iss: params.issuer_did.to_owned(),
-        aud: params.agent_did.to_owned(),
+        iss: params.did.to_owned(),
+        aud: params.did.to_owned(),
         exp,
         nbf: params.not_before,
         nnc: nonce,
@@ -737,6 +763,16 @@ fn generate_spending_nonce() -> Result<String, crate::time::ClockError> {
 ///
 /// Standard UCAN validation (signature, chain, revocation, nonce) should be
 /// performed separately via [`super::validate::validate_ucan`].
+///
+/// # Key scope validation
+///
+/// This function does **not** validate `scp_key_scope` from the token's facts.
+/// Key scope validation (verifying that the `kid` header matches the signing
+/// key and that `scp_key_scope` is consistent) is handled by the parent UCAN
+/// validator (SCP-AB-012/SCP-AB-013 steps 5a/5b). This function validates
+/// spending-specific fields only — duplicating key scope checks here would
+/// violate the single-responsibility split between spending validation and
+/// general UCAN validation.
 ///
 /// # Arguments
 ///
@@ -1326,8 +1362,8 @@ mod tests {
         let cap = sample_capability();
         let scope = SpendingScope::Context("ctx123".to_owned());
         let params = MintSpendingParams {
-            issuer_did: "did:dht:z6MkHuman",
-            agent_did: "did:dht:z6MkAgent",
+            did: "did:dht:z6MkShared",
+            key_scope: DEFAULT_SPENDING_KEY_SCOPE,
             scope: &scope,
             capability: &cap,
             lifetime_secs: 3600,
@@ -1335,8 +1371,9 @@ mod tests {
         };
         let payload = mint_spending_ucan_payload(&params).unwrap();
 
-        assert_eq!(payload.iss, "did:dht:z6MkHuman");
-        assert_eq!(payload.aud, "did:dht:z6MkAgent");
+        // Self-delegation: iss == aud
+        assert_eq!(payload.iss, "did:dht:z6MkShared");
+        assert_eq!(payload.aud, "did:dht:z6MkShared");
         assert_eq!(payload.att.len(), 1);
         assert_eq!(payload.att[0].with, "scp:spending:ctx123");
         assert_eq!(payload.att[0].can, "spend");
@@ -1347,6 +1384,12 @@ mod tests {
         let extracted: SpendingCapability =
             serde_json::from_value(fct["spending_capability"].clone()).unwrap();
         assert_eq!(extracted, cap);
+
+        // Verify scp_key_scope is present for self-delegation validation.
+        assert_eq!(
+            fct.get("scp_key_scope").and_then(|v| v.as_str()),
+            Some("#agent")
+        );
     }
 
     #[test]
@@ -1354,8 +1397,8 @@ mod tests {
         let cap = sample_capability();
         let scope = SpendingScope::Global;
         let params = MintSpendingParams {
-            issuer_did: "did:dht:z6MkHuman",
-            agent_did: "did:dht:z6MkAgent",
+            did: "did:dht:z6MkShared",
+            key_scope: DEFAULT_SPENDING_KEY_SCOPE,
             scope: &scope,
             capability: &cap,
             lifetime_secs: 3600,
@@ -1363,6 +1406,7 @@ mod tests {
         };
         let payload = mint_spending_ucan_payload(&params).unwrap();
         assert_eq!(payload.att[0].with, "scp:spending:*");
+        assert_eq!(payload.iss, payload.aud); // self-delegation
     }
 
     #[test]
@@ -1370,8 +1414,8 @@ mod tests {
         let cap = sample_capability();
         let scope = SpendingScope::Context("ctx123".to_owned());
         let params = MintSpendingParams {
-            issuer_did: "did:dht:z6MkHuman",
-            agent_did: "did:dht:z6MkAgent",
+            did: "did:dht:z6MkShared",
+            key_scope: DEFAULT_SPENDING_KEY_SCOPE,
             scope: &scope,
             capability: &cap,
             lifetime_secs: MAX_EXPIRY_SECS + 1,
@@ -1386,8 +1430,8 @@ mod tests {
         let cap = sample_capability();
         let scope = SpendingScope::Context("ctx123".to_owned());
         let params = MintSpendingParams {
-            issuer_did: "did:dht:z6MkHuman",
-            agent_did: "did:dht:z6MkAgent",
+            did: "did:dht:z6MkShared",
+            key_scope: DEFAULT_SPENDING_KEY_SCOPE,
             scope: &scope,
             capability: &cap,
             lifetime_secs: 3600,
@@ -1402,14 +1446,17 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Helper to build a spending UCAN token for testing.
+    ///
+    /// Uses the shared-DID model: `iss == aud` (self-delegation) with
+    /// `fct.scp_key_scope: "#agent"`.
     fn make_spending_token(cap: &SpendingCapability, scope_uri: &str) -> UcanToken {
         let now = crate::time::now_secs().expect("clock unavailable in test");
 
         UcanToken {
             header: super::super::UcanHeader::new(),
             payload: UcanPayload {
-                iss: "did:dht:z6MkHuman".to_owned(),
-                aud: "did:dht:z6MkAgent".to_owned(),
+                iss: "did:dht:z6MkShared".to_owned(),
+                aud: "did:dht:z6MkShared".to_owned(),
                 exp: now + 3600,
                 nbf: Some(now),
                 nnc: "1699999000000-aabbccdd11223344".to_owned(),
@@ -1419,7 +1466,8 @@ mod tests {
                 }],
                 prf: vec![],
                 fct: Some(serde_json::json!({
-                    "spending_capability": serde_json::to_value(cap).unwrap()
+                    "spending_capability": serde_json::to_value(cap).unwrap(),
+                    "scp_key_scope": "#agent"
                 })),
             },
             signature: vec![0u8; 64],
@@ -1565,8 +1613,8 @@ mod tests {
         // Mint a spending UCAN payload.
         let scope = SpendingScope::Context("ctx123".to_owned());
         let params = MintSpendingParams {
-            issuer_did: "did:dht:z6MkHuman",
-            agent_did: "did:dht:z6MkAgent",
+            did: "did:dht:z6MkShared",
+            key_scope: DEFAULT_SPENDING_KEY_SCOPE,
             scope: &scope,
             capability: &cap,
             lifetime_secs: 3600,
@@ -1683,6 +1731,180 @@ mod tests {
                     "anything"
                 )
                 .is_ok()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared-DID model tests (ADR-039, SCP-AB-014)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mint_spending_self_delegation_iss_equals_aud() {
+        let cap = sample_capability();
+        let scope = SpendingScope::Context("ctx-self".to_owned());
+        let params = MintSpendingParams {
+            did: "did:dht:z6MkSharedIdentity",
+            key_scope: "#agent",
+            scope: &scope,
+            capability: &cap,
+            lifetime_secs: 1800,
+            not_before: None,
+        };
+        let payload = mint_spending_ucan_payload(&params).unwrap();
+
+        // Core invariant: self-delegation means iss == aud
+        assert_eq!(payload.iss, "did:dht:z6MkSharedIdentity");
+        assert_eq!(payload.aud, "did:dht:z6MkSharedIdentity");
+        assert_eq!(payload.iss, payload.aud);
+    }
+
+    #[test]
+    fn mint_spending_includes_key_scope_in_facts() {
+        let cap = sample_capability();
+        let scope = SpendingScope::Global;
+        let params = MintSpendingParams {
+            did: "did:dht:z6MkTest",
+            key_scope: "#agent",
+            scope: &scope,
+            capability: &cap,
+            lifetime_secs: 3600,
+            not_before: None,
+        };
+        let payload = mint_spending_ucan_payload(&params).unwrap();
+
+        let fct = payload.fct.as_ref().expect("facts must be present");
+        assert_eq!(
+            fct.get("scp_key_scope").and_then(|v| v.as_str()),
+            Some("#agent"),
+            "scp_key_scope must be set to the key_scope parameter"
+        );
+    }
+
+    #[test]
+    fn mint_spending_custom_key_scope() {
+        let cap = sample_capability();
+        let scope = SpendingScope::Context("ctx-custom".to_owned());
+        let params = MintSpendingParams {
+            did: "did:dht:z6MkCustom",
+            key_scope: "#active",
+            scope: &scope,
+            capability: &cap,
+            lifetime_secs: 3600,
+            not_before: None,
+        };
+        let payload = mint_spending_ucan_payload(&params).unwrap();
+
+        // Custom key scope should be respected
+        let fct = payload.fct.as_ref().unwrap();
+        assert_eq!(
+            fct.get("scp_key_scope").and_then(|v| v.as_str()),
+            Some("#active"),
+        );
+        // Self-delegation still holds with custom scope
+        assert_eq!(payload.iss, payload.aud);
+    }
+
+    #[test]
+    fn mint_spending_facts_contain_both_capability_and_key_scope() {
+        let cap = sample_capability();
+        let scope = SpendingScope::Context("ctx-both".to_owned());
+        let params = MintSpendingParams {
+            did: "did:dht:z6MkBoth",
+            key_scope: DEFAULT_SPENDING_KEY_SCOPE,
+            scope: &scope,
+            capability: &cap,
+            lifetime_secs: 3600,
+            not_before: None,
+        };
+        let payload = mint_spending_ucan_payload(&params).unwrap();
+
+        let fct = payload.fct.as_ref().expect("facts must be present");
+
+        // Both spending_capability and scp_key_scope must coexist in facts
+        assert!(
+            fct.get("spending_capability").is_some(),
+            "spending_capability must be present in facts"
+        );
+        assert!(
+            fct.get("scp_key_scope").is_some(),
+            "scp_key_scope must be present in facts"
+        );
+
+        // spending_capability must round-trip correctly
+        let extracted: SpendingCapability =
+            serde_json::from_value(fct["spending_capability"].clone()).unwrap();
+        assert_eq!(extracted, cap);
+    }
+
+    #[test]
+    fn default_spending_key_scope_is_agent() {
+        assert_eq!(DEFAULT_SPENDING_KEY_SCOPE, "#agent");
+    }
+
+    #[test]
+    fn end_to_end_shared_did_mint_and_validate() {
+        // Full round-trip: mint with shared-DID model, validate, use budget tracker.
+        let cap = SpendingCapability {
+            max_per_action: Amount(500),
+            max_total: Amount(1500),
+            currency: usd(),
+            time_window: Duration::from_secs(3600),
+            allowed_adapters: vec!["x402".to_owned()],
+        };
+
+        let scope = SpendingScope::Context("ctx-e2e".to_owned());
+        let params = MintSpendingParams {
+            did: "did:dht:z6MkE2E",
+            key_scope: DEFAULT_SPENDING_KEY_SCOPE,
+            scope: &scope,
+            capability: &cap,
+            lifetime_secs: 3600,
+            not_before: None,
+        };
+        let payload = mint_spending_ucan_payload(&params).unwrap();
+
+        // Verify self-delegation structure
+        assert_eq!(payload.iss, payload.aud);
+        let fct = payload.fct.as_ref().unwrap();
+        assert_eq!(
+            fct.get("scp_key_scope").and_then(|v| v.as_str()),
+            Some("#agent")
+        );
+
+        // Build token and validate
+        let token = UcanToken {
+            header: super::super::UcanHeader::new(),
+            payload,
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        };
+        let validated_cap = validate_spending_ucan(&token, "ctx-e2e", None).unwrap();
+        assert_eq!(validated_cap, cap);
+
+        // Budget tracker works with the validated capability
+        let mut tracker = BudgetTracker::new(validated_cap);
+        let now = crate::time::now_secs().expect("clock unavailable in test");
+
+        assert!(
+            tracker
+                .check_and_record(Amount(500), usd(), now, "x402")
+                .is_ok()
+        );
+        assert!(
+            tracker
+                .check_and_record(Amount(500), usd(), now, "x402")
+                .is_ok()
+        );
+        assert!(
+            tracker
+                .check_and_record(Amount(500), usd(), now, "x402")
+                .is_ok()
+        );
+        // Fourth spend exceeds max_total
+        assert!(
+            tracker
+                .check_and_record(Amount(500), usd(), now, "x402")
+                .is_err()
         );
     }
 }

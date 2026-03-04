@@ -1003,6 +1003,7 @@ fn py_context_send(
                 timestamp: now_ms,
                 payload: &payload_bytes,
                 provenance: None,
+                signing_key_id: scp_identity::SigningKeyId::Active,
             };
             scp_core::envelope::create_inner_envelope(
                 &params,

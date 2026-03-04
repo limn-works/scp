@@ -321,6 +321,8 @@ pub async fn ucan_mint(
         not_before: None,
         proofs: vec![],
         facts: None,
+        key_scope: None,
+        signing_key_id: None,
     };
 
     // Sign the token using the real InMemoryKeyCustody via scp-core.
