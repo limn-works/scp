@@ -240,7 +240,8 @@
       "files": [
         "crates/scp-transport/src/relay/bridge.rs",
         "crates/scp-transport/src/relay/operations.rs",
-        "crates/scp-transport/src/relay/mod.rs"
+        "crates/scp-transport/src/relay/mod.rs",
+        "crates/scp-transport/src/native/server.rs"
       ],
       "description": "Implement the BRIDGE operation (§10.12.4) as Tier 3 fallback for symmetric NAT (~15% of home routers). A willing SCP relay acts as a transparent bridge, proxying blobs bidirectionally to the target self-hosted relay. The bridge does NOT inspect, modify, or cache proxied blobs. Bridge relays see the same metadata as any relay (§9.9.1). Any SCP relay MAY offer bridge service via supports_bridge configuration. Phase 3 component.",
       "acceptanceCriteria": [
@@ -274,7 +275,7 @@
         "phase": 3,
         "crate": "scp-transport"
       },
-      "result": "Implemented BRIDGE relay operation with bidirectional blob proxying, supports_bridge config, and bridge discovery/failover. Commit 88e4aaa."
+      "result": "Implemented BRIDGE relay operation with bidirectional blob proxying, supports_bridge config, and bridge discovery/failover (88e4aaa). Wired BridgeRegistry into RelayServer: handle_bridge_register with Ed25519 auth, handle_bridge_data with transparent forwarding, connection cleanup on disconnect, 6 integration tests. Closes #271."
     },
     {
       "id": "SCP-237",
