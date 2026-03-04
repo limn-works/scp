@@ -7,7 +7,8 @@
 //! **Phase 1:** single adapter support (SCP native relay).
 //! **Phase 2:** multi-adapter routing with per-context relay set assignment,
 //! suppression-resistant multi-relay publishing (3+ relays per context), and
-//! deduplicated merged subscription streams.
+//! deduplicated merged subscription streams. Connection budget enforcement
+//! via transport profiles (ADR-036, spec section 10.13.3).
 //!
 //! See ADR-005 in `.docs/adrs/phase-1.md` for the original transport manager
 //! design and ADR-012 in `.docs/adrs/phase-2.md` for multi-transport routing.
@@ -26,6 +27,8 @@ use scp_core::envelope::OuterEnvelope;
 
 use crate::config::TransportConfig;
 use crate::error::TransportError;
+use crate::pool::ConnectionPool;
+use crate::profile::TransportProfile;
 use crate::scoring::{
     self, DeliveryOutcome, ReliabilityScore, SuppressionTracker, SuppressionWarning,
 };
@@ -55,6 +58,26 @@ const MIN_RELAYS_PER_CONTEXT: usize = 3;
 /// returns an error (insufficient redundancy).
 const MIN_SUCCESSFUL_SENDS: usize = 2;
 
+/// Outcome of an LRU eviction triggered by connection budget enforcement.
+///
+/// Returned by [`TransportManager::add_adapter`] when the connection budget
+/// is exceeded and an existing connection must be evicted to make room.
+///
+/// See spec section 10.13.3 and ADR-036 acceptance criterion 4.
+#[derive(Debug, Clone)]
+pub struct EvictionOutcome {
+    /// The adapter index that was evicted.
+    pub evicted_index: usize,
+    /// Routing IDs whose subscriptions were on the evicted connection.
+    /// These subscriptions need to be migrated to a surviving connection
+    /// to the same relay, or the relay must be reassigned.
+    pub affected_subscriptions: Vec<RoutingId>,
+    /// Adapter index that surviving subscriptions were migrated to, if any.
+    /// `None` means no surviving connection to the same relay was found,
+    /// and relay reassignment should be triggered by the caller.
+    pub migrated_to: Option<usize>,
+}
+
 /// Multi-adapter transport manager.
 ///
 /// Holds multiple [`TransportAdapter`] instances and routes operations
@@ -71,6 +94,8 @@ const MIN_SUCCESSFUL_SENDS: usize = 2;
 /// - **Relay set assignment:** `assign_relay_set` distributes contexts
 ///   across relays with round-robin spread to minimize overlap.
 /// - **Reliability scoring:** Per-relay delivery success tracking.
+/// - **Connection budget:** Enforces `max_connections` from the transport
+///   profile. LRU eviction when budget exceeded (section 10.13.3, ADR-036).
 ///
 /// # Construction
 ///
@@ -105,6 +130,35 @@ pub struct TransportManager {
     /// without an entry are treated as free (cost = 0). Cost is the third
     /// criterion in relay selection alongside reliability and latency.
     relay_costs: RwLock<HashMap<usize, u64>>,
+    /// Maximum total connections across all adapters, derived from the
+    /// transport profile (section 10.13.3, ADR-036).
+    ///
+    /// Connection budgets are soft limits. The SDK MAY temporarily exceed
+    /// during relay set reassignment or context join operations, then
+    /// converge back within 30 seconds.
+    max_connections: usize,
+    /// Last-used timestamp per adapter index, for LRU eviction order.
+    /// Updated on every send, subscribe, or query operation. The adapter
+    /// with the oldest (smallest) timestamp is the LRU candidate.
+    ///
+    /// Uses `Mutex` for interior mutability so operations taking `&self`
+    /// can update timestamps without requiring `&mut self`.
+    connection_last_used: Mutex<HashMap<usize, Instant>>,
+    /// Active subscriptions per adapter index: maps adapter index to the
+    /// set of routing IDs currently subscribed on that adapter.
+    ///
+    /// Used for subscription migration when a connection is evicted per
+    /// section 10.13.3: subscriptions on the evicted connection are
+    /// re-subscribed on a surviving connection to the same relay.
+    active_subscriptions: RwLock<HashMap<usize, Vec<RoutingId>>>,
+    /// Shared connection pool for adapter deduplication and reuse (§10.13.2).
+    ///
+    /// Keyed by `(relay_url, transport_type)`. When multiple
+    /// `TransportManager` instances exist in the same process, they share
+    /// connections to the same relay via this `Arc<ConnectionPool>`.
+    ///
+    /// See SCP-253 and ADR-036 acceptance criterion 3.
+    connection_pool: Arc<ConnectionPool>,
 }
 
 /// Helper to create a `NonZeroUsize` for LRU capacity, falling back to 1.
@@ -112,14 +166,37 @@ fn nonzero_capacity(size: usize) -> std::num::NonZeroUsize {
     std::num::NonZeroUsize::new(size).unwrap_or(std::num::NonZeroUsize::MIN)
 }
 
+/// Reindexes a `HashMap<usize, V>` inside a `Mutex` after removing an entry.
+///
+/// Removes the entry at `removed_index` and shifts all keys greater than
+/// `removed_index` down by 1. Used by [`TransportManager::reindex_after_removal`]
+/// for the `connection_last_used` map.
+fn reindex_usize_map<V>(map: &Mutex<HashMap<usize, V>>, removed_index: usize) {
+    let mut guard = map
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let old_map = std::mem::take(&mut *guard);
+    for (idx, val) in old_map {
+        if idx == removed_index {
+            continue;
+        }
+        let new_idx = if idx > removed_index { idx - 1 } else { idx };
+        guard.insert(new_idx, val);
+    }
+}
+
 impl TransportManager {
     /// Creates a new `TransportManager` with a single adapter.
     ///
     /// This is the Phase 1 constructor. The provided adapter is used for
-    /// all operations. For Phase 2 multi-adapter configuration, use
+    /// all operations. Uses the default (platform-inferred) transport
+    /// profile for connection budget. For Phase 2 multi-adapter
+    /// configuration with explicit profile, use
     /// [`TransportManager::with_config`].
     #[must_use]
     pub fn new(adapter: Box<dyn TransportAdapter>) -> Self {
+        let mut last_used = HashMap::new();
+        last_used.insert(0, Instant::now());
         Self {
             adapters: vec![adapter],
             relay_assignments: RwLock::new(HashMap::new()),
@@ -129,12 +206,18 @@ impl TransportManager {
             assignment_counter: AtomicUsize::new(0),
             suppression_tracker: Arc::new(Mutex::new(SuppressionTracker::new())),
             relay_costs: RwLock::new(HashMap::new()),
+            max_connections: TransportProfile::platform_default().max_connections(),
+            connection_last_used: Mutex::new(last_used),
+            active_subscriptions: RwLock::new(HashMap::new()),
+            connection_pool: Arc::new(ConnectionPool::new()),
         }
     }
 
     /// Creates a new `TransportManager` with no adapters.
     ///
-    /// Use [`add_adapter`](TransportManager::add_adapter) to register
+    /// Uses the default (platform-inferred) transport profile for
+    /// connection budget. Use
+    /// [`add_adapter`](TransportManager::add_adapter) to register
     /// adapters before performing any operations.
     #[must_use]
     pub fn builder() -> Self {
@@ -147,12 +230,17 @@ impl TransportManager {
             assignment_counter: AtomicUsize::new(0),
             suppression_tracker: Arc::new(Mutex::new(SuppressionTracker::new())),
             relay_costs: RwLock::new(HashMap::new()),
+            max_connections: TransportProfile::platform_default().max_connections(),
+            connection_last_used: Mutex::new(HashMap::new()),
+            active_subscriptions: RwLock::new(HashMap::new()),
+            connection_pool: Arc::new(ConnectionPool::new()),
         }
     }
 
     /// Creates a new `TransportManager` with the given configuration.
     ///
-    /// Uses the dedup cache size and TTL from the [`TransportConfig`].
+    /// Uses the dedup cache size and TTL from the [`TransportConfig`],
+    /// and the connection budget from the config's transport profile.
     #[must_use]
     pub fn with_config(config: &TransportConfig) -> Self {
         Self {
@@ -164,7 +252,78 @@ impl TransportManager {
             assignment_counter: AtomicUsize::new(0),
             suppression_tracker: Arc::new(Mutex::new(SuppressionTracker::new())),
             relay_costs: RwLock::new(HashMap::new()),
+            max_connections: config.profile.max_connections(),
+            connection_last_used: Mutex::new(HashMap::new()),
+            active_subscriptions: RwLock::new(HashMap::new()),
+            connection_pool: Arc::new(ConnectionPool::new()),
         }
+    }
+
+    /// Creates a new `TransportManager` with a shared connection pool.
+    ///
+    /// Use this constructor when multiple `TransportManager` instances
+    /// in the same process need to share connections to the same relays
+    /// (§10.13.2 item 3). Pass the same `Arc<ConnectionPool>` to each
+    /// manager.
+    ///
+    /// See SCP-253 and ADR-036 acceptance criterion 3.
+    #[must_use]
+    pub fn with_pool(pool: Arc<ConnectionPool>) -> Self {
+        Self {
+            adapters: Vec::new(),
+            relay_assignments: RwLock::new(HashMap::new()),
+            reliability_scores: Arc::new(Mutex::new(HashMap::new())),
+            dedup_cache: LruCache::new(nonzero_capacity(DEFAULT_DEDUP_CAPACITY)),
+            dedup_ttl: DEFAULT_DEDUP_TTL,
+            assignment_counter: AtomicUsize::new(0),
+            suppression_tracker: Arc::new(Mutex::new(SuppressionTracker::new())),
+            relay_costs: RwLock::new(HashMap::new()),
+            max_connections: TransportProfile::platform_default().max_connections(),
+            connection_last_used: Mutex::new(HashMap::new()),
+            active_subscriptions: RwLock::new(HashMap::new()),
+            connection_pool: pool,
+        }
+    }
+
+    /// Creates a new `TransportManager` with the given configuration and
+    /// a shared connection pool.
+    ///
+    /// Combines [`with_config`](Self::with_config) dedup parameters with
+    /// [`with_pool`](Self::with_pool) cross-manager connection sharing.
+    #[must_use]
+    pub fn with_config_and_pool(config: &TransportConfig, pool: Arc<ConnectionPool>) -> Self {
+        Self {
+            adapters: Vec::new(),
+            relay_assignments: RwLock::new(HashMap::new()),
+            reliability_scores: Arc::new(Mutex::new(HashMap::new())),
+            dedup_cache: LruCache::new(nonzero_capacity(config.dedup_cache_size)),
+            dedup_ttl: config.dedup_cache_ttl,
+            assignment_counter: AtomicUsize::new(0),
+            suppression_tracker: Arc::new(Mutex::new(SuppressionTracker::new())),
+            relay_costs: RwLock::new(HashMap::new()),
+            max_connections: config.profile.max_connections(),
+            connection_last_used: Mutex::new(HashMap::new()),
+            active_subscriptions: RwLock::new(HashMap::new()),
+            connection_pool: pool,
+        }
+    }
+
+    /// Returns the maximum connection budget for this manager.
+    ///
+    /// Derived from the transport profile (section 10.13.3, ADR-036):
+    /// - Server: `usize::MAX` (unlimited)
+    /// - Desktop: 50
+    /// - Mobile: 10
+    /// - Constrained: 2
+    #[must_use]
+    pub const fn max_connections(&self) -> usize {
+        self.max_connections
+    }
+
+    /// Returns the number of currently active connections (adapters).
+    #[must_use]
+    pub fn active_connection_count(&self) -> usize {
+        self.adapters.len()
     }
 
     /// Registers an additional transport adapter.
@@ -172,12 +331,35 @@ impl TransportManager {
     /// The adapter is appended to the end of the adapter list. Its index
     /// is used as the identifier for relay set assignments and reliability
     /// scoring.
-    pub fn add_adapter(&mut self, adapter: Box<dyn TransportAdapter>) {
+    ///
+    /// # Connection Budget Enforcement (section 10.13.3)
+    ///
+    /// If adding this adapter would exceed `max_connections`, the
+    /// least-recently-used connection is evicted first. Subscriptions on
+    /// the evicted connection are migrated to a surviving connection
+    /// assigned to the same relay contexts, or relay reassignment is
+    /// signaled via the returned [`EvictionOutcome`].
+    ///
+    /// Returns `None` if no eviction was needed, or `Some(EvictionOutcome)`
+    /// describing the evicted connection and subscription migration result.
+    pub fn add_adapter(&mut self, adapter: Box<dyn TransportAdapter>) -> Option<EvictionOutcome> {
+        // Enforce connection budget per section 10.13.3.
+        let eviction = if self.adapters.len() >= self.max_connections {
+            self.evict_lru_connection()
+        } else {
+            None
+        };
+
         let idx = self.adapters.len();
         if let Ok(mut scores) = self.reliability_scores.lock() {
             scores.insert(idx.to_string(), ReliabilityScore::new(idx.to_string()));
         }
+        if let Ok(mut last_used) = self.connection_last_used.lock() {
+            last_used.insert(idx, Instant::now());
+        }
         self.adapters.push(adapter);
+
+        eviction
     }
 
     /// Returns the number of registered adapters.
@@ -198,6 +380,7 @@ impl TransportManager {
     /// Propagates errors from the underlying adapter.
     pub async fn send(&self, envelope: &OuterEnvelope) -> Result<BlobId, TransportError> {
         let adapter = self.adapters.first().ok_or(TransportError::NotConnected)?;
+        self.touch_adapter(0);
         adapter.send(envelope).await
     }
 
@@ -237,6 +420,11 @@ impl TransportManager {
                 ))
             })?
             .clone();
+
+        // Touch all adapters in the relay set (mark as recently used).
+        for &idx in &relay_indices {
+            self.touch_adapter(idx);
+        }
 
         // Send to all relays concurrently.
         let mut futures: FuturesUnordered<_> = relay_indices
@@ -316,6 +504,8 @@ impl TransportManager {
             Vec::with_capacity(self.adapters.len());
 
         for (idx, adapter) in self.adapters.iter().enumerate() {
+            self.touch_adapter(idx);
+            self.record_subscription(idx, routing_id);
             let stream = adapter.subscribe(routing_id, since).await?;
             indexed_streams.push((idx, stream));
         }
@@ -382,6 +572,8 @@ impl TransportManager {
             Vec::with_capacity(relay_indices.len());
         for &idx in &relay_indices {
             if let Some(adapter) = self.adapters.get(idx) {
+                self.touch_adapter(idx);
+                self.record_subscription(idx, routing_id);
                 let stream = adapter.subscribe(routing_id, since).await?;
                 indexed_streams.push((idx, stream));
             }
@@ -427,7 +619,8 @@ impl TransportManager {
         }
 
         let mut first_error: Option<TransportError> = None;
-        for adapter in &self.adapters {
+        for (idx, adapter) in self.adapters.iter().enumerate() {
+            self.remove_subscription_record(idx, routing_id);
             if let Err(e) = adapter.unsubscribe(routing_id).await
                 && first_error.is_none()
             {
@@ -454,6 +647,7 @@ impl TransportManager {
         since: Option<u64>,
     ) -> Result<Vec<OuterEnvelope>, TransportError> {
         let adapter = self.adapters.first().ok_or(TransportError::NotConnected)?;
+        self.touch_adapter(0);
         adapter.query(routing_id, since).await
     }
 
@@ -620,18 +814,6 @@ impl TransportManager {
         scores.get(relay_url).cloned()
     }
 
-    /// Returns a shared reference to the suppression tracker.
-    #[must_use]
-    pub fn suppression_tracker(&self) -> Arc<Mutex<SuppressionTracker>> {
-        Arc::clone(&self.suppression_tracker)
-    }
-
-    /// Returns a shared reference to the reliability scores.
-    #[must_use]
-    pub fn reliability_scores(&self) -> Arc<Mutex<HashMap<String, ReliabilityScore>>> {
-        Arc::clone(&self.reliability_scores)
-    }
-
     /// Sets the per-publish cost for an adapter by index.
     ///
     /// The cost is used as the third criterion in relay selection
@@ -658,6 +840,234 @@ impl TransportManager {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         costs.get(&adapter_index).copied().unwrap_or(0)
+    }
+
+    /// Returns a shared reference to the connection pool.
+    ///
+    /// The returned `Arc<ConnectionPool>` can be passed to other
+    /// `TransportManager` instances via [`with_pool`](Self::with_pool) to
+    /// enable cross-manager connection sharing (§10.13.2 item 3).
+    ///
+    /// See SCP-253 and ADR-036 acceptance criterion 3.
+    #[must_use]
+    pub fn connection_pool(&self) -> Arc<ConnectionPool> {
+        Arc::clone(&self.connection_pool)
+    }
+
+    // -----------------------------------------------------------------------
+    // Connection budget enforcement (section 10.13.3, ADR-036)
+    // -----------------------------------------------------------------------
+
+    /// Updates the last-used timestamp for an adapter, marking it as
+    /// recently active for LRU eviction ordering.
+    ///
+    /// Called internally by `send`, `send_to_context`, `subscribe`,
+    /// `subscribe_context`, and `query` to keep the LRU order accurate.
+    fn touch_adapter(&self, adapter_index: usize) {
+        if let Ok(mut last_used) = self.connection_last_used.lock() {
+            last_used.insert(adapter_index, Instant::now());
+        }
+    }
+
+    /// Records that a routing ID is subscribed on the given adapter.
+    ///
+    /// Used for subscription migration when a connection is evicted.
+    fn record_subscription(&self, adapter_index: usize, routing_id: &RoutingId) {
+        if let Ok(mut subs) = self.active_subscriptions.write() {
+            subs.entry(adapter_index).or_default().push(*routing_id);
+        }
+    }
+
+    /// Removes a subscription record for a routing ID on the given adapter.
+    fn remove_subscription_record(&self, adapter_index: usize, routing_id: &RoutingId) {
+        if let Ok(mut subs) = self.active_subscriptions.write()
+            && let Some(routing_ids) = subs.get_mut(&adapter_index)
+        {
+            routing_ids.retain(|r| r != routing_id);
+        }
+    }
+
+    /// Evicts the least-recently-used connection per section 10.13.3.
+    ///
+    /// Finds the adapter with the oldest last-used timestamp, removes it,
+    /// and attempts to migrate its subscriptions to a surviving adapter
+    /// that shares relay set membership.
+    ///
+    /// Returns `None` if there are no adapters to evict.
+    fn evict_lru_connection(&mut self) -> Option<EvictionOutcome> {
+        if self.adapters.is_empty() {
+            return None;
+        }
+
+        let lru_index = self.find_lru_adapter_index();
+        let affected_subscriptions = self.collect_affected_subscriptions(lru_index);
+        let migration_target = self.find_migration_target(lru_index);
+
+        // Migrate subscription records to the target adapter if one exists.
+        if let Some(target) = migration_target
+            && let Ok(mut subs) = self.active_subscriptions.write()
+        {
+            let migrated = subs.remove(&lru_index).unwrap_or_default();
+            subs.entry(target).or_default().extend(migrated);
+        }
+
+        // Remove the evicted adapter and reindex all data structures.
+        self.adapters.remove(lru_index);
+        self.reindex_after_removal(lru_index);
+
+        let adjusted_target = migration_target.map(|t| if t > lru_index { t - 1 } else { t });
+
+        tracing::info!(
+            evicted = lru_index,
+            migrated_to = ?adjusted_target,
+            affected_subscriptions = affected_subscriptions.len(),
+            remaining_connections = self.adapters.len(),
+            max_connections = self.max_connections,
+            "connection budget enforcement: evicted LRU adapter"
+        );
+
+        Some(EvictionOutcome {
+            evicted_index: lru_index,
+            affected_subscriptions,
+            migrated_to: adjusted_target,
+        })
+    }
+
+    /// Returns the index of the least-recently-used adapter.
+    fn find_lru_adapter_index(&self) -> usize {
+        let last_used = self
+            .connection_last_used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // If an adapter has no timestamp, treat it as the oldest possible
+        // instant (Instant::now() minus 24 hours, falling back to epoch-ish).
+        let fallback_instant = Instant::now()
+            .checked_sub(Duration::from_secs(86400))
+            .unwrap_or_else(Instant::now);
+
+        (0..self.adapters.len())
+            .min_by_key(|&idx| last_used.get(&idx).copied().unwrap_or(fallback_instant))
+            .unwrap_or(0)
+    }
+
+    /// Collects the routing IDs subscribed on the given adapter.
+    fn collect_affected_subscriptions(&self, adapter_index: usize) -> Vec<RoutingId> {
+        self.active_subscriptions
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&adapter_index)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Finds a surviving adapter that shares at least one context relay set
+    /// with the evicted adapter, for subscription migration.
+    fn find_migration_target(&self, evicted_index: usize) -> Option<usize> {
+        let affected_contexts: Vec<ContextId> = self
+            .relay_assignments
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(_, indices)| indices.contains(&evicted_index))
+            .map(|(ctx, _)| ctx.clone())
+            .collect();
+
+        if affected_contexts.is_empty() {
+            return None;
+        }
+
+        let assignments = self
+            .relay_assignments
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        affected_contexts.iter().find_map(|ctx| {
+            assignments.get(ctx).and_then(|indices| {
+                indices
+                    .iter()
+                    .copied()
+                    .find(|&idx| idx != evicted_index && idx < self.adapters.len())
+            })
+        })
+    }
+
+    /// Reindexes all index-keyed data structures after removing an adapter.
+    ///
+    /// When an adapter at `removed_index` is removed from the `adapters` vec,
+    /// all adapter indices above `removed_index` shift down by 1. This method
+    /// updates `relay_assignments`, `connection_last_used`,
+    /// `active_subscriptions`, `relay_costs`, and `reliability_scores`.
+    fn reindex_after_removal(&self, removed_index: usize) {
+        // Relay assignments: remove references and shift.
+        {
+            let mut assignments = self
+                .relay_assignments
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for indices in assignments.values_mut() {
+                indices.retain(|idx| *idx != removed_index);
+                for idx in indices.iter_mut() {
+                    if *idx > removed_index {
+                        *idx -= 1;
+                    }
+                }
+            }
+        }
+
+        // Connection last-used timestamps.
+        reindex_usize_map(&self.connection_last_used, removed_index);
+
+        // Active subscriptions.
+        {
+            let mut subs = self
+                .active_subscriptions
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let old_map = std::mem::take(&mut *subs);
+            for (idx, routing_ids) in old_map {
+                if idx == removed_index {
+                    continue;
+                }
+                let new_idx = if idx > removed_index { idx - 1 } else { idx };
+                subs.insert(new_idx, routing_ids);
+            }
+        }
+
+        // Relay costs.
+        {
+            let mut costs = self
+                .relay_costs
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let old_map = std::mem::take(&mut *costs);
+            for (idx, cost) in old_map {
+                if idx == removed_index {
+                    continue;
+                }
+                let new_idx = if idx > removed_index { idx - 1 } else { idx };
+                costs.insert(new_idx, cost);
+            }
+        }
+
+        // Reliability scores (string-keyed by adapter index).
+        {
+            let mut scores = self
+                .reliability_scores
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let old_map = std::mem::take(&mut *scores);
+            for (key, score) in old_map {
+                if let Ok(idx) = key.parse::<usize>() {
+                    if idx == removed_index {
+                        continue;
+                    }
+                    let new_idx = if idx > removed_index { idx - 1 } else { idx };
+                    scores.insert(new_idx.to_string(), score);
+                } else {
+                    scores.insert(key, score);
+                }
+            }
+        }
     }
 }
 
@@ -801,63 +1211,66 @@ impl Stream for MergedStream {
             return Poll::Ready(Some(TransportEvent::SuppressionDetected(warning)));
         }
 
-        // Round-robin poll across all streams. Return the first ready item
-        // that passes deduplication. If all streams are pending, return
-        // Pending. If all streams are exhausted, return None.
-        let mut all_done = true;
-        let mut any_pending = false;
+        let mut i = 0;
+        // Track whether any stream returned Ready (duplicate or exhausted)
+        // without registering a waker. If so, we must wake ourselves before
+        // returning Pending, because Ready streams don't register wakers and
+        // the task would stall otherwise.
+        let mut any_ready_without_waker = false;
 
-        for i in 0..this.streams.len() {
+        while i < this.streams.len() {
             let (adapter_index, stream) = &mut this.streams[i];
             let adapter_idx = *adapter_index;
             match stream.poll_next_unpin(cx) {
-                Poll::Ready(Some(event)) => {
-                    match &event {
-                        TransportEvent::Envelope(envelope) => {
-                            let blob_id = BlobId::from_sha256(&envelope.encrypted_blob);
+                Poll::Ready(Some(event)) => match &event {
+                    TransportEvent::Envelope(envelope) => {
+                        let blob_id = BlobId::from_sha256(&envelope.encrypted_blob);
 
-                            // Record this delivery for suppression tracking,
-                            // regardless of whether it's a duplicate.
-                            if let (Ok(mut tracker), Ok(now_ms)) = (
-                                this.suppression_tracker.lock(),
-                                scp_core::time::now_millis(),
-                            ) {
-                                tracker.record_delivery(blob_id, adapter_idx, now_ms);
-                            }
+                        if let (Ok(mut tracker), Ok(now_ms)) = (
+                            this.suppression_tracker.lock(),
+                            scp_core::time::now_millis(),
+                        ) {
+                            tracker.record_delivery(blob_id, adapter_idx, now_ms);
+                        }
 
-                            if !this.is_duplicate(&blob_id) {
-                                return Poll::Ready(Some(event));
-                            }
-                            // Duplicate -- skip and wake so we poll again.
-                            cx.waker().wake_by_ref();
-                            return Poll::Pending;
+                        if this.is_duplicate(&blob_id) {
+                            any_ready_without_waker = true;
+                            i += 1;
+                            continue;
                         }
-                        // Control events are always passed through.
-                        TransportEvent::Error(_)
-                        | TransportEvent::BackfillComplete
-                        | TransportEvent::Reconnected
-                        | TransportEvent::Terminated { .. }
-                        | TransportEvent::SuppressionDetected(_) => {
-                            return Poll::Ready(Some(event));
-                        }
+                        cx.waker().wake_by_ref();
+                        return Poll::Ready(Some(event));
                     }
-                }
+                    TransportEvent::Error(_)
+                    | TransportEvent::BackfillComplete
+                    | TransportEvent::Reconnected
+                    | TransportEvent::Terminated { .. }
+                    | TransportEvent::SuppressionDetected(_) => {
+                        cx.waker().wake_by_ref();
+                        return Poll::Ready(Some(event));
+                    }
+                },
                 Poll::Ready(None) => {
-                    // This stream is exhausted.
+                    any_ready_without_waker = true;
+                    drop(this.streams.swap_remove(i));
                 }
                 Poll::Pending => {
-                    all_done = false;
-                    any_pending = true;
+                    i += 1;
                 }
             }
         }
 
-        if all_done {
+        if this.streams.is_empty() {
             Poll::Ready(None)
-        } else if any_pending {
-            Poll::Pending
         } else {
-            Poll::Ready(None)
+            // If any stream returned Ready (duplicate filtered or exhausted)
+            // without registering a waker, we must re-poll to check for new
+            // items. Without this wake, the task stalls permanently when all
+            // streams yield only duplicates.
+            if any_ready_without_waker {
+                cx.waker().wake_by_ref();
+            }
+            Poll::Pending
         }
     }
 }
@@ -1169,6 +1582,108 @@ mod tests {
 
         let second = stream.next().await;
         assert!(matches!(second, Some(TransportEvent::BackfillComplete)));
+    }
+
+    // -----------------------------------------------------------------------
+    // MergedStream poll_next contract tests (Items 1 AC1-AC5)
+    // -----------------------------------------------------------------------
+
+    fn make_merged_stream(indexed_streams: Vec<(usize, SubscriptionStream)>) -> MergedStream {
+        MergedStream::new(
+            indexed_streams,
+            std::num::NonZeroUsize::new(100).unwrap(),
+            Duration::from_secs(60),
+            Arc::new(Mutex::new(SuppressionTracker::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            2,
+        )
+    }
+
+    #[tokio::test]
+    async fn merged_stream_continues_after_duplicate() {
+        let envelope = test_envelope();
+        let duplicate = envelope.clone();
+        let distinct = test_envelope_with_blob(vec![0xDE, 0xAD]);
+
+        // Stream 0 yields a duplicate of envelope; stream 1 yields a distinct item.
+        let stream0: SubscriptionStream =
+            Box::pin(stream::iter(vec![TransportEvent::Envelope(duplicate)]));
+        let stream1: SubscriptionStream =
+            Box::pin(stream::iter(vec![TransportEvent::Envelope(distinct)]));
+
+        let mut merged = make_merged_stream(vec![(0, stream0), (1, stream1)]);
+
+        // First poll should return the original envelope from stream 0.
+        let first = merged.next().await;
+        assert!(matches!(first, Some(TransportEvent::Envelope(ref e)) if {
+            let blob_id = BlobId::from_sha256(&e.encrypted_blob);
+            let original_blob_id = BlobId::from_sha256(&envelope.encrypted_blob);
+            blob_id == original_blob_id
+        }));
+
+        // Second poll should return the distinct envelope from stream 1
+        // (not Pending — the duplicate from stream 0 is skipped, not blocking).
+        let second = merged.next().await;
+        assert!(matches!(second, Some(TransportEvent::Envelope(_))));
+
+        // Both streams exhausted.
+        let third = merged.next().await;
+        assert!(third.is_none());
+    }
+
+    #[tokio::test]
+    async fn merged_stream_removes_exhausted_streams() {
+        let envelope = test_envelope();
+
+        let stream0: SubscriptionStream = Box::pin(stream::empty());
+        let stream1: SubscriptionStream =
+            Box::pin(stream::iter(vec![TransportEvent::Envelope(envelope)]));
+
+        let mut merged = make_merged_stream(vec![(0, stream0), (1, stream1)]);
+
+        assert_eq!(merged.streams.len(), 2);
+
+        // Polling should remove the empty stream0 and yield stream1's item.
+        let first = merged.next().await;
+        assert!(matches!(first, Some(TransportEvent::Envelope(_))));
+        assert_eq!(merged.streams.len(), 1);
+
+        // Stream1 is now exhausted too.
+        let second = merged.next().await;
+        assert!(second.is_none());
+        assert_eq!(merged.streams.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn merged_stream_all_duplicates_returns_pending() {
+        use futures::channel::mpsc;
+        use std::task::Poll;
+
+        let envelope = test_envelope();
+        let dup0 = envelope.clone();
+        let dup1 = envelope.clone();
+
+        let (mut tx0, rx0) = mpsc::channel::<TransportEvent>(1);
+        let (mut tx1, rx1) = mpsc::channel::<TransportEvent>(1);
+
+        tx0.try_send(TransportEvent::Envelope(dup0)).unwrap();
+        tx1.try_send(TransportEvent::Envelope(dup1)).unwrap();
+
+        let stream0: SubscriptionStream = Box::pin(rx0);
+        let stream1: SubscriptionStream = Box::pin(rx1);
+
+        let mut merged = make_merged_stream(vec![(0, stream0), (1, stream1)]);
+
+        // First poll returns the original envelope.
+        let first = merged.next().await;
+        assert!(matches!(first, Some(TransportEvent::Envelope(_))));
+
+        // Second poll: both streams' items are duplicates → should return Pending, not spin.
+        let poll_result = futures::poll!(merged.next());
+        assert!(
+            matches!(poll_result, Poll::Pending),
+            "expected Pending when all remaining items are duplicates, got {poll_result:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1877,6 +2392,308 @@ mod tests {
         assert!(
             !set.contains(&3),
             "most expensive adapter 3 should not be in the set (set={set:?})"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Connection budget enforcement tests (section 10.13.3, ADR-036)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn max_connections_derived_from_profile() {
+        // Server profile: unlimited connections.
+        let config = TransportConfig {
+            profile: TransportProfile::Server,
+            ..TransportConfig::default()
+        };
+        let manager = TransportManager::with_config(&config);
+        assert_eq!(manager.max_connections(), usize::MAX);
+
+        // Desktop profile: 50 connections.
+        let config = TransportConfig {
+            profile: TransportProfile::Desktop,
+            ..TransportConfig::default()
+        };
+        let manager = TransportManager::with_config(&config);
+        assert_eq!(manager.max_connections(), 50);
+
+        // Mobile profile: 10 connections.
+        let config = TransportConfig {
+            profile: TransportProfile::Mobile,
+            ..TransportConfig::default()
+        };
+        let manager = TransportManager::with_config(&config);
+        assert_eq!(manager.max_connections(), 10);
+
+        // Constrained profile: 2 connections.
+        let config = TransportConfig {
+            profile: TransportProfile::Constrained,
+            ..TransportConfig::default()
+        };
+        let manager = TransportManager::with_config(&config);
+        assert_eq!(manager.max_connections(), 2);
+    }
+
+    #[tokio::test]
+    async fn active_connection_count_tracks_adapters() {
+        let mut manager = TransportManager::builder();
+        assert_eq!(manager.active_connection_count(), 0);
+
+        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        assert_eq!(manager.active_connection_count(), 1);
+
+        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        assert_eq!(manager.active_connection_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn connection_budget_evicts_lru_when_exceeded() {
+        // Constrained profile: max 2 connections.
+        let config = TransportConfig {
+            profile: TransportProfile::Constrained,
+            ..TransportConfig::default()
+        };
+        let mut manager = TransportManager::with_config(&config);
+        assert_eq!(manager.max_connections(), 2);
+
+        // Add 2 adapters (at budget).
+        let eviction =
+            manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))));
+        assert!(eviction.is_none(), "no eviction expected when under budget");
+
+        // Sleep briefly so adapter 0 has an older timestamp than adapter 1.
+        std::thread::sleep(Duration::from_millis(10));
+
+        let eviction =
+            manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x02; 32]))));
+        assert!(eviction.is_none(), "no eviction expected when at budget");
+        assert_eq!(manager.active_connection_count(), 2);
+
+        // Sleep briefly so adapters 0 and 1 have older timestamps.
+        std::thread::sleep(Duration::from_millis(10));
+
+        // Add a 3rd adapter — should evict the LRU (adapter 0, the oldest).
+        let eviction =
+            manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))));
+        assert!(eviction.is_some(), "eviction expected when budget exceeded");
+
+        let outcome = eviction.unwrap();
+        assert_eq!(outcome.evicted_index, 0, "adapter 0 should be the LRU");
+        assert_eq!(
+            manager.active_connection_count(),
+            2,
+            "should be back at budget after eviction"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_budget_evicts_correct_lru_after_touch() {
+        // Constrained profile: max 2 connections.
+        let config = TransportConfig {
+            profile: TransportProfile::Constrained,
+            ..TransportConfig::default()
+        };
+        let mut manager = TransportManager::with_config(&config);
+
+        // Add 2 adapters.
+        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))));
+        std::thread::sleep(Duration::from_millis(10));
+        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x02; 32]))));
+
+        // Touch adapter 0 (make it more recently used than adapter 1).
+        std::thread::sleep(Duration::from_millis(10));
+        manager.touch_adapter(0);
+
+        // Add a 3rd adapter — should evict adapter 1 (now the LRU).
+        std::thread::sleep(Duration::from_millis(10));
+        let eviction =
+            manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))));
+        assert!(eviction.is_some());
+
+        let outcome = eviction.unwrap();
+        // Adapter 1 was the LRU since adapter 0 was touched more recently.
+        assert_eq!(
+            outcome.evicted_index, 1,
+            "adapter 1 should be evicted (LRU) after adapter 0 was touched"
+        );
+        assert_eq!(manager.active_connection_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn connection_budget_subscription_migration_to_surviving_adapter() {
+        // Constrained profile: max 2 connections.
+        let config = TransportConfig {
+            profile: TransportProfile::Constrained,
+            ..TransportConfig::default()
+        };
+        let mut manager = TransportManager::with_config(&config);
+
+        // Add 2 adapters.
+        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        std::thread::sleep(Duration::from_millis(10));
+        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+
+        // Assign both adapters to a context.
+        let ctx = "ctx-migrate".to_string();
+        manager
+            .relay_assignments
+            .write()
+            .unwrap()
+            .insert(ctx, vec![0, 1]);
+
+        // Record a subscription on adapter 0.
+        let routing_id = RoutingId::new([0xBB; 32]);
+        manager.record_subscription(0, &routing_id);
+
+        // Verify the subscription is recorded.
+        assert!(
+            manager
+                .active_subscriptions
+                .read()
+                .unwrap()
+                .get(&0)
+                .is_some_and(|ids| ids.contains(&routing_id)),
+            "subscription should be recorded on adapter 0"
+        );
+
+        // Add a 3rd adapter — evicts adapter 0 (LRU).
+        std::thread::sleep(Duration::from_millis(10));
+        let eviction = manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        assert!(eviction.is_some());
+
+        let outcome = eviction.unwrap();
+        assert_eq!(outcome.evicted_index, 0);
+        assert_eq!(outcome.affected_subscriptions.len(), 1);
+        assert_eq!(outcome.affected_subscriptions[0], routing_id);
+        // Subscription was migrated to adapter 1 (now re-indexed as adapter 0
+        // after the eviction shift, since the evicted index was 0).
+        assert!(
+            outcome.migrated_to.is_some(),
+            "subscription should be migrated to a surviving adapter"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_budget_no_surviving_connection_signals_reassignment() {
+        // Constrained profile: max 2 connections.
+        let config = TransportConfig {
+            profile: TransportProfile::Constrained,
+            ..TransportConfig::default()
+        };
+        let mut manager = TransportManager::with_config(&config);
+
+        // Add 2 adapters, each assigned to different contexts (no overlap).
+        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        std::thread::sleep(Duration::from_millis(10));
+        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+
+        manager
+            .relay_assignments
+            .write()
+            .unwrap()
+            .insert("ctx-a".to_string(), vec![0]); // Only adapter 0
+        manager
+            .relay_assignments
+            .write()
+            .unwrap()
+            .insert("ctx-b".to_string(), vec![1]); // Only adapter 1
+
+        // Record a subscription on adapter 0.
+        let routing_id = RoutingId::new([0xCC; 32]);
+        manager.record_subscription(0, &routing_id);
+
+        // Add a 3rd adapter — evicts adapter 0 (LRU).
+        std::thread::sleep(Duration::from_millis(10));
+        let eviction = manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        assert!(eviction.is_some());
+
+        let outcome = eviction.unwrap();
+        assert_eq!(outcome.evicted_index, 0);
+        assert_eq!(outcome.affected_subscriptions.len(), 1);
+        // No surviving connection shares the same context, so migrated_to
+        // is None — caller should trigger relay reassignment.
+        assert!(
+            outcome.migrated_to.is_none(),
+            "should signal relay reassignment when no surviving connection shares the context"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_budget_unlimited_server_profile_never_evicts() {
+        let config = TransportConfig {
+            profile: TransportProfile::Server,
+            ..TransportConfig::default()
+        };
+        let mut manager = TransportManager::with_config(&config);
+        assert_eq!(manager.max_connections(), usize::MAX);
+
+        // Add many adapters — none should trigger eviction.
+        for _ in 0..100 {
+            let eviction = manager.add_adapter(Box::new(MockAdapter::succeeding()));
+            assert!(eviction.is_none());
+        }
+        assert_eq!(manager.active_connection_count(), 100);
+    }
+
+    #[tokio::test]
+    async fn connection_budget_reindexes_relay_assignments_after_eviction() {
+        let config = TransportConfig {
+            profile: TransportProfile::Constrained,
+            ..TransportConfig::default()
+        };
+        let mut manager = TransportManager::with_config(&config);
+
+        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))));
+        std::thread::sleep(Duration::from_millis(10));
+        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x02; 32]))));
+
+        // Assign context to adapter 1 (index 1).
+        let ctx = "ctx-reindex".to_string();
+        manager
+            .relay_assignments
+            .write()
+            .unwrap()
+            .insert(ctx.clone(), vec![1]);
+
+        // Add 3rd adapter — evicts adapter 0 (LRU). Adapter 1 becomes
+        // adapter 0 after reindexing.
+        std::thread::sleep(Duration::from_millis(10));
+        manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x03; 32]))));
+
+        let set = manager.get_relay_set(&ctx).unwrap();
+        assert_eq!(
+            set,
+            vec![0],
+            "adapter 1 should be reindexed to 0 after eviction of adapter 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_budget_mobile_profile_enforces_limit_of_10() {
+        let config = TransportConfig {
+            profile: TransportProfile::Mobile,
+            ..TransportConfig::default()
+        };
+        let mut manager = TransportManager::with_config(&config);
+        assert_eq!(manager.max_connections(), 10);
+
+        // Fill to budget.
+        for _ in 0..10 {
+            let eviction = manager.add_adapter(Box::new(MockAdapter::succeeding()));
+            assert!(eviction.is_none());
+        }
+        assert_eq!(manager.active_connection_count(), 10);
+
+        // 11th adapter triggers eviction.
+        let eviction = manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        assert!(
+            eviction.is_some(),
+            "mobile profile should evict at 11th connection"
+        );
+        assert_eq!(
+            manager.active_connection_count(),
+            10,
+            "should remain at budget after eviction"
         );
     }
 }

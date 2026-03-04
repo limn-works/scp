@@ -477,6 +477,14 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
     /// as before -- no additional listener is spawned. The dev API always
     /// uses plain HTTP (it is bound to loopback only).
     ///
+    /// ## HTTP/3
+    ///
+    /// When the `http3` feature is enabled and an [`Http3Config`] is provided
+    /// via [`ApplicationNodeBuilder::http3`], an HTTP/3 listener is started
+    /// on a separate QUIC endpoint. All HTTP/1.1 and HTTP/2 responses include
+    /// an `Alt-Svc` header advertising the HTTP/3 endpoint (spec section
+    /// 10.15.1).
+    ///
     /// ## Graceful shutdown
     ///
     /// The `shutdown` future is awaited as a graceful shutdown signal: when
@@ -519,6 +527,10 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
         let dev_bind_addr = self.state.dev_bind_addr;
         let tls_config = self.state.tls_config.clone();
 
+        // Extract HTTP/3 config before destructuring self.
+        #[cfg(feature = "http3")]
+        let http3_config = self.http3_config;
+
         // Destructure self so we own the relay handle and state directly.
         let relay = self.relay;
         let state = self.state;
@@ -531,6 +543,12 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
             .merge(projection);
 
         let dev_api_handle = spawn_dev_api(dev_router, dev_bind_addr, state.shutdown_token.clone());
+
+        // Spawn HTTP/3 listener when configured (spec section 10.15.1).
+        #[cfg(feature = "http3")]
+        if let Some(http3_config) = http3_config {
+            spawn_http3_listener(http3_config, &state);
+        }
 
         let bind_addr = state.http_bind_addr;
 
@@ -804,4 +822,74 @@ mod tests {
             .unwrap();
         assert!(methods.contains("GET"), "should allow GET method");
     }
+}
+
+/// Spawns the HTTP/3 listener in a background task (spec §10.15.1).
+///
+/// Extracted from [`ApplicationNode::serve`] to keep the `serve()` method
+/// within the clippy line limit. Creates a `RequestHandler` that
+/// serves the full `.well-known/scp` document (same as the Axum handler)
+/// over HTTP/3 and returns 404 for all other paths.
+///
+/// The handler holds an `Arc<NodeState>` so it can build the same
+/// complete document that the HTTP/1.1+HTTP/2 handler serves, including
+/// relay_config, contexts, handles, and transports (SCP-264).
+#[cfg(feature = "http3")]
+fn spawn_http3_listener(http3_config: scp_transport::http3::Http3Config, state: &Arc<NodeState>) {
+    use scp_transport::http3::Http3Server;
+    use scp_transport::http3::adapter::RequestHandler;
+
+    struct H3RequestHandler {
+        state: Arc<NodeState>,
+        rt: tokio::runtime::Handle,
+    }
+
+    impl RequestHandler for H3RequestHandler {
+        fn handle(
+            &self,
+            method: &str,
+            uri: &str,
+            _headers: &[(String, String)],
+        ) -> axum::http::Response<Vec<u8>> {
+            if method == "GET" && uri == "/.well-known/scp" {
+                // Build the full WellKnownScp document using the same
+                // function as the Axum handler, ensuring identical
+                // responses across transports.
+                let doc = self
+                    .rt
+                    .block_on(crate::well_known::build_well_known_scp(&self.state));
+                let body_bytes = serde_json::to_vec(&doc).unwrap_or_default();
+                axum::http::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(body_bytes)
+                    .unwrap_or_else(|_| axum::http::Response::new(b"internal error".to_vec()))
+            } else {
+                axum::http::Response::builder()
+                    .status(404)
+                    .body(b"not found".to_vec())
+                    .unwrap_or_else(|_| axum::http::Response::new(Vec::new()))
+            }
+        }
+    }
+
+    let handler: Arc<dyn RequestHandler> = Arc::new(H3RequestHandler {
+        state: Arc::clone(state),
+        rt: tokio::runtime::Handle::current(),
+    });
+
+    tokio::spawn(async move {
+        let mut server = Http3Server::new(http3_config, handler);
+        match server.bind() {
+            Ok(addr) => {
+                tracing::info!(addr = %addr, "HTTP/3 server started");
+                if let Err(e) = server.serve().await {
+                    tracing::error!(error = %e, "HTTP/3 server exited with error");
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to bind HTTP/3 server");
+            }
+        }
+    });
 }

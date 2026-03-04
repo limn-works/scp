@@ -133,6 +133,28 @@ pub struct RelayConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_subscribe: Option<u32>,
 
+    /// Supported transport bindings advertised by this relay (§10.5.1).
+    ///
+    /// `"websocket"` is always present (mandatory baseline). Other
+    /// transport types are optional and depend on which listeners
+    /// the relay has enabled:
+    ///
+    /// - `"websocket"` -- always present
+    /// - `"quic"` -- when QUIC listener is active
+    /// - `"webtransport"` -- when HTTP/3 + WebTransport is active
+    /// - `"udp-dtls"` -- when UDP/DTLS listener is active
+    ///
+    /// Clients use this array to select the best available transport.
+    /// Clients SHOULD prefer QUIC over WebSocket when both are
+    /// available (lower overhead, connection migration). Browser
+    /// clients SHOULD prefer WebTransport over WebSocket when the
+    /// `WebTransport` API is available.
+    ///
+    /// Absent field means the relay only supports WebSocket (the
+    /// mandatory baseline).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transports: Option<Vec<String>>,
+
     /// Relay economic configuration (section 19.8). Optional. Absence = free
     /// relay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -483,6 +505,7 @@ mod tests {
                 max_blob_ttl: Some(86_400),
                 rate_limit_publish: Some(100),
                 rate_limit_subscribe: Some(50),
+                transports: Some(vec!["websocket".to_owned(), "quic".to_owned()]),
                 economic: None,
             }),
             handles: Some(handles),
@@ -526,6 +549,11 @@ mod tests {
         assert_eq!(rc["max_blob_ttl"], 86_400);
         assert_eq!(rc["rate_limit_publish"], 100);
         assert_eq!(rc["rate_limit_subscribe"], 50);
+
+        let transports = rc["transports"].as_array().expect("transports is array");
+        assert_eq!(transports.len(), 2);
+        assert_eq!(transports[0], "websocket");
+        assert_eq!(transports[1], "quic");
     }
 
     #[test]
@@ -687,6 +715,7 @@ mod tests {
             max_blob_ttl: None,
             rate_limit_publish: None,
             rate_limit_subscribe: None,
+            transports: None,
             economic: None,
         };
         let json = serde_json::to_value(&config).expect("serialization failed");
@@ -695,6 +724,65 @@ mod tests {
         assert!(json.get("max_blob_ttl").is_none());
         assert!(json.get("rate_limit_publish").is_none());
         assert!(json.get("rate_limit_subscribe").is_none());
+        assert!(json.get("transports").is_none());
+    }
+
+    #[test]
+    fn transports_field_serializes_when_present() {
+        let config = RelayConfig {
+            max_blob_size: None,
+            max_blob_ttl: None,
+            rate_limit_publish: None,
+            rate_limit_subscribe: None,
+            transports: Some(vec![
+                "websocket".to_owned(),
+                "quic".to_owned(),
+                "webtransport".to_owned(),
+                "udp-dtls".to_owned(),
+            ]),
+            economic: None,
+        };
+        let json = serde_json::to_value(&config).expect("serialization failed");
+
+        let transports = json["transports"].as_array().expect("transports is array");
+        assert_eq!(transports.len(), 4);
+        assert_eq!(transports[0], "websocket");
+        assert_eq!(transports[1], "quic");
+        assert_eq!(transports[2], "webtransport");
+        assert_eq!(transports[3], "udp-dtls");
+    }
+
+    #[test]
+    fn transports_field_deserializes_from_json() {
+        let json = r#"{
+            "version": 1,
+            "did": "did:dht:z6Mk...",
+            "relay": "wss://relay.example.com/scp/v1",
+            "relay_config": {
+                "transports": ["websocket", "quic", "webtransport"]
+            }
+        }"#;
+        let doc: WellKnownScp = serde_json::from_str(json).expect("deserialization failed");
+
+        let rc = doc.relay_config.expect("relay_config present");
+        let transports = rc.transports.expect("transports present");
+        assert_eq!(transports, vec!["websocket", "quic", "webtransport"]);
+    }
+
+    #[test]
+    fn transports_field_absent_when_not_in_json() {
+        let json = r#"{
+            "version": 1,
+            "did": "did:dht:z6Mk...",
+            "relay": "wss://relay.example.com/scp/v1",
+            "relay_config": {
+                "max_blob_size": 262144
+            }
+        }"#;
+        let doc: WellKnownScp = serde_json::from_str(json).expect("deserialization failed");
+
+        let rc = doc.relay_config.expect("relay_config present");
+        assert!(rc.transports.is_none());
     }
 
     // -- handles tests (§22.6.1) -------------------------------------------

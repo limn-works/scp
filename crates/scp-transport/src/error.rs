@@ -51,4 +51,14 @@ pub enum TransportError {
         /// The SHA-256 hash of the actual blob content (hex-encoded).
         actual: String,
     },
+
+    /// The requested operation is not supported by this transport adapter.
+    ///
+    /// Some adapters do not support all five [`TransportAdapter`] methods.
+    /// For example, UDP/DTLS (section 10.16.1) cannot maintain long-lived
+    /// subscription streams — callers should poll via `query()` instead.
+    ///
+    /// See SCP-261 and spec section 10.16.1 point 6.
+    #[error("not supported: {0}")]
+    NotSupported(String),
 }

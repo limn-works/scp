@@ -225,6 +225,7 @@ mod tests {
                 max_blob_ttl: None,
                 rate_limit_publish: None,
                 rate_limit_subscribe: None,
+                transports: None,
                 economic: None,
             }),
         };
@@ -240,6 +241,7 @@ mod tests {
                 max_blob_ttl: None,
                 rate_limit_publish: None,
                 rate_limit_subscribe: None,
+                transports: None,
                 economic: Some(RelayEconomicConfig {
                     currency: CurrencyCode::from("USD"),
                     per_publish: Some(Amount::new(10)),
@@ -269,6 +271,7 @@ mod tests {
                     max_blob_ttl: None,
                     rate_limit_publish: None,
                     rate_limit_subscribe: None,
+                    transports: None,
                     economic: Some(RelayEconomicConfig {
                         currency: CurrencyCode::from("USD"),
                         per_publish: Some(Amount::new(10)),
@@ -291,6 +294,7 @@ mod tests {
                 max_blob_ttl: None,
                 rate_limit_publish: None,
                 rate_limit_subscribe: None,
+                transports: None,
                 economic: Some(RelayEconomicConfig {
                     currency: CurrencyCode::from("USD"),
                     per_publish: Some(Amount::new(10)),
@@ -333,6 +337,7 @@ mod tests {
                     max_blob_ttl: None,
                     rate_limit_publish: None,
                     rate_limit_subscribe: None,
+                    transports: None,
                     economic: None,
                 }),
             },

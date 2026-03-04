@@ -265,15 +265,38 @@ scp/
 │   │   └── store/             # ProtocolStore — typed domain storage (§17.4)
 │   │
 │   ├── scp-transport/         # Transport abstraction + adapters
-│   │   ├── trait.rs           # TransportAdapter trait
-│   │   ├── native/            # SCP native relay adapter (canonical reference)
-│   │   ├── nostr/             # Nostr adapter
-│   │   ├── matrix/            # Matrix adapter
-│   │   ├── hyperswarm/        # Holepunch/Hyperswarm adapter (DHT + NAT traversal)
-│   │   ├── libp2p/            # libp2p adapter (modular p2p)
+│   │   ├── traits.rs          # TransportAdapter trait (5 methods)
+│   │   ├── config.rs          # TransportConfig, CoverTrafficTier, CoverTrafficConfig
+│   │   ├── profile.rs         # TransportProfile enum, platform inference (§10.13)
+│   │   ├── pool.rs            # ConnectionPool keyed by (relay_url, transport_type)
+│   │   ├── manager.rs         # TransportManager — multi-adapter routing, budget enforcement
+│   │   ├── cover_traffic.rs   # Cover traffic generation (tier-aware)
+│   │   ├── heartbeat.rs       # Heartbeat monitoring, suppression detection
+│   │   ├── scoring.rs         # Per-adapter reliability scoring
+│   │   ├── nat/               # NAT traversal (STUN, port mapping)
+│   │   ├── native/            # SCP native relay adapter (Tier 1, mandatory baseline)
+│   │   │   └── server.rs      # Relay server — multi-transport listener
+│   │   ├── quic/              # QUIC adapter (Tier 1, feature = "quic")
+│   │   │   ├── adapter.rs     # QuicAdapter implementing TransportAdapter
+│   │   │   ├── streams.rs     # Per-operation stream management
+│   │   │   ├── lifecycle.rs   # Connection lifecycle (0-RTT, migration, reconnect)
+│   │   │   └── listener.rs    # Relay-side QUIC listener
+│   │   ├── webtransport/      # WebTransport adapter (Tier 1, feature = "webtransport-wasm")
+│   │   │   ├── client.rs      # Client-side WebTransport adapter (WASM)
+│   │   │   ├── fallback.rs    # WebSocket fallback when WebTransport unavailable
+│   │   │   └── session.rs     # Server-side WebTransport session handling
+│   │   ├── udp/               # Constrained device transport (Tier 1, feature = "udp")
+│   │   │   ├── adapter.rs     # UdpDtlsAdapter — MessagePack-over-DTLS
+│   │   │   └── listener.rs    # Relay-side UDP/DTLS listener
+│   │   ├── coap/              # CoAP-over-DTLS adapter (Tier 1, feature = "coap")
+│   │   │   ├── adapter.rs     # CoapAdapter — CoAP framing over DTLS
+│   │   │   └── message.rs     # CoAP message encoding/decoding
+│   │   ├── nostr/             # Nostr adapter (Tier 2)
+│   │   ├── matrix/            # Matrix adapter (Tier 2)
+│   │   ├── hyperswarm/        # Holepunch/Hyperswarm adapter (Tier 2)
+│   │   ├── libp2p/            # libp2p adapter (Tier 2)
 │   │   ├── websocket/         # Direct WebSocket (testing/local)
-│   │   ├── webrtc/            # WebRTC adapter (browser p2p)
-│   │   └── manager.rs         # Multi-transport routing
+│   │   └── webrtc/            # WebRTC adapter (Tier 2)
 │   │
 │   ├── scp-platform/          # Platform-specific adapters (production impls in bindings/{swift,kotlin}/)
 │   │   ├── traits.rs          # KeyCustody, DeviceAttestation, Push, Storage traits
@@ -806,6 +829,46 @@ These rules must not be violated. They are enforced by the crate dependency grap
 7. **scp-testing is a dev-dependency only.** It must never be imported by production code. It provides InMemoryRelay, InMemoryTransport, SimulatedClock, ScenarioBuilder, trait conformance macros, and distributed assertion utilities.
 
 8. **Dependency direction is strictly downward through layers.** A crate at Layer N may depend on crates at Layer N-1 or below, never at Layer N or above. scp-transport (Layer 2) may depend on scp-core (Layer 1) and scp-platform (Layer 0), but scp-core must never depend on scp-transport.
+
+### 2.6 Transport Layer Architecture
+
+The transport layer (`scp-transport`) abstracts all relay communication behind the `TransportAdapter` trait. It provides four Tier 1 adapters (WebSocket, QUIC, WebTransport, UDP/DTLS), a profile-aware resource management system, and connection pooling. For the full navigation guide, see [docs/guides/architecture.md](../docs/guides/architecture.md).
+
+#### Transport Profiles (§10.13, ADR-036)
+
+Transport profiles bundle connection strategy, cover traffic tier (§9.10.6), relay count, reconnect behavior, and connection budget for a device class. The `TransportProfile` enum (`profile.rs`) has four variants — `Server`, `Desktop`, `Mobile`, `Constrained` — each carrying default values for `min_relays`, `max_connections`, `reconnect_backoff_range`, and `cover_traffic_tier`. The SDK infers a profile from the platform via `#[cfg(target_os)]` with runtime refinement for Linux (headless → Server, low-memory → Constrained, fallback → Desktop).
+
+All profile-aware components read defaults from the active profile:
+- `CoverTrafficTier::from_profile()` maps Server/Desktop → Full (30s/1024B), Mobile → Reduced (120s/256B), Constrained → Off.
+- `ConnectionPool` enforces max connections per profile (Server=unlimited, Desktop=50, Mobile=10, Constrained=2).
+- `TransportManager` uses profile-driven reconnect backoff and mobile connection shedding.
+
+#### Connection Pool and Budget (§10.13.2–§10.13.3, ADR-036)
+
+`ConnectionPool` (`pool.rs`) is keyed by `(relay_url, transport_type)`. At most one connection per relay per transport type. Cross-`TransportManager` sharing via `Arc<ConnectionPool>`.
+
+Budget enforcement: when `max_connections` is reached, the least-recently-used connection is closed and its subscriptions are migrated to a surviving connection to the same relay, or trigger relay reassignment. The `Mobile` profile proactively sheds connections idle for 5+ minutes and relies on push notification bridging (§10.7).
+
+#### Tier 1 Transport Bindings (§10.14–§10.16, ADR-037)
+
+All Tier 1 adapters use the same MessagePack wire format (ADR-004). The only differences are framing and connection lifecycle. Optional transports are gated behind Cargo feature flags:
+
+| Transport | Module | Feature Flag | Key Characteristics |
+|-----------|--------|-------------|-------------------|
+| WebSocket (native relay) | `native/` | Always enabled | Mandatory baseline. Single bidirectional channel, `ref_id` correlation, 30s PING/PONG. |
+| QUIC | `quic/` | `quic` | Per-operation streams. 0-RTT resumption. Connection migration. No PING/PONG. Uses `quinn`. |
+| WebTransport | `webtransport/` | `webtransport-wasm` | Browser QUIC equivalent. HTTP/3 + WebTransport API. Falls back to WebSocket. |
+| UDP/DTLS | `udp/` | `udp` | Constrained devices. DTLS 1.3 datagrams. No SUBSCRIBE (poll via QUERY). |
+| CoAP-over-DTLS | `coap/` | `coap` | IoT interop. CoAP (RFC 7252) framing. CoAP Observe (RFC 7641) for best-effort subscription. |
+
+Each optional transport module uses `#[cfg(feature = "...")]` for conditional compilation. The relay server's multi-transport listener in `native/server.rs` conditionally starts each listener. The relay advertises available transports in `.well-known/scp` under `relay_config.transports`.
+
+**Relay shared state:** All transport handlers (WebSocket, QUIC, WebTransport, UDP/DTLS) share the same subscription registry, blob storage, rate limiters, and delivery jitter configuration. A subscription created via QUIC is visible to WebSocket queries and vice versa.
+
+**Fallback chains:**
+- Native clients: QUIC → WebSocket (probe QUIC first, 3s timeout).
+- Browser clients: WebTransport → WebSocket (transparent to callers).
+- Constrained: UDP/DTLS only (poll-based, no fallback).
 
 ---
 
