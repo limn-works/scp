@@ -10,7 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod dev_api;
-pub mod error;
+pub(crate) mod error;
 pub mod http;
 pub mod projection;
 pub mod tls;
