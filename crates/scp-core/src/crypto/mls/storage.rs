@@ -9,8 +9,8 @@
 //!
 //! [`MlsStorageBridge`] wraps an `Arc<ProtocolStore<S>>` and a context ID.
 //! All keys are prefixed with `mls/{context_id}/...` per spec section 17.9.
-//! `OpenMLS` key types are serialized via JSON for sub-key construction;
-//! entity values are serialized via JSON and stored as raw bytes through
+//! `OpenMLS` key types are serialized via `MessagePack` for sub-key construction;
+//! entity values are serialized via `MessagePack` and stored as raw bytes through
 //! the `ProtocolStore`'s underlying `Storage` backend.
 //!
 //! [`ScpMlsProvider`] combines `RustCrypto` (crypto + randomness) with
@@ -97,8 +97,8 @@ pub enum MlsStorageBridgeError {
 /// Bridges `OpenMLS` `StorageProvider` to scp-platform `Storage` via `ProtocolStore`.
 ///
 /// All keys are prefixed with `mls/{context_id}/` per spec section 17.9.
-/// `OpenMLS` key types are serialized to hex-encoded JSON bytes for sub-key
-/// construction. Entity values are serialized via JSON.
+/// `OpenMLS` key types are serialized to hex-encoded `MessagePack` bytes for sub-key
+/// construction. Entity values are serialized via `MessagePack`.
 ///
 /// The bridge is generic over `S: Storage`, enabling use with any storage
 /// backend (in-memory, `SQLite`, etc.).
@@ -148,21 +148,21 @@ impl<S: Storage> MlsStorageBridge<S> {
         )
     }
 
-    /// Serializes an `OpenMLS` key type to JSON bytes for use in storage key construction.
+    /// Serializes an `OpenMLS` key type to `MessagePack` bytes for use in storage key construction.
     fn serialize_key<K: Serialize>(key: &K) -> Result<Vec<u8>, MlsStorageBridgeError> {
-        serde_json::to_vec(key).map_err(|e| MlsStorageBridgeError::Serialization(e.to_string()))
+        rmp_serde::to_vec(key).map_err(|e| MlsStorageBridgeError::Serialization(e.to_string()))
     }
 
-    /// Serializes an `OpenMLS` entity value to JSON bytes for storage.
+    /// Serializes an `OpenMLS` entity value to `MessagePack` bytes for storage.
     fn serialize_value<V: Serialize>(value: &V) -> Result<Vec<u8>, MlsStorageBridgeError> {
-        serde_json::to_vec(value).map_err(|e| MlsStorageBridgeError::Serialization(e.to_string()))
+        rmp_serde::to_vec(value).map_err(|e| MlsStorageBridgeError::Serialization(e.to_string()))
     }
 
-    /// Deserializes an `OpenMLS` entity value from stored JSON bytes.
+    /// Deserializes an `OpenMLS` entity value from stored `MessagePack` bytes.
     fn deserialize_value<V: serde::de::DeserializeOwned>(
         bytes: &[u8],
     ) -> Result<V, MlsStorageBridgeError> {
-        serde_json::from_slice(bytes)
+        rmp_serde::from_slice(bytes)
             .map_err(|e| MlsStorageBridgeError::Deserialization(e.to_string()))
     }
 
@@ -241,7 +241,7 @@ impl<S: Storage> MlsStorageBridge<S> {
         self.sync_delete(&key)
     }
 
-    /// Appends a value to a JSON-encoded list stored under a single key.
+    /// Appends a value to a `MessagePack`-encoded list stored under a single key.
     fn append_to_list<GroupId: Serialize, V: Serialize>(
         &self,
         label: &str,
@@ -253,18 +253,18 @@ impl<S: Storage> MlsStorageBridge<S> {
         let val_bytes = Self::serialize_value(value)?;
 
         let mut list: Vec<Vec<u8>> = match self.sync_retrieve(&key)? {
-            Some(bytes) => serde_json::from_slice(&bytes)
+            Some(bytes) => rmp_serde::from_slice(&bytes)
                 .map_err(|e| MlsStorageBridgeError::Deserialization(e.to_string()))?,
             None => Vec::new(),
         };
         list.push(val_bytes);
 
-        let list_bytes = serde_json::to_vec(&list)
+        let list_bytes = rmp_serde::to_vec(&list)
             .map_err(|e| MlsStorageBridgeError::Serialization(e.to_string()))?;
         self.sync_store(&key, &list_bytes)
     }
 
-    /// Reads a JSON-encoded list stored under a single key.
+    /// Reads a `MessagePack`-encoded list stored under a single key.
     fn read_list<GroupId: Serialize, V: serde::de::DeserializeOwned>(
         &self,
         label: &str,
@@ -274,7 +274,7 @@ impl<S: Storage> MlsStorageBridge<S> {
         let key = self.build_key(label, &gid_bytes);
         match self.sync_retrieve(&key)? {
             Some(bytes) => {
-                let items: Vec<Vec<u8>> = serde_json::from_slice(&bytes)
+                let items: Vec<Vec<u8>> = rmp_serde::from_slice(&bytes)
                     .map_err(|e| MlsStorageBridgeError::Deserialization(e.to_string()))?;
                 items
                     .iter()
@@ -285,7 +285,7 @@ impl<S: Storage> MlsStorageBridge<S> {
         }
     }
 
-    /// Removes a specific value from a JSON-encoded list stored under a single key.
+    /// Removes a specific value from a `MessagePack`-encoded list stored under a single key.
     fn remove_from_list<GroupId: Serialize, V: Serialize>(
         &self,
         label: &str,
@@ -297,7 +297,7 @@ impl<S: Storage> MlsStorageBridge<S> {
         let val_bytes = Self::serialize_value(value)?;
 
         let mut list: Vec<Vec<u8>> = match self.sync_retrieve(&key)? {
-            Some(bytes) => serde_json::from_slice(&bytes)
+            Some(bytes) => rmp_serde::from_slice(&bytes)
                 .map_err(|e| MlsStorageBridgeError::Deserialization(e.to_string()))?,
             None => Vec::new(),
         };
@@ -306,7 +306,7 @@ impl<S: Storage> MlsStorageBridge<S> {
             list.remove(pos);
         }
 
-        let list_bytes = serde_json::to_vec(&list)
+        let list_bytes = rmp_serde::to_vec(&list)
             .map_err(|e| MlsStorageBridgeError::Serialization(e.to_string()))?;
         self.sync_store(&key, &list_bytes)
     }
