@@ -269,6 +269,11 @@ impl<S: Storage> ProtocolStore<S> {
     /// [`ProtocolStorePersistence`] to implement
     /// [`ContextPersistence::list_persisted_contexts`].
     ///
+    /// The returned list is a point-in-time snapshot. In a concurrent
+    /// environment, contexts may be created or deleted between the list
+    /// operation and subsequent access — callers must handle missing
+    /// snapshots gracefully.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError::Storage`] if the underlying storage operation fails.

@@ -49,7 +49,14 @@ impl SqliteStorage {
     /// Opens or creates an encrypted `SQLite` database at `{dir}/scp.db`.
     ///
     /// The `key` parameter is the raw encryption key material. It is
-    /// hex-encoded and passed to `SQLCipher` via `PRAGMA key`.
+    /// hex-encoded and passed to `SQLCipher` via `PRAGMA key`. The
+    /// hex-encoded key string is zeroized after the PRAGMA is executed,
+    /// but `SQLCipher` retains the derived key internally for the lifetime
+    /// of the connection — this is inherent to how `SQLCipher` works and
+    /// cannot be avoided without closing the connection.
+    ///
+    /// Callers that hold the raw key in a `Vec<u8>` or similar should
+    /// zeroize it after passing it to this constructor.
     ///
     /// # Errors
     ///

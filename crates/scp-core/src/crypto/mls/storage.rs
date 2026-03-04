@@ -80,6 +80,14 @@ pub enum MlsStorageBridgeError {
     /// Deserialization of a stored `OpenMLS` value failed.
     #[error("deserialization error: {0}")]
     Deserialization(String),
+
+    /// No tokio runtime available on the current thread.
+    ///
+    /// The MLS storage bridge requires a tokio runtime to bridge async
+    /// `Storage` operations into sync `StorageProvider` methods. This error
+    /// occurs when `StorageProvider` methods are called outside a tokio context.
+    #[error("no tokio runtime available: {0}")]
+    NoRuntime(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -165,28 +173,34 @@ impl<S: Storage> MlsStorageBridge<S> {
     /// when `OpenMLS` calls `StorageProvider` methods during group operations).
     fn sync_store(&self, key: &str, value: &[u8]) -> Result<(), MlsStorageBridgeError> {
         tokio::task::block_in_place(|| {
-            let handle = tokio::runtime::Handle::current();
-            handle.block_on(self.store.storage().store(key, value))
-        })?;
-        Ok(())
+            let handle = tokio::runtime::Handle::try_current()
+                .map_err(|e| MlsStorageBridgeError::NoRuntime(e.to_string()))?;
+            handle
+                .block_on(self.store.storage().store(key, value))
+                .map_err(MlsStorageBridgeError::from)
+        })
     }
 
     /// Synchronously retrieves a value by blocking on the async storage operation.
     fn sync_retrieve(&self, key: &str) -> Result<Option<Vec<u8>>, MlsStorageBridgeError> {
         tokio::task::block_in_place(|| {
-            let handle = tokio::runtime::Handle::current();
-            handle.block_on(self.store.storage().retrieve(key))
+            let handle = tokio::runtime::Handle::try_current()
+                .map_err(|e| MlsStorageBridgeError::NoRuntime(e.to_string()))?;
+            handle
+                .block_on(self.store.storage().retrieve(key))
+                .map_err(MlsStorageBridgeError::from)
         })
-        .map_err(Into::into)
     }
 
     /// Synchronously deletes a value by blocking on the async storage operation.
     fn sync_delete(&self, key: &str) -> Result<(), MlsStorageBridgeError> {
         tokio::task::block_in_place(|| {
-            let handle = tokio::runtime::Handle::current();
-            handle.block_on(self.store.storage().delete(key))
-        })?;
-        Ok(())
+            let handle = tokio::runtime::Handle::try_current()
+                .map_err(|e| MlsStorageBridgeError::NoRuntime(e.to_string()))?;
+            handle
+                .block_on(self.store.storage().delete(key))
+                .map_err(MlsStorageBridgeError::from)
+        })
     }
 
     /// Writes a single-valued entity keyed by group ID + label.
