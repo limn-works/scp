@@ -364,7 +364,7 @@ The "run it on your MacBook" thesis is the keystone of "protocol requires no ope
 |------|-----------|-------------|------------------------|---------|-----------------|
 | 1 | UPnP/NAT-PMP port mapping | ~40% home routers | None | Direct | None |
 | 2 | STUN hole punching | ~85% cumulative (cone NATs) | Any SCP relay as STUN server | Direct after punch | None (STUN is pre-connection) |
-| 3 | Relay bridging (TURN-like) | ~100% (symmetric NAT fallback) | A willing SCP relay as bridge | +1 hop | BRIDGE operation |
+| 3 | Relay bridging (TURN-like) | ~100% (symmetric NAT fallback) | A willing SCP relay as bridge | +1 hop | BRIDGE_REGISTER + BRIDGE_DATA operations |
 | 4 | Domain-based (existing §18.6) | 100% | DNS + ACME CA | Direct | None |
 
 **Tier selection algorithm:**
@@ -440,23 +440,46 @@ For routers that do not support UPnP, STUN (Session Traversal Utilities for NAT,
 
 For deployments behind symmetric NAT (~15% of consumer internet connections), where neither UPnP nor STUN hole punching can establish direct reachability, traffic is proxied through an intermediary SCP relay acting as a transparent bridge. This is architecturally analogous to TURN (Traversal Using Relays around NAT) but uses SCP's own relay infrastructure rather than dedicated TURN servers.
 
-**New relay operation:**
+**New relay operations:**
+
+Two operations support bridge relaying: `BRIDGE_REGISTER` (self-hosted relay → bridge) and `BRIDGE_DATA` (peer → bridge → self-hosted relay).
 
 ```
-BRIDGE {
-    target_routing_id: [u8; 32],     // Routing ID of the bridged relay
-    target_relay_hint: String,        // URL hint for reaching the target
+BRIDGE_REGISTER {
+    routing_id: [u8; 32],            // Routing ID to register
+    public_key: [u8; 32],            // Ed25519 public key of the DID owner
+    signature: [u8; 64],             // Ed25519 signature (SCP-247, see below)
+    timestamp: u64,                  // Unix timestamp included in signed payload
+    target_relay_hint: Option<String> // URL hint for reaching this relay directly
 }
 ```
 
-The bridge relay establishes a connection to the target self-hosted relay (which maintains an outbound connection to the bridge) and proxies blobs bidirectionally. The bridge does NOT inspect, modify, decrypt, or cache proxied blobs — it is a transparent pipe.
+The bridge relay authenticates the registration (§10.12.4.1) and records the routing ID → connection mapping. Responds with `OK` on success, `ERR` with code `BRIDGE_AUTH_FAILED` (4034) on authentication failure, or `ERR` with `BRIDGE_NOT_SUPPORTED` (4030) if bridging is disabled.
+
+```
+BRIDGE_DATA {
+    target_routing_id: [u8; 32],     // Routing ID of the bridged relay
+    payload: Vec<u8>,                // Opaque data to forward
+}
+```
+
+The bridge looks up the target routing ID, wraps the payload in a `BRIDGE_DATA` relay message (with `source_routing_id` set by the bridge), and forwards the serialized message to the registered self-hosted relay over its outbound connection. The bridge does NOT inspect, modify, decrypt, or cache payloads — it is a transparent pipe. Responds with `OK` to the sending peer on success, `ERR` with `BRIDGE_TARGET_NOT_FOUND` (4032) if the target is not registered.
+
+**Authentication (SCP-247):**
+
+`BRIDGE_REGISTER` requires an Ed25519 ownership proof to prevent unauthorized routing ID claims. The signature covers the domain-separated payload `"SCP-BRIDGE-REGISTER-V1:" || routing_id || big-endian-u64(timestamp)` (63 bytes). The bridge verifies:
+
+1. The Ed25519 signature is valid for the provided `public_key`.
+2. The DID derived from `public_key` maps to the claimed `routing_id` via `SHA-256("scp:did:" || did_string)` (§3.10.2).
+3. The `timestamp` is within 60 seconds of the server's current time (replay window).
 
 **Bridge establishment:**
 
 1. The self-hosted relay behind symmetric NAT connects outbound to a bridge relay (outbound connections are not blocked by NAT).
-2. The self-hosted relay registers its routing ID with the bridge via the BRIDGE operation.
-3. The bridge relay accepts incoming connections from peers and forwards traffic to the registered self-hosted relay over the existing outbound connection.
+2. The self-hosted relay registers its routing ID with the bridge via `BRIDGE_REGISTER`, proving DID ownership with an Ed25519 signature.
+3. The bridge relay accepts incoming connections from peers. Peers send `BRIDGE_DATA` to forward traffic to the registered self-hosted relay over the existing outbound connection.
 4. The self-hosted relay publishes the bridge relay's address in its DID document, annotated as a bridge: `wss://bridge-relay.example.com/scp/v1?bridge_target=<hex-routing-hint>`.
+5. When the self-hosted relay disconnects, the bridge deregisters all its routing IDs. Subsequent `BRIDGE_DATA` for those IDs returns `BRIDGE_TARGET_NOT_FOUND`.
 
 **Bridge properties:**
 
@@ -599,7 +622,7 @@ The reachability tiers introduce attack surfaces beyond the standard relay threa
 | STUN hole punching + keepalive | Phase 2 | `scp-transport` | `stun-rs` or `webrtc-rs/stun` |
 | `.no_domain()` builder mode | Phase 2 | `scp-node` | `ApplicationNodeBuilder` extension |
 | `ws://` transport for DHT-discovered relays | Phase 2 | `scp-transport` | Enforcement: reject `ws://` from non-DHT sources |
-| Relay bridging (BRIDGE operation) | Phase 3 | `scp-transport` | New wire operation, bridge registration protocol |
+| Relay bridging (BRIDGE_REGISTER + BRIDGE_DATA) | Phase 3 | `scp-transport` | Wire operations, Ed25519-authenticated registration, transparent forwarding |
 | STUN service on SCP relays | Phase 3 | `scp-transport` | Coexists with WebSocket endpoint |
 
 Phase 2 delivers the zero-config floor: a self-hosted relay behind most consumer NATs becomes reachable without any manual configuration. Phase 3 closes the remaining ~15% (symmetric NAT) with bridge relaying and adds STUN service to the relay fleet, making the network self-reinforcing. Domain-based deployment (Tier 4) is already specified in Phase 2 via §18.6.
