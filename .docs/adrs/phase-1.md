@@ -103,7 +103,7 @@ Each function below must be implemented and tested:
 
 8. **`generate_key_package(identity) -> KeyPackage`**
    - Generates a single-use KeyPackage for offline member addition.
-   - Signed by the identity's Ed25519 Identity Key (`#0`). KeyPackages are always signed by `#0`, not by `#active` or `#agent`, because they represent the identity's MLS participation (ADR-039).
+   - Signed by the credential key (`#active` or `#agent`) matching the `signing_key_id` in the member's `ScpCredential` (ADR-039). This is consistent with standard MLS behavior where the leaf node signature key matches the credential key, and avoids requiring the hardware-backed `#0` for routine background operations (the SDK replenishes KeyPackage buffers automatically).
    - The SDK must maintain a buffer of at least 10 unused KeyPackages per identity (spec section 9.7.4). Replenished when buffer drops below 5.
 
 9. **`destroy_group(group) -> ()`**
@@ -338,7 +338,7 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
 
    **4a′. `rotate_agent_key(identity, key_custody) -> Identity`** (Layer 1 — agent key rotation, ADR-039)
    - Generates a new Ed25519 keypair as the new Agent Signing Key via `key_custody.generate_keypair(KeyType::Ed25519)`.
-   - Updates the DID document: replaces the `#agent` verification method with the new key. Retains the old agent key as `#retired-agent-{sequence}` for historical verification.
+   - Updates the DID document: replaces the `#agent` verification method with the new key. Retains the old agent key as `#retired-agent-{sequence}` for historical verification. Retired key retention is bounded: the document retains at most the 2 most recent retired agent keys; older ones are pruned on rotation. This mirrors the `#retired-{sequence}` pattern for active key rotation and prevents unbounded DID document growth within DHT size constraints.
    - Signs the DID document update with the **Identity Key** (`#0`).
    - Publishes to DHT with incremented BEP44 sequence number.
    - Returns updated Identity with the new agent key handle.
@@ -1139,13 +1139,14 @@ DidDocument.verification_method = [
 
 ### Permission Model
 
-**Category A — Protocol-Immutable (`#0` only, agent key MUST NOT sign):** DID document modifications only. This is the minimal set that must be human-only for the security model to hold: if the agent can modify the DID document, it can modify its own constraints.
-- DID document updates (add/remove keys, change services, alter relays)
-- Pre-rotation commitments
-- Identity migration (Layer 2)
+**Category A — Protocol-Immutable (`#0` or `#active` only, agent key MUST NOT sign):** The minimal set that must be human-only for the security model to hold — if the agent can perform these actions, it can bootstrap its own authority or modify its own constraints.
+- DID document updates (add/remove keys, change services, alter relays) — requires `#0`
+- Pre-rotation commitments — requires `#0`
+- Identity migration (Layer 2) — requires `#0`
+- Root UCAN issuance — requires `#active`. Root UCANs are the origin of all delegation chains; an agent that can issue root UCANs can grant itself arbitrary capabilities. Sub-delegation (minting scoped UCANs from an existing delegation) is Category B.
 
 **Category B — User-Configurable:** All operational actions. Human sets defaults and limits per agent via UCAN `fct.scp_agent_permissions`.
-- Messaging, blocking, context creation/joining, tool invocation, UCAN minting, governance voting, spending — all configurable by the human with protocol defaults (messaging allowed, most other actions denied by default).
+- Messaging, blocking, context creation/joining, tool invocation, sub-UCAN minting, governance voting, spending — all configurable by the human with protocol defaults (messaging allowed, most other actions denied by default).
 
 **Category C — Context-Configurable:** Per-context restrictions on agent actions via existing governance mechanisms (no new primitives).
 - `agent_keys_allowed: false` — no agents in this context
@@ -1170,12 +1171,19 @@ DidDocument.verification_method = [
 `ScpCredential` gains a `signing_key_id: String` field (`"#active"` or `"#agent"`). Verifiers resolve the correct public key from the DID document based on this field. Same DID = same MLS membership entry. Agent key rotation doesn't require MLS re-key — only a credential update via MLS Update proposal.
 
 ```rust
+pub enum SigningKeyId {
+    Active,  // serializes to "#active"
+    Agent,   // serializes to "#agent"
+}
+
 pub struct ScpCredential {
     pub did: String,
     pub ucan_token: Option<String>,
-    pub signing_key_id: String,  // "#active" or "#agent"
+    pub signing_key_id: SigningKeyId,
 }
 ```
+
+`SigningKeyId` is an enum rather than a `String` to prevent invalid values at construction time — typos, case sensitivity, and unknown values are caught by the type system. The same enum is used for `signer_key_ref` on `SenderKeyEpochAdvance` and `signing_key_id` on `InnerEnvelope`. Wire serialization produces `"#active"`/`"#agent"` strings.
 
 ### UCAN Impact
 

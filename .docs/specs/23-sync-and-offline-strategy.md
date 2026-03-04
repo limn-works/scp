@@ -183,7 +183,7 @@ Messages may arrive out of order due to relay batching, multi-relay delivery, or
 
 ## 23.10 KeyPackage Pre-Publication
 
-To support offline member addition (a member can be added to a group even when they are not currently connected), the SDK pre-publishes `KeyPackage`s to relays. This ensures that an admin can add an offline member using a valid, pre-stored KeyPackage rather than waiting for the member to come online. KeyPackages are single-use and signed by the identity key `#0` (section 9.6). **Custody note (ADR-039):** Only `#0` (Identity Key) can sign KeyPackages — the `#agent` verification method cannot publish KeyPackages because KeyPackage signing is a Category A operation requiring the identity key.
+To support offline member addition (a member can be added to a group even when they are not currently connected), the SDK pre-publishes `KeyPackage`s to relays. This ensures that an admin can add an offline member using a valid, pre-stored KeyPackage rather than waiting for the member to come online. KeyPackages are single-use and signed by the credential key (`#active` or `#agent`) matching the member's `ScpCredential.signing_key_id` (ADR-039). This is consistent with standard MLS behavior where the leaf node signature key matches the credential key, and avoids requiring the hardware-backed `#0` for routine background operations.
 
 ## 23.11 Constants
 
