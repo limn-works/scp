@@ -218,7 +218,7 @@ impl<'de> Deserialize<'de> for SigningKeyId {
 /// document as a `PreRotationCommitment` service.
 ///
 /// See ADR-003 acceptance criterion 1 and ADR-039 for the full construction.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ScpIdentity {
     /// `did:dht` Identity Key (`#0`). Derives the DID string. Stored in
     /// highest-security custody (Secure Enclave, HSM). Used ONLY for DID

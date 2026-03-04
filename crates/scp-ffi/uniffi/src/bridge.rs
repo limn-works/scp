@@ -28,7 +28,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use scp_identity::{DidDht, DidMethod, ScpIdentity};
+use scp_identity::{DidDht, DidDocument as CoreDidDocument, DidMethod, ScpIdentity};
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
 use uuid::Uuid;
@@ -657,6 +657,13 @@ pub struct Identity {
     /// signing or key-rotation operation on this handle.
     #[allow(dead_code)]
     pub(crate) core_id: Option<ScpIdentity>,
+    /// Retained DID document for agent key operations.
+    ///
+    /// Needed by `add_agent_key`, `rotate_agent_key`, `remove_agent_key` which
+    /// take the current document as input. Updated in place when agent key
+    /// operations succeed.
+    #[allow(dead_code)]
+    pub(crate) core_document: Option<CoreDidDocument>,
     /// Retained `InMemoryKeyCustody` for in-memory custody paths.
     ///
     /// Key material lives here. Dropping this destroys all private keys.
@@ -711,6 +718,280 @@ impl Identity {
                 .to_owned(),
             code: "SCP-IDENT-1002".to_owned(),
         })
+    }
+
+    /// Returns whether this identity has an agent signing key (`#agent` VM).
+    ///
+    /// Checks the retained `ScpIdentity`'s `agent_signing_key` field.
+    /// Returns `false` for external/loaded identities without core state.
+    ///
+    /// See ADR-039 acceptance criterion 4.
+    #[must_use]
+    pub fn has_agent_key(&self) -> bool {
+        self.core_id
+            .as_ref()
+            .is_some_and(|id| id.agent_signing_key.is_some())
+    }
+
+    /// Returns the agent signing key's public key as a multibase-encoded string.
+    ///
+    /// Retrieves the `#agent` verification method's `publicKeyMultibase` from
+    /// the retained DID document. Returns `None` if no agent key exists.
+    ///
+    /// See ADR-039 acceptance criterion 4.
+    #[must_use]
+    pub fn get_agent_public_key(&self) -> Option<String> {
+        self.core_document
+            .as_ref()
+            .and_then(|doc| doc.agent_verification_method())
+            .map(|vm| vm.public_key_multibase.clone())
+    }
+
+    /// Adds an agent signing key to this identity (ADR-039).
+    ///
+    /// Generates a new Ed25519 keypair for the `#agent` verification method,
+    /// adds it to the DID document, publishes the updated document to the DHT,
+    /// and returns a new `Identity` handle with the agent key.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Identity` if:
+    /// - The identity already has an agent key
+    /// - No in-memory custody is available (feature-gated)
+    /// - Key generation or DHT publishing fails
+    ///
+    /// See ADR-039 acceptance criterion 4.
+    // async required by UniFFI export interface even though non-custody path has no await
+    #[allow(clippy::unused_async)]
+    pub async fn add_agent_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
+        #[cfg(not(feature = "allow_in_memory_custody"))]
+        {
+            Err(ScpError::Identity {
+                message: "agent key operations require in-memory custody — \
+                          enable the \"allow_in_memory_custody\" feature or use \
+                          the platform KeyCustodyProvider interface"
+                    .to_owned(),
+                code: "SCP-IDN-1008".to_owned(),
+            })
+        }
+
+        #[cfg(feature = "allow_in_memory_custody")]
+        {
+            let core_id = self.core_id.as_ref().ok_or_else(|| ScpError::Identity {
+                message: "cannot add agent key to an external/loaded identity \
+                          without core state — use identity_create first"
+                    .to_owned(),
+                code: "SCP-IDENT-1005".to_owned(),
+            })?;
+            let core_doc = self
+                .core_document
+                .as_ref()
+                .ok_or_else(|| ScpError::Identity {
+                    message: "cannot add agent key without a retained DID document".to_owned(),
+                    code: "SCP-IDENT-1005".to_owned(),
+                })?;
+            let custody = self
+                .in_memory_custody
+                .as_ref()
+                .ok_or_else(|| ScpError::Identity {
+                    message: "cannot add agent key without in-memory custody".to_owned(),
+                    code: "SCP-IDN-1008".to_owned(),
+                })?
+                .clone();
+
+            // Clone what we need for the spawned task.
+            let identity_clone = core_id.clone();
+            let doc_clone = core_doc.clone();
+            let did = self.did.clone();
+            let custody_type = self.custody_type.clone();
+            let in_memory_custody = Some(custody.clone());
+
+            runtime()
+                .spawn(async move {
+                    let dht = DidDht::new();
+                    let (updated_identity, updated_doc) = dht
+                        .add_agent_key(&identity_clone, &doc_clone, &custody.0)
+                        .await
+                        .map_err(ScpError::from)?;
+
+                    let handle = Arc::new(Identity {
+                        did,
+                        custody_type,
+                        core_id: Some(updated_identity),
+                        core_document: Some(updated_doc),
+                        in_memory_custody,
+                    });
+                    increment_handle_count();
+                    Ok(handle)
+                })
+                .await
+                .map_err(|e| ScpError::Identity {
+                    message: format!("tokio task join error during add_agent_key: {e}"),
+                    code: "SCP-IDENT-1007".to_owned(),
+                })?
+        }
+    }
+
+    /// Removes the agent signing key from this identity (ADR-039).
+    ///
+    /// Removes the `#agent` verification method from the DID document,
+    /// publishes the updated document to the DHT, and returns a new `Identity`
+    /// handle without the agent key.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Identity` if:
+    /// - The identity has no agent key
+    /// - No in-memory custody is available (feature-gated)
+    /// - DHT publishing fails
+    ///
+    /// See ADR-039 acceptance criterion 4.
+    // async required by UniFFI export interface even though non-custody path has no await
+    #[allow(clippy::unused_async)]
+    pub async fn remove_agent_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
+        #[cfg(not(feature = "allow_in_memory_custody"))]
+        {
+            Err(ScpError::Identity {
+                message: "agent key operations require in-memory custody — \
+                          enable the \"allow_in_memory_custody\" feature or use \
+                          the platform KeyCustodyProvider interface"
+                    .to_owned(),
+                code: "SCP-IDN-1008".to_owned(),
+            })
+        }
+
+        #[cfg(feature = "allow_in_memory_custody")]
+        {
+            let core_id = self.core_id.as_ref().ok_or_else(|| ScpError::Identity {
+                message: "cannot remove agent key from an external/loaded identity \
+                          without core state"
+                    .to_owned(),
+                code: "SCP-IDENT-1005".to_owned(),
+            })?;
+            let core_doc = self
+                .core_document
+                .as_ref()
+                .ok_or_else(|| ScpError::Identity {
+                    message: "cannot remove agent key without a retained DID document".to_owned(),
+                    code: "SCP-IDENT-1005".to_owned(),
+                })?;
+
+            // Clone what we need for the spawned task.
+            let identity_clone = core_id.clone();
+            let doc_clone = core_doc.clone();
+            let did = self.did.clone();
+            let custody_type = self.custody_type.clone();
+            let in_memory_custody = self.in_memory_custody.clone();
+
+            runtime()
+                .spawn(async move {
+                    let dht = DidDht::new();
+                    let (updated_identity, updated_doc) = dht
+                        .remove_agent_key(&identity_clone, &doc_clone)
+                        .await
+                        .map_err(ScpError::from)?;
+
+                    let handle = Arc::new(Identity {
+                        did,
+                        custody_type,
+                        core_id: Some(updated_identity),
+                        core_document: Some(updated_doc),
+                        in_memory_custody,
+                    });
+                    increment_handle_count();
+                    Ok(handle)
+                })
+                .await
+                .map_err(|e| ScpError::Identity {
+                    message: format!("tokio task join error during remove_agent_key: {e}"),
+                    code: "SCP-IDENT-1007".to_owned(),
+                })?
+        }
+    }
+
+    /// Rotates the agent signing key for this identity (ADR-039).
+    ///
+    /// Generates a new Ed25519 keypair, moves the old `#agent` key to
+    /// `#retired-agent-{sequence}`, installs the new key as `#agent`, publishes
+    /// the updated DID document, and returns a new `Identity` handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Identity` if:
+    /// - The identity has no agent key to rotate
+    /// - No in-memory custody is available (feature-gated)
+    /// - Key generation or DHT publishing fails
+    ///
+    /// See ADR-039 acceptance criterion 4.
+    // async required by UniFFI export interface even though non-custody path has no await
+    #[allow(clippy::unused_async)]
+    pub async fn rotate_agent_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
+        #[cfg(not(feature = "allow_in_memory_custody"))]
+        {
+            Err(ScpError::Identity {
+                message: "agent key operations require in-memory custody — \
+                          enable the \"allow_in_memory_custody\" feature or use \
+                          the platform KeyCustodyProvider interface"
+                    .to_owned(),
+                code: "SCP-IDN-1008".to_owned(),
+            })
+        }
+
+        #[cfg(feature = "allow_in_memory_custody")]
+        {
+            let core_id = self.core_id.as_ref().ok_or_else(|| ScpError::Identity {
+                message: "cannot rotate agent key on an external/loaded identity \
+                          without core state"
+                    .to_owned(),
+                code: "SCP-IDENT-1005".to_owned(),
+            })?;
+            let core_doc = self
+                .core_document
+                .as_ref()
+                .ok_or_else(|| ScpError::Identity {
+                    message: "cannot rotate agent key without a retained DID document".to_owned(),
+                    code: "SCP-IDENT-1005".to_owned(),
+                })?;
+            let custody = self
+                .in_memory_custody
+                .as_ref()
+                .ok_or_else(|| ScpError::Identity {
+                    message: "cannot rotate agent key without in-memory custody".to_owned(),
+                    code: "SCP-IDN-1008".to_owned(),
+                })?
+                .clone();
+
+            // Clone what we need for the spawned task.
+            let identity_clone = core_id.clone();
+            let doc_clone = core_doc.clone();
+            let did = self.did.clone();
+            let custody_type = self.custody_type.clone();
+            let in_memory_custody = Some(custody.clone());
+
+            runtime()
+                .spawn(async move {
+                    let dht = DidDht::new();
+                    let (updated_identity, updated_doc) = dht
+                        .rotate_agent_key(&identity_clone, &doc_clone, &custody.0)
+                        .await
+                        .map_err(ScpError::from)?;
+
+                    let handle = Arc::new(Identity {
+                        did,
+                        custody_type,
+                        core_id: Some(updated_identity),
+                        core_document: Some(updated_doc),
+                        in_memory_custody,
+                    });
+                    increment_handle_count();
+                    Ok(handle)
+                })
+                .await
+                .map_err(|e| ScpError::Identity {
+                    message: format!("tokio task join error during rotate_agent_key: {e}"),
+                    code: "SCP-IDENT-1007".to_owned(),
+                })?
+        }
     }
 }
 
@@ -992,13 +1273,14 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
                         let key_custody =
                             Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
                         let dht = DidDht::new();
-                        let (identity, _document) =
+                        let (identity, document) =
                             dht.create(&key_custody.0).await.map_err(ScpError::from)?;
 
                         let handle = Arc::new(Identity {
                             did: identity.did.clone(),
                             custody_type: CustodyMethod::InMemory,
                             core_id: Some(identity),
+                            core_document: Some(document),
                             in_memory_custody: Some(key_custody),
                         });
                         increment_handle_count();
@@ -1073,6 +1355,7 @@ pub async fn identity_load(did: String) -> Result<Arc<Identity>, ScpError> {
                 did,
                 custody_type: CustodyMethod::External,
                 core_id: None,
+                core_document: None,
                 #[cfg(feature = "allow_in_memory_custody")]
                 in_memory_custody: None,
             });

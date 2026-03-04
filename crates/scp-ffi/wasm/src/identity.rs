@@ -70,6 +70,16 @@ pub struct WasmIdentity {
     did: String,
     /// The custody type used at identity creation (`"js_custody"`).
     custody_type: String,
+    /// Whether this identity has an `#agent` verification method.
+    ///
+    /// Managed locally (no scp-core dependency, per ADR-034).
+    /// Set via `addAgentKey()` / `removeAgentKey()` / `rotateAgentKey()`.
+    has_agent_key: bool,
+    /// The agent key's public key as a multibase-encoded string, if present.
+    ///
+    /// Stored as metadata for JS-side consumption. Actual key material is
+    /// managed by the JS `SubtleCrypto` API via `JsKeyCustody`.
+    agent_public_key_multibase: Option<String>,
 }
 
 #[wasm_bindgen]
@@ -114,7 +124,117 @@ impl WasmIdentity {
         Ok(Self {
             did,
             custody_type: "js_custody".to_owned(),
+            has_agent_key: false,
+            agent_public_key_multibase: None,
         })
+    }
+
+    /// Returns whether this identity has an agent signing key (`#agent` VM).
+    ///
+    /// See ADR-039 acceptance criterion 4.
+    #[must_use]
+    #[wasm_bindgen(getter, js_name = "hasAgentKey")]
+    pub fn has_agent_key(&self) -> bool {
+        self.has_agent_key
+    }
+
+    /// Returns the agent key's public key as a multibase string, or `null`.
+    ///
+    /// See ADR-039 acceptance criterion 4.
+    #[must_use]
+    #[wasm_bindgen(getter, js_name = "agentPublicKey")]
+    pub fn agent_public_key(&self) -> Option<String> {
+        self.agent_public_key_multibase.clone()
+    }
+
+    /// Adds an agent signing key to this identity (ADR-039).
+    ///
+    /// The TypeScript SDK is responsible for:
+    /// 1. Generating the Ed25519 agent keypair via `SubtleCrypto.generateKey`.
+    /// 2. Encoding the public key as multibase.
+    /// 3. Updating the DID document on the DHT to include the `#agent` VM.
+    /// 4. Calling this method with the multibase public key to record state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `[SCP-IDENT-1009]` if the identity already has an agent key.
+    /// Returns `[SCP-IDENT-1010]` if the public key is empty.
+    #[wasm_bindgen(js_name = "addAgentKey")]
+    pub fn add_agent_key(&mut self, public_key_multibase: String) -> Result<(), JsError> {
+        if self.has_agent_key {
+            return Err(ScpWasmError::Identity {
+                message: "identity already has an agent key — remove it first or use \
+                          rotateAgentKey"
+                    .to_owned(),
+                code: "SCP-IDENT-1009".to_owned(),
+            }
+            .into_js());
+        }
+        if public_key_multibase.is_empty() {
+            return Err(ScpWasmError::Identity {
+                message: "agent public key multibase string must not be empty".to_owned(),
+                code: "SCP-IDENT-1010".to_owned(),
+            }
+            .into_js());
+        }
+        self.has_agent_key = true;
+        self.agent_public_key_multibase = Some(public_key_multibase);
+        Ok(())
+    }
+
+    /// Removes the agent signing key from this identity (ADR-039).
+    ///
+    /// The TypeScript SDK is responsible for:
+    /// 1. Removing the `#agent` VM from the DID document on the DHT.
+    /// 2. Calling this method to update local state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `[SCP-IDENT-1011]` if the identity has no agent key.
+    #[wasm_bindgen(js_name = "removeAgentKey")]
+    pub fn remove_agent_key(&mut self) -> Result<(), JsError> {
+        if !self.has_agent_key {
+            return Err(ScpWasmError::Identity {
+                message: "identity has no agent key to remove".to_owned(),
+                code: "SCP-IDENT-1011".to_owned(),
+            }
+            .into_js());
+        }
+        self.has_agent_key = false;
+        self.agent_public_key_multibase = None;
+        Ok(())
+    }
+
+    /// Rotates the agent signing key for this identity (ADR-039).
+    ///
+    /// The TypeScript SDK is responsible for:
+    /// 1. Generating the new Ed25519 agent keypair via `SubtleCrypto.generateKey`.
+    /// 2. Encoding the new public key as multibase.
+    /// 3. Updating the DID document on the DHT (retiring old `#agent`, installing new).
+    /// 4. Calling this method with the new multibase public key to update state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `[SCP-IDENT-1011]` if the identity has no agent key to rotate.
+    /// Returns `[SCP-IDENT-1010]` if the new public key is empty.
+    #[wasm_bindgen(js_name = "rotateAgentKey")]
+    pub fn rotate_agent_key(&mut self, new_public_key_multibase: String) -> Result<(), JsError> {
+        if !self.has_agent_key {
+            return Err(ScpWasmError::Identity {
+                message: "identity has no agent key to rotate — use addAgentKey first".to_owned(),
+                code: "SCP-IDENT-1011".to_owned(),
+            }
+            .into_js());
+        }
+        if new_public_key_multibase.is_empty() {
+            return Err(ScpWasmError::Identity {
+                message: "new agent public key multibase string must not be empty".to_owned(),
+                code: "SCP-IDENT-1010".to_owned(),
+            }
+            .into_js());
+        }
+        self.agent_public_key_multibase = Some(new_public_key_multibase);
+        Ok(())
     }
 }
 
@@ -273,6 +393,8 @@ pub fn identity_load(did: String) -> Promise {
         Ok(JsValue::from(WasmIdentity {
             did,
             custody_type: "js_custody".to_owned(),
+            has_agent_key: false,
+            agent_public_key_multibase: None,
         }))
     })
 }
