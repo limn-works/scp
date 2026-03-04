@@ -246,9 +246,9 @@ Each adapter requires credentials to operate (wallet private key, LND macaroon, 
 - **Adapter credential** = capability ("here's how to move money")
 - Both required for any payment. UCAN without credential = can't pay. Credential without UCAN = not authorized to pay.
 
-Credentials are bound to the human identity, not the agent. An agent never holds raw payment credentials — it holds a spending UCAN that authorizes the SDK (which holds the credential) to execute payments on its behalf. This separation is critical: revoking the spending UCAN instantly cuts off the agent's ability to spend, without needing to rotate the underlying payment credential.
+Credentials are bound to the human identity, not a separate agent identity. Under the shared-DID model (ADR-039), the agent's `#agent` verification method on the human's DID never holds raw payment credentials — it holds a spending UCAN that authorizes the SDK (which holds the credential) to execute payments on its behalf. This separation is critical: revoking the spending UCAN instantly cuts off the agent's ability to spend, without needing to rotate the underlying payment credential.
 
-Credential rotation follows identity key rotation (§9.12). SPL-specific: human calls `ApproveChecked` granting agent's keypair delegate authority on their USDC ATA — single delegate per account, amount-capped.
+Credential rotation follows identity key rotation (§9.12). SPL-specific: human calls `ApproveChecked` granting the `#agent` verification method's keypair delegate authority on their USDC ATA — single delegate per account, amount-capped.
 
 ### 19.2.6 Conformance Testing
 
@@ -393,7 +393,7 @@ pub struct SpendingCapability {
 
 **AND composition:** Action UCAN + spending UCAN both required for paid actions. Agent with `messagesWrite` but no spending UCAN cannot send paid messages. Agent with spending UCAN but no `messagesWrite` cannot spend on messages. Both capabilities are independently verified before any paid action proceeds.
 
-**Delegation chain:** Human root DID → spending UCAN → agent DID. Attenuation applies: sub-delegation must narrow, never widen. An agent granted $100/day can delegate $10/day to a sub-agent. UCAN standard attenuation rules (§7.2) apply unchanged.
+**Delegation chain:** Human DID (`#active`) → spending UCAN (self-delegation with `fct.scp_key_scope: "#agent"`) → same DID (`#agent` scoped). Attenuation applies: sub-delegation must narrow, never widen. An agent granted $100/day can delegate $10/day to a sub-agent. UCAN standard attenuation rules (§7.2) apply unchanged.
 
 **No implicit spending:** Protocol NEVER authorizes expenditure without explicit spending UCAN. Missing UCAN → `SpendingCapabilityRequired` error. Agent can still perform free actions in the context.
 
@@ -438,7 +438,7 @@ Economic governance introduces new event types for the verifiable event log (ADR
 |---|---|---|
 | `PaymentReceived` | `adapter.capture()` succeeds | `PaymentReceipt` |
 | `EconomicPolicyChanged` | Governance updates economic policy | Old policy hash, new `EconomicPolicy`, governance justification |
-| `SpendingUcanGranted` | Human grants spending UCAN to agent | Agent DID, `SpendingCapability` summary (amounts, window), UCAN token ID |
+| `SpendingUcanGranted` | Human grants spending UCAN to agent | Agent key `#agent` on human's DID, `SpendingCapability` summary (amounts, window), UCAN token ID |
 | `SpendingUcanRevoked` | Human revokes spending UCAN | UCAN token ID, revocation reason |
 
 These extend the existing event type enum alongside `MessageSent`, `MemberJoined`, `RoleAssigned`, `ToolInvoked`, etc. All economic events carry the same Merkle-tree inclusion guarantees as other event types.
@@ -556,7 +556,7 @@ SCP.Identity.configureAdapter(adapter) → ()
 
 **Payment adapter trust:** Malicious adapter could falsify receipts. Mitigation: `verify()` checks against the payment rail (on-chain state, preimage hash), not the adapter's word. Receipts are signed by the payer's DID key — adapter cannot forge the payer's signature.
 
-**Spending UCAN theft:** Compromised agent spends up to `max_total` within `time_window`. Mitigation: 24-hour maximum expiry (§9.5), independent revocation (§7.4.4), conservative limits. Blast radius bounded by the UCAN's constraints.
+**Spending UCAN theft:** Compromised `#agent` verification method on human's own DID spends up to `max_total` within `time_window`. Mitigation: 24-hour maximum expiry (§9.5), independent revocation (§7.4.4), conservative limits. Blast radius bounded by the UCAN's constraints — but note that under the shared-DID model (ADR-039), the blast radius extends to the human's identity reputation since agent actions are attributed to the same DID.
 
 **Privacy:** Payment adapter sees transaction metadata but not context content. For context-level payments, payment data is inside the encrypted envelope — the adapter sees amount and DIDs but not what the payment is for. For relay-level payments, the adapter sees the relay operation but not the encrypted content. For maximum privacy, Lightning's onion routing or local-only adapters.
 

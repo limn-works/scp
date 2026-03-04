@@ -65,7 +65,7 @@ Every protocol action is zero-trust. An agent presents a UCAN capability token w
 
 No action proceeds on reputation or identity alone. A trusted DID with an expired token is denied. An unknown DID with a valid token is permitted. This layer is mandatory and non-negotiable.
 
-**Capability tokens** are fine-grained, per-agent, per-context, per-capability. Build on UCAN (User Controlled Authorization Networks). A human grants their agent specific capabilities for specific contexts. Tokens are independently revocable — you can revoke one capability from one agent in one context without affecting anything else. The UCAN chain provides verifiable delegation: the protocol can trace any token back to the root authority that granted it.
+**Capability tokens** are fine-grained, per-context, per-capability. Build on UCAN (User Controlled Authorization Networks). Under the shared-DID model (ADR-039), intra-DID delegation uses self-delegation UCANs where `iss == aud` (same DID), the issuing key is `#active`, and `fct.scp_key_scope: "#agent"` scopes the delegation to the agent verification method. Tokens are independently revocable — you can revoke one capability from one agent in one context without affecting anything else. The UCAN chain provides verifiable delegation: the protocol can trace any token back to the root authority that granted it.
 
 ## 7.3 Layer 2: Behavioral Validation
 

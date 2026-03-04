@@ -385,7 +385,7 @@ pub struct RoleDefinition {
    - Verifies assigner has `RoleAssign` capability (via UCAN validation).
    - Validates role exists in context's role definitions.
    - Mints UCAN tokens for each capability in the role's permission set.
-   - Each token: `iss` = context creator DID, `aud` = member DID, `att` = `[{ "with": "scp:ctx:{context_id}/{capability}", "can": "invoke" }]`, `nnc` = unique nonce.
+   - Each token: `iss` = context creator DID, `aud` = member DID, `att` = `[{ "with": "scp:ctx:{context_id}/{capability}", "can": "invoke" }]`, `nnc` = unique nonce. The UCAN header includes `kid` (ADR-039) identifying the signing verification method (e.g., `"#active"` or `"#agent"`), enabling verifiers to resolve the correct public key from the issuer's DID document.
    - Distributes tokens to the member via MLS application message.
    - Revokes any previous tokens for this member (role change).
    - Appends `RoleAssigned` event to event log.
@@ -397,10 +397,10 @@ pub struct RoleDefinition {
 
    The 11 steps:
    1. **Parse** — Decode JWT-format UCAN token; reject malformed tokens.
-   2. **Signature verification** — Verify Ed25519 signature over `base64url(header).base64url(payload)`.
+   2. **Signature verification** — Verify Ed25519 signature over `base64url(header).base64url(payload)`. If the header contains `kid` (ADR-039), resolve the correct public key from the issuer's DID document using that verification method ID (e.g., `"#active"`, `"#agent"`). If `kid` is absent, default to the issuer's `#active` verification method.
    3. **Chain verification** — For each proof CID in `prf`, resolve parent UCAN, verify its signature, verify parent's `aud` matches this token's `iss`. Recurse to root.
    4. **Root issuer** — Verify root token's `iss` is the context creator's DID.
-   5. **Audience** — Verify token's `aud` matches the presenting agent's DID.
+   5. **Audience** — Verify token's `aud` matches the presenting agent's DID. Self-delegation (`iss == aud`) is valid when the token's `fct` contains `scp_key_scope` (ADR-039), indicating key-scope delegation (e.g., human delegates to their own agent key).
    6. **Capability match** — Verify token's `att` includes the `required_capability`.
    7. **Attenuation** — Verify each delegation narrows or preserves capabilities (never widens).
    8. **Ceiling** — Verify `required_capability` is within the context's immutable capability ceiling.
@@ -703,7 +703,7 @@ Implement an append-only Merkle tree per context in `scp-core/event_log/`. The t
 
 - **ADR-008 (Context):** The event log is owned by a context. Every context state transition is an event. The Context Manager appends events to the log.
 - **ADR-002 (Envelope):** Events reference envelope hashes for message events.
-- **ADR-003 (DID):** Events are signed by the acting agent's DID. Checkpoint signatures are verified against DID public keys.
+- **ADR-003 (DID):** Events are signed by the acting agent's DID. The `Event` struct includes a `signing_key_id` field (ADR-039) identifying which verification method signed (e.g., `"#active"` or `"#agent"`), enabling verifiers to resolve the correct public key from the actor's DID document. Checkpoint signatures are verified against DID public keys.
 
 ### Acceptance Criteria
 
@@ -720,6 +720,7 @@ pub struct EventLog {
 pub struct Event {
     pub event_type: EventType,
     pub actor_did: DID,
+    pub signing_key_id: String,     // Which VM signed: "#active" or "#agent" (ADR-039)
     pub timestamp: u64,
     pub sequence: u64,              // Monotonic event sequence within this log
     pub payload: EventPayload,      // Type-specific data
@@ -839,7 +840,7 @@ pub struct ConsistencyCheckpoint {
 }
 ```
 
-   - **`generate_checkpoint(log: &EventLog, sender_did: &DID, epoch: u64, signing_key: &KeyHandle) -> Result<ConsistencyCheckpoint, EventLogError>`**: Creates and signs a checkpoint from the current log state.
+   - **`generate_checkpoint(log: &EventLog, sender_did: &DID, epoch: u64, signing_key: &KeyHandle, signing_key_id: &str) -> Result<ConsistencyCheckpoint, EventLogError>`**: Creates and signs a checkpoint from the current log state. The `signing_key_id` (ADR-039) identifies which verification method signed (accepts `"#active"` or `"#agent"`).
    - **`compare_checkpoint(local_log: &EventLog, remote_checkpoint: &ConsistencyCheckpoint) -> CheckpointComparison`**: Compares a received checkpoint against local state. Returns `Consistent`, `Divergent { first_divergent_event: Option<u64> }`, `Behind { missing_events: u64 }`, or `Ahead { extra_events: u64 }`.
    - Checkpoints are generated every 50 events or every 10 minutes, whichever comes first (spec section 9.9.3).
    - Checkpoints are sent as regular MLS application messages.

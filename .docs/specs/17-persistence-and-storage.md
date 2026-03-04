@@ -78,6 +78,7 @@ All keys follow `{namespace}/{entity_id}/{sub_key}` with `/` as the hierarchy se
 ```
 identity/{did}/document
 identity/{did}/active_signing_key
+identity/{did}/agent_signing_key
 identity/{did}/private_state/{seq:020d}
 
 context/{context_id}/state

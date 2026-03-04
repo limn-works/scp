@@ -557,7 +557,7 @@ agent_deregister(did) -> { removed }
 ```
 
 2. **DID document capability resolution:**
-   - `resolve_capabilities(did) -> Result<CapabilityEntry, DiscoveryError>`: Resolve DID via did:dht, extract `SCPCapabilities` from service array, cache in local contact index.
+   - `resolve_capabilities(did) -> Result<CapabilityEntry, DiscoveryError>`: Resolve DID via did:dht, extract `SCPCapabilities` from service array, cache in local contact index. Resolution returns all verification methods including the optional `#agent` VM (ADR-039), enabling callers to determine whether a DID has agent delegation enabled.
 
 3. **Discovery context standard tools:**
    - `agent_search`, `agent_register`, `agent_deregister` implemented per schema.
@@ -682,10 +682,10 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
    async fn identity_resolve(did: String) -> Result<DIDDocument, ScpError> { ... }
    ```
 
-   - `identity_create(custody) -> Identity` — creates a new DID identity. `custody` is a string: `"platform"`, `"in_memory"`.
+   - `identity_create(custody) -> Identity` — creates a new DID identity with up to four keypairs (Identity Key, Active Signing Key, Pre-Rotation Key, and optionally Agent Signing Key per ADR-039). `custody` is a string: `"platform"`, `"in_memory"`.
    - `identity_load(did) -> Identity` — loads an existing identity from storage.
-   - `identity_resolve(did) -> DIDDocument` — resolves a DID to its document.
-   - `Identity` is an opaque object interface exposing: `did() -> String`, `custody_type() -> String`, `rotate_key() -> Identity`.
+   - `identity_resolve(did) -> DIDDocument` — resolves a DID to its document. The returned `DIDDocument` includes all verification methods: `#0`, `#active`, and optionally `#agent` (ADR-039).
+   - `Identity` is an opaque object interface exposing: `did() -> String`, `custody_type() -> String`, `rotateActiveKey() -> Identity`, `rotateAgentKey() -> Identity` (ADR-039 — separate rotation for `#active` and `#agent` keys).
 
 3. **Context bridge functions:**
 
@@ -1255,8 +1255,9 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
    ```
    - `Identity.create({ custody: "in_memory" })` returns an `Identity` with a `did:dht:` DID.
    - `Identity.load(did)` rehydrates an existing identity from storage.
-   - `Identity.resolve(did)` returns a `DIDDocument` with at least one verification method.
-   - `Identity.rotateKey()` returns a new `Identity` with an updated DID document.
+   - `Identity.resolve(did)` returns a `DIDDocument` with at least two verification methods (`#0`, `#active`), and optionally `#agent` if agent delegation is configured (ADR-039).
+   - `Identity.rotateActiveKey()` returns a new `Identity` with a rotated `#active` key.
+   - `Identity.rotateAgentKey()` returns a new `Identity` with a rotated (or newly provisioned) `#agent` key (ADR-039).
 
 3. **Context API:**
    ```typescript

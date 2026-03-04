@@ -880,7 +880,7 @@ pub struct BroadcastEnvelope {
 
 **Signature formula:**
 ```
-Ed25519_sign(active_signing_key, SHA-256(
+Ed25519_sign(active_signing_key_or_agent_signing_key, SHA-256(
     context_id || sender_did || sequence || key_epoch || timestamp || content_hash || provenance_hash
 ))
 ```
@@ -889,7 +889,7 @@ Where `provenance_hash = SHA256(serialize(provenance))` if present, or `SHA256(0
 
 **Send path:** validate UCAN (`messagesWrite`) → assign sequence number → hash plaintext → hash provenance → sign → AES-256-GCM encrypt with author broadcast key → serialize → wrap in OuterEnvelope → relay PUBLISH.
 
-**Receive path:** transport receive → dedup by blob hash → deserialize → verify signature against author's known Active Signing Key → decrypt with cached author broadcast key for this epoch → verify `content_hash == SHA-256(decrypted_content)` → verify author UCAN → replay check (sequence number) → deliver to application layer.
+**Receive path:** transport receive → dedup by blob hash → deserialize → verify signature against author's Active Signing Key or Agent Signing Key from sender's DID document → decrypt with cached author broadcast key for this epoch → verify `content_hash == SHA-256(decrypted_content)` → verify author UCAN → replay check (sequence number) → deliver to application layer.
 
 ### 5.14.6 Routing
 

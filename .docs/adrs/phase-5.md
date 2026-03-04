@@ -28,7 +28,7 @@ Spec §12 comprehensively specifies bridge architecture. Bridges are protocol en
 
 ### Decision
 
-Implement bridge support in `scp-core/bridge/`. Bridge connector as registered protocol entity with accountable operator DID. Shadow identities as restricted participants (observer default). Four operating modes (Relay, Puppet, Api, Cooperative). All bridged content carries full provenance chain. Shadow claiming via identity attestation (§3.5) is one-way and irreversible.
+Implement bridge support in `scp-core/bridge/`. Bridge connector as registered protocol entity with accountable operator DID. The bridge operator signs bridge protocol messages with the `#agent` verification method on the operator's DID (ADR-039), allowing automated bridge operation without exposing the operator's `#active` key to the bridge software. Shadow identities as restricted participants (observer default). Four operating modes (Relay, Puppet, Api, Cooperative). All bridged content carries full provenance chain. Shadow claiming via identity attestation (§3.5) is one-way and irreversible.
 
 ### Rationale
 
@@ -469,7 +469,7 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 ### Acceptance Criteria
 
 1. **`AppleKeyCustody` — Keychain storage:**
-   - `generateKeypair(keyType: KeyType) -> KeyHandle`: Generates an Ed25519 or X25519 keypair. Private key bytes stored in Keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. Returns an opaque handle (UUID string). Fails with `PlatformError.keychainError(OSStatus)` on Keychain failure.
+   - `generateKeypair(keyType: KeyType) -> KeyHandle`: Generates an Ed25519 or X25519 keypair. Private key bytes stored in Keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. Returns an opaque handle (UUID string). Fails with `PlatformError.keychainError(OSStatus)` on Keychain failure. Called four times during identity creation when agent delegation is enabled (ADR-039): Identity Key, Active Signing Key, Pre-Rotation Key, and Agent Signing Key. The Agent Signing Key is always software-held (Keychain, not Secure Enclave) since it is designed for autonomous agent operation.
    - `sign(keyHandle: String, data: Data) -> Data`: Retrieves Ed25519 private key from Keychain, signs `data`, returns 64-byte signature. Returns `PlatformError.wrongKeyType` for X25519 handles.
    - `publicKey(keyHandle: String) -> Data`: Returns the 32-byte public key for a handle. Derived from the stored private key bytes.
    - `destroyKey(keyHandle: String)`: Deletes the Keychain item. Verifies deletion by confirming `errSecItemNotFound` on re-fetch. Returns `PlatformError.destructionFailed` if the item persists.

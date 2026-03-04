@@ -104,7 +104,7 @@ Any one of the following triggers a group state reset:
 
 ### 23.5.2 Reset Protocol
 
-1. The reconnecting member publishes a `ResetRequest` via the relay (not MLS-encrypted -- the member may not be able to encrypt at the current epoch). The request is signed by the member's Active Signing Key for authentication. Includes context_id, member_did, last_known_epoch, reset reason, and signature.
+1. The reconnecting member publishes a `ResetRequest` via the relay (not MLS-encrypted -- the member may not be able to encrypt at the current epoch). The request is signed by the member's Active Signing Key or Agent Signing Key (`#active` or `#agent`) for authentication. Includes context_id, member_did, last_known_epoch, reset reason, and signature.
 2. An online member with `MemberRemove` + `MemberInvite` capabilities (typically admin) processes the reset: (a) removes the offline member's stale leaf node via MLS `remove_member()`, (b) immediately re-adds the member using a fresh KeyPackage via MLS `add_member()`, (c) distributes the new Welcome message via relay.
 3. The reconnecting member processes the Welcome, joining the group at the current epoch. They request sender keys for all current members via the pull-based protocol (ADR-007).
 4. The reconnecting member's outbound queue is drained using the new epoch's key schedule.
@@ -183,7 +183,7 @@ Messages may arrive out of order due to relay batching, multi-relay delivery, or
 
 ## 23.10 KeyPackage Pre-Publication
 
-To support offline member addition (a member can be added to a group even when they are not currently connected), the SDK pre-publishes `KeyPackage`s to relays. This ensures that an admin can add an offline member using a valid, pre-stored KeyPackage rather than waiting for the member to come online. KeyPackages are single-use and signed by the identity key (section 9.6).
+To support offline member addition (a member can be added to a group even when they are not currently connected), the SDK pre-publishes `KeyPackage`s to relays. This ensures that an admin can add an offline member using a valid, pre-stored KeyPackage rather than waiting for the member to come online. KeyPackages are single-use and signed by the credential key (`#active` or `#agent`) matching the member's `ScpCredential.signing_key_id` (ADR-039). This is consistent with standard MLS behavior where the leaf node signature key matches the credential key, and avoids requiring the hardware-backed `#0` for routine background operations.
 
 ## 23.11 Constants
 

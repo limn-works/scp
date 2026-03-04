@@ -95,7 +95,8 @@ Implement the FFI bridge in `crates/scp-ffi/src/` using PyO3 and maturin. The br
    - `py_identity_create(custody) -> PyIdentity` — creates a new DID identity. `custody` is a string: `"platform"`, `"in_memory"`.
    - `py_identity_load(did) -> PyIdentity` — loads an existing identity from storage.
    - `py_identity_resolve(did) -> PyDIDDocument` — resolves a DID to its document.
-   - `py_identity_rotate_key(identity) -> PyIdentity` — rotates the identity's key.
+   - `py_identity_rotate_active_key(identity) -> PyIdentity` — rotates the identity's Active Signing Key (`#active`).
+   - `py_identity_rotate_agent_key(identity) -> PyIdentity` — rotates (or provisions) the identity's Agent Signing Key (`#agent`). See ADR-039.
 
 3. **Context bridge functions:**
    - `py_context_create(identity, params) -> PyContextHandle` — creates a context. `params` is a Python dict converted to `ContextParams`.
@@ -674,7 +675,7 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
 ### Rationale
 
 - **Per-action validation is non-negotiable:** The spec mandates UCAN validation on every action (spec section 7.2). A token revoked mid-session takes effect immediately — the next action fails. This is not an optimization target; it is a security invariant. Validation is in the hot path for every SCP operation.
-- **Attenuation chain verification:** UCAN tokens support delegation — Alice delegates to Bob, who delegates to Carol. Each delegation can attenuate (narrow) capabilities. The validation module must verify the complete chain: every signature valid, every delegation narrower than or equal to its parent, root issuer is the context creator. Attenuation violations (a delegatee claiming broader capabilities than delegated) must be rejected.
+- **Attenuation chain verification:** UCAN tokens support delegation — Alice delegates to Bob, who delegates to Carol. Each delegation can attenuate (narrow) capabilities. The validation module must verify the complete chain: every signature valid (using the `kid` at each link to resolve the correct verification method, ADR-039), every delegation narrower than or equal to its parent, root issuer is the context creator. Attenuation violations (a delegatee claiming broader capabilities than delegated) must be rejected.
 - **Nonce uniqueness for replay prevention (spec section 9.5):** Every UCAN token includes a mandatory `nnc` (nonce) field. The SDK tracks seen nonces per context and rejects duplicates. Without nonce tracking, a captured UCAN could be replayed to authorize actions the human never intended. Nonces are pruned after 24 hours to bound storage.
 - **Ceiling integration:** UCAN capabilities are bounded by the context's immutable capability ceiling (spec section 5.3). A valid UCAN chain that grants a capability outside the ceiling is rejected. Ceiling checking is a constant-time set membership test, performed as part of every validation.
 - **Rust implementation, Python exposure:** Validation logic is implemented in Rust for performance (hot path) and correctness (crypto operations). Python sees a clean API surface via the bridge. Validation failures surface as `scp_sdk.PermissionError` with descriptive messages.
@@ -711,6 +712,11 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
        pub alg: String,                // "EdDSA"
        pub typ: String,                // "JWT" (UCAN is JWT-based)
        pub ucv: String,                // UCAN version, "0.10.0"
+       pub kid: Option<String>,        // Key ID per RFC 7515 (ADR-039): identifies the issuer's
+                                       // verification method (e.g., "#active", "#agent"). When
+                                       // present, verifiers resolve the public key from the
+                                       // issuer's DID document using this VM ID. When absent,
+                                       // defaults to "#active".
    }
 
    pub struct UcanPayload {
@@ -732,10 +738,10 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
 
 2. **`validate_ucan(context, token, required_capability) -> Result<(), UcanError>`:**
    - **Step 1 — Parse:** Decode the JWT-format UCAN token. Reject malformed tokens.
-   - **Step 2 — Signature verification:** Verify the Ed25519 signature on the token. The signature covers `base64url(header).base64url(payload)`.
+   - **Step 2 — Signature verification:** Verify the Ed25519 signature on the token. The signature covers `base64url(header).base64url(payload)`. If the header contains `kid` (ADR-039), resolve the correct public key from the issuer's DID document using that verification method ID. If `kid` is absent, default to `#active`. At every link in the delegation chain, the `kid` (if present) identifies which key signed that particular token.
    - **Step 3 — Chain verification:** For each proof CID in `prf`, resolve the parent UCAN, verify its signature, and verify the parent's `aud` matches this token's `iss` (delegation chain integrity). Recurse until reaching a root token (empty `prf`).
-   - **Step 4 — Root issuer:** Verify the root token's `iss` is the context creator's DID.
-   - **Step 5 — Audience:** Verify the token's `aud` matches the presenting agent's DID.
+   - **Step 4 — Root issuer:** Verify the root token's `iss` is the context creator's DID. Agent keys (`#agent`) cannot issue root UCANs — root UCAN issuance requires `#active` (the human signing key). This ensures human accountability at the root of every delegation chain (ADR-039).
+   - **Step 5 — Audience:** Verify the token's `aud` matches the presenting agent's DID. Self-delegation (`iss == aud`) is valid when the token's `fct` contains `scp_key_scope` (ADR-039), indicating key-scope delegation (e.g., `fct.scp_key_scope: "#agent"` delegates authority from the human's `#active` key to their own `#agent` key on the same DID).
    - **Step 6 — Capability match:** Verify the token's `att` includes the `required_capability`. Capability matching supports wildcards (`scp:ctx:*/messages:write` matches any context).
    - **Step 7 — Attenuation:** Verify each delegation in the chain narrows or preserves capabilities (never widens). A child token cannot grant capabilities its parent does not have.
    - **Step 8 — Ceiling:** Verify the `required_capability` is within the context's immutable capability ceiling.
@@ -744,11 +750,12 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
    - **Step 11 — Expiry:** Verify `exp > now` and `nbf <= now` (if present).
    - Returns `Ok(())` if all 11 checks pass. Returns a specific `UcanError` variant indicating which check failed.
 
-3. **`mint_ucan(issuer, audience, capabilities, context_id, expiry) -> UcanToken`:**
+3. **`mint_ucan(issuer, audience, capabilities, context_id, expiry, signing_key_ref) -> UcanToken`:**
    - Creates a new UCAN token.
+   - The `signing_key_ref` parameter (ADR-039) identifies which verification method to sign with (e.g., `"#active"` or `"#agent"`). This value is stored in the UCAN header as `kid`.
    - Generates a unique nonce (UUID v4 or 32 random bytes, hex-encoded).
    - Constructs the `att` array from the `capabilities` list, scoped to the context: `"scp:ctx:{context_id}/{capability}"`.
-   - Signs with the issuer's Ed25519 key.
+   - Signs with the issuer's Ed25519 key identified by `signing_key_ref`.
    - Returns the signed token.
 
 4. **`delegate_ucan(parent_token, delegator, delegatee, attenuated_capabilities) -> UcanToken`:**
@@ -996,7 +1003,7 @@ No existing standard combines UCAN delegation chains with payment semantics. L40
 
 1. **Payment adapter trait** following the transport adapter pattern (ADR-005): `PaymentAdapter` with `authorize`, `capture`, `void`, `verify`, `refund` methods. `AdapterCapabilities` struct declares supported features. `payment_adapter_conformance!()` macro validates implementations. `TestAdapter` in-memory reference ships with SDK.
 
-2. **Spending UCAN** as new capability type: `SpendingCapability` with `max_per_action`, `max_total`, `currency`, `time_window`, `allowed_adapters`. AND-composed with action UCANs — both required for paid actions. Standard UCAN attenuation and revocation rules apply.
+2. **Spending UCAN** as new capability type: `SpendingCapability` with `max_per_action`, `max_total`, `currency`, `time_window`, `allowed_adapters`. AND-composed with action UCANs — both required for paid actions. Standard UCAN attenuation and revocation rules apply. Agents sign spending UCANs with `#agent` via self-delegation: `iss == aud` with `fct.scp_key_scope: "#agent"` (ADR-039). This allows agents to authorize spending within delegated limits without requiring the human's `#active` key for each transaction.
 
 3. **Formula-based dynamic pricing** (EIP-1559-inspired): `PricingFormula` with `base_cost`, `variables` (linear/step), `cap`, `floor`. Observable metrics: `ContextMessageRate`, `MemberCount`, `RelayQueueDepth`, `TimeOfDay`, `SenderVelocity`, `StorageUsage`. Both sides evaluate independently — deterministic, no oracle.
 

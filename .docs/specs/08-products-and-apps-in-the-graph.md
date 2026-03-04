@@ -72,7 +72,7 @@ MCP (Model Context Protocol) defines how AI models connect to tools and data sou
 │                                                        │
 │  - Exposes context tools as MCP tool schemas          │
 │  - Filters tools by role + capability tokens          │
-│  - Signs actions with human's DID                     │
+│  - Signs with #active or #agent from human's DID      │
 │  - Encrypts/decrypts context envelopes                │
 │  - Surfaces context events as MCP resources           │
 └────────────────────┬─────────────────────────────────┘

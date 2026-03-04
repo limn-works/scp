@@ -401,6 +401,7 @@ dependencies {
    - For `KeyType.ED25519` on API 33+: generates key in `AndroidKeyStore` using `KeyPairGenerator.getInstance("EdDSA", "AndroidKeyStore")` with `EdDSAParameterSpec(Ed25519)`. Returns `KeyHandle` with `custodyType = CustodyType.HARDWARE`.
    - For `KeyType.ED25519` on API 26-32: generates Bouncy Castle software key. Stores in `EncryptedSharedPreferences`. Returns `KeyHandle` with `custodyType = CustodyType.SOFTWARE`.
    - For `KeyType.X25519`: generates Bouncy Castle software X25519 key. Returns `KeyHandle` with `custodyType = CustodyType.SOFTWARE`.
+   - Called four times during identity creation when agent delegation is enabled (ADR-039): Identity Key, Active Signing Key, Pre-Rotation Key, and Agent Signing Key. The Agent Signing Key is always software-held (Bouncy Castle, not Android Keystore TEE) since it is designed for autonomous agent operation and may need to be exported or rotated independently.
 
 2. **`AndroidKeyCustody.sign(keyHandle, data)`:**
    - For hardware handles: retrieves `PrivateKeyEntry` from `AndroidKeyStore`, calls `Signature.getInstance("EdDSA")`, returns 64-byte signature.
@@ -1372,7 +1373,7 @@ When a member has been offline for more than 7 days, or when the epoch catch-up 
 
 **Reset protocol:**
 
-1. The reconnecting member publishes a `ResetRequest { context_id, member_did, last_known_epoch, reason, signature }` via the relay (not MLS-encrypted — the member may not be able to encrypt at the current epoch). The request is signed by the member's Active Signing Key for authentication.
+1. The reconnecting member publishes a `ResetRequest { context_id, member_did, last_known_epoch, reason, signature }` via the relay (not MLS-encrypted — the member may not be able to encrypt at the current epoch). The request is signed by the member's Active Signing Key or Agent Signing Key (ADR-039) for authentication — either key is accepted since both are valid verification methods on the member's DID.
 2. An online member with `MemberRemove` + `MemberInvite` capabilities (typically admin) processes the reset: (a) removes the offline member's stale leaf node via MLS `remove_member()`, (b) immediately re-adds the member using a fresh KeyPackage via MLS `add_member()`, (c) distributes the new Welcome message via relay.
 3. The reconnecting member processes the Welcome, joining the group at the current epoch. They request sender keys for all current members via the pull-based protocol (ADR-007 criterion 4c).
 4. The reconnecting member's outbound queue is drained using the new epoch's key schedule.
@@ -1803,7 +1804,7 @@ pub struct ContextStateSnapshot {
 
 **Checkpoint creation rules:**
 
-- In single-admin contexts (Phase 2 governance), only the admin can create checkpoints. The checkpoint is signed by the admin's Active Signing Key.
+- In single-admin contexts (Phase 2 governance), only the admin can create checkpoints. The checkpoint is signed by the admin's Active Signing Key or Agent Signing Key (ADR-039).
 - In multi-admin contexts (ADR-031), checkpoints require signatures from a governance quorum (e.g., M-of-N admins). The `cosignatures` field carries additional signer attestations.
 - Members receiving a checkpoint verify the signature(s) against known admin DID(s), then verify that the `merkle_root` matches their local Merkle root at `checkpoint_seq`. If it matches, the checkpoint is trusted. If it diverges, the member raises an equivocation alert (same mechanism as §9.9.3 consistency checkpoint divergence).
 - The `state_snapshot` is deterministically serialized (sorted keys, canonical MessagePack encoding) so that any member can independently compute `SHA-256(serialize(state_snapshot))` and verify the signature covers the correct state.
@@ -2182,7 +2183,7 @@ Checkpoint {
 
    - Captures the current Merkle root, event count, and last event hash from the event log.
    - Serializes the full `ContextStateSnapshot` deterministically.
-   - Signs the checkpoint with the provided signing key (admin's Active Signing Key).
+   - Signs the checkpoint with the provided signing key (admin's Active Signing Key or Agent Signing Key per ADR-039).
    - Appends the checkpoint as a `Checkpoint` event to the event log.
    - Persists the checkpoint to `ProtocolStore` at `context/{id}/checkpoint/{seq:020d}`.
    - Updates `context/{id}/checkpoint_meta/latest`.
@@ -2412,6 +2413,8 @@ pub enum GovernanceModelConfig {
 
     /// M-of-N threshold approval. A fixed set of designated signers;
     /// a proposal passes when at least `threshold` of them approve.
+    /// One DID = one vote regardless of signing key (ADR-039). A vote
+    /// signed by `#agent` counts the same as one signed by `#active`.
     Threshold {
         /// The set of DIDs authorized to vote. These DIDs must hold
         /// the `GovernanceVote` capability.
@@ -2653,7 +2656,7 @@ Every proposal has a `voting_deadline = created_at + voting_window_secs`. The vo
 
 In single-admin governance, the context creator holds the root UCAN authority and delegates all capabilities. In multi-admin governance, UCAN authority is distributed:
 
-**Root UCAN issuer.** The context creator remains the root UCAN issuer. This is a cryptographic necessity — the UCAN delegation chain must have a single root of trust (ADR-009 step 4: "root token's `iss` is the context creator's DID"). The creator is not a privileged governor — they are the key ceremony initiator.
+**Root UCAN issuer.** The context creator remains the root UCAN issuer. This is a cryptographic necessity — the UCAN delegation chain must have a single root of trust (ADR-009 step 4: "root token's `iss` is the context creator's DID"). The creator is not a privileged governor — they are the key ceremony initiator. One DID = one vote regardless of which signing key (`#active` or `#agent`) casts the vote (ADR-039). The governance engine deduplicates by DID, not by key.
 
 **Governance capability distribution.** At context creation, the creator mints `GovernancePropose` and `GovernanceVote` UCAN tokens for each DID that the governance model designates as a voter:
 
@@ -3103,8 +3106,10 @@ pub struct AccessKeyRequest {
     pub epoch: u64,
     pub timestamp: u64,  // Unix milliseconds; requests older than 30s are rejected
     pub wrapping_pubkey: X25519PublicKey,  // Ephemeral, per-request
-    /// Ed25519 signature over: SHA-256(context_id || requester_did || epoch || timestamp || wrapping_pubkey)
-    /// using the requester's Active Signing Key. Prevents replay and impersonation.
+    /// Which verification method signed: "#active" or "#agent" (ADR-039).
+    pub signing_key_id: String,
+    /// Ed25519 signature over: SHA-256(context_id || requester_did || signing_key_id || epoch || timestamp || wrapping_pubkey)
+    /// using the requester's Active Signing Key or Agent Signing Key (ADR-039). Prevents replay and impersonation.
     pub signature: Ed25519Signature,
 }
 
@@ -3121,12 +3126,12 @@ pub struct AccessKeyResponse {
 
 1. Generate a fresh CEK (32 random bytes).
 2. Encrypt the message content with AES-256-GCM using the CEK.
-3. For each intended recipient: wrap the CEK with AES-256-KW using the recipient's access key.
+3. For each intended recipient: wrap the CEK with AES-256-KW using the recipient's access key. The wrapping operation is signed by the sender's Active Signing Key or Agent Signing Key (ADR-039).
 4. Publish: `{ ciphertext, nonce, wrapped_ceks }`. Integrity is verified by the AES-256-GCM authentication tag — no separate content hash is stored.
 
 On receive:
 
-1. Look up own `member_id` (truncated DID hash) in `wrapped_ceks`.
+1. Look up own `member_id` (truncated DID hash) in `wrapped_ceks`. Note: the lookup is by DID, not by signing key — both `#active` and `#agent` operations on the same DID share the same access key (ADR-039).
 2. Unwrap the CEK with own access key using AES-256-KW.
 3. Decrypt the ciphertext with AES-256-GCM using the unwrapped CEK. The AEAD authentication tag verifies integrity.
 
