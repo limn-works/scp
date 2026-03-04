@@ -579,26 +579,33 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         document: &DidDocument,
         key_custody: &impl KeyCustody,
     ) -> Result<(ScpIdentity, DidDocument), IdentityError> {
-        // Step 1: Generate a new Ed25519 keypair for the agent key.
+        // Step 1: Check if the document already has an agent key.
+        // This must happen BEFORE key generation to avoid leaking key material
+        // in the custody provider on the error path.
+        if document.has_agent_key() {
+            return Err(IdentityError::AgentKeyAlreadyExists);
+        }
+
+        // Step 2: Generate a new Ed25519 keypair for the agent key.
         let agent_key = key_custody
             .generate_keypair(KeyType::Ed25519)
             .await
             .map_err(IdentityError::Platform)?;
 
-        // Step 2: Get the agent key's public key.
+        // Step 3: Get the agent key's public key.
         let agent_public = key_custody
             .public_key(&agent_key)
             .await
             .map_err(IdentityError::Platform)?;
 
-        // Step 3: Clone and update the document.
+        // Step 4: Clone and update the document.
         let mut updated_doc = document.clone();
         updated_doc.add_agent_key(agent_public.as_bytes())?;
 
-        // Step 4: Publish the updated document (signed with Identity Key).
+        // Step 5: Publish the updated document (signed with Identity Key).
         self.publish_document(identity, &updated_doc).await?;
 
-        // Step 5: Build the updated identity.
+        // Step 6: Build the updated identity.
         let updated_identity = ScpIdentity {
             identity_key: identity.identity_key,
             active_signing_key: identity.active_signing_key,
@@ -636,6 +643,12 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         document: &DidDocument,
         key_custody: &impl KeyCustody,
     ) -> Result<(ScpIdentity, DidDocument), IdentityError> {
+        // Step 0: Verify identity/document consistency — the identity must
+        // track an agent key before we attempt rotation.
+        if identity.agent_signing_key.is_none() {
+            return Err(IdentityError::AgentKeyNotFound);
+        }
+
         // Step 1: Generate a new Ed25519 keypair.
         let new_agent_key = key_custody
             .generate_keypair(KeyType::Ed25519)
@@ -690,6 +703,12 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         identity: &ScpIdentity,
         document: &DidDocument,
     ) -> Result<(ScpIdentity, DidDocument), IdentityError> {
+        // Step 0: Verify identity/document consistency — the identity must
+        // track an agent key before we attempt removal.
+        if identity.agent_signing_key.is_none() {
+            return Err(IdentityError::AgentKeyNotFound);
+        }
+
         // Step 1: Clone and update the document.
         let mut updated_doc = document.clone();
         updated_doc.remove_agent_key()?;
