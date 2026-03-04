@@ -18,14 +18,18 @@
 //!
 //! # Key Separation
 //!
-//! SCP separates three key roles:
-//! 1. **Identity Key** — Derives the DID string. Highest-security custody.
-//!    Used only for DID document updates.
-//! 2. **Active Signing Key** — Used for MLS, envelopes, UCANs. Rotatable.
-//! 3. **Pre-Rotation Key** — Cold/offline custody. Provides the commitment
+//! SCP separates four key roles (three verification methods per ADR-039):
+//! 1. **Identity Key (`#0`)** — Derives the DID string. Highest-security custody
+//!    (hardware-backed). Used only for DID document updates. Never rotates.
+//! 2. **Active Signing Key (`#active`)** — Human's operational key. Used for MLS,
+//!    envelopes, UCANs. Rotatable via Layer 1 rotation.
+//! 3. **Agent Signing Key (`#agent`)** — Optional. Software-held key for autonomous
+//!    agent operations. Rotatable independently. Generated only when agent
+//!    delegation is needed. See ADR-039.
+//! 4. **Pre-Rotation Key** — Cold/offline custody. Provides the commitment
 //!    for identity migration.
 //!
-//! See ADR-003 in `.docs/adrs/phase-1.md` for the full design.
+//! See ADR-003 and ADR-039 in `.docs/adrs/phase-1.md` for the full design.
 
 pub mod cache;
 pub mod dht;
@@ -40,6 +44,7 @@ pub use dht::{
     DidDht, did_from_ed25519_public_key, extract_public_key, verify_bep44_signature,
     verify_migration, verify_self_certification,
 };
+// SigningKeyId is defined in this module and exported directly.
 pub use dht_client::{DhtClient, InMemoryDhtClient};
 pub use document::{DidDocument, DidRotationEvent, MigrationProof, PreRotationProof};
 pub use republish::RepublishManager;
@@ -53,6 +58,7 @@ pub use resolver::{
 };
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 use scp_platform::traits::{KeyCustody, KeyHandle};
 
@@ -130,6 +136,79 @@ impl std::borrow::Borrow<str> for DID {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SigningKeyId (ADR-039)
+// ---------------------------------------------------------------------------
+
+/// Identifies which verification method signed an action.
+///
+/// Used in `ScpCredential`, `InnerEnvelope`, and `SenderKeyEpochAdvance` to
+/// indicate whether the `#active` (human) or `#agent` (agent software) signing
+/// key produced a signature. Verifiers resolve the correct public key from the
+/// sender's DID document using this field.
+///
+/// Wire-serializes as `"#active"` / `"#agent"` for JSON interoperability.
+///
+/// See ADR-039 in `.docs/adrs/phase-1.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SigningKeyId {
+    /// The human's active signing key (`#active` verification method).
+    Active,
+    /// The agent's signing key (`#agent` verification method).
+    Agent,
+}
+
+impl SigningKeyId {
+    /// Returns the DID document fragment for this signing key (e.g., `"active"` or `"agent"`).
+    #[must_use]
+    pub const fn fragment(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Agent => "agent",
+        }
+    }
+
+    /// Returns the full DID document fragment reference (e.g., `"#active"` or `"#agent"`).
+    #[must_use]
+    pub const fn fragment_ref(&self) -> &'static str {
+        match self {
+            Self::Active => "#active",
+            Self::Agent => "#agent",
+        }
+    }
+}
+
+impl fmt::Display for SigningKeyId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.fragment_ref())
+    }
+}
+
+impl Serialize for SigningKeyId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.fragment_ref())
+    }
+}
+
+impl<'de> Deserialize<'de> for SigningKeyId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "#active" => Ok(Self::Active),
+            "#agent" => Ok(Self::Agent),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown SigningKeyId: {other}, expected \"#active\" or \"#agent\""
+            ))),
+        }
+    }
+}
+
 /// An SCP identity containing the DID string, key handles, and pre-rotation
 /// commitment.
 ///
@@ -138,18 +217,24 @@ impl std::borrow::Borrow<str> for DID {
 /// hash of the pre-rotation key's public key bytes, published in the DID
 /// document as a `PreRotationCommitment` service.
 ///
-/// See ADR-003 acceptance criterion 1 for the full construction.
+/// See ADR-003 acceptance criterion 1 and ADR-039 for the full construction.
 #[derive(Debug)]
 pub struct ScpIdentity {
-    /// `did:dht` Identity Key. Derives the DID string. Stored in highest-security
-    /// custody (Secure Enclave, HSM). Used ONLY for DID document updates and
-    /// signing pre-rotation commitments. NEVER for MLS, envelopes, or UCANs.
+    /// `did:dht` Identity Key (`#0`). Derives the DID string. Stored in
+    /// highest-security custody (Secure Enclave, HSM). Used ONLY for DID
+    /// document updates and signing pre-rotation commitments. NEVER for MLS,
+    /// envelopes, or UCANs.
     pub identity_key: KeyHandle,
 
-    /// Current Active Signing Key. A verification method in the DID document.
-    /// Used for MLS credentials, inner envelope signatures, UCAN issuance.
-    /// Rotatable via `rotate_active_key` (DID string stays the same).
+    /// Current Active Signing Key (`#active`). A verification method in the
+    /// DID document. Used for MLS credentials, inner envelope signatures, UCAN
+    /// issuance. Rotatable via `rotate_active_key` (DID string stays the same).
     pub active_signing_key: KeyHandle,
+
+    /// Optional Agent Signing Key (`#agent`). Software-held key for autonomous
+    /// agent operations. `None` when no agent is delegated. Rotatable
+    /// independently of `#active`. See ADR-039.
+    pub agent_signing_key: Option<KeyHandle>,
 
     /// SHA-256 hash of the next Identity Key's public key.
     /// Published in DID document as a `PreRotationCommitment` service.
@@ -235,6 +320,30 @@ pub enum IdentityError {
         /// The last known sequence number for this DID.
         last_known: u64,
     },
+
+    /// An `#agent` verification method already exists in the DID document.
+    #[error("agent key already exists in DID document")]
+    AgentKeyAlreadyExists,
+
+    /// No `#agent` verification method exists in the DID document.
+    #[error("no agent key exists in DID document")]
+    AgentKeyNotFound,
+
+    /// The DID document contains multiple `#agent` verification methods.
+    #[error("DID document contains {count} #agent verification methods, expected at most 1")]
+    MultipleAgentKeys {
+        /// The number of `#agent` VMs found.
+        count: usize,
+    },
+
+    /// Too many retired agent keys in the DID document.
+    #[error("too many retired agent keys: found {count}, maximum is {max}")]
+    TooManyRetiredAgentKeys {
+        /// The number of retired agent keys found.
+        count: usize,
+        /// The maximum allowed.
+        max: usize,
+    },
 }
 
 /// Abstract trait for DID method implementations.
@@ -308,4 +417,82 @@ pub trait DidMethod: Send + Sync {
         identity: &ScpIdentity,
         key_custody: &impl KeyCustody,
     ) -> impl Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send;
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::clone_on_copy)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signing_key_id_fragment() {
+        assert_eq!(SigningKeyId::Active.fragment(), "active");
+        assert_eq!(SigningKeyId::Agent.fragment(), "agent");
+    }
+
+    #[test]
+    fn signing_key_id_fragment_ref() {
+        assert_eq!(SigningKeyId::Active.fragment_ref(), "#active");
+        assert_eq!(SigningKeyId::Agent.fragment_ref(), "#agent");
+    }
+
+    #[test]
+    fn signing_key_id_display() {
+        assert_eq!(format!("{}", SigningKeyId::Active), "#active");
+        assert_eq!(format!("{}", SigningKeyId::Agent), "#agent");
+    }
+
+    #[test]
+    fn signing_key_id_serialize() {
+        let active_json = serde_json::to_string(&SigningKeyId::Active).unwrap();
+        assert_eq!(active_json, "\"#active\"");
+
+        let agent_json = serde_json::to_string(&SigningKeyId::Agent).unwrap();
+        assert_eq!(agent_json, "\"#agent\"");
+    }
+
+    #[test]
+    fn signing_key_id_deserialize() {
+        let active: SigningKeyId = serde_json::from_str("\"#active\"").unwrap();
+        assert_eq!(active, SigningKeyId::Active);
+
+        let agent: SigningKeyId = serde_json::from_str("\"#agent\"").unwrap();
+        assert_eq!(agent, SigningKeyId::Agent);
+    }
+
+    #[test]
+    fn signing_key_id_deserialize_unknown() {
+        let result = serde_json::from_str::<SigningKeyId>("\"#unknown\"");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown SigningKeyId"),
+            "error should mention unknown SigningKeyId, got: {err}"
+        );
+    }
+
+    #[test]
+    fn signing_key_id_roundtrip() {
+        for key_id in [SigningKeyId::Active, SigningKeyId::Agent] {
+            let json = serde_json::to_string(&key_id).unwrap();
+            let parsed: SigningKeyId = serde_json::from_str(&json).unwrap();
+            assert_eq!(key_id, parsed);
+        }
+    }
+
+    #[test]
+    fn signing_key_id_equality() {
+        assert_eq!(SigningKeyId::Active, SigningKeyId::Active);
+        assert_eq!(SigningKeyId::Agent, SigningKeyId::Agent);
+        assert_ne!(SigningKeyId::Active, SigningKeyId::Agent);
+    }
+
+    #[test]
+    fn signing_key_id_copy_clone() {
+        let original = SigningKeyId::Agent;
+        let copied = original;
+        let cloned = original.clone();
+        assert_eq!(original, copied);
+        assert_eq!(original, cloned);
+    }
 }

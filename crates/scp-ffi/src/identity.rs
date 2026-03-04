@@ -618,6 +618,7 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
             let old_identity = ScpIdentity {
                 identity_key: old_identity_key,
                 active_signing_key: old_active_key,
+                agent_signing_key: None,
                 pre_rotation_commitment,
                 did: old_did.clone(),
             };

@@ -1886,6 +1886,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     let bg_identity = ScpIdentity {
         identity_key: identity.identity_key,
         active_signing_key: identity.active_signing_key,
+        agent_signing_key: identity.agent_signing_key,
         pre_rotation_commitment: identity.pre_rotation_commitment,
         did: identity.did.clone(),
     };
@@ -3801,6 +3802,7 @@ mod tests {
         let identity = ScpIdentity {
             identity_key: scp_platform::KeyHandle::new(1),
             active_signing_key: scp_platform::KeyHandle::new(2),
+            agent_signing_key: None,
             pre_rotation_commitment: [0u8; 32],
             did: "did:dht:test123".to_owned(),
         };
@@ -3888,6 +3890,7 @@ mod tests {
         let identity = ScpIdentity {
             identity_key: scp_platform::KeyHandle::new(1),
             active_signing_key: scp_platform::KeyHandle::new(2),
+            agent_signing_key: None,
             pre_rotation_commitment: [0u8; 32],
             did: "did:dht:testnet123".to_owned(),
         };
@@ -3975,6 +3978,7 @@ mod tests {
         let identity = ScpIdentity {
             identity_key: scp_platform::KeyHandle::new(1),
             active_signing_key: scp_platform::KeyHandle::new(2),
+            agent_signing_key: None,
             pre_rotation_commitment: [0u8; 32],
             did: "did:dht:unchanged123".to_owned(),
         };
@@ -4072,6 +4076,7 @@ mod tests {
         let identity = ScpIdentity {
             identity_key: scp_platform::KeyHandle::new(1),
             active_signing_key: scp_platform::KeyHandle::new(2),
+            agent_signing_key: None,
             pre_rotation_commitment: [0u8; 32],
             did: "did:dht:resilient123".to_owned(),
         };

@@ -445,6 +445,263 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         let updated_identity = ScpIdentity {
             identity_key: identity.identity_key,
             active_signing_key: new_active_key,
+            agent_signing_key: identity.agent_signing_key,
+            pre_rotation_commitment: identity.pre_rotation_commitment,
+            did: identity.did.clone(),
+        };
+
+        Ok((updated_identity, updated_doc))
+    }
+
+    /// Creates a new identity with an agent signing key (ADR-039).
+    ///
+    /// Like [`DidMethod::create`] but generates a 4th Ed25519 keypair for the
+    /// agent key. The agent key is included in the DID document as the `#agent`
+    /// verification method and stored in `ScpIdentity::agent_signing_key`.
+    ///
+    /// # Arguments
+    ///
+    /// * `key_custody` - The key custody for generating all keypairs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::Platform`] if key generation fails.
+    ///
+    /// See ADR-039 acceptance criterion 4.
+    pub async fn create_with_agent_key(
+        &self,
+        key_custody: &impl KeyCustody,
+    ) -> Result<(ScpIdentity, DidDocument), IdentityError> {
+        // Step 1: Generate four Ed25519 keypairs.
+        let identity_key = key_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        let active_signing_key = key_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        let pre_rotation_key = key_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        let agent_key = key_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        // Step 2: Get public keys.
+        let identity_public = key_custody
+            .public_key(&identity_key)
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        let active_public = key_custody
+            .public_key(&active_signing_key)
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        let pre_rotation_public = key_custody
+            .public_key(&pre_rotation_key)
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        let agent_public = key_custody
+            .public_key(&agent_key)
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        // Step 3: Derive the DID string.
+        let did = format!(
+            "{DID_DHT_PREFIX}z{}",
+            zbase32::encode(identity_public.as_bytes())
+        );
+
+        // Step 4: Compute pre-rotation commitment.
+        let mut hasher = Sha256::new();
+        hasher.update(pre_rotation_public.as_bytes());
+        let commitment_bytes = hasher.finalize();
+        let mut pre_rotation_commitment = [0u8; 32];
+        pre_rotation_commitment.copy_from_slice(&commitment_bytes);
+
+        // Step 5: Destroy the pre-rotation key handle.
+        key_custody
+            .destroy_key(&pre_rotation_key)
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        // Step 6: Build the DID document with agent key.
+        let document = DidDocument::new_with_agent_key(
+            &did,
+            identity_public.as_bytes(),
+            active_public.as_bytes(),
+            &pre_rotation_commitment,
+            Some(agent_public.as_bytes()),
+        );
+
+        // Step 7: Return the identity and document.
+        let identity = ScpIdentity {
+            identity_key,
+            active_signing_key,
+            agent_signing_key: Some(agent_key),
+            pre_rotation_commitment,
+            did,
+        };
+
+        Ok((identity, document))
+    }
+
+    /// Adds an agent signing key to an existing identity (ADR-039).
+    ///
+    /// Generates a new Ed25519 keypair for the agent key, adds it to the DID
+    /// document as the `#agent` verification method, signs the document with
+    /// the Identity Key, and publishes to the DHT.
+    ///
+    /// # Arguments
+    ///
+    /// * `identity` - The current identity (must not already have an agent key).
+    /// * `document` - The current DID document.
+    /// * `key_custody` - The key custody for generating the agent keypair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::AgentKeyAlreadyExists`] if `#agent` already exists.
+    /// Returns [`IdentityError::Platform`] if key generation fails.
+    /// Returns [`IdentityError::DhtPublishFailed`] if DHT publishing fails.
+    ///
+    /// See ADR-039 acceptance criterion 4.
+    pub async fn add_agent_key(
+        &self,
+        identity: &ScpIdentity,
+        document: &DidDocument,
+        key_custody: &impl KeyCustody,
+    ) -> Result<(ScpIdentity, DidDocument), IdentityError> {
+        // Step 1: Generate a new Ed25519 keypair for the agent key.
+        let agent_key = key_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        // Step 2: Get the agent key's public key.
+        let agent_public = key_custody
+            .public_key(&agent_key)
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        // Step 3: Clone and update the document.
+        let mut updated_doc = document.clone();
+        updated_doc.add_agent_key(agent_public.as_bytes())?;
+
+        // Step 4: Publish the updated document (signed with Identity Key).
+        self.publish_document(identity, &updated_doc).await?;
+
+        // Step 5: Build the updated identity.
+        let updated_identity = ScpIdentity {
+            identity_key: identity.identity_key,
+            active_signing_key: identity.active_signing_key,
+            agent_signing_key: Some(agent_key),
+            pre_rotation_commitment: identity.pre_rotation_commitment,
+            did: identity.did.clone(),
+        };
+
+        Ok((updated_identity, updated_doc))
+    }
+
+    /// Rotates the agent signing key for an identity (ADR-039).
+    ///
+    /// Generates a new Ed25519 keypair, updates the DID document (moves the old
+    /// `#agent` key to `#retired-agent-{sequence}`, installs the new key as
+    /// `#agent`), signs the document with the Identity Key, and publishes to
+    /// the DHT.
+    ///
+    /// # Arguments
+    ///
+    /// * `identity` - The current identity (must have an existing agent key).
+    /// * `document` - The current DID document.
+    /// * `key_custody` - The key custody for generating the new agent keypair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::AgentKeyNotFound`] if no `#agent` VM exists.
+    /// Returns [`IdentityError::Platform`] if key generation fails.
+    /// Returns [`IdentityError::DhtPublishFailed`] if DHT publishing fails.
+    ///
+    /// See ADR-039 acceptance criterion 4.
+    pub async fn rotate_agent_key(
+        &self,
+        identity: &ScpIdentity,
+        document: &DidDocument,
+        key_custody: &impl KeyCustody,
+    ) -> Result<(ScpIdentity, DidDocument), IdentityError> {
+        // Step 1: Generate a new Ed25519 keypair.
+        let new_agent_key = key_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        // Step 2: Get the new key's public key.
+        let new_agent_public = key_custody
+            .public_key(&new_agent_key)
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        // Step 3: Clone and update the document.
+        let mut updated_doc = document.clone();
+        let sequence = self.current_sequence().saturating_add(1);
+        updated_doc.rotate_agent_key(new_agent_public.as_bytes(), sequence)?;
+
+        // Step 4: Publish the updated document (signed with Identity Key).
+        self.publish_document(identity, &updated_doc).await?;
+
+        // Step 5: Build the updated identity. DID, identity key, active key,
+        // and pre-rotation commitment are preserved.
+        let updated_identity = ScpIdentity {
+            identity_key: identity.identity_key,
+            active_signing_key: identity.active_signing_key,
+            agent_signing_key: Some(new_agent_key),
+            pre_rotation_commitment: identity.pre_rotation_commitment,
+            did: identity.did.clone(),
+        };
+
+        Ok((updated_identity, updated_doc))
+    }
+
+    /// Removes the agent signing key from an identity (ADR-039).
+    ///
+    /// Removes the `#agent` verification method from the DID document, signs
+    /// the document with the Identity Key, and publishes to the DHT.
+    ///
+    /// # Arguments
+    ///
+    /// * `identity` - The current identity (must have an existing agent key).
+    /// * `document` - The current DID document.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::AgentKeyNotFound`] if no `#agent` VM exists.
+    /// Returns [`IdentityError::DhtPublishFailed`] if DHT publishing fails.
+    ///
+    /// See ADR-039 acceptance criterion 4.
+    pub async fn remove_agent_key(
+        &self,
+        identity: &ScpIdentity,
+        document: &DidDocument,
+    ) -> Result<(ScpIdentity, DidDocument), IdentityError> {
+        // Step 1: Clone and update the document.
+        let mut updated_doc = document.clone();
+        updated_doc.remove_agent_key()?;
+
+        // Step 2: Publish the updated document (signed with Identity Key).
+        self.publish_document(identity, &updated_doc).await?;
+
+        // Step 3: Build the updated identity with agent_signing_key: None.
+        let updated_identity = ScpIdentity {
+            identity_key: identity.identity_key,
+            active_signing_key: identity.active_signing_key,
+            agent_signing_key: None,
             pre_rotation_commitment: identity.pre_rotation_commitment,
             did: identity.did.clone(),
         };
@@ -523,6 +780,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         let temp_new_identity = ScpIdentity {
             identity_key: *pre_rotation_key,
             active_signing_key: new_active_key,
+            agent_signing_key: None,
             pre_rotation_commitment: new_pre_rotation_commitment,
             did: new_did.clone(),
         };
@@ -541,6 +799,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         let new_identity = ScpIdentity {
             identity_key: *pre_rotation_key,
             active_signing_key: new_active_key,
+            agent_signing_key: None,
             pre_rotation_commitment: new_pre_rotation_commitment,
             did: new_did,
         };
@@ -834,6 +1093,7 @@ impl<D: DhtClient + 'static, C: Clock + 'static> DidMethod for DidDht<D, C> {
             let identity = ScpIdentity {
                 identity_key,
                 active_signing_key,
+                agent_signing_key: None,
                 pre_rotation_commitment,
                 did,
             };
@@ -1593,6 +1853,7 @@ mod tests {
         let identity = ScpIdentity {
             identity_key,
             active_signing_key,
+            agent_signing_key: None,
             pre_rotation_commitment,
             did,
         };
@@ -2435,6 +2696,408 @@ mod tests {
             resolved.document.relay_service_urls()[0],
             "wss://relay.example.com/scp/v1"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-AB-009 tests — Agent key DHT wiring (ADR-039)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn create_with_agent_key_produces_four_verification_methods() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create_with_agent_key(&*custody).await.unwrap();
+
+        // DID format is valid.
+        assert!(identity.did.starts_with("did:dht:z"));
+        assert_eq!(document.id, identity.did);
+
+        // Should have three verification methods: #0, #active, #agent.
+        assert_eq!(document.verification_method.len(), 3);
+        assert!(document.verification_method_by_fragment("0").is_some());
+        assert!(document.verification_method_by_fragment("active").is_some());
+        assert!(document.verification_method_by_fragment("agent").is_some());
+
+        // agent_signing_key should be set.
+        assert!(identity.agent_signing_key.is_some());
+
+        // authentication and assertionMethod should reference both #active and #agent.
+        assert_eq!(document.authentication.len(), 2);
+        assert!(
+            document
+                .authentication
+                .iter()
+                .any(|r| r.ends_with("#active"))
+        );
+        assert!(
+            document
+                .authentication
+                .iter()
+                .any(|r| r.ends_with("#agent"))
+        );
+        assert_eq!(document.assertion_method.len(), 2);
+        assert!(
+            document
+                .assertion_method
+                .iter()
+                .any(|r| r.ends_with("#active"))
+        );
+        assert!(
+            document
+                .assertion_method
+                .iter()
+                .any(|r| r.ends_with("#agent"))
+        );
+    }
+
+    #[tokio::test]
+    async fn create_without_agent_key_backward_compat() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+
+        // Should have two verification methods: #0 and #active.
+        assert_eq!(document.verification_method.len(), 2);
+        assert!(!document.has_agent_key());
+
+        // agent_signing_key should be None.
+        assert!(identity.agent_signing_key.is_none());
+
+        // authentication and assertionMethod should reference only #active.
+        assert_eq!(document.authentication.len(), 1);
+        assert_eq!(document.assertion_method.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_with_agent_key_self_certifies() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create_with_agent_key(&*custody).await.unwrap();
+
+        // Self-certification: identity key in document matches DID string.
+        let identity_public = custody.public_key(&identity.identity_key).await.unwrap();
+        assert!(dht.verify(&identity.did, identity_public.as_bytes()));
+
+        // verify_self_certification should succeed.
+        verify_self_certification(&identity.did, &document).unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_with_agent_key_publish_and_resolve_roundtrip() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create_with_agent_key(&*custody).await.unwrap();
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        // Resolve and verify the agent key survives the roundtrip.
+        dht.cache().remove(&identity.did).await;
+        let resolved = dht.resolve_did(&identity.did).await.unwrap();
+        assert_eq!(resolved.document, document);
+        assert!(resolved.document.has_agent_key());
+        assert_eq!(resolved.document.verification_method.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn add_agent_key_to_existing_identity() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        // Create identity without agent key.
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+        dht.publish_document(&identity, &document).await.unwrap();
+        assert!(!document.has_agent_key());
+        assert!(identity.agent_signing_key.is_none());
+
+        // Add agent key.
+        let (updated_identity, updated_doc) = dht
+            .add_agent_key(&identity, &document, &*custody)
+            .await
+            .unwrap();
+
+        // Identity should now have an agent key.
+        assert!(updated_identity.agent_signing_key.is_some());
+        assert!(updated_doc.has_agent_key());
+
+        // DID and identity key preserved.
+        assert_eq!(updated_identity.did, identity.did);
+        assert_eq!(updated_identity.identity_key, identity.identity_key);
+        assert_eq!(
+            updated_identity.active_signing_key,
+            identity.active_signing_key
+        );
+
+        // Resolve from DHT and verify.
+        dht.cache().remove(&identity.did).await;
+        let resolved = dht.resolve_did(&identity.did).await.unwrap();
+        assert!(resolved.document.has_agent_key());
+        assert_eq!(resolved.document.verification_method.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn add_agent_key_fails_if_already_exists() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create_with_agent_key(&*custody).await.unwrap();
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        // Trying to add again should fail.
+        let result = dht.add_agent_key(&identity, &document, &*custody).await;
+        assert!(matches!(result, Err(IdentityError::AgentKeyAlreadyExists)));
+    }
+
+    #[tokio::test]
+    async fn rotate_agent_key_produces_new_key() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create_with_agent_key(&*custody).await.unwrap();
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let old_agent_key = identity.agent_signing_key.unwrap();
+        let old_agent_public = custody.public_key(&old_agent_key).await.unwrap();
+
+        // Rotate the agent key.
+        let (rotated_identity, rotated_doc) = dht
+            .rotate_agent_key(&identity, &document, &*custody)
+            .await
+            .unwrap();
+
+        // New agent key should be different.
+        let new_agent_key = rotated_identity.agent_signing_key.unwrap();
+        let new_agent_public = custody.public_key(&new_agent_key).await.unwrap();
+        assert_ne!(old_agent_public.as_bytes(), new_agent_public.as_bytes());
+
+        // Document should have #agent with new key.
+        assert!(rotated_doc.has_agent_key());
+        let agent_vm = rotated_doc
+            .verification_method_by_fragment("agent")
+            .unwrap();
+        assert!(agent_vm.id.ends_with("#agent"));
+
+        // Should have a retired agent key.
+        assert!(rotated_doc.retired_agent_key_count() >= 1);
+
+        // DID, identity key, active key preserved.
+        assert_eq!(rotated_identity.did, identity.did);
+        assert_eq!(rotated_identity.identity_key, identity.identity_key);
+        assert_eq!(
+            rotated_identity.active_signing_key,
+            identity.active_signing_key
+        );
+
+        // Resolve from DHT and verify.
+        dht.cache().remove(&identity.did).await;
+        let resolved = dht.resolve_did(&identity.did).await.unwrap();
+        assert!(resolved.document.has_agent_key());
+    }
+
+    #[tokio::test]
+    async fn rotate_agent_key_fails_without_existing_agent_key() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let result = dht.rotate_agent_key(&identity, &document, &*custody).await;
+        assert!(matches!(result, Err(IdentityError::AgentKeyNotFound)));
+    }
+
+    #[tokio::test]
+    async fn remove_agent_key_clears_identity_and_document() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create_with_agent_key(&*custody).await.unwrap();
+        dht.publish_document(&identity, &document).await.unwrap();
+        assert!(document.has_agent_key());
+
+        // Remove the agent key.
+        let (updated_identity, updated_doc) =
+            dht.remove_agent_key(&identity, &document).await.unwrap();
+
+        // Agent key should be gone from identity and document.
+        assert!(updated_identity.agent_signing_key.is_none());
+        assert!(!updated_doc.has_agent_key());
+
+        // DID, identity key, active key preserved.
+        assert_eq!(updated_identity.did, identity.did);
+        assert_eq!(updated_identity.identity_key, identity.identity_key);
+        assert_eq!(
+            updated_identity.active_signing_key,
+            identity.active_signing_key
+        );
+
+        // authentication and assertionMethod should only reference #active.
+        assert_eq!(updated_doc.authentication.len(), 1);
+        assert!(updated_doc.authentication[0].ends_with("#active"));
+        assert_eq!(updated_doc.assertion_method.len(), 1);
+        assert!(updated_doc.assertion_method[0].ends_with("#active"));
+
+        // Resolve from DHT and verify.
+        dht.cache().remove(&identity.did).await;
+        let resolved = dht.resolve_did(&identity.did).await.unwrap();
+        assert!(!resolved.document.has_agent_key());
+        assert_eq!(resolved.document.verification_method.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn remove_agent_key_fails_without_existing_agent_key() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let result = dht.remove_agent_key(&identity, &document).await;
+        assert!(matches!(result, Err(IdentityError::AgentKeyNotFound)));
+    }
+
+    #[tokio::test]
+    async fn rotate_active_key_preserves_agent_key() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        // Create identity with agent key.
+        let (identity, document) = dht.create_with_agent_key(&*custody).await.unwrap();
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let agent_key = identity.agent_signing_key.unwrap();
+        let agent_public = custody.public_key(&agent_key).await.unwrap();
+
+        // Rotate the active key.
+        let (rotated_identity, rotated_doc) = dht
+            .rotate_active_key(&identity, &document, &*custody)
+            .await
+            .unwrap();
+
+        // Agent key should be preserved in the identity.
+        assert_eq!(rotated_identity.agent_signing_key, Some(agent_key));
+
+        // Document should still have #agent.
+        assert!(rotated_doc.has_agent_key());
+        let agent_vm = rotated_doc
+            .verification_method_by_fragment("agent")
+            .unwrap();
+        let doc_agent_bytes = super::decode_multibase_key(&agent_vm.public_key_multibase).unwrap();
+        assert_eq!(
+            doc_agent_bytes,
+            <[u8; 32]>::try_from(agent_public.as_bytes()).unwrap()
+        );
+
+        // authentication and assertionMethod should reference both #active and #agent.
+        assert_eq!(rotated_doc.authentication.len(), 2);
+        assert!(
+            rotated_doc
+                .authentication
+                .iter()
+                .any(|r| r.ends_with("#active"))
+        );
+        assert!(
+            rotated_doc
+                .authentication
+                .iter()
+                .any(|r| r.ends_with("#agent"))
+        );
+        assert_eq!(rotated_doc.assertion_method.len(), 2);
+        assert!(
+            rotated_doc
+                .assertion_method
+                .iter()
+                .any(|r| r.ends_with("#active"))
+        );
+        assert!(
+            rotated_doc
+                .assertion_method
+                .iter()
+                .any(|r| r.ends_with("#agent"))
+        );
+
+        // Resolve from DHT and verify.
+        dht.cache().remove(&identity.did).await;
+        let resolved = dht.resolve_did(&identity.did).await.unwrap();
+        assert!(resolved.document.has_agent_key());
+    }
+
+    #[tokio::test]
+    async fn verify_self_certification_works_with_agent_key() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create_with_agent_key(&*custody).await.unwrap();
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        // Self-certification only checks #0 (identity key), so it should work
+        // regardless of how many VMs exist.
+        dht.cache().remove(&identity.did).await;
+        let resolved = dht.resolve_did(&identity.did).await.unwrap();
+        verify_self_certification(&identity.did, &resolved.document).unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrate_identity_drops_agent_key() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        // Create identity with agent key and pre-rotation key (manual).
+        let identity_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let active_signing_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let pre_rotation_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let agent_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+
+        let identity_public = custody.public_key(&identity_key).await.unwrap();
+        let active_public = custody.public_key(&active_signing_key).await.unwrap();
+        let pre_rotation_public = custody.public_key(&pre_rotation_key).await.unwrap();
+        let agent_public = custody.public_key(&agent_key).await.unwrap();
+
+        let did = format!("did:dht:z{}", zbase32::encode(identity_public.as_bytes()));
+
+        let mut hasher = Sha256::new();
+        hasher.update(pre_rotation_public.as_bytes());
+        let commitment_bytes = hasher.finalize();
+        let mut pre_rotation_commitment = [0u8; 32];
+        pre_rotation_commitment.copy_from_slice(&commitment_bytes);
+
+        let document = DidDocument::new_with_agent_key(
+            &did,
+            identity_public.as_bytes(),
+            active_public.as_bytes(),
+            &pre_rotation_commitment,
+            Some(agent_public.as_bytes()),
+        );
+
+        let identity = ScpIdentity {
+            identity_key,
+            active_signing_key,
+            agent_signing_key: Some(agent_key),
+            pre_rotation_commitment,
+            did,
+        };
+
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        // Migrate the identity.
+        let rotated_at = 1_700_000_000u64;
+        let (new_identity, new_doc, _event) = dht
+            .migrate_identity(
+                &identity,
+                &document,
+                &pre_rotation_key,
+                &*custody,
+                rotated_at,
+            )
+            .await
+            .unwrap();
+
+        // Migration creates a new identity -- agent key is NOT carried forward.
+        // The agent relationship must be re-established with add_agent_key.
+        assert!(new_identity.agent_signing_key.is_none());
+        assert!(!new_doc.has_agent_key());
     }
 
     // -----------------------------------------------------------------------
