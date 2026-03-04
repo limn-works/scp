@@ -34,6 +34,11 @@ import SQLite3
 /// This is intentionally *not* an actor — it uses a serial DispatchQueue
 /// for synchronisation, matching the thread-safety semantics that the
 /// conformance tests verify. Swift Testing does not require actor isolation.
+///
+/// `@unchecked Sendable`: The serial queue provides mutual exclusion for
+/// all database operations, making this safe to share across isolation
+/// domains in tests. Every public method dispatches synchronously onto
+/// the queue, so no concurrent access to the `sqlite3` handle is possible.
 private final class InMemoryStorage: @unchecked Sendable {
     private let db: OpaquePointer
     private let queue = DispatchQueue(label: "dev.limn.scp.test-storage")
