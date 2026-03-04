@@ -504,19 +504,27 @@ Success responses return the resource directly. Error responses use:
 }
 ```
 
-Standard HTTP status codes: `200` (success), `201` (created), `204` (deleted), `400` (bad request), `401` (unauthorized), `404` (not found), `500` (internal error).
+Standard HTTP status codes: `200` (success), `201` (created), `204` (deleted), `400` (bad request), `401` (unauthorized), `403` (forbidden — DNS rebinding), `404` (not found), `500` (internal error).
+
+Request bodies are limited to **64 KiB**. Requests exceeding this limit are rejected before handler dispatch.
 
 ### 18.10.5 SDK Surface
 
 - `ApplicationNodeBuilder::local_api(addr: SocketAddr)` — enables the dev API on the specified address. Not called = dev API disabled (production default).
 - `ApplicationNode::dev_router() -> axum::Router` — returns the dev API router for composition. Only available when `local_api()` was called on the builder.
 - `ApplicationNode::dev_token() -> Option<&str>` — returns the bearer token if the dev API is enabled. `None` if disabled.
+- `ApplicationNode::register_broadcast_context(id, name) -> Result<(), NodeError>` — registers a broadcast context for `.well-known/scp`. Validates hex format, length, and enforces the 1024-context limit. Also available via `POST /scp/dev/v1/contexts`.
 
 ### 18.10.6 Security Properties
 
 - **Localhost binding** prevents remote access. Combined with bearer token authentication, this provides defense-in-depth against SSRF attacks (a compromised service on the same machine still needs the token).
+- **DNS rebinding protection.** The dev API validates the `Host` header on every request, rejecting any value that is not `localhost`, `127.0.0.1`, or `[::1]` (with optional port). This prevents DNS rebinding attacks where a malicious website resolves its domain to `127.0.0.1` and accesses the dev API through the browser. Non-matching Host headers receive `403 Forbidden`.
+- **Security response headers.** All dev API responses include `X-Content-Type-Options: nosniff` (prevents MIME sniffing), `Cache-Control: no-store` (prevents caching of sensitive diagnostics), and `X-Frame-Options: DENY` (prevents clickjacking via iframe embedding).
+- **CORS preflight rejection.** `OPTIONS` requests to the dev API are rejected with `403 Forbidden`. The dev API is localhost-only and must not be accessible cross-origin.
 - **No private key material** is exposed through any endpoint. The identity endpoint returns the DID string and DID document (public information).
 - **No message content** is exposed. The relay status endpoint shows connection and blob counts, not blob contents.
+- **Request body limit.** POST request bodies are limited to 64 KiB to prevent unbounded memory allocation.
+- **Broadcast context limit.** A maximum of 1024 broadcast contexts may be registered per node. This prevents unbounded memory growth from registration floods via the dev API or SDK.
 - **Production default: disabled.** The dev API is opt-in via `local_api()`. Deployments that do not call this method have zero additional attack surface.
 - **Separate port** from the public HTTPS listener. Reverse proxy configurations that forward to the public port never accidentally expose the dev API.
 
@@ -540,10 +548,10 @@ Subscriber-side projection is deliberately not supported — it would allow subs
 
 ### 18.11.2 Activation
 
-Projection is opt-in per context:
+Projection is opt-in per context. A maximum of **1024** simultaneously projected contexts may be registered per node; exceeding this limit returns an error.
 
 ```rust
-node.enable_broadcast_projection(context_id, broadcast_key).await;
+node.enable_broadcast_projection(context_id, broadcast_key).await?;
 ```
 
 Projected content is served at:
@@ -583,8 +591,10 @@ Returns the most recent messages in the broadcast context, decrypted and seriali
 
 Query parameters:
 
-- `?since=<blob_id>` — return messages after the specified blob ID (exclusive).
+- `?since=<blob_id>` — return messages after the specified blob ID (exclusive). The `since` blob must belong to the same context (verified by `routing_id`); cross-context blob IDs return `400 Bad Request`.
 - `?limit=N` — maximum number of messages to return. Default: 20, maximum: 100.
+
+**Cursor expiry:** When a `since` blob ID refers to a blob that has expired or been purged from storage, the feed returns **empty** (no messages) rather than the full feed. Clients should treat an empty response to a previously-valid cursor as a signal to reset their cursor (omit `since`) and re-fetch from the beginning.
 
 Caching headers:
 
@@ -648,6 +658,6 @@ This allows URI consumers to choose between the native SCP path (relay + broadca
 
 ### 18.11.8 SDK Surface
 
-- `ApplicationNode::enable_broadcast_projection(context_id, broadcast_key)` — activates HTTP projection for the specified broadcast context. Registers the context and key in the `ProjectedContext` registry.
+- `ApplicationNode::enable_broadcast_projection(context_id, broadcast_key) -> Result<(), NodeError>` — activates HTTP projection for the specified broadcast context. Registers the context and key in the `ProjectedContext` registry. Returns `NodeError::InvalidConfig` if the projected context limit (1024) has been reached.
 - `ApplicationNode::disable_broadcast_projection(context_id)` — deactivates HTTP projection for the specified context. Removes it from the registry. Existing CDN caches may continue serving stale content per their cache headers.
 - `ApplicationNode::broadcast_projection_router() -> axum::Router` — returns the projection router for composition. Served on the public HTTPS port alongside `.well-known/scp` and `/scp/v1`.

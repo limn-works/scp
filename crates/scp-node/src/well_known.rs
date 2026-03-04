@@ -46,7 +46,7 @@ pub async fn well_known_handler(State(state): State<Arc<NodeState>>) -> impl Int
         } else {
             Some(
                 guard
-                    .iter()
+                    .values()
                     .map(|ctx| {
                         let encoded_relay = utf8_percent_encode(&state.relay_url, QUERY_VALUE);
                         let name_param = ctx

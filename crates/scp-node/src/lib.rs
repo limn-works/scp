@@ -26,6 +26,7 @@ use scp_platform::traits::{KeyCustody, Storage};
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer, ShutdownHandle};
 use scp_transport::native::storage::BlobStorageBackend;
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
 pub use http::BroadcastContext;
 pub use projection::ProjectedContext;
@@ -48,6 +49,17 @@ pub use projection::ProjectedContext;
 /// the server to the network.
 pub const DEFAULT_HTTP_BIND_ADDR: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 8443);
+
+// ---------------------------------------------------------------------------
+// Resource limits
+// ---------------------------------------------------------------------------
+
+/// Maximum number of broadcast contexts that can be registered per node.
+///
+/// Enforced in both the SDK API ([`ApplicationNode::register_broadcast_context`])
+/// and the dev API (`POST /scp/dev/v1/contexts`). Prevents unbounded `HashMap`
+/// growth from registration floods.
+pub(crate) const MAX_BROADCAST_CONTEXTS: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -254,9 +266,43 @@ impl<S: Storage> ApplicationNode<S> {
     ///
     /// Only broadcast contexts may be registered (spec section 18.3
     /// privacy constraints). Encrypted context IDs MUST NOT be exposed.
-    pub async fn register_broadcast_context(&self, id: String, name: Option<String>) {
+    ///
+    /// # Limits
+    ///
+    /// A maximum of [`MAX_BROADCAST_CONTEXTS`] simultaneous broadcast
+    /// contexts may be registered per node.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::InvalidConfig`] if the context ID is empty,
+    /// exceeds 64 characters, contains non-hex characters, or the broadcast
+    /// context limit has been reached.
+    pub async fn register_broadcast_context(
+        &self,
+        id: String,
+        name: Option<String>,
+    ) -> Result<(), NodeError> {
+        // Validate: non-empty, hex-only, max 64 chars (32 bytes hex-encoded).
+        if id.is_empty() || id.len() > 64 {
+            return Err(NodeError::InvalidConfig(
+                "context id must be 1-64 hex characters".into(),
+            ));
+        }
+        if !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(NodeError::InvalidConfig(
+                "context id must contain only hex characters".into(),
+            ));
+        }
+        let id = id.to_ascii_lowercase();
         let mut contexts = self.state.broadcast_contexts.write().await;
-        contexts.push(BroadcastContext { id, name });
+        if !contexts.contains_key(&id) && contexts.len() >= MAX_BROADCAST_CONTEXTS {
+            return Err(NodeError::InvalidConfig(format!(
+                "broadcast context limit ({MAX_BROADCAST_CONTEXTS}) reached",
+            )));
+        }
+        contexts.insert(id.clone(), BroadcastContext { id, name });
+        drop(contexts);
+        Ok(())
     }
 
     /// Returns the hex-encoded bridge secret for the internal relay.
@@ -296,6 +342,9 @@ impl<S: Storage> ApplicationNode<S> {
         self.state.shutdown_token.cancel();
     }
 
+    /// Maximum number of simultaneously projected broadcast contexts per node.
+    const MAX_PROJECTED_CONTEXTS: usize = 1024;
+
     /// Activates HTTP broadcast projection for the given context.
     ///
     /// Computes `routing_id = SHA-256(context_id)` per spec section 5.14.6,
@@ -309,19 +358,38 @@ impl<S: Storage> ApplicationNode<S> {
     /// `/scp/broadcast/<routing_id_hex>/messages/<blob_id_hex>`.
     ///
     /// See spec sections 18.11.2 and 18.11.8.
+    ///
+    /// # Limits
+    ///
+    /// A maximum of 1024 simultaneous projected contexts may be registered
+    /// per node. Returns [`NodeError::InvalidConfig`] if the limit is
+    /// exceeded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::InvalidConfig`] if the projected context limit
+    /// (1024) has been reached.
     pub async fn enable_broadcast_projection(
         &self,
         context_id: &str,
         broadcast_key: scp_core::crypto::sender_keys::BroadcastKey,
-    ) {
+    ) -> Result<(), NodeError> {
         let routing_id = projection::compute_routing_id(context_id);
         let mut registry = self.state.projected_contexts.write().await;
         if let Some(existing) = registry.get_mut(&routing_id) {
             existing.insert_key(broadcast_key);
         } else {
+            if registry.len() >= Self::MAX_PROJECTED_CONTEXTS {
+                return Err(NodeError::InvalidConfig(format!(
+                    "projected context limit ({}) reached",
+                    Self::MAX_PROJECTED_CONTEXTS
+                )));
+            }
             let projected = ProjectedContext::new(context_id, broadcast_key);
             registry.insert(routing_id, projected);
         }
+        drop(registry);
+        Ok(())
     }
 
     /// Deactivates HTTP broadcast projection for the given context.
@@ -1022,24 +1090,14 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
             .ok_or(NodeError::MissingField("identity"))?;
         let storage = self.storage.unwrap_or_else(|| Arc::new(S::default()));
 
-        let (identity, document, did_method) = match identity_source {
-            IdentitySource::Generate {
-                key_custody,
-                did_method,
-            } => {
-                let (identity, document) = did_method.create(&*key_custody).await?;
-                (identity, document, did_method)
-            }
-            IdentitySource::Explicit(e) => (e.identity, e.document, e.did_method),
-        };
-
-        let bridge_secret: [u8; 32] = rand::random();
+        let (identity, document, did_method) = resolve_identity(identity_source).await?;
+        let bridge_secret = generate_bridge_secret();
         let bind_addr = self
             .bind_addr
             .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
         let relay_config = RelayConfig {
             bind_addr,
-            bridge_secret: Some(bridge_secret),
+            bridge_secret: Some(*bridge_secret),
             ..RelayConfig::default()
         };
 
@@ -1058,7 +1116,6 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
             &storage,
             self.acme_email.as_ref(),
         );
-
         match tls_provider.provision().await {
             Ok(cert_data) => {
                 build_domain_inner(
@@ -1106,6 +1163,36 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bridge secret generation
+// ---------------------------------------------------------------------------
+
+/// Resolves the identity from an [`IdentitySource`], returning the identity,
+/// document, and DID method.
+async fn resolve_identity<K: KeyCustody, D: DidMethod>(
+    source: IdentitySource<K, D>,
+) -> Result<(ScpIdentity, DidDocument, Arc<D>), NodeError> {
+    match source {
+        IdentitySource::Generate {
+            key_custody,
+            did_method,
+        } => {
+            let (identity, document) = did_method.create(&*key_custody).await?;
+            Ok((identity, document, did_method))
+        }
+        IdentitySource::Explicit(e) => Ok((e.identity, e.document, e.did_method)),
+    }
+}
+
+/// Generates a 32-byte bridge secret using `OsRng`.
+///
+/// Wrapped in `Zeroizing` so the secret is zeroed on drop.
+fn generate_bridge_secret() -> Zeroizing<[u8; 32]> {
+    let mut bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+    Zeroizing::new(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -1179,7 +1266,7 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     storage: Arc<S>,
     shutdown_handle: ShutdownHandle,
     bound_addr: SocketAddr,
-    bridge_secret: [u8; 32],
+    bridge_secret: Zeroizing<[u8; 32]>,
     dev_token: Option<String>,
     dev_bind_addr: Option<SocketAddr>,
     blob_storage: Arc<BlobStorageBackend>,
@@ -1207,7 +1294,7 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     let state = Arc::new(http::NodeState {
         did: identity.did.clone(),
         relay_url,
-        broadcast_contexts: tokio::sync::RwLock::new(Vec::new()),
+        broadcast_contexts: tokio::sync::RwLock::new(HashMap::new()),
         relay_addr: bound_addr,
         bridge_secret,
         dev_token,
@@ -1249,7 +1336,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     shutdown_handle: ShutdownHandle,
     bound_addr: SocketAddr,
     nat_strategy: Arc<dyn NatStrategy>,
-    bridge_secret: [u8; 32],
+    bridge_secret: Zeroizing<[u8; 32]>,
     dev_token: Option<String>,
     dev_bind_addr: Option<SocketAddr>,
     blob_storage: Arc<BlobStorageBackend>,
@@ -1294,7 +1381,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     let state = Arc::new(http::NodeState {
         did: identity.did.clone(),
         relay_url,
-        broadcast_contexts: tokio::sync::RwLock::new(Vec::new()),
+        broadcast_contexts: tokio::sync::RwLock::new(HashMap::new()),
         relay_addr: bound_addr,
         bridge_secret,
         dev_token,
@@ -1357,30 +1444,17 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
             .identity_source
             .ok_or(NodeError::MissingField("identity"))?;
 
-        // 1. Initialize storage.
         let storage = self.storage.unwrap_or_else(|| Arc::new(S::default()));
-
-        // 2. Obtain identity.
-        let (identity, document, did_method) = match identity_source {
-            IdentitySource::Generate {
-                key_custody,
-                did_method,
-            } => {
-                let (identity, document) = did_method.create(&*key_custody).await?;
-                (identity, document, did_method)
-            }
-            IdentitySource::Explicit(e) => (e.identity, e.document, e.did_method),
-        };
+        let (identity, document, did_method) = resolve_identity(identity_source).await?;
 
         // 3. Start relay server.
         let bind_addr = self
             .bind_addr
             .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
-
-        let bridge_secret: [u8; 32] = rand::random();
+        let bridge_secret = generate_bridge_secret();
         let relay_config = RelayConfig {
             bind_addr,
-            bridge_secret: Some(bridge_secret),
+            bridge_secret: Some(*bridge_secret),
             ..RelayConfig::default()
         };
 
@@ -2575,7 +2649,8 @@ mod tests {
 
             // Register a broadcast context.
             node.register_broadcast_context("abc123".to_owned(), Some("Test Broadcast".to_owned()))
-                .await;
+                .await
+                .unwrap();
 
             let router = node.well_known_router();
 
@@ -2627,7 +2702,8 @@ mod tests {
 
             // Register a context.
             node.register_broadcast_context("def456".to_owned(), None)
-                .await;
+                .await
+                .unwrap();
 
             // Second request: context appears.
             let router = node.well_known_router();

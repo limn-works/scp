@@ -21,6 +21,7 @@ use futures::{SinkExt, StreamExt};
 use tokio::sync::{RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use zeroize::Zeroizing;
 
 use scp_platform::traits::Storage;
 use scp_transport::native::server::RelayConfig as TransportRelayConfig;
@@ -61,9 +62,9 @@ pub struct NodeState {
     pub(crate) did: String,
     /// The relay URL (e.g., `wss://example.com/scp/v1`).
     pub(crate) relay_url: String,
-    /// Registered broadcast contexts. Modified via
-    /// [`ApplicationNode::register_broadcast_context`].
-    pub(crate) broadcast_contexts: RwLock<Vec<BroadcastContext>>,
+    /// Registered broadcast contexts, keyed by lowercase hex context ID.
+    /// Modified via [`ApplicationNode::register_broadcast_context`].
+    pub(crate) broadcast_contexts: RwLock<HashMap<String, BroadcastContext>>,
     /// The relay server's bound address for WebSocket bridge connections.
     pub(crate) relay_addr: SocketAddr,
     /// Shared secret for authenticating internal bridge connections.
@@ -73,7 +74,8 @@ pub struct NodeState {
     /// relay validates this token during the WebSocket handshake
     /// (defense-in-depth, #85). Moved from query parameter to header to
     /// prevent leakage via server logs or error messages (#225).
-    pub(crate) bridge_secret: [u8; 32],
+    /// Wrapped in `Zeroizing` so the secret is zeroed on drop.
+    pub(crate) bridge_secret: Zeroizing<[u8; 32]>,
     /// Bearer token for the dev API (`scp_local_token_<32 hex chars>`).
     ///
     /// `Some` when `local_api()` was called on the builder, `None` otherwise.
@@ -240,7 +242,9 @@ async fn ws_upgrade_handler(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let relay_addr = state.relay_addr;
-    let bridge_secret = state.bridge_secret;
+    // Clone the Zeroizing wrapper so the bridge task's copy is also zeroed
+    // on drop. Avoids leaving bare secret bytes on the stack/heap.
+    let bridge_secret = state.bridge_secret.clone();
     // Move the permit into the closure — it is released when the closure
     // is dropped, either after the bridge ends or if the upgrade fails.
     ws.on_upgrade(move |socket| async move {
@@ -266,9 +270,12 @@ async fn ws_upgrade_handler(
 /// Ping/Pong control frames. This prevents an attacker from keeping
 /// connections alive indefinitely by sending pings without real data
 /// (#229).
-async fn relay_bridge(axum_ws: WebSocket, relay_addr: SocketAddr, bridge_secret: [u8; 32]) {
+async fn relay_bridge(
+    axum_ws: WebSocket,
+    relay_addr: SocketAddr,
+    bridge_secret: Zeroizing<[u8; 32]>,
+) {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-
     let token_hex = scp_transport::native::server::hex_encode_32(&bridge_secret);
     let url = format!("ws://{relay_addr}/");
     let mut request = match url.into_client_request() {
@@ -675,9 +682,9 @@ mod tests {
         Arc::new(NodeState {
             did: "did:dht:cors_test".to_owned(),
             relay_url: "wss://localhost/scp/v1".to_owned(),
-            broadcast_contexts: RwLock::new(Vec::new()),
+            broadcast_contexts: RwLock::new(HashMap::new()),
             relay_addr: "127.0.0.1:9000".parse::<SocketAddr>().unwrap(),
-            bridge_secret: [0u8; 32],
+            bridge_secret: Zeroizing::new([0u8; 32]),
             dev_token: None,
             dev_bind_addr: None,
             projected_contexts: RwLock::new(HashMap::new()),
