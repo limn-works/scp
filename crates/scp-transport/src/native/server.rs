@@ -46,7 +46,7 @@ use super::protocol::{
 use super::relay_persistence::RelayPersistence;
 use super::storage::{BlobStorage, BlobStorageBackend};
 use crate::error::TransportError;
-use crate::relay::bridge::{BridgeRegistration, BridgeRegistry, BRIDGE_AUTH_FAILED_MSG};
+use crate::relay::bridge::{BRIDGE_AUTH_FAILED_MSG, BridgeRegistration, BridgeRegistry};
 use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter, SubscribeRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
 
@@ -292,6 +292,7 @@ impl RelayServer {
             connection_tracker,
             publish_rate_limiter,
             persistence: None,
+            bridge_registry: Arc::new(BridgeRegistry::new()),
         }
     }
 
@@ -3131,7 +3132,7 @@ mod tests {
             RelayMessage::Err { code: c, .. } => {
                 assert_eq!(c, code::BRIDGE_AUTH_FAILED);
             }
-            other => panic!("expected ERR(BRIDGE_AUTH_FAILED), got {other:?}")
+            other => panic!("expected ERR(BRIDGE_AUTH_FAILED), got {other:?}"),
         }
     }
 }
