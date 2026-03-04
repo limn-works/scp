@@ -112,6 +112,13 @@ mls/{context_id}/...
 
 **Nonce keys.** UCAN nonce replay prevention uses `context/{context_id}/nonce/{SHA256(nonce_string)}` — the nonce string is hashed to a fixed-length key. The value stores `(first_seen_timestamp, token_expiry_timestamp)` for pruning. The `exists()` method enables O(1) replay checks without deserializing.
 
+**Nonce pruning.** Expired nonces (where `token_expiry < now`) must be cleaned up to prevent unbounded growth. Pruning is triggered in two places:
+
+1. **At startup.** `restore_all_contexts` calls `prune_expired_nonces` for each restored context, clearing the backlog accumulated during the previous process lifetime.
+2. **Time-gated inline.** `check_and_record_nonce` tracks the last prune time per context via a storage key (`context/{context_id}/nonce/_last_prune`). If more than 1 hour has elapsed since the last prune, a full prune pass runs before the nonce check. This adds one extra storage read per nonce check (the last-prune timestamp), which is negligible relative to the two reads and one write the nonce check already performs. The expensive full scan only runs hourly.
+
+The in-memory `NonceTracker` remains the primary, synchronised replay defense on the hot path. `ProtocolStore` nonce tracking is defense-in-depth for crash recovery. The time-gated prune ensures the persistent nonce store does not grow without bound even in long-running processes that never restart.
+
 **Context cleanup.** When a context is closed or expired, `delete_prefix("context/{context_id}/")` removes all context state atomically. No enumeration required.
 
 ## 17.4 ProtocolStore
