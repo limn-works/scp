@@ -605,9 +605,13 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     ) -> Result<MigrationProof, IdentityError> {
         let mut hasher = Sha256::new();
         hasher.update(DOMAIN_MIGRATION_V1);
-        hasher.update((identity.did.len() as u32).to_be_bytes());
+        let old_len = u32::try_from(identity.did.len())
+            .map_err(|_| IdentityError::InvalidDidFormat("DID too long for length prefix".into()))?;
+        let new_len = u32::try_from(new_did.len())
+            .map_err(|_| IdentityError::InvalidDidFormat("DID too long for length prefix".into()))?;
+        hasher.update(old_len.to_be_bytes());
         hasher.update(identity.did.as_bytes());
-        hasher.update((new_did.len() as u32).to_be_bytes());
+        hasher.update(new_len.to_be_bytes());
         hasher.update(new_did.as_bytes());
         hasher.update(rotated_at.to_be_bytes());
         let digest = hasher.finalize();
@@ -961,9 +965,15 @@ pub fn verify_migration(
     // variable-length DID strings.
     let mut hasher = Sha256::new();
     hasher.update(DOMAIN_MIGRATION_V1);
-    hasher.update((old_did.len() as u32).to_be_bytes());
+    let old_len = u32::try_from(old_did.len()).map_err(|_| {
+        IdentityError::InvalidDidFormat("DID too long for length prefix".into())
+    })?;
+    let new_len = u32::try_from(new_did.len()).map_err(|_| {
+        IdentityError::InvalidDidFormat("DID too long for length prefix".into())
+    })?;
+    hasher.update(old_len.to_be_bytes());
     hasher.update(old_did.as_bytes());
-    hasher.update((new_did.len() as u32).to_be_bytes());
+    hasher.update(new_len.to_be_bytes());
     hasher.update(new_did.as_bytes());
     hasher.update(rotated_at.to_be_bytes());
     let digest = hasher.finalize();
