@@ -89,28 +89,6 @@ const BRIDGE_REGISTER_REPLAY_WINDOW_SECS: u64 = 60;
 use scp_identity::{did_from_ed25519_public_key, resolution::did_routing_id};
 
 // ---------------------------------------------------------------------------
-// BridgeRequest — wire-level operation type
-// ---------------------------------------------------------------------------
-
-/// The BRIDGE operation sent by peers to a bridge relay to reach a
-/// self-hosted relay behind symmetric NAT (spec section 10.12.4).
-///
-/// This is a higher-level routing hint — peers include this information
-/// via the `bridge_target` query parameter in the relay URL. The bridge
-/// relay uses `target_routing_id` to look up the registered self-hosted
-/// relay connection and proxies traffic to it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BridgeRequest {
-    /// Routing ID of the bridged (self-hosted) relay.
-    pub target_routing_id: [u8; 32],
-
-    /// URL hint for reaching the target relay. Used by the bridge for
-    /// initial connection establishment if the target is not yet
-    /// registered.
-    pub target_relay_hint: String,
-}
-
-// ---------------------------------------------------------------------------
 // BridgeRegistration — self-hosted relay registers with a bridge
 // ---------------------------------------------------------------------------
 
@@ -380,10 +358,9 @@ impl BridgeRegistry {
         // Check global registration limit (replacements don't increase count).
         let is_replacement = entries.contains_key(&routing_id);
         if !is_replacement && entries.len() >= self.max_registrations {
-            return Err(TransportError::ProtocolError(format!(
-                "bridge global registration limit exceeded: max {} registrations",
-                self.max_registrations
-            )));
+            return Err(TransportError::ProtocolError(
+                "bridge registration limit exceeded".into(),
+            ));
         }
 
         // Check per-connection limit. For replacements where the old entry
@@ -395,10 +372,9 @@ impl BridgeRegistry {
                 .get(&routing_id)
                 .is_some_and(|e| e.connection_id != connection_id);
         if needs_new_slot && conn_count >= MAX_REGISTRATIONS_PER_CONNECTION {
-            return Err(TransportError::ProtocolError(format!(
-                "bridge registration limit exceeded: max {MAX_REGISTRATIONS_PER_CONNECTION} \
-                 registrations per connection"
-            )));
+            return Err(TransportError::ProtocolError(
+                "bridge registration limit exceeded".into(),
+            ));
         }
 
         let (tx, rx) = mpsc::channel(256);
@@ -483,10 +459,13 @@ impl BridgeRegistry {
 
     /// Removes all registrations for a given connection (on disconnect).
     pub async fn deregister_connection(&self, connection_id: u64) {
-        // Hold a single write lock throughout to prevent TOCTOU races:
-        // a concurrent register() between a read-check and write-remove
-        // could be wrongly removed.
+        // Acquire BOTH write locks up front to match the lock ordering in
+        // register() and deregister(), preventing TOCTOU races where a
+        // concurrent register() could see stale counts between the two
+        // lock regions.
         let mut entries = self.entries.write().await;
+        let mut counts = self.connection_counts.write().await;
+
         let routing_ids: Vec<[u8; 32]> = entries
             .iter()
             .filter(|(_, e)| e.connection_id == connection_id)
@@ -496,9 +475,10 @@ impl BridgeRegistry {
         for id in &routing_ids {
             entries.remove(id);
         }
-        drop(entries);
+        counts.remove(&connection_id);
 
-        self.connection_counts.write().await.remove(&connection_id);
+        drop(counts);
+        drop(entries);
 
         if !routing_ids.is_empty() {
             debug!(
@@ -535,53 +515,27 @@ impl Default for BridgeRegistry {
 }
 
 // ---------------------------------------------------------------------------
-// BridgeConfig — server-side configuration
-// ---------------------------------------------------------------------------
-
-/// Configuration for the bridge relay service (spec section 10.12.4).
-///
-/// Any SCP relay MAY offer bridge service. When `enabled` is true, the
-/// relay accepts `BRIDGE_REGISTER` operations and proxies traffic for
-/// registered routing IDs.
-#[derive(Debug, Clone)]
-pub struct BridgeConfig {
-    /// Whether this relay supports the BRIDGE operation.
-    /// Corresponds to the `supports_bridge` configuration flag.
-    pub enabled: bool,
-
-    /// Maximum number of concurrent bridge registrations across all
-    /// connections. Prevents unbounded registry growth.
-    pub max_registrations: usize,
-}
-
-impl Default for BridgeConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_registrations: 1000,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Bridge URL parsing (section 10.12.7)
 // ---------------------------------------------------------------------------
 
-/// Parses a bridge relay URL and extracts the `bridge_target` routing hint.
+/// Parses a bridge relay URL and extracts the `bridge_target` routing ID.
 ///
 /// Bridge URLs follow the format specified in section 10.12.7:
-/// `wss://bridge.example.com/scp/v1?bridge_target=<hex-routing-hint>`
+/// `wss://bridge.example.com/scp/v1?bridge_target=<hex-routing-id>`
 ///
-/// Returns `None` if the URL does not contain a `bridge_target` parameter
-/// or if the hex encoding is invalid.
+/// Returns `None` if the URL does not contain a `bridge_target` parameter,
+/// if the hex encoding is invalid, or if the decoded value is not exactly
+/// 32 bytes (routing IDs are `[u8; 32]` throughout the protocol).
 #[must_use]
-pub fn parse_bridge_target(url: &str) -> Option<Vec<u8>> {
+pub fn parse_bridge_target(url: &str) -> Option<[u8; 32]> {
     let query_start = url.find('?')?;
     let query = &url[query_start + 1..];
 
     for param in query.split('&') {
         if let Some(value) = param.strip_prefix("bridge_target=") {
-            return hex::decode(value).ok();
+            let bytes = hex::decode(value).ok()?;
+            let arr: [u8; 32] = bytes.try_into().ok()?;
+            return Some(arr);
         }
     }
 
@@ -593,112 +547,13 @@ pub fn parse_bridge_target(url: &str) -> Option<Vec<u8>> {
 #[must_use]
 pub fn is_bridge_url(url: &str) -> bool {
     // Only match bridge_target= in the query string portion (after '?'),
-    // not in the path, fragment, or userinfo components.
-    url.find('?')
-        .is_some_and(|pos| url[pos..].contains("bridge_target="))
-}
-
-// ---------------------------------------------------------------------------
-// BridgeDiscovery — client-side bridge discovery and failover
-// ---------------------------------------------------------------------------
-
-/// A discovered bridge relay that can be used for registration.
-#[derive(Debug, Clone)]
-pub struct BridgeRelay {
-    /// The bridge relay's WebSocket URL.
-    pub url: String,
-
-    /// Whether this bridge is currently active (has a live registration).
-    pub active: bool,
-}
-
-/// Client-side bridge discovery and failover manager.
-///
-/// When a self-hosted relay behind symmetric NAT needs bridge service,
-/// this manager handles:
-/// 1. Discovering available bridge relays (from bootstrap list, DHT, etc.).
-/// 2. Registering with one or more bridges.
-/// 3. Detecting bridge failures and re-registering with alternatives.
-///
-/// The bridge is **substitutable** (spec section 10.12.4): if one bridge
-/// fails, the manager discovers another and re-registers. No session
-/// state is lost because MLS sessions survive relay changes.
-#[derive(Debug)]
-pub struct BridgeDiscovery {
-    /// Known bridge relays, ordered by preference.
-    relays: RwLock<Vec<BridgeRelay>>,
-
-    /// The routing ID this self-hosted relay wants to register.
-    routing_id: [u8; 32],
-}
-
-impl BridgeDiscovery {
-    /// Creates a new bridge discovery manager for the given routing ID.
-    #[must_use]
-    pub fn new(routing_id: [u8; 32]) -> Self {
-        Self {
-            relays: RwLock::new(Vec::new()),
-            routing_id,
-        }
-    }
-
-    /// Returns the routing ID being registered with bridges.
-    #[must_use]
-    pub const fn routing_id(&self) -> &[u8; 32] {
-        &self.routing_id
-    }
-
-    /// Adds a bridge relay to the list of known bridges.
-    pub async fn add_relay(&self, url: String) {
-        let mut relays = self.relays.write().await;
-        // Avoid duplicates.
-        if !relays.iter().any(|r| r.url == url) {
-            relays.push(BridgeRelay { url, active: false });
-        }
-    }
-
-    /// Marks a bridge relay as active (successfully registered).
-    pub async fn mark_active(&self, url: &str) {
-        let mut relays = self.relays.write().await;
-        if let Some(relay) = relays.iter_mut().find(|r| r.url == url) {
-            relay.active = true;
-        }
-    }
-
-    /// Marks a bridge relay as failed and returns the next available
-    /// alternative for failover.
-    ///
-    /// Returns `None` if no alternative bridges are available.
-    pub async fn failover(&self, failed_url: &str) -> Option<String> {
-        let mut relays = self.relays.write().await;
-
-        // Mark the failed relay as inactive.
-        if let Some(relay) = relays.iter_mut().find(|r| r.url == failed_url) {
-            relay.active = false;
-            warn!(url = failed_url, "bridge relay failed, attempting failover");
-        }
-
-        // Find the first inactive relay that isn't the failed one.
-        relays
-            .iter()
-            .find(|r| !r.active && r.url != failed_url)
-            .map(|r| r.url.clone())
-    }
-
-    /// Returns a list of all currently active bridge relays.
-    pub async fn active_relays(&self) -> Vec<String> {
-        let relays = self.relays.read().await;
-        relays
-            .iter()
-            .filter(|r| r.active)
-            .map(|r| r.url.clone())
-            .collect()
-    }
-
-    /// Returns the number of known bridge relays (active and inactive).
-    pub async fn relay_count(&self) -> usize {
-        self.relays.read().await.len()
-    }
+    // not in the path, fragment, or userinfo components. Truncate at '#'
+    // to exclude the fragment.
+    url.find('?').is_some_and(|pos| {
+        let query = &url[pos..];
+        let query = query.split('#').next().unwrap_or(query);
+        query.contains("bridge_target=")
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -736,28 +591,6 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock before UNIX epoch")
             .as_secs()
-    }
-
-    // -- BridgeRequest --
-
-    #[test]
-    fn bridge_request_construction() {
-        let req = BridgeRequest {
-            target_routing_id: [0xAA; 32],
-            target_relay_hint: "wss://bridge.example.com/scp/v1".to_string(),
-        };
-        assert_eq!(req.target_routing_id, [0xAA; 32]);
-        assert_eq!(req.target_relay_hint, "wss://bridge.example.com/scp/v1");
-    }
-
-    #[test]
-    fn bridge_request_equality() {
-        let a = BridgeRequest {
-            target_routing_id: [0x11; 32],
-            target_relay_hint: "wss://a.example.com/scp/v1".to_string(),
-        };
-        let b = a.clone();
-        assert_eq!(a, b);
     }
 
     // -- BridgeRegistration --
@@ -1152,31 +985,22 @@ mod tests {
         assert_eq!(received, blob);
     }
 
-    // -- BridgeConfig --
-
-    #[test]
-    fn bridge_config_default_is_disabled() {
-        let config = BridgeConfig::default();
-        assert!(!config.enabled);
-        assert_eq!(config.max_registrations, 1000);
-    }
-
     // -- URL parsing --
 
     #[test]
-    fn parse_bridge_target_valid() {
-        let url = "wss://bridge.example.com/scp/v1?bridge_target=aabbccdd";
-        let target = parse_bridge_target(url).unwrap();
-        assert_eq!(target, vec![0xAA, 0xBB, 0xCC, 0xDD]);
-    }
-
-    #[test]
-    fn parse_bridge_target_full_routing_id() {
+    fn parse_bridge_target_valid_32_bytes() {
         let routing_id = [0x42; 32];
         let hex_id = hex::encode(routing_id);
         let url = format!("wss://bridge.example.com/scp/v1?bridge_target={hex_id}");
         let target = parse_bridge_target(&url).unwrap();
-        assert_eq!(target, routing_id.to_vec());
+        assert_eq!(target, routing_id);
+    }
+
+    #[test]
+    fn parse_bridge_target_wrong_length_returns_none() {
+        // 4 bytes is not a valid routing ID (needs 32).
+        let url = "wss://bridge.example.com/scp/v1?bridge_target=aabbccdd";
+        assert!(parse_bridge_target(url).is_none());
     }
 
     #[test]
@@ -1193,9 +1017,11 @@ mod tests {
 
     #[test]
     fn parse_bridge_target_with_other_params() {
-        let url = "wss://bridge.example.com/scp/v1?foo=bar&bridge_target=deadbeef&baz=1";
-        let target = parse_bridge_target(url).unwrap();
-        assert_eq!(target, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let routing_id = [0xDE; 32];
+        let hex_id = hex::encode(routing_id);
+        let url = format!("wss://bridge.example.com/scp/v1?foo=bar&bridge_target={hex_id}&baz=1");
+        let target = parse_bridge_target(&url).unwrap();
+        assert_eq!(target, routing_id);
     }
 
     #[test]
@@ -1208,83 +1034,6 @@ mod tests {
     #[test]
     fn is_bridge_url_false() {
         assert!(!is_bridge_url("wss://relay.example.com/scp/v1"));
-    }
-
-    // -- BridgeDiscovery --
-
-    #[tokio::test]
-    async fn discovery_add_and_count() {
-        let discovery = BridgeDiscovery::new([0x01; 32]);
-        assert_eq!(discovery.relay_count().await, 0);
-
-        discovery
-            .add_relay("wss://bridge1.example.com/scp/v1".to_string())
-            .await;
-        discovery
-            .add_relay("wss://bridge2.example.com/scp/v1".to_string())
-            .await;
-        assert_eq!(discovery.relay_count().await, 2);
-    }
-
-    #[tokio::test]
-    async fn discovery_no_duplicates() {
-        let discovery = BridgeDiscovery::new([0x01; 32]);
-
-        discovery
-            .add_relay("wss://bridge1.example.com/scp/v1".to_string())
-            .await;
-        discovery
-            .add_relay("wss://bridge1.example.com/scp/v1".to_string())
-            .await;
-        assert_eq!(discovery.relay_count().await, 1);
-    }
-
-    #[tokio::test]
-    async fn discovery_mark_active() {
-        let discovery = BridgeDiscovery::new([0x01; 32]);
-        let url = "wss://bridge1.example.com/scp/v1".to_string();
-
-        discovery.add_relay(url.clone()).await;
-        assert!(discovery.active_relays().await.is_empty());
-
-        discovery.mark_active(&url).await;
-        assert_eq!(discovery.active_relays().await, vec![url]);
-    }
-
-    #[tokio::test]
-    async fn discovery_failover_returns_alternative() {
-        let discovery = BridgeDiscovery::new([0x01; 32]);
-
-        let url1 = "wss://bridge1.example.com/scp/v1".to_string();
-        let url2 = "wss://bridge2.example.com/scp/v1".to_string();
-
-        discovery.add_relay(url1.clone()).await;
-        discovery.add_relay(url2.clone()).await;
-        discovery.mark_active(&url1).await;
-
-        // Failover from url1 should return url2.
-        let alt = discovery.failover(&url1).await;
-        assert_eq!(alt, Some(url2));
-    }
-
-    #[tokio::test]
-    async fn discovery_failover_no_alternatives() {
-        let discovery = BridgeDiscovery::new([0x01; 32]);
-
-        let url1 = "wss://bridge1.example.com/scp/v1".to_string();
-        discovery.add_relay(url1.clone()).await;
-        discovery.mark_active(&url1).await;
-
-        // No alternative bridges available.
-        let alt = discovery.failover(&url1).await;
-        assert!(alt.is_none());
-    }
-
-    #[tokio::test]
-    async fn discovery_routing_id() {
-        let routing_id = [0xAB; 32];
-        let discovery = BridgeDiscovery::new(routing_id);
-        assert_eq!(discovery.routing_id(), &routing_id);
     }
 
     #[tokio::test]
@@ -1309,8 +1058,8 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("global registration limit"),
-            "expected global limit error, got: {err_msg}"
+            err_msg.contains("registration limit exceeded"),
+            "expected limit error, got: {err_msg}"
         );
     }
 
@@ -1342,8 +1091,8 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("registrations per connection"),
-            "expected per-connection limit error, got: {err_msg}"
+            err_msg.contains("registration limit exceeded"),
+            "expected limit error, got: {err_msg}"
         );
 
         // A different connection should still succeed (global limit is 1000).

@@ -56,10 +56,6 @@ pub mod code {
     /// The target routing ID is not registered on this bridge relay.
     pub const BRIDGE_TARGET_NOT_FOUND: u16 = 4032;
 
-    /// The relay supports bridge operations but the bridge service is not yet
-    /// integrated into the relay server. The client should retry later.
-    pub const BRIDGE_NOT_INTEGRATED: u16 = 4033;
-
     /// Bridge registration authentication failed (SCP-247, §10.12.4).
     ///
     /// The `BRIDGE_REGISTER` message had a missing, invalid, or expired
@@ -137,7 +133,6 @@ mod tests {
             code::BRIDGE_NOT_SUPPORTED,
             code::BRIDGE_LIMIT_EXCEEDED,
             code::BRIDGE_TARGET_NOT_FOUND,
-            code::BRIDGE_NOT_INTEGRATED,
             code::BRIDGE_AUTH_FAILED,
         ];
 
@@ -203,7 +198,6 @@ mod tests {
         assert_eq!(code::BRIDGE_NOT_SUPPORTED, 4030);
         assert_eq!(code::BRIDGE_LIMIT_EXCEEDED, 4031);
         assert_eq!(code::BRIDGE_TARGET_NOT_FOUND, 4032);
-        assert_eq!(code::BRIDGE_NOT_INTEGRATED, 4033);
         assert_eq!(code::BRIDGE_AUTH_FAILED, 4034);
         assert_eq!(code::INTERNAL_ERROR, 5000);
         assert_eq!(code::STORAGE_FULL, 5001);

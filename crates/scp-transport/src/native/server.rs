@@ -989,8 +989,10 @@ async fn handle_client_message(
                 ref_id.clone(),
                 *target_routing_id,
                 payload,
+                ip,
                 tx,
                 config,
+                rate_limiter,
                 bridge_registry,
             )
             .await;
@@ -1442,12 +1444,18 @@ async fn handle_bridge_register(
 /// the opaque payload to the registered self-hosted relay. The bridge
 /// does not inspect, modify, or cache the payload — it is a transparent
 /// pipe.
+///
+/// Rate-limited via the same [`PublishRateLimiter`] as `PUBLISH` to
+/// prevent amplification attacks (security review finding).
+#[allow(clippy::too_many_arguments)]
 async fn handle_bridge_data(
     ref_id: Option<String>,
     target_routing_id: [u8; 32],
     payload: &[u8],
+    ip: IpAddr,
     tx: &mpsc::Sender<RelayMessage>,
     config: &RelayConfig,
+    rate_limiter: &PublishRateLimiter,
     bridge_registry: &Arc<BridgeRegistry>,
 ) {
     // Gate: bridging must be enabled on this relay.
@@ -1456,6 +1464,33 @@ async fn handle_bridge_data(
             ref_id,
             code: code::BRIDGE_NOT_SUPPORTED,
             msg: "this relay does not support BRIDGE operations".to_string(),
+        };
+        let _ = tx.send(err).await;
+        return;
+    }
+
+    // Rate limit bridge data forwarding (same per-IP limit as PUBLISH).
+    if !rate_limiter.check(ip).await {
+        tracing::warn!(ip = %ip, "bridge data rate limit exceeded");
+        let err = RelayMessage::Err {
+            ref_id,
+            code: code::RATE_LIMITED,
+            msg: "bridge data rate limit exceeded".to_string(),
+        };
+        let _ = tx.send(err).await;
+        return;
+    }
+
+    // Validate payload size (same constraint as PUBLISH blobs).
+    if payload.is_empty() || payload.len() > config.max_blob_size {
+        let err = RelayMessage::Err {
+            ref_id,
+            code: code::BLOB_TOO_LARGE,
+            msg: format!(
+                "bridge payload must be 1-{} bytes, got {}",
+                config.max_blob_size,
+                payload.len()
+            ),
         };
         let _ = tx.send(err).await;
         return;

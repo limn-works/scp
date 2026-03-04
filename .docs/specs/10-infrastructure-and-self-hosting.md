@@ -454,7 +454,10 @@ BRIDGE_REGISTER {
 }
 ```
 
-The bridge relay authenticates the registration (§10.12.4.1) and records the routing ID → connection mapping. Responds with `OK` on success, `ERR` with code `BRIDGE_AUTH_FAILED` (4034) on authentication failure, or `ERR` with `BRIDGE_NOT_SUPPORTED` (4030) if bridging is disabled.
+The bridge relay authenticates the registration (§10.12.4.1) and records the routing ID → connection mapping. Responds with `OK` on success, or `ERR` with:
+- `BRIDGE_NOT_SUPPORTED` (4030) — bridging is disabled on this relay.
+- `BRIDGE_LIMIT_EXCEEDED` (4031) — global or per-connection registration limit reached.
+- `BRIDGE_AUTH_FAILED` (4034) — authentication failed (invalid signature, routing ID mismatch, or expired timestamp).
 
 ```
 BRIDGE_DATA (client → bridge) {
@@ -463,7 +466,10 @@ BRIDGE_DATA (client → bridge) {
 }
 ```
 
-The bridge looks up the target routing ID, wraps the payload in a relay-side `BRIDGE_DATA` message, and forwards it to the registered self-hosted relay over its outbound connection. The bridge does NOT inspect, modify, decrypt, or cache payloads — it is a transparent pipe. Responds with `OK` to the sending peer on success, `ERR` with `BRIDGE_TARGET_NOT_FOUND` (4032) if the target is not registered.
+The bridge looks up the target routing ID, wraps the payload in a relay-side `BRIDGE_DATA` message, and forwards it to the registered self-hosted relay over its outbound connection. The bridge does NOT inspect, modify, decrypt, or cache payloads — it is a transparent pipe. `BRIDGE_DATA` is subject to the same per-IP rate limit as `PUBLISH` and the same maximum payload size (`max_blob_size`, default 256 KB) to prevent amplification attacks. Responds with `OK` to the sending peer on success, or `ERR` with:
+- `BRIDGE_TARGET_NOT_FOUND` (4032) — target routing ID is not registered.
+- `RATE_LIMITED` (4020) — per-IP rate limit exceeded.
+- `BLOB_TOO_LARGE` (4010) — payload exceeds maximum allowed size.
 
 **Relay-side forwarding format.** The message delivered to the self-hosted relay uses a different wire structure from the client-side `BRIDGE_DATA`:
 
