@@ -329,7 +329,7 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
 
    **4a. `rotate_active_key(identity, key_custody) -> Identity`** (Layer 1 — common case)
    - Generates a new Ed25519 keypair as the new Active Signing Key via `key_custody.generate_keypair(KeyType::Ed25519)`.
-   - Updates the DID document: adds the new key as a verification method, moves `authentication` and `assertionMethod` references to the new key. Retains the old key as `#retired-{sequence}` for historical verification.
+   - Updates the DID document: adds the new key as a verification method, moves `authentication` and `assertionMethod` references to the new key. Retains the old key as `#retired-{sequence}` for historical verification. Retired key retention is bounded: the document retains at most the 2 most recent retired active keys; older ones are pruned on rotation to prevent unbounded DID document growth within DHT size constraints.
    - Signs the DID document update with the **Identity Key** (NOT the old active key).
    - Publishes to DHT with incremented BEP44 sequence number.
    - Returns updated Identity with the new active key handle.
@@ -338,7 +338,7 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
 
    **4a′. `rotate_agent_key(identity, key_custody) -> Identity`** (Layer 1 — agent key rotation, ADR-039)
    - Generates a new Ed25519 keypair as the new Agent Signing Key via `key_custody.generate_keypair(KeyType::Ed25519)`.
-   - Updates the DID document: replaces the `#agent` verification method with the new key. Retains the old agent key as `#retired-agent-{sequence}` for historical verification. Retired key retention is bounded: the document retains at most the 2 most recent retired agent keys; older ones are pruned on rotation. This mirrors the `#retired-{sequence}` pattern for active key rotation and prevents unbounded DID document growth within DHT size constraints.
+   - Updates the DID document: replaces the `#agent` verification method with the new key. Retains the old agent key as `#retired-agent-{sequence}` for historical verification. Retired key retention is bounded: the document retains at most the 2 most recent retired agent keys; older ones are pruned on rotation (same policy as active key rotation) to prevent unbounded DID document growth within DHT size constraints.
    - Signs the DID document update with the **Identity Key** (`#0`).
    - Publishes to DHT with incremented BEP44 sequence number.
    - Returns updated Identity with the new agent key handle.
@@ -982,7 +982,7 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
    pub struct SenderKeyEpochAdvance {
        pub sender_did: DID,
        pub epoch: u64,
-       pub signer_key_ref: String,       // Which VM signed: "#active" or "#agent" (ADR-039)
+       pub signer_key_ref: SigningKeyId,  // Which VM signed: Active or Agent (ADR-039)
        pub signature: Ed25519Signature,  // Signs context_id || sender_did || signer_key_ref || "key_epoch" || epoch
    }
 
@@ -1168,7 +1168,7 @@ DidDocument.verification_method = [
 
 ### MLS Impact
 
-`ScpCredential` gains a `signing_key_id: String` field (`"#active"` or `"#agent"`). Verifiers resolve the correct public key from the DID document based on this field. Same DID = same MLS membership entry. Agent key rotation doesn't require MLS re-key — only a credential update via MLS Update proposal.
+`ScpCredential` gains a `signing_key_id: SigningKeyId` field (`Active` or `Agent`, wire-serialized as `"#active"` / `"#agent"`). Verifiers resolve the correct public key from the DID document based on this field. Same DID = same MLS membership entry. Agent key rotation doesn't require MLS re-key — only a credential update via MLS Update proposal.
 
 ```rust
 pub enum SigningKeyId {
@@ -1195,7 +1195,7 @@ New validation step 5b (after existing audience check): if `fct.scp_key_scope` e
 
 ### Inner Envelope Impact
 
-`InnerEnvelope` gains a `signing_key_id: String` field. Verifiers use it to resolve the correct public key from the sender's DID document. `SenderKeyEpochAdvance` gains a `signer_key_ref: String` field for the same purpose.
+`InnerEnvelope` gains a `signing_key_id: SigningKeyId` field. Verifiers use it to resolve the correct public key from the sender's DID document. `SenderKeyEpochAdvance` gains a `signer_key_ref: SigningKeyId` field for the same purpose.
 
 ### Key Continuity
 
@@ -1232,13 +1232,13 @@ Agent key compromise (most common case — agent runtime is less secure than dev
 2. `ScpIdentity` includes `agent_signing_key: Option<KeyHandle>`.
 3. `DidDht::create()` generates an optional fourth keypair for the agent signing key.
 4. `add_agent_key()`, `remove_agent_key()`, `rotate_agent_key()` methods on `DidDocument`.
-5. `ScpCredential` includes `signing_key_id: String` field; serialization round-trips correctly.
+5. `ScpCredential` includes `signing_key_id: SigningKeyId` field; serialization round-trips correctly.
 6. `UcanHeader` includes optional `kid: String` field; `MintParams` includes optional `key_scope: String`.
 7. UCAN validation step 5b: if `fct.scp_key_scope` exists, verify the presenting key matches.
 8. Self-delegation (`iss == aud` with `key_scope`) is explicitly valid.
 9. `MintSpendingParams` uses `{ did, key_scope }` instead of `{ issuer_did, agent_did }`.
-10. `InnerEnvelope` includes `signing_key_id: String`; verifiers resolve the correct DID document VM.
-11. `SenderKeyEpochAdvance` includes `signer_key_ref: String`.
+10. `InnerEnvelope` includes `signing_key_id: SigningKeyId`; verifiers resolve the correct DID document VM.
+11. `SenderKeyEpochAdvance` includes `signer_key_ref: SigningKeyId`.
 12. Key continuity fingerprint includes all three VMs.
 13. One DID = one governance vote regardless of signing key.
 14. Verifiers reject DID documents with multiple `#agent` VMs.
