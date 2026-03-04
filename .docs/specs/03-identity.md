@@ -101,7 +101,10 @@ Context state handles multi-party social data. Identity private state handles si
 ```
 Identity (DID)
 ├── Public State (DID Document)
-│   ├── Public keys
+│   ├── Verification methods (ADR-039)
+│   │   ├── #0 — Identity Key (Ed25519, root of trust, offline)
+│   │   ├── #active — Human Signing Key (Ed25519, hardware-backed)
+│   │   └── #agent — Agent Signing Key (Ed25519, optional, software-held, rotatable)
 │   ├── Service endpoints / relay list
 │   └── Published attestations
 │

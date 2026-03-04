@@ -6,14 +6,14 @@ Humans and their bound agents are the only actors in the system. Every action on
 
 ## 4.2 Binding
 
-Every agent is bound to one or more humans via cryptographic proof. The binding is verifiable by any participant.
+Every agent is bound to its human through the DID document itself — the agent's signing key is a verification method (`#agent`) on the human's DID. Binding is structural, not an external proof: the DID document is the single source of truth for which key is the human's (`#active`) and which is the agent's (`#agent`). The binding is verifiable by any participant who resolves the DID.
 
-- **Personal agents:** Bound to a single human. The common case.
+- **Personal agents:** Bound to a single human. The common case. The human's DID document contains at most one `#agent` verification method.
 - **Institutional agents:** Bound to multiple humans through shared governance (multi-sig, elected operators, organizational hierarchy). Structurally identical to personal agents; the difference is in who holds the keys and how revocation/control works. Institutions get one agent per context, the same as individuals — one seat per institution per table.
 
 ## 4.3 One Agent Per Person Per Context
 
-At the protocol level, each human has exactly one agent per context. This is a social constraint, not a computational one. The agent can be arbitrarily capable internally — parallel execution, complex orchestration, sophisticated reasoning. The constraint is on presence: one seat per person per table.
+At the protocol level, each human has exactly one agent per context. This is structurally enforced: a DID document contains exactly one `#agent` verification method. Verifiers reject DID documents with multiple `#agent` VMs. The agent can be arbitrarily capable internally — parallel execution, complex orchestration, sophisticated reasoning. The constraint is on presence: one seat per person per table.
 
 Prevents: fleet-based force multiplication within a space, agent slot rental within a context, swarm attacks from a single identity, ambiguity in trust evaluation.
 
@@ -34,7 +34,7 @@ The fundamental unit of participation in SCP is not the agent alone — it is th
 
 This pairing is what the protocol provides. At the protocol level, the agent acts. At the trust level, the human is accountable. Other participants evaluate both: "Do I trust this person?" and "Do I trust what their agent can do?" These are separate questions with a single answer — the trust function (§7.1) evaluates identity and capability together.
 
-The protocol does not define a separate "human-direct" interaction mode. The human always acts through their agent. But this is not because the human is subordinate to the agent — it is because the agent is the human's presence in the protocol, the way a voice is a person's presence in a conversation. The agent carries the human's capability tokens, bound to their DID, legible to other participants. The human decides what the agent does — from full autonomy to direct manual control — and that decision is local, outside protocol scope.
+The human and agent share a single DID but their actions carry distinct provenance. Messages signed with `#active` are human-direct; messages signed with `#agent` are agent-autonomous. This distinction is structural — verifiers can determine provenance from the signing key alone, without out-of-band metadata. The human can always act directly through `#active`, and the agent acts through `#agent`. The human decides what the agent does — from full autonomy to direct manual control — and that decision is local, outside protocol scope.
 
 What this means for the ecosystem:
 
@@ -44,7 +44,7 @@ What this means for the ecosystem:
 
 ## 4.6 Agents Are Consumers, Not Enforcers
 
-Human-bound agents are **protocol consumers** — a different class of user than humans, but users nonetheless. They use apps. They use context tools. They interact with contexts through the protocol. They have zero responsibility for enforcing protocol rules.
+Human-bound agents are **protocol consumers** — the same identity as their human, distinguished only by verification method (`#agent` vs `#active`), but consumers nonetheless. They use apps. They use context tools. They interact with contexts through the protocol. They have zero responsibility for enforcing protocol rules.
 
 The protocol enforces itself — through cryptography (encryption-as-access-control, key tree exclusion for blocks, capability token validation) and through the SDK that builders use to construct conformant apps. Agents do not enforce blocking, role permissions, capability ceilings, or any other protocol rule. The protocol and its cryptographic guarantees handle enforcement. Apps built on the SDK inherit those guarantees. Agents and humans consume those apps.
 

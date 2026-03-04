@@ -2,10 +2,10 @@
 
 ## 9.1 Core Invariants
 
-1. **Every action traces to a human.** No anonymous actors. No unaccountable software.
+1. **Every action traces to a human.** No anonymous actors. No unaccountable software. Every action is distinguishable as human-direct (`#active`) or agent-autonomous (`#agent`) by the verification method used to sign it (ADR-039).
 2. **Agents are context-bound.** No protocol-level cross-context awareness or communication for agents.
 3. **Tools are stateless and non-agentic.** They compute, they don't act.
-4. **One agent per person per context.** No fleet multiplication within a space.
+4. **One agent per person per context.** No fleet multiplication within a space. Structurally enforced via DID document cardinality — exactly one `#agent` verification method per DID document (ADR-039).
 5. **Contexts are isolated by default.** No transitive exposure. Cross-context data flow only through two explicit, opt-in mechanisms: tool interfaces (asymmetric, §6.2) and multi-parent child contexts (symmetric, §5.13).
 6. **Role assignment is non-negotiable.** Agents cannot request elevated permissions.
 7. **Context metadata is transparent.** Full legibility before opt-in.
@@ -211,9 +211,9 @@ The protocol mandates a single ciphersuite for v1. No negotiation, no fallback. 
 
 **Merkle tree hash:** SHA-256. Append-only log tree following Certificate Transparency structure (RFC 6962). Each event entry is `SHA256(previous_hash || event_data)`. The Merkle root provides tamper-evident integrity over the entire event history.
 
-**Envelope signature scope:** The outer envelope is unsigned — it contains only the routing pseudonym, recipient hint, blob TTL, and encrypted blob (§9.10.2). The full signature lives inside the encrypted payload, signed by the sender's identity key: `SHA256("SCP-INNER-ENVELOPE-V1:" || context_id || sender_did || epoch || generation_number || sequence_number || timestamp || payload_hash || provenance_hash)` where `payload_hash = SHA256(original_plaintext)` (before padding) and `provenance_hash = SHA256(serialize(provenance))` if present, or `SHA256(0x00)` if absent. The `SCP-INNER-ENVELOPE-V1:` domain separator prefix prevents cross-protocol hash confusion — the same byte sequence cannot be a valid canonical hash in another protocol. This binds both payload content and provenance metadata to the signature — neither can be stripped, modified, or fabricated without invalidating the envelope signature. Field-swapping attacks (e.g., moving a payload from one context to another) produce invalid signatures. Relay operators cannot verify signatures (they cannot see sender DIDs), which is by design — verification is the responsibility of context members who can decrypt the payload.
+**Envelope signature scope:** The outer envelope is unsigned — it contains only the routing pseudonym, recipient hint, blob TTL, and encrypted blob (§9.10.2). The full signature lives inside the encrypted payload, signed by `#active` (Active Signing Key) or `#agent` (Agent Signing Key) from the sender's DID document (ADR-039): `SHA256("SCP-INNER-ENVELOPE-V1:" || context_id || sender_did || epoch || generation_number || sequence_number || timestamp || payload_hash || provenance_hash)` where `payload_hash = SHA256(original_plaintext)` (before padding) and `provenance_hash = SHA256(serialize(provenance))` if present, or `SHA256(0x00)` if absent. The `SCP-INNER-ENVELOPE-V1:` domain separator prefix prevents cross-protocol hash confusion — the same byte sequence cannot be a valid canonical hash in another protocol. This binds both payload content and provenance metadata to the signature — neither can be stripped, modified, or fabricated without invalidating the envelope signature. Field-swapping attacks (e.g., moving a payload from one context to another) produce invalid signatures. Relay operators cannot verify signatures (they cannot see sender DIDs), which is by design — verification is the responsibility of context members who can decrypt the payload.
 
-**Broadcast envelope signature scope:** Broadcast contexts (§5.14) use a different envelope format (`BroadcastEnvelope`) where the sender identity is visible (not inside MLS encryption). The signature covers: `SHA256(context_id || sender_did || sequence || key_epoch || timestamp || content_hash || provenance_hash)` where `content_hash = SHA256(original_plaintext)` and `provenance_hash = SHA256(serialize(provenance))` if present, or `SHA256(0x00)` if absent. This is structurally consistent with the InnerEnvelope signature — it replaces `epoch || generation` (MLS-specific) with `key_epoch` (broadcast-specific) and omits MLS generation numbers (broadcast uses per-sender sequence numbers only). The signature is verified by subscribers against the author's known Active Signing Key (resolved from the author's DID document).
+**Broadcast envelope signature scope:** Broadcast contexts (§5.14) use a different envelope format (`BroadcastEnvelope`) where the sender identity is visible (not inside MLS encryption). The signature covers: `SHA256(context_id || sender_did || sequence || key_epoch || timestamp || content_hash || provenance_hash)` where `content_hash = SHA256(original_plaintext)` and `provenance_hash = SHA256(serialize(provenance))` if present, or `SHA256(0x00)` if absent. This is structurally consistent with the InnerEnvelope signature — it replaces `epoch || generation` (MLS-specific) with `key_epoch` (broadcast-specific) and omits MLS generation numbers (broadcast uses per-sender sequence numbers only). The signature is verified by subscribers against the author's Active Signing Key or Agent Signing Key (resolved from the author's DID document, ADR-039). Both `#active` and `#agent` are valid signing keys for broadcast envelopes.
 
 **UCAN signing:** EdDSA (Ed25519) per UCAN specification. The nonce field (`nnc`) is mandatory and must be unique per token issuance. This prevents UCAN token replay. UCAN token expiry (`exp`) MUST NOT exceed 24 hours (matching the nonce deduplication cache window in §9.8.2). Tokens with longer expiry could be replayed after nonce cache eviction. **UCAN revocation** is per-context via `RevocationList` — an append-only map of token CIDs to revocation states (Active, RevocationPending, Revoked). Revocations are distributed as MLS application messages to all context members. Revocation check is step 10 of the 11-step validation pipeline (ADR-016) and is performed on every capability exercise. The system is **fail-closed**: tokens in `RevocationPending` state (revocation initiated but not yet confirmed via MLS) are denied. See ADR-016 criterion 7 and `scp-core/crypto/ucan/revoke.rs` for the full specification.
 
@@ -248,7 +248,7 @@ did:web (fallback only — used only if did:dht libraries prove unusable) resolv
 **Required mitigations if did:web is used:**
 
 - The SDK MUST pin the TLS certificate of the did:web resolution server.
-- The SDK MUST verify that the DID document's verification method key matches the key used for all prior interactions with this DID (key continuity check / TOFU — Trust On First Use).
+- The SDK MUST verify each verification method independently — track `#0` (Identity Key), `#active` (Active Signing Key), and `#agent` (Agent Signing Key) separately for TOFU pinning (ADR-039). A change in any single VM triggers the key change alert, even if others remain stable.
 - The SDK MUST alert the user on any key change, with maximum severity.
 - The SDK SHOULD record the did:web key fingerprint in identity private state (§3.7) for cross-device consistency of TOFU state.
 
@@ -282,7 +282,7 @@ MLS (RFC 9420) provides the group encryption layer for SCP. This section specifi
 | Group | Context | 1:1 mapping. Each SCP context is one MLS group. |
 | Member (LeafNode) | Agent (in context) | One MLS leaf node per agent in the context. |
 | Epoch | Context epoch | Increments on every membership change or key update. Included in all SCP envelopes. |
-| LeafNode credential | DID + UCAN | The MLS credential field contains the member's DID and their context-scoped UCAN token. |
+| LeafNode credential | DID + UCAN + signing_key_id | The MLS credential field contains the member's DID, their context-scoped UCAN token, and the `signing_key_id` (`#active` or `#agent`) identifying which verification method signed this leaf node (ADR-039). |
 | Welcome message | Context join token | HPKE-encrypted to new member's KeyPackage. Contains the group state needed to decrypt future messages. |
 | KeyPackage | Pre-key bundle | Published to relays so others can add the identity to groups even when offline. Signed by identity key. Single-use. |
 | Proposal (Add/Remove/Update) | Governance action | MLS membership proposals map to SCP membership changes. |
@@ -320,6 +320,7 @@ MLS provides PCS through the Update proposal mechanism. After a member sends an 
 - The SDK MUST periodically issue MLS Update proposals. Recommended interval: every 24 hours for active contexts, or immediately after any suspected compromise.
 - The SDK SHOULD issue an Update after re-establishing connectivity following an offline period.
 - When an Active Signing Key rotates (ADR-003 §4a), the agent MUST issue an MLS Update in every active context with the new credential. This synchronizes key rotation with MLS-level post-compromise security.
+- When an Agent Signing Key rotates (ADR-039), the SDK MUST issue an MLS Update proposal in every active context with a new credential containing the updated `signing_key_id` referencing the new `#agent` verification method. This ensures peers can verify messages signed by the new agent key and reject messages signed by the old one.
 - When an Identity Key migrates (ADR-003 §4b), the agent MUST send a `DidRotationEvent` in every active context and issue MLS Updates with the new credential under the new DID.
 
 **PCS Update interval as context parameter:** High-security contexts may configure shorter PCS Update intervals (e.g., 1 hour). The interval is a context-level parameter set at creation, defaulting to 24 hours.
@@ -331,9 +332,10 @@ MLS provides PCS through the Update proposal mechanism. After a member sends an 
 - Identity Key (Ed25519): Generated in hardware security module where available (Secure Enclave, Android Keystore). Private key never exported from the secure element. Used ONLY for DID document updates and signing pre-rotation commitments. The DID string is derived from this key and never changes.
 - Active Signing Key (Ed25519): Generated via KeyCustody. Used for MLS credentials, inner envelope signatures, UCAN issuance. Rotatable via DID document update signed by the Identity Key (ADR-003 §4a). The DID string does NOT change on active key rotation.
 - Pre-Rotation Key (Ed25519): Generated at identity creation, stored in cold/offline custody. `SHA-256(public_key)` is published as a PreRotationCommitment in the DID document. Revealed only during Identity Key migration (ADR-003 §4b) to prove legitimate rotation.
+- Agent Signing Key (Ed25519, optional): Generated by agent runtime software. Published as `#agent` verification method in the DID document by the Identity Key (`#0`). Software-held — no HSM requirement (agent runtimes typically lack hardware security). Used for agent-autonomous message signing and scoped UCAN delegation. Rotatable via DID document update signed by `#0` (ADR-039). The DID string does NOT change on agent key rotation.
 - MLS leaf key (X25519): Generated by the MLS library per the selected ciphersuite. Stored in platform secure storage.
 - KeyPackages: Pre-generated and published to relays. Each KeyPackage is single-use. The SDK MUST maintain a buffer of at least 10 unused KeyPackages per identity on relays. Replenished when the buffer drops below 5.
-- UCAN signing key: Active Signing Key (Ed25519). UCAN tokens are signed by the human's Active Signing Key — NOT the Identity Key (ADR-003 §4a). On active key rotation, existing UCAN tokens are revoked and reissued under the new Active Signing Key.
+- UCAN signing key: Active Signing Key (Ed25519) for root UCANs. UCAN tokens are signed by the human's Active Signing Key — NOT the Identity Key (ADR-003 §4a). On active key rotation, existing UCAN tokens are revoked and reissued under the new Active Signing Key. Agent-autonomous actions use scoped UCANs delegated from `#active` to `#agent` with `fct.scp_key_scope: "#agent"` (ADR-039). The agent signs these scoped UCANs with its `#agent` key — never the root UCAN directly.
 
 **Key distribution:**
 
@@ -344,9 +346,10 @@ MLS provides PCS through the Update proposal mechanism. After a member sends an 
 **Key rotation:**
 
 - Active Signing Key: Rotated via `rotate_active_key` (ADR-003 §4a). DID document is updated with new verification method, signed by the Identity Key, published to DHT with incremented sequence number. All active MLS groups receive an Update proposal with the new credential. The DID string does NOT change.
+- Agent Signing Key: Rotated via `rotate_agent_key` (ADR-039). The Identity Key (`#0`) publishes a new DID document with a replacement `#agent` verification method (or removes `#agent` entirely to revoke agent access). All scoped UCANs with `fct.scp_key_scope: "#agent"` signed by the old `#agent` key are revoked and reissued with the new key. All active MLS groups receive an Update proposal with a new credential containing the updated `signing_key_id`. The DID string does NOT change.
 - Identity Key: Migrated via `migrate_identity` (ADR-003 §4b) — rare operation. Creates a new DID with the pre-rotation key as the new Identity Key. Old DID document updated with `alsoKnownAs` forwarding. `DidRotationEvent` sent to all active contexts. Pre-rotation proof resolves ambiguity if the old key was compromised. The migration proof is an Ed25519 signature over `SHA-256(SCP-MIGRATION-V1: || len(old_did) || old_did || len(new_did) || new_did || rotated_at)` where `len()` is a 4-byte big-endian unsigned integer and `rotated_at` is an 8-byte big-endian Unix timestamp. Length prefixes prevent concatenation ambiguity between variable-length DID strings.
 - MLS epoch keys: Rotated automatically on every Commit (membership change or Update).
-- UCAN tokens: Expire per their `exp` field. Re-issued by the human's Active Signing Key. On active key rotation (ADR-003 §4a), all UCAN tokens signed by the old Active Signing Key are revoked and reissued under the new key. Revocations are added to the per-context `RevocationList` and distributed as MLS application messages (see §9.5 UCAN revocation, ADR-016 criterion 5).
+- UCAN tokens: Expire per their `exp` field. Re-issued by the human's Active Signing Key. On active key rotation (ADR-003 §4a), all UCAN tokens signed by the old Active Signing Key are revoked and reissued under the new key. On agent key rotation (ADR-039), all scoped UCANs with `fct.scp_key_scope: "#agent"` are revoked and reissued with the new `#agent` key; root UCANs signed by `#active` are unaffected. Revocations are added to the per-context `RevocationList` and distributed as MLS application messages (see §9.5 UCAN revocation, ADR-016 criterion 5).
 
 **Key destruction:**
 
@@ -362,7 +365,7 @@ This section specifies how SCP prevents message forgery, replay attacks, and ord
 
 Every SCP message has two independent integrity verifications, both inside the encrypted payload. Neither is verifiable by relays — relays see only opaque blobs.
 
-**Inner check 1 — Ed25519 identity signature.** The sender signs the payload with their Active Signing Key (see ADR-003 §4a): `SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash)` where `payload_hash` covers the original plaintext (before padding) and `provenance_hash` covers serialized provenance metadata (or `SHA256(0x00)` if absent). Processing order: hash plaintext -> hash provenance -> sign -> pad -> sender-key encrypt -> MLS encrypt. Reverse on receipt: MLS decrypt -> sender-key decrypt -> strip padding -> verify signature -> verify payload_hash -> verify provenance_hash. A failed signature means the envelope was tampered with or forged and MUST be rejected.
+**Inner check 1 — Ed25519 identity signature.** The sender signs the payload with their Active Signing Key or Agent Signing Key (see ADR-003 §4a, ADR-039): `SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash)` where `payload_hash` covers the original plaintext (before padding) and `provenance_hash` covers serialized provenance metadata (or `SHA256(0x00)` if absent). Processing order: hash plaintext -> hash provenance -> sign -> pad -> sender-key encrypt -> MLS encrypt. Reverse on receipt: MLS decrypt -> sender-key decrypt -> strip padding -> verify signature -> verify payload_hash -> verify provenance_hash. A failed signature means the envelope was tampered with or forged and MUST be rejected.
 
 **Inner check 2 — MLS membership_tag.** The MLS PrivateMessage format includes an HMAC (membership_tag) that proves the sender is a group member with correct epoch secrets. This is verified during MLS decryption. It provides authentication independent of the identity signature — even if an attacker obtained the DID private key, they cannot produce a valid membership_tag without the MLS epoch secrets.
 
@@ -463,7 +466,7 @@ ConsistencyCheckpoint {
   merkleRoot:   [UInt8; 32]      // root hash of local event log
   epoch:        UInt64           // current MLS epoch
   timestamp:    DateTime
-  signature:    Ed25519Signature // signed by sender's DID key
+  signature:    Ed25519Signature // signed by sender's #active or #agent key (ADR-039); equivocation detection applies to both
 }
 ```
 
@@ -548,6 +551,7 @@ context_keypair = Ed25519_keygen(context_seed[0..32])
 context_pseudonym = context_keypair.public_key
 ```
 
+- **Per-DID, not per-VM.** The pseudonym is derived from `identity_key_material` (the DID's `#0` key), so human and agent share one pseudonym per context regardless of which signing key (`#active` or `#agent`) is used for individual messages (ADR-039). This prevents pseudonym divergence from leaking the human/agent distinction to relays.
 - **Deterministic:** Same identity + same context = same pseudonym.
 - **Unlinkable across contexts:** Different context_id = different pseudonym. Relays cannot correlate activity across contexts.
 - **Verification:** Sender includes full DID inside MLS-encrypted payload. Group members verify pseudonym-to-DID mapping on first encounter and cache the association.
@@ -656,8 +660,10 @@ Equivalent to Signal's "safety numbers." Allows two parties to verify they have 
 **Fingerprint format:**
 
 ```
-fingerprint = SHA256(sort(alice_did, bob_did) || alice_pubkey || bob_pubkey)
+fingerprint = SHA256(sort(alice_did, bob_did) || alice_identity_key || alice_active_key || alice_agent_key || bob_identity_key || bob_active_key || bob_agent_key)
 ```
+
+All three verification methods (`#0`, `#active`, `#agent`) from each party's DID document are included to detect substitution of any single key (ADR-039). If a DID has no `#agent` verification method (no agent bound), 32 zero bytes are used as a placeholder to maintain a fixed-length input. Keys are concatenated in the order shown (identity, active, agent) within each DID's block; the two DID blocks are ordered by lexicographic sort of the DID strings.
 
 Displayed as:
 - A 12-word mnemonic (BIP-39 word list, first 128 bits of the hash)
@@ -682,6 +688,7 @@ Displayed as:
 When a key is known or suspected to be compromised, the following ordered steps constitute the recovery protocol:
 
 **1. Key rotation on trusted device.**
+- **Agent Signing Key compromise (most common case):** The agent runtime is typically less secure than device HSM, making `#agent` the most likely key to be compromised. Recovery: (1) Human uses `#0` (Identity Key) to publish a new DID document removing or replacing the `#agent` verification method. (2) Revoke all UCANs with `fct.scp_key_scope: "#agent"` — add to per-context `RevocationList` and distribute via MLS application messages. (3) Issue MLS Update proposals in all active contexts with new credentials (updated `signing_key_id`). (4) Publish new KeyPackages. The human's `#active` key, root UCANs, and Identity Key are unaffected — only agent-scoped material is rotated (ADR-039). This is the cheapest recovery scenario: no identity migration, no root UCAN reissuance.
 - **Active Signing Key compromise (common case):** Call `rotate_active_key` (ADR-003 §4a). Generate new active signing keypair, update DID document signed by Identity Key, publish to DHT. The DID string does NOT change. No identity migration needed.
 - **Identity Key compromise (rare, severe):** Call `migrate_identity` (ADR-003 §4b) using the pre-rotation key from cold storage. The pre-rotation commitment in the old DID document proves the legitimate owner is rotating, not the attacker. Creates a new DID. Old DID document updated with forwarding record. `DidRotationEvent` sent to all contexts with pre-rotation proof.
 - **Both keys compromised, pre-rotation key available:** Same as Identity Key compromise — the pre-rotation key resolves the race condition.
@@ -744,7 +751,7 @@ KeyDestructionAttestation {
   destroyedAt:           DateTime
   platformAttestation:   PlatformAttestation?  // hardware-backed if available
   method:                .hardwareBacked | .softwareOnly
-  signature:             Ed25519Signature       // signed by identity key, NOT the destroyed key
+  signature:             Ed25519Signature       // signed by #0 (Identity Key) or #active (Active Signing Key); NOT #agent — agents cannot sign destruction attestations (ADR-039)
 }
 ```
 
@@ -772,7 +779,7 @@ Each participant in a context holds one AES-256 symmetric sender key. All messag
 
 **Wrapping key terminology.** The sender-side key layer uses two distinct wrapping keys, both HPKE-based but serving different roles: (1) the **stable wrapping keypair** (below) protects the persistent per-sender AES-256 symmetric key during key distribution — it is long-lived and published in the MLS LeafNode; (2) the **ephemeral wrapping keypair** (§9.16.2) protects per-request key material during individual key exchanges — it is generated fresh for each `SenderKeyRequest` and discarded after use. Both use X25519 + HPKE for key encapsulation, but the stable key enables offline key distribution while the ephemeral key provides forward secrecy for individual key exchanges.
 
-**Stable wrapping keypair.** Each member maintains a dedicated X25519 keypair per context, used exclusively for HPKE wrapping of sender key distributions (§9.16.2). This keypair is published as an MLS LeafNode extension (`scp_wrapping_key`) and is distinct from the MLS leaf HPKE key used for MLS key agreement. The wrapping keypair does NOT rotate on MLS Updates (epoch advances) — it remains stable across epochs so that sender key distributions can always be unwrapped, even by members who are offline during epoch transitions or who join after an epoch advance. The wrapping keypair rotates only on: (1) identity key rotation (§9.12), or (2) suspected compromise. On rotation, the member publishes the new wrapping public key in their LeafNode extension via an MLS Update and re-distributes their current sender key to all non-blocked members using the new wrapping keys.
+**Stable wrapping keypair.** Each member maintains a single dedicated X25519 keypair per context (one per DID, shared by human and agent — ADR-039), used exclusively for HPKE wrapping of sender key distributions (§9.16.2). This keypair is published as an MLS LeafNode extension (`scp_wrapping_key`) and is distinct from the MLS leaf HPKE key used for MLS key agreement. The wrapping keypair does NOT rotate on MLS Updates (epoch advances) — it remains stable across epochs so that sender key distributions can always be unwrapped, even by members who are offline during epoch transitions or who join after an epoch advance. The wrapping keypair rotates only on: (1) identity key rotation (§9.12), or (2) suspected compromise. On rotation, the member publishes the new wrapping public key in their LeafNode extension via an MLS Update and re-distributes their current sender key to all non-blocked members using the new wrapping keys.
 
 ### 9.16.2 Key Distribution (Pull-Based)
 
@@ -780,7 +787,7 @@ Sender keys are distributed via a pull-based request/response protocol. When a s
 
 **Protocol flow:**
 
-1. **Epoch advance notification.** When a sender generates or rotates their key, they publish a `SenderKeyEpochAdvance { sender_did, epoch, signature }` as an MLS application message. The signature covers `context_id || sender_did || "key_epoch" || epoch`, signed by the sender's Active Signing Key. This is **O(1)** regardless of group size.
+1. **Epoch advance notification.** When a sender generates or rotates their key, they publish a `SenderKeyEpochAdvance { sender_did, epoch, signature }` as an MLS application message. The signature covers `context_id || sender_did || "key_epoch" || epoch`, signed by the sender's Active Signing Key or Agent Signing Key (ADR-039). This is **O(1)** regardless of group size.
 
 2. **Key request.** Members who need the key (because they see a new epoch, or because they just joined) send a `SenderKeyRequest { requester_did, sender_did, epoch, wrapping_pubkey, signature }` as an MLS application message with `recipient_hint` directed to the key holder. The `wrapping_pubkey` is a fresh ephemeral X25519 key generated per request.
 
@@ -803,9 +810,9 @@ When Alice blocks Bob:
 1. Alice persists the block to her block list (identity private state, §3.7.1 for global blocks; context state for in-context blocks) BEFORE any key operations. **This ordering is mandatory** — the block list must be authoritative before `SenderKeyEpochAdvance` publication. Without this ordering invariant, Bob can race to send a `SenderKeyRequest` for the new key before the block list is updated, defeating the block.
 2. Alice generates a new AES-256-GCM sender key and increments her `sender_key_epoch`.
 3. Alice publishes `SenderKeyEpochAdvance { sender_did: alice_did, epoch: N, signature }` as an MLS application message. **O(1) cost** — no per-recipient HPKE payloads. All group members see the epoch advance.
-4. Alice sends a **signed** block notification to Bob as an MLS application message: `{"type": "block", "blocker": "did:dht:alice", "blocked": "did:dht:bob", "timestamp": unix_ms, "signature": Ed25519_sign(alice_active_signing_key, SHA-256(context_id || "block" || alice_did || bob_did || timestamp))}`. The signature prevents forgery — without it, any group member could impersonate Alice and trick Bob into rotating his sender key. MLS application messages prove group membership but not individual sender identity within the message payload.
+4. Alice sends a **signed** block notification to Bob as an MLS application message: `{"type": "block", "blocker": "did:dht:alice", "blocked": "did:dht:bob", "timestamp": unix_ms, "signature": Ed25519_sign(alice_signing_key, SHA-256(context_id || "block" || alice_did || bob_did || timestamp))}` where `alice_signing_key` is Alice's `#active` (Active Signing Key) or `#agent` (Agent Signing Key) — either is valid (ADR-039). The signature prevents forgery — without it, any group member could impersonate Alice and trick Bob into rotating his sender key. MLS application messages prove group membership but not individual sender identity within the message payload.
 5. Non-blocked members observe the epoch advance and send `SenderKeyRequest` for Alice's new key (§9.16.2). Alice's SDK checks the block list for each request — responds with the HPKE-encrypted key for non-blocked members, ignores requests from Bob. **O(1) per response.** For global blocks (Tier 2), Alice's SDK checks the identity-level block list directly — not only the per-context block list — to prevent bypass via context-level propagation delays.
-6. Bob's client **verifies the block notification signature** against Alice's known Active Signing Key (from her MLS LeafNode `scp_signing_key` extension). If verification fails, the notification is discarded and logged for anomaly detection. If verification succeeds, Bob's client automatically rotates Bob's sender key (incrementing his own epoch), publishes his own `SenderKeyEpochAdvance`, and adds Alice to Bob's block list. When members request Bob's new key, Bob's SDK responds to everyone except Alice.
+6. Bob's client **verifies the block notification signature** against Alice's known Active Signing Key or Agent Signing Key (from her DID document; both `#active` and `#agent` are valid — ADR-039). If verification fails, the notification is discarded and logged for anomaly detection. If verification succeeds, Bob's client automatically rotates Bob's sender key (incrementing his own epoch), publishes his own `SenderKeyEpochAdvance`, and adds Alice to Bob's block list. When members request Bob's new key, Bob's SDK responds to everyone except Alice.
 7. The block event is recorded in the context event log with `EventType::MemberBlocked { blocker, blocked, signature }` for auditability.
 
 **Block event observability:** Block events are observable to the group. The epoch advance notifications are visible to all members, and the block notification is an MLS application message. Other members can infer the block. This is an acceptable tradeoff, consistent with how other messaging systems handle blocks. The protocol prioritizes cryptographic enforcement of the block over concealing the block event.
@@ -832,7 +839,7 @@ Sender keys rotate ONLY on block events, not on MLS epoch advances. This is a de
 
 ### 9.16.6 Sybil Resistance at the Blocking Layer
 
-The block list (§9.16.3) is per-DID. A Sybil attacker — one human controlling multiple DIDs — can create a fresh DID not on the block list and use it to request the new sender key after a block event. The block protocol tenet "every agent traces to a human DID through attestation chains" is not mechanically enforced by the block list alone. This section specifies the mitigations.
+The block list (§9.16.3) is per-DID. A Sybil attacker — one human controlling multiple DIDs — can create a fresh DID not on the block list and use it to request the new sender key after a block event. Under the shared-DID model (ADR-039), the agent key lives inside the human's DID document — creating a separate agent identity requires creating a full human-grade DID with its own identity depth (attestations, history, economic activity). This mechanically enforces the "every agent traces to a human" tenet: the agent IS the human's DID. The Sybil cost for agents is identical to the Sybil cost for humans. Despite this mechanical enforcement, the block list alone does not prevent all bypass. This section specifies the mitigations.
 
 **Mitigation 1: Membership gate.** `handle_sender_key_request` MUST verify that the requester's DID is a current member of the context before distributing sender keys. In Encrypted contexts, MLS group membership already gates who can observe application messages (including `SenderKeyRequest`), so this is defense-in-depth redundancy. In Broadcast contexts, where key requests travel as relay messages outside MLS, the membership gate is the primary defense: a Sybil DID that has not been admitted through normal subscription controls (DID-authentication for open contexts, UCAN validation for gated contexts) cannot request keys. The Sybil attacker must first pass the context's admission controls — earned capacity thresholds, UCAN gating, device attestation requirements, or whatever the context mandates — before they can even attempt a key request. This raises the cost of Sybil bypass from "create a DID" to "create a DID AND satisfy context admission requirements."
 
@@ -909,7 +916,7 @@ Content Encryption:
 
 **AES-256-GCM additional authenticated data (AAD).** Content encryption MUST bind `context_id` as AAD: `AAD = context_id || sender_did || sequence_number`. This prevents ciphertext from being moved between contexts or reordered within a context. The AEAD authentication tag provides integrity verification — no separate content hash is needed.
 
-**Access key request protocol.** `AccessKeyRequest` messages MUST include a signed payload: `{ context_id, requester_did, epoch, timestamp }` signed with the requester's Active Signing Key. The responder verifies the signature, checks the block list and revocation list, and responds with the HPKE-encrypted access key only if the requester is authorized. The timestamp prevents replay (requests older than 30 seconds are rejected).
+**Access key request protocol.** `AccessKeyRequest` messages MUST include a signed payload: `{ context_id, requester_did, epoch, timestamp }` signed with the requester's Active Signing Key or Agent Signing Key (either `#active` or `#agent` is valid — ADR-039). The responder verifies the signature, checks the block list and revocation list, and responds with the HPKE-encrypted access key only if the requester is authorized. The timestamp prevents replay (requests older than 30 seconds are rejected).
 
 ### 9.17.2 Access Key Lifecycle
 

@@ -1,0 +1,950 @@
+{
+  "project": "scp",
+  "description": "Shared-DID human-agent identity model: human and agent share one DID with three verification methods (#0 identity key, #active human signing key, #agent agent signing key). Mechanical enforcement of one-agent-per-context, structural accountability, protocol-native action provenance. Permission model: Category A (DID doc mods, #0 only), Category B (operational actions, user-configurable), Category C (context-configurable). Five-layer enforcement stack: custody separation, SDK defaults, verifier validation, custody attestation, behavioral signals. ADR-039.",
+  "gates": [
+    {
+      "id": "gate-design-artifacts",
+      "name": "Design Artifacts (ADR + Specs)",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-AB-001",
+        "SCP-AB-002",
+        "SCP-AB-003",
+        "SCP-AB-004",
+        "SCP-AB-005",
+        "SCP-AB-006",
+        "SCP-AB-007"
+      ]
+    },
+    {
+      "id": "gate-identity-layer",
+      "name": "Identity Layer Implementation",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-AB-008",
+        "SCP-AB-009",
+        "SCP-AB-010"
+      ]
+    },
+    {
+      "id": "gate-crypto-layer",
+      "name": "Crypto Layer (MLS + UCAN + Envelope)",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-AB-011",
+        "SCP-AB-012",
+        "SCP-AB-013",
+        "SCP-AB-014",
+        "SCP-AB-015"
+      ]
+    },
+    {
+      "id": "gate-ffi-bridges",
+      "name": "FFI Bridge Updates",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-AB-016",
+        "SCP-AB-017"
+      ]
+    },
+    {
+      "id": "gate-attestation",
+      "name": "Custody Attestation & Violation Logging",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-AB-018",
+        "SCP-AB-019",
+        "SCP-AB-020"
+      ]
+    },
+    {
+      "id": "gate-integration",
+      "name": "Integration Testing",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-AB-021",
+        "SCP-AB-022"
+      ]
+    }
+  ],
+  "stories": [
+    {
+      "id": "SCP-AB-001",
+      "title": "Create ADR-039: Shared-DID Human-Agent Identity Model",
+      "gate": "gate-design-artifacts",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "done",
+      "files": [".docs/adrs/phase-1.md"],
+      "description": "Write ADR-039 in .docs/adrs/phase-1.md defining the shared-DID human-agent identity model. Decision: human and agent share one DID with #0 (identity key), #active (human signing key), #agent (agent signing key) verification methods. Rationale: mechanical enforcement of one-agent-per-context (verifiers reject DID documents with multiple #agent VMs), structural accountability (agent actions trace to human DID without UCAN chain resolution), protocol-native action provenance. Rejected alternative: separate DIDs linked by UCAN delegation — zero mechanical enforcement, agent identity structurally independent, human-agent unlinkability contradicts §9.1 invariant 1 and §4.5. Includes permission model (Categories A/B/C), enforcement stack (5 layers), and impacts on MLS, UCAN, inner envelope, key continuity, governance, and compromise recovery.",
+      "acceptanceCriteria": [
+        "ADR-039 exists in .docs/adrs/phase-1.md with Status: Accepted",
+        "ADR-039 Extends: ADR-003 (DID Creation)",
+        "Decision section defines three verification methods: #0 (Identity Key, Ed25519, hardware-backed), #active (Human Signing Key, Ed25519), #agent (Agent Signing Key, Ed25519, optional, rotatable)",
+        "Permission Model section defines Category A (#0 only: DID doc mods), Category B (user-configurable operational actions), Category C (context-configurable restrictions)",
+        "Enforcement Stack section defines 5 layers: custody separation, SDK defaults, verifier validation, custody attestation, behavioral signals",
+        "MLS Impact section adds signing_key_id to ScpCredential",
+        "UCAN Impact section adds kid header and fct.scp_key_scope, refactors MintSpendingParams",
+        "Inner Envelope Impact section adds signing_key_id field",
+        "Key Continuity section updates fingerprint to include all three VMs",
+        "Governance section states one DID = one vote",
+        "Compromise Recovery section documents agent key compromise procedure",
+        "Rejected Alternative section documents separate-DID model and reasons for rejection",
+        "Acceptance Criteria section lists 20 verifiable criteria"
+      ],
+      "actionItems": [
+        "Write ADR-039 with all required sections: Context, Decision, Permission Model, Enforcement Stack, MLS Impact, UCAN Impact, Inner Envelope Impact, Key Continuity, Governance, Compromise Recovery, Rejected Alternative, Acceptance Criteria",
+        "Place in .docs/adrs/phase-1.md after Phase 1 Integration Test section"
+      ],
+      "blockedBy": [],
+      "sources": [
+        { "file": ".docs/specs/04-agents.md", "section": "## 4.2 Binding" },
+        { "file": ".docs/specs/04-agents.md", "section": "## 4.3 One Agent Per Person Per Context" },
+        { "file": ".docs/specs/04-agents.md", "section": "## 4.5 The Human-Agent Pair" },
+        { "file": ".docs/specs/09-security-model.md", "section": "## 9.1 Core Invariants" },
+        { "file": ".docs/specs/09-security-model.md", "section": "## 9.3 Sybil Resistance and Identity Uniqueness" },
+        { "file": ".docs/specs/09-security-model.md", "section": "### 9.7.4 Key Lifecycle" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-002",
+      "title": "Update §3 identity spec for #agent verification method",
+      "gate": "gate-design-artifacts",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [".docs/specs/03-identity.md"],
+      "description": "Update §3 (Identity) to integrate the shared-DID model from ADR-039. §3.1 (Root of Identity) must document that a DID has three verification methods: #0 (identity), #active (human signing), #agent (agent signing, optional). §3.2 (Key Custody) must document custody separation between hardware-backed #active and software-based #agent. §3.9 (Key Lifecycle) must document agent key generation, rotation via #0, and removal. Add new subsection for agent key management operations: add_agent_key(), remove_agent_key(), rotate_agent_key(). Document the structural constraint: exactly one #agent VM per DID document; verifiers reject documents with multiple #agent VMs.",
+      "acceptanceCriteria": [
+        "§3.1 documents three verification methods: #0 (Identity Key), #active (Human Signing Key), #agent (Agent Signing Key, optional)",
+        "§3.2 documents custody separation: #active in hardware (SE/AKS), #agent in software keychain",
+        "§3.9 documents agent key lifecycle: generation at identity creation or later, rotation signed by #0, removal signed by #0",
+        "New subsection documents add_agent_key(), remove_agent_key(), rotate_agent_key() operations",
+        "Structural constraint documented: exactly one #agent VM per DID document, verifiers reject multiple",
+        "#agent is explicitly optional — not every DID needs an agent",
+        "Trust chain documented: #0 authorizes #active and #agent via DID document publication"
+      ],
+      "actionItems": [
+        "Update §3.1 to add #agent as third verification method",
+        "Update §3.2 to document custody separation for agent keys",
+        "Update §3.9 to document agent key lifecycle (generation, rotation, removal)",
+        "Add subsection for agent key management operations",
+        "Document structural constraint (one #agent per DID document)"
+      ],
+      "blockedBy": ["SCP-AB-001"],
+      "sources": [
+        { "file": ".docs/adrs/phase-1.md", "section": "## ADR-039: Shared-DID Human-Agent Identity Model" },
+        { "file": ".docs/specs/03-identity.md", "section": "## 3.1 Root of Identity" },
+        { "file": ".docs/specs/03-identity.md", "section": "## 3.2 Key Custody" },
+        { "file": ".docs/specs/03-identity.md", "section": "## 3.9 Key Lifecycle" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-003",
+      "title": "Update §4 agents spec for mechanical enforcement",
+      "gate": "gate-design-artifacts",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [".docs/specs/04-agents.md"],
+      "description": "Update §4 (Agents) to reflect the shared-DID model from ADR-039. §4.2 (Binding) must state that agents are bound to their human's DID via #agent verification method — not via separate DID with UCAN delegation. §4.3 (One Agent Per Person Per Context) must state that this is now mechanically enforced: exactly one #agent VM per DID document, verifiers reject documents with multiple. §4.5 (The Human-Agent Pair) must state that the pair shares one DID — agent actions are structurally traceable to the human without UCAN chain resolution. §4.7 (Context-Bound at Protocol Level) must document Category C context-configurable restrictions: agent_keys_allowed, agent-specific roles, agent_rate_limit, agent_cosign_required. §4.8 (Agent Fleet) must document how fleet operation works under shared-DID: one agent per DID, but a human can have multiple DIDs for fleet scenarios (with full Sybil cost per identity).",
+      "acceptanceCriteria": [
+        "§4.2 states binding is via #agent verification method on the human's DID",
+        "§4.3 states one-agent-per-context is mechanically enforced by DID document structure (one #agent VM max)",
+        "§4.5 states human-agent pair shares one DID, agent accountability is structural not inferential",
+        "§4.7 documents Category C context restrictions: agent_keys_allowed, agent-specific roles, agent_rate_limit, agent_cosign_required",
+        "§4.8 documents fleet operation under shared-DID model: one agent per DID, multiple DIDs for fleet (full Sybil cost each)",
+        "No references to separate agent DIDs or UCAN-delegation-based binding remain in §4"
+      ],
+      "actionItems": [
+        "Rewrite §4.2 for shared-DID binding model",
+        "Rewrite §4.3 for mechanical enforcement",
+        "Rewrite §4.5 for structural accountability",
+        "Update §4.7 with Category C context restrictions",
+        "Update §4.8 for fleet operation under shared-DID",
+        "Remove all references to separate agent DIDs"
+      ],
+      "blockedBy": ["SCP-AB-001"],
+      "sources": [
+        { "file": ".docs/adrs/phase-1.md", "section": "## ADR-039: Shared-DID Human-Agent Identity Model" },
+        { "file": ".docs/specs/04-agents.md", "section": "## 4.2 Binding" },
+        { "file": ".docs/specs/04-agents.md", "section": "## 4.3 One Agent Per Person Per Context" },
+        { "file": ".docs/specs/04-agents.md", "section": "## 4.5 The Human-Agent Pair" },
+        { "file": ".docs/specs/04-agents.md", "section": "## 4.7 Context-Bound at Protocol Level" },
+        { "file": ".docs/specs/04-agents.md", "section": "## 4.8 Agent Fleet" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-004",
+      "title": "Update §9 key lifecycle for agent key generation, rotation, and compromise",
+      "gate": "gate-design-artifacts",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [".docs/specs/09-security-model.md"],
+      "description": "Update §9.7.4 (Key Lifecycle) and §9.12 (Compromise Recovery) to integrate agent key management per ADR-039. §9.7.4 must document the three-key model: #0 identity key (hardware, never rotates), #active human signing key (rotatable via Layer 1), #agent agent signing key (rotatable via Layer 1, optional). Document agent key generation at identity creation or later via add_agent_key(). Document rotation: human uses #0 to publish new DID document with updated #agent. Document compromise recovery: remove/replace #agent, revoke scoped UCANs, MLS credential updates, new KeyPackages. §9.12 must add an agent key compromise section with the 4-step recovery procedure.",
+      "acceptanceCriteria": [
+        "§9.7.4 documents three verification methods: #0, #active, #agent with properties (holder, backing, rotatable, signs what)",
+        "§9.7.4 documents agent key generation: optional at identity creation or later via add_agent_key()",
+        "§9.7.4 documents agent key rotation: signed by #0 via DID document update",
+        "§9.7.4 documents agent key removal: signed by #0 via DID document update",
+        "§9.12 includes agent key compromise recovery: (1) #0 publishes new DID doc removing/replacing #agent, (2) revoke UCANs with scp_key_scope #agent, (3) MLS credential updates, (4) new KeyPackages",
+        "Agent key rotation does NOT require MLS re-key — only credential update via Update proposal"
+      ],
+      "actionItems": [
+        "Update §9.7.4 to document three-key model with properties table",
+        "Add agent key generation, rotation, and removal procedures to §9.7.4",
+        "Add agent key compromise recovery section to §9.12",
+        "Document that agent key rotation uses MLS Update proposal, not re-key"
+      ],
+      "blockedBy": ["SCP-AB-001"],
+      "sources": [
+        { "file": ".docs/adrs/phase-1.md", "section": "## ADR-039: Shared-DID Human-Agent Identity Model" },
+        { "file": ".docs/specs/09-security-model.md", "section": "### 9.7.4 Key Lifecycle" },
+        { "file": ".docs/specs/09-security-model.md", "section": "## 9.12 Compromise Recovery Protocol" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-005",
+      "title": "Update §9 envelope, MLS, UCAN, and signing sections for shared-DID",
+      "gate": "gate-design-artifacts",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [".docs/specs/09-security-model.md"],
+      "description": "Update §9.8 (Message Security), §9.7 (MLS Integration), §9.11 (Key Continuity), and §9.16 (Sender-Side Key Layer) for the shared-DID model per ADR-039. §9.8.1 (Envelope Integrity) must document that InnerEnvelope includes signing_key_id to identify which VM signed. §9.7.1 (MLS-to-SCP Concept Mapping) must document that ScpCredential includes signing_key_id — same DID = same MLS membership entry. §9.11 must update key continuity fingerprint to include all three VMs (agent key absence uses 32 zero bytes). §9.16.2 (Key Distribution) must document that SenderKeyEpochAdvance includes signer_key_ref. Also update §9.1 to strengthen invariant 1 ('every action traces to a human') as now structurally enforced, and invariant 4 ('one agent per person per context') as now mechanically enforced.",
+      "acceptanceCriteria": [
+        "§9.1 invariant 1 notes structural enforcement via shared-DID model",
+        "§9.1 invariant 4 notes mechanical enforcement via one #agent VM constraint",
+        "§9.7.1 documents ScpCredential with signing_key_id field (#active or #agent)",
+        "§9.7.1 documents that same DID = same MLS membership entry regardless of signing key",
+        "§9.8.1 documents InnerEnvelope with signing_key_id field for VM resolution",
+        "§9.11 fingerprint formula includes all three VMs: identity_key, active_key, agent_key (32 zero bytes if absent)",
+        "§9.16.2 documents SenderKeyEpochAdvance with signer_key_ref field",
+        "One DID = one governance vote regardless of signing key documented in appropriate section"
+      ],
+      "actionItems": [
+        "Update §9.1 invariants for structural/mechanical enforcement",
+        "Update §9.7.1 for ScpCredential signing_key_id",
+        "Update §9.8.1 for InnerEnvelope signing_key_id",
+        "Update §9.11 for three-VM fingerprint computation",
+        "Update §9.16.2 for SenderKeyEpochAdvance signer_key_ref"
+      ],
+      "blockedBy": ["SCP-AB-001"],
+      "sources": [
+        { "file": ".docs/adrs/phase-1.md", "section": "## ADR-039: Shared-DID Human-Agent Identity Model" },
+        { "file": ".docs/specs/09-security-model.md", "section": "## 9.1 Core Invariants" },
+        { "file": ".docs/specs/09-security-model.md", "section": "### 9.7.1 MLS-to-SCP Concept Mapping" },
+        { "file": ".docs/specs/09-security-model.md", "section": "### 9.8.1 Envelope Integrity (Two Independent Checks)" },
+        { "file": ".docs/specs/09-security-model.md", "section": "## 9.11 Key Continuity Verification" },
+        { "file": ".docs/specs/09-security-model.md", "section": "### 9.16.2 Key Distribution (Pull-Based)" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-006",
+      "title": "Update secondary specs for shared-DID model references",
+      "gate": "gate-design-artifacts",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        ".docs/specs/01-thesis.md",
+        ".docs/specs/05-contexts.md",
+        ".docs/specs/07-trust-validation-and-capabilities.md",
+        ".docs/specs/08-products-and-apps-in-the-graph.md",
+        ".docs/specs/17-persistence-and-storage.md",
+        ".docs/specs/18-addressability-and-deployment.md",
+        ".docs/specs/19-economic-governance.md",
+        ".docs/specs/23-sync-and-offline-strategy.md",
+        ".docs/specs/00-open-questions.md"
+      ],
+      "description": "Update all secondary spec files that reference agent identity, agent DIDs, or agent-human binding to reflect the shared-DID model from ADR-039. §1 (Thesis): update 'human accountability' principle to note structural enforcement. §5 (Contexts): update §5.6 (Membership) and §5.9 (Governance) for one-DID-one-vote and Category C context restrictions (agent_keys_allowed, agent_rate_limit, agent_cosign_required). §7 (Trust): update §7.3.2 (Behavioral Records) for per-key behavioral tracking. §8 (Products): update §8.2 (App Interface) for agent key access. §17 (Persistence): update storage key conventions if agent key material requires new store keys. §18 (Addressability): update §18.2 (DID Document Service Endpoints) for ScpKeyCustodyAttestation service entry. §19 (Economic Governance): update §19.5 (Spending Capability) for refactored MintSpendingParams. §23 (Sync): update §23.8 (Multi-Device Coordination) for agent key rotation sync. §00 (Open Questions): close the agent binding question if listed, or add a closed entry.",
+      "acceptanceCriteria": [
+        "§1 human accountability principle references structural enforcement via shared-DID",
+        "§5.6 membership reflects that human and agent share one DID (one membership entry)",
+        "§5.9 governance documents one-DID-one-vote regardless of signing key, and Category C restrictions",
+        "§7.3.2 behavioral records note per-key tracking (actions by #active vs #agent distinguishable)",
+        "§8.2 app interface notes agent key access for SDK consumers",
+        "§17 persistence documents any new storage keys for agent key material",
+        "§18.2 documents ScpKeyCustodyAttestation service entry in DID documents",
+        "§19.5 spending capability references refactored MintSpendingParams { did, key_scope }",
+        "§23.8 multi-device coordination addresses agent key rotation across devices",
+        "§00 open questions: agent binding marked as resolved with ADR-039 reference",
+        "No references to separate agent DIDs or UCAN-delegation-based agent binding remain in any updated file"
+      ],
+      "actionItems": [
+        "Update §1 thesis for structural enforcement reference",
+        "Update §5.6 and §5.9 for shared-DID membership and governance",
+        "Update §7.3.2 for per-key behavioral tracking",
+        "Update §8.2 for agent key SDK access",
+        "Update §17 for agent key storage conventions",
+        "Update §18.2 for custody attestation service entry",
+        "Update §19.5 for MintSpendingParams refactor",
+        "Update §23.8 for agent key rotation sync",
+        "Update §00 to close agent binding question"
+      ],
+      "blockedBy": ["SCP-AB-001"],
+      "sources": [
+        { "file": ".docs/adrs/phase-1.md", "section": "## ADR-039: Shared-DID Human-Agent Identity Model" },
+        { "file": ".docs/specs/01-thesis.md", "section": "## Core Principles" },
+        { "file": ".docs/specs/05-contexts.md", "section": "## 5.9 Governance" },
+        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "### 7.3.2 Behavioral Records" },
+        { "file": ".docs/specs/18-addressability-and-deployment.md", "section": "### 18.2.2 Existing Endpoint Types (Cross-Reference)" },
+        { "file": ".docs/specs/19-economic-governance.md", "section": "## 19.5 Spending Capability (UCAN Extension)" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-007",
+      "title": "Update all ADR phase files for shared-DID model consistency",
+      "gate": "gate-design-artifacts",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        ".docs/adrs/phase-1.md",
+        ".docs/adrs/phase-2.md",
+        ".docs/adrs/phase-3.md",
+        ".docs/adrs/phase-4.md",
+        ".docs/adrs/phase-5.md",
+        ".docs/adrs/phase-6.md"
+      ],
+      "description": "Audit and update all ADR phase files for consistency with ADR-039. Phase 1: ADR-001 (MLS) references to identity/credentials must note signing_key_id; ADR-002 (Envelope) must note signing_key_id in inner envelope; ADR-003 (DID Creation) must note optional #agent VM generation; ADR-007 (Sender Keys) must note signer_key_ref. Phase 2: ADR-008 (Context Lifecycle) must note shared-DID membership model. Phase 3: ADR-013/014 (Python bridges) must note agent key exposure; ADR-016 (UCAN Validation) must note step 5b and key_scope. Phase 4: ADR-021 (UniFFI), ADR-022 (TypeScript), ADR-034 (WASM) must note agent key bridge updates. Phase 5: ADR-026 (Swift) must note agent key. Phase 6: ADR-028 (Kotlin) must note agent key; ADR-029 (Offline/Sync) must address agent key rotation sync; ADR-031 (Governance) must note one-DID-one-vote.",
+      "acceptanceCriteria": [
+        "ADR-001 (MLS) references signing_key_id in ScpCredential",
+        "ADR-002 (Envelope) references signing_key_id in InnerEnvelope",
+        "ADR-003 (DID Creation) documents optional #agent VM generation in DidDht::create()",
+        "ADR-007 (Sender Keys) documents signer_key_ref in SenderKeyEpochAdvance",
+        "ADR-008 (Context Lifecycle) notes shared-DID membership",
+        "ADR-013/014 (Python) note agent key bridge methods",
+        "ADR-016 (UCAN) documents validation step 5b and scp_key_scope",
+        "ADR-021/022/034 (UniFFI/TypeScript/WASM) note agent key bridge updates",
+        "ADR-026 (Swift) notes agent key bridge",
+        "ADR-028 (Kotlin) notes agent key bridge",
+        "ADR-029 (Offline/Sync) addresses agent key rotation sync",
+        "ADR-031 (Governance) notes one-DID-one-vote",
+        "No ADR references separate agent DIDs or UCAN-delegation-based agent binding"
+      ],
+      "actionItems": [
+        "Audit each ADR for agent identity references",
+        "Update ADR-001 for signing_key_id in credentials",
+        "Update ADR-002 for signing_key_id in inner envelope",
+        "Update ADR-003 for optional #agent VM",
+        "Update ADR-007 for signer_key_ref",
+        "Update ADR-008 for shared-DID membership",
+        "Update ADR-013/014/016 for Python bridge and UCAN changes",
+        "Update ADR-021/022/034 for FFI bridge changes",
+        "Update ADR-026/028 for Swift/Kotlin bridge changes",
+        "Update ADR-029 for agent key sync",
+        "Update ADR-031 for one-DID-one-vote"
+      ],
+      "blockedBy": ["SCP-AB-001"],
+      "sources": [
+        { "file": ".docs/adrs/phase-1.md", "section": "## ADR-039: Shared-DID Human-Agent Identity Model" },
+        { "file": ".docs/adrs/phase-1.md", "section": "## ADR-001: MLS Wrapper (OpenMLS Integration)" },
+        { "file": ".docs/adrs/phase-1.md", "section": "## ADR-002: Envelope Creation, Signing, and Verification" },
+        { "file": ".docs/adrs/phase-1.md", "section": "## ADR-003: DID Creation (did:dht)" },
+        { "file": ".docs/adrs/phase-1.md", "section": "## ADR-007: Sender-Side Key Layer" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-008",
+      "title": "Add #agent verification method to DidDocument and ScpIdentity",
+      "gate": "gate-identity-layer",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-identity/src/document.rs",
+        "crates/scp-identity/src/lib.rs"
+      ],
+      "description": "Add #agent verification method support to DidDocument and ScpIdentity per ADR-039 acceptance criteria 1-2. DidDocument.verification_method must support three entries: #0 (Identity Key), #active (Human Signing Key), #agent (Agent Signing Key, optional). ScpIdentity gains agent_signing_key: Option<KeyHandle>. Add methods: add_agent_key(public_key) -> Result, remove_agent_key() -> Result, rotate_agent_key(new_public_key) -> Result. All three methods require #0 signature for authorization. Add validation: reject DID documents with more than one #agent VM. Serialize/deserialize must round-trip correctly with and without #agent.",
+      "acceptanceCriteria": [
+        "DidDocument supports three verification methods: #0 (Identity Key), #active (Human Signing Key), #agent (Agent Signing Key)",
+        "#agent verification method is optional — DidDocument valid without it",
+        "ScpIdentity includes agent_signing_key: Option<KeyHandle>",
+        "add_agent_key(public_key) adds #agent VM to DidDocument, returns error if one already exists",
+        "remove_agent_key() removes #agent VM from DidDocument, returns error if none exists",
+        "rotate_agent_key(new_public_key) replaces existing #agent VM, returns error if none exists",
+        "Validation rejects DID documents with multiple #agent verification methods",
+        "Serialization round-trips correctly with #agent present",
+        "Serialization round-trips correctly without #agent (backward-compatible)",
+        "All new methods require #0 (Identity Key) authorization",
+        "Tests verify add/remove/rotate lifecycle",
+        "Tests verify rejection of multiple #agent VMs",
+        "Tests verify serialization round-trip with and without #agent"
+      ],
+      "actionItems": [
+        "Add #agent VM support to DidDocument verification_method list",
+        "Add agent_signing_key: Option<KeyHandle> to ScpIdentity",
+        "Implement add_agent_key(), remove_agent_key(), rotate_agent_key() on DidDocument",
+        "Add validation to reject multiple #agent VMs",
+        "Update serialization/deserialization for backward compatibility",
+        "Add unit tests for lifecycle and validation"
+      ],
+      "blockedBy": ["SCP-AB-002"],
+      "sources": [
+        { "file": ".docs/adrs/phase-1.md", "section": "## ADR-039: Shared-DID Human-Agent Identity Model" },
+        { "file": ".docs/specs/03-identity.md", "section": "## 3.1 Root of Identity" },
+        { "file": ".docs/specs/03-identity.md", "section": "## 3.9 Key Lifecycle" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-009",
+      "title": "Wire agent key through DidDht::create(), rotation, and migration",
+      "gate": "gate-identity-layer",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": ["crates/scp-identity/src/dht.rs"],
+      "description": "Update DidDht::create() to optionally generate a fourth keypair for the agent signing key per ADR-039 acceptance criterion 3. The create() method gains an optional parameter (or builder method) to include an agent key. When provided, the generated DID document includes #agent as a third verification method. DidDht::update() must support adding, removing, and rotating #agent. DidDht::migrate() (Layer 2 migration) must preserve or drop #agent based on migration parameters. All DID document publications (create, update, migrate) must sign with #0.",
+      "acceptanceCriteria": [
+        "DidDht::create() accepts optional agent key generation parameter",
+        "When agent key requested, create() generates Ed25519 keypair and includes #agent VM in DID document",
+        "When agent key not requested, create() produces DID document without #agent (backward-compatible)",
+        "DidDht::update() supports adding #agent to existing DID document",
+        "DidDht::update() supports removing #agent from existing DID document",
+        "DidDht::update() supports rotating #agent (replace public key)",
+        "All DID document updates signed by #0 (Identity Key)",
+        "Published DID document resolves correctly with #agent present",
+        "Published DID document resolves correctly without #agent",
+        "Tests verify create with and without agent key",
+        "Tests verify update operations (add, remove, rotate agent key)",
+        "Tests verify DID resolution round-trip with agent key"
+      ],
+      "actionItems": [
+        "Add optional agent key parameter to DidDht::create()",
+        "Generate Ed25519 keypair for #agent when requested",
+        "Include #agent VM in DID document during creation",
+        "Update DidDht::update() for agent key add/remove/rotate",
+        "Ensure DID document publication signs with #0",
+        "Add tests for all create and update paths"
+      ],
+      "blockedBy": ["SCP-AB-008"],
+      "sources": [
+        { "file": ".docs/adrs/phase-1.md", "section": "## ADR-039: Shared-DID Human-Agent Identity Model" },
+        { "file": ".docs/adrs/phase-1.md", "section": "## ADR-003: DID Creation (did:dht)" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-010",
+      "title": "Update test fixtures and consumers for ScpIdentity struct change",
+      "gate": "gate-identity-layer",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-ffi/src/runtime.rs"
+      ],
+      "description": "Update all consumers of ScpIdentity that construct instances directly to account for the new agent_signing_key: Option<KeyHandle> field (SCP-AB-008). This includes scp-node initialization (lib.rs) and FFI runtime initialization (runtime.rs). Test fixtures that create ScpIdentity must set agent_signing_key to None for backward compatibility or Some(key) for agent-enabled test scenarios. This is a mechanical fixup story — the actual identity logic is in SCP-AB-008/009.",
+      "acceptanceCriteria": [
+        "All ScpIdentity construction sites compile with the new agent_signing_key field",
+        "scp-node lib.rs creates ScpIdentity with agent_signing_key: None by default",
+        "scp-ffi runtime.rs creates ScpIdentity with agent_signing_key: None by default",
+        "At least one test fixture creates ScpIdentity with agent_signing_key: Some(key) for agent-enabled testing",
+        "cargo test --workspace passes with no failures from the struct change",
+        "cargo clippy --workspace --all-targets passes"
+      ],
+      "actionItems": [
+        "Update ScpIdentity construction in scp-node/src/lib.rs",
+        "Update ScpIdentity construction in scp-ffi/src/runtime.rs",
+        "Search for all other ScpIdentity construction sites and update",
+        "Add agent-enabled test fixture",
+        "Verify workspace builds and tests pass"
+      ],
+      "blockedBy": ["SCP-AB-008"],
+      "sources": [
+        { "file": ".docs/adrs/phase-1.md", "section": "## ADR-039: Shared-DID Human-Agent Identity Model" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-011",
+      "title": "Add signing_key_id to ScpCredential for MLS",
+      "gate": "gate-crypto-layer",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/mls/credential.rs",
+        "crates/scp-core/src/crypto/mls/group.rs"
+      ],
+      "description": "Add signing_key_id: String field to ScpCredential per ADR-039 acceptance criterion 5 and MLS Impact section. The field identifies which verification method (#active or #agent) signed the credential. Verifiers resolve the correct public key from the DID document based on this field. Same DID = same MLS membership entry regardless of signing key. Agent key rotation uses MLS Update proposal with new credential (not MLS re-key). Update credential serialization (MLS Credential payload). Update group operations that create or verify credentials: join, add member, update credential. Verifier must check signing_key_id matches the key that actually signed.",
+      "acceptanceCriteria": [
+        "ScpCredential includes signing_key_id: String field (value '#active' or '#agent')",
+        "ScpCredential serialization round-trips correctly with signing_key_id",
+        "Credential creation sets signing_key_id based on which key is used",
+        "Credential verification resolves public key from DID document using signing_key_id",
+        "Same DID with different signing_key_id values maps to same MLS membership entry",
+        "Agent key rotation triggers MLS Update proposal with new credential (not re-key)",
+        "Verifier rejects credential where signing_key_id does not match the actual signing key",
+        "Tests verify credential creation with #active and #agent",
+        "Tests verify credential verification resolves correct key",
+        "Tests verify rejection of mismatched signing_key_id"
+      ],
+      "actionItems": [
+        "Add signing_key_id: String to ScpCredential struct",
+        "Update credential serialization/deserialization",
+        "Update credential creation to set signing_key_id",
+        "Update credential verification to resolve key by signing_key_id",
+        "Update MLS group join/add to propagate signing_key_id",
+        "Add MLS Update proposal path for agent key rotation",
+        "Add unit tests for all paths"
+      ],
+      "blockedBy": ["SCP-AB-008"],
+      "sources": [
+        { "file": ".docs/adrs/phase-1.md", "section": "### MLS Impact" },
+        { "file": ".docs/specs/09-security-model.md", "section": "### 9.7.1 MLS-to-SCP Concept Mapping" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-012",
+      "title": "Add UCAN kid header and key_scope to minting",
+      "gate": "gate-crypto-layer",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": ["crates/scp-core/src/crypto/ucan/mint.rs"],
+      "description": "Add kid (Key ID) field to UCAN JWT header per RFC 7515 and add scp_key_scope to UCAN facts per ADR-039 acceptance criteria 6 and 8. The kid header identifies which verification method (#active or #agent) signed the UCAN token. The scp_key_scope fact field in the UCAN payload scopes the delegation: when present, the UCAN is only valid when presented by the specified key. Self-delegation (iss == aud, same DID) with key_scope is explicitly valid — this is how the human delegates specific permissions to the agent key. Update MintParams to include optional key_scope: Option<String>. Update token signing to include kid in JWT header.",
+      "acceptanceCriteria": [
+        "UCAN JWT header includes optional kid: String field identifying signing verification method",
+        "kid value matches the verification method ID that signed the token (#active or #agent)",
+        "MintParams includes optional key_scope: Option<String> for delegation scoping",
+        "When key_scope is set, it is included in UCAN facts as fct.scp_key_scope",
+        "Self-delegation (iss == aud with key_scope) is valid and produces a well-formed token",
+        "Token signing includes kid in JWT header per RFC 7515",
+        "Minting without key_scope produces backward-compatible tokens (no scp_key_scope in facts)",
+        "Tests verify kid header is set correctly for #active and #agent",
+        "Tests verify self-delegation with key_scope produces valid token",
+        "Tests verify backward compatibility (no key_scope = no scp_key_scope fact)"
+      ],
+      "actionItems": [
+        "Add kid field to UCAN JWT header struct",
+        "Add key_scope: Option<String> to MintParams",
+        "Set kid based on signing key during token creation",
+        "Add scp_key_scope to facts when key_scope is provided",
+        "Allow self-delegation (iss == aud) when key_scope is present",
+        "Add unit tests for all minting paths"
+      ],
+      "blockedBy": ["SCP-AB-008"],
+      "sources": [
+        { "file": ".docs/adrs/phase-1.md", "section": "### UCAN Impact" },
+        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "## 7.2 Layer 1: Protocol Enforcement" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-013",
+      "title": "Add UCAN validation step 5b for key scope verification",
+      "gate": "gate-crypto-layer",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": ["crates/scp-core/src/crypto/ucan/validate.rs"],
+      "description": "Add UCAN validation step 5b per ADR-039 acceptance criterion 7: after the existing audience check (step 5), if fct.scp_key_scope exists in the UCAN payload, verify that the presenting key matches the specified scope. The presenting key is identified by kid in the JWT header. If scp_key_scope is '#agent' but the presenter signed with #active (or vice versa), validation fails with UcanError::KeyScopeMismatch. If scp_key_scope is absent, skip this check (backward compatibility). This is a critical enforcement point: it ensures that UCANs scoped to the agent key cannot be exercised by the human key and vice versa.",
+      "acceptanceCriteria": [
+        "Validation step 5b exists: checks fct.scp_key_scope against presenting key's kid",
+        "If scp_key_scope is '#agent' and presenter kid is '#active', validation returns UcanError::KeyScopeMismatch",
+        "If scp_key_scope is '#active' and presenter kid is '#agent', validation returns UcanError::KeyScopeMismatch",
+        "If scp_key_scope matches presenter kid, validation passes step 5b",
+        "If scp_key_scope is absent, step 5b is skipped (backward compatibility)",
+        "UcanError::KeyScopeMismatch variant exists with descriptive message",
+        "Tests verify step 5b passes with matching scope",
+        "Tests verify step 5b fails with mismatched scope",
+        "Tests verify step 5b is skipped when no scope present",
+        "Tests verify that scoped UCAN cannot be exercised by wrong key"
+      ],
+      "actionItems": [
+        "Add UcanError::KeyScopeMismatch variant to error enum",
+        "Implement step 5b in validation pipeline after audience check",
+        "Extract scp_key_scope from UCAN facts",
+        "Compare against presenter's kid header",
+        "Skip check if scp_key_scope absent",
+        "Add unit tests for all cases"
+      ],
+      "blockedBy": ["SCP-AB-012"],
+      "sources": [
+        { "file": ".docs/adrs/phase-1.md", "section": "### UCAN Impact" },
+        { "file": ".docs/adrs/phase-3.md", "section": "## ADR-016: UCAN Validation" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-014",
+      "title": "Refactor MintSpendingParams for shared-DID model",
+      "gate": "gate-crypto-layer",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": ["crates/scp-core/src/crypto/ucan/spending.rs"],
+      "description": "Refactor MintSpendingParams from { issuer_did, agent_did } to { did, key_scope } per ADR-039 acceptance criterion 9. Under the shared-DID model, spending UCANs are self-scoped delegations: the issuer and audience are the same DID, with key_scope specifying which verification method can exercise the spending capability. This removes the agent_did field entirely — agents do not have separate DIDs. Update all call sites that construct MintSpendingParams. Update spending UCAN creation to use self-delegation pattern with scp_key_scope fact.",
+      "acceptanceCriteria": [
+        "MintSpendingParams struct has fields: did: String, key_scope: String (not issuer_did/agent_did)",
+        "No issuer_did or agent_did fields remain in MintSpendingParams",
+        "Spending UCAN creation uses iss == aud (self-delegation) with scp_key_scope fact",
+        "All call sites constructing MintSpendingParams updated for new field names",
+        "Spending UCAN validation uses step 5b (SCP-AB-013) for key scope enforcement",
+        "Tests verify spending UCAN creation with new params",
+        "Tests verify backward incompatibility is clean (no silent fallback to old format)",
+        "cargo clippy --workspace --all-targets passes"
+      ],
+      "actionItems": [
+        "Refactor MintSpendingParams struct: replace issuer_did + agent_did with did + key_scope",
+        "Update spending UCAN creation to use self-delegation pattern",
+        "Include scp_key_scope in spending UCAN facts",
+        "Find and update all MintSpendingParams construction sites",
+        "Update spending UCAN tests",
+        "Verify workspace compiles and passes tests"
+      ],
+      "blockedBy": ["SCP-AB-012", "SCP-AB-013"],
+      "sources": [
+        { "file": ".docs/adrs/phase-1.md", "section": "### UCAN Impact" },
+        { "file": ".docs/specs/19-economic-governance.md", "section": "## 19.5 Spending Capability (UCAN Extension)" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-015",
+      "title": "Add signing_key_id to inner envelope and audit sender key protocol",
+      "gate": "gate-crypto-layer",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/envelope/inner.rs",
+        "crates/scp-core/src/crypto/sender_keys/key_protocol.rs"
+      ],
+      "description": "Add signing_key_id: String field to InnerEnvelope per ADR-039 acceptance criterion 10. Verifiers use it to resolve the correct public key from the sender's DID document. Add signer_key_ref: String field to SenderKeyEpochAdvance per ADR-039 acceptance criterion 11. This allows recipients to verify that the sender key epoch advance was signed by the expected key. Update inner envelope creation and verification to use signing_key_id for key resolution. Update sender key protocol to include signer_key_ref in epoch advances.",
+      "acceptanceCriteria": [
+        "InnerEnvelope includes signing_key_id: String field (#active or #agent)",
+        "Inner envelope creation sets signing_key_id based on signing key used",
+        "Inner envelope verification resolves public key from DID document using signing_key_id",
+        "Verifier rejects inner envelope where signing_key_id does not match actual signing key",
+        "SenderKeyEpochAdvance includes signer_key_ref: String field",
+        "Epoch advance creation sets signer_key_ref based on signing key used",
+        "Epoch advance verification resolves key using signer_key_ref",
+        "Serialization round-trips correctly for both modified types",
+        "Tests verify inner envelope with #active and #agent signing",
+        "Tests verify rejection of mismatched signing_key_id",
+        "Tests verify epoch advance with signer_key_ref"
+      ],
+      "actionItems": [
+        "Add signing_key_id: String to InnerEnvelope struct",
+        "Update inner envelope creation to set signing_key_id",
+        "Update inner envelope verification to resolve key by signing_key_id",
+        "Add signer_key_ref: String to SenderKeyEpochAdvance struct",
+        "Update epoch advance creation and verification",
+        "Update serialization for both types",
+        "Add unit tests for all paths"
+      ],
+      "blockedBy": ["SCP-AB-008"],
+      "sources": [
+        { "file": ".docs/adrs/phase-1.md", "section": "### Inner Envelope Impact" },
+        { "file": ".docs/adrs/phase-1.md", "section": "## ADR-002: Envelope Creation, Signing, and Verification" },
+        { "file": ".docs/specs/09-security-model.md", "section": "### 9.8.1 Envelope Integrity (Two Independent Checks)" },
+        { "file": ".docs/specs/09-security-model.md", "section": "### 9.16.2 Key Distribution (Pull-Based)" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-016",
+      "title": "Update Python (PyO3) and NAPI bridges for agent key",
+      "gate": "gate-ffi-bridges",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/identity.rs",
+        "crates/scp-ffi/napi/src/identity.rs"
+      ],
+      "description": "Update PyO3 (Python) and NAPI (Node.js) FFI bridges to expose agent key creation, rotation, removal, and status per ADR-039 acceptance criterion 19. PyO3 bridge (scp-ffi/src/identity.rs): expose add_agent_key(), remove_agent_key(), rotate_agent_key(), has_agent_key() -> bool, get_agent_public_key() -> Option<bytes>. NAPI bridge (scp-ffi/napi/src/identity.rs): expose equivalent JavaScript-friendly methods. Both bridges must propagate errors correctly (e.g., attempt to add when one already exists, attempt to remove when none exists).",
+      "acceptanceCriteria": [
+        "PyO3 bridge exposes add_agent_key(public_key: bytes) method",
+        "PyO3 bridge exposes remove_agent_key() method",
+        "PyO3 bridge exposes rotate_agent_key(new_public_key: bytes) method",
+        "PyO3 bridge exposes has_agent_key() -> bool method",
+        "PyO3 bridge exposes get_agent_public_key() -> Optional[bytes] method",
+        "NAPI bridge exposes equivalent addAgentKey, removeAgentKey, rotateAgentKey, hasAgentKey, getAgentPublicKey methods",
+        "Error propagation: add when exists returns appropriate error in both bridges",
+        "Error propagation: remove when none exists returns appropriate error in both bridges",
+        "Tests verify PyO3 agent key lifecycle",
+        "Tests verify NAPI agent key lifecycle"
+      ],
+      "actionItems": [
+        "Add agent key methods to PyO3 identity bridge",
+        "Add agent key methods to NAPI identity bridge",
+        "Wire through to ScpIdentity/DidDocument operations (SCP-AB-008/009)",
+        "Add error variants for invalid operations",
+        "Add tests for both bridges"
+      ],
+      "blockedBy": ["SCP-AB-008", "SCP-AB-009"],
+      "sources": [
+        { "file": ".docs/adrs/phase-1.md", "section": "### Acceptance Criteria" },
+        { "file": ".docs/adrs/phase-3.md", "section": "## ADR-013: PyO3 Bridge Layer" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-017",
+      "title": "Update UniFFI and WASM bridges for agent key",
+      "gate": "gate-ffi-bridges",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/uniffi/src/bridge.rs",
+        "crates/scp-ffi/wasm/src/identity.rs"
+      ],
+      "description": "Update UniFFI (Swift/Kotlin) and WASM (TypeScript) FFI bridges to expose agent key creation, rotation, removal, and status per ADR-039 acceptance criterion 19. UniFFI bridge (scp-ffi/uniffi/src/bridge.rs): add agent key methods to UDL interface and implement in bridge.rs. WASM bridge (scp-ffi/wasm/src/identity.rs): expose wasm-bindgen methods. UniFFI generates Swift and Kotlin bindings automatically from the UDL. WASM bridge must re-implement agent key operations locally (cannot depend on scp-core per ADR-034).",
+      "acceptanceCriteria": [
+        "UniFFI bridge.rs exposes add_agent_key, remove_agent_key, rotate_agent_key, has_agent_key, get_agent_public_key",
+        "UniFFI UDL file (scp.udl) includes agent key method signatures",
+        "Generated Swift bindings include agent key methods",
+        "Generated Kotlin bindings include agent key methods",
+        "WASM bridge exposes addAgentKey, removeAgentKey, rotateAgentKey, hasAgentKey, getAgentPublicKey via wasm-bindgen",
+        "WASM implementation re-implements agent key logic locally (not via scp-core, per ADR-034)",
+        "Error propagation works correctly in all four target languages",
+        "Tests verify UniFFI agent key lifecycle",
+        "Tests verify WASM agent key lifecycle"
+      ],
+      "actionItems": [
+        "Add agent key methods to UniFFI bridge.rs",
+        "Update scp.udl with agent key method signatures",
+        "Add agent key methods to WASM identity.rs (local implementation)",
+        "Wire UniFFI through to ScpIdentity/DidDocument operations",
+        "Add error handling for all bridges",
+        "Add tests for UniFFI and WASM bridges"
+      ],
+      "blockedBy": ["SCP-AB-008", "SCP-AB-009"],
+      "sources": [
+        { "file": ".docs/adrs/phase-1.md", "section": "### Acceptance Criteria" },
+        { "file": ".docs/adrs/phase-4.md", "section": "## ADR-021: UniFFI Bridge Definitions" },
+        { "file": ".docs/adrs/phase-4.md", "section": "## ADR-034: WASM Bridge Re-Implementation Strategy" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-018",
+      "title": "Implement ScpKeyCustodyAttestation type and DID document integration",
+      "gate": "gate-attestation",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-identity/src/document.rs",
+        "crates/scp-identity/src/attestation.rs"
+      ],
+      "description": "Implement ScpKeyCustodyAttestation per ADR-039 acceptance criterion 16 and Enforcement Stack layer 4. At identity creation, the DID document includes a service entry declaring key custody model. The attestation declares: custody_model (hardware-biometric, hardware-pin, software), platform (ios, android, desktop, browser), platform_attestation (optional platform-specific proof — Apple App Attest token or Android Key Attestation certificate chain). Absence of attestation is itself a signal (feeds into trust evaluation per §7.1). Create attestation.rs module in scp-identity. Add ScpKeyCustodyAttestation as a DID document service entry type. The attestation is signed by #0.",
+      "acceptanceCriteria": [
+        "ScpKeyCustodyAttestation struct with fields: custody_model, platform, platform_attestation (optional), timestamp",
+        "CustodyModel enum: HardwareBiometric, HardwarePin, Software",
+        "Platform enum: Ios, Android, Desktop, Browser",
+        "Attestation published as DID document service entry with type 'ScpKeyCustodyAttestation'",
+        "Attestation signed by #0 (Identity Key)",
+        "create_custody_attestation() generates attestation for current platform",
+        "Attestation serializes/deserializes correctly as DID document service entry",
+        "DID document can be created without custody attestation (backward-compatible)",
+        "Tests verify attestation creation for each custody model",
+        "Tests verify attestation round-trip through DID document service entries",
+        "Tests verify attestation signature verification"
+      ],
+      "actionItems": [
+        "Create crates/scp-identity/src/attestation.rs module",
+        "Define ScpKeyCustodyAttestation, CustodyModel, Platform types",
+        "Implement create_custody_attestation()",
+        "Add service entry type to DID document",
+        "Sign attestation with #0",
+        "Update mod.rs exports",
+        "Add unit tests"
+      ],
+      "blockedBy": ["SCP-AB-008"],
+      "sources": [
+        { "file": ".docs/adrs/phase-1.md", "section": "### Enforcement Stack (5 Layers)" },
+        { "file": ".docs/specs/03-identity.md", "section": "## 3.5 Identity Attestations" },
+        { "file": ".docs/specs/18-addressability-and-deployment.md", "section": "### 18.2.2 Existing Endpoint Types (Cross-Reference)" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-019",
+      "title": "Implement custody violation detection and permanent logging",
+      "gate": "gate-attestation",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/trust/custody_violation.rs",
+        "crates/scp-core/src/trust/mod.rs"
+      ],
+      "description": "Implement ScpCustodyViolationAttestation per ADR-039 acceptance criteria 17-18 and Enforcement Stack layer 4. Unambiguous violations — Category A actions (DID document modifications) signed by #agent, or attestation mismatches with hardware proof — are permanently logged as ScpCustodyViolationAttestation records. These are append-only, never deleted. Create custody_violation.rs module in scp-core/src/trust/. Define violation types: CategoryAViolation (DID doc mod with #agent), AttestationMismatch (hardware proof contradicts behavior). DID owners can publish CounterAttestation records for reputation restoration. Violation records feed into trust evaluation (§7.1) as strong negative signals.",
+      "acceptanceCriteria": [
+        "ScpCustodyViolationAttestation struct with fields: violation_type, violator_did, evidence, timestamp, reporter_did, reporter_signature",
+        "ViolationType enum: CategoryAViolation { action_type }, AttestationMismatch { expected, observed }",
+        "log_custody_violation() creates and persists violation attestation",
+        "Violation records are append-only (no delete or update)",
+        "get_violations_for_did(did) returns all violation records for a DID",
+        "CounterAttestation struct with fields: violation_id, counter_evidence, counter_did, counter_signature, timestamp",
+        "publish_counter_attestation() creates counter-attestation for reputation restoration",
+        "Violation records derive Debug, Clone, Serialize, Deserialize",
+        "Tests verify violation logging for CategoryA attempt with #agent",
+        "Tests verify violation logging for attestation mismatch",
+        "Tests verify counter-attestation creation and association with violation",
+        "Tests verify append-only property (cannot delete violations)"
+      ],
+      "actionItems": [
+        "Create crates/scp-core/src/trust/custody_violation.rs module",
+        "Define ScpCustodyViolationAttestation, ViolationType, CounterAttestation types",
+        "Implement log_custody_violation()",
+        "Implement get_violations_for_did()",
+        "Implement publish_counter_attestation()",
+        "Persist violations to ProtocolStore with append-only semantics",
+        "Update trust/mod.rs exports",
+        "Add unit tests"
+      ],
+      "blockedBy": ["SCP-AB-008"],
+      "sources": [
+        { "file": ".docs/adrs/phase-1.md", "section": "### Enforcement Stack (5 Layers)" },
+        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "### 7.3.2 Behavioral Records" },
+        { "file": ".docs/specs/09-security-model.md", "section": "## 9.1 Core Invariants" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-020",
+      "title": "Wire verifier-side Category A enforcement with violation logging",
+      "gate": "gate-attestation",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/ucan/validate.rs",
+        "crates/scp-core/src/envelope/inner.rs"
+      ],
+      "description": "Wire Enforcement Stack layer 3 (verifier validation) per ADR-039 acceptance criterion 15. All conformant verifiers must reject Category A actions (DID document modifications) signed by #agent. This is a network-level enforcement point: non-conformant SDKs can produce these signatures but they cannot propagate through the network. When a Category A action signed by #agent is detected, the verifier both rejects the action AND logs a ScpCustodyViolationAttestation (SCP-AB-019). Enforcement points: (1) UCAN validation — if the UCAN grants DID doc modification capability and kid is #agent, reject. (2) Inner envelope verification — if the action type is DID doc modification and signing_key_id is #agent, reject. Both rejection points call log_custody_violation() from SCP-AB-019.",
+      "acceptanceCriteria": [
+        "UCAN validator rejects tokens granting DID doc modification capability when kid is #agent",
+        "UCAN validator returns UcanError::CategoryAViolation on rejection",
+        "Inner envelope verifier rejects DID doc modification actions when signing_key_id is #agent",
+        "Inner envelope verifier returns EnvelopeError::CategoryAViolation on rejection",
+        "Both rejection points log ScpCustodyViolationAttestation via log_custody_violation()",
+        "Violation log includes the rejected action details as evidence",
+        "Non-Category-A actions signed by #agent are NOT rejected (they are valid operational actions)",
+        "Actions signed by #active or #0 are never rejected by this check",
+        "Tests verify rejection of DID doc mod UCAN signed by #agent",
+        "Tests verify rejection of DID doc mod inner envelope signed by #agent",
+        "Tests verify that operational actions with #agent pass this check",
+        "Tests verify violation logging on rejection"
+      ],
+      "actionItems": [
+        "Add Category A action detection to UCAN validation pipeline",
+        "Add Category A action detection to inner envelope verification",
+        "Wire rejection to log_custody_violation() from SCP-AB-019",
+        "Add UcanError::CategoryAViolation and EnvelopeError::CategoryAViolation variants",
+        "Define the set of Category A actions (DID doc modification capabilities)",
+        "Add unit tests for all enforcement paths"
+      ],
+      "blockedBy": ["SCP-AB-013", "SCP-AB-015", "SCP-AB-019"],
+      "sources": [
+        { "file": ".docs/adrs/phase-1.md", "section": "### Enforcement Stack (5 Layers)" },
+        { "file": ".docs/adrs/phase-1.md", "section": "### Permission Model" },
+        { "file": ".docs/specs/09-security-model.md", "section": "## 9.1 Core Invariants" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-021",
+      "title": "End-to-end integration test for shared-DID agent binding",
+      "gate": "gate-integration",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": ["crates/scp-core/tests/agent_binding_integration.rs"],
+      "description": "End-to-end integration test exercising the full shared-DID agent binding lifecycle per ADR-039 acceptance criterion 20. The test proves: identity with agent key works, scoped UCAN minting works, MLS group operations with agent credentials work, message sending and verification works, agent key rotation works, Category A enforcement works, custody attestation works. This is the ultimate acceptance criterion for the agent binding feature: create identity with agent key, mint scoped UCAN, join MLS group with agent credential, send message, verify at recipient (correct key resolved), rotate agent key, verify credential update propagates, attempt Category A action with #agent (rejected), verify violation logged.",
+      "acceptanceCriteria": [
+        "Test creates identity with agent key via DidDht::create() with agent key parameter",
+        "Test mints UCAN with scp_key_scope: '#agent' via self-delegation",
+        "Test joins MLS group using agent credential (ScpCredential with signing_key_id: '#agent')",
+        "Test sends message signed by #agent via inner envelope",
+        "Test verifies message at recipient: signing_key_id resolves to correct public key from DID document",
+        "Test rotates agent key via DID document update signed by #0",
+        "Test verifies MLS credential update propagates (Update proposal with new credential)",
+        "Test verifies post-rotation messages use new agent key",
+        "Test attempts Category A action (DID doc mod) with #agent — rejected",
+        "Test verifies ScpCustodyViolationAttestation logged for the Category A attempt",
+        "Test verifies key continuity fingerprint includes all three VMs",
+        "Test verifies one-DID-one-vote (agent and human key on same proposal counts as one vote)"
+      ],
+      "actionItems": [
+        "Create integration test file",
+        "Implement identity creation with agent key test",
+        "Implement scoped UCAN minting test",
+        "Implement MLS group join with agent credential test",
+        "Implement message send and verify test",
+        "Implement agent key rotation test",
+        "Implement Category A enforcement test",
+        "Implement key continuity verification test",
+        "Implement governance one-vote test"
+      ],
+      "blockedBy": ["SCP-AB-011", "SCP-AB-013", "SCP-AB-015", "SCP-AB-020"],
+      "sources": [
+        { "file": ".docs/adrs/phase-1.md", "section": "### Acceptance Criteria" },
+        { "file": ".docs/adrs/phase-1.md", "section": "## ADR-039: Shared-DID Human-Agent Identity Model" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-AB-022",
+      "title": "Update key continuity fingerprint and add negative tests",
+      "gate": "gate-integration",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": ["crates/scp-core/src/crypto/mls/group.rs"],
+      "description": "Update key continuity fingerprint computation per ADR-039 acceptance criterion 12 and Key Continuity section. The fingerprint must include all three verification methods: identity_key, active_key, agent_key. Agent key absence uses 32 zero bytes as placeholder. Formula: fingerprint = SHA256(sort(alice_did, bob_did) || alice_identity_key || alice_active_key || alice_agent_key || bob_identity_key || bob_active_key || bob_agent_key). Add negative tests: (1) fingerprint changes when agent key is added, (2) fingerprint changes when agent key is rotated, (3) fingerprint changes when agent key is removed, (4) fingerprint with no agent key uses 32 zero bytes, (5) DID document with multiple #agent VMs is rejected.",
+      "acceptanceCriteria": [
+        "Key continuity fingerprint includes all three VMs: identity_key, active_key, agent_key",
+        "Agent key absence uses 32 zero bytes in fingerprint computation",
+        "Fingerprint formula: SHA256(sort(did_a, did_b) || a_identity || a_active || a_agent || b_identity || b_active || b_agent)",
+        "Fingerprint changes when agent key is added to a DID",
+        "Fingerprint changes when agent key is rotated",
+        "Fingerprint changes when agent key is removed",
+        "Fingerprint with no agent key on either side produces deterministic result (zero bytes)",
+        "Fingerprint with agent key on one side but not other produces correct asymmetric result",
+        "Tests verify fingerprint computation with various agent key states",
+        "Tests verify DID document with multiple #agent VMs is rejected (validation from SCP-AB-008)"
+      ],
+      "actionItems": [
+        "Update fingerprint computation to include agent key (or 32 zero bytes if absent)",
+        "Update fingerprint formula to match ADR-039 specification",
+        "Add test: fingerprint changes on agent key add",
+        "Add test: fingerprint changes on agent key rotate",
+        "Add test: fingerprint changes on agent key remove",
+        "Add test: no agent key uses 32 zero bytes",
+        "Add test: asymmetric agent key presence",
+        "Add negative test: multiple #agent VMs rejected"
+      ],
+      "blockedBy": ["SCP-AB-011", "SCP-AB-013", "SCP-AB-015"],
+      "sources": [
+        { "file": ".docs/adrs/phase-1.md", "section": "### Key Continuity" },
+        { "file": ".docs/specs/09-security-model.md", "section": "## 9.11 Key Continuity Verification" }
+      ],
+      "details": {}
+    }
+  ]
+}

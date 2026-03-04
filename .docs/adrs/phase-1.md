@@ -103,7 +103,7 @@ Each function below must be implemented and tested:
 
 8. **`generate_key_package(identity) -> KeyPackage`**
    - Generates a single-use KeyPackage for offline member addition.
-   - Signed by the identity's Ed25519 key.
+   - Signed by the identity's Ed25519 Identity Key (`#0`). KeyPackages are always signed by `#0`, not by `#active` or `#agent`, because they represent the identity's MLS participation (ADR-039).
    - The SDK must maintain a buffer of at least 10 unused KeyPackages per identity (spec section 9.7.4). Replenished when buffer drops below 5.
 
 9. **`destroy_group(group) -> ()`**
@@ -122,7 +122,7 @@ Each function below must be implemented and tested:
 | `encrypt.rs` | `encrypt`, `decrypt` with generation number tracking |
 | `ratchet.rs` | `ratchet` (Commit processing), `update` (PCS), epoch key deletion |
 | `key_package.rs` | `generate_key_package`, KeyPackage buffer management |
-| `credential.rs` | SCP credential type (DID + UCAN) for MLS LeafNode credential field |
+| `credential.rs` | SCP credential type (DID + UCAN + `signing_key_id`) for MLS LeafNode credential field. The `signing_key_id` field (ADR-039) identifies which verification method (`#active` or `#agent`) signed the credential, enabling verifiers to resolve the correct public key from the DID document. |
 | `storage.rs` | `StorageProvider` trait bridge to scp-platform storage adapters |
 | `epoch_grace.rs` | `EpochGraceStore` — in-memory old epoch key retention with timer-based purge, per-epoch indexing |
 | `error.rs` | MLS-specific error types |
@@ -162,7 +162,9 @@ Two-layer envelope format:
 - `payload` — the actual message content (after bucket padding, Decision 3)
 - `provenance` — origin metadata (spec section 7.7)
 
-**Inner signature:** `Ed25519_sign(SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash))`
+**Inner signature:** `Ed25519_sign(SHA256(context_id || sender_did || signing_key_id || epoch || generation || sequence || timestamp || payload_hash || provenance_hash))`
+
+The `signing_key_id` field (ADR-039) identifies which verification method signed the envelope (e.g., `"#active"` or `"#agent"`). It is included in the signature preimage to bind the signature to the specific key, and stored as a field on `InnerEnvelope` so verifiers can resolve the correct public key from the sender's DID document.
 
 Where `provenance_hash = SHA256(serialize(provenance))` if provenance is present, or `SHA256(0x00)` (hash of a single zero byte) if provenance is absent. Using a sentinel value for absent provenance ensures the signature unambiguously commits to "no provenance" — stripping provenance from a message that had it, or adding provenance to one that did not, produces an invalid signature.
 
@@ -200,12 +202,13 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
    - Uses `HMAC-SHA256(ed25519_public_key_bytes, context_id || "scp-pseudonym")` then `Ed25519_keygen(seed[0..32])`. `identity_key_material` is the raw 32-byte Ed25519 public key for all adapter types — this is the cross-platform canonical definition (see ADR-027 amendment). The resulting PseudonymKeypair is software-managed.
    - The pseudonym keypair's public key is the routing identifier used in outer envelopes.
 
-2. **`create_inner_envelope(context_id, sender_did, epoch, generation, sequence, timestamp, payload, provenance, signing_key) -> InnerEnvelope`**
+2. **`create_inner_envelope(context_id, sender_did, epoch, generation, sequence, timestamp, payload, provenance, signing_key, signing_key_id) -> InnerEnvelope`**
+   - The `signing_key_id` parameter (ADR-039) identifies which verification method is signing (e.g., `"#active"` or `"#agent"`). Stored on the `InnerEnvelope` for verifier key resolution.
    - Computes `payload_hash = SHA256(payload)` — hash of the original plaintext BEFORE padding. Enables content-addressing and deduplication by recipients.
    - Computes `provenance_hash = SHA256(serialize(provenance))` if present, or `SHA256(0x00)` if absent.
-   - Computes `signature = Ed25519_sign(SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash))`.
+   - Computes `signature = Ed25519_sign(SHA256(context_id || sender_did || signing_key_id || epoch || generation || sequence || timestamp || payload_hash || provenance_hash))`.
    - Pads payload to next bucket boundary (256B, 1KB, 4KB, 16KB, 64KB, 256KB) AFTER signing.
-   - Returns the complete inner envelope struct with all fields (including padded payload) + signature.
+   - Returns the complete inner envelope struct with all fields (including padded payload, `signing_key_id`) + signature.
 
 3. **`create_outer_envelope(routing_id, recipient_hint, blob_ttl, encrypted_blob) -> OuterEnvelope`**
    - Constructs the minimal outer envelope.
@@ -222,11 +225,12 @@ The inner signature is included inside the encrypted blob. Relays never see it. 
    - Rejects if generation number violates replay prevention (delegates to MLS layer).
    - Returns the verified inner envelope.
 
-6. **`verify_inner_signature(inner_envelope, sender_public_key) -> bool`**
+6. **`verify_inner_signature(inner_envelope, sender_did_document) -> bool`**
+   - Resolves the correct public key from the sender's DID document using `inner_envelope.signing_key_id` (ADR-039). For example, `signing_key_id: "#active"` resolves to the `#active` verification method, `"#agent"` resolves to `#agent`.
    - Computes `provenance_hash = SHA256(serialize(provenance))` if provenance is present, or `SHA256(0x00)` if absent.
-   - Recomputes `SHA256(context_id || sender_did || epoch || generation || sequence || timestamp || payload_hash || provenance_hash)`.
-   - Verifies the Ed25519 signature against the sender's public key (resolved from `sender_did`).
-   - A mismatch indicates either payload tampering or provenance tampering — both MUST be rejected.
+   - Recomputes `SHA256(context_id || sender_did || signing_key_id || epoch || generation || sequence || timestamp || payload_hash || provenance_hash)`.
+   - Verifies the Ed25519 signature against the resolved public key.
+   - A mismatch indicates either payload tampering, provenance tampering, or signing key mismatch — all MUST be rejected.
 
 7. **`strip_padding(padded_payload) -> Payload`**
    - Removes bucket padding from decrypted payload.
@@ -285,14 +289,16 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
 ### Acceptance Criteria
 
 1. **`create_identity(key_custody) -> Identity`**
-   - Generates three keypairs via key_custody:
+   - Generates three or four keypairs via key_custody:
      - **Identity Key** (Ed25519): derives the DID string. Stored in highest-security custody.
      - **Active Signing Key** (Ed25519): used for MLS, envelopes, UCANs. Rotatable.
      - **Pre-Rotation Key** (Ed25519): stored in cold/offline custody. Generates the pre-rotation commitment `SHA-256(pre_rotation_key.public)`.
+     - **Agent Signing Key** (Ed25519, optional): software-held key for autonomous agent operations. Rotatable independently of the Active Signing Key. Generated only when agent delegation is needed. See ADR-039.
    - Derives the did:dht identifier: `did:dht:` + z-base-32 encoding of the Identity Key's public key.
    - Constructs a DID document with:
      - Identity Key as verification method `#0`
      - Active Signing Key as verification method `#active` (referenced by `authentication` and `assertionMethod`)
+     - Agent Signing Key as verification method `#agent` (referenced by `authentication` and `assertionMethod`), if present
      - PreRotationCommitment service: `{"type": "PreRotationCommitment", "serviceEndpoint": "sha256:<hex>"}`
    - Returns an `ScpIdentity` handle containing the DID string, all key handles (never raw private keys), pre-rotation commitment, and DID document.
 
@@ -330,9 +336,18 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
    - **The DID string does NOT change. The Identity Key does NOT change. No references break.**
    - After rotation, the caller MUST issue MLS Update proposals in all active contexts (PCS, spec §9.7.3) and revoke/reissue UCAN tokens signed by the old active key.
 
+   **4a′. `rotate_agent_key(identity, key_custody) -> Identity`** (Layer 1 — agent key rotation, ADR-039)
+   - Generates a new Ed25519 keypair as the new Agent Signing Key via `key_custody.generate_keypair(KeyType::Ed25519)`.
+   - Updates the DID document: replaces the `#agent` verification method with the new key. Retains the old agent key as `#retired-agent-{sequence}` for historical verification.
+   - Signs the DID document update with the **Identity Key** (`#0`).
+   - Publishes to DHT with incremented BEP44 sequence number.
+   - Returns updated Identity with the new agent key handle.
+   - Also used for initial agent key provisioning: if no `#agent` VM exists, adds one.
+   - After rotation, the caller MUST revoke/reissue self-delegated UCANs that grant `#agent` scope.
+
    **4b. `migrate_identity(identity, pre_rotation_key, key_custody) -> (Identity, DidRotationEvent)`** (Layer 2 — rare, planned migration)
    - Creates a new DID using the pre-rotation key as the new Identity Key.
-   - Generates a new Active Signing Key and new pre-rotation commitment for the new DID.
+   - Generates a new Active Signing Key, new pre-rotation commitment, and (if the old identity had one) a new Agent Signing Key for the new DID.
    - Updates the OLD DID document: adds `alsoKnownAs` pointing to the new DID, includes cryptographic linkage (old Identity Key signs new Identity Key public bytes, per did:dht spec).
    - Publishes both old (updated) and new DID documents to the DHT.
    - Returns the new Identity and a `DidRotationEvent` for distribution to all active contexts.
@@ -357,6 +372,12 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
        /// Used for MLS credentials, inner envelope signatures, UCAN issuance.
        /// Rotatable via rotate_active_key (DID string stays the same).
        pub active_signing_key: KeyHandle,
+
+       /// Optional Agent Signing Key. Verification method `#agent` in the DID doc.
+       /// Software-held Ed25519 key for autonomous agent operations. Rotatable
+       /// independently via rotate_agent_key. Authorized via self-delegated UCAN
+       /// with `fct.scp_key_scope: "#agent"`. See ADR-039.
+       pub agent_signing_key: Option<KeyHandle>,
 
        /// SHA-256 hash of the next Identity Key's public key.
        /// Published in DID document as a PreRotationCommitment service.
@@ -961,7 +982,8 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
    pub struct SenderKeyEpochAdvance {
        pub sender_did: DID,
        pub epoch: u64,
-       pub signature: Ed25519Signature,  // Signs context_id || sender_did || "key_epoch" || epoch
+       pub signer_key_ref: String,       // Which VM signed: "#active" or "#agent" (ADR-039)
+       pub signature: Ed25519Signature,  // Signs context_id || sender_did || signer_key_ref || "key_epoch" || epoch
    }
 
    /// Request for a sender's current key at a specific epoch.
@@ -985,7 +1007,7 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
    ```
 
    **4a. `publish_sender_key_epoch_advance(key_custody, mls_group, context_id, sender_did, epoch) -> MlsMessage`**
-   - Constructs a `SenderKeyEpochAdvance` signed by the sender's Active Signing Key: `Ed25519_sign(active_signing_key, SHA-256(context_id || sender_did || "key_epoch" || epoch))`.
+   - Constructs a `SenderKeyEpochAdvance` signed by the sender's Active Signing Key or Agent Signing Key (ADR-039): `Ed25519_sign(signing_key, SHA-256(context_id || sender_did || signer_key_ref || "key_epoch" || epoch))`. The `signer_key_ref` field records which verification method signed (e.g., `"#active"` or `"#agent"`).
    - Sends as an MLS application message (broadcast to all group members). **O(1) cost** regardless of group size.
    - Recipients verify the signature and record the new epoch for this sender.
 
@@ -998,7 +1020,7 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
 
    **4c. `request_sender_key(key_custody, mls_group, sender_did, epoch) -> MlsMessage`**
    - Constructs a `SenderKeyRequest` with a fresh ephemeral X25519 wrapping keypair.
-   - Signs the request with the requester's Active Signing Key.
+   - Signs the request with the requester's Active Signing Key or Agent Signing Key (ADR-039).
    - Sends as an MLS application message with `recipient_hint` to the sender. **O(1) cost.**
 
    **HPKE open (recipient-side decryption):** Uses `key_custody.dh_agree(wrapping_key_handle, ephemeral_pk)` to compute the shared secret inside the custody boundary, then KDF + AEAD in software to recover the sender key. The wrapping private key never leaves KeyCustody.
@@ -1017,10 +1039,10 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
 
 6. **`send_block_notification(key_custody, mls_group, context_id, blocked_did, blocker_did) -> MlsMessage`**
    - Sends a signed block notification as an MLS application message.
-   - The blocker signs the notification with their Active Signing Key to prevent forgery by other group members (MLS authenticates group membership, not individual identity within application messages).
-   - Signature payload: `Ed25519_sign(active_signing_key, SHA-256(context_id || "block" || blocker_did || blocked_did || timestamp))`.
-   - Message content: `{ "type": "block_notification", "blocker": blocker_did, "blocked": blocked_did, "timestamp": unix_ms, "signature": blocker_signature }`.
-   - **Verification on receipt:** The receiver MUST verify the Ed25519 signature against the claimed blocker's known Active Signing Key (from their MLS LeafNode `scp_signing_key` extension). Discard without action if verification fails. Log the discarded notification for anomaly detection.
+   - The blocker signs the notification with their Active Signing Key or Agent Signing Key (ADR-039) to prevent forgery by other group members (MLS authenticates group membership, not individual identity within application messages).
+   - Signature payload: `Ed25519_sign(signing_key, SHA-256(context_id || "block" || blocker_did || blocked_did || signing_key_id || timestamp))`.
+   - Message content: `{ "type": "block_notification", "blocker": blocker_did, "blocked": blocked_did, "signing_key_id": signing_key_id, "timestamp": unix_ms, "signature": blocker_signature }`.
+   - **Verification on receipt:** The receiver MUST resolve the correct public key from the claimed blocker's DID document using the `signing_key_id` field (ADR-039), then verify the Ed25519 signature. Both `#active` and `#agent` are accepted. Discard without action if verification fails. Log the discarded notification for anomaly detection.
    - On successful verification, the blocked party's client automatically calls `rotate_sender_key_for_block` excluding the blocker.
    - The block event is recorded in the context event log (ADR-011) with `EventType::MemberBlocked { blocker, blocked, signature }`.
 
@@ -1066,3 +1088,155 @@ The ultimate acceptance criterion for Phase 1 is a single integration test that 
 ```
 
 This test proves: identity works, encryption works, the envelope format works, sender keys work, the relay is a dumb pipe, and the transport abstraction is functional.
+
+---
+
+## ADR-039: Shared-DID Human-Agent Identity Model
+
+**Date:** March 4, 2026
+**Status:** Accepted
+**Extends:** ADR-003 (DID Creation)
+
+### Context
+
+SCP spec §4.3 states "one agent per person per context" but calls it "a social constraint, not a computational one." §9.3 admits "provably guaranteeing one-identity-per-human is an unsolved problem." The current implementation uses two separate DIDs — human DID and agent DID — linked by UCAN delegation (`MintSpendingParams { issuer_did, agent_did }`).
+
+This model contradicts the protocol's own tenets:
+- §9.1 invariant 1: "every action traces to a human" — but agent DID is unlinkable without UCAN chain resolution.
+- §9.1 invariant 4: "one agent per person per context" — zero mechanical enforcement; a human can create N agent DIDs trivially.
+- §1 principle 6: "human accountability" — agent has a separate identity the human can disown.
+- §4.5: "the human is the root of identity, trust, and accountability" — but agent identity is structurally independent.
+
+The separate-DID model provides human-agent unlinkability, which is not privacy — it is unaccountability. An unlinkable agent is an unaccountable agent.
+
+### Decision
+
+Human and agent share ONE DID with three verification methods:
+
+```
+DidDocument.verification_method = [
+  #0      — Identity Key (Ed25519, hardware-backed, never rotates, derives DID)
+  #active — Human Signing Key (Ed25519, human's operational key)
+  #agent  — Agent Signing Key (Ed25519, agent software key, rotatable)
+]
+```
+
+**Trust chain:** `#0` (root of trust) authorizes `#active` and `#agent` via DID document publication. Adding/removing `#agent` is a DID document update signed by `#0`.
+
+**Key properties:**
+
+| Property | `#0` | `#active` | `#agent` |
+|----------|------|-----------|----------|
+| Holder | Human | Human | Agent software |
+| Backing | Hardware (SE/AKS) | Software | Software |
+| Rotatable | No (Layer 2 migration only) | Yes (Layer 1 rotation) | Yes (Layer 1 rotation) |
+| Signs DID doc updates | Yes | No | No |
+| Signs operational actions | No | Yes | Yes (within permission scope) |
+
+**Structural constraint:** Exactly one `#agent` verification method per DID document. Verifiers reject documents with multiple `#agent` VMs. `#agent` is optional — not every DID needs an agent.
+
+**Agent key scope is global.** One persistent `#agent` key per DID, not per-context. DID documents are already ~1,140 bytes with 2 VMs (BEP44 v1 payload limit is 1,000 bytes, requiring bencode packing). Per-context agent keys would exceed document size constraints at scale. Context-specific restrictions on agent behavior use existing mechanisms: roles, capability ceilings, and context parameters — not separate keys.
+
+### Permission Model
+
+**Category A — Protocol-Immutable (`#0` only, agent key MUST NOT sign):** DID document modifications only. This is the minimal set that must be human-only for the security model to hold: if the agent can modify the DID document, it can modify its own constraints.
+- DID document updates (add/remove keys, change services, alter relays)
+- Pre-rotation commitments
+- Identity migration (Layer 2)
+
+**Category B — User-Configurable:** All operational actions. Human sets defaults and limits per agent via UCAN `fct.scp_agent_permissions`.
+- Messaging, blocking, context creation/joining, tool invocation, UCAN minting, governance voting, spending — all configurable by the human with protocol defaults (messaging allowed, most other actions denied by default).
+
+**Category C — Context-Configurable:** Per-context restrictions on agent actions via existing governance mechanisms (no new primitives).
+- `agent_keys_allowed: false` — no agents in this context
+- Agent-specific roles with restricted capabilities
+- `agent_rate_limit` — rate limiting for agent actions
+- `agent_cosign_required` — agent actions require human co-signature
+
+### Enforcement Stack (5 Layers)
+
+1. **Custody separation.** `#active` in hardware (Secure Enclave / Android Keystore) with session-based biometric unlock. `#agent` in software keychain accessible to agent runtime. Agent physically cannot invoke `#active` on hardware-backed platforms. On software-only platforms, isolation is process-level (different keychains, different access controls).
+
+2. **SDK defaults.** Auto-selects correct key by call context. Developer must deliberately override defaults to misuse keys.
+
+3. **Verifier validation.** Network-level enforcement: all conformant verifiers reject Category A actions (DID document modifications) signed by `#agent`. Non-conformant SDKs can produce these signatures, but they cannot propagate through the network. The attempt is both rejected and logged as a custody violation.
+
+4. **Custody attestation.** At identity creation, the DID document includes a `ScpKeyCustodyAttestation` service entry declaring key custody model (`hardware-biometric` vs `software`) with optional platform attestation proof (Apple App Attest / Android Key Attestation). Unambiguous violations (Category A attempts with `#agent`, attestation mismatches with hardware proof) are permanently logged as `ScpCustodyViolationAttestation` records. DID owners can publish counter-attestations for reputation restoration. Absence of attestation is itself a signal.
+
+5. **Behavioral signals.** Soft trust signal only — feeds into trust function (§7.1), NOT logged as violations. Timing patterns, usage anomalies, and interaction patterns provide supplementary context for trust evaluation. Explicitly excluded from violation records due to false positive risk.
+
+### MLS Impact
+
+`ScpCredential` gains a `signing_key_id: String` field (`"#active"` or `"#agent"`). Verifiers resolve the correct public key from the DID document based on this field. Same DID = same MLS membership entry. Agent key rotation doesn't require MLS re-key — only a credential update via MLS Update proposal.
+
+```rust
+pub struct ScpCredential {
+    pub did: String,
+    pub ucan_token: Option<String>,
+    pub signing_key_id: String,  // "#active" or "#agent"
+}
+```
+
+### UCAN Impact
+
+Self-delegation: `iss == aud` (same DID), scoped by a new `fct.scp_key_scope` field. New UCAN JWT header `kid` field per RFC 7515 identifies which verification method signed the token.
+
+New validation step 5b (after existing audience check): if `fct.scp_key_scope` exists, verify the signing key matches the specified scope.
+
+`MintSpendingParams` refactored from `{ issuer_did, agent_did }` to `{ did, key_scope }` — spending UCANs become self-scoped delegations.
+
+### Inner Envelope Impact
+
+`InnerEnvelope` gains a `signing_key_id: String` field. Verifiers use it to resolve the correct public key from the sender's DID document. `SenderKeyEpochAdvance` gains a `signer_key_ref: String` field for the same purpose.
+
+### Key Continuity
+
+Fingerprint computation (§9.11) updated to include all three verification methods:
+```
+fingerprint = SHA256(sort(alice_did, bob_did) || alice_identity_key || alice_active_key || alice_agent_key || bob_identity_key || bob_active_key || bob_agent_key)
+```
+Agent key absence uses 32 zero bytes.
+
+### Governance
+
+One DID = one governance vote, regardless of which signing key is used. Prevents double-voting via `#active` and `#agent` on the same proposal.
+
+### Compromise Recovery
+
+Agent key compromise (most common case — agent runtime is less secure than device HSM):
+1. Human uses `#0` to publish new DID document removing or replacing `#agent`.
+2. Revoke all UCANs with `scp_key_scope: "#agent"`.
+3. MLS credential updates in all active contexts (Update proposal with new credential).
+4. Publish new KeyPackages.
+
+### Rejected Alternative
+
+**Separate DIDs linked by UCAN delegation (current model).** Rejected because:
+- Zero mechanical enforcement of one-agent-per-context
+- Agent accountability requires UCAN chain traversal (inferential, not structural)
+- Agent identity is structurally independent — human can disown
+- Human-agent unlinkability contradicts §9.1 invariant 1, §4.5, §1 principle 6
+- Higher Sybil cost with shared-DID (every identity needs full human-grade depth signals)
+
+### Acceptance Criteria
+
+1. `DidDocument` supports three verification methods: `#0` (Identity Key), `#active` (Human Signing Key), `#agent` (Agent Signing Key, optional).
+2. `ScpIdentity` includes `agent_signing_key: Option<KeyHandle>`.
+3. `DidDht::create()` generates an optional fourth keypair for the agent signing key.
+4. `add_agent_key()`, `remove_agent_key()`, `rotate_agent_key()` methods on `DidDocument`.
+5. `ScpCredential` includes `signing_key_id: String` field; serialization round-trips correctly.
+6. `UcanHeader` includes optional `kid: String` field; `MintParams` includes optional `key_scope: String`.
+7. UCAN validation step 5b: if `fct.scp_key_scope` exists, verify the presenting key matches.
+8. Self-delegation (`iss == aud` with `key_scope`) is explicitly valid.
+9. `MintSpendingParams` uses `{ did, key_scope }` instead of `{ issuer_did, agent_did }`.
+10. `InnerEnvelope` includes `signing_key_id: String`; verifiers resolve the correct DID document VM.
+11. `SenderKeyEpochAdvance` includes `signer_key_ref: String`.
+12. Key continuity fingerprint includes all three VMs.
+13. One DID = one governance vote regardless of signing key.
+14. Verifiers reject DID documents with multiple `#agent` VMs.
+15. Verifiers reject Category A actions (DID document modifications) signed by `#agent`.
+16. `ScpKeyCustodyAttestation` type published in DID document service entries.
+17. `ScpCustodyViolationAttestation` type for permanently recording unambiguous violations.
+18. `CounterAttestation` type for reputation restoration.
+19. All FFI bridges (PyO3, NAPI, UniFFI, WASM) expose agent key creation, rotation, and status.
+20. Integration test: create identity with agent key → mint scoped UCAN → join MLS group with agent credential → send message → verify at recipient → rotate agent key → verify credential update.

@@ -56,7 +56,7 @@ SCP uses multiple DID document service endpoint types, each serving a distinct p
 | `SCPRelay` | Transport-layer relay URLs for encrypted blob routing | `TransportManager` (ADR-012) | §18.2.1 |
 | `SCPCapabilities` | Application-layer capability endpoints (tool schemas, agent descriptions) | Discovery Engine (§6.2.2) | ADR-020 |
 | `IdentityPrivateState` | Relay URLs storing identity private state blobs | Identity Manager | §3.7 |
-| `PreRotationCommitment` | SHA-256 commitment hash for pre-rotation key | Identity Manager (§9.12) | ADR-003 |
+| `PreRotationCommitment` | SHA-256 commitment hash for pre-rotation key (applies to `#0` and `#active` only; `#agent` is a software key with simpler rotation — no pre-rotation needed, see ADR-039) | Identity Manager (§9.12) | ADR-003 |
 | `SCPBroadcastContext` | Broadcast context ID + relay URLs for author discovery | Discovery Engine | §5.14.11 |
 
 **SCPRelay vs SCPCapabilities.** These are distinct service types with different consumers and different purposes:
