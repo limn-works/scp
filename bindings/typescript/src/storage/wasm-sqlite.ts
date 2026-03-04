@@ -39,6 +39,37 @@ export interface StorageInterface {
 }
 
 // ---------------------------------------------------------------------------
+// Async mutex for serializing wa-sqlite access
+// ---------------------------------------------------------------------------
+
+/**
+ * Simple async mutex that serializes access to a single wa-sqlite connection.
+ *
+ * wa-sqlite (async mode) cannot handle concurrent prepare/step/finalize
+ * calls on the same database handle. This mutex ensures only one SQL
+ * operation executes at a time, queuing any concurrent callers.
+ */
+class AsyncMutex {
+  #queue: Promise<void> = Promise.resolve();
+
+  /** Executes `fn` exclusively -- concurrent callers wait in FIFO order. */
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const waiting = this.#queue;
+    this.#queue = gate;
+    await waiting;
+    try {
+      return await fn();
+    } finally {
+      release?.();
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // AES-GCM encryption helpers
 // ---------------------------------------------------------------------------
 
@@ -154,6 +185,7 @@ export class WasmSqliteStorage implements StorageInterface {
   readonly #sqlite: SQLiteAPI;
   readonly #encryptionKey: CryptoKey;
   readonly #vfsType: VfsType;
+  readonly #mutex = new AsyncMutex();
 
   private constructor(db: number, sqlite: SQLiteAPI, encryptionKey: CryptoKey, vfsType: VfsType) {
     this.#db = db;
@@ -210,85 +242,97 @@ export class WasmSqliteStorage implements StorageInterface {
 
   async store(key: string, data: Uint8Array): Promise<void> {
     const encrypted = await encrypt(this.#encryptionKey, data);
-    await run(this.#sqlite, this.#db, "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", [
-      key,
-      encrypted,
-    ]);
+    await this.#mutex.run(() =>
+      run(this.#sqlite, this.#db, "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", [
+        key,
+        encrypted,
+      ]),
+    );
   }
 
   async retrieve(key: string): Promise<Uint8Array | null> {
-    const rows = await query(this.#sqlite, this.#db, "SELECT value FROM kv WHERE key = ?", [key]);
-    if (rows.length === 0) {
-      return null;
-    }
-    const row = rows[0];
-    if (!row) {
-      return null;
-    }
-    const encrypted = row[0];
-    if (!(encrypted instanceof Uint8Array)) {
-      return null;
-    }
-    return decrypt(this.#encryptionKey, encrypted);
+    return this.#mutex.run(async () => {
+      const rows = await query(this.#sqlite, this.#db, "SELECT value FROM kv WHERE key = ?", [key]);
+      if (rows.length === 0) {
+        return null;
+      }
+      const row = rows[0];
+      if (!row) {
+        return null;
+      }
+      const encrypted = row[0];
+      if (!(encrypted instanceof Uint8Array)) {
+        return null;
+      }
+      return decrypt(this.#encryptionKey, encrypted);
+    });
   }
 
   async delete(key: string): Promise<void> {
-    await run(this.#sqlite, this.#db, "DELETE FROM kv WHERE key = ?", [key]);
+    await this.#mutex.run(() => run(this.#sqlite, this.#db, "DELETE FROM kv WHERE key = ?", [key]));
   }
 
   async listKeys(prefix: string): Promise<string[]> {
-    const successor = prefixSuccessor(prefix);
-    let rows: SQLiteRow[];
-    if (successor === null) {
-      // No successor -- match all keys >= prefix.
-      rows = await query(this.#sqlite, this.#db, "SELECT key FROM kv WHERE key >= ? ORDER BY key", [
-        prefix,
-      ]);
-    } else {
-      rows = await query(
-        this.#sqlite,
-        this.#db,
-        "SELECT key FROM kv WHERE key >= ? AND key < ? ORDER BY key",
-        [prefix, successor],
-      );
-    }
-    return rows.map((row) => {
-      const val = row[0];
-      return typeof val === "string" ? val : String(val);
+    return this.#mutex.run(async () => {
+      const successor = prefixSuccessor(prefix);
+      let rows: SQLiteRow[];
+      if (successor === null) {
+        rows = await query(
+          this.#sqlite,
+          this.#db,
+          "SELECT key FROM kv WHERE key >= ? ORDER BY key",
+          [prefix],
+        );
+      } else {
+        rows = await query(
+          this.#sqlite,
+          this.#db,
+          "SELECT key FROM kv WHERE key >= ? AND key < ? ORDER BY key",
+          [prefix, successor],
+        );
+      }
+      return rows.map((row) => {
+        const val = row[0];
+        return typeof val === "string" ? val : String(val);
+      });
     });
   }
 
   async deletePrefix(prefix: string): Promise<number> {
-    const successor = prefixSuccessor(prefix);
-    let countRows: SQLiteRow[];
-    if (successor === null) {
-      countRows = await query(this.#sqlite, this.#db, "SELECT COUNT(*) FROM kv WHERE key >= ?", [
-        prefix,
-      ]);
-      await run(this.#sqlite, this.#db, "DELETE FROM kv WHERE key >= ?", [prefix]);
-    } else {
-      countRows = await query(
-        this.#sqlite,
-        this.#db,
-        "SELECT COUNT(*) FROM kv WHERE key >= ? AND key < ?",
-        [prefix, successor],
-      );
-      await run(this.#sqlite, this.#db, "DELETE FROM kv WHERE key >= ? AND key < ?", [
-        prefix,
-        successor,
-      ]);
-    }
-    const row = countRows[0];
-    if (!row) {
-      return 0;
-    }
-    const count = row[0];
-    return typeof count === "number" ? count : 0;
+    return this.#mutex.run(async () => {
+      const successor = prefixSuccessor(prefix);
+      let countRows: SQLiteRow[];
+      if (successor === null) {
+        countRows = await query(this.#sqlite, this.#db, "SELECT COUNT(*) FROM kv WHERE key >= ?", [
+          prefix,
+        ]);
+        await run(this.#sqlite, this.#db, "DELETE FROM kv WHERE key >= ?", [prefix]);
+      } else {
+        countRows = await query(
+          this.#sqlite,
+          this.#db,
+          "SELECT COUNT(*) FROM kv WHERE key >= ? AND key < ?",
+          [prefix, successor],
+        );
+        await run(this.#sqlite, this.#db, "DELETE FROM kv WHERE key >= ? AND key < ?", [
+          prefix,
+          successor,
+        ]);
+      }
+      const row = countRows[0];
+      if (!row) {
+        return 0;
+      }
+      const count = row[0];
+      return typeof count === "number" ? count : 0;
+    });
   }
 
   async exists(key: string): Promise<boolean> {
-    const rows = await query(this.#sqlite, this.#db, "SELECT 1 FROM kv WHERE key = ?", [key]);
-    return rows.length > 0;
+    return this.#mutex.run(async () => {
+      const rows = await query(this.#sqlite, this.#db, "SELECT 1 FROM kv WHERE key = ?", [key]);
+      return rows.length > 0;
+    });
   }
 }
 
@@ -308,6 +352,7 @@ export class WasmSqliteStorage implements StorageInterface {
 export class InMemorySqliteStorage implements StorageInterface {
   readonly #db: number;
   readonly #sqlite: SQLiteAPI;
+  readonly #mutex = new AsyncMutex();
 
   private constructor(db: number, sqlite: SQLiteAPI) {
     this.#db = db;
@@ -330,84 +375,107 @@ export class InMemorySqliteStorage implements StorageInterface {
   }
 
   async store(key: string, data: Uint8Array): Promise<void> {
-    await run(this.#sqlite, this.#db, "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", [
-      key,
-      data,
-    ]);
+    await this.#mutex.run(() => {
+      // wa-sqlite's bind_blob passes a null pointer for zero-length arrays,
+      // violating NOT NULL constraints. Use zeroblob(0) SQL literal instead.
+      if (data.length === 0) {
+        return run(
+          this.#sqlite,
+          this.#db,
+          "INSERT OR REPLACE INTO kv (key, value) VALUES (?, zeroblob(0))",
+          [key],
+        );
+      }
+      return run(this.#sqlite, this.#db, "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", [
+        key,
+        data,
+      ]);
+    });
   }
 
   async retrieve(key: string): Promise<Uint8Array | null> {
-    const rows = await query(this.#sqlite, this.#db, "SELECT value FROM kv WHERE key = ?", [key]);
-    if (rows.length === 0) {
+    return this.#mutex.run(async () => {
+      const rows = await query(this.#sqlite, this.#db, "SELECT value FROM kv WHERE key = ?", [key]);
+      if (rows.length === 0) {
+        return null;
+      }
+      const row = rows[0];
+      if (!row) {
+        return null;
+      }
+      const value = row[0];
+      if (value instanceof Uint8Array) {
+        return value;
+      }
       return null;
-    }
-    const row = rows[0];
-    if (!row) {
-      return null;
-    }
-    const value = row[0];
-    if (value instanceof Uint8Array) {
-      return value;
-    }
-    return null;
+    });
   }
 
   async delete(key: string): Promise<void> {
-    await run(this.#sqlite, this.#db, "DELETE FROM kv WHERE key = ?", [key]);
+    await this.#mutex.run(() => run(this.#sqlite, this.#db, "DELETE FROM kv WHERE key = ?", [key]));
   }
 
   async listKeys(prefix: string): Promise<string[]> {
-    const successor = prefixSuccessor(prefix);
-    let rows: SQLiteRow[];
-    if (successor === null) {
-      rows = await query(this.#sqlite, this.#db, "SELECT key FROM kv WHERE key >= ? ORDER BY key", [
-        prefix,
-      ]);
-    } else {
-      rows = await query(
-        this.#sqlite,
-        this.#db,
-        "SELECT key FROM kv WHERE key >= ? AND key < ? ORDER BY key",
-        [prefix, successor],
-      );
-    }
-    return rows.map((row) => {
-      const val = row[0];
-      return typeof val === "string" ? val : String(val);
+    return this.#mutex.run(async () => {
+      const successor = prefixSuccessor(prefix);
+      let rows: SQLiteRow[];
+      if (successor === null) {
+        rows = await query(
+          this.#sqlite,
+          this.#db,
+          "SELECT key FROM kv WHERE key >= ? ORDER BY key",
+          [prefix],
+        );
+      } else {
+        rows = await query(
+          this.#sqlite,
+          this.#db,
+          "SELECT key FROM kv WHERE key >= ? AND key < ? ORDER BY key",
+          [prefix, successor],
+        );
+      }
+      return rows.map((row) => {
+        const val = row[0];
+        return typeof val === "string" ? val : String(val);
+      });
     });
   }
 
   async deletePrefix(prefix: string): Promise<number> {
-    const successor = prefixSuccessor(prefix);
-    let countRows: SQLiteRow[];
-    if (successor === null) {
-      countRows = await query(this.#sqlite, this.#db, "SELECT COUNT(*) FROM kv WHERE key >= ?", [
-        prefix,
-      ]);
-      await run(this.#sqlite, this.#db, "DELETE FROM kv WHERE key >= ?", [prefix]);
-    } else {
-      countRows = await query(
-        this.#sqlite,
-        this.#db,
-        "SELECT COUNT(*) FROM kv WHERE key >= ? AND key < ?",
-        [prefix, successor],
-      );
-      await run(this.#sqlite, this.#db, "DELETE FROM kv WHERE key >= ? AND key < ?", [
-        prefix,
-        successor,
-      ]);
-    }
-    const row = countRows[0];
-    if (!row) {
-      return 0;
-    }
-    const count = row[0];
-    return typeof count === "number" ? count : 0;
+    return this.#mutex.run(async () => {
+      const successor = prefixSuccessor(prefix);
+      let countRows: SQLiteRow[];
+      if (successor === null) {
+        countRows = await query(this.#sqlite, this.#db, "SELECT COUNT(*) FROM kv WHERE key >= ?", [
+          prefix,
+        ]);
+        await run(this.#sqlite, this.#db, "DELETE FROM kv WHERE key >= ?", [prefix]);
+      } else {
+        countRows = await query(
+          this.#sqlite,
+          this.#db,
+          "SELECT COUNT(*) FROM kv WHERE key >= ? AND key < ?",
+          [prefix, successor],
+        );
+        await run(this.#sqlite, this.#db, "DELETE FROM kv WHERE key >= ? AND key < ?", [
+          prefix,
+          successor,
+        ]);
+      }
+      const row = countRows[0];
+      if (!row) {
+        return 0;
+      }
+      const count = row[0];
+      return typeof count === "number" ? count : 0;
+    });
   }
 
   async exists(key: string): Promise<boolean> {
-    const rows = await query(this.#sqlite, this.#db, "SELECT 1 FROM kv WHERE key = ?", [key]);
-    return rows.length > 0;
+    return this.#mutex.run(async () => {
+      const rows = await query(this.#sqlite, this.#db, "SELECT 1 FROM kv WHERE key = ?", [key]);
+      return rows.length > 0;
+    });
   }
 }
 
