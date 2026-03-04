@@ -1,4 +1,4 @@
-//! Transport abstraction layer for SCP (Shareable Context Protocol).
+//! Transport abstraction layer for SCP (Shared Context Protocol).
 //!
 //! `scp-transport` defines the [`TransportAdapter`] trait that all SCP transport
 //! adapters implement, along with supporting types ([`BlobId`], [`RoutingId`],

@@ -1,6 +1,6 @@
 {
   "project": "scp",
-  "description": "Shareable Context Protocol \u2014 cryptographic identity, governed contexts, encrypted communication, capability-based auth, and transparent provenance for AI agent infrastructure.",
+  "description": "Shared Context Protocol \u2014 cryptographic identity, governed contexts, encrypted communication, capability-based auth, and transparent provenance for AI agent infrastructure.",
   "gates": [
     {
       "id": "gate-1",

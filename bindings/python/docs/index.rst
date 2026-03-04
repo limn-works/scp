@@ -1,7 +1,7 @@
 scp-sdk
 =======
 
-Python SDK for the Shareable Context Protocol.
+Python SDK for the Shared Context Protocol.
 
 .. toctree::
    :maxdepth: 2

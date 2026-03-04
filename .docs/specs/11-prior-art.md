@@ -116,13 +116,14 @@ This means SCP identities are resolvable even if:
 
 An attacker must suppress a DID document on ALL relays AND ALL reachable DHT nodes to prevent resolution. This is a strictly harder attack than suppressing on either layer alone.
 
-**2. Three-key architecture.** Standard did:dht uses a single Ed25519 keypair (the one encoded in the DID string) for everything — signing documents, authenticating, operating. SCP defines three keys per identity:
+**2. Multi-key verification method architecture (§3.9, ADR-039).** Standard did:dht uses a single Ed25519 keypair (the one encoded in the DID string) for everything — signing documents, authenticating, operating. SCP defines multiple verification methods per DID document:
 
-- **Identity Key** — the Ed25519 key encoded in the DID string. Long-lived. Used for BEP44 signing and as the root of the identity's trust chain. Never used for day-to-day operations.
-- **Active Signing Key** — the operational key used for protocol actions (signing inner envelopes, MLS operations, capability delegation). Rotatable without changing the DID. Published in the DID document, authorized by the Identity Key.
-- **Pre-Rotation Key** — a commitment to the next Active Signing Key. The hash of the pre-rotation key is published in the DID document before it's needed. This enables safe key rotation even if the current Active Signing Key is compromised: the pre-rotation commitment was made before compromise, so an attacker who steals the active key cannot forge a valid rotation (they would need the pre-rotation private key, which was generated separately).
+- **Identity Key (`#0`)** — the Ed25519 key encoded in the DID string. Hardware-backed. Long-lived root of trust. Used for BEP44 signing and DID document modifications only — never for day-to-day operations.
+- **Human Signing Key (`#active`)** — the human's operational key for protocol actions (signing inner envelopes, MLS operations, capability delegation). Hardware-backed. Rotatable without changing the DID. Published in the DID document, authorized by the Identity Key.
+- **Pre-Rotation Key** — a commitment to the next Human Signing Key. The hash of the pre-rotation key is published in the DID document before it's needed. This enables safe key rotation even if the current signing key is compromised: the pre-rotation commitment was made before compromise, so an attacker who steals the signing key cannot forge a valid rotation (they would need the pre-rotation private key, which was generated separately).
+- **Agent Signing Key (`#agent`)** — optional. A software-held Ed25519 key for the human's agent to perform protocol operations autonomously. Published in the DID document, authorized by the human via self-delegation UCAN (`iss == aud`, same DID, with `fct.scp_key_scope: "#agent"`). The agent key is independently rotatable and revocable without affecting the human's keys. When present, protocol messages carry a `signing_key_id` field identifying which verification method produced the signature.
 
-This separation of concerns (identity ≠ signing ≠ rotation) is a significant security improvement over single-key DID methods. It provides a recovery path from key compromise that doesn't require changing the DID itself.
+This separation of concerns (identity ≠ human signing ≠ agent signing ≠ rotation) is a significant security improvement over single-key DID methods. It provides: (a) recovery from key compromise without DID change, (b) custody separation between human and agent operations, and (c) structural action provenance — verifiers can determine whether a human or agent performed any given action by inspecting the `signing_key_id`, without trusting self-reported claims.
 
 **3. Protocol-level healing (§3.10.7).** When both resolution layers return valid documents with different sequence numbers, the resolver accepts the higher one and MAY re-publish the fresher document to the stale layer. The network self-heals — converging on the freshest document without central coordination. This is unique to SCP; standard did:dht has no concept of multi-layer resolution and therefore no healing protocol.
 
@@ -153,7 +154,7 @@ Given SCP's significant departures from did:dht, a natural question is whether S
 
 1. **Interoperability.** The DID string format is identical to did:dht. A standard did:dht resolver can resolve SCP identities via Mainline DHT. They won't get the relay layer, three-key semantics, or protocol-level healing — but they get a valid DID document. Changing to `did:scp` would break this interoperability bridge.
 
-2. **SCP's extensions are additive, not contradictory.** Nothing SCP does violates the did:dht specification. SCP adds capabilities on top (dual resolution, key separation, healing). A did:dht-compliant resolver seeing an SCP identity just sees a standard did:dht identity with some extra service endpoints.
+2. **SCP's extensions are additive, not contradictory.** Nothing SCP does violates the did:dht specification. SCP adds capabilities on top (dual resolution, multi-key verification methods, healing, agent signing keys). A did:dht-compliant resolver seeing an SCP identity just sees a standard did:dht identity with additional verification methods and service endpoints — all of which are valid DID document constructs that standard resolvers can parse (and ignore what they don't understand).
 
 3. **Cost of premature separation.** Defining a new DID method requires registration, documentation, resolver implementation by third parties. The benefit is namespace clarity. The cost is loss of DHT interoperability with the existing did:dht ecosystem. The cost currently outweighs the benefit.
 
@@ -165,6 +166,6 @@ If did:dht governance at DIF collapses entirely, or if a future did:dht spec rev
 
 Agents as first-class protocol participants with formalized trust semantics, one-agent-per-person-per-context constraints, context-bound agents that cannot cross at the protocol level, trust as identity + capability pairs applied to autonomous agents, non-fungible cross-platform identity attestations with shadow identity claiming, protocol-level bridge connectors with provenance-tracked content attribution, and all of this framed as infrastructure for generated/ephemeral apps.
 
-Additionally: dual-layer DID resolution with protocol-level self-healing, three-key identity architecture with pre-rotation commitments, encryption-as-access-control where MLS group keys ARE membership, sender-side key layers enabling per-sender blocking without group disruption, and context-level economic governance with spending UCANs.
+Additionally: dual-layer DID resolution with protocol-level self-healing, multi-key identity architecture with pre-rotation commitments and optional agent signing keys, shared-DID human-agent pairs with structural action provenance (verifiers know whether a human or agent signed any action from the `signing_key_id` — no trust in self-reported claims), encryption-as-access-control where MLS group keys ARE membership, sender-side key layers enabling per-sender blocking without group disruption, and context-level economic governance with spending UCANs.
 
 This is the novel contribution of SCP.

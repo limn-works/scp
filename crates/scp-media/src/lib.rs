@@ -1,4 +1,4 @@
-//! Real-time media transport types for SCP (Shareable Context Protocol).
+//! Real-time media transport types for SCP (Shared Context Protocol).
 //!
 //! `scp-media` implements the delegated media model defined in ADR-024.
 //! SCP governs identity, trust, governance, and MLS-derived key material.

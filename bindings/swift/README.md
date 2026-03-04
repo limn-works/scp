@@ -1,6 +1,6 @@
 # SCP Swift SDK
 
-> `SCP` -- Shareable Context Protocol for Swift
+> `SCP` -- Shared Context Protocol for Swift
 
 Cryptographic identity, encrypted contexts, capability-based auth, and tool invocation for AI agents. Built on Rust via UniFFI, distributed as XCFramework.
 

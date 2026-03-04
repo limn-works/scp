@@ -59,7 +59,8 @@ These are interleaved within the same sections, sometimes within the same paragr
 9. **Spec §17.2 Storage trait:** Defined as a Rust trait with async fn signatures. The protocol need is "implementations must provide key-value storage with these operations" — the Rust syntax is implementation.
 10. **Architecture.md §1.2 message lifecycle:** Contains protocol-level security checkpoint annotations that ARE normative. But they're embedded in a document that is otherwise entirely implementation architecture. These need to be extracted to the protocol spec.
 11. **DID document serialization divergence from did:dht.** Standard did:dht specifies DNS packet encoding (TXT/SRV records) for DID documents. SCP uses JSON-LD serialization on the relay layer, with DNS packet encoding only for the DHT layer (BEP44 compatibility). The protocol spec must explicitly define both serialization formats: JSON-LD for relay-stored documents and DNS packets for DHT-stored documents. This divergence is intentional (JSON-LD removes the 1000-byte payload limit), but it needs formal specification — currently §3.10 describes the dual-layer architecture without specifying the serialization difference between layers.
-12. **Three-key architecture underspecified.** §3.9 mentions key generation, distribution, rotation, and destruction at a high level and references §9.7.4 for the full lifecycle. The three-key separation (Identity / Active Signing / Pre-Rotation) is described in §11.2.3 (prior art comparison) but not formally specified in the identity section itself. The protocol spec must consolidate this into a single authoritative section with wire formats, not scattered across §3.9, §3.10, §9.7.4, and §11.2.3.
+12. **Multi-key architecture underspecified and scattered.** §3.9 mentions key generation, distribution, rotation, and destruction at a high level and references §9.7.4 for the full lifecycle. The multi-key separation (Identity `#0` / Human Signing `#active` / Pre-Rotation / Agent Signing `#agent`) is described across §3.9, §3.10, §4.2, §4.5 (ADR-039), §9.7.4, §9.8.1 (updated preimage), and §11.2.3 (prior art) but not formally specified in a single authoritative section. The protocol spec must consolidate this with wire formats, not scattered across 6+ locations.
+13. **Signature preimage mismatch.** ADR-039 updates the inner signature preimage to include `signing_key_id` (`context_id || sender_did || signing_key_id || epoch || ...`), but §9.8.1 as currently written does not include this field. The ADR-039 version is normative. Must be reconciled before extraction.
 
 ---
 
@@ -127,27 +128,32 @@ Every section of every current spec file, classified as:
 
 **Action:** Nearly all protocol content. Remove: ProtocolStore method blocks, DidResolver trait section, Phase Integration table. These are implementation artifacts.
 
-**GAP IDENTIFIED:** §3.10 (dual-layer resolution) is one of the most protocol-pure sections in the spec and should extract cleanly into the SCP Identity document. However, the **three-key architecture** (Identity Key / Active Signing Key / Pre-Rotation Key) is described across §3.9 and §3.10 in prose but lacks a formal wire format specification. The extracted protocol spec needs:
+**GAP IDENTIFIED:** §3.10 (dual-layer resolution) is one of the most protocol-pure sections in the spec and should extract cleanly into the SCP Identity document. However, the **multi-key verification method architecture** (Identity Key `#0` / Human Signing Key `#active` / Pre-Rotation Key / Agent Signing Key `#agent`) is described across §3.9, §3.10, §4.2, §4.5, and ADR-039 but lacks a formal wire format specification. The extracted protocol spec needs:
 - Explicit key commitment scheme (how the pre-rotation key hash is encoded in the DID document)
-- Key rotation authorization chain (how the Active Signing Key proves it was authorized by the Identity Key)
-- DID document structure showing all three keys and their roles
+- Key rotation authorization chain (how the Human Signing Key proves it was authorized by the Identity Key)
+- DID document structure showing all verification methods (`#0`, `#active`, `#agent`) and their roles
 - Wire format for key rotation messages
+- **Agent Signing Key (`#agent`) verification method format** — how it appears in the DID document, its relationship to the `#active` key
+- **Self-delegation UCAN format** — `iss == aud` (same DID) with `fct.scp_key_scope: "#agent"`, UCAN header `signing_key_id`
+- **`ScpKeyCustodyAttestation` service entry format** — DID document service entry declaring key custody model
+- **`ScpCustodyViolationAttestation` format** — permanent violation logging for Category A violations by `#agent`
+- **Permission category definitions** — Category A (`#0` only), Category B (user-configurable), Category C (context-configurable)
 
-This is a P0 gap for the Identity document — the three-key architecture is a novel contribution and must be specified precisely enough for independent implementation.
+This is a P0 gap for the Identity document — the multi-key architecture and shared-DID human-agent model are novel contributions and must be specified precisely enough for independent implementation.
 
-### Spec 04 — Agents (69 lines)
+### Spec 04 — Agents (69 lines + ADR-039 additions)
 | Section | Classification | Notes |
 |---------|---------------|-------|
 | §4.1 Core Principle | **P** | Human traceability — normative |
-| §4.2 Binding | **P** | Personal + institutional agents — normative |
-| §4.3 One Agent Per Person Per Context | **P** | Social constraint — normative |
+| §4.2 Binding (updated ADR-039) | **P** | Personal + institutional agents, shared-DID model, `#agent` verification method — normative |
+| §4.3 One Agent Per Person Per Context (updated ADR-039) | **P** | Social constraint, `signing_key_id` attribution — normative |
 | §4.4 Bring Your Own Agent | **P** | Capability metadata, self-attested vs challenge-verified — normative |
-| §4.5 The Human-Agent Pair | **P** | Fundamental unit of participation — normative |
+| §4.5 The Human-Agent Pair (updated ADR-039) | **P** | Shared-DID model, self-delegation UCAN, Category A/B/C permissions, 5-layer enforcement stack — **critical normative content** |
 | §4.6 Agents Are Consumers, Not Enforcers | **P** | Enforcement is cryptographic — normative |
 | §4.7 Context-Bound at Protocol Level | **P** | Agent isolation, A2A rejection rationale — normative |
 | §4.8 Agent Fleet | **P** | Fleet model, earned capacity reference — normative |
 
-**Action:** Entirely protocol content. Extract as-is.
+**Action:** Entirely protocol content. Extract as-is. **Note:** ADR-039 significantly enriches §4.2, §4.3, and §4.5 with shared-DID semantics, permission categories, and the enforcement stack. These are protocol-level (not implementation-level) additions — they define how verifiers validate agent actions.
 
 ### Spec 05 — Contexts (960 lines)
 | Section | Classification | Notes |
@@ -241,10 +247,11 @@ This is a P0 gap for the Identity document — the three-key architecture is a n
 | §9.16 Sender-Side Keys | **P** | Full sender key specification — **critical normative content** |
 | §9.16.1-4 subsections | **P** | Blocking protocol, distribution, epoch management — normative |
 | §9.17 Content Access Control | **P** | Access key layer, CEK wrapping, AAD binding — **critical normative content** |
+| §9.8.1 Inner signature preimage (updated ADR-039) | **P** | Preimage now includes `signing_key_id`: `context_id \|\| sender_did \|\| signing_key_id \|\| epoch \|\| ...` — **critical normative content, wire format change** |
 | Any Rust code blocks | **I** | Replace with language-agnostic notation |
 | Any "see crates/..." references | **I** | Remove from protocol spec |
 
-**Action:** Nearly the entire spec is normative protocol content. Remove Rust code blocks and crate references. This is the densest normative content in the project.
+**Action:** Nearly the entire spec is normative protocol content. Remove Rust code blocks and crate references. This is the densest normative content in the project. **Note:** ADR-039 adds `signing_key_id` to InnerEnvelope, ScpCredential, and SenderKeyEpochAdvance — all three need wire format definitions updated.
 
 ### Spec 10 — Infrastructure and Self-Hosting (826 lines)
 | Section | Classification | Notes |
@@ -477,6 +484,7 @@ The 38 ADRs across 6 phase files contain both protocol-level and implementation-
 | ADR-029 | Broadcast Contexts | Broadcast mode protocol |
 | ADR-031 | Governance Actions | 24 action types |
 | ADR-038 | Content Access Control | Access key layer, CEK wrapping |
+| ADR-039 | Shared-DID Human-Agent Identity | Shared-DID model, `#agent` verification method, signing_key_id, self-delegation UCAN, Category A/B/C permissions, 5-layer enforcement stack, custody attestation — **critical** |
 
 ### Implementation-Level ADRs (stay in current docs)
 | ADR | Topic | Why Implementation |
@@ -620,9 +628,13 @@ The protocol spec must define:
 | BEP44 signature verification | **P0** | Given this DID and this document, the signature verification succeeds/fails |
 | Routing ID derivation | **P0** | Given this context_id/DID, the routing_id is exactly X |
 | DID routing ID derivation | **P0** | Given this DID string, SHA-256("scp:did:" \|\| did_string) is exactly X |
-| Three-key DID document | **P0** | Given these three keys, the DID document structure is exactly X |
-| Key rotation authorization | **P0** | Given this Identity Key and new Active Signing Key, the rotation message is exactly X |
+| Multi-key DID document | **P0** | Given these keys (`#0`, `#active`, `#agent`), the DID document structure is exactly X |
+| Key rotation authorization | **P0** | Given this Identity Key and new Human Signing Key, the rotation message is exactly X |
 | z-base-32 encoding | **P0** | Given this Ed25519 public key, the z-base-32 encoding is exactly X (did:dht compatibility) |
+| signing_key_id in InnerEnvelope | **P0** | Given this InnerEnvelope with signing_key_id="#active", the serialized bytes and signature preimage are exactly X |
+| ScpCredential with signing_key_id | **P0** | Given this ScpCredential with signing_key_id="#agent", the serialized format is exactly X |
+| Self-delegation UCAN | **P0** | Given this self-delegation UCAN (iss==aud, fct.scp_key_scope="#agent"), the encoded token is exactly X |
+| Custody attestation | **P1** | Given this ScpKeyCustodyAttestation, the DID document service entry format is exactly X |
 | HKDF key derivation | **P0** | Given this key material and context, the derived key is exactly X |
 | Sender key HPKE wrapping | **P0** | Given this sender key and recipient, the wrapped key is exactly X |
 | AES-256-KW wrapping | **P0** | Given this CEK and access key, the wrapped CEK is exactly X |
@@ -675,14 +687,22 @@ JSON files, one per category, structured as:
 
 4. **Formal wire format definitions.** All message types need language-agnostic notation. See §5 of this plan.
 
-5. **Three-key architecture wire format.** The three-key identity architecture (Identity Key / Active Signing Key / Pre-Rotation Key) is a novel contribution described in prose (§3.9, §3.10) but lacks formal specification. The protocol spec must define:
+5. **Multi-key architecture wire format (expanded by ADR-039).** The multi-key identity architecture (Identity Key `#0` / Human Signing Key `#active` / Pre-Rotation Key / Agent Signing Key `#agent`) is a novel contribution described in prose (§3.9, §3.10, §4.2, §4.5, ADR-039) but lacks formal specification. The protocol spec must define:
    - Pre-rotation key commitment format (how the hash is encoded in the DID document)
-   - Key rotation authorization chain (how Active Signing Key proves authorization by Identity Key)
-   - DID document structure showing all three key slots and their service endpoint types
+   - Key rotation authorization chain (how Human Signing Key proves authorization by Identity Key)
+   - DID document structure showing all verification methods (`#0`, `#active`, `#agent`) and their service endpoint types
    - Key rotation wire message format
    - Rotation under compromise: the pre-rotation recovery protocol
+   - **Agent Signing Key (`#agent`) verification method format** in DID document
+   - **Self-delegation UCAN wire format:** `iss == aud` with `fct.scp_key_scope: "#agent"`, `signing_key_id` in UCAN header
+   - **`signing_key_id` field** in InnerEnvelope, ScpCredential, SenderKeyEpochAdvance — how it's serialized and validated
+   - **Inner signature preimage** updated to include `signing_key_id` — must match between spec §9.8.1 and ADR-039
+   - **`ScpKeyCustodyAttestation`** DID document service entry format
+   - **`ScpCustodyViolationAttestation`** format for permanent violation logging
+   - **Permission category definitions:** Category A (`#0` only), Category B (user-configurable), Category C (context-configurable)
+   - **`MintSpendingParams` refactoring:** `{ did, key_scope }` replaces `{ issuer_did, agent_did }` — wire format change in §19
 
-   This is critical because the three-key architecture is one of SCP's novel contributions to the DID space — it must be specified precisely enough for independent implementation, not just described conceptually.
+   This is critical because the multi-key architecture and shared-DID model are among SCP's most significant novel contributions — they must be specified precisely enough for independent implementation.
 
 ### 7.2 Important Gaps (P1 — should be filled for completeness)
 
@@ -774,7 +794,13 @@ Processing order (dependencies first):
 
 17. **Define DID-specific wire formats**:
     - DID document structure (JSON-LD for relay layer, DNS packet for DHT layer)
-    - Three-key architecture: Identity Key, Active Signing Key, Pre-Rotation Key commitment
+    - Multi-key architecture: Identity Key (`#0`), Human Signing Key (`#active`), Pre-Rotation Key commitment, Agent Signing Key (`#agent`)
+    - `signing_key_id` field in InnerEnvelope, ScpCredential, SenderKeyEpochAdvance
+    - Inner signature preimage with `signing_key_id` (per ADR-039)
+    - Self-delegation UCAN format (`iss == aud`, `fct.scp_key_scope`)
+    - `ScpKeyCustodyAttestation` DID document service entry
+    - `ScpCustodyViolationAttestation` format
+    - `MintSpendingParams` updated format (`{ did, key_scope }` replacing `{ issuer_did, agent_did }`)
     - Key rotation authorization message
     - BEP44 signed mutable item format (for DHT publishing)
     - DID document service endpoint types (SCPRelay, IdentityPrivateState, etc.)

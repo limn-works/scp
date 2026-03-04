@@ -135,7 +135,7 @@ internal sealed class ContextHandle : SafeHandle
 
     <PackageId>Limn.Scp</PackageId>
     <Version>0.1.0</Version>
-    <Description>Shareable Context Protocol SDK for .NET</Description>
+    <Description>Shared Context Protocol SDK for .NET</Description>
     <Authors>Limn</Authors>
     <!-- License TBD -->
     <RepositoryUrl>https://github.com/limn/scp</RepositoryUrl>

@@ -153,13 +153,15 @@ Transport + Data (relay-based, transport-agnostic)
 - Key custody: invisible to users — Secure Enclave, Android Keystore, passkeys, hardware keys, self-managed
 - Recovery: social and device mechanisms, no seed phrases
 
-### 4.2 Three-Key Architecture (Novel Contribution)
-- Standard DID methods use a single keypair for everything (signing, authenticating, operating). SCP separates concerns:
-  - **Identity Key:** Ed25519 key encoded in DID string. Long-lived root of trust. Used for BEP44 signing only — never for day-to-day operations.
-  - **Active Signing Key:** Operational key for protocol actions. Rotatable without changing DID. Published in DID document, authorized by Identity Key.
-  - **Pre-Rotation Key:** Hash commitment published before needed. Enables safe rotation even under compromise — attacker who steals Active Signing Key cannot forge rotation (needs pre-rotation private key, generated separately).
-- Security improvement over single-key DID methods: recovery from key compromise without DID change
-- Compare to did:key (no rotation), did:web (server-dependent rotation), did:plc (PLC directory-mediated rotation)
+### 4.2 Multi-Key Verification Method Architecture (Novel Contribution)
+- Standard DID methods use a single keypair for everything (signing, authenticating, operating). SCP defines multiple verification methods per DID:
+  - **Identity Key (`#0`):** Ed25519 key encoded in DID string. Hardware-backed. Root of trust. Used for BEP44 signing and DID document modifications only.
+  - **Human Signing Key (`#active`):** Human's operational key for protocol actions. Hardware-backed. Rotatable without changing DID.
+  - **Pre-Rotation Key:** Hash commitment published before needed. Enables safe rotation under compromise.
+  - **Agent Signing Key (`#agent`):** Optional. Software-held Ed25519 key for the human's agent. Authorized via self-delegation UCAN. Independently rotatable and revocable.
+- All protocol messages carry `signing_key_id` — verifiers know which key (human or agent) signed each action. This is structural action provenance: the protocol makes human-vs-agent authorship verifiable, not self-reported.
+- Security improvements: (a) key compromise recovery without DID change, (b) custody separation between human and agent, (c) graduated permission categories (A/B/C) based on signing key
+- Compare to did:key (no rotation), did:web (server-dependent rotation), did:plc (PLC directory-mediated rotation), all existing methods (no concept of agent signing keys)
 
 ### 4.3 Dual-Layer Resolution (Novel Contribution)
 - Layer 1: SCP relay-based (deterministic routing_id = SHA-256("scp:did:" || did_string), uses existing relay PUBLISH/QUERY)
@@ -170,11 +172,18 @@ Transport + Data (relay-based, transport-agnostic)
 - Security: attacker must suppress on ALL relays AND ALL DHT nodes — strictly harder than either layer alone
 - did:dht governance risk (TBD shutdown Nov 2024, transfer to DIF) — SCP is insulated because the identity layer is fully self-owned, depending only on BEP44 (BitTorrent standard) and Ed25519 (universal primitive), not on did:dht software or governance
 
-### 4.3 The Human-Agent Pair
-- Fundamental unit: human + agent. Neither is complete without the other.
+### 4.3 The Human-Agent Pair (Shared-DID Model)
+- Fundamental unit: human + agent sharing a single DID. Neither is a separate identity — they are one participant with two signing keys.
+- The shared-DID model answers the Agent Trust Problem (§2.2): every agent action is cryptographically bound to a human identity. There is no "agent DID" to create, manage, or sybil-attack — agents exist only as extensions of human identities.
 - One agent per person per context. Social constraint, not computational.
 - Agent capability metadata: self-attested and challenge-verified capabilities
 - Agents are protocol consumers, not enforcers. Enforcement is cryptographic.
+- **Permission model:** Three categories govern what each key can do:
+  - **Category A** (`#0` only): DID document modifications, key rotation — human-exclusive, never delegable to agent
+  - **Category B** (user-configurable): operational actions (messaging, tool invocation, governance votes) — SDK defaults to human-only, human can delegate subsets to agent via UCAN
+  - **Category C** (context-configurable): context governance can further restrict which key types are accepted for specific actions
+- **Self-delegation UCAN:** `iss == aud` (same DID) with `fct.scp_key_scope: "#agent"` — the mechanism by which a human authorizes their agent key. Verifiers validate the full chain: DID → self-delegation → agent action.
+- **Enforcement stack (5 layers):** custody separation (hardware vs software keys) → SDK defaults (conservative) → verifier validation (signing_key_id checks) → custody attestation (DID document service entry declaring key custody model) → behavioral signals (participation history by key type)
 
 ### 4.4 Identity Attestations
 - Cryptographic binding of external platform identities to DIDs
@@ -250,6 +259,8 @@ Transport + Data (relay-based, transport-agnostic)
 - HPKE-wrapped keys with domain separation ("scp-sender-key-v1")
 - 30-second grace period for key transition
 - Purpose: enables per-sender blocking without MLS group disruption
+- `signing_key_id` field in InnerEnvelope, ScpCredential, and SenderKeyEpochAdvance identifies which verification method (`#active` or `#agent`) signed the message
+- Inner signature preimage includes signing_key_id: `context_id || sender_did || signing_key_id || epoch || generation || sequence || timestamp || payload_hash || provenance_hash`
 
 ### 6.3 Content Access Control
 - Three-tier blocking: DID-to-DID in-context, DID-to-DID global, governance-gated
@@ -279,6 +290,7 @@ Transport + Data (relay-based, transport-agnostic)
 - Independently revocable (per-capability, per-agent, per-context)
 - Nonce-based replay prevention
 - AND-composition with spending UCANs for paid actions
+- **Self-delegation pattern:** `iss == aud` (same DID) with `fct.scp_key_scope: "#agent"` — authorizes the agent signing key to perform Category B actions on behalf of the human. The UCAN header includes `signing_key_id` to bind the token to a specific verification method. This is how human-to-agent delegation works within the shared-DID model.
 
 ### 7.2 Capability Categories
 - Standard categories: messaging, toolInvocation, media (voice/video/screenShare), bridging, toolInterface, childContext
@@ -412,8 +424,9 @@ Transport + Data (relay-based, transport-agnostic)
 ## 15. Security Analysis (~4 pages)
 
 ### 15.1 Threat Model
-- Enumerate threat actors: malicious relay operators, compromised agents, sybil attackers, insider threats, context spoofers, governance captors
+- Enumerate threat actors: malicious relay operators, compromised agents, compromised agent keys, sybil attackers, insider threats, context spoofers, governance captors
 - What the protocol defends against vs. what it makes legible (some attacks are detectable and attributable but not preventable)
+- **Agent key compromise:** Agent signing key (`#agent`) is software-held and therefore higher-risk. Mitigations: Category A actions are never delegable to `#agent`; agent key rotation doesn't require `#0` (can use `#active`); custody attestation (`ScpKeyCustodyAttestation` service entry in DID document) declares key custody model so verifiers can assess risk; `ScpCustodyViolationAttestation` provides permanent violation logging if `#agent` performs Category A actions
 
 ### 15.2 Security Properties
 - Confidentiality: MLS + sender-side keys. Relays are untrusted dumb pipes.
@@ -433,12 +446,14 @@ Transport + Data (relay-based, transport-agnostic)
 - Traffic analysis remains the strongest residual attack surface — acknowledged, not hand-waved
 
 ### 15.5 Key Security Invariants
-- Every action traces to a human
+- Every action traces to a human (via shared DID — agent key is bound to human identity)
 - Agents are context-bound (no cross-context protocol awareness)
 - Tools are stateless and non-agentic
 - One agent per person per context
 - Role assignment is non-negotiable
 - Context metadata is transparent before opt-in
+- Category A actions (`#0` only) are structurally impossible for agents (custody separation enforced by hardware)
+- `signing_key_id` on every signed message provides unforgeable human-vs-agent attribution
 
 ---
 
@@ -448,7 +463,7 @@ Structured comparison on the axes that matter:
 
 | Property | SCP | Matrix | AT Protocol | Nostr | Signal | Holepunch | MCP |
 |----------|-----|--------|-------------|-------|--------|-----------|-----|
-| Identity model | Self-sovereign DID (three-key) | Server-bound | did:plc (PLC directory) | Keypair | Phone number | Keypair (per-feed) | N/A |
+| Identity model | Self-sovereign DID (multi-key, shared human-agent) | Server-bound | did:plc (PLC directory) | Keypair | Phone number | Keypair (per-feed) | N/A |
 | Identity resolution | Dual-layer (relay + DHT) | Homeserver | PLC directory | Relay + NIP-05 | Phone registry | DHT | N/A |
 | Encryption | MLS + sender keys | Megolm | None (relay sees all) | NIP-44 (pairwise) | Double Ratchet | Noise XX (transport) | N/A |
 | Group encryption | MLS (RFC 9420) | Megolm (custom) | None | None | Signal Groups | Undocumented | N/A |
@@ -479,7 +494,8 @@ Structured comparison on the axes that matter:
 - Context-level economic governance
 - Verifiable behavioral records replacing reputation scores
 - **Dual-layer DID resolution with protocol-level self-healing** — no existing DID method provides multi-backend resolution with automatic convergence
-- **Three-key identity architecture** (identity/signing/pre-rotation) — safe rotation under compromise without changing DID, a stronger model than any existing DID method
+- **Multi-key identity architecture** (identity/human signing/pre-rotation/agent signing) — safe rotation under compromise without changing DID, custody separation between human and agent, a stronger model than any existing DID method
+- **Shared-DID human-agent pairs with structural action provenance** — human and agent share one DID, sign with different keys, verifiers can distinguish authorship cryptographically (not via self-reported claims). No existing protocol provides this.
 - **Append-only logs embedded in governance and encryption context** — Hypercore proves the data structure; SCP embeds it in MLS groups, UCAN authorization, and context governance
 
 ### 16.3 Detailed Comparison: Holepunch / Hypercore
@@ -512,7 +528,7 @@ SCP builds on did:dht's self-certification property but extends it significantly
 |----------|---------|--------------|
 | Self-certification | Yes (BEP44) | Yes (same BEP44) |
 | Resolution backends | Mainline DHT only | Dual-layer: SCP relays + Mainline DHT |
-| Key architecture | Single Ed25519 keypair | Three keys: identity / signing / pre-rotation |
+| Key architecture | Single Ed25519 keypair | Multi-key: identity (`#0`) / human signing (`#active`) / pre-rotation / agent signing (`#agent`, optional) |
 | Rotation safety | No pre-rotation commitment | Pre-rotation key hash published in advance |
 | Document serialization | DNS packet encoding (TXT/SRV) | JSON-LD (relay layer), DNS packets (DHT layer) |
 | Payload limit | 1000 bytes (BEP44) | 256KB (relay layer), 1000 bytes (DHT fallback) |
@@ -523,7 +539,7 @@ SCP builds on did:dht's self-certification property but extends it significantly
 
 Key points for the paper:
 - SCP takes the genuinely good idea (self-certification) and removes the single-point-of-failure resolution path
-- The three-key architecture provides a recovery path from compromise that no existing DID method offers without changing the identifier itself
+- The multi-key architecture provides a recovery path from compromise that no existing DID method offers without changing the identifier itself, plus custody separation between human and agent operations
 - SCP identities are simultaneously did:dht-compatible (resolvable by standard did:dht resolvers via DHT) and more resilient (dual-layer with self-healing)
 - The identity layer is a novel contribution to the DID space, not just an application of an existing method
 
@@ -616,7 +632,7 @@ Key points for the paper:
 4. Trust evaluation layer model (4 layers, enforcement → trust)
 5. Message lifecycle with security checkpoints
 6. Dual-layer DID resolution (relay + DHT in parallel, with self-healing)
-7. Three-key identity architecture (identity key → active signing key → pre-rotation commitment)
+7. Multi-key identity architecture (identity key → human signing key / agent signing key → pre-rotation commitment)
 8. Three-tier blocking architecture (enforcement layers × blocking tiers)
 9. Deployment spectrum (phone → agent workstation → managed infra)
 10. Sender-side key distribution (pull model, SenderKeyEpochAdvance/Request/Response)

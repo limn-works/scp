@@ -1,4 +1,4 @@
-//! Testing crate for SCP (Shareable Context Protocol).
+//! Testing crate for SCP (Shared Context Protocol).
 //!
 //! This crate contains cross-crate integration tests and conformance test
 //! macros that validate SCP trait implementations against the protocol

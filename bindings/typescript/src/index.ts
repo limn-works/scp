@@ -1,5 +1,5 @@
 /**
- * @scp/sdk — Shareable Context Protocol TypeScript SDK.
+ * @scp/sdk — Shared Context Protocol TypeScript SDK.
  *
  * Dual-target architecture: browser (WASM) and Bun/Node (napi-rs native
  * addon). The correct backend is selected automatically at runtime.

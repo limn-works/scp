@@ -1,4 +1,4 @@
-"""SCP Python SDK -- Shareable Context Protocol.
+"""SCP Python SDK -- Shared Context Protocol.
 
 This package provides Pythonic wrappers around the ``_scp_core`` PyO3
 extension module, offering typed dataclasses, an exception hierarchy,

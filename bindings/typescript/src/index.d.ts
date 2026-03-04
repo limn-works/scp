@@ -1,5 +1,5 @@
 /**
- * @scp/sdk -- Shareable Context Protocol SDK for TypeScript
+ * @scp/sdk -- Shared Context Protocol SDK for TypeScript
  *
  * Type declarations for IDE autocompletion and static analysis.
  * Generated from the SCP API surface defined in .docs/sketch.md.

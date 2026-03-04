@@ -1,4 +1,4 @@
-//! Core protocol implementation for SCP (Shareable Context Protocol).
+//! Core protocol implementation for SCP (Shared Context Protocol).
 //!
 //! `scp-core` contains the cryptographic and protocol logic that all SCP
 //! clients share:

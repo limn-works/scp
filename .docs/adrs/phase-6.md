@@ -1005,7 +1005,7 @@ publishing {
 
             pom {
                 name.set("SCP SDK for Kotlin")
-                description.set("Kotlin SDK for the Shareable Context Protocol")
+                description.set("Kotlin SDK for the Shared Context Protocol")
                 url.set("https://github.com/limn/scp")
                 licenses {
                     license {

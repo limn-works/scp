@@ -1,6 +1,6 @@
 # SCP Go SDK
 
-> `github.com/limn/scp-go` -- Shareable Context Protocol for Go
+> `github.com/limn/scp-go` -- Shared Context Protocol for Go
 
 Cryptographic identity, encrypted contexts, capability-based auth, and tool invocation for AI agents. Built on Rust via cbindgen + cgo.
 

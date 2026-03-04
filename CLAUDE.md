@@ -1,4 +1,4 @@
-# Shareable Context Protocol (SCP)
+# Shared Context Protocol (SCP)
 
 ## Vision
 

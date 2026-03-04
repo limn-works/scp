@@ -1,6 +1,6 @@
 # SCP C# SDK
 
-> `Limn.Scp` -- Shareable Context Protocol for .NET
+> `Limn.Scp` -- Shared Context Protocol for .NET
 
 Cryptographic identity, encrypted contexts, capability-based auth, and tool invocation for AI agents. Built on Rust via cbindgen + P/Invoke.
 

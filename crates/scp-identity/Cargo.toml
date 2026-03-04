@@ -1,7 +1,7 @@
 [package]
 name = "scp-identity"
 version = "0.1.0"
-description = "Decentralized identity (DID) management for SCP (Shareable Context Protocol)"
+description = "Decentralized identity (DID) management for SCP (Shared Context Protocol)"
 edition.workspace = true
 repository.workspace = true
 license.workspace = true

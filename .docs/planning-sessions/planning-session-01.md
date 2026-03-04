@@ -22,7 +22,7 @@ Alec rejected the advice to build Cronica first and extract the protocol later. 
 
 ## Naming
 
-The protocol is called the **Shareable Context Protocol (SCP)**. The name reflects that the core abstraction is shareable contexts — bounded, encrypted spaces that can be shared between participants but don't require multi-party use.
+The protocol is called the **Shared Context Protocol (SCP)**. The name reflects that the core abstraction is shareable contexts — bounded, encrypted spaces that can be shared between participants but don't require multi-party use.
 
 ---
 

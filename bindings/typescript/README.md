@@ -1,6 +1,6 @@
 # SCP TypeScript SDK
 
-> `@scp/sdk` -- Shareable Context Protocol for TypeScript
+> `@scp/sdk` -- Shared Context Protocol for TypeScript
 
 Cryptographic identity, encrypted contexts, capability-based auth, and tool invocation for AI agents. Dual-target: browser (WASM) and Bun/Node (native addon).
 

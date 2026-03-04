@@ -1,6 +1,6 @@
 # SCP Kotlin SDK
 
-> `com.limn:scp-sdk-kotlin` -- Shareable Context Protocol for Kotlin
+> `com.limn:scp-sdk-kotlin` -- Shared Context Protocol for Kotlin
 
 Cryptographic identity, encrypted contexts, capability-based auth, and tool invocation for AI agents. Built on Rust via UniFFI with Kotlin coroutines.
 

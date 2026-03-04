@@ -1,6 +1,6 @@
 # SCP Java SDK
 
-> `com.limn:scp-sdk-java` -- Shareable Context Protocol for Java
+> `com.limn:scp-sdk-java` -- Shared Context Protocol for Java
 
 Cryptographic identity, encrypted contexts, capability-based auth, and tool invocation for AI agents. Built on Rust via cbindgen + JNA.
 
