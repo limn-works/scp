@@ -744,7 +744,7 @@
         "Implement verification method retirement (#retired-{sequence}) in document.rs",
         "Implement migrate_identity in dht.rs \u2014 create new DID, update old document with alsoKnownAs, sign linkage, publish both",
         "Define DidRotationEvent struct with old_did, new_did, migration_proof, pre_rotation_proof, rotated_at",
-        "Define MigrationProof struct with signature (Ed25519 of SHA-256(old_did || new_did || rotated_at) signed by old Identity Key) and old_public_key",
+        "Define MigrationProof struct with signature (Ed25519 of SHA-256(SCP-MIGRATION-V1: || len(old_did) || old_did || len(new_did) || new_did || rotated_at) where len() is u32 BE, signed by old Identity Key) and old_public_key",
         "Define PreRotationProof struct with commitment and revealed_key",
         "Implement verify_migration with both migration proof and optional pre-rotation proof verification",
         "Implement background republish for old DID document during migration (90-day recommended)",
@@ -762,7 +762,7 @@
         }
       ],
       "details": {
-        "didRotationEvent": "```rust\npub struct DidRotationEvent {\n    pub old_did: String,\n    pub new_did: String,\n    pub migration_proof: MigrationProof,\n    pub pre_rotation_proof: Option<PreRotationProof>,\n    pub rotated_at: u64,\n}\n\npub struct MigrationProof {\n    /// Ed25519 signature of SHA-256(old_did || new_did || rotated_at)\n    /// signed by the old Identity Key.\n    pub signature: [u8; 64],\n    pub old_public_key: [u8; 32],\n}\n\npub struct PreRotationProof {\n    /// The commitment published in the old DID document.\n    pub commitment: [u8; 32],\n    /// The new Identity Key public bytes. SHA-256(this) must equal commitment.\n    pub revealed_key: [u8; 32],\n}\n```",
+        "didRotationEvent": "```rust\npub struct DidRotationEvent {\n    pub old_did: String,\n    pub new_did: String,\n    pub migration_proof: MigrationProof,\n    pub pre_rotation_proof: Option<PreRotationProof>,\n    pub rotated_at: u64,\n}\n\npub struct MigrationProof {\n    /// Ed25519 signature of SHA-256(SCP-MIGRATION-V1: || len(old_did) || old_did || len(new_did) || new_did || rotated_at)\n    /// where len() is u32 big-endian. Signed by the old Identity Key.\n    pub signature: [u8; 64],\n    pub old_public_key: [u8; 32],\n}\n\npub struct PreRotationProof {\n    /// The commitment published in the old DID document.\n    pub commitment: [u8; 32],\n    /// The new Identity Key public bytes. SHA-256(this) must equal commitment.\n    pub revealed_key: [u8; 32],\n}\n```",
         "postRotationRequirements": "After rotation, the caller MUST issue MLS Update proposals in all active contexts (PCS, spec \u00a79.7.3) and revoke/reissue UCAN tokens signed by the old active key.",
         "threeLayerSummary": "Layer 1 (rotate_active_key): common case, DID string unchanged. Layer 2 (migrate_identity): rare planned migration, DID string changes. Layer 3 (verify_migration): verification of migration proofs."
       },

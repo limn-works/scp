@@ -379,8 +379,8 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
    }
 
    pub struct MigrationProof {
-       /// Ed25519 signature of SHA-256(old_did || new_did || rotated_at)
-       /// signed by the old Identity Key.
+       /// Ed25519 signature of SHA-256(SCP-MIGRATION-V1: || len(old_did) || old_did || len(new_did) || new_did || rotated_at)
+       /// where len() is u32 big-endian. Signed by the old Identity Key.
        pub signature: [u8; 64],
        pub old_public_key: [u8; 32],
    }
