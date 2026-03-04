@@ -1406,13 +1406,22 @@ async fn handle_bridge_register(
 
     // Spawn a pipe task: reads from the BridgeForwardReceiver and sends
     // to the connection's bridge_forward_tx. The forward task multiplexes
-    // this onto the WebSocket as raw binary frames (transparent proxy).
+    // this onto the WebSocket as pre-serialized binary frames.
+    // When the connection closes (send fails), deregister the routing ID
+    // so subsequent BRIDGE_DATA operations fail immediately instead of
+    // silently succeeding (GH review finding).
     let pipe_tx = bridge_forward_tx.clone();
+    let pipe_registry = Arc::clone(bridge_registry);
+    let pipe_routing_id = routing_id;
+    let pipe_conn_id = connection_id;
     tokio::spawn(async move {
         let mut forward_rx = forward_rx;
         while let Some(data) = forward_rx.recv().await {
             if pipe_tx.send(data).await.is_err() {
-                // Connection closed — stop piping.
+                // Connection closed — deregister so lookups fail fast.
+                pipe_registry
+                    .deregister(&pipe_routing_id, pipe_conn_id)
+                    .await;
                 break;
             }
         }
@@ -1452,14 +1461,13 @@ async fn handle_bridge_data(
     }
 
     // Look up the forwarding channel for the target routing ID.
+    // Error message is intentionally generic to prevent routing ID
+    // enumeration attacks (GH review finding).
     let Some(forward_tx) = bridge_registry.lookup(&target_routing_id).await else {
         let err = RelayMessage::Err {
             ref_id,
             code: code::BRIDGE_TARGET_NOT_FOUND,
-            msg: format!(
-                "routing ID {} is not registered on this bridge",
-                hex::encode(target_routing_id)
-            ),
+            msg: "bridge target not found".to_string(),
         };
         let _ = tx.send(err).await;
         return;
@@ -1497,7 +1505,7 @@ async fn handle_bridge_data(
         let err = RelayMessage::Err {
             ref_id,
             code: code::BRIDGE_TARGET_NOT_FOUND,
-            msg: "bridge target connection closed".to_string(),
+            msg: "bridge target not found".to_string(),
         };
         let _ = tx.send(err).await;
         return;
@@ -3032,7 +3040,10 @@ mod tests {
             } => {
                 // Bridge doesn't track peer identities — source is zeroed.
                 assert_eq!(source_routing_id, [0u8; 32]);
-                assert_eq!(fwd_payload, payload, "forwarded payload must match original");
+                assert_eq!(
+                    fwd_payload, payload,
+                    "forwarded payload must match original"
+                );
             }
             other => panic!("expected BridgeData, got {other:?}"),
         }
