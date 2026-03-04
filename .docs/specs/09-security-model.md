@@ -505,7 +505,7 @@ The protocol provides layered metadata privacy protections. Each layer addresses
 - **Push layer:** Fully opaque push notifications (§10.7)
 - **Blocking layer:** AES-256 sender-side keys enable cryptographic blocking without MLS group changes (§9.16)
 - **Cross-context key isolation:** Independent MLS key material per context (§9.10.9)
-- **Delivery layer:** Relay-side delivery jitter breaks timing correlation between PUBLISH and delivery (§9.10.11)
+- **Delivery layer:** Relay-side delivery jitter breaks timing correlation between PUBLISH and delivery (§9.10.10)
 
 This section specifies what the protocol protects, how it protects it, and what residual risks remain.
 
@@ -635,7 +635,7 @@ Cover traffic uses **tiered configuration driven by transport profiles** (§10.1
 
 Each SCP context is a separate MLS group with independent key material. Compromising one context's keys reveals nothing about any other context's keys. The identity key (Ed25519) is shared across contexts but signs actions — it never directly encrypts group content. MLS handles group encryption with ephemeral key material derived independently per group. Per-context pseudonyms (§9.10.4) prevent the identity key from being visible outside encrypted payloads.
 
-### 9.10.11 Relay Delivery Jitter (BLACK-001 Mitigation)
+### 9.10.10 Relay Delivery Jitter (BLACK-001 Mitigation)
 
 Relays add a uniformly random delay in `[0, delivery_jitter_ms)` (default: 50ms) before forwarding each stored blob to its subscribers. This breaks the timing correlation between PUBLISH arrival and subscriber delivery, making it harder for a compromised relay to infer communication patterns between specific pseudonyms.
 
@@ -643,7 +643,7 @@ Relays add a uniformly random delay in `[0, delivery_jitter_ms)` (default: 50ms)
 2. **Configurable.** Relay operators can tune the jitter range via `RelayConfig::delivery_jitter_ms`. Higher values provide stronger timing decorrelation at the cost of delivery latency. Set to 0 to disable (useful for low-latency deployments that accept the residual risk).
 3. **Complements cover traffic.** Delivery jitter addresses the relay-to-subscriber path. Cover traffic (§9.10.6) addresses the client-to-relay path. Together they reduce timing correlation on both legs of the relay.
 
-### 9.10.12 Residual Risks
+### 9.10.11 Residual Risks
 
 Even with all protections in this section, the following metadata leaks remain:
 
