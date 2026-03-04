@@ -45,7 +45,8 @@ use super::protocol::{
 };
 use super::relay_persistence::RelayPersistence;
 use super::storage::{BlobStorage, BlobStorageBackend};
-use crate::relay::bridge::{BridgeRegistration, BridgeRegistry};
+use crate::error::TransportError;
+use crate::relay::bridge::{BridgeRegistration, BridgeRegistry, BRIDGE_AUTH_FAILED_MSG};
 use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter, SubscribeRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
 
@@ -690,11 +691,16 @@ async fn handle_connection(
     // Channel for sending relay messages back to this client.
     let (tx, mut rx) = mpsc::channel::<RelayMessage>(256);
 
-    // Channel for forwarding raw bridge data to this client (§10.12.4).
+    // Channel for forwarding serialized bridge data to this client (§10.12.4).
     // When this connection is a self-hosted relay that registered via
-    // BRIDGE_REGISTER, peers send BRIDGE_DATA which is forwarded as raw
-    // bytes through this channel. The forward task multiplexes both
-    // protocol messages and raw bridge data onto the WebSocket.
+    // BRIDGE_REGISTER, peers send BRIDGE_DATA which is wrapped in
+    // RelayMessage::BridgeData, serialized, and forwarded through this
+    // channel. The forward task multiplexes both protocol messages and
+    // bridge data onto the WebSocket.
+    //
+    // Allocated unconditionally for simplicity — the cost (~2 KB per
+    // connection for buffer pointers) is negligible vs. WebSocket
+    // overhead. The channel is only used when BRIDGE_REGISTER succeeds.
     let (bridge_forward_tx, mut bridge_forward_rx) = mpsc::channel::<Vec<u8>>(256);
 
     // Track this connection's subscriptions for cleanup.
@@ -706,11 +712,16 @@ async fn handle_connection(
 
     // Spawn a task to forward relay messages and bridge data to the WebSocket.
     // Multiplexes two channels: protocol messages (RelayMessage) are
-    // serialized to MessagePack; bridge-forwarded payloads are sent as
-    // raw binary frames (transparent proxy, §10.12.4).
+    // serialized to MessagePack; bridge-forwarded data (pre-serialized
+    // RelayMessage::BridgeData) is sent as pre-serialized binary frames
+    // (transparent proxy, §10.12.4).
     let forward_handle = tokio::spawn(async move {
         loop {
+            // biased: prioritize protocol messages (OK/ERR/BLOB) over
+            // bridge-forwarded data to ensure control messages are not
+            // starved under high bridge throughput.
             tokio::select! {
+                biased;
                 msg = rx.recv() => {
                     let Some(msg) = msg else { break; };
                     let Ok(bytes) = msg.to_bytes() else { continue; };
@@ -1375,11 +1386,13 @@ async fn handle_bridge_register(
     let forward_rx = match bridge_registry.register(&registration, connection_id).await {
         Ok(rx) => rx,
         Err(e) => {
-            // Distinguish auth failures from limit violations.
-            let (err_code, err_msg) = if e.to_string().contains("BRIDGE_AUTH_FAILED") {
-                (code::BRIDGE_AUTH_FAILED, e.to_string())
-            } else {
-                (code::BRIDGE_LIMIT_EXCEEDED, e.to_string())
+            // Distinguish auth failures from limit violations using the
+            // exported constant — avoids fragile string matching.
+            let (err_code, err_msg) = match &e {
+                TransportError::ProtocolError(msg) if msg == BRIDGE_AUTH_FAILED_MSG => {
+                    (code::BRIDGE_AUTH_FAILED, e.to_string())
+                }
+                _ => (code::BRIDGE_LIMIT_EXCEEDED, e.to_string()),
             };
             let err = RelayMessage::Err {
                 ref_id,
@@ -1452,8 +1465,30 @@ async fn handle_bridge_data(
         return;
     };
 
-    // Forward the payload to the self-hosted relay (transparent proxy).
-    if let Err(e) = forward_tx.send(payload.to_vec()).await {
+    // Wrap in RelayMessage::BridgeData so the self-hosted relay receives
+    // a proper protocol frame. The source_routing_id is zeroed because
+    // the bridge does not track peer identities in the transparent pipe
+    // model — the payload itself contains all necessary routing info.
+    let bridge_msg = RelayMessage::BridgeData {
+        source_routing_id: [0u8; 32],
+        payload: payload.to_vec(),
+    };
+    let serialized = match bridge_msg.to_bytes() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to serialize BridgeData relay message");
+            let err = RelayMessage::Err {
+                ref_id,
+                code: code::INTERNAL_ERROR,
+                msg: "internal bridge serialization error".to_string(),
+            };
+            let _ = tx.send(err).await;
+            return;
+        }
+    };
+
+    // Forward the serialized RelayMessage::BridgeData to the self-hosted relay.
+    if let Err(e) = forward_tx.send(serialized).await {
         tracing::warn!(
             target_routing_id = hex::encode(target_routing_id),
             error = %e,
@@ -2987,15 +3022,19 @@ mod tests {
             "expected OK for BRIDGE_DATA, got {peer_reply:?}"
         );
 
-        // Self-hosted relay (connection 1) should receive the forwarded payload
-        // as a raw binary frame.
-        let forwarded = tokio::time::timeout(Duration::from_secs(5), stream1.next()).await;
-        let forwarded_msg = forwarded.unwrap().unwrap().unwrap();
-        match forwarded_msg {
-            Message::Binary(data) => {
-                assert_eq!(data, payload, "forwarded payload must match original");
+        // Self-hosted relay (connection 1) should receive a serialized
+        // RelayMessage::BridgeData wrapping the forwarded payload.
+        let forwarded = recv_msg(&mut stream1).await;
+        match forwarded {
+            RelayMessage::BridgeData {
+                source_routing_id,
+                payload: fwd_payload,
+            } => {
+                // Bridge doesn't track peer identities — source is zeroed.
+                assert_eq!(source_routing_id, [0u8; 32]);
+                assert_eq!(fwd_payload, payload, "forwarded payload must match original");
             }
-            other => panic!("expected binary frame, got {other:?}"),
+            other => panic!("expected BridgeData, got {other:?}"),
         }
     }
 

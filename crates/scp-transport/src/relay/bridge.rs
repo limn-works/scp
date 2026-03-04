@@ -71,6 +71,11 @@ use crate::error::TransportError;
 /// Example: `wss://bridge.example.com/scp/v1?bridge_target=deadbeef...`
 pub const BRIDGE_TARGET_PARAM: &str = "bridge_target";
 
+/// Error message string used by [`BridgeRegistry::register`] when
+/// authentication fails (SCP-247). Exported so callers can match on it
+/// without fragile `contains()` checks.
+pub const BRIDGE_AUTH_FAILED_MSG: &str = "BRIDGE_AUTH_FAILED";
+
 /// Maximum number of simultaneous bridge registrations per connection.
 /// Prevents a single connection from consuming excessive registry space.
 const MAX_REGISTRATIONS_PER_CONNECTION: usize = 64;
@@ -360,7 +365,7 @@ impl BridgeRegistry {
                 error = %e,
                 "bridge registration authentication failed"
             );
-            TransportError::ProtocolError("BRIDGE_AUTH_FAILED".to_string())
+            TransportError::ProtocolError(BRIDGE_AUTH_FAILED_MSG.to_string())
         })?;
 
         // Step 2: Check limits and register (same logic as before).
