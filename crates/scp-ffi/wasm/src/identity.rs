@@ -149,11 +149,20 @@ impl WasmIdentity {
 
     /// Adds an agent signing key to this identity (ADR-039).
     ///
-    /// The TypeScript SDK is responsible for:
-    /// 1. Generating the Ed25519 agent keypair via `SubtleCrypto.generateKey`.
-    /// 2. Encoding the public key as multibase.
-    /// 3. Updating the DID document on the DHT to include the `#agent` VM.
-    /// 4. Calling this method with the multibase public key to record state.
+    /// # Contract
+    ///
+    /// The caller (TypeScript SDK) **MUST** have already updated the DID
+    /// document on the DHT to include the `#agent` verification method
+    /// **BEFORE** calling this method. Calling this method without completing
+    /// the DHT update first will result in inconsistent state between the
+    /// local `WasmIdentity` and the published DID document.
+    ///
+    /// ## Required steps (in order)
+    ///
+    /// 1. Generate the Ed25519 agent keypair via `SubtleCrypto.generateKey`.
+    /// 2. Encode the public key as multibase.
+    /// 3. Update the DID document on the DHT to include the `#agent` VM.
+    /// 4. Call this method with the multibase public key to record state.
     ///
     /// # Errors
     ///
@@ -184,9 +193,18 @@ impl WasmIdentity {
 
     /// Removes the agent signing key from this identity (ADR-039).
     ///
-    /// The TypeScript SDK is responsible for:
-    /// 1. Removing the `#agent` VM from the DID document on the DHT.
-    /// 2. Calling this method to update local state.
+    /// # Contract
+    ///
+    /// The caller (TypeScript SDK) **MUST** have already updated the DID
+    /// document on the DHT to remove the `#agent` verification method
+    /// **BEFORE** calling this method. Calling this method without completing
+    /// the DHT update first will result in inconsistent state between the
+    /// local `WasmIdentity` and the published DID document.
+    ///
+    /// ## Required steps (in order)
+    ///
+    /// 1. Remove the `#agent` VM from the DID document on the DHT.
+    /// 2. Call this method to update local state.
     ///
     /// # Errors
     ///
@@ -207,11 +225,22 @@ impl WasmIdentity {
 
     /// Rotates the agent signing key for this identity (ADR-039).
     ///
-    /// The TypeScript SDK is responsible for:
-    /// 1. Generating the new Ed25519 agent keypair via `SubtleCrypto.generateKey`.
-    /// 2. Encoding the new public key as multibase.
-    /// 3. Updating the DID document on the DHT (retiring old `#agent`, installing new).
-    /// 4. Calling this method with the new multibase public key to update state.
+    /// # Contract
+    ///
+    /// The caller (TypeScript SDK) **MUST** have already updated the DID
+    /// document on the DHT to retire the old `#agent` verification method
+    /// and install the new one **BEFORE** calling this method. Calling this
+    /// method without completing the DHT update first will result in
+    /// inconsistent state between the local `WasmIdentity` and the published
+    /// DID document.
+    ///
+    /// ## Required steps (in order)
+    ///
+    /// 1. Generate the new Ed25519 agent keypair via `SubtleCrypto.generateKey`.
+    /// 2. Encode the new public key as multibase.
+    /// 3. Update the DID document on the DHT (retiring old `#agent`,
+    ///    installing new).
+    /// 4. Call this method with the new multibase public key to update state.
     ///
     /// # Errors
     ///

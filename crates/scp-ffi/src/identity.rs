@@ -36,7 +36,7 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use scp_identity::{DidDht, DidDocument, DidMethod, ScpIdentity};
+use scp_identity::{DidCache, DidDht, DidDocument, DidMethod, InMemoryDhtClient, ScpIdentity};
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, Storage};
 
@@ -659,7 +659,15 @@ fn py_identity_rotate_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyI
 
     let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
         crate::runtime::with_identity_mut(&did, |entry| {
-            let did_method = DidDht::new();
+            let sign_fn =
+                DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
+                    Arc::clone(&entry.custody),
+                );
+            let did_method = DidDht::with_client_and_signer(
+                Arc::new(InMemoryDhtClient::new()),
+                Arc::new(DidCache::new()),
+                sign_fn,
+            );
 
             let rotation_result = rt.block_on(async {
                 did_method
@@ -713,7 +721,15 @@ fn py_identity_add_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<
 
     let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
         crate::runtime::with_identity_mut(&did, |entry| {
-            let did_method = DidDht::new();
+            let sign_fn =
+                DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
+                    Arc::clone(&entry.custody),
+                );
+            let did_method = DidDht::with_client_and_signer(
+                Arc::new(InMemoryDhtClient::new()),
+                Arc::new(DidCache::new()),
+                sign_fn,
+            );
 
             let add_result = rt.block_on(async {
                 did_method
@@ -766,7 +782,15 @@ fn py_identity_rotate_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResu
 
     let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
         crate::runtime::with_identity_mut(&did, |entry| {
-            let did_method = DidDht::new();
+            let sign_fn =
+                DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
+                    Arc::clone(&entry.custody),
+                );
+            let did_method = DidDht::with_client_and_signer(
+                Arc::new(InMemoryDhtClient::new()),
+                Arc::new(DidCache::new()),
+                sign_fn,
+            );
 
             let rotate_result = rt.block_on(async {
                 did_method
@@ -818,7 +842,15 @@ fn py_identity_remove_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResu
 
     let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
         crate::runtime::with_identity_mut(&did, |entry| {
-            let did_method = DidDht::new();
+            let sign_fn =
+                DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
+                    Arc::clone(&entry.custody),
+                );
+            let did_method = DidDht::with_client_and_signer(
+                Arc::new(InMemoryDhtClient::new()),
+                Arc::new(DidCache::new()),
+                sign_fn,
+            );
 
             let remove_result = rt.block_on(async {
                 did_method

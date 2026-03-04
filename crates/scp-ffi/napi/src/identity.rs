@@ -35,8 +35,11 @@ use std::sync::Arc;
 
 use napi::Error as NapiError;
 use napi_derive::napi;
-use scp_identity::{DidDht, DidDocument, DidMethod, ScpIdentity};
+use scp_identity::{
+    DidCache, DidDht, DidDocument, DidMethod, IdentityError, InMemoryDhtClient, ScpIdentity,
+};
 use scp_platform::testing::InMemoryKeyCustody;
+use scp_platform::traits::KeyCustody;
 
 use crate::error::{ScpNapiError, validate_custody_type};
 use crate::{decrement_handle_count, increment_handle_count};
@@ -54,6 +57,45 @@ impl fmt::Debug for OpaqueInMemoryKeyCustody {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("InMemoryKeyCustody([redacted])")
     }
+}
+
+/// Creates a `DidDht` instance with a signing function derived from the
+/// custody held inside an [`OpaqueInMemoryKeyCustody`].
+///
+/// `DidDht::new()` creates an instance with `sign_fn: None`, which causes
+/// all DHT publish operations (used by `add_agent_key`, `rotate_agent_key`,
+/// `remove_agent_key`, `rotate_active_key`) to fail. This helper constructs
+/// a properly configured instance with the signing function wired to the
+/// custody's key material.
+#[allow(clippy::type_complexity)]
+fn make_dht_with_signer(
+    custody: &Arc<OpaqueInMemoryKeyCustody>,
+) -> DidDht<InMemoryDhtClient, scp_identity::cache::SystemClock> {
+    let custody_clone = Arc::clone(custody);
+    let sign_fn: Arc<
+        dyn Fn(
+                u64,
+                Vec<u8>,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Vec<u8>, IdentityError>> + Send>,
+            > + Send
+            + Sync,
+    > = Arc::new(move |key_id: u64, data: Vec<u8>| {
+        let kc = Arc::clone(&custody_clone);
+        Box::pin(async move {
+            let handle = scp_platform::traits::KeyHandle::new(key_id);
+            let sig =
+                kc.0.sign(&handle, &data)
+                    .await
+                    .map_err(IdentityError::Platform)?;
+            Ok(sig.into_bytes())
+        })
+    });
+    DidDht::with_client_and_signer(
+        Arc::new(InMemoryDhtClient::new()),
+        Arc::new(DidCache::new()),
+        sign_fn,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +243,7 @@ impl NapiIdentity {
     pub async fn add_agent_key(&self) -> napi::Result<Self> {
         let (scp_identity, custody, document) = self.extract_in_memory_state("addAgentKey")?;
 
-        let dht = DidDht::new();
+        let dht = make_dht_with_signer(&custody);
         let (new_identity, new_document) = dht
             .add_agent_key(&scp_identity, &document, &custody.0)
             .await
@@ -241,7 +283,7 @@ impl NapiIdentity {
     pub async fn rotate_agent_key(&self) -> napi::Result<Self> {
         let (scp_identity, custody, document) = self.extract_in_memory_state("rotateAgentKey")?;
 
-        let dht = DidDht::new();
+        let dht = make_dht_with_signer(&custody);
         let (new_identity, new_document) = dht
             .rotate_agent_key(&scp_identity, &document, &custody.0)
             .await
@@ -279,9 +321,9 @@ impl NapiIdentity {
     /// See ADR-039 acceptance criterion 4 and SCP-AB-016.
     #[napi(js_name = "removeAgentKey")]
     pub async fn remove_agent_key(&self) -> napi::Result<Self> {
-        let (scp_identity, _custody, document) = self.extract_in_memory_state("removeAgentKey")?;
+        let (scp_identity, custody, document) = self.extract_in_memory_state("removeAgentKey")?;
 
-        let dht = DidDht::new();
+        let dht = make_dht_with_signer(&custody);
         let (new_identity, new_document) = dht
             .remove_agent_key(&scp_identity, &document)
             .await
@@ -578,8 +620,14 @@ pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<Nap
 
 /// Loads an existing identity from a DID string.
 ///
-/// Validates the DID format and returns an identity handle. Key operations
-/// require a wired `KeyCustodyProvider` callback.
+/// Validates the DID format, resolves the DID document from the DHT, and
+/// returns an identity handle with the document retained. The retained
+/// document is needed for `hasAgentKey` and `agentPublicKey` to return
+/// correct values.
+///
+/// Key operations (signing, key rotation) require a wired
+/// `KeyCustodyProvider` callback — loaded identities do not have retained
+/// key material.
 ///
 /// # Arguments
 ///
@@ -587,13 +635,15 @@ pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<Nap
 ///
 /// # Returns
 ///
-/// A `Promise<NapiIdentity>` resolving to the identity handle.
+/// A `Promise<NapiIdentity>` resolving to the identity handle with the
+/// resolved DID document retained.
 ///
 /// # Errors
 ///
-/// Rejects with `SCP-IDENT-1004` if the DID method is not `"did:dht:"`.
+/// - Rejects with `SCP-IDENT-1004` if the DID method is not `"did:dht:"`.
+/// - Rejects with `SCP-IDENT-1001` if the DID cannot be resolved from the
+///   DHT (network error, not found, verification failure).
 #[napi]
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
     if !did.starts_with("did:dht:") {
         return Err(ScpNapiError::Identity {
@@ -603,13 +653,21 @@ pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
         .into());
     }
 
+    // Resolve the DID document from the DHT so that `hasAgentKey` and
+    // `agentPublicKey` return meaningful values for loaded identities.
+    let dht = DidDht::new();
+    let document = dht
+        .resolve(&did)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
     let handle = NapiIdentity {
         inner: Arc::new(NapiIdentityInner {
             did,
             custody_type: "external".to_owned(),
             scp_identity: None,
             in_memory_custody: None,
-            document: None,
+            document: Some(document),
         }),
     };
     increment_handle_count();

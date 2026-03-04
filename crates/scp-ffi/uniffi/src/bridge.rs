@@ -28,9 +28,13 @@
 use std::fmt;
 use std::sync::Arc;
 
+#[cfg(feature = "allow_in_memory_custody")]
+use scp_identity::{DidCache, IdentityError, InMemoryDhtClient};
 use scp_identity::{DidDht, DidDocument as CoreDidDocument, DidMethod, ScpIdentity};
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
+#[cfg(feature = "allow_in_memory_custody")]
+use scp_platform::traits::KeyCustody;
 use uuid::Uuid;
 
 use crate::{decrement_handle_count, increment_handle_count, runtime};
@@ -49,6 +53,45 @@ impl fmt::Debug for OpaqueInMemoryKeyCustody {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("InMemoryKeyCustody([redacted])")
     }
+}
+
+/// Creates a `DidDht` instance with a signing function derived from the
+/// custody held inside an [`OpaqueInMemoryKeyCustody`].
+///
+/// `DidDht::new()` creates an instance with `sign_fn: None`, which causes
+/// all DHT publish operations (used by `add_agent_key`, `rotate_agent_key`,
+/// `remove_agent_key`) to fail. This helper constructs a properly configured
+/// instance with the signing function wired to the custody's key material.
+#[cfg(feature = "allow_in_memory_custody")]
+#[allow(clippy::type_complexity)]
+fn make_dht_with_signer(
+    custody: &Arc<OpaqueInMemoryKeyCustody>,
+) -> DidDht<InMemoryDhtClient, scp_identity::cache::SystemClock> {
+    let custody_clone = Arc::clone(custody);
+    let sign_fn: Arc<
+        dyn Fn(
+                u64,
+                Vec<u8>,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Vec<u8>, IdentityError>> + Send>,
+            > + Send
+            + Sync,
+    > = Arc::new(move |key_id: u64, data: Vec<u8>| {
+        let kc = Arc::clone(&custody_clone);
+        Box::pin(async move {
+            let handle = scp_platform::traits::KeyHandle::new(key_id);
+            let sig =
+                kc.0.sign(&handle, &data)
+                    .await
+                    .map_err(IdentityError::Platform)?;
+            Ok(sig.into_bytes())
+        })
+    });
+    DidDht::with_client_and_signer(
+        Arc::new(InMemoryDhtClient::new()),
+        Arc::new(DidCache::new()),
+        sign_fn,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -722,8 +765,17 @@ impl Identity {
 
     /// Returns whether this identity has an agent signing key (`#agent` VM).
     ///
-    /// Checks the retained `ScpIdentity`'s `agent_signing_key` field.
-    /// Returns `false` for external/loaded identities without core state.
+    /// Checks the retained `ScpIdentity`'s `agent_signing_key` field
+    /// (`core_id`). Returns `false` for external/loaded identities that
+    /// have no retained `ScpIdentity` (even if the DID document on the DHT
+    /// contains an `#agent` verification method).
+    ///
+    /// **Note:** This method checks `core_id` (key handle existence), while
+    /// [`get_agent_public_key`](Self::get_agent_public_key) checks
+    /// `core_document` (DID document contents). Both should agree for
+    /// identities created via `identity_create_with_agent_key` or after
+    /// calling `add_agent_key`. For loaded identities without retained
+    /// crypto state, both return `false`/`None`.
     ///
     /// See ADR-039 acceptance criterion 4.
     #[must_use]
@@ -736,7 +788,15 @@ impl Identity {
     /// Returns the agent signing key's public key as a multibase-encoded string.
     ///
     /// Retrieves the `#agent` verification method's `publicKeyMultibase` from
-    /// the retained DID document. Returns `None` if no agent key exists.
+    /// the retained DID document (`core_document`). Returns `None` if no
+    /// agent key exists or if the identity has no retained document.
+    ///
+    /// **Note:** This method checks `core_document` (DID document contents),
+    /// while [`has_agent_key`](Self::has_agent_key) checks `core_id` (key
+    /// handle existence). Both should agree for identities created via
+    /// `identity_create_with_agent_key` or after calling `add_agent_key`.
+    /// For loaded identities without retained crypto state, both return
+    /// `false`/`None`.
     ///
     /// See ADR-039 acceptance criterion 4.
     #[must_use]
@@ -771,7 +831,7 @@ impl Identity {
                           enable the \"allow_in_memory_custody\" feature or use \
                           the platform KeyCustodyProvider interface"
                     .to_owned(),
-                code: "SCP-IDN-1008".to_owned(),
+                code: "SCP-IDENT-1008".to_owned(),
             })
         }
 
@@ -795,7 +855,7 @@ impl Identity {
                 .as_ref()
                 .ok_or_else(|| ScpError::Identity {
                     message: "cannot add agent key without in-memory custody".to_owned(),
-                    code: "SCP-IDN-1008".to_owned(),
+                    code: "SCP-IDENT-1008".to_owned(),
                 })?
                 .clone();
 
@@ -805,10 +865,10 @@ impl Identity {
             let did = self.did.clone();
             let custody_type = self.custody_type.clone();
             let in_memory_custody = Some(custody.clone());
+            let dht = make_dht_with_signer(&custody);
 
             runtime()
                 .spawn(async move {
-                    let dht = DidDht::new();
                     let (updated_identity, updated_doc) = dht
                         .add_agent_key(&identity_clone, &doc_clone, &custody.0)
                         .await
@@ -856,7 +916,7 @@ impl Identity {
                           enable the \"allow_in_memory_custody\" feature or use \
                           the platform KeyCustodyProvider interface"
                     .to_owned(),
-                code: "SCP-IDN-1008".to_owned(),
+                code: "SCP-IDENT-1008".to_owned(),
             })
         }
 
@@ -876,16 +936,26 @@ impl Identity {
                     code: "SCP-IDENT-1005".to_owned(),
                 })?;
 
+            let custody = self
+                .in_memory_custody
+                .as_ref()
+                .ok_or_else(|| ScpError::Identity {
+                    message: "cannot remove agent key without in-memory custody \
+                              (needed for DHT publish signing)"
+                        .to_owned(),
+                    code: "SCP-IDENT-1008".to_owned(),
+                })?;
+
             // Clone what we need for the spawned task.
             let identity_clone = core_id.clone();
             let doc_clone = core_doc.clone();
             let did = self.did.clone();
             let custody_type = self.custody_type.clone();
             let in_memory_custody = self.in_memory_custody.clone();
+            let dht = make_dht_with_signer(custody);
 
             runtime()
                 .spawn(async move {
-                    let dht = DidDht::new();
                     let (updated_identity, updated_doc) = dht
                         .remove_agent_key(&identity_clone, &doc_clone)
                         .await
@@ -933,7 +1003,7 @@ impl Identity {
                           enable the \"allow_in_memory_custody\" feature or use \
                           the platform KeyCustodyProvider interface"
                     .to_owned(),
-                code: "SCP-IDN-1008".to_owned(),
+                code: "SCP-IDENT-1008".to_owned(),
             })
         }
 
@@ -957,7 +1027,7 @@ impl Identity {
                 .as_ref()
                 .ok_or_else(|| ScpError::Identity {
                     message: "cannot rotate agent key without in-memory custody".to_owned(),
-                    code: "SCP-IDN-1008".to_owned(),
+                    code: "SCP-IDENT-1008".to_owned(),
                 })?
                 .clone();
 
@@ -967,10 +1037,10 @@ impl Identity {
             let did = self.did.clone();
             let custody_type = self.custody_type.clone();
             let in_memory_custody = Some(custody.clone());
+            let dht = make_dht_with_signer(&custody);
 
             runtime()
                 .spawn(async move {
-                    let dht = DidDht::new();
                     let (updated_identity, updated_doc) = dht
                         .rotate_agent_key(&identity_clone, &doc_clone, &custody.0)
                         .await
@@ -1209,7 +1279,7 @@ impl Drop for TransportManager {
 ///   - `"software"` — always accepted; requires a wired `KeyCustodyProvider`.
 ///   - `"in_memory"` — **only** accepted when the `allow_in_memory_custody`
 ///     feature is enabled at compile time. Returns `ScpError::Identity` with
-///     code `SCP-IDN-1008` otherwise. Stores key material in unprotected heap
+///     code `SCP-IDENT-1008` otherwise. Stores key material in unprotected heap
 ///     memory; suitable for testing and development but NOT for production use
 ///     on mobile devices.
 ///
@@ -1220,7 +1290,7 @@ impl Drop for TransportManager {
 /// # Errors
 ///
 /// Returns `ScpError::Identity` if key generation or DID creation fails.
-/// Returns `ScpError::Identity` with code `SCP-IDN-1008` if `"in_memory"` is
+/// Returns `ScpError::Identity` with code `SCP-IDENT-1008` if `"in_memory"` is
 /// requested but the `allow_in_memory_custody` feature is not enabled.
 /// Returns `ScpError::Validation` if the custody string is not recognized.
 ///
@@ -1254,7 +1324,7 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
                                       dev/desktop use. Production mobile builds must use \
                                       \"platform\" custody (Secure Enclave / Android Keystore)."
                                 .to_owned(),
-                            code: "SCP-IDN-1008".to_owned(),
+                            code: "SCP-IDENT-1008".to_owned(),
                         })
                     }
 
