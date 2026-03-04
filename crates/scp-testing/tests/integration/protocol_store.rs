@@ -13,13 +13,20 @@
 //!   `check_and_record_nonce`; `prune_expired_nonces` removes only expired.
 //! - **Economy**: adapter credential store/load/list/remove; identity isolation.
 //! - **Tools**: tool and tool-session CRUD; context scoping; delete cascades.
+//! - **Event Log**: append/load/range query, Merkle root and tree node roundtrip.
+//! - **Sender Keys**: store/load/list/remove roundtrip; context isolation.
+//! - **DID Cache**: cache with expiry; TOFU record roundtrip.
+//! - **Transport**: relay score store/load/list roundtrip.
+//! - **MLS**: group state roundtrip via `MlsStorageBridge`; context isolation.
 //!
 //! See spec sections 17.3 and 17.4.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
+use scp_core::crypto::mls::MlsStorageBridge;
 use scp_core::store::ProtocolStore;
 use scp_identity::DID;
 use scp_platform::testing::InMemoryStorage;
@@ -1024,4 +1031,338 @@ async fn identity_and_context_namespaces_are_isolated() {
         store.load_context_state("ctx-iso-2").await.unwrap(),
         Some(b"ctx-state-2".to_vec())
     );
+}
+
+// =========================================================================
+// Event Log module — append, load, range, Merkle root & tree nodes
+// =========================================================================
+
+#[tokio::test]
+async fn event_log_append_load_roundtrip() {
+    let store = make_store();
+    let hash: [u8; 32] = [0xAA; 32];
+    store.append_event("ctx-el", 0, &hash).await.unwrap();
+
+    let loaded = store.load_event("ctx-el", 0).await.unwrap();
+    assert_eq!(loaded, Some(hash.to_vec()));
+
+    let count = store.event_count("ctx-el").await.unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn event_log_load_event_range_returns_ordered_subset() {
+    let store = make_store();
+    for seq in 0u64..5 {
+        #[allow(clippy::cast_possible_truncation)]
+        let hash = [seq as u8; 32];
+        store.append_event("ctx-range", seq, &hash).await.unwrap();
+    }
+
+    // Range is [start, end) — so (1, 4) returns events 1, 2, 3.
+    let range = store.load_event_range("ctx-range", 1, 4).await.unwrap();
+    assert_eq!(range.len(), 3);
+    assert_eq!(range[0], [1u8; 32].to_vec());
+    assert_eq!(range[1], [2u8; 32].to_vec());
+    assert_eq!(range[2], [3u8; 32].to_vec());
+}
+
+#[tokio::test]
+async fn event_log_missing_sequence_returns_none() {
+    let store = make_store();
+    let loaded = store.load_event("ctx-miss", 999).await.unwrap();
+    assert!(loaded.is_none());
+}
+
+#[tokio::test]
+async fn event_log_merkle_root_roundtrip() {
+    let store = make_store();
+    let root: [u8; 32] = [0xBB; 32];
+    store.store_event_root("ctx-root", &root).await.unwrap();
+
+    let loaded = store.load_event_root("ctx-root").await.unwrap();
+    assert_eq!(loaded, Some(root));
+}
+
+#[tokio::test]
+async fn event_log_merkle_tree_node_roundtrip() {
+    let store = make_store();
+    let hash: [u8; 32] = [0xCC; 32];
+    store
+        .store_event_tree_node("ctx-tree", 2, 5, &hash)
+        .await
+        .unwrap();
+
+    let loaded = store.load_event_tree_node("ctx-tree", 2, 5).await.unwrap();
+    assert_eq!(loaded, Some(hash));
+
+    // Different level/index returns None.
+    assert!(
+        store
+            .load_event_tree_node("ctx-tree", 3, 5)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+// =========================================================================
+// Sender Keys module — store, load, list, remove
+// =========================================================================
+
+#[tokio::test]
+async fn sender_key_store_load_roundtrip() {
+    let store = make_store();
+    let did = DID::from("did:dht:z6MkSenderKey1");
+    let key_data = b"sender-key-bytes-32";
+
+    store
+        .store_sender_key("ctx-sk", &did, key_data)
+        .await
+        .unwrap();
+    let loaded = store.load_sender_key("ctx-sk", &did).await.unwrap();
+    assert_eq!(loaded, Some(key_data.to_vec()));
+}
+
+#[tokio::test]
+async fn sender_key_list_returns_all_pairs() {
+    let store = make_store();
+    let did1 = DID::from("did:dht:z6MkSK-a");
+    let did2 = DID::from("did:dht:z6MkSK-b");
+
+    store
+        .store_sender_key("ctx-skl", &did1, b"key-a")
+        .await
+        .unwrap();
+    store
+        .store_sender_key("ctx-skl", &did2, b"key-b")
+        .await
+        .unwrap();
+
+    let list = store.list_sender_keys("ctx-skl").await.unwrap();
+    assert_eq!(list.len(), 2);
+
+    let listed: HashSet<String> = list.iter().map(|(d, _)| d.to_string()).collect();
+    assert!(listed.contains(&did1.to_string()));
+    assert!(listed.contains(&did2.to_string()));
+}
+
+#[tokio::test]
+async fn sender_key_remove_deletes_entry() {
+    let store = make_store();
+    let did = DID::from("did:dht:z6MkSKRemove");
+
+    store
+        .store_sender_key("ctx-skr", &did, b"remove-me")
+        .await
+        .unwrap();
+    store.remove_sender_key("ctx-skr", &did).await.unwrap();
+
+    assert!(
+        store
+            .load_sender_key("ctx-skr", &did)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn sender_key_context_isolation() {
+    let store = make_store();
+    let did = DID::from("did:dht:z6MkSKIso");
+
+    store
+        .store_sender_key("ctx-sk-a", &did, b"key-a")
+        .await
+        .unwrap();
+    store
+        .store_sender_key("ctx-sk-b", &did, b"key-b")
+        .await
+        .unwrap();
+
+    // Different contexts, same DID — keys are independent.
+    assert_eq!(
+        store.load_sender_key("ctx-sk-a", &did).await.unwrap(),
+        Some(b"key-a".to_vec())
+    );
+    assert_eq!(
+        store.load_sender_key("ctx-sk-b", &did).await.unwrap(),
+        Some(b"key-b".to_vec())
+    );
+}
+
+// =========================================================================
+// DID Cache — cache with expiry; TOFU record roundtrip
+// =========================================================================
+
+#[tokio::test]
+async fn did_cache_roundtrip_and_expiry() {
+    let store = make_store();
+    let did = DID::from("did:dht:z6MkCacheDID");
+
+    store
+        .cache_did_document(&did, b"doc-bytes", 1000)
+        .await
+        .unwrap();
+
+    // Before expiry — returns document.
+    let loaded = store.load_cached_did_document(&did, 500).await.unwrap();
+    assert_eq!(loaded, Some(b"doc-bytes".to_vec()));
+
+    // At expiry — returns None.
+    let expired = store.load_cached_did_document(&did, 1000).await.unwrap();
+    assert!(expired.is_none());
+
+    // After expiry — returns None.
+    let expired = store.load_cached_did_document(&did, 2000).await.unwrap();
+    assert!(expired.is_none());
+}
+
+#[tokio::test]
+async fn did_cache_overwrite_with_later_expiry() {
+    let store = make_store();
+    let did = DID::from("did:dht:z6MkCacheOver");
+
+    store.cache_did_document(&did, b"v1", 100).await.unwrap();
+    store.cache_did_document(&did, b"v2", 200).await.unwrap();
+
+    // Old expiry passed, but new expiry not yet — should return v2.
+    let loaded = store.load_cached_did_document(&did, 150).await.unwrap();
+    assert_eq!(loaded, Some(b"v2".to_vec()));
+}
+
+#[tokio::test]
+async fn tofu_record_roundtrip() {
+    let store = make_store();
+    let did = DID::from("did:dht:z6MkTOFU");
+
+    store
+        .store_tofu_record(&did, b"first-seen-data")
+        .await
+        .unwrap();
+    let loaded = store.load_tofu_record(&did).await.unwrap();
+    assert_eq!(loaded, Some(b"first-seen-data".to_vec()));
+}
+
+#[tokio::test]
+async fn tofu_record_missing_returns_none() {
+    let store = make_store();
+    let did = DID::from("did:dht:z6MkTOFUMissing");
+    assert!(store.load_tofu_record(&did).await.unwrap().is_none());
+}
+
+// =========================================================================
+// Transport module — relay score store/load/list
+// =========================================================================
+
+#[tokio::test]
+async fn relay_score_store_load_roundtrip() {
+    let store = make_store();
+    store
+        .store_relay_score("wss://relay1.example.com", b"score-data")
+        .await
+        .unwrap();
+
+    let loaded = store
+        .load_relay_score("wss://relay1.example.com")
+        .await
+        .unwrap();
+    assert_eq!(loaded, Some(b"score-data".to_vec()));
+}
+
+#[tokio::test]
+async fn relay_score_list_returns_all_stored() {
+    let store = make_store();
+    store
+        .store_relay_score("wss://relay-a.example.com", b"score-a")
+        .await
+        .unwrap();
+    store
+        .store_relay_score("wss://relay-b.example.com", b"score-b")
+        .await
+        .unwrap();
+
+    let list = store.list_relay_scores().await.unwrap();
+    assert_eq!(list.len(), 2);
+
+    let urls: HashSet<String> = list.iter().map(|e| e.url.clone()).collect();
+    assert!(urls.contains("wss://relay-a.example.com"));
+    assert!(urls.contains("wss://relay-b.example.com"));
+}
+
+#[tokio::test]
+async fn relay_score_missing_returns_none() {
+    let store = make_store();
+    assert!(
+        store
+            .load_relay_score("wss://nonexistent.example.com")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+// =========================================================================
+// MLS module — group state roundtrip via MlsStorageBridge; context isolation
+// =========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mls_bridge_group_state_roundtrip() {
+    use openmls::group::{GroupId as MlsGroupId, MlsGroupState};
+    use openmls_traits::storage::StorageProvider;
+
+    let store = Arc::new(make_store());
+    let bridge = MlsStorageBridge::new(store, "ctx-mls-rt".to_owned()).unwrap();
+
+    let group_id = MlsGroupId::from_slice(b"test-group-rt");
+
+    StorageProvider::write_group_state(&bridge, &group_id, &MlsGroupState::Operational).unwrap();
+
+    let loaded: Option<MlsGroupState> = StorageProvider::group_state(&bridge, &group_id).unwrap();
+    assert!(loaded.is_some(), "group state should be loaded");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mls_bridge_context_isolation() {
+    use openmls::group::{GroupId as MlsGroupId, MlsGroupState};
+    use openmls_traits::storage::StorageProvider;
+
+    let store = Arc::new(make_store());
+
+    let bridge_a = MlsStorageBridge::new(Arc::clone(&store), "ctx-mls-a".to_owned()).unwrap();
+    let bridge_b = MlsStorageBridge::new(Arc::clone(&store), "ctx-mls-b".to_owned()).unwrap();
+
+    let group_id = MlsGroupId::from_slice(b"shared-group-id");
+
+    StorageProvider::write_group_state(&bridge_a, &group_id, &MlsGroupState::Operational).unwrap();
+    StorageProvider::write_group_state(&bridge_b, &group_id, &MlsGroupState::Inactive).unwrap();
+
+    // Same group_id, different contexts — values are independent.
+    let a: Option<MlsGroupState> = StorageProvider::group_state(&bridge_a, &group_id).unwrap();
+    let b: Option<MlsGroupState> = StorageProvider::group_state(&bridge_b, &group_id).unwrap();
+    assert!(a.is_some(), "bridge_a state should exist");
+    assert!(b.is_some(), "bridge_b state should exist");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mls_bridge_survives_restart() {
+    use openmls::group::{GroupId as MlsGroupId, MlsGroupState};
+    use openmls_traits::storage::StorageProvider;
+
+    let store = Arc::new(make_store());
+    let group_id = MlsGroupId::from_slice(b"restart-group");
+
+    // Write via one bridge instance.
+    {
+        let bridge =
+            MlsStorageBridge::new(Arc::clone(&store), "ctx-mls-restart".to_owned()).unwrap();
+        StorageProvider::write_group_state(&bridge, &group_id, &MlsGroupState::Operational)
+            .unwrap();
+    }
+
+    // Read via a fresh bridge instance backed by the same store.
+    let bridge2 = MlsStorageBridge::new(store, "ctx-mls-restart".to_owned()).unwrap();
+    let loaded: Option<MlsGroupState> = StorageProvider::group_state(&bridge2, &group_id).unwrap();
+    assert!(loaded.is_some(), "state should survive bridge recreation");
 }

@@ -1304,20 +1304,20 @@
       "severity": "major",
       "status": "done",
       "files": [
-        "crates/scp-platform/src/combined/mod.rs",
-        "crates/scp-platform/Cargo.toml"
+        "crates/scp-transport/src/native/combined.rs",
+        "crates/scp-transport/Cargo.toml"
       ],
-      "description": "Implement `CombinedNodeStorage` for personal node pattern per section 17.1 deployment patterns. Single SQLite database containing both `kv` table (client ProtocolStore) and `blobs` table (relay BlobStore). Implements BOTH `Storage` and `BlobStorage` traits on one struct. Behind `combined` feature flag. This is a PRD-originated design implementing the deployment pattern described in section 17.1, not a directly specified component.",
+      "description": "Implement `CombinedNodeStorage` for personal node pattern per section 17.1 deployment patterns. Single SQLite database containing both `kv` table (client ProtocolStore) and `blobs` table (relay BlobStore). Implements BOTH `Storage` and `BlobStorage` traits on one struct. Behind `combined` feature flag in `scp-transport`. This is a PRD-originated design implementing the deployment pattern described in section 17.1, not a directly specified component.",
       "acceptanceCriteria": [
         "`CombinedNodeStorage` struct behind `combined` feature flag with single SQLite database containing both `kv` and `blobs` tables",
         "Implements `Storage` trait (delegates to kv table) and `BlobStorage` trait (delegates to blobs table)",
         "Passes `storage_conformance!()` for Storage and `blob_store_conformance!()` for BlobStorage",
         "One directory = complete node state",
-        "`cargo test -p scp-platform --features combined` passes",
-        "`cargo clippy -p scp-platform --features combined` clean"
+        "`cargo test -p scp-transport --features combined` passes",
+        "`cargo clippy -p scp-transport --features combined` clean"
       ],
       "actionItems": [
-        "Add `combined` feature flag depending on `sqlite` and `sqlite-blob` features",
+        "Add `combined` feature flag depending on `rusqlite` and `scp-platform` features",
         "Create `CombinedNodeStorage` with single database holding both tables",
         "Implement both `Storage` and `BlobStorage` traits",
         "Apply both conformance macros in tests"
@@ -1342,7 +1342,7 @@
       ],
       "details": {
         "phase": 2,
-        "crate": "scp-platform",
+        "crate": "scp-transport",
         "note": "PRD-originated design implementing deployment patterns from section 17.1"
       }
     },
