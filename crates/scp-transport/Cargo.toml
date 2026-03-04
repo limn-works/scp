@@ -54,5 +54,15 @@ rmpv = { version = "1", features = ["with-serde"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 
+[[test]]
+name = "combined_conformance"
+path = "tests/combined_conformance.rs"
+required-features = ["combined"]
+
+[[test]]
+name = "local_cache_conformance"
+path = "tests/local_cache_conformance.rs"
+required-features = ["local-cache"]
+
 [lints]
 workspace = true

@@ -32,6 +32,11 @@ use scp_core::store::ProtocolStore;
 use scp_identity::DID;
 use scp_platform::testing::InMemoryStorage;
 
+#[cfg(feature = "filesystem")]
+use scp_platform::filesystem::FilesystemStorage;
+#[cfg(feature = "sqlite")]
+use scp_platform::sqlite::SqliteStorage;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -759,6 +764,68 @@ macro_rules! persistence_tests {
                 let members_after = store.list_members(ctx_id).await.unwrap();
                 assert!(members_after.is_empty());
             }
+
+            // ---------------------------------------------------------------
+            // AC3 (extended): Expired context state survives restore
+            // ---------------------------------------------------------------
+
+            /// Stores a context with `ContextState::Expired`, loads it back, and
+            /// verifies the expired state is faithfully restored. This ensures
+            /// that expired contexts are not silently dropped or reset during
+            /// the persist/load cycle.
+            #[tokio::test]
+            async fn expired_context_refuses_operations_after_restore() {
+                let store = $make_store;
+                let ctx_id = "ctx-expired-restore";
+
+                // Persist context as Expired.
+                let expired_state = rmp_serde::to_vec(&ContextState::Expired).unwrap();
+                store
+                    .store_context_state(ctx_id, &expired_state)
+                    .await
+                    .unwrap();
+                store
+                    .store_context_params(ctx_id, b"params-expired-ctx")
+                    .await
+                    .unwrap();
+
+                // Add a member before expiry (simulates pre-expiry state).
+                let alice = DID::from("did:dht:z6MkAliceExpired");
+                store
+                    .store_membership(ctx_id, &alice, "member")
+                    .await
+                    .unwrap();
+
+                // --- "Restart": load state back ---
+                let loaded_bytes = store
+                    .load_context_state(ctx_id)
+                    .await
+                    .unwrap()
+                    .expect("expired state should be loadable");
+                let loaded_state: ContextState = rmp_serde::from_slice(&loaded_bytes).unwrap();
+
+                // Verify the state is Expired.
+                assert_eq!(
+                    loaded_state,
+                    ContextState::Expired,
+                    "restored state must be Expired"
+                );
+
+                // Verify params and membership survived alongside the expired state.
+                let loaded_params = store.load_context_params(ctx_id).await.unwrap();
+                assert_eq!(loaded_params, Some(b"params-expired-ctx".to_vec()));
+
+                let alice_role = store.load_membership(ctx_id, &alice).await.unwrap();
+                assert_eq!(alice_role, Some("member".to_owned()));
+
+                // The expired context still appears in the active context list
+                // (the store is state-agnostic; callers interpret the state).
+                let active = store.list_active_contexts().await.unwrap();
+                assert!(
+                    active.contains(&ctx_id.to_owned()),
+                    "expired context should still appear in active list"
+                );
+            }
         }
     };
 }
@@ -770,24 +837,24 @@ macro_rules! persistence_tests {
 // InMemoryStorage -- always available, no feature gate.
 persistence_tests!(in_memory, make_store());
 
-// SqliteStorage -- gated behind `sqlite` feature (not yet implemented).
-// When SqliteStorage lands, uncomment and add the feature gate:
-//
-// #[cfg(feature = "sqlite")]
-// persistence_tests!(sqlite, {
-//     let dir = tempfile::tempdir().unwrap();
-//     let path = dir.path().join("test.db");
-//     ProtocolStore::new(SqliteStorage::open(&path).await.unwrap())
-// });
+// SqliteStorage -- gated behind `sqlite` feature.
+#[cfg(feature = "sqlite")]
+persistence_tests!(sqlite, {
+    let dir = tempfile::tempdir().unwrap();
+    let key = [0xABu8; 32];
+    let dir_path = dir.path().to_path_buf();
+    let _ = Box::leak(Box::new(dir));
+    ProtocolStore::new(SqliteStorage::new(&dir_path, &key).unwrap())
+});
 
-// FilesystemStorage -- gated behind `filesystem` feature (not yet implemented).
-// When FilesystemStorage lands, uncomment and add the feature gate:
-//
-// #[cfg(feature = "filesystem")]
-// persistence_tests!(filesystem, {
-//     let dir = tempfile::tempdir().unwrap();
-//     ProtocolStore::new(FilesystemStorage::new(dir.path()).unwrap())
-// });
+// FilesystemStorage -- gated behind `filesystem` feature.
+#[cfg(feature = "filesystem")]
+persistence_tests!(filesystem, {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_path_buf();
+    let _ = Box::leak(Box::new(dir));
+    ProtocolStore::new(FilesystemStorage::new(&dir_path).unwrap())
+});
 
 // ---------------------------------------------------------------------------
 // ContextManager-level persistence integration test

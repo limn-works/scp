@@ -26,6 +26,8 @@
 //! See `.docs/specs/17-persistence-and-storage.md` section 17.7 for the full
 //! specification.
 
+use std::sync::Arc;
+
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
@@ -65,6 +67,15 @@ CREATE INDEX IF NOT EXISTS idx_expiry ON blobs (expires_at);
 pub struct PostgresBlobStore {
     pool: PgPool,
     clock: ClockFn,
+}
+
+impl Clone for PostgresBlobStore {
+    fn clone(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            clock: Arc::clone(&self.clock),
+        }
+    }
 }
 
 impl PostgresBlobStore {
@@ -639,6 +650,134 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 2);
         assert!(results[0].stored_at > 1_000_050);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn get_expired_returns_none() {
+        let (clock, time) = test_clock(1_000_000);
+        let storage = fresh_store_with_clock(clock).await;
+        let routing_id = [0xAA; 32];
+        let data = vec![1, 2, 3];
+        let blob_id = make_blob_id(&data);
+
+        // Store with TTL of 60 seconds.
+        storage
+            .store(routing_id, blob_id, None, 60, data)
+            .await
+            .unwrap();
+
+        // Blob should be retrievable before TTL expires.
+        let before = storage.get(&blob_id).await.unwrap();
+        assert!(before.is_some());
+
+        // Advance clock past expiry.
+        time.store(1_000_061, Ordering::SeqCst);
+
+        // Blob should not be returned after TTL expires.
+        let after = storage.get(&blob_id).await.unwrap();
+        assert!(after.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn store_returns_correct_blob_id() {
+        let storage = fresh_store().await;
+        let routing_id = [0xAA; 32];
+        let blob_data = vec![11, 22, 33, 44, 55];
+        let expected_id = make_blob_id(&blob_data);
+
+        let stored = storage
+            .store(routing_id, expected_id, None, 3600, blob_data)
+            .await
+            .unwrap();
+
+        assert_eq!(stored.blob_id, expected_id);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn concurrent_store_purge() {
+        let (clock, time) = test_clock(1_000_000);
+        let storage = fresh_store_with_clock(clock).await;
+        let routing_id = [0xAA; 32];
+
+        // Store blobs with short TTL.
+        for i in 0u8..5 {
+            let data = vec![i; 10];
+            let blob_id = make_blob_id(&data);
+            storage
+                .store(routing_id, blob_id, None, 10, data)
+                .await
+                .unwrap();
+        }
+
+        // Advance clock past TTL.
+        time.store(1_000_011, Ordering::SeqCst);
+
+        // Run purge and store concurrently.
+        let storage_clone = storage.clone();
+        let purge_handle = tokio::spawn(async move { storage_clone.purge_expired().await });
+
+        // Store new blobs while purge runs.
+        for i in 10u8..15 {
+            let data = vec![i; 10];
+            let blob_id = make_blob_id(&data);
+            storage
+                .store(routing_id, blob_id, None, 3600, data)
+                .await
+                .unwrap();
+        }
+
+        let purge_result = purge_handle.await.unwrap();
+        assert!(purge_result.is_ok());
+
+        // Verify newly stored blobs are still retrievable.
+        for i in 10u8..15 {
+            let data = vec![i; 10];
+            let blob_id = make_blob_id(&data);
+            let result = storage.get(&blob_id).await.unwrap();
+            assert!(result.is_some(), "blob {i} should survive concurrent purge");
+            assert_eq!(result.unwrap().blob, data);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn purge_expired_only_removes_expired() {
+        let (clock, time) = test_clock(1_000_000);
+        let storage = fresh_store_with_clock(clock).await;
+        let routing_id = [0xAA; 32];
+
+        // Store a short-lived blob (TTL 10s).
+        let short_data = vec![1, 2, 3];
+        let short_id = make_blob_id(&short_data);
+        storage
+            .store(routing_id, short_id, None, 10, short_data)
+            .await
+            .unwrap();
+
+        // Store a long-lived blob (TTL 3600s).
+        let long_data = vec![4, 5, 6];
+        let long_id = make_blob_id(&long_data);
+        storage
+            .store(routing_id, long_id, None, 3600, long_data.clone())
+            .await
+            .unwrap();
+
+        // Advance clock past short TTL but not long TTL.
+        time.store(1_000_011, Ordering::SeqCst);
+
+        let purged = storage.purge_expired().await.unwrap();
+        assert_eq!(purged, 1);
+
+        // Short-lived blob should be gone.
+        let short_result = storage.get(&short_id).await.unwrap();
+        assert!(short_result.is_none());
+
+        // Long-lived blob should still exist.
+        let long_result = storage.get(&long_id).await.unwrap().unwrap();
+        assert_eq!(long_result.blob, long_data);
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@
 //! See SCP-PERSIST-063 and spec section 17.1 (deployment patterns).
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
 
@@ -25,12 +25,12 @@ use super::storage::{BlobStorage, StorageError, StoredBlob};
 ///
 /// The default ([`system_clock`]) delegates to [`scp_core::time::now_secs`].
 /// Tests inject a deterministic clock via [`CombinedNodeStorage::with_clock`].
-pub type ClockFn = Box<dyn Fn() -> Result<u64, StorageError> + Send + Sync>;
+pub type ClockFn = Arc<dyn Fn() -> Result<u64, StorageError> + Send + Sync>;
 
 /// Returns a [`ClockFn`] backed by the real system clock.
 #[must_use]
 pub fn system_clock() -> ClockFn {
-    Box::new(|| {
+    Arc::new(|| {
         scp_core::time::now_secs().map_err(|e| StorageError::Internal(format!("clock error: {e}")))
     })
 }
@@ -85,9 +85,10 @@ fn prefix_successor(prefix: &str) -> Option<String> {
 /// - `kv` — key-value store implementing [`Storage`] (client `ProtocolStore`)
 /// - `blobs` — blob store implementing [`BlobStorage`] (relay blob storage)
 ///
-/// Uses `std::sync::Mutex<Connection>` (not `tokio::sync::Mutex`) because all
-/// `SQLite` operations are sub-millisecond and blocking briefly is cheaper than
-/// the overhead of an async mutex. This matches the pattern established by
+/// Uses `Arc<std::sync::Mutex<Connection>>` (not `tokio::sync::Mutex`) because
+/// all `SQLite` operations are sub-millisecond and blocking briefly is cheaper
+/// than the overhead of an async mutex. The `Arc` wrapper enables cheap clones
+/// for concurrent access patterns. This matches the pattern established by
 /// `InMemoryStorage` for the [`Storage`] trait.
 ///
 /// # Construction
@@ -97,15 +98,18 @@ fn prefix_successor(prefix: &str) -> Option<String> {
 /// ```
 ///
 /// Creates `node.db` inside `dir` with WAL mode and `SQLCipher` encryption.
+///
+/// Clone is cheap — the connection and clock are shared via `Arc`.
+#[derive(Clone)]
 pub struct CombinedNodeStorage {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
     clock: ClockFn,
 }
 
 impl std::fmt::Debug for CombinedNodeStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CombinedNodeStorage")
-            .field("conn", &"<Mutex<Connection>>")
+            .field("conn", &"<Arc<Mutex<Connection>>>")
             .finish()
     }
 }
@@ -191,7 +195,7 @@ impl CombinedNodeStorage {
         .map_err(|e| StorageError::Internal(format!("failed to create blobs table: {e}")))?;
 
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
             clock,
         })
     }
@@ -570,7 +574,7 @@ mod tests {
     fn test_clock(start: u64) -> (ClockFn, Arc<AtomicU64>) {
         let time = Arc::new(AtomicU64::new(start));
         let time_clone = Arc::clone(&time);
-        let clock: ClockFn = Box::new(move || Ok(time_clone.load(Ordering::Relaxed)));
+        let clock: ClockFn = Arc::new(move || Ok(time_clone.load(Ordering::Relaxed)));
         (clock, time)
     }
 

@@ -62,6 +62,17 @@ pub struct LocalBlobCache<S: BlobStorage> {
     clock: ClockFn,
 }
 
+impl<S: BlobStorage + Clone> Clone for LocalBlobCache<S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            max_cache_size: self.max_cache_size,
+            entries: Arc::clone(&self.entries),
+            clock: Arc::clone(&self.clock),
+        }
+    }
+}
+
 impl<S: BlobStorage> LocalBlobCache<S> {
     /// Creates a new `LocalBlobCache` wrapping the given storage with the
     /// specified maximum cache size.
