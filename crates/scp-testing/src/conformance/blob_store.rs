@@ -67,7 +67,7 @@ macro_rules! blob_store_conformance {
             use scp_transport::native::storage::BlobStorage;
             use sha2::{Digest, Sha256};
 
-            /// Compute SHA-256 blob_id from content bytes.
+            /// Compute SHA-256 `blob_id` from content bytes.
             fn sha256_blob_id(data: &[u8]) -> [u8; 32] {
                 let hash = Sha256::digest(data);
                 let mut out = [0u8; 32];
@@ -160,15 +160,13 @@ macro_rules! blob_store_conformance {
                 let routing_id = [0xCC; 32];
 
                 // Store 3 blobs at different timestamps.
-                let mut stored_ats = Vec::new();
                 for i in 0u8..3 {
                     let data = vec![i; 10];
                     let blob_id = sha256_blob_id(&data);
-                    let stored = store
+                    store
                         .store(routing_id, blob_id, None, 3600, data)
                         .await
                         .expect("store should succeed");
-                    stored_ats.push(stored.stored_at);
 
                     // Advance clock by 1 second between stores to ensure
                     // distinct timestamps.
