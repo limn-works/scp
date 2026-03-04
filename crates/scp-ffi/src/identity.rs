@@ -1,12 +1,17 @@
 //! `PyO3` bridge for identity operations.
 //!
 //! Exposes [`PyIdentity`] and [`PyDIDDocument`] as opaque Python objects with
-//! attribute access, plus four bridge functions for identity lifecycle:
+//! attribute access, plus bridge functions for identity lifecycle:
 //!
 //! - [`py_identity_create`] — creates a new DID identity.
+//! - [`py_identity_create_with_agent_key`] — creates a new DID identity with
+//!   an agent signing key.
 //! - [`py_identity_load`] — loads an existing identity from storage.
 //! - [`py_identity_resolve`] — resolves a DID to its document.
 //! - [`py_identity_rotate_key`] — rotates the identity's active signing key.
+//! - [`py_identity_add_agent_key`] — adds an agent signing key to an identity.
+//! - [`py_identity_rotate_agent_key`] — rotates the agent signing key.
+//! - [`py_identity_remove_agent_key`] — removes the agent signing key.
 //!
 //! All async operations run on the shared tokio runtime via
 //! [`crate::runtime()`]. The GIL is released during Rust async execution
@@ -23,7 +28,8 @@
 //! [`PyDIDDocument`] wraps [`DidDocument`](scp_identity::DidDocument)
 //! and exposes safe getters for the document's public fields.
 //!
-//! See ADR-013 in `.docs/adrs/phase-3.md` for the full specification.
+//! See ADR-013 in `.docs/adrs/phase-3.md` and ADR-039 for the full
+//! specification.
 
 use std::sync::Arc;
 
@@ -63,6 +69,8 @@ pub struct PyIdentity {
     did: String,
     /// The custody type used to create this identity (`"in_memory"` or `"platform"`).
     custody: String,
+    /// Whether this identity has an agent signing key (`#agent` VM).
+    has_agent_key: bool,
 }
 
 #[pymethods]
@@ -79,8 +87,37 @@ impl PyIdentity {
         &self.custody
     }
 
+    /// Returns `True` if this identity has an agent signing key (`#agent`
+    /// verification method in the DID document).
+    ///
+    /// See ADR-039 acceptance criterion 19.
+    #[getter]
+    const fn has_agent_key(&self) -> bool {
+        self.has_agent_key
+    }
+
+    /// Returns the agent key's public key as a multibase-encoded string, or
+    /// `None` if no agent key exists.
+    ///
+    /// The returned string is z-base-32 multibase-encoded (prefix `z`),
+    /// matching the `publicKeyMultibase` field in the DID document.
+    ///
+    /// See ADR-039 acceptance criterion 19.
+    fn get_agent_public_key(&self) -> PyResult<Option<String>> {
+        crate::runtime::with_identity(&self.did, |entry| {
+            Ok(entry
+                .document
+                .agent_verification_method()
+                .map(|vm| vm.public_key_multibase.clone()))
+        })
+        .map_err(PyErr::from)
+    }
+
     fn __repr__(&self) -> String {
-        format!("PyIdentity(did={:?}, custody={:?})", self.did, self.custody)
+        format!(
+            "PyIdentity(did={:?}, custody={:?}, has_agent_key={})",
+            self.did, self.custody, self.has_agent_key
+        )
     }
 
     fn __str__(&self) -> &str {
@@ -183,6 +220,25 @@ impl PyDIDDocument {
             list.append(am)?;
         }
         Ok(list)
+    }
+
+    /// Returns `True` if this document contains an `#agent` verification method.
+    ///
+    /// See ADR-039 acceptance criterion 19.
+    #[getter]
+    fn has_agent_key(&self) -> bool {
+        self.inner.has_agent_key()
+    }
+
+    /// Returns the agent key's public key as a multibase-encoded string, or
+    /// `None` if no agent key exists.
+    ///
+    /// See ADR-039 acceptance criterion 19.
+    #[getter]
+    fn agent_public_key(&self) -> Option<String> {
+        self.inner
+            .agent_verification_method()
+            .map(|vm| vm.public_key_multibase.clone())
     }
 
     fn __repr__(&self) -> String {
@@ -368,6 +424,68 @@ fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
             Ok(PyIdentity {
                 did,
                 custody: custody_str,
+                has_agent_key: false,
+            })
+        })
+    })
+}
+
+/// Creates a new DID identity with an agent signing key.
+///
+/// Like [`py_identity_create`], but the resulting identity also has an
+/// `#agent` verification method in its DID document.
+///
+/// # Arguments
+///
+/// * `custody` — The custody type: `"in_memory"` or `"platform"`.
+///
+/// # Returns
+///
+/// A [`PyIdentity`] with `has_agent_key == True`.
+///
+/// # Errors
+///
+/// Raises `IdentityError` if key generation or DID creation fails.
+/// Raises `ValidationError` if the custody string is invalid.
+///
+/// See ADR-039 acceptance criterion 4 and SCP-AB-016.
+#[pyfunction]
+fn py_identity_create_with_agent_key(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
+    let (key_custody, custody_str) = parse_custody(custody)?;
+    let rt = crate::runtime()?;
+
+    py.allow_threads(|| {
+        rt.block_on(async {
+            let did_method = DidDht::new();
+            let (identity, document) = did_method
+                .create_with_agent_key(key_custody.as_ref())
+                .await
+                .map_err(ScpPyError::from)?;
+
+            let did = identity.did.clone();
+
+            crate::runtime::register_identity(
+                &did,
+                IdentityEntry {
+                    identity,
+                    custody: key_custody,
+                    document,
+                },
+            );
+
+            // Persist identity state if storage is initialized (SCP-217).
+            if let Ok(storage) = crate::runtime::get_storage() {
+                let key = identity_state_key(&did);
+                let data = serialize_identity_state(&did, &custody_str);
+                storage.store(&key, &data).await.map_err(|e| {
+                    ScpPyError::IdentityError(format!("failed to persist identity state: {e}"))
+                })?;
+            }
+
+            Ok(PyIdentity {
+                did,
+                custody: custody_str,
+                has_agent_key: true,
             })
         })
     })
@@ -455,9 +573,14 @@ fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
             // (UCAN minting, signing, pseudonym derivation, key rotation)
             // would fail with "identity not found in registry" (RED-013).
             if crate::runtime::identity_registry_contains(&did_owned) {
+                let has_agent = crate::runtime::with_identity(&did_owned, |entry| {
+                    Ok(entry.document.has_agent_key())
+                })
+                .unwrap_or(false);
                 return Ok(PyIdentity {
                     did: stored_did,
                     custody: custody_str,
+                    has_agent_key: has_agent,
                 });
             }
 
@@ -545,12 +668,172 @@ fn py_identity_rotate_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyI
             });
 
             let (new_identity, new_document) = rotation_result.map_err(ScpPyError::from)?;
+            let has_agent = new_document.has_agent_key();
             entry.identity = new_identity;
             entry.document = new_document;
 
             Ok(PyIdentity {
                 did: did.clone(),
                 custody: custody_str.clone(),
+                has_agent_key: has_agent,
+            })
+        })
+    });
+    result.map_err(PyErr::from)
+}
+
+/// Adds an agent signing key to an identity (ADR-039).
+///
+/// Generates a new Ed25519 keypair for the `#agent` verification method,
+/// updates the DID document, and publishes to the DHT. The identity
+/// registry entry is updated in-place.
+///
+/// # Arguments
+///
+/// * `identity` — The [`PyIdentity`] to add an agent key to.
+///
+/// # Returns
+///
+/// An updated [`PyIdentity`] with `has_agent_key == True`.
+///
+/// # Errors
+///
+/// Raises `IdentityError` if:
+/// - The identity already has an agent key (`AgentKeyAlreadyExists`).
+/// - Key generation fails.
+/// - DHT publishing fails.
+/// - The identity is not in the runtime registry.
+///
+/// See ADR-039 acceptance criterion 4 and SCP-AB-016.
+#[pyfunction]
+fn py_identity_add_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
+    let did = identity.did.clone();
+    let custody_str = identity.custody.clone();
+    let rt = crate::runtime()?;
+
+    let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
+        crate::runtime::with_identity_mut(&did, |entry| {
+            let did_method = DidDht::new();
+
+            let add_result = rt.block_on(async {
+                did_method
+                    .add_agent_key(&entry.identity, &entry.document, entry.custody.as_ref())
+                    .await
+            });
+
+            let (new_identity, new_document) = add_result.map_err(ScpPyError::from)?;
+            entry.identity = new_identity;
+            entry.document = new_document;
+
+            Ok(PyIdentity {
+                did: did.clone(),
+                custody: custody_str.clone(),
+                has_agent_key: true,
+            })
+        })
+    });
+    result.map_err(PyErr::from)
+}
+
+/// Rotates the agent signing key for an identity (ADR-039).
+///
+/// Generates a new Ed25519 keypair, retires the old `#agent` key as
+/// `#retired-agent-{sequence}`, and installs the new key as `#agent`.
+/// The identity registry entry is updated in-place.
+///
+/// # Arguments
+///
+/// * `identity` — The [`PyIdentity`] whose agent key should be rotated.
+///
+/// # Returns
+///
+/// An updated [`PyIdentity`] with the same DID but a new agent key.
+///
+/// # Errors
+///
+/// Raises `IdentityError` if:
+/// - The identity has no agent key (`AgentKeyNotFound`).
+/// - Key generation fails.
+/// - DHT publishing fails.
+/// - The identity is not in the runtime registry.
+///
+/// See ADR-039 acceptance criterion 4 and SCP-AB-016.
+#[pyfunction]
+fn py_identity_rotate_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
+    let did = identity.did.clone();
+    let custody_str = identity.custody.clone();
+    let rt = crate::runtime()?;
+
+    let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
+        crate::runtime::with_identity_mut(&did, |entry| {
+            let did_method = DidDht::new();
+
+            let rotate_result = rt.block_on(async {
+                did_method
+                    .rotate_agent_key(&entry.identity, &entry.document, entry.custody.as_ref())
+                    .await
+            });
+
+            let (new_identity, new_document) = rotate_result.map_err(ScpPyError::from)?;
+            entry.identity = new_identity;
+            entry.document = new_document;
+
+            Ok(PyIdentity {
+                did: did.clone(),
+                custody: custody_str.clone(),
+                has_agent_key: true,
+            })
+        })
+    });
+    result.map_err(PyErr::from)
+}
+
+/// Removes the agent signing key from an identity (ADR-039).
+///
+/// Removes the `#agent` verification method from the DID document and
+/// publishes the update to the DHT. The identity registry entry is
+/// updated in-place with `agent_signing_key: None`.
+///
+/// # Arguments
+///
+/// * `identity` — The [`PyIdentity`] whose agent key should be removed.
+///
+/// # Returns
+///
+/// An updated [`PyIdentity`] with `has_agent_key == False`.
+///
+/// # Errors
+///
+/// Raises `IdentityError` if:
+/// - The identity has no agent key (`AgentKeyNotFound`).
+/// - DHT publishing fails.
+/// - The identity is not in the runtime registry.
+///
+/// See ADR-039 acceptance criterion 4 and SCP-AB-016.
+#[pyfunction]
+fn py_identity_remove_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
+    let did = identity.did.clone();
+    let custody_str = identity.custody.clone();
+    let rt = crate::runtime()?;
+
+    let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
+        crate::runtime::with_identity_mut(&did, |entry| {
+            let did_method = DidDht::new();
+
+            let remove_result = rt.block_on(async {
+                did_method
+                    .remove_agent_key(&entry.identity, &entry.document)
+                    .await
+            });
+
+            let (new_identity, new_document) = remove_result.map_err(ScpPyError::from)?;
+            entry.identity = new_identity;
+            entry.document = new_document;
+
+            Ok(PyIdentity {
+                did: did.clone(),
+                custody: custody_str.clone(),
+                has_agent_key: false,
             })
         })
     });
@@ -651,6 +934,9 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
             Ok(PyIdentity {
                 did: new_did,
                 custody: custody_str,
+                // Migration creates a new DID — agent key is not carried
+                // over (agent_signing_key: None in the old_identity above).
+                has_agent_key: false,
             })
         })
     })
@@ -672,9 +958,13 @@ pub fn register_identity(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDIDDocument>()?;
     m.add_function(wrap_pyfunction!(py_init_storage, m)?)?;
     m.add_function(wrap_pyfunction!(py_identity_create, m)?)?;
+    m.add_function(wrap_pyfunction!(py_identity_create_with_agent_key, m)?)?;
     m.add_function(wrap_pyfunction!(py_identity_load, m)?)?;
     m.add_function(wrap_pyfunction!(py_identity_resolve, m)?)?;
     m.add_function(wrap_pyfunction!(py_identity_rotate_key, m)?)?;
+    m.add_function(wrap_pyfunction!(py_identity_add_agent_key, m)?)?;
+    m.add_function(wrap_pyfunction!(py_identity_rotate_agent_key, m)?)?;
+    m.add_function(wrap_pyfunction!(py_identity_remove_agent_key, m)?)?;
     m.add_function(wrap_pyfunction!(py_identity_migrate, m)?)?;
     Ok(())
 }

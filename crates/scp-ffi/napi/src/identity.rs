@@ -1,11 +1,21 @@
 //! napi-rs bridge for identity operations.
 //!
-//! Exposes [`NapiIdentity`] as an opaque JS class and three bridge functions
-//! for the identity lifecycle:
+//! Exposes [`NapiIdentity`] as an opaque JS class and bridge functions for
+//! the identity lifecycle:
 //!
 //! - [`identity_create`] — Creates a new DID identity (returns `Promise<NapiIdentity>`).
+//! - [`identity_create_with_agent_key`] — Creates a new DID identity with an
+//!   agent signing key.
 //! - [`identity_load`] — Loads an existing identity by DID string.
 //! - [`identity_resolve`] — Resolves a DID to its document.
+//!
+//! Agent key management (ADR-039):
+//!
+//! - [`NapiIdentity::add_agent_key`] — Adds an agent signing key.
+//! - [`NapiIdentity::rotate_agent_key`] — Rotates the agent signing key.
+//! - [`NapiIdentity::remove_agent_key`] — Removes the agent signing key.
+//! - [`NapiIdentity::has_agent_key`] — Checks if an agent key exists.
+//! - [`NapiIdentity::agent_public_key`] — Returns the agent key's public key.
 //!
 //! Unlike the WASM bridge, this bridge calls `scp-core` directly for the
 //! `"in_memory"` custody path — the tokio multi-thread runtime is available
@@ -18,14 +28,14 @@
 //! for production on devices with HSM capability. Production callers should
 //! use `"platform"` custody, which requires a wired `KeyCustodyProvider`.
 //!
-//! See ADR-022 in `.docs/adrs/phase-4.md`.
+//! See ADR-022 in `.docs/adrs/phase-4.md` and ADR-039.
 
 use std::fmt;
 use std::sync::Arc;
 
 use napi::Error as NapiError;
 use napi_derive::napi;
-use scp_identity::{DidDht, DidMethod, ScpIdentity};
+use scp_identity::{DidDht, DidDocument, DidMethod, ScpIdentity};
 use scp_platform::testing::InMemoryKeyCustody;
 
 use crate::error::{ScpNapiError, validate_custody_type};
@@ -66,6 +76,11 @@ pub(crate) struct NapiIdentityInner {
     ///
     /// Key material lives here. Dropping this destroys all private keys.
     pub(crate) in_memory_custody: Option<Arc<OpaqueInMemoryKeyCustody>>,
+    /// Retained DID document for this identity.
+    ///
+    /// Used by agent key operations to read/modify the document. `None` for
+    /// externally loaded identities.
+    pub(crate) document: Option<DidDocument>,
 }
 
 // ---------------------------------------------------------------------------
@@ -108,6 +123,39 @@ impl NapiIdentity {
         self.inner.custody_type.clone()
     }
 
+    /// Returns `true` if this identity has an agent signing key (`#agent`
+    /// verification method in the DID document).
+    ///
+    /// Returns `false` for externally loaded identities (no retained
+    /// document state).
+    ///
+    /// See ADR-039 acceptance criterion 19 and SCP-AB-016.
+    #[napi(getter, js_name = "hasAgentKey")]
+    #[must_use]
+    pub fn has_agent_key(&self) -> bool {
+        self.inner
+            .document
+            .as_ref()
+            .is_some_and(DidDocument::has_agent_key)
+    }
+
+    /// Returns the agent key's public key as a multibase-encoded string, or
+    /// `null` if no agent key exists.
+    ///
+    /// The returned string is z-base-32 multibase-encoded (prefix `z`),
+    /// matching the `publicKeyMultibase` field in the DID document.
+    ///
+    /// See ADR-039 acceptance criterion 19 and SCP-AB-016.
+    #[napi(getter, js_name = "agentPublicKey")]
+    #[must_use]
+    pub fn agent_public_key(&self) -> Option<String> {
+        self.inner
+            .document
+            .as_ref()
+            .and_then(|doc| doc.agent_verification_method())
+            .map(|vm| vm.public_key_multibase.clone())
+    }
+
     /// Rotates the active signing key for this identity.
     ///
     /// Generates a new Active Signing Key, updates the DID document on the
@@ -131,6 +179,126 @@ impl NapiIdentity {
         }
         .into())
     }
+
+    /// Adds an agent signing key to this identity (ADR-039).
+    ///
+    /// Generates a new Ed25519 keypair for the `#agent` verification method,
+    /// updates the DID document, and publishes to the DHT.
+    ///
+    /// # Returns
+    ///
+    /// A new `NapiIdentity` with the agent key added.
+    ///
+    /// # Errors
+    ///
+    /// - `SCP-IDENT-1006`: The identity already has an agent key.
+    /// - `SCP-IDENT-1007`: The identity was externally loaded (no retained
+    ///   crypto state).
+    /// - `SCP-IDENT-1001`: Key generation or DHT publishing failed.
+    ///
+    /// See ADR-039 acceptance criterion 4 and SCP-AB-016.
+    #[napi(js_name = "addAgentKey")]
+    pub async fn add_agent_key(&self) -> napi::Result<Self> {
+        let (scp_identity, custody, document) = self.extract_in_memory_state("addAgentKey")?;
+
+        let dht = DidDht::new();
+        let (new_identity, new_document) = dht
+            .add_agent_key(&scp_identity, &document, &custody.0)
+            .await
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+        let handle = Self {
+            inner: Arc::new(NapiIdentityInner {
+                did: new_identity.did.clone(),
+                custody_type: self.inner.custody_type.clone(),
+                scp_identity: Some(new_identity),
+                in_memory_custody: self.inner.in_memory_custody.clone(),
+                document: Some(new_document),
+            }),
+        };
+        increment_handle_count();
+        Ok(handle)
+    }
+
+    /// Rotates the agent signing key for this identity (ADR-039).
+    ///
+    /// Generates a new Ed25519 keypair, retires the old `#agent` key as
+    /// `#retired-agent-{sequence}`, and installs the new key as `#agent`.
+    ///
+    /// # Returns
+    ///
+    /// A new `NapiIdentity` with the rotated agent key.
+    ///
+    /// # Errors
+    ///
+    /// - `SCP-IDENT-1008`: The identity has no agent key to rotate.
+    /// - `SCP-IDENT-1007`: The identity was externally loaded (no retained
+    ///   crypto state).
+    /// - `SCP-IDENT-1001`: Key generation or DHT publishing failed.
+    ///
+    /// See ADR-039 acceptance criterion 4 and SCP-AB-016.
+    #[napi(js_name = "rotateAgentKey")]
+    pub async fn rotate_agent_key(&self) -> napi::Result<Self> {
+        let (scp_identity, custody, document) = self.extract_in_memory_state("rotateAgentKey")?;
+
+        let dht = DidDht::new();
+        let (new_identity, new_document) = dht
+            .rotate_agent_key(&scp_identity, &document, &custody.0)
+            .await
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+        let handle = Self {
+            inner: Arc::new(NapiIdentityInner {
+                did: new_identity.did.clone(),
+                custody_type: self.inner.custody_type.clone(),
+                scp_identity: Some(new_identity),
+                in_memory_custody: self.inner.in_memory_custody.clone(),
+                document: Some(new_document),
+            }),
+        };
+        increment_handle_count();
+        Ok(handle)
+    }
+
+    /// Removes the agent signing key from this identity (ADR-039).
+    ///
+    /// Removes the `#agent` verification method from the DID document and
+    /// publishes the update to the DHT.
+    ///
+    /// # Returns
+    ///
+    /// A new `NapiIdentity` with the agent key removed.
+    ///
+    /// # Errors
+    ///
+    /// - `SCP-IDENT-1009`: The identity has no agent key to remove.
+    /// - `SCP-IDENT-1007`: The identity was externally loaded (no retained
+    ///   crypto state).
+    /// - `SCP-IDENT-1001`: DHT publishing failed.
+    ///
+    /// See ADR-039 acceptance criterion 4 and SCP-AB-016.
+    #[napi(js_name = "removeAgentKey")]
+    pub async fn remove_agent_key(&self) -> napi::Result<Self> {
+        let (scp_identity, _custody, document) = self.extract_in_memory_state("removeAgentKey")?;
+
+        let dht = DidDht::new();
+        let (new_identity, new_document) = dht
+            .remove_agent_key(&scp_identity, &document)
+            .await
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+        let handle = Self {
+            inner: Arc::new(NapiIdentityInner {
+                did: new_identity.did.clone(),
+                custody_type: self.inner.custody_type.clone(),
+                scp_identity: Some(new_identity),
+                in_memory_custody: self.inner.in_memory_custody.clone(),
+                document: Some(new_document),
+            }),
+        };
+        increment_handle_count();
+        Ok(handle)
+    }
 }
 
 impl NapiIdentity {
@@ -146,6 +314,64 @@ impl NapiIdentity {
     #[allow(dead_code)]
     pub(crate) fn scp_identity(&self) -> Option<&ScpIdentity> {
         self.inner.scp_identity.as_ref()
+    }
+
+    /// Extracts the in-memory crypto state required for agent key operations.
+    ///
+    /// Returns the `ScpIdentity`, `InMemoryKeyCustody` (via `Arc`), and
+    /// `DidDocument` if this identity was created with in-memory custody.
+    /// Returns an error for externally loaded identities that have no
+    /// retained crypto state.
+    fn extract_in_memory_state(
+        &self,
+        operation: &str,
+    ) -> napi::Result<(ScpIdentity, Arc<OpaqueInMemoryKeyCustody>, DidDocument)> {
+        let scp_identity = self
+            .inner
+            .scp_identity
+            .as_ref()
+            .ok_or_else(|| {
+                NapiError::from(ScpNapiError::Identity {
+                    message: format!(
+                        "{operation} requires retained crypto state — this identity was \
+                         externally loaded and has no in-memory key material"
+                    ),
+                    code: "SCP-IDENT-1007".to_owned(),
+                })
+            })?
+            .clone();
+
+        let custody = self
+            .inner
+            .in_memory_custody
+            .as_ref()
+            .ok_or_else(|| {
+                NapiError::from(ScpNapiError::Identity {
+                    message: format!(
+                        "{operation} requires in-memory custody — this identity uses \
+                         external custody"
+                    ),
+                    code: "SCP-IDENT-1007".to_owned(),
+                })
+            })?
+            .clone();
+
+        let document = self
+            .inner
+            .document
+            .as_ref()
+            .ok_or_else(|| {
+                NapiError::from(ScpNapiError::Identity {
+                    message: format!(
+                        "{operation} requires a retained DID document — this identity \
+                         was externally loaded"
+                    ),
+                    code: "SCP-IDENT-1007".to_owned(),
+                })
+            })?
+            .clone();
+
+        Ok((scp_identity, custody, document))
     }
 }
 
@@ -184,6 +410,15 @@ pub struct NapiDIDDocument {
     pub also_known_as: Vec<String>,
     /// Service endpoint URLs declared in the DID document.
     pub service_endpoints: Vec<String>,
+    /// Whether this document contains an `#agent` verification method.
+    ///
+    /// See ADR-039 acceptance criterion 19 and SCP-AB-016.
+    pub has_agent_key: bool,
+    /// The agent key's public key as a multibase-encoded string, or `null`
+    /// if no agent key exists.
+    ///
+    /// See ADR-039 acceptance criterion 19 and SCP-AB-016.
+    pub agent_public_key: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -235,7 +470,7 @@ pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
             // all private key material and renders those handles dangling.
             let key_custody = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
             let dht = DidDht::new();
-            let (scp_identity, _document) = dht
+            let (scp_identity, document) = dht
                 .create(&key_custody.0)
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
@@ -246,6 +481,75 @@ pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
                     custody_type: "in_memory".to_owned(),
                     scp_identity: Some(scp_identity),
                     in_memory_custody: Some(key_custody),
+                    document: Some(document),
+                }),
+            };
+            increment_handle_count();
+            Ok(handle)
+        }
+        "platform" | "software" => Err(ScpNapiError::Identity {
+            message: format!(
+                "custody type {custody:?} requires a wired platform \
+                 KeyCustodyProvider — use the KeyCustodyProvider callback \
+                 interface to inject Secure Enclave (iOS) or Android \
+                 Keystore (Android) backed custody"
+            ),
+            code: "SCP-IDENT-1003".to_owned(),
+        }
+        .into()),
+        _ => Err(ScpNapiError::Identity {
+            code: "SCP-IDENT-1005".to_owned(),
+            message: format!(
+                "internal: unexpected custody type {custody:?} passed validate_custody_type — \
+                 this is a bug in the bridge layer"
+            ),
+        }
+        .into()),
+    }
+}
+
+/// Creates a new DID identity with an agent signing key.
+///
+/// Like [`identity_create`], but the resulting identity also has an `#agent`
+/// verification method in its DID document.
+///
+/// # Arguments
+///
+/// * `custody` — The custody type string: `"in_memory"`, `"platform"`, or
+///   `"software"`.
+///
+/// # Returns
+///
+/// A `Promise<NapiIdentity>` resolving to the new identity handle with
+/// `hasAgentKey === true`.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-VALID-7007` if `custody` is not a recognized value.
+/// - Rejects with `SCP-IDENT-1003` for `"platform"` or `"software"` custody.
+/// - Rejects with `SCP-IDENT-1001` if key generation or DID creation fails.
+///
+/// See ADR-039 acceptance criterion 4 and SCP-AB-016.
+#[napi(js_name = "identityCreateWithAgentKey")]
+pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<NapiIdentity> {
+    validate_custody_type(&custody).map_err(NapiError::from)?;
+
+    match custody.as_str() {
+        "in_memory" => {
+            let key_custody = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+            let dht = DidDht::new();
+            let (scp_identity, document) = dht
+                .create_with_agent_key(&key_custody.0)
+                .await
+                .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+            let handle = NapiIdentity {
+                inner: Arc::new(NapiIdentityInner {
+                    did: scp_identity.did.clone(),
+                    custody_type: "in_memory".to_owned(),
+                    scp_identity: Some(scp_identity),
+                    in_memory_custody: Some(key_custody),
+                    document: Some(document),
                 }),
             };
             increment_handle_count();
@@ -305,6 +609,7 @@ pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
             custody_type: "external".to_owned(),
             scp_identity: None,
             in_memory_custody: None,
+            document: None,
         }),
     };
     increment_handle_count();
@@ -345,6 +650,11 @@ pub async fn identity_resolve(did: String) -> napi::Result<NapiDIDDocument> {
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
+    let has_agent_key = document.has_agent_key();
+    let agent_public_key = document
+        .agent_verification_method()
+        .map(|vm| vm.public_key_multibase.clone());
+
     Ok(NapiDIDDocument {
         id: document.id.clone(),
         authentication: document.authentication.clone(),
@@ -355,5 +665,7 @@ pub async fn identity_resolve(did: String) -> napi::Result<NapiDIDDocument> {
             .iter()
             .map(|s| s.service_endpoint.clone())
             .collect(),
+        has_agent_key,
+        agent_public_key,
     })
 }
