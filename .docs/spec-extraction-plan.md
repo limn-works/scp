@@ -812,16 +812,98 @@ Processing order (dependencies first):
 18. **Verify test vectors** are reproducible from the spec alone (have someone implement from the spec, not the code)
 19. **Package test vectors** as JSON files alongside the spec documents
 
-### Phase 6: Review and Validation (2 weeks)
+### Phase 6: Review, Validation, and Cleanup (2 weeks)
 
 20. **Internal review:** Does the extracted spec fully describe the protocol? Can an independent developer implement from it?
 21. **Cross-check:** For every normative requirement in the extracted spec, verify the reference implementation conforms
 22. **Gap audit:** For every feature in the reference implementation, verify it traces to a normative requirement in the extracted spec
 23. **Security review:** Have the security analysis sections independently reviewed
+24. **README cleanup:** Remove the "Technical Deep Dive" (~600 lines), "Why Now", and "Intellectual Lineage" sections per §9 of this plan. Replace with links to the protocol spec and white paper. Migrate "Intellectual Lineage" to white paper. Migrate "Crate architecture" to Development section. Target: ~180-200 line README.
 
 ---
 
-## 9. What Stays in the Current Docs
+## 9. README Cleanup
+
+### 9.1 Current State
+
+The `README.md` is ~860 lines. Roughly 680 of those reproduce protocol specification content that will live in the extracted protocol spec and/or white paper. The README currently serves as project overview, development guide, intellectual history essay, AND a mini-spec — it should only be the first two.
+
+### 9.2 Classification
+
+| Section | Lines | Disposition |
+|---------|-------|-------------|
+| Title + tagline + "What SCP Provides" table | ~17 | **Keep** — concise project introduction |
+| "Core Concepts" | ~13 | **Keep** — brief orientation |
+| "Where SCP Fits" comparison table | ~14 | **Keep** — useful positioning, but link to white paper §2.3 for the full comparison |
+| "Architecture" (bindings table, client/server split) | ~16 | **Keep** — practical project info |
+| "Why Now" | ~8 | **Move to white paper** §1.1. Replace with one-line link: "See the [white paper](link) for the full thesis." |
+| "Intellectual Lineage" (~65 lines: prior art, theoretical, speculative/literary, meta-narrative) | ~65 | **Move to white paper** (new appendix or §16 expansion). This is excellent content — it belongs in the academic paper, not the README. |
+| **"Technical Deep Dive"** | **~600** | **Remove entirely.** Every subsection is covered by the protocol spec or white paper: |
+| — "What it is" | ~6 | Redundant with "Core Concepts" above |
+| — "The five pillars" (Identity, Contexts, Encryption, Capabilities, Trust) | ~100 | Protocol spec: SCP Identity, SCP Core, SCP Security, SCP Trust |
+| — "Cross-context communication" | ~10 | Protocol spec: SCP Cross-Context |
+| — "Provenance" | ~15 | Protocol spec: SCP Provenance |
+| — "Crate architecture" | ~12 | **Keep as brief note** in Development section (just the tree + one-liner per crate) |
+| — "What makes it different" | ~8 | White paper §1.4 / §16.2 |
+| — "Encryption and MLS — deep dive" (~200 lines) | ~200 | Protocol spec: SCP Security. Most detailed section — full MLS mapping, sender key protocol, message pipeline, replay prevention, broadcast mode, metadata privacy, relay threat model, compromise recovery |
+| — "Contexts in practice" (templates, auto-accept, standing, memory, nesting) | ~65 | Protocol spec: SCP Core |
+| — "Apps and MCP integration" | ~30 | Protocol spec: SCP Core (§8) |
+| — "Discovery and addressing" | ~25 | Protocol spec: SCP Addressing |
+| — "Economic layer" | ~40 | Protocol spec: SCP Economic |
+| — "Sybil resistance" | ~20 | Protocol spec: SCP Security |
+| Development section (prerequisites, setup, verify, relay, env vars) | ~120 | **Keep** — operational documentation |
+| License | ~10 | **Keep** |
+
+### 9.3 Target README Structure
+
+After cleanup, the README should be ~180-200 lines:
+
+```
+# Shared Context Protocol (SCP)
+Tagline + one paragraph
+
+## What SCP Provides (table — keep as-is)
+## Core Concepts (keep as-is)
+## Where SCP Fits (keep comparison table, add link to white paper)
+
+## Architecture
+- Bindings table
+- Client SDK / Server SDK split
+- Crate layout (brief tree from "Crate architecture")
+
+## Documentation
+- Link to protocol specification (the extracted standalone spec)
+- Link to white paper
+- Link to .docs/ for reference implementation docs
+
+## Development
+- Prerequisites (keep)
+- Setup (keep)
+- Verify (keep)
+- Running the Relay (keep)
+- Environment variables (keep)
+
+## License (keep)
+```
+
+### 9.4 Timing
+
+README cleanup should happen in **Phase 6** (Review and Validation), after the protocol spec and white paper exist and can be linked to. The "Intellectual Lineage" content should be migrated to the white paper during **Phase 3** (Content Extraction) since it's source material for the paper.
+
+### 9.5 Content Migration Notes
+
+**"Intellectual Lineage" → White paper.** This section is genuinely well-written and traces SCP's ideas to their origins (Dennis & Van Horn, Saltzer/Reed/Clark, Ostrom, Zooko, Vinge, Stephenson, Suarez, Banks, Doctorow). It deserves a home — just not the README. Options:
+- White paper Appendix E: "Intellectual Lineage"
+- White paper §16 expansion: fold into "Comparison with Related Work"
+- Standalone companion document: "SCP Design Influences" (if the white paper is already long enough)
+
+**"Technical Deep Dive" → already covered.** Every subsection maps directly to a protocol spec document or white paper section. No content is lost — it was already written into the specs. The README version is a less precise, less complete copy. Removing it eliminates a maintenance burden (two copies of the same information that can drift).
+
+**"Why Now" → White paper §1.1.** The ephemeral software thesis is the paper's opening argument. The README version is a compressed form of what the white paper will say more precisely.
+
+---
+
+## 10. What Stays in the Current Docs
 
 After extraction, the current `.docs/` directory retains its role as the **reference implementation documentation**:
 
@@ -853,3 +935,5 @@ The extraction is complete when:
 5. **Conformance test:** The protocol spec defines what "conforming" means, and the reference implementation demonstrably conforms.
 
 6. **Test vector test:** Language-neutral test vectors exist for all critical protocol operations, and both the reference implementation and at least one independent implementation pass them.
+
+7. **No duplication test:** The README contains no protocol specification content. It links to the protocol spec and white paper for technical depth. There is exactly one authoritative source for every protocol requirement — the extracted spec documents.
