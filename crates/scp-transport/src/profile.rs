@@ -266,9 +266,15 @@ impl TransportProfile {
         CoverTrafficTier::from_profile(*self)
     }
 
-    /// Returns the platform-inferred default profile.
+    /// Returns the transport profile for the current platform.
     ///
-    /// Uses a two-stage strategy per spec section 10.13.1:
+    /// Checks the `SCP_TRANSPORT_PROFILE` environment variable first. If set,
+    /// the value must be one of `server`, `desktop`, `mobile`, `constrained`
+    /// (case-insensitive). This allows operators to override profile inference
+    /// in containers or other environments where automatic detection is
+    /// unreliable.
+    ///
+    /// Falls back to compile-time platform inference with runtime refinement:
     ///
     /// 1. **Compile-time:** `#[cfg(target_os)]` narrows the candidate set.
     ///    - iOS / Android -> `Mobile`
@@ -280,16 +286,39 @@ impl TransportProfile {
     ///    - Headless (no `$DISPLAY`, no `$WAYLAND_DISPLAY`) AND >2 GB RAM -> `Server`
     ///    - <256 MB RAM OR small architecture (arm, riscv32, mips) -> `Constrained`
     ///    - Fallback -> `Desktop`
-    ///
-    /// Operators deploying SCP on Linux servers SHOULD set the profile
-    /// explicitly. Runtime heuristics are best-effort defaults.
-    // Cannot be const: Linux runtime refinement reads env vars and /proc/meminfo.
-    // On non-Linux targets the underlying fn is const, but the method signature
-    // must be uniform across all platforms.
-    #[allow(clippy::missing_const_for_fn)]
+    // Cannot be const: reads env vars and (on Linux) /proc/meminfo.
     #[must_use]
     pub fn platform_default() -> Self {
+        // Environment variable override for containers/CI/explicit configuration.
+        if let Ok(val) = std::env::var("SCP_TRANSPORT_PROFILE") {
+            if let Some(profile) = parse_profile_env_value(&val) {
+                return profile;
+            }
+            tracing::warn!(
+                value = %val,
+                "unrecognized SCP_TRANSPORT_PROFILE value, falling back to platform inference"
+            );
+        }
+
         platform_default_impl()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Environment variable parsing
+// ---------------------------------------------------------------------------
+
+/// Parses a `SCP_TRANSPORT_PROFILE` environment variable value into a
+/// [`TransportProfile`].
+///
+/// Case-insensitive. Returns `None` for unrecognized values.
+fn parse_profile_env_value(val: &str) -> Option<TransportProfile> {
+    match val.to_ascii_lowercase().as_str() {
+        "server" => Some(TransportProfile::Server),
+        "desktop" => Some(TransportProfile::Desktop),
+        "mobile" => Some(TransportProfile::Mobile),
+        "constrained" => Some(TransportProfile::Constrained),
+        _ => None,
     }
 }
 
@@ -759,6 +788,55 @@ mod tests {
         // Verify Debug is implemented (compilation test + basic check).
         let debug = format!("{:?}", TransportProfile::Mobile);
         assert!(debug.contains("Mobile"));
+    }
+
+    // -- Environment variable override parsing --
+    //
+    // The actual env-var reading in `platform_default()` cannot be tested
+    // directly because `set_var`/`remove_var` are unsafe under
+    // `#![forbid(unsafe_code)]`. Instead, we test the extracted parsing
+    // function `parse_profile_env_value()` which exercises the same logic.
+
+    #[test]
+    fn profile_env_parse_server() {
+        assert_eq!(
+            super::parse_profile_env_value("server"),
+            Some(TransportProfile::Server)
+        );
+    }
+
+    #[test]
+    fn profile_env_parse_desktop_case_insensitive() {
+        assert_eq!(
+            super::parse_profile_env_value("Desktop"),
+            Some(TransportProfile::Desktop)
+        );
+    }
+
+    #[test]
+    fn profile_env_parse_mobile_uppercase() {
+        assert_eq!(
+            super::parse_profile_env_value("MOBILE"),
+            Some(TransportProfile::Mobile)
+        );
+    }
+
+    #[test]
+    fn profile_env_parse_constrained_mixed_case() {
+        assert_eq!(
+            super::parse_profile_env_value("Constrained"),
+            Some(TransportProfile::Constrained)
+        );
+    }
+
+    #[test]
+    fn profile_env_parse_invalid_returns_none() {
+        assert_eq!(super::parse_profile_env_value("invalid-value"), None);
+    }
+
+    #[test]
+    fn profile_env_parse_empty_returns_none() {
+        assert_eq!(super::parse_profile_env_value(""), None);
     }
 
     // -- TransportConfig integration is tested in config.rs --

@@ -388,10 +388,50 @@ impl TransportAdapter for UdpDtlsAdapter {
 ///
 /// The context is configured with:
 /// - DTLS method (supporting DTLS 1.2; DTLS 1.3 when OpenSSL adds support)
-/// - No certificate verification (relays are untrusted per ADR-004)
+/// - No server certificate verification (intentional — see security rationale below)
+/// - DTLS 1.2 minimum version
+/// - AEAD cipher suites with forward secrecy (ECDHE + AES-GCM)
 ///
-/// Relay authentication happens at the protocol layer inside the MLS-encrypted
-/// envelope (section 9.13), not at the transport layer.
+/// # Security rationale: why relay certificate verification is intentionally skipped
+///
+/// SCP relays are **untrusted by design** (ADR-004). This is not a shortcut — it is a
+/// core protocol tenet. Relay certificate verification is skipped for four distinct
+/// reasons that together form a coherent security model:
+///
+/// **1. Content security does not depend on the relay.** Every message payload is
+/// MLS-encrypted before it reaches the transport layer (§9.13). A relay that is
+/// fully MITM'd — even one that can see, copy, replay, or drop DTLS records — cannot
+/// read, forge, or modify plaintext content. The MLS group key is the only meaningful
+/// content-security boundary, and it is never exposed to the relay.
+///
+/// **2. Certificate verification would introduce an operator dependency.** Verifying
+/// a relay's certificate requires either a trusted CA or certificate pinning. A CA
+/// creates centralized infrastructure — a single entity (Limn or another operator)
+/// that must remain online and trustworthy for the protocol to work. Certificate
+/// pinning requires relay-specific configuration that must be distributed out-of-band.
+/// Both options violate the "protocol requires no operator" tenet: the protocol must
+/// function even if Limn disappears tomorrow.
+///
+/// **3. Metadata protection is handled at the protocol layer, not the transport layer.**
+/// DTLS certificate verification addresses server identity, not traffic analysis.
+/// Metadata privacy (who talks to whom, when, how often) is provided by routing
+/// pseudonyms (§9.10.4) and cover traffic (§9.10.6). These mechanisms operate above
+/// the transport and are independent of whether the relay's DTLS certificate is
+/// verified. A MITM attacker who can observe DTLS records already sees the same
+/// metadata that a verified relay would see — certificate verification does not
+/// reduce this exposure.
+///
+/// **4. Constrained devices cannot maintain CA certificate stores.** UDP/DTLS targets
+/// environments — `IoT`, embedded, constrained-node networks — where persistent storage
+/// for CA bundles is often unavailable or impractical. Requiring certificate
+/// verification would exclude an entire class of legitimate SCP participants.
+///
+/// **What DTLS still provides without certificate verification:** The handshake still
+/// performs an ECDHE key exchange, so the session is encrypted against passive
+/// eavesdroppers. An on-path attacker who can substitute the server's ephemeral key
+/// could decrypt the DTLS-layer traffic, but as noted above, all application-layer
+/// content is independently protected by MLS. The WebSocket relay adapter follows the
+/// same model for the same reasons.
 ///
 /// # Errors
 ///
@@ -399,10 +439,14 @@ impl TransportAdapter for UdpDtlsAdapter {
 fn build_dtls_context() -> Result<SslContext, openssl::error::ErrorStack> {
     let mut builder = SslConnector::builder(SslMethod::dtls())?;
 
-    // Disable verification -- relay authentication happens at the protocol
-    // layer inside the MLS-encrypted envelope (section 9.13), not at the
-    // transport layer. This is consistent with the native relay model
-    // (ADR-004) where relays are untrusted.
+    // Server certificate verification is intentionally disabled. Relays are untrusted
+    // by design (ADR-004): all application content is MLS-encrypted before reaching
+    // the transport layer (§9.13), so relay identity does not gate content security.
+    // Requiring verification would introduce a CA or pinning dependency that violates
+    // the "protocol requires no operator" tenet, and is impractical on constrained
+    // devices. Metadata privacy is provided by routing pseudonyms and cover traffic
+    // (§9.10.4, §9.10.6), not by transport-layer certificate checks. See full
+    // rationale in the doc comment above.
     builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
 
     // Enforce DTLS 1.2 minimum — disables DTLSv1.0 (spec §9.13, §10.16.1).

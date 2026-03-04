@@ -1306,6 +1306,8 @@ async fn handle_delete(
     clippy::too_many_lines
 )]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::native::storage::BlobStorageBackend;
     use futures::{SinkExt, StreamExt};

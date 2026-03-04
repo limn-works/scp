@@ -270,8 +270,11 @@ mod tests {
     /// Builds a client DTLS context (no certificate verification).
     ///
     /// Matches production cipher settings: DTLS 1.2 minimum, ECDHE-ECDSA-AES-GCM only.
+    /// Certificate verification is skipped here to mirror production behaviour — see
+    /// the `build_dtls_context` doc comment in `udp/adapter.rs` for full rationale.
     fn build_test_client_ctx() -> SslContext {
         let mut builder = SslContext::builder(SslMethod::dtls()).unwrap();
+        // Mirror production: relays are untrusted (ADR-004); MLS protects content (§9.13).
         builder.set_verify(SslVerifyMode::NONE);
         builder
             .set_min_proto_version(Some(SslVersion::DTLS1_2))
@@ -287,8 +290,13 @@ mod tests {
     /// Uses `SslContext::builder(SslMethod::dtls())` directly rather than
     /// `SslAcceptor::mozilla_intermediate_v5` — the latter configures TLS 1.3
     /// cipher suites that are incompatible with DTLSv1.2.
+    ///
+    /// Certificate verification is disabled on both sides: in tests the server holds a
+    /// self-signed certificate (no CA), which matches the production model where relays
+    /// are untrusted and client code skips server verification (ADR-004, §9.13).
     fn build_test_server_ctx() -> SslContext {
         let mut builder = SslContext::builder(SslMethod::dtls()).unwrap();
+        // Mirror production: relays are untrusted (ADR-004); MLS protects content (§9.13).
         builder.set_verify(SslVerifyMode::NONE);
         builder
             .set_min_proto_version(Some(SslVersion::DTLS1_2))

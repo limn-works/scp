@@ -73,24 +73,39 @@ const DEFAULT_BLOB_TTL: u32 = 3600;
 
 /// Wrapper to make `!Send` JS types satisfy `Send + Sync`.
 ///
-/// SAFETY: WASM is single-threaded. The wrapped value is never accessed from
-/// multiple threads. This wrapper exists solely to satisfy the `Send + Sync`
-/// bounds required by `TransportAdapter`. If WASM threads (SharedArrayBuffer)
-/// are adopted, this must be replaced with `postMessage`-based marshalling.
+/// # Safety invariant
 ///
-/// Gated to `wasm32` targets only — on non-WASM targets the blanket
-/// `unsafe impl` would be unsound.
-#[cfg(target_arch = "wasm32")]
+/// This is sound **only** on single-threaded WASM runtimes (the standard
+/// `wasm32-unknown-unknown` target without the `atomics` target feature).
+/// The wrapped `JsValue`-containing types are never accessed from multiple
+/// threads because there is only one thread.
+///
+/// If WASM gains threading support (SharedArrayBuffer + `atomics` target
+/// feature), this wrapper becomes unsound. The compile-time guard below
+/// ensures a hard error in that case — the migration path is
+/// `postMessage`-based marshalling between workers.
+///
+/// The wrapper exists solely to satisfy the `Send + Sync` bounds required
+/// by [`TransportAdapter`]. On non-WASM targets the struct is not compiled.
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
 struct SendSyncWrapper<T>(T);
 
-// SAFETY: WASM is single-threaded -- no concurrent access possible.
-#[cfg(target_arch = "wasm32")]
+// Fail compilation if someone enables WASM threads — the SendSyncWrapper
+// would be unsound with concurrent access to JsValue.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+compile_error!(
+    "SendSyncWrapper is unsound with WASM threads (atomics target feature). \
+     Replace with postMessage-based marshalling for cross-worker JsValue access."
+);
+
+// SAFETY: WASM without atomics is single-threaded — no concurrent access.
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
 unsafe impl<T> Send for SendSyncWrapper<T> {}
-// SAFETY: WASM is single-threaded -- no concurrent access possible.
-#[cfg(target_arch = "wasm32")]
+// SAFETY: WASM without atomics is single-threaded — no concurrent access.
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
 unsafe impl<T> Sync for SendSyncWrapper<T> {}
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
 impl<T> SendSyncWrapper<T> {
     fn new(val: T) -> Self {
         Self(val)

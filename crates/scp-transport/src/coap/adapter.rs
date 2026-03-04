@@ -55,6 +55,12 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 /// require block-wise transfer (RFC 7959).
 pub const RECOMMENDED_MAX_BLOB_SIZE: usize = 1024;
 
+/// Default maximum reassembled payload size for block-wise transfers.
+///
+/// 256 KiB is appropriate for constrained devices (§10.16.2). The per-adapter
+/// limit can be overridden via [`CoapAdapter::with_max_reassembly_bytes`].
+pub const DEFAULT_MAX_REASSEMBLY_BYTES: usize = 262_144;
+
 /// Default CoAP block size exponent (SZX=6 -> 1024 bytes).
 /// Used when initiating block-wise transfers for large payloads.
 pub const DEFAULT_BLOCK_SZX: u8 = 6;
@@ -107,6 +113,13 @@ pub struct CoapAdapter {
     /// Initialized to a random value per RFC 7252 section 4.4 to prevent
     /// cross-talk between adapter instances on the same network.
     next_message_id: AtomicU16,
+
+    /// Maximum reassembled payload size in bytes for block-wise transfers.
+    ///
+    /// Protects constrained devices from memory exhaustion when a server
+    /// sends large block-wise responses. Defaults to
+    /// [`DEFAULT_MAX_REASSEMBLY_BYTES`] (256 KiB).
+    max_reassembly_bytes: usize,
 }
 
 impl std::fmt::Debug for CoapAdapter {
@@ -140,7 +153,18 @@ impl CoapAdapter {
             ssl_ctx,
             dtls_session: Arc::new(Mutex::new(None)),
             next_message_id: AtomicU16::new(initial_msg_id),
+            max_reassembly_bytes: DEFAULT_MAX_REASSEMBLY_BYTES,
         })
+    }
+
+    /// Sets the maximum reassembled payload size for block-wise transfers.
+    ///
+    /// Defaults to [`DEFAULT_MAX_REASSEMBLY_BYTES`] (256 KiB). Constrained
+    /// devices may want to lower this further; servers may raise it.
+    #[must_use]
+    pub const fn with_max_reassembly_bytes(mut self, max: usize) -> Self {
+        self.max_reassembly_bytes = max;
+        self
     }
 
     /// Returns the relay address this adapter is configured to connect to.
@@ -258,8 +282,10 @@ impl CoapAdapter {
 
     /// Maximum number of block-wise transfer iterations to prevent infinite
     /// loops from a malicious or buggy server sending `more=true` forever.
-    /// 1024 blocks at SZX=6 (1024 bytes/block) = 1 MiB maximum reassembled payload.
-    const MAX_BLOCKWISE_ITERATIONS: u32 = 1024;
+    ///
+    /// 512 blocks at SZX=6 (1024 bytes/block) = 512 KiB maximum, but the
+    /// effective limit is `max_reassembly_bytes` (default 256 KiB).
+    const MAX_BLOCKWISE_ITERATIONS: u32 = 512;
 
     /// Handles block-wise transfer for large QUERY responses (RFC 7959 Block2).
     ///
@@ -320,6 +346,13 @@ impl CoapAdapter {
             }
 
             full_payload.extend_from_slice(&response.payload);
+
+            if full_payload.len() > self.max_reassembly_bytes {
+                return Err(TransportError::PayloadTooLarge(format!(
+                    "blockwise reassembly exceeded {} bytes",
+                    self.max_reassembly_bytes
+                )));
+            }
 
             match CoapResponseParser::block2_option(&response) {
                 Some(b) if b.more => {
@@ -690,10 +723,50 @@ fn process_observe_notification(
 ///
 /// The context is configured with:
 /// - DTLS method (supporting DTLS 1.2; DTLS 1.3 when OpenSSL adds support)
-/// - No client certificate verification (relays are untrusted per ADR-004)
+/// - No server certificate verification (intentional — see security rationale below)
+/// - DTLS 1.2 minimum version
+/// - AEAD cipher suites with forward secrecy (ECDHE + AES-GCM)
 ///
-/// Relay authentication happens at the protocol layer inside the MLS-encrypted
-/// envelope (section 9.13), not at the transport layer.
+/// # Security rationale: why relay certificate verification is intentionally skipped
+///
+/// SCP relays are **untrusted by design** (ADR-004). This is not a shortcut — it is a
+/// core protocol tenet. Relay certificate verification is skipped for four distinct
+/// reasons that together form a coherent security model:
+///
+/// **1. Content security does not depend on the relay.** Every message payload is
+/// MLS-encrypted before it reaches the transport layer (§9.13). A relay that is
+/// fully MITM'd — even one that can see, copy, replay, or drop DTLS records — cannot
+/// read, forge, or modify plaintext content. The MLS group key is the only meaningful
+/// content-security boundary, and it is never exposed to the relay.
+///
+/// **2. Certificate verification would introduce an operator dependency.** Verifying
+/// a relay's certificate requires either a trusted CA or certificate pinning. A CA
+/// creates centralized infrastructure — a single entity (Limn or another operator)
+/// that must remain online and trustworthy for the protocol to work. Certificate
+/// pinning requires relay-specific configuration that must be distributed out-of-band.
+/// Both options violate the "protocol requires no operator" tenet: the protocol must
+/// function even if Limn disappears tomorrow.
+///
+/// **3. Metadata protection is handled at the protocol layer, not the transport layer.**
+/// DTLS certificate verification addresses server identity, not traffic analysis.
+/// Metadata privacy (who talks to whom, when, how often) is provided by routing
+/// pseudonyms (§9.10.4) and cover traffic (§9.10.6). These mechanisms operate above
+/// the transport and are independent of whether the relay's DTLS certificate is
+/// verified. A MITM attacker who can observe DTLS records already sees the same
+/// metadata that a verified relay would see — certificate verification does not
+/// reduce this exposure.
+///
+/// **4. Constrained devices cannot maintain CA certificate stores.** CoAP targets
+/// embedded and constrained environments (RFC 7252, RFC 8323) where persistent storage
+/// for CA bundles is often unavailable or impractical. Requiring certificate
+/// verification would exclude an entire class of legitimate SCP participants.
+///
+/// **What DTLS still provides without certificate verification:** The handshake still
+/// performs an ECDHE key exchange, so the session is encrypted against passive
+/// eavesdroppers. An on-path attacker who can substitute the server's ephemeral key
+/// could decrypt the DTLS-layer traffic, but as noted above, all application-layer
+/// content is independently protected by MLS. The WebSocket relay adapter follows the
+/// same model for the same reasons.
 ///
 /// # Errors
 ///
@@ -701,10 +774,14 @@ fn process_observe_notification(
 fn build_dtls_context() -> Result<SslContext, openssl::error::ErrorStack> {
     let mut builder = SslConnector::builder(SslMethod::dtls())?;
 
-    // Disable verification -- relay authentication happens at the protocol
-    // layer inside the MLS-encrypted envelope (section 9.13), not at the
-    // transport layer. This is consistent with the native relay model (ADR-004)
-    // where relays are untrusted.
+    // Server certificate verification is intentionally disabled. Relays are untrusted
+    // by design (ADR-004): all application content is MLS-encrypted before reaching
+    // the transport layer (§9.13), so relay identity does not gate content security.
+    // Requiring verification would introduce a CA or pinning dependency that violates
+    // the "protocol requires no operator" tenet, and is impractical on constrained
+    // devices (CoAP targets RFC 7252 embedded environments). Metadata privacy is
+    // provided by routing pseudonyms and cover traffic (§9.10.4, §9.10.6), not by
+    // transport-layer certificate checks. See full rationale in the doc comment above.
     builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
 
     // Enforce DTLS 1.2 minimum — disables DTLSv1.0 (spec §9.13, §10.16.1).
@@ -847,11 +924,37 @@ mod tests {
         assert_ne!(t1, t2);
     }
 
-    // ---- Recommended max blob size ----
+    // ---- Reassembly limits ----
 
     #[test]
     fn recommended_max_blob_size_is_1024() {
         assert_eq!(RECOMMENDED_MAX_BLOB_SIZE, 1024);
+    }
+
+    #[test]
+    fn default_max_reassembly_bytes_is_256_kib() {
+        assert_eq!(DEFAULT_MAX_REASSEMBLY_BYTES, 262_144);
+    }
+
+    #[test]
+    fn max_blockwise_iterations_is_512() {
+        assert_eq!(CoapAdapter::MAX_BLOCKWISE_ITERATIONS, 512);
+    }
+
+    #[test]
+    fn with_max_reassembly_bytes_overrides_default() {
+        let addr: SocketAddr = "127.0.0.1:5684".parse().unwrap();
+        let adapter = CoapAdapter::new(addr)
+            .unwrap()
+            .with_max_reassembly_bytes(128_000);
+        assert_eq!(adapter.max_reassembly_bytes, 128_000);
+    }
+
+    #[test]
+    fn default_max_reassembly_bytes_set_on_construction() {
+        let addr: SocketAddr = "127.0.0.1:5684".parse().unwrap();
+        let adapter = CoapAdapter::new(addr).unwrap();
+        assert_eq!(adapter.max_reassembly_bytes, DEFAULT_MAX_REASSEMBLY_BYTES);
     }
 
     // ---- Method mapping produces correct CoAP request types ----

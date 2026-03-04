@@ -61,4 +61,14 @@ pub enum TransportError {
     /// See SCP-261 and spec section 10.16.1 point 6.
     #[error("not supported: {0}")]
     NotSupported(String),
+
+    /// A received or reassembled payload exceeds the adapter's configured
+    /// maximum size.
+    ///
+    /// This protects constrained devices from memory exhaustion during
+    /// operations like CoAP block-wise reassembly (RFC 7959) where a
+    /// malicious or misconfigured server could send arbitrarily large
+    /// payloads.
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
 }

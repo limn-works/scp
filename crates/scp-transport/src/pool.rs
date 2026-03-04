@@ -33,6 +33,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
+use crate::error::TransportError;
 use crate::traits::TransportAdapter;
 
 // ---------------------------------------------------------------------------
@@ -228,6 +229,49 @@ impl ConnectionPool {
         let arc_adapter = Arc::new(adapter);
         entries.insert(key, Arc::clone(&arc_adapter));
         arc_adapter
+    }
+
+    /// Returns the adapter for the given key if one exists, or calls the
+    /// factory to create and insert a new one.
+    ///
+    /// Unlike [`get_or_insert`](Self::get_or_insert), this defers adapter
+    /// construction until it's known that no existing connection exists —
+    /// avoiding wasted work (and potentially wasted network connections)
+    /// when the key is already present.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error returned by the factory closure.
+    pub fn get_or_try_insert_with<F>(
+        &self,
+        key: PoolKey,
+        factory: F,
+    ) -> Result<Arc<Box<dyn TransportAdapter>>, TransportError>
+    where
+        F: FnOnce() -> Result<Box<dyn TransportAdapter>, TransportError>,
+    {
+        // Fast path: check if the key already exists (read lock).
+        if let Some(existing) = self.get(&key) {
+            return Ok(existing);
+        }
+
+        // Slow path: acquire write lock and re-check (double-checked locking).
+        let mut entries = self
+            .entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Re-check after acquiring write lock -- another thread may have
+        // inserted between the read and write lock acquisitions.
+        if let Some(existing) = entries.get(&key) {
+            return Ok(Arc::clone(existing));
+        }
+
+        let adapter = factory()?;
+        let arc_adapter = Arc::new(adapter);
+        entries.insert(key, Arc::clone(&arc_adapter));
+        drop(entries);
+        Ok(arc_adapter)
     }
 
     /// Inserts an adapter for the given key, replacing any existing entry.
@@ -651,6 +695,80 @@ mod tests {
 
         // Both managers got the same adapter.
         assert!(Arc::ptr_eq(&adapter, &adapter_from_pool2.unwrap()));
+    }
+
+    #[test]
+    fn pool_get_or_try_insert_with_defers_construction() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let pool = ConnectionPool::new();
+        let key = PoolKey::new(
+            "wss://relay.example.com/scp/v1".to_owned(),
+            TransportType::NativeWebSocket,
+        );
+
+        // Pre-insert an adapter for the key.
+        pool.insert(key.clone(), Box::new(MockPoolAdapter::new("existing")));
+
+        // Factory should NOT be called when key exists.
+        let factory_called = Arc::new(AtomicBool::new(false));
+        let factory_called_clone = Arc::clone(&factory_called);
+        let result = pool.get_or_try_insert_with(key, move || {
+            factory_called_clone.store(true, Ordering::SeqCst);
+            Ok(Box::new(MockPoolAdapter::new("should-not-be-used")) as Box<dyn TransportAdapter>)
+        });
+        assert!(result.is_ok());
+        assert!(
+            !factory_called.load(Ordering::SeqCst),
+            "factory should NOT be called when key exists"
+        );
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn pool_get_or_try_insert_with_calls_factory_when_missing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let pool = ConnectionPool::new();
+        let key = PoolKey::new(
+            "wss://relay.example.com/scp/v1".to_owned(),
+            TransportType::NativeWebSocket,
+        );
+
+        // Factory IS called when key is missing.
+        let factory_called = Arc::new(AtomicBool::new(false));
+        let factory_called_clone = Arc::clone(&factory_called);
+        let result = pool.get_or_try_insert_with(key.clone(), move || {
+            factory_called_clone.store(true, Ordering::SeqCst);
+            Ok(Box::new(MockPoolAdapter::new("new-adapter")) as Box<dyn TransportAdapter>)
+        });
+        assert!(result.is_ok());
+        assert!(
+            factory_called.load(Ordering::SeqCst),
+            "factory SHOULD be called when key is missing"
+        );
+        assert_eq!(pool.len(), 1);
+        assert!(pool.contains_key(&key));
+    }
+
+    #[test]
+    fn pool_get_or_try_insert_with_propagates_factory_error() {
+        let pool = ConnectionPool::new();
+        let key = PoolKey::new(
+            "wss://relay.example.com/scp/v1".to_owned(),
+            TransportType::NativeWebSocket,
+        );
+
+        let result = pool.get_or_try_insert_with(key, || {
+            Err(TransportError::ConnectionFailed(
+                "factory failed".to_owned(),
+            ))
+        });
+        assert!(result.is_err());
+        assert!(
+            pool.is_empty(),
+            "pool should remain empty when factory errors"
+        );
     }
 
     #[test]

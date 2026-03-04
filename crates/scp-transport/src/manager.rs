@@ -58,6 +58,13 @@ const MIN_RELAYS_PER_CONTEXT: usize = 3;
 /// returns an error (insufficient redundancy).
 const MIN_SUCCESSFUL_SENDS: usize = 2;
 
+/// Idle threshold for mobile connection shedding (spec section 10.13.3 item 3).
+///
+/// The `Mobile` profile proactively sheds connections for inactive contexts
+/// (no sends or receives in the last 5 minutes) and relies on the push
+/// notification bridge (§10.7) to wake the connection on new messages.
+const MOBILE_IDLE_THRESHOLD: Duration = Duration::from_secs(300);
+
 /// Outcome of an LRU eviction triggered by connection budget enforcement.
 ///
 /// Returned by [`TransportManager::add_adapter`] when the connection budget
@@ -1068,6 +1075,122 @@ impl TransportManager {
                 }
             }
         }
+    }
+
+    /// Proactively sheds connections for contexts that have been idle longer
+    /// than [`MOBILE_IDLE_THRESHOLD`] (5 minutes).
+    ///
+    /// **Only operates when `profile` is [`TransportProfile::Mobile`].** For
+    /// all other profiles this is a no-op returning an empty `Vec`.
+    ///
+    /// Idle adapters are processed from highest index to lowest so that
+    /// `reindex_after_removal` shifts do not invalidate indices still
+    /// pending removal within the same call.
+    ///
+    /// Subscriptions on shed connections are migrated to a surviving adapter
+    /// that shares at least one context relay set with the evicted adapter,
+    /// following the same migration logic as
+    /// [`evict_lru_connection`](Self::evict_lru_connection).
+    ///
+    /// The caller is expected to rely on the push notification bridge (§10.7)
+    /// to wake connections on new messages for shed contexts.
+    ///
+    /// See spec section 10.13.3 item 3.
+    pub fn shed_idle_connections(&mut self, profile: &TransportProfile) -> Vec<EvictionOutcome> {
+        if !matches!(profile, TransportProfile::Mobile) {
+            return Vec::new();
+        }
+
+        let now = Instant::now();
+        let threshold = MOBILE_IDLE_THRESHOLD;
+
+        // Collect indices of adapters whose last-used timestamp is older than
+        // the idle threshold. Adapters without a recorded timestamp are treated
+        // as idle (they were never used).
+        let idle_indices: Vec<usize> = {
+            let last_used = self
+                .connection_last_used
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            (0..self.adapters.len())
+                .filter(|&idx| {
+                    last_used
+                        .get(&idx)
+                        .is_none_or(|&ts| now.duration_since(ts) >= threshold)
+                })
+                .collect()
+        };
+
+        if idle_indices.is_empty() {
+            return Vec::new();
+        }
+
+        let mut outcomes = Vec::with_capacity(idle_indices.len());
+
+        // Process from highest index to lowest so that removals + reindex
+        // shifts do not affect indices still pending in this loop.
+        for &idx in idle_indices.iter().rev() {
+            // After prior removals in this loop, `idx` may be out of bounds
+            // if a reindex shifted things. Guard against that.
+            if idx >= self.adapters.len() {
+                continue;
+            }
+
+            let affected_subscriptions = self.collect_affected_subscriptions(idx);
+            let migration_target = self.find_migration_target(idx);
+
+            // Migrate subscription records to the target adapter if one exists.
+            if let Some(target) = migration_target
+                && let Ok(mut subs) = self.active_subscriptions.write()
+            {
+                let migrated = subs.remove(&idx).unwrap_or_default();
+                subs.entry(target).or_default().extend(migrated);
+            }
+
+            // Remove the adapter and reindex all data structures.
+            self.adapters.remove(idx);
+            self.reindex_after_removal(idx);
+
+            let adjusted_target = migration_target.map(|t| if t > idx { t - 1 } else { t });
+
+            outcomes.push(EvictionOutcome {
+                evicted_index: idx,
+                affected_subscriptions,
+                migrated_to: adjusted_target,
+            });
+        }
+
+        tracing::info!(
+            shed_count = outcomes.len(),
+            remaining_connections = self.adapters.len(),
+            "mobile shedding: closed {} idle connections",
+            outcomes.len(),
+        );
+
+        outcomes
+    }
+
+    /// Returns the number of adapters whose last-used timestamp is older than
+    /// the given `threshold`.
+    ///
+    /// Useful for introspection and monitoring without actually shedding
+    /// connections. Adapters without a recorded timestamp are counted as idle.
+    #[must_use]
+    pub fn idle_connection_count(&self, threshold: Duration) -> usize {
+        let now = Instant::now();
+        let last_used = self
+            .connection_last_used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        (0..self.adapters.len())
+            .filter(|&idx| {
+                last_used
+                    .get(&idx)
+                    .is_none_or(|&ts| now.duration_since(ts) >= threshold)
+            })
+            .count()
     }
 }
 
@@ -2694,6 +2817,197 @@ mod tests {
             manager.active_connection_count(),
             10,
             "should remain at budget after eviction"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Mobile connection shedding tests (section 10.13.3 item 3)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn mobile_shedding_closes_idle_connections() {
+        let config = TransportConfig {
+            profile: TransportProfile::Mobile,
+            ..TransportConfig::default()
+        };
+        let mut manager = TransportManager::with_config(&config);
+
+        // Add 3 adapters.
+        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        assert_eq!(manager.active_connection_count(), 3);
+
+        // Manually backdate adapters 0 and 1 past the idle threshold.
+        // Adapter 2 remains recently used.
+        {
+            let mut last_used = manager.connection_last_used.lock().unwrap();
+            let old_time = Instant::now()
+                .checked_sub(Duration::from_secs(600))
+                .unwrap();
+            last_used.insert(0, old_time);
+            last_used.insert(1, old_time);
+            // Adapter 2 keeps its current (recent) timestamp.
+        }
+
+        let outcomes = manager.shed_idle_connections(&TransportProfile::Mobile);
+        assert_eq!(outcomes.len(), 2, "should shed 2 idle connections");
+        assert_eq!(
+            manager.active_connection_count(),
+            1,
+            "only the active adapter should remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn mobile_shedding_ignores_non_mobile_profiles() {
+        let config = TransportConfig {
+            profile: TransportProfile::Desktop,
+            ..TransportConfig::default()
+        };
+        let mut manager = TransportManager::with_config(&config);
+
+        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+
+        // Backdate both adapters past the idle threshold.
+        {
+            let mut last_used = manager.connection_last_used.lock().unwrap();
+            let old_time = Instant::now()
+                .checked_sub(Duration::from_secs(600))
+                .unwrap();
+            last_used.insert(0, old_time);
+            last_used.insert(1, old_time);
+        }
+
+        // Desktop profile — shedding should be a no-op.
+        let outcomes = manager.shed_idle_connections(&TransportProfile::Desktop);
+        assert_eq!(outcomes.len(), 0, "non-mobile profile should not shed");
+        assert_eq!(
+            manager.active_connection_count(),
+            2,
+            "all adapters should remain"
+        );
+
+        // Also verify Server and Constrained profiles are no-ops.
+        let outcomes = manager.shed_idle_connections(&TransportProfile::Server);
+        assert_eq!(outcomes.len(), 0);
+        let outcomes = manager.shed_idle_connections(&TransportProfile::Constrained);
+        assert_eq!(outcomes.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn mobile_shedding_migrates_subscriptions() {
+        let config = TransportConfig {
+            profile: TransportProfile::Mobile,
+            ..TransportConfig::default()
+        };
+        let mut manager = TransportManager::with_config(&config);
+
+        // Add 2 adapters.
+        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+
+        // Assign both adapters to a shared context so migration can occur.
+        let ctx = "ctx-shed-migrate".to_string();
+        manager
+            .relay_assignments
+            .write()
+            .unwrap()
+            .insert(ctx, vec![0, 1]);
+
+        // Record a subscription on adapter 0.
+        let routing_id = RoutingId::new([0xDD; 32]);
+        manager.record_subscription(0, &routing_id);
+
+        // Verify the subscription is recorded.
+        assert!(
+            manager
+                .active_subscriptions
+                .read()
+                .unwrap()
+                .get(&0)
+                .is_some_and(|ids| ids.contains(&routing_id)),
+            "subscription should be recorded on adapter 0"
+        );
+
+        // Backdate adapter 0 past the idle threshold. Adapter 1 stays recent.
+        {
+            let mut last_used = manager.connection_last_used.lock().unwrap();
+            let old_time = Instant::now()
+                .checked_sub(Duration::from_secs(600))
+                .unwrap();
+            last_used.insert(0, old_time);
+        }
+
+        let outcomes = manager.shed_idle_connections(&TransportProfile::Mobile);
+        assert_eq!(outcomes.len(), 1, "should shed 1 idle connection");
+        assert_eq!(outcomes[0].evicted_index, 0);
+        assert_eq!(outcomes[0].affected_subscriptions.len(), 1);
+        assert_eq!(outcomes[0].affected_subscriptions[0], routing_id);
+        assert!(
+            outcomes[0].migrated_to.is_some(),
+            "subscription should be migrated to surviving adapter"
+        );
+        assert_eq!(
+            manager.active_connection_count(),
+            1,
+            "only the active adapter should remain"
+        );
+
+        // Verify the subscription was migrated to the surviving adapter (now
+        // index 0 after reindex).
+        assert!(
+            manager
+                .active_subscriptions
+                .read()
+                .unwrap()
+                .get(&0)
+                .is_some_and(|ids| ids.contains(&routing_id)),
+            "subscription should be migrated to surviving adapter (reindexed to 0)"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_connection_count_introspection() {
+        let config = TransportConfig {
+            profile: TransportProfile::Mobile,
+            ..TransportConfig::default()
+        };
+        let mut manager = TransportManager::with_config(&config);
+
+        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+        manager.add_adapter(Box::new(MockAdapter::succeeding()));
+
+        // All adapters are recent — none should be idle.
+        assert_eq!(
+            manager.idle_connection_count(Duration::from_secs(300)),
+            0,
+            "no connections should be idle immediately after creation"
+        );
+
+        // Backdate 2 of 3 adapters.
+        {
+            let mut last_used = manager.connection_last_used.lock().unwrap();
+            let old_time = Instant::now()
+                .checked_sub(Duration::from_secs(600))
+                .unwrap();
+            last_used.insert(0, old_time);
+            last_used.insert(1, old_time);
+        }
+
+        assert_eq!(
+            manager.idle_connection_count(Duration::from_secs(300)),
+            2,
+            "2 backdated connections should be idle"
+        );
+
+        // With a very long threshold, none should be idle.
+        assert_eq!(
+            manager.idle_connection_count(Duration::from_secs(3600)),
+            0,
+            "no connections should be idle with a 1-hour threshold"
         );
     }
 }
