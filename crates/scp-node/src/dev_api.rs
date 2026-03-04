@@ -31,74 +31,8 @@ use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
+use crate::error::ApiError;
 use crate::http::NodeState;
-
-// ---------------------------------------------------------------------------
-// Error response
-// ---------------------------------------------------------------------------
-
-/// JSON error body returned on authentication failure or bad requests.
-///
-/// All dev API error responses use this shape, as specified in section 18.10.4.
-///
-/// # Example
-///
-/// ```json
-/// { "error": "unauthorized", "code": "UNAUTHORIZED" }
-/// ```
-#[derive(Debug, Clone, Serialize)]
-pub struct DevApiError {
-    /// Human-readable error description.
-    pub error: String,
-    /// Machine-readable error code.
-    pub code: String,
-}
-
-impl DevApiError {
-    /// Returns the standard unauthorized error response (HTTP 401).
-    fn unauthorized() -> (StatusCode, Json<Self>) {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(Self {
-                error: "unauthorized".to_owned(),
-                code: "UNAUTHORIZED".to_owned(),
-            }),
-        )
-    }
-
-    /// Returns a not-found error response (HTTP 404) with the given message.
-    fn not_found(msg: impl Into<String>) -> (StatusCode, Json<Self>) {
-        (
-            StatusCode::NOT_FOUND,
-            Json(Self {
-                error: msg.into(),
-                code: "NOT_FOUND".to_owned(),
-            }),
-        )
-    }
-
-    /// Returns a conflict error response (HTTP 409) with the given message.
-    fn conflict(msg: impl Into<String>) -> (StatusCode, Json<Self>) {
-        (
-            StatusCode::CONFLICT,
-            Json(Self {
-                error: msg.into(),
-                code: "CONFLICT".to_owned(),
-            }),
-        )
-    }
-
-    /// Returns a bad-request error response (HTTP 400) with the given message.
-    fn bad_request(msg: impl Into<String>) -> (StatusCode, Json<Self>) {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(Self {
-                error: msg.into(),
-                code: "BAD_REQUEST".to_owned(),
-            }),
-        )
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Bearer auth middleware
@@ -133,10 +67,10 @@ pub async fn bearer_auth_middleware(
             if bool::from(provided.as_bytes().ct_eq(expected_token.as_bytes())) {
                 next.run(req).await.into_response()
             } else {
-                DevApiError::unauthorized().into_response()
+                ApiError::unauthorized().into_response()
             }
         }
-        _ => DevApiError::unauthorized().into_response(),
+        _ => ApiError::unauthorized().into_response(),
     }
 }
 
@@ -187,14 +121,7 @@ pub async fn localhost_host_middleware(req: Request<Body>, next: Next) -> impl I
         Some(h) if is_localhost_host(h) => next.run(req).await.into_response(),
         _ => {
             // No Host header or non-localhost Host — reject.
-            (
-                StatusCode::FORBIDDEN,
-                Json(DevApiError {
-                    error: "forbidden: dev API only accessible via localhost".to_owned(),
-                    code: "FORBIDDEN".to_owned(),
-                }),
-            )
-                .into_response()
+            ApiError::forbidden("forbidden: dev API only accessible via localhost").into_response()
         }
     }
 }
@@ -215,13 +142,7 @@ pub async fn localhost_host_middleware(req: Request<Body>, next: Next) -> impl I
 pub async fn security_headers_middleware(req: Request<Body>, next: Next) -> impl IntoResponse {
     // Reject CORS preflight requests explicitly.
     if req.method() == axum::http::Method::OPTIONS {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(DevApiError {
-                error: "forbidden: CORS requests not allowed on dev API".to_owned(),
-                code: "FORBIDDEN".to_owned(),
-            }),
-        )
+        return ApiError::forbidden("forbidden: CORS requests not allowed on dev API")
             .into_response();
     }
 
@@ -445,7 +366,7 @@ pub async fn get_context_handler(
     let id = id.to_ascii_lowercase();
     let contexts = state.broadcast_contexts.read().await;
     contexts.get(&id).map_or_else(
-        || DevApiError::not_found(format!("context {id} not found")).into_response(),
+        || ApiError::not_found(format!("context {id} not found")).into_response(),
         |ctx| (StatusCode::OK, Json(ContextResponse::from(ctx))).into_response(),
     )
 }
@@ -471,20 +392,20 @@ pub async fn create_context_handler(
     State(state): State<Arc<NodeState>>,
     body: Result<Json<CreateContextRequest>, JsonRejection>,
 ) -> impl IntoResponse {
-    // Unwrap JSON body, mapping extraction failures to DevApiError (spec §18.10.4).
+    // Unwrap JSON body, mapping extraction failures to ApiError (spec §18.10.4).
     let Ok(Json(body)) = body else {
-        return DevApiError::bad_request("invalid JSON body").into_response();
+        return ApiError::bad_request("invalid JSON body").into_response();
     };
 
     // Validate context ID: non-empty, hex-only, bounded length.
     if body.id.is_empty() || body.id.len() > MAX_CONTEXT_ID_LEN {
-        return DevApiError::bad_request(format!(
+        return ApiError::bad_request(format!(
             "context id must be 1-{MAX_CONTEXT_ID_LEN} characters"
         ))
         .into_response();
     }
     if !body.id.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return DevApiError::bad_request("context id must contain only hex characters")
+        return ApiError::bad_request("context id must contain only hex characters")
             .into_response();
     }
 
@@ -495,13 +416,13 @@ pub async fn create_context_handler(
     // Use chars().count() for correct Unicode character counting.
     if let Some(ref name) = body.name {
         if name.chars().count() > MAX_CONTEXT_NAME_LEN {
-            return DevApiError::bad_request(format!(
+            return ApiError::bad_request(format!(
                 "context name must be at most {MAX_CONTEXT_NAME_LEN} characters"
             ))
             .into_response();
         }
         if name.chars().any(char::is_control) {
-            return DevApiError::bad_request("context name must not contain control characters")
+            return ApiError::bad_request("context name must not contain control characters")
                 .into_response();
         }
     }
@@ -510,12 +431,12 @@ pub async fn create_context_handler(
 
     // Reject duplicate context IDs (compared against normalized lowercase).
     if contexts.contains_key(&id) {
-        return DevApiError::conflict(format!("context {id} already exists")).into_response();
+        return ApiError::conflict(format!("context {id} already exists")).into_response();
     }
 
     // Enforce broadcast context limit (mirrors MAX_PROJECTED_CONTEXTS).
     if contexts.len() >= crate::MAX_BROADCAST_CONTEXTS {
-        return DevApiError::bad_request(format!(
+        return ApiError::bad_request(format!(
             "broadcast context limit ({}) reached",
             crate::MAX_BROADCAST_CONTEXTS
         ))
@@ -557,7 +478,7 @@ pub async fn delete_context_handler(
     if contexts.remove(&id).is_some() {
         StatusCode::NO_CONTENT.into_response()
     } else {
-        DevApiError::not_found(format!("context {id} not found")).into_response()
+        ApiError::not_found(format!("context {id} not found")).into_response()
     }
 }
 

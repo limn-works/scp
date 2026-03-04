@@ -35,6 +35,7 @@ use sha2::{Digest, Sha256};
 use scp_core::crypto::sender_keys::{BroadcastEnvelope, BroadcastKey, open_broadcast};
 use scp_transport::native::storage::BlobStorage;
 
+use crate::error::ApiError;
 use crate::http::NodeState;
 
 // ---------------------------------------------------------------------------
@@ -279,18 +280,6 @@ pub struct FeedQuery {
     pub limit: Option<u32>,
 }
 
-/// JSON error body returned by feed endpoints.
-///
-/// Matches the shape used by the dev API for consistency across the
-/// node's HTTP surface.
-#[derive(Debug, Clone, Serialize)]
-pub struct FeedError {
-    /// Human-readable error description.
-    pub error: String,
-    /// Machine-readable error code.
-    pub code: String,
-}
-
 // ---------------------------------------------------------------------------
 // Feed handler
 // ---------------------------------------------------------------------------
@@ -404,27 +393,13 @@ pub async fn feed_handler(
 ) -> impl IntoResponse {
     // Parse routing_id from hex.
     let Some(routing_id) = hex_decode(&routing_id_hex) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(FeedError {
-                error: "invalid routing_id hex".to_owned(),
-                code: "BAD_REQUEST".to_owned(),
-            }),
-        )
-            .into_response();
+        return ApiError::bad_request("invalid routing_id hex").into_response();
     };
 
     // Look up projected context.
     let projected_contexts = state.projected_contexts.read().await;
     let Some(projected) = projected_contexts.get(&routing_id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(FeedError {
-                error: "unknown routing_id".to_owned(),
-                code: "NOT_FOUND".to_owned(),
-            }),
-        )
-            .into_response();
+        return ApiError::not_found("unknown routing_id").into_response();
     };
 
     // Extract context_id and keys before dropping the read lock.
@@ -437,14 +412,7 @@ pub async fn feed_handler(
     // to get its stored_at timestamp for the query filter.
     let since_ts: Option<u64> = if let Some(ref since_hex) = params.since {
         let Some(since_blob_id) = hex_decode(since_hex) else {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(FeedError {
-                    error: "invalid since blob_id hex".to_owned(),
-                    code: "BAD_REQUEST".to_owned(),
-                }),
-            )
-                .into_response();
+            return ApiError::bad_request("invalid since blob_id hex").into_response();
         };
         // Look up the blob to get its stored_at timestamp.
         match state.blob_storage.get(&since_blob_id).await {
@@ -452,13 +420,7 @@ pub async fn feed_handler(
                 // Verify the blob belongs to this routing_id to prevent
                 // cross-context timestamp oracle (BLACK-HTTP-005).
                 if blob.routing_id != routing_id {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(FeedError {
-                            error: "since blob_id does not belong to this context".to_owned(),
-                            code: "BAD_REQUEST".to_owned(),
-                        }),
-                    )
+                    return ApiError::bad_request("since blob_id does not belong to this context")
                         .into_response();
                 }
                 Some(blob.stored_at)
@@ -498,14 +460,7 @@ pub async fn feed_handler(
                 routing_id = routing_id_hex,
                 "blob storage query failed"
             );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(FeedError {
-                    error: "storage error".to_owned(),
-                    code: "INTERNAL_ERROR".to_owned(),
-                }),
-            )
-                .into_response();
+            return ApiError::internal_error("storage error").into_response();
         }
     };
 
@@ -583,40 +538,19 @@ pub async fn message_handler(
 
     // Parse routing_id from hex.
     let Some(routing_id) = hex_decode(&routing_id_hex) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(FeedError {
-                error: "invalid routing_id hex".to_owned(),
-                code: "BAD_REQUEST".to_owned(),
-            }),
-        )
-            .into_response();
+        return ApiError::bad_request("invalid routing_id hex").into_response();
     };
 
     // Parse blob_id from hex.
     let Some(blob_id) = hex_decode(&blob_id_hex) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(FeedError {
-                error: "invalid blob_id hex".to_owned(),
-                code: "BAD_REQUEST".to_owned(),
-            }),
-        )
-            .into_response();
+        return ApiError::bad_request("invalid blob_id hex").into_response();
     };
 
     // Look up projected context (before conditional GET to avoid
     // cross-context blob existence oracle — BLACK-HTTP-005).
     let projected_contexts = state.projected_contexts.read().await;
     let Some(projected) = projected_contexts.get(&routing_id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(FeedError {
-                error: "unknown routing_id".to_owned(),
-                code: "NOT_FOUND".to_owned(),
-            }),
-        )
-            .into_response();
+        return ApiError::not_found("unknown routing_id").into_response();
     };
 
     // Snapshot keys before dropping the read lock.
@@ -627,14 +561,7 @@ pub async fn message_handler(
     let stored = match state.blob_storage.get(&blob_id).await {
         Ok(Some(blob)) => blob,
         Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(FeedError {
-                    error: "unknown blob_id".to_owned(),
-                    code: "NOT_FOUND".to_owned(),
-                }),
-            )
-                .into_response();
+            return ApiError::not_found("unknown blob_id").into_response();
         }
         Err(e) => {
             tracing::error!(
@@ -642,14 +569,7 @@ pub async fn message_handler(
                 blob_id = blob_id_hex,
                 "blob storage get failed"
             );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(FeedError {
-                    error: "storage error".to_owned(),
-                    code: "INTERNAL_ERROR".to_owned(),
-                }),
-            )
-                .into_response();
+            return ApiError::internal_error("storage error").into_response();
         }
     };
 
@@ -659,14 +579,7 @@ pub async fn message_handler(
     // send If-None-Match with a blob_id from routing_A to routing_B and
     // receive 304 (confirming blob existence) instead of 404.
     if stored.routing_id != routing_id {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(FeedError {
-                error: "unknown blob_id".to_owned(),
-                code: "NOT_FOUND".to_owned(),
-            }),
-        )
-            .into_response();
+        return ApiError::not_found("unknown blob_id").into_response();
     }
 
     // Conditional GET: check If-None-Match header. Placed after both
@@ -690,14 +603,7 @@ pub async fn message_handler(
                 blob_id = blob_id_hex,
                 "failed to deserialize BroadcastEnvelope"
             );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(FeedError {
-                    error: "decryption failure".to_owned(),
-                    code: "INTERNAL_ERROR".to_owned(),
-                }),
-            )
-                .into_response();
+            return ApiError::internal_error("decryption failure").into_response();
         }
     };
 
@@ -708,14 +614,7 @@ pub async fn message_handler(
             epoch = envelope.key_epoch,
             "no broadcast key for epoch"
         );
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(FeedError {
-                error: "decryption failure".to_owned(),
-                code: "INTERNAL_ERROR".to_owned(),
-            }),
-        )
-            .into_response();
+        return ApiError::internal_error("decryption failure").into_response();
     };
 
     // Decrypt.
@@ -728,14 +627,7 @@ pub async fn message_handler(
                 epoch = envelope.key_epoch,
                 "decryption failed"
             );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(FeedError {
-                    error: "decryption failure".to_owned(),
-                    code: "INTERNAL_ERROR".to_owned(),
-                }),
-            )
-                .into_response();
+            return ApiError::internal_error("decryption failure").into_response();
         }
     };
 
