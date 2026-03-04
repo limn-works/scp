@@ -353,17 +353,12 @@ A trusted DID with an expired token is denied. An unknown DID with a valid token
 
 Trust evaluation runs through four layers, from hardest to softest:
 
-┌─────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────┬────────────────────────────────────┐
-│            Layer            │                                                 What                                                 │                How                 │
-├─────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────┤
-│ 1. Protocol Enforcement     │ UCAN validation, signatures, ceilings, roles                                                         │ 100% validation, 0% trust          │
-├─────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────┤
-│ 2. Behavioral Validation    │ Merkle event logs, behavioral records, tool verification, challenge-response, consequence mechanisms │ Mostly validation, grows over time │
-├─────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────┤
-│ 3. Attestation Authenticity │ Signature verification on claims (identity links, endorsements, tool integrity)                      │ Verified as real, not as true      │
-├─────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────┤
-│ 4. Trust Evaluation         │ Agent-level judgment for new identities, non-testable capabilities, novel situations                 │ Shrinks as behavioral data grows   │
-└─────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────┴────────────────────────────────────┘
+| Layer | What | How |
+|---|---|---|
+| 1. Protocol Enforcement | UCAN validation, signatures, ceilings, roles | 100% validation, 0% trust |
+| 2. Behavioral Validation | Merkle event logs, behavioral records, tool verification, challenge-response, consequence mechanisms | Mostly validation, grows over time |
+| 3. Attestation Authenticity | Signature verification on claims (identity links, endorsements, tool integrity) | Verified as real, not as true |
+| 4. Trust Evaluation | Agent-level judgment for new identities, non-testable capabilities, novel situations | Shrinks as behavioral data grows |
 
 **The critical property:** the trust surface shrinks over time. New identities start trust-heavy. As they participate, behavioral records accumulate, and validation replaces trust.
 
@@ -426,19 +421,10 @@ boundary all in one.
 
 SCP's encryption is a two-layer stack where each layer serves a distinct purpose and operates independently:
 
-```
-┌───────────────────────────────────────────────────┐
-│  Layer 2: MLS Group Encryption (RFC 9420)         │
-│  Purpose: Group confidentiality + forward secrecy │
-│  Key: Shared MLS group key, ratcheted per epoch   │
-│  Who can decrypt: All MLS group members           │
-├───────────────────────────────────────────────────┤
-│  Layer 1: Sender-Side Key (AES-256-GCM)           │
-│  Purpose: Selective readability + blocking        │
-│  Key: Per-sender symmetric key, rotated on block  │
-│  Who can decrypt: All non-blocked group members   │
-└───────────────────────────────────────────────────┘
-```
+| Layer | Purpose | Key | Who can decrypt |
+|---|---|---|---|
+| 2. MLS Group Encryption (RFC 9420) | Group confidentiality + forward secrecy | Shared MLS group key, ratcheted per epoch | All MLS group members |
+| 1. Sender-Side Key (AES-256-GCM) | Selective readability + blocking | Per-sender symmetric key, rotated on block | All non-blocked group members |
 
 The sender-side key encrypts first. Then MLS encrypts the result. On receipt, the recipient MLS-decrypts, then sender-key-decrypts. Blocking works because the blocked party can strip the MLS layer but hits opaque ciphertext at the sender-key layer.
 
