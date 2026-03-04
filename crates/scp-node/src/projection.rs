@@ -44,11 +44,14 @@ use crate::http::NodeState;
 /// Computes the 32-byte routing ID for a broadcast context.
 ///
 /// `routing_id = SHA-256(context_id)` where `context_id` is the raw bytes
-/// of the hex-encoded context ID string, per spec section 5.14.6.
+/// of the **lowercase** hex-encoded context ID string, per spec section 5.14.6.
+/// Normalizes to lowercase before hashing so that mixed-case IDs produce
+/// the same routing ID.
 #[must_use]
 pub fn compute_routing_id(context_id: &str) -> [u8; 32] {
+    let normalized = context_id.to_ascii_lowercase();
     let mut hasher = Sha256::new();
-    hasher.update(context_id.as_bytes());
+    hasher.update(normalized.as_bytes());
     hasher.finalize().into()
 }
 
@@ -377,12 +380,23 @@ fn decrypt_blobs(
 /// - `Cache-Control: public, max-age=30, stale-while-revalidate=300`
 /// - `ETag: "<latest_blob_id_hex>"` (the blob ID of the last message)
 ///
+/// # Cursor expiry
+///
+/// When a `since` blob ID refers to a blob that has expired or been purged,
+/// the feed returns **empty** (no messages) rather than the full feed. Clients
+/// should treat an empty response to a previously-valid cursor as a signal to
+/// reset their cursor (omit `since`) and re-fetch from the beginning.
+///
+/// A `since` blob ID that belongs to a different context returns **400**.
+///
 /// # Errors
 ///
 /// - **404** — Unknown routing ID (no projected context registered).
-/// - **400** — Invalid routing ID hex or invalid `since` blob ID hex.
+/// - **400** — Invalid routing ID hex, invalid `since` blob ID hex, or
+///   `since` blob belongs to a different context.
 ///
 /// See spec section 18.11.3.
+#[allow(clippy::too_many_lines)]
 pub async fn feed_handler(
     State(state): State<Arc<NodeState>>,
     Path(routing_id_hex): Path<String>,
@@ -434,11 +448,26 @@ pub async fn feed_handler(
         };
         // Look up the blob to get its stored_at timestamp.
         match state.blob_storage.get(&since_blob_id).await {
-            Ok(Some(blob)) => Some(blob.stored_at),
+            Ok(Some(blob)) => {
+                // Verify the blob belongs to this routing_id to prevent
+                // cross-context timestamp oracle (BLACK-HTTP-005).
+                if blob.routing_id != routing_id {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(FeedError {
+                            error: "since blob_id does not belong to this context".to_owned(),
+                            code: "BAD_REQUEST".to_owned(),
+                        }),
+                    )
+                        .into_response();
+                }
+                Some(blob.stored_at)
+            }
             Ok(None) => {
-                // Blob not found — treat as "no since filter" rather than error.
-                // This handles the case where the blob has expired or been purged.
-                None
+                // Blob expired or purged — return empty feed rather than all
+                // messages. Returning all would be a surprising behavior change
+                // when a previously-valid cursor expires.
+                Some(u64::MAX)
             }
             Err(e) => {
                 tracing::warn!(
@@ -446,7 +475,8 @@ pub async fn feed_handler(
                     since_blob_id = since_hex,
                     "failed to look up since blob"
                 );
-                None
+                // Storage error — conservative: return empty feed.
+                Some(u64::MAX)
             }
         }
     } else {
@@ -545,9 +575,12 @@ pub async fn feed_handler(
 #[allow(clippy::too_many_lines)]
 pub async fn message_handler(
     State(state): State<Arc<NodeState>>,
-    Path((routing_id_hex, blob_id_hex)): Path<(String, String)>,
+    Path((routing_id_hex, blob_id_hex_raw)): Path<(String, String)>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
+    // Normalize blob_id_hex to lowercase for consistent ETag generation.
+    let blob_id_hex = blob_id_hex_raw.to_ascii_lowercase();
+
     // Parse routing_id from hex.
     let Some(routing_id) = hex_decode(&routing_id_hex) else {
         return (
@@ -949,9 +982,9 @@ mod tests {
         Arc::new(NodeState {
             did: "did:dht:test".to_owned(),
             relay_url: "wss://localhost/scp/v1".to_owned(),
-            broadcast_contexts: RwLock::new(Vec::new()),
+            broadcast_contexts: RwLock::new(HashMap::new()),
             relay_addr: "127.0.0.1:9000".parse::<SocketAddr>().unwrap(),
-            bridge_secret: [0u8; 32],
+            bridge_secret: zeroize::Zeroizing::new([0u8; 32]),
             dev_token: None,
             dev_bind_addr: None,
             projected_contexts: RwLock::new(projected),
@@ -1650,7 +1683,9 @@ mod tests {
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), HttpStatus::OK);
 
-        // Test 2: since=nonexistent_id — should return all blobs (fallback).
+        // Test 2: since=nonexistent_id — returns empty feed (not all blobs).
+        // A nonexistent blob_id could be a cross-context oracle probe, so we
+        // treat it as "nothing new" rather than returning the full feed.
         let router = broadcast_projection_router(Arc::clone(&state));
         let nonexistent = hex_encode(&[0xFF; 32]);
         let req = Request::builder()
@@ -1667,8 +1702,8 @@ mod tests {
         let messages = json["messages"].as_array().unwrap();
         assert_eq!(
             messages.len(),
-            3,
-            "nonexistent since blob_id should fall back to returning all"
+            0,
+            "nonexistent since blob_id should return empty feed (cross-context oracle prevention)"
         );
 
         // Test 3: since=invalid_hex — should return 400.

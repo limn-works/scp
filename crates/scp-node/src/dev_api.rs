@@ -141,6 +141,108 @@ pub async fn bearer_auth_middleware(
 }
 
 // ---------------------------------------------------------------------------
+// Host header validation (DNS rebinding protection)
+// ---------------------------------------------------------------------------
+
+/// Allowed Host header values for the dev API.
+///
+/// The dev API is intended for localhost access only (spec section 18.10.1).
+/// This middleware rejects requests whose `Host` header does not match a
+/// localhost pattern, preventing DNS rebinding attacks where a malicious
+/// website resolves to 127.0.0.1 and accesses the dev API through the browser.
+const ALLOWED_HOSTS: &[&str] = &["localhost", "127.0.0.1", "[::1]"];
+
+/// Returns true if the `Host` header value is a localhost address,
+/// optionally followed by a port (e.g., `localhost:8080`, `127.0.0.1:3000`,
+/// `[::1]:8080`).
+///
+/// Handles RFC 3986 bracket notation for IPv6 addresses — `[::1]:8080`
+/// is correctly parsed as hostname `[::1]`, not split on internal colons.
+fn is_localhost_host(host: &str) -> bool {
+    // IPv6 bracket notation: [::1] or [::1]:port
+    let hostname = if host.starts_with('[') {
+        // Find the closing bracket; everything up to and including it is the host.
+        host.find(']').map_or(host, |end| &host[..=end])
+    } else {
+        // IPv4 or hostname: split on first ':' to strip port.
+        host.split(':').next().unwrap_or(host)
+    };
+    ALLOWED_HOSTS
+        .iter()
+        .any(|h| hostname.eq_ignore_ascii_case(h))
+}
+
+/// Axum middleware that rejects requests with non-localhost Host headers.
+///
+/// Prevents DNS rebinding attacks against the dev API (spec section 18.10.1).
+/// Returns HTTP 403 if the Host header is missing or does not match a
+/// localhost address.
+pub async fn localhost_host_middleware(req: Request<Body>, next: Next) -> impl IntoResponse {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok());
+
+    match host {
+        Some(h) if is_localhost_host(h) => next.run(req).await.into_response(),
+        _ => {
+            // No Host header or non-localhost Host — reject.
+            (
+                StatusCode::FORBIDDEN,
+                Json(DevApiError {
+                    error: "forbidden: dev API only accessible via localhost".to_owned(),
+                    code: "FORBIDDEN".to_owned(),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Security response headers
+// ---------------------------------------------------------------------------
+
+/// Axum middleware that sets security response headers on every dev API response.
+///
+/// Headers applied:
+/// - `X-Content-Type-Options: nosniff` — prevents MIME sniffing
+/// - `Cache-Control: no-store` — prevents caching of sensitive diagnostics
+/// - `X-Frame-Options: DENY` — prevents clickjacking via iframe embedding
+///
+/// Also rejects CORS preflight (OPTIONS) requests with 403 Forbidden.
+/// The dev API is localhost-only and must not be accessible cross-origin.
+pub async fn security_headers_middleware(req: Request<Body>, next: Next) -> impl IntoResponse {
+    // Reject CORS preflight requests explicitly.
+    if req.method() == axum::http::Method::OPTIONS {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(DevApiError {
+                error: "forbidden: CORS requests not allowed on dev API".to_owned(),
+                code: "FORBIDDEN".to_owned(),
+            }),
+        )
+            .into_response();
+    }
+
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        axum::http::header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    response
+}
+
+// ---------------------------------------------------------------------------
 // Response types
 // ---------------------------------------------------------------------------
 
@@ -322,7 +424,7 @@ pub async fn list_contexts_handler(State(state): State<Arc<NodeState>>) -> impl 
         .broadcast_contexts
         .read()
         .await
-        .iter()
+        .values()
         .map(ContextResponse::from)
         .collect();
 
@@ -342,7 +444,7 @@ pub async fn get_context_handler(
 ) -> impl IntoResponse {
     let id = id.to_ascii_lowercase();
     let contexts = state.broadcast_contexts.read().await;
-    contexts.iter().find(|ctx| ctx.id == id).map_or_else(
+    contexts.get(&id).map_or_else(
         || DevApiError::not_found(format!("context {id} not found")).into_response(),
         |ctx| (StatusCode::OK, Json(ContextResponse::from(ctx))).into_response(),
     )
@@ -360,7 +462,7 @@ const MAX_CONTEXT_NAME_LEN: usize = 256;
 /// [`ContextResponse`].
 ///
 /// Validates:
-/// - `id` is non-empty, ASCII hex only, max 128 chars
+/// - `id` is non-empty, ASCII hex only, max 64 chars (32 bytes hex-encoded)
 /// - `name` (if present) is max 256 chars, no control characters
 /// - No duplicate context ID already registered
 ///
@@ -370,9 +472,8 @@ pub async fn create_context_handler(
     body: Result<Json<CreateContextRequest>, JsonRejection>,
 ) -> impl IntoResponse {
     // Unwrap JSON body, mapping extraction failures to DevApiError (spec §18.10.4).
-    let Json(body) = match body {
-        Ok(b) => b,
-        Err(e) => return DevApiError::bad_request(e.body_text()).into_response(),
+    let Ok(Json(body)) = body else {
+        return DevApiError::bad_request("invalid JSON body").into_response();
     };
 
     // Validate context ID: non-empty, hex-only, bounded length.
@@ -391,8 +492,9 @@ pub async fn create_context_handler(
     let id = body.id.to_ascii_lowercase();
 
     // Validate context name if present: bounded length, no control chars.
+    // Use chars().count() for correct Unicode character counting.
     if let Some(ref name) = body.name {
-        if name.len() > MAX_CONTEXT_NAME_LEN {
+        if name.chars().count() > MAX_CONTEXT_NAME_LEN {
             return DevApiError::bad_request(format!(
                 "context name must be at most {MAX_CONTEXT_NAME_LEN} characters"
             ))
@@ -407,19 +509,35 @@ pub async fn create_context_handler(
     let mut contexts = state.broadcast_contexts.write().await;
 
     // Reject duplicate context IDs (compared against normalized lowercase).
-    if contexts.iter().any(|ctx| ctx.id == id) {
+    if contexts.contains_key(&id) {
         return DevApiError::conflict(format!("context {id} already exists")).into_response();
     }
 
+    // Enforce broadcast context limit (mirrors MAX_PROJECTED_CONTEXTS).
+    if contexts.len() >= crate::MAX_BROADCAST_CONTEXTS {
+        return DevApiError::bad_request(format!(
+            "broadcast context limit ({}) reached",
+            crate::MAX_BROADCAST_CONTEXTS
+        ))
+        .into_response();
+    }
+
     let ctx = crate::http::BroadcastContext {
-        id,
+        id: id.clone(),
         name: body.name,
     };
     let response = ContextResponse::from(&ctx);
-    contexts.push(ctx);
+    contexts.insert(id.clone(), ctx);
     drop(contexts);
 
-    (StatusCode::CREATED, Json(response)).into_response()
+    // Include Location header per HTTP semantics for 201 Created.
+    let location = format!("/scp/dev/v1/contexts/{id}");
+    let mut headers = axum::http::HeaderMap::new();
+    if let Ok(val) = axum::http::HeaderValue::from_str(&location) {
+        headers.insert(axum::http::header::LOCATION, val);
+    }
+
+    (StatusCode::CREATED, headers, Json(response)).into_response()
 }
 
 /// Handler for `DELETE /scp/dev/v1/contexts/{id}`.
@@ -435,10 +553,8 @@ pub async fn delete_context_handler(
 ) -> impl IntoResponse {
     let id = id.to_ascii_lowercase();
     let mut contexts = state.broadcast_contexts.write().await;
-    let len_before = contexts.len();
-    contexts.retain(|ctx| ctx.id != id);
 
-    if contexts.len() < len_before {
+    if contexts.remove(&id).is_some() {
         StatusCode::NO_CONTENT.into_response()
     } else {
         DevApiError::not_found(format!("context {id} not found")).into_response()
@@ -458,6 +574,10 @@ pub async fn delete_context_handler(
 /// `Authorization: Bearer <token>` header receive HTTP 401.
 ///
 /// See spec section 18.10.2.
+/// Maximum request body size for the dev API (64 KiB).
+/// Prevents unbounded memory allocation from oversized POST bodies.
+const DEV_API_MAX_BODY_SIZE: usize = 64 * 1024;
+
 pub fn dev_router(state: Arc<NodeState>, token: String) -> axum::Router {
     use axum::middleware;
     use axum::routing::get;
@@ -475,9 +595,22 @@ pub fn dev_router(state: Arc<NodeState>, token: String) -> axum::Router {
             "/scp/dev/v1/contexts/{id}",
             get(get_context_handler).delete(delete_context_handler),
         )
+        .layer(axum::extract::DefaultBodyLimit::max(DEV_API_MAX_BODY_SIZE))
+        // Axum layers are LIFO: last added = outermost = runs first.
+        //
+        // Execution order (outermost → innermost):
+        //   1. Security headers — sets X-Content-Type-Options, Cache-Control,
+        //      X-Frame-Options on ALL responses (including auth/host rejections),
+        //      and rejects CORS preflight requests.
+        //   2. Host check — cheapest rejection, prevents DNS rebinding.
+        //   3. Bearer auth — validates token, rejects unauthorized requests.
+        //   4. Body limit — enforces 64 KiB max on POST bodies.
+        //   5. Route handlers.
         .layer(middleware::from_fn(move |req, next| {
             bearer_auth_middleware(req, next, expected.clone())
         }))
+        .layer(middleware::from_fn(localhost_host_middleware))
+        .layer(middleware::from_fn(security_headers_middleware))
         .with_state(state)
 }
 
@@ -504,14 +637,24 @@ mod tests {
 
     use super::*;
 
+    /// Valid bearer token used across all dev API tests.
+    const TEST_TOKEN: &str = "scp_local_token_abcdef1234567890abcdef1234567890";
+
+    /// Helper: creates an HTTP request builder with `Host: localhost` pre-set.
+    /// All dev API test requests must include a localhost Host header for the
+    /// DNS-rebinding protection middleware.
+    fn localhost_request() -> axum::http::request::Builder {
+        Request::builder().header(header::HOST, "localhost")
+    }
+
     /// Creates a test `NodeState` with the given dev token.
     fn test_state(token: &str) -> Arc<NodeState> {
         Arc::new(NodeState {
             did: "did:dht:test123".to_owned(),
             relay_url: "wss://localhost/scp/v1".to_owned(),
-            broadcast_contexts: RwLock::new(Vec::new()),
+            broadcast_contexts: RwLock::new(HashMap::new()),
             relay_addr: "127.0.0.1:9000".parse::<SocketAddr>().unwrap(),
-            bridge_secret: [0u8; 32],
+            bridge_secret: zeroize::Zeroizing::new([0u8; 32]),
             dev_token: Some(token.to_owned()),
             dev_bind_addr: Some("127.0.0.1:9100".parse::<SocketAddr>().unwrap()),
             projected_contexts: RwLock::new(HashMap::new()),
@@ -528,11 +671,11 @@ mod tests {
 
     #[tokio::test]
     async fn valid_token_passes_middleware() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
         let router = dev_router(state, token.to_owned());
 
-        let req = Request::builder()
+        let req = localhost_request()
             .uri("/scp/dev/v1/health")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
@@ -550,11 +693,11 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_token_returns_401() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
         let router = dev_router(state, token.to_owned());
 
-        let req = Request::builder()
+        let req = localhost_request()
             .uri("/scp/dev/v1/health")
             .header(header::AUTHORIZATION, "Bearer wrong_token")
             .body(Body::empty())
@@ -570,12 +713,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_header_returns_401() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+    async fn non_localhost_host_returns_403() {
+        let token = TEST_TOKEN;
         let state = test_state(token);
         let router = dev_router(state, token.to_owned());
 
+        // DNS rebinding: request with external Host header should be rejected.
         let req = Request::builder()
+            .uri("/scp/dev/v1/health")
+            .header(header::HOST, "evil.example.com")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "FORBIDDEN");
+    }
+
+    #[tokio::test]
+    async fn ipv6_localhost_host_accepted() {
+        let token = TEST_TOKEN;
+        let state = test_state(token);
+        let router = dev_router(state, token.to_owned());
+
+        // [::1]:8080 is valid localhost — must not be rejected.
+        let req = Request::builder()
+            .uri("/scp/dev/v1/health")
+            .header(header::HOST, "[::1]:8080")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ipv6_localhost_host_without_port_accepted() {
+        let token = TEST_TOKEN;
+        let state = test_state(token);
+        let router = dev_router(state, token.to_owned());
+
+        // [::1] without port is also valid localhost.
+        let req = Request::builder()
+            .uri("/scp/dev/v1/health")
+            .header(header::HOST, "[::1]")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn missing_header_returns_401() {
+        let token = TEST_TOKEN;
+        let state = test_state(token);
+        let router = dev_router(state, token.to_owned());
+
+        let req = localhost_request()
             .uri("/scp/dev/v1/health")
             .body(Body::empty())
             .unwrap();
@@ -591,11 +792,11 @@ mod tests {
 
     #[tokio::test]
     async fn identity_handler_returns_did() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
         let router = dev_router(state, token.to_owned());
 
-        let req = Request::builder()
+        let req = localhost_request()
             .uri("/scp/dev/v1/identity")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
@@ -612,11 +813,11 @@ mod tests {
 
     #[tokio::test]
     async fn relay_status_handler_returns_addr() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
         let router = dev_router(state, token.to_owned());
 
-        let req = Request::builder()
+        let req = localhost_request()
             .uri("/scp/dev/v1/relay/status")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
@@ -634,7 +835,7 @@ mod tests {
 
     #[tokio::test]
     async fn all_responses_are_json_content_type() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
 
         let paths = [
@@ -645,7 +846,7 @@ mod tests {
 
         for path in paths {
             let router = dev_router(Arc::clone(&state), token.to_owned());
-            let req = Request::builder()
+            let req = localhost_request()
                 .uri(path)
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
@@ -671,11 +872,11 @@ mod tests {
 
     #[tokio::test]
     async fn list_contexts_returns_empty_array() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
         let router = dev_router(state, token.to_owned());
 
-        let req = Request::builder()
+        let req = localhost_request()
             .uri("/scp/dev/v1/contexts")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
@@ -691,19 +892,18 @@ mod tests {
 
     #[tokio::test]
     async fn list_contexts_returns_registered_contexts() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
-        state
-            .broadcast_contexts
-            .write()
-            .await
-            .push(crate::http::BroadcastContext {
+        state.broadcast_contexts.write().await.insert(
+            "aa11bb22".to_owned(),
+            crate::http::BroadcastContext {
                 id: "aa11bb22".to_owned(),
                 name: Some("Test Context".to_owned()),
-            });
+            },
+        );
         let router = dev_router(state, token.to_owned());
 
-        let req = Request::builder()
+        let req = localhost_request()
             .uri("/scp/dev/v1/contexts")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
@@ -724,19 +924,18 @@ mod tests {
 
     #[tokio::test]
     async fn get_context_returns_found() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
-        state
-            .broadcast_contexts
-            .write()
-            .await
-            .push(crate::http::BroadcastContext {
+        state.broadcast_contexts.write().await.insert(
+            "abcdef01".to_owned(),
+            crate::http::BroadcastContext {
                 id: "abcdef01".to_owned(),
                 name: Some("My Context".to_owned()),
-            });
+            },
+        );
         let router = dev_router(state, token.to_owned());
 
-        let req = Request::builder()
+        let req = localhost_request()
             .uri("/scp/dev/v1/contexts/abcdef01")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
@@ -755,11 +954,11 @@ mod tests {
 
     #[tokio::test]
     async fn get_context_returns_404_for_unknown() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
         let router = dev_router(state, token.to_owned());
 
-        let req = Request::builder()
+        let req = localhost_request()
             .uri("/scp/dev/v1/contexts/nonexistent")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
@@ -775,11 +974,11 @@ mod tests {
 
     #[tokio::test]
     async fn create_context_returns_201() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
         let router = dev_router(Arc::clone(&state), token.to_owned());
 
-        let req = Request::builder()
+        let req = localhost_request()
             .method("POST")
             .uri("/scp/dev/v1/contexts")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -806,17 +1005,17 @@ mod tests {
         // Verify context was actually stored
         let contexts = state.broadcast_contexts.read().await;
         assert_eq!(contexts.len(), 1);
-        assert_eq!(contexts[0].id, "cc33dd44");
+        assert!(contexts.contains_key("cc33dd44"));
         drop(contexts);
     }
 
     #[tokio::test]
     async fn create_context_without_name() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
         let router = dev_router(state, token.to_owned());
 
-        let req = Request::builder()
+        let req = localhost_request()
             .method("POST")
             .uri("/scp/dev/v1/contexts")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -835,19 +1034,18 @@ mod tests {
 
     #[tokio::test]
     async fn delete_context_returns_204() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
-        state
-            .broadcast_contexts
-            .write()
-            .await
-            .push(crate::http::BroadcastContext {
+        state.broadcast_contexts.write().await.insert(
+            "d00aed".to_owned(),
+            crate::http::BroadcastContext {
                 id: "d00aed".to_owned(),
                 name: None,
-            });
+            },
+        );
         let router = dev_router(Arc::clone(&state), token.to_owned());
 
-        let req = Request::builder()
+        let req = localhost_request()
             .method("DELETE")
             .uri("/scp/dev/v1/contexts/d00aed")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -863,11 +1061,11 @@ mod tests {
 
     #[tokio::test]
     async fn delete_context_returns_404_for_unknown() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
         let router = dev_router(state, token.to_owned());
 
-        let req = Request::builder()
+        let req = localhost_request()
             .method("DELETE")
             .uri("/scp/dev/v1/contexts/nonexistent")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -884,7 +1082,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_endpoints_require_auth() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
 
         // Test all context endpoints without auth
@@ -896,7 +1094,7 @@ mod tests {
 
         for (method, uri) in uris_and_methods {
             let router = dev_router(Arc::clone(&state), token.to_owned());
-            let req = Request::builder()
+            let req = localhost_request()
                 .method(method)
                 .uri(uri)
                 .body(Body::empty())
@@ -912,7 +1110,7 @@ mod tests {
 
         // POST with body but no auth
         let router = dev_router(Arc::clone(&state), token.to_owned());
-        let req = Request::builder()
+        let req = localhost_request()
             .method("POST")
             .uri("/scp/dev/v1/contexts")
             .header(header::CONTENT_TYPE, "application/json")
@@ -925,11 +1123,11 @@ mod tests {
 
     #[tokio::test]
     async fn create_context_rejects_non_hex_id() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
         let router = dev_router(state, token.to_owned());
 
-        let req = Request::builder()
+        let req = localhost_request()
             .method("POST")
             .uri("/scp/dev/v1/contexts")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -947,11 +1145,11 @@ mod tests {
 
     #[tokio::test]
     async fn create_context_rejects_empty_id() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
         let router = dev_router(state, token.to_owned());
 
-        let req = Request::builder()
+        let req = localhost_request()
             .method("POST")
             .uri("/scp/dev/v1/contexts")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -965,19 +1163,18 @@ mod tests {
 
     #[tokio::test]
     async fn create_context_rejects_duplicate_id() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
-        state
-            .broadcast_contexts
-            .write()
-            .await
-            .push(crate::http::BroadcastContext {
+        state.broadcast_contexts.write().await.insert(
+            "aabb0011".to_owned(),
+            crate::http::BroadcastContext {
                 id: "aabb0011".to_owned(),
                 name: None,
-            });
+            },
+        );
         let router = dev_router(state, token.to_owned());
 
-        let req = Request::builder()
+        let req = localhost_request()
             .method("POST")
             .uri("/scp/dev/v1/contexts")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -998,11 +1195,11 @@ mod tests {
     /// Test A: Wrong bearer token returns 401 with correct error shape.
     #[tokio::test]
     async fn wrong_bearer_token_returns_401_with_error_shape() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
         let router = dev_router(state, token.to_owned());
 
-        let req = Request::builder()
+        let req = localhost_request()
             .uri("/scp/dev/v1/health")
             .header(header::AUTHORIZATION, "Bearer wrong_token_here")
             .body(Body::empty())
@@ -1031,12 +1228,12 @@ mod tests {
     /// Test B: Case-insensitive bearer scheme (RFC 7235 §2.1).
     #[tokio::test]
     async fn bearer_scheme_case_insensitive() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
 
         // lowercase "bearer"
         let router = dev_router(Arc::clone(&state), token.to_owned());
-        let req = Request::builder()
+        let req = localhost_request()
             .uri("/scp/dev/v1/health")
             .header(header::AUTHORIZATION, format!("bearer {token}"))
             .body(Body::empty())
@@ -1050,7 +1247,7 @@ mod tests {
 
         // uppercase "BEARER"
         let router = dev_router(Arc::clone(&state), token.to_owned());
-        let req = Request::builder()
+        let req = localhost_request()
             .uri("/scp/dev/v1/health")
             .header(header::AUTHORIZATION, format!("BEARER {token}"))
             .body(Body::empty())
@@ -1064,7 +1261,7 @@ mod tests {
 
         // mixed case "BeArEr"
         let router = dev_router(Arc::clone(&state), token.to_owned());
-        let req = Request::builder()
+        let req = localhost_request()
             .uri("/scp/dev/v1/health")
             .header(header::AUTHORIZATION, format!("BeArEr {token}"))
             .body(Body::empty())
@@ -1080,11 +1277,11 @@ mod tests {
     /// Test C: Non-bearer auth scheme returns 401.
     #[tokio::test]
     async fn non_bearer_auth_scheme_returns_401() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
         let router = dev_router(state, token.to_owned());
 
-        let req = Request::builder()
+        let req = localhost_request()
             .uri("/scp/dev/v1/health")
             .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
             .body(Body::empty())
@@ -1101,14 +1298,14 @@ mod tests {
     /// Test D: Context ID exceeding `MAX_CONTEXT_ID_LEN` returns 400.
     #[tokio::test]
     async fn create_context_rejects_oversized_id() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
         let router = dev_router(state, token.to_owned());
 
         let oversized_id = "a".repeat(MAX_CONTEXT_ID_LEN + 1);
         let body_json = serde_json::json!({ "id": oversized_id });
 
-        let req = Request::builder()
+        let req = localhost_request()
             .method("POST")
             .uri("/scp/dev/v1/contexts")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -1134,14 +1331,14 @@ mod tests {
     /// Test E: Context name exceeding `MAX_CONTEXT_NAME_LEN` returns 400.
     #[tokio::test]
     async fn create_context_rejects_oversized_name() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
         let router = dev_router(state, token.to_owned());
 
         let oversized_name = "a".repeat(MAX_CONTEXT_NAME_LEN + 1);
         let body_json = serde_json::json!({ "id": "aabb", "name": oversized_name });
 
-        let req = Request::builder()
+        let req = localhost_request()
             .method("POST")
             .uri("/scp/dev/v1/contexts")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -1167,7 +1364,7 @@ mod tests {
     /// Test F: Context name with control characters returns 400.
     #[tokio::test]
     async fn create_context_rejects_control_chars_in_name() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
 
         let names_with_control = [
@@ -1181,7 +1378,7 @@ mod tests {
             let router = dev_router(Arc::clone(&state), token.to_owned());
             let body_json = serde_json::json!({ "id": "aabb", "name": bad_name });
 
-            let req = Request::builder()
+            let req = localhost_request()
                 .method("POST")
                 .uri("/scp/dev/v1/contexts")
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -1205,12 +1402,12 @@ mod tests {
     /// Test G: Malformed JSON body returns 400 with JSON error (not plain text).
     #[tokio::test]
     async fn malformed_json_returns_400_with_json_body() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
         let router = dev_router(state, token.to_owned());
 
         // Send {"id": 42} -- number instead of string
-        let req = Request::builder()
+        let req = localhost_request()
             .method("POST")
             .uri("/scp/dev/v1/contexts")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -1244,11 +1441,11 @@ mod tests {
     /// Test G (cont.): Completely invalid JSON returns 400 with JSON body.
     #[tokio::test]
     async fn invalid_json_syntax_returns_400_with_json_body() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
         let router = dev_router(state, token.to_owned());
 
-        let req = Request::builder()
+        let req = localhost_request()
             .method("POST")
             .uri("/scp/dev/v1/contexts")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -1278,12 +1475,12 @@ mod tests {
     /// Test H: Mixed-case hex context IDs are normalized to lowercase.
     #[tokio::test]
     async fn context_id_normalized_to_lowercase() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
 
         // Create context with uppercase ID.
         let router = dev_router(Arc::clone(&state), token.to_owned());
-        let req = Request::builder()
+        let req = localhost_request()
             .method("POST")
             .uri("/scp/dev/v1/contexts")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -1303,7 +1500,7 @@ mod tests {
 
         // GET /contexts/aabb should find it.
         let router = dev_router(Arc::clone(&state), token.to_owned());
-        let req = Request::builder()
+        let req = localhost_request()
             .uri("/scp/dev/v1/contexts/aabb")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
@@ -1317,7 +1514,7 @@ mod tests {
 
         // GET /contexts/AABB should also find it (lookup is normalized).
         let router = dev_router(Arc::clone(&state), token.to_owned());
-        let req = Request::builder()
+        let req = localhost_request()
             .uri("/scp/dev/v1/contexts/AABB")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
@@ -1331,7 +1528,7 @@ mod tests {
 
         // Creating with "aabb" should be rejected as duplicate.
         let router = dev_router(Arc::clone(&state), token.to_owned());
-        let req = Request::builder()
+        let req = localhost_request()
             .method("POST")
             .uri("/scp/dev/v1/contexts")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -1347,7 +1544,7 @@ mod tests {
 
         // DELETE /contexts/AaBb should work (normalized).
         let router = dev_router(Arc::clone(&state), token.to_owned());
-        let req = Request::builder()
+        let req = localhost_request()
             .method("DELETE")
             .uri("/scp/dev/v1/contexts/AaBb")
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -1373,7 +1570,7 @@ mod tests {
         desc: &str,
     ) {
         let router = dev_router(Arc::clone(state), token.to_owned());
-        let mut builder = Request::builder()
+        let mut builder = localhost_request()
             .method(method)
             .uri(path)
             .header(header::AUTHORIZATION, format!("Bearer {token}"));
@@ -1404,16 +1601,15 @@ mod tests {
     /// Test I (part 1): Success and error endpoints return JSON Content-Type.
     #[tokio::test]
     async fn success_endpoints_return_json_content_type() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
-        state
-            .broadcast_contexts
-            .write()
-            .await
-            .push(crate::http::BroadcastContext {
+        state.broadcast_contexts.write().await.insert(
+            "deadbeef".to_owned(),
+            crate::http::BroadcastContext {
                 id: "deadbeef".to_owned(),
                 name: Some("Test".to_owned()),
-            });
+            },
+        );
 
         let cases: &[(&str, &str, Option<&str>, StatusCode, &str)] = &[
             (
@@ -1462,16 +1658,15 @@ mod tests {
     /// Test I (part 2): Error responses and create/auth return JSON Content-Type.
     #[tokio::test]
     async fn error_and_create_endpoints_return_json_content_type() {
-        let token = "scp_local_token_abcdef1234567890abcdef1234567890";
+        let token = TEST_TOKEN;
         let state = test_state(token);
-        state
-            .broadcast_contexts
-            .write()
-            .await
-            .push(crate::http::BroadcastContext {
+        state.broadcast_contexts.write().await.insert(
+            "deadbeef".to_owned(),
+            crate::http::BroadcastContext {
                 id: "deadbeef".to_owned(),
                 name: Some("Test".to_owned()),
-            });
+            },
+        );
 
         let error_cases: &[(&str, &str, Option<&str>, StatusCode, &str)] = &[
             (
@@ -1523,7 +1718,7 @@ mod tests {
 
         // Unauthenticated 401.
         let router = dev_router(Arc::clone(&state), token.to_owned());
-        let req = Request::builder()
+        let req = localhost_request()
             .uri("/scp/dev/v1/health")
             .body(Body::empty())
             .unwrap();
@@ -1539,5 +1734,76 @@ mod tests {
             content_type.contains("application/json"),
             "unauth 401: Content-Type should be JSON, got: {content_type}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Security headers
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn responses_include_security_headers() {
+        let token = TEST_TOKEN;
+        let state = test_state(token);
+        let router = dev_router(state, token.to_owned());
+
+        let req = localhost_request()
+            .uri("/scp/dev/v1/health")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert_eq!(
+            resp.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert_eq!(resp.headers().get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+    }
+
+    #[tokio::test]
+    async fn security_headers_on_error_responses() {
+        let token = TEST_TOKEN;
+        let state = test_state(token);
+        let router = dev_router(state, token.to_owned());
+
+        // 401 response should also have security headers.
+        let req = localhost_request()
+            .uri("/scp/dev/v1/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_rejected() {
+        let token = TEST_TOKEN;
+        let state = test_state(token);
+        let router = dev_router(state, token.to_owned());
+
+        let req = Request::builder()
+            .method(axum::http::Method::OPTIONS)
+            .uri("/scp/dev/v1/health")
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "FORBIDDEN");
     }
 }
