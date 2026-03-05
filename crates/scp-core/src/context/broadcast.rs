@@ -181,6 +181,33 @@ pub struct AuthorBlockResult {
 }
 
 // ---------------------------------------------------------------------------
+// GovernanceBanResult
+// ---------------------------------------------------------------------------
+
+/// Result of a governance-directed subscriber ban (§5.14.8).
+///
+/// Unlike per-author blocking (which affects a single author's block list),
+/// governance bans are context-wide: the subscriber is removed from the
+/// registry and added to every author's block list, with mandatory key
+/// rotation on all authors.
+#[derive(Debug, Clone)]
+pub struct GovernanceBanResult {
+    /// The banned subscriber's DID.
+    pub banned_did: String,
+    /// Per-author key rotations triggered by the ban.
+    pub rotated_authors: Vec<AuthorKeyRotation>,
+}
+
+/// Record of an author's key rotation during a governance ban.
+#[derive(Debug, Clone)]
+pub struct AuthorKeyRotation {
+    /// The author whose key was rotated.
+    pub author_did: String,
+    /// The new epoch after rotation.
+    pub new_epoch: u64,
+}
+
+// ---------------------------------------------------------------------------
 // KeyRequestDecision
 // ---------------------------------------------------------------------------
 
@@ -591,6 +618,89 @@ impl BroadcastContext {
         })?;
         author.block_list = block_list;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Governance bans (spec section 5.14.8)
+    // -----------------------------------------------------------------------
+
+    /// Bans a subscriber via governance action (§5.14.8).
+    ///
+    /// Unlike per-author blocking, governance bans are context-wide:
+    ///
+    /// 1. The subscriber is removed from the subscriber registry.
+    /// 2. The subscriber is added to **every** author's block list.
+    /// 3. **Every** author's broadcast key is rotated (mandatory
+    ///    `KeyEpochAdvance`) to ensure the banned subscriber cannot decrypt
+    ///    future content from any author.
+    ///
+    /// This method does NOT check ceiling policy — that is the
+    /// `ContextManager`'s responsibility (SCP-GG-006).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::MemberNotFound`] if the subscriber DID is not
+    ///   registered.
+    /// - [`ContextError::CryptoFailed`] if any author's epoch counter
+    ///   overflows.
+    pub fn governance_ban_subscriber(
+        &mut self,
+        did: &str,
+    ) -> Result<GovernanceBanResult, ContextError> {
+        if !self.subscribers.contains_key(did) {
+            return Err(ContextError::MemberNotFound(format!(
+                "subscriber not found: {did}"
+            )));
+        }
+
+        // Remove from subscriber registry.
+        self.subscribers.remove(did);
+
+        // Add to every author's block list and rotate keys.
+        let author_dids: Vec<String> = self.authors.keys().cloned().collect();
+        let mut rotated_authors = Vec::with_capacity(author_dids.len());
+
+        for author_did in &author_dids {
+            // Safety: `author_did` was just collected from `self.authors.keys()`,
+            // so the entry is guaranteed to exist.
+            let author = self.authors.get_mut(author_did.as_str()).ok_or_else(|| {
+                ContextError::MemberNotFound(format!("author not found: {author_did}"))
+            })?;
+
+            author.block_list.insert(did.to_owned());
+
+            let new_epoch = author.epoch.checked_add(1).ok_or_else(|| {
+                ContextError::CryptoFailed("broadcast key epoch overflow".to_owned())
+            })?;
+
+            author.epoch = new_epoch;
+            author.broadcast_key = generate_sender_key();
+
+            rotated_authors.push(AuthorKeyRotation {
+                author_did: author_did.clone(),
+                new_epoch,
+            });
+        }
+
+        Ok(GovernanceBanResult {
+            banned_did: did.to_owned(),
+            rotated_authors,
+        })
+    }
+
+    /// Unbans a subscriber via governance action (§5.14.8).
+    ///
+    /// Removes the DID from every author's block list. Does **not**
+    /// re-register the subscriber — they must re-subscribe manually to
+    /// regain access. Does **not** rotate keys — unban is access
+    /// restoration, not revocation.
+    ///
+    /// This method does NOT check ceiling policy — that is the
+    /// `ContextManager`'s responsibility (SCP-GG-006).
+    pub fn governance_unban_subscriber(&mut self, did: &str) {
+        for author in self.authors.values_mut() {
+            author.block_list.remove(did);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2899,5 +3009,186 @@ mod tests {
         assert_eq!(decoded.context_id, "ctx-snap-msgpack");
         assert_eq!(decoded.subscribers.len(), 1);
         assert_eq!(decoded.authors.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Governance ban (SCP-GG-005)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn governance_ban_updates_all_author_block_lists_and_rotates_keys() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        ctx.add_author("did:example:bob").unwrap();
+        ctx.add_author("did:example:carol").unwrap();
+        subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
+
+        // Record pre-ban epochs.
+        assert_eq!(ctx.get_author("did:example:alice").unwrap().epoch, 0);
+        assert_eq!(ctx.get_author("did:example:bob").unwrap().epoch, 0);
+        assert_eq!(ctx.get_author("did:example:carol").unwrap().epoch, 0);
+
+        let result = ctx.governance_ban_subscriber("did:example:sub1").unwrap();
+
+        // Banned DID is correct.
+        assert_eq!(result.banned_did, "did:example:sub1");
+
+        // All 3 authors had their keys rotated.
+        assert_eq!(result.rotated_authors.len(), 3);
+        for rotation in &result.rotated_authors {
+            assert_eq!(rotation.new_epoch, 1);
+        }
+
+        // Subscriber removed from registry.
+        assert!(!ctx.is_subscriber("did:example:sub1"));
+        assert_eq!(ctx.subscriber_count(), 0);
+
+        // Blocked on all authors.
+        assert!(ctx.is_blocked("did:example:alice", "did:example:sub1"));
+        assert!(ctx.is_blocked("did:example:bob", "did:example:sub1"));
+        assert!(ctx.is_blocked("did:example:carol", "did:example:sub1"));
+
+        // All authors advanced to epoch 1.
+        assert_eq!(ctx.get_author("did:example:alice").unwrap().epoch, 1);
+        assert_eq!(ctx.get_author("did:example:bob").unwrap().epoch, 1);
+        assert_eq!(ctx.get_author("did:example:carol").unwrap().epoch, 1);
+    }
+
+    #[test]
+    fn governance_ban_nonexistent_subscriber_returns_error() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        let result = ctx.governance_ban_subscriber("did:example:ghost");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("subscriber not found"),
+            "expected MemberNotFound, got: {err}"
+        );
+    }
+
+    #[test]
+    fn governance_ban_then_unban_clears_all_block_lists() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        ctx.add_author("did:example:bob").unwrap();
+        subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
+
+        // Ban.
+        ctx.governance_ban_subscriber("did:example:sub1").unwrap();
+        assert!(ctx.is_blocked("did:example:alice", "did:example:sub1"));
+        assert!(ctx.is_blocked("did:example:bob", "did:example:sub1"));
+        assert!(!ctx.is_subscriber("did:example:sub1"));
+
+        // Unban.
+        ctx.governance_unban_subscriber("did:example:sub1");
+        assert!(!ctx.is_blocked("did:example:alice", "did:example:sub1"));
+        assert!(!ctx.is_blocked("did:example:bob", "did:example:sub1"));
+
+        // Still not re-registered — subscriber must re-subscribe manually.
+        assert!(!ctx.is_subscriber("did:example:sub1"));
+    }
+
+    #[test]
+    fn governance_ban_denies_key_requests_from_all_authors() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        ctx.add_author("did:example:bob").unwrap();
+        ctx.add_author("did:example:carol").unwrap();
+        subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
+        subscribe_open(&mut ctx, "did:example:sub2", None, 1001).unwrap();
+
+        // Before ban: sub1 can get keys from all authors.
+        assert!(matches!(
+            ctx.handle_key_request("did:example:alice", "did:example:sub1"),
+            KeyRequestDecision::Grant { .. }
+        ));
+        assert!(matches!(
+            ctx.handle_key_request("did:example:bob", "did:example:sub1"),
+            KeyRequestDecision::Grant { .. }
+        ));
+        assert!(matches!(
+            ctx.handle_key_request("did:example:carol", "did:example:sub1"),
+            KeyRequestDecision::Grant { .. }
+        ));
+
+        // Ban sub1.
+        ctx.governance_ban_subscriber("did:example:sub1").unwrap();
+
+        // After ban: sub1 is denied from ALL authors.
+        assert!(matches!(
+            ctx.handle_key_request("did:example:alice", "did:example:sub1"),
+            KeyRequestDecision::Deny { .. }
+        ));
+        assert!(matches!(
+            ctx.handle_key_request("did:example:bob", "did:example:sub1"),
+            KeyRequestDecision::Deny { .. }
+        ));
+        assert!(matches!(
+            ctx.handle_key_request("did:example:carol", "did:example:sub1"),
+            KeyRequestDecision::Deny { .. }
+        ));
+
+        // sub2 is unaffected — still granted from all authors.
+        assert!(matches!(
+            ctx.handle_key_request("did:example:alice", "did:example:sub2"),
+            KeyRequestDecision::Grant { .. }
+        ));
+        assert!(matches!(
+            ctx.handle_key_request("did:example:bob", "did:example:sub2"),
+            KeyRequestDecision::Grant { .. }
+        ));
+        assert!(matches!(
+            ctx.handle_key_request("did:example:carol", "did:example:sub2"),
+            KeyRequestDecision::Grant { .. }
+        ));
+    }
+
+    #[test]
+    fn governance_unban_allows_resubscription() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
+
+        // Ban, unban, re-subscribe.
+        ctx.governance_ban_subscriber("did:example:sub1").unwrap();
+        ctx.governance_unban_subscriber("did:example:sub1");
+        subscribe_open(&mut ctx, "did:example:sub1", None, 2000).unwrap();
+
+        // After re-subscription, key requests are granted.
+        assert!(ctx.is_subscriber("did:example:sub1"));
+        assert!(matches!(
+            ctx.handle_key_request("did:example:alice", "did:example:sub1"),
+            KeyRequestDecision::Grant { .. }
+        ));
+    }
+
+    #[test]
+    fn governance_ban_with_no_authors_removes_subscriber_only() {
+        let mut ctx = make_open_ctx();
+        subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
+        assert!(ctx.is_subscriber("did:example:sub1"));
+
+        let result = ctx.governance_ban_subscriber("did:example:sub1").unwrap();
+
+        assert_eq!(result.banned_did, "did:example:sub1");
+        assert!(result.rotated_authors.is_empty());
+        assert!(!ctx.is_subscriber("did:example:sub1"));
+    }
+
+    #[test]
+    fn governance_unban_idempotent_on_unknown_did() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        // Unbanning a DID that was never banned is a no-op — no panic.
+        ctx.governance_unban_subscriber("did:example:never-seen");
+        assert!(
+            ctx.get_author("did:example:alice")
+                .unwrap()
+                .block_list
+                .is_empty()
+        );
     }
 }

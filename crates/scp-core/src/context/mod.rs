@@ -79,8 +79,9 @@ pub fn context_id_bytes(context_id: &str) -> [u8; 32] {
 
 // Re-export all parameter types for convenience.
 pub use params::{
-    Capability, CeilingPolicy, ContextMode, ContextParams, GovernanceModel, MemoryScope,
-    PromotionPolicy, RoleDefinition, TemplateId, ToolRegistration,
+    Capability, CeilingPolicy, ContextMode, ContextParams, FieldVisibility, GovernanceModel,
+    MemoryScope, MetadataVisibilityPolicy, ProjectionOverride, ProjectionPolicy, ProjectionRule,
+    PromotionPolicy, PublicMetadata, RoleDefinition, RuntimeMetadata, TemplateId, ToolRegistration,
 };
 pub use state_machine::transition;
 
@@ -141,7 +142,8 @@ pub use standing::{StandingChannelError, StandingChannelManager};
 pub use governance::{
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
     GovernanceModelConfig, GovernanceProposal, ProposalId, ProposalStatus, RejectionReason,
-    SignedVote, SingleAdminEngine, VoteType, majority::MajorityVoteEngine, sign_vote, verify_vote,
+    RevocationScope, SignedVote, SingleAdminEngine, VoteType, majority::MajorityVoteEngine,
+    sign_vote, verify_vote,
 };
 
 // Re-export broadcast context types (SCP-227, spec section 5.14, #101).

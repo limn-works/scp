@@ -398,6 +398,10 @@ impl<S: Storage> ApplicationNode<S> {
     /// content at `/scp/broadcast/<routing_id_hex>/feed` and
     /// `/scp/broadcast/<routing_id_hex>/messages/<blob_id_hex>`.
     ///
+    /// The `admission` mode and optional `projection_policy` are stored on the
+    /// [`ProjectedContext`] so that projection handlers can enforce
+    /// authentication requirements per spec section 18.11.2.1.
+    ///
     /// See spec sections 18.11.2 and 18.11.8.
     ///
     /// # Limits
@@ -408,13 +412,22 @@ impl<S: Storage> ApplicationNode<S> {
     ///
     /// # Errors
     ///
-    /// Returns [`NodeError::InvalidConfig`] if the projected context limit
-    /// (1024) has been reached.
+    /// Returns [`NodeError::InvalidConfig`] if:
+    /// - The projected context limit (1024) has been reached.
+    /// - A gated context has a `Public` default projection rule (violates
+    ///   spec section 18.11.2.1: gated contexts cannot have public projection).
+    /// - A gated context has a `Public` per-author projection override.
     pub async fn enable_broadcast_projection(
         &self,
         context_id: &str,
         broadcast_key: scp_core::crypto::sender_keys::BroadcastKey,
+        admission: scp_core::context::broadcast::BroadcastAdmission,
+        projection_policy: Option<scp_core::context::params::ProjectionPolicy>,
     ) -> Result<(), NodeError> {
+        // Validate: gated contexts cannot have public projection rules.
+        projection::validate_projection_policy(admission, projection_policy.as_ref())
+            .map_err(NodeError::InvalidConfig)?;
+
         let routing_id = projection::compute_routing_id(context_id);
         let mut registry = self.state.projected_contexts.write().await;
         if let Some(existing) = registry.get_mut(&routing_id) {
@@ -426,7 +439,8 @@ impl<S: Storage> ApplicationNode<S> {
                     Self::MAX_PROJECTED_CONTEXTS
                 )));
             }
-            let projected = ProjectedContext::new(context_id, broadcast_key);
+            let projected =
+                ProjectedContext::new(context_id, broadcast_key, admission, projection_policy);
             registry.insert(routing_id, projected);
         }
         drop(registry);

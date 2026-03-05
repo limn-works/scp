@@ -315,6 +315,28 @@ pub fn actions_conflict(
             GovernanceAction::RemoveMember { did: did_b, .. },
         ) => did_a == b_proposer && did_b == a_proposer,
 
+        // Two RevokeReadAccess actions targeting the same DID conflict
+        // (scope may differ, but concurrent revocation is unsafe).
+        (
+            GovernanceAction::RevokeReadAccess { did: did_a, .. },
+            GovernanceAction::RevokeReadAccess { did: did_b, .. },
+        ) => did_a == did_b,
+
+        // RevokeReadAccess and RestoreReadAccess for the same DID conflict
+        // (contradictory intent on the same member's access state).
+        (
+            GovernanceAction::RevokeReadAccess {
+                did: revoke_did, ..
+            },
+            GovernanceAction::RestoreReadAccess { did: restore_did },
+        )
+        | (
+            GovernanceAction::RestoreReadAccess { did: restore_did },
+            GovernanceAction::RevokeReadAccess {
+                did: revoke_did, ..
+            },
+        ) => revoke_did == restore_did,
+
         // All other action pairs are non-conflicting.
         _ => false,
     }
@@ -603,6 +625,7 @@ fn generate_fork_id(original_context_id: &str, fork_point: &MerkleRoot) -> Strin
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::context::governance::RevocationScope;
 
     // Helper: create a DID from a string.
     fn did(s: &str) -> DID {
@@ -807,6 +830,84 @@ mod tests {
             &did("did:dht:alice"),
             &b,
             &did("did:dht:bob"),
+        ));
+    }
+
+    #[test]
+    fn conflicting_revoke_read_access_same_did() {
+        let a = GovernanceAction::RevokeReadAccess {
+            did: did("did:dht:alice"),
+            scope: RevocationScope::Full,
+        };
+        let b = GovernanceAction::RevokeReadAccess {
+            did: did("did:dht:alice"),
+            scope: RevocationScope::FutureOnly,
+        };
+        assert!(actions_conflict(
+            &a,
+            &did("did:dht:bob"),
+            &b,
+            &did("did:dht:carol"),
+        ));
+    }
+
+    #[test]
+    fn non_conflicting_revoke_read_access_different_dids() {
+        let a = GovernanceAction::RevokeReadAccess {
+            did: did("did:dht:alice"),
+            scope: RevocationScope::Full,
+        };
+        let b = GovernanceAction::RevokeReadAccess {
+            did: did("did:dht:bob"),
+            scope: RevocationScope::Full,
+        };
+        assert!(!actions_conflict(
+            &a,
+            &did("did:dht:carol"),
+            &b,
+            &did("did:dht:dave"),
+        ));
+    }
+
+    #[test]
+    fn conflicting_revoke_and_restore_read_access_same_did() {
+        let revoke = GovernanceAction::RevokeReadAccess {
+            did: did("did:dht:alice"),
+            scope: RevocationScope::Full,
+        };
+        let restore = GovernanceAction::RestoreReadAccess {
+            did: did("did:dht:alice"),
+        };
+        // Revoke then restore.
+        assert!(actions_conflict(
+            &revoke,
+            &did("did:dht:bob"),
+            &restore,
+            &did("did:dht:carol"),
+        ));
+        // Commutative: restore then revoke.
+        assert!(actions_conflict(
+            &restore,
+            &did("did:dht:carol"),
+            &revoke,
+            &did("did:dht:bob"),
+        ));
+    }
+
+    #[test]
+    fn non_conflicting_revoke_and_restore_read_access_different_dids() {
+        let revoke = GovernanceAction::RevokeReadAccess {
+            did: did("did:dht:alice"),
+            scope: RevocationScope::FutureOnly,
+        };
+        let restore = GovernanceAction::RestoreReadAccess {
+            did: did("did:dht:bob"),
+        };
+        assert!(!actions_conflict(
+            &revoke,
+            &did("did:dht:carol"),
+            &restore,
+            &did("did:dht:dave"),
         ));
     }
 

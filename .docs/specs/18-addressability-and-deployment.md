@@ -564,8 +564,15 @@ Subscriber-side projection is deliberately not supported — it would allow subs
 Projection is opt-in per context. A maximum of **1024** simultaneously projected contexts may be registered per node; exceeding this limit returns an error.
 
 ```rust
-node.enable_broadcast_projection(context_id, broadcast_key).await?;
+node.enable_broadcast_projection(
+    context_id,
+    broadcast_key,
+    admission,           // BroadcastAdmission — Open or Gated
+    projection_policy,   // Option<ProjectionPolicy> — per-author overrides
+).await?;
 ```
+
+The `admission` parameter determines baseline authentication for projection endpoints (§5.14.4). The `projection_policy` provides per-author granularity within the bounds set by the admission mode.
 
 Projected content is served at:
 
@@ -579,6 +586,46 @@ Projection is disabled per context via:
 ```rust
 node.disable_broadcast_projection(context_id).await;
 ```
+
+#### 18.11.2.1 Projection Policy
+
+`ProjectionPolicy` controls per-author access rules for projected content, within the bounds set by the context's `BroadcastAdmission` mode.
+
+```rust
+pub struct ProjectionPolicy {
+    /// Default rule for all authors without an explicit override.
+    pub default_rule: ProjectionRule,
+    /// Per-author overrides. Author DID → specific rule.
+    pub overrides: Vec<ProjectionOverride>,
+}
+
+pub enum ProjectionRule {
+    /// Content served without authentication.
+    Public,
+    /// Content requires valid messagesRead UCAN in Authorization header.
+    Gated,
+    /// Author chooses their own projection rule (author-side configuration).
+    AuthorChoice,
+}
+
+pub struct ProjectionOverride {
+    pub did: DID,
+    pub rule: ProjectionRule,
+}
+```
+
+**Ceiling constraints:**
+
+- A **gated** context (`BroadcastAdmission::Gated`) cannot have `ProjectionRule::Public` as its default or as any per-author override. The admission mode is the floor — gated content cannot be projected publicly. `enable_broadcast_projection` rejects policies that violate this constraint.
+- An **open** context (`BroadcastAdmission::Open`) can use any `ProjectionRule`. An author on an open context can choose to gate their projected content even though the broadcast key distribution is open.
+
+**Template defaults:**
+
+- `public-broadcast`: `ProjectionPolicy { default_rule: Public, overrides: vec![] }`
+- `gated-broadcast`: `ProjectionPolicy { default_rule: Gated, overrides: vec![] }`
+- `paid-broadcast`: `ProjectionPolicy { default_rule: Gated, overrides: vec![] }`
+
+**Governance.** `ProjectionPolicy` is declared on `ContextParams` and follows the context's `CeilingPolicy` — immutable or governed. If governed, `ModifyCeiling` governance action can update the projection policy. Per-author overrides allow granular control: "everyone except Bob is gated — he's public" or "everyone gets to choose — except Dave, he's always public."
 
 ### 18.11.3 Feed Endpoint
 
@@ -655,10 +702,16 @@ Keys are retained per epoch for the blob TTL window. When a key epoch advances, 
 
 - **Author's own keys only.** The node holds the broadcast keys it created. It cannot project contexts it merely subscribes to.
 - **Read-only.** Projection endpoints serve content; they do not accept writes. The write path remains the SCP protocol (MLS or broadcast envelope).
-- **Public endpoint.** Broadcast content was intended for broad distribution (§5.14 design). The projection makes already-public content accessible via HTTP without requiring SCP client software.
-- **No authentication on projection endpoints.** The content is public by design. Operators wanting access control can place a reverse proxy with authentication in front of the projection endpoints.
+- **Context-governed authentication.** Projection endpoints enforce authentication consistent with the context's `BroadcastAdmission` mode (§5.14.4):
+  - **Open contexts** (`BroadcastAdmission::Open`): content served without authentication. Broadcast content was intended for broad distribution — the projection makes already-public content accessible via HTTP.
+  - **Gated contexts** (`BroadcastAdmission::Gated`): content requires a valid `messagesRead` UCAN in the `Authorization: Bearer <token>` header. The same `validate_messages_read_ucan()` pipeline used for key distribution (§5.14.4) validates the token. Requests without a valid UCAN receive `401 Unauthorized` with JSON error body `{"error": "...", "code": "UNAUTHORIZED"}`.
+  - **Per-author overrides**: `ProjectionPolicy` overrides (§18.11.2.1) can specify different rules per author DID, within ceiling constraints. A gated context cannot have public per-author overrides (ceiling is the floor).
+- **Cache-Control for gated content.** Gated projection responses use `Cache-Control: private` (not `public`) to prevent CDNs from caching authenticated content. Specifically:
+  - Gated feed: `Cache-Control: private, max-age=30`
+  - Gated per-message: `Cache-Control: private, immutable, max-age=31536000`
+  - Open endpoints retain `Cache-Control: public` as specified in §18.11.3 and §18.11.4.
 - **`routing_id` is not new disclosure.** The `routing_id = SHA-256(context_id)` is already visible to relays (§5.14.6). Using it in URL paths reveals nothing beyond what relays already observe.
-- **Per-IP rate limiting.** Projection endpoints apply a per-IP token-bucket rate limiter (default 60 req/s, configurable via `SCP_NODE_PROJECTION_RATE_LIMIT`). Requests exceeding the limit receive HTTP 429 Too Many Requests. This prevents abuse of the public, unauthenticated endpoints that perform crypto decryption and blob reads per request. When deployed behind a reverse proxy or CDN, all requests arrive from the proxy's IP — operators in this topology should rely on proxy-layer rate limiting or configure `X-Forwarded-For` / `X-Real-IP` extraction with a trusted-proxy allowlist.
+- **Per-IP rate limiting.** Projection endpoints apply a per-IP token-bucket rate limiter (default 60 req/s, configurable via `SCP_NODE_PROJECTION_RATE_LIMIT`). Requests exceeding the limit receive HTTP 429 Too Many Requests. This prevents abuse of the endpoints that perform crypto decryption and blob reads per request. When deployed behind a reverse proxy or CDN, all requests arrive from the proxy's IP — operators in this topology should rely on proxy-layer rate limiting or configure `X-Forwarded-For` / `X-Real-IP` extraction with a trusted-proxy allowlist.
 
 ### 18.11.7 `scp://` URI Integration
 
@@ -672,6 +725,6 @@ This allows URI consumers to choose between the native SCP path (relay + broadca
 
 ### 18.11.8 SDK Surface
 
-- `ApplicationNode::enable_broadcast_projection(context_id, broadcast_key) -> Result<(), NodeError>` — activates HTTP projection for the specified broadcast context. Registers the context and key in the `ProjectedContext` registry. Returns `NodeError::InvalidConfig` if the projected context limit (1024) has been reached.
+- `ApplicationNode::enable_broadcast_projection(context_id, broadcast_key, admission, projection_policy) -> Result<(), NodeError>` — activates HTTP projection for the specified broadcast context. `admission: BroadcastAdmission` determines baseline authentication (§5.14.4). `projection_policy: Option<ProjectionPolicy>` provides per-author overrides (§18.11.2.1). Registers the context, key, admission mode, and policy in the `ProjectedContext` registry. Returns `NodeError::InvalidConfig` if the projected context limit (1024) has been reached or if the projection policy violates ceiling constraints (e.g., `Public` rule on a gated context).
 - `ApplicationNode::disable_broadcast_projection(context_id)` — deactivates HTTP projection for the specified context. Removes it from the registry. Existing CDN caches may continue serving stale content per their cache headers.
 - `ApplicationNode::broadcast_projection_router() -> axum::Router` — returns the projection router for composition. Served on the public HTTPS port alongside `.well-known/scp` and `/scp/v1`.

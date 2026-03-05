@@ -2577,10 +2577,14 @@ pub enum GovernanceAction {
     /// Full scope: retroactive (destroy access keys for historical + future content).
     /// FutureOnly scope: exclude from future content key distribution only.
     /// Does NOT remove the member — they remain for governance/presence.
+    /// Requires `MemberBan` capability in the context's ceiling (§5.3).
+    /// In broadcast contexts: removes subscriber from registry, adds to all
+    /// authors' block lists, forces key rotation on all authors (§5.14.8).
     RevokeReadAccess { did: DID, scope: RevocationScope },
     /// Restore a member's read access to context content (§9.17).
     /// Always forward-only — historical content from before/during revocation
     /// remains inaccessible (access keys were destroyed, not archived).
+    /// Requires `MemberBan` capability in the context's ceiling (§5.3).
     RestoreReadAccess { did: DID },
     /// Revoke a member's write access to context content (§9.17).
     /// Full scope: stop publishing + suppress historical content.

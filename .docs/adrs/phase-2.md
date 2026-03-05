@@ -1120,11 +1120,12 @@ Implement two `ApplicationNode` features in the `scp-node` crate:
 
 #### 2. HTTP Broadcast Projection (§18.11)
 
-- **Public HTTPS port.** Projection endpoints serve on the same listener as `.well-known/scp` and `/scp/v1`. Content is public by design (§5.14).
+- **Public HTTPS port.** Projection endpoints serve on the same listener as `.well-known/scp` and `/scp/v1`.
+- **Context-governed auth.** Open contexts serve publicly; gated contexts require `messagesRead` UCAN. Per-author `ProjectionPolicy` overrides within admission bounds (§18.11.2.1).
 - **Author-side only.** The relay cannot decrypt (§9.9.1). The author's `ApplicationNode` holds the broadcast keys and decrypts its own content for HTTP serving. Subscriber-side projection is deliberately unsupported.
 - **Feed endpoint.** `GET /scp/broadcast/<routing_id>/feed` — paginated JSON with 30s cache TTL and ETag.
 - **Per-message endpoint.** `GET /scp/broadcast/<routing_id>/messages/<blob_id>` — immutable individual messages with 1-year cache TTL and conditional GET (304).
-- **Opt-in per context.** `enable_broadcast_projection(context_id, broadcast_key)` activates projection. `disable_broadcast_projection(context_id)` deactivates.
+- **Opt-in per context.** `enable_broadcast_projection(context_id, broadcast_key, admission, projection_policy)` activates projection. `disable_broadcast_projection(context_id)` deactivates.
 
 #### 3. Shared BlobStorage via Arc
 
@@ -1133,7 +1134,7 @@ Implement two `ApplicationNode` features in the `scp-node` crate:
 ### Rationale
 
 - **Separate port for dev API:** A reverse proxy forwarding `*` to the public HTTPS port is a common deployment pattern. If the dev API shared the public port, every such proxy would expose it. Separate port requires explicit, intentional proxy configuration. The trade-off (two listeners) is negligible.
-- **Projection is public because broadcast content is public:** §5.14 defines broadcast contexts as unlimited-audience, per-author keyed content. Making this content accessible via HTTP is consistent with its design intent. Adding authentication would be contradictory — the content is already available to anyone with the broadcast key, and broadcast keys are distributed freely.
+- **Projection auth follows context admission mode:** §5.14 defines broadcast contexts with two admission models — open (keys distributed on DID registration) and gated (keys require `messagesRead` UCAN). Projection endpoints enforce the same access model: open contexts serve publicly; gated contexts require a valid `messagesRead` UCAN in the `Authorization: Bearer` header. Per-author `ProjectionPolicy` overrides (§18.11.2.1) provide granularity within the bounds set by the admission mode — a gated context cannot have public per-author overrides (the admission mode is the floor). Gated projection responses use `Cache-Control: private` to prevent CDN caching of authenticated content.
 - **Author-side only:** Subscriber-side projection would let any subscriber redistribute content via HTTP without the author's control or knowledge. Author-side projection means the author explicitly opts in.
 - **`routing_id` in URLs is not new disclosure:** `routing_id = SHA-256(context_id)` is already visible to every relay handling the broadcast context (§5.14.6). Using it in HTTP URLs reveals nothing beyond what relays already observe.
 - **`Arc<dyn BlobStorage>` sharing over IPC:** A separate `scp-broadcast-proxy` process would require IPC (Unix socket, shared memory) to access blobs. The keys and blobs are already in-process in the `ApplicationNode`. `Arc` sharing is zero-copy, zero-overhead.

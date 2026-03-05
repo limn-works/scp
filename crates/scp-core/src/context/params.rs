@@ -2,11 +2,17 @@
 //!
 //! Defines [`ContextParams`] and its constituent types: [`ContextMode`],
 //! [`CeilingPolicy`], [`PromotionPolicy`], [`MemoryScope`], [`GovernanceModel`],
-//! and [`TemplateId`]. These types capture the full configuration surface of an
-//! SCP context at creation time. See ADR-008 in `.docs/adrs/phase-2.md`.
+//! [`TemplateId`], [`FieldVisibility`], [`MetadataVisibilityPolicy`],
+//! [`ProjectionRule`], [`ProjectionOverride`], [`ProjectionPolicy`],
+//! [`PublicMetadata`], and [`RuntimeMetadata`].
+//! These types capture the full configuration surface of an SCP context at
+//! creation time. [`PublicMetadata`] is the filtered projection returned by
+//! [`ContextParams::public_metadata()`] for pre-join observers (spec §5.7).
+//! See ADR-008 in `.docs/adrs/phase-2.md`.
 
 use std::time::Duration;
 
+use scp_identity::DID;
 use serde::{Deserialize, Serialize};
 
 use crate::economy::EconomicPolicy;
@@ -211,6 +217,201 @@ pub enum TemplateId {
 }
 
 // ---------------------------------------------------------------------------
+// FieldVisibility
+// ---------------------------------------------------------------------------
+
+/// Controls whether metadata fields are visible before joining a context.
+///
+/// Used by [`MetadataVisibilityPolicy`] to declare per-field visibility.
+/// Structural fields (ceiling, governance, mode, etc.) are always visible
+/// regardless of this setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FieldVisibility {
+    /// Visible to anyone with the `context_id` (pre-join legibility).
+    #[default]
+    PreJoin,
+    /// Visible only to context members.
+    MemberOnly,
+}
+
+// ---------------------------------------------------------------------------
+// MetadataVisibilityPolicy
+// ---------------------------------------------------------------------------
+
+/// Per-field metadata visibility policy (spec section 5.7).
+///
+/// Structural fields (ceiling, governance, mode, etc.) are always visible.
+/// This policy governs operational fields only. By default, all operational
+/// fields are [`FieldVisibility::PreJoin`] -- visible to anyone with the
+/// `context_id`, supporting informed consent before joining.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataVisibilityPolicy {
+    /// Visibility of the context's member count.
+    pub member_count: FieldVisibility,
+    /// Visibility of the context's age (time since creation).
+    pub context_age: FieldVisibility,
+    /// Visibility of the context creator's identity (DID).
+    pub creator_identity: FieldVisibility,
+    /// Visibility of the context's human-readable name.
+    pub name: FieldVisibility,
+    /// Visibility of the context's description.
+    pub description: FieldVisibility,
+    /// Visibility of the context's economic policy.
+    pub economic_policy: FieldVisibility,
+    /// Visibility of the count of registered tool interfaces.
+    pub tool_interface_count: FieldVisibility,
+    /// Visibility of child context summary information.
+    pub child_context_info: FieldVisibility,
+}
+
+impl Default for MetadataVisibilityPolicy {
+    fn default() -> Self {
+        Self {
+            member_count: FieldVisibility::PreJoin,
+            context_age: FieldVisibility::PreJoin,
+            creator_identity: FieldVisibility::PreJoin,
+            name: FieldVisibility::PreJoin,
+            description: FieldVisibility::PreJoin,
+            economic_policy: FieldVisibility::PreJoin,
+            tool_interface_count: FieldVisibility::PreJoin,
+            child_context_info: FieldVisibility::PreJoin,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ProjectionRule / ProjectionPolicy
+// ---------------------------------------------------------------------------
+
+/// Rule for HTTP broadcast projection access control (spec section 18.11.2.1).
+///
+/// Controls whether projected broadcast content requires authentication to access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProjectionRule {
+    /// Content served without authentication.
+    Public,
+    /// Content requires valid `messagesRead` UCAN in Authorization header.
+    Gated,
+    /// Author chooses their own projection rule.
+    AuthorChoice,
+}
+
+/// Per-author projection access override.
+///
+/// Allows individual authors within a broadcast context to have a projection
+/// rule that differs from the context's default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionOverride {
+    /// The DID of the author this override applies to.
+    pub did: DID,
+    /// The projection rule for this specific author.
+    pub rule: ProjectionRule,
+}
+
+/// Per-author projection access policy for broadcast contexts (spec section 18.11.2.1).
+///
+/// Controls whether projected content requires authentication, with per-author
+/// overrides within the bounds of the context's admission mode. Only meaningful
+/// for [`ContextMode::Broadcast`] contexts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionPolicy {
+    /// Default rule for all authors without an explicit override.
+    pub default_rule: ProjectionRule,
+    /// Per-author overrides.
+    pub overrides: Vec<ProjectionOverride>,
+}
+
+// ---------------------------------------------------------------------------
+// PublicMetadata
+// ---------------------------------------------------------------------------
+
+/// Metadata visible to pre-join observers (spec section 5.7).
+///
+/// Structural fields are always included — they are the parameters a
+/// prospective member needs to evaluate whether to join. Operational fields
+/// are included only when the corresponding [`FieldVisibility`] in the
+/// context's [`MetadataVisibilityPolicy`] is [`FieldVisibility::PreJoin`];
+/// otherwise they are `None`.
+///
+/// Constructed via [`ContextParams::public_metadata()`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicMetadata {
+    // --- Structural fields (always visible) ---
+    /// Well-known template identifier, if created from a template.
+    pub template_id: Option<TemplateId>,
+    /// Capability ceiling.
+    pub ceiling: Vec<Capability>,
+    /// Ceiling mutability policy.
+    pub ceiling_policy: CeilingPolicy,
+    /// Role definitions.
+    pub roles: Vec<RoleDefinition>,
+    /// Governance model.
+    pub governance: GovernanceModel,
+    /// Context processing mode.
+    pub mode: ContextMode,
+    /// Time-to-live, if set.
+    pub ttl: Option<Duration>,
+    /// Promotion policy.
+    pub promotion_policy: PromotionPolicy,
+    /// Memory scope.
+    pub memory_scope: MemoryScope,
+    /// The visibility policy itself (so prospective members know what's hidden).
+    pub metadata_visibility: MetadataVisibilityPolicy,
+
+    // --- Operational fields (governed by MetadataVisibilityPolicy) ---
+    /// Current member count. `None` when hidden by `MemberOnly` or unavailable.
+    pub member_count: Option<u64>,
+    /// Context age in seconds since creation. `None` when hidden by `MemberOnly` or unavailable.
+    pub context_age: Option<u64>,
+    /// Creator's DID. `None` when hidden by `MemberOnly` or unavailable.
+    pub creator_identity: Option<DID>,
+    /// Human-readable name. `None` when hidden by `MemberOnly` or unavailable.
+    pub name: Option<String>,
+    /// Human-readable description. `None` when hidden by `MemberOnly` or unavailable.
+    pub description: Option<String>,
+    /// Economic policy. `None` when hidden by `MemberOnly`, absent, or unavailable.
+    pub economic_policy: Option<EconomicPolicy>,
+    /// Count of registered tool interfaces. `None` when hidden by `MemberOnly` or unavailable.
+    pub tool_interface_count: Option<u32>,
+    /// Child context summary information. `None` when hidden by `MemberOnly` or unavailable.
+    pub child_context_info: Option<Vec<String>>,
+}
+
+/// Runtime context state that is not captured in [`ContextParams`] but may
+/// be published as operational metadata. Pass to
+/// [`ContextParams::public_metadata()`] to populate the corresponding fields.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeMetadata {
+    /// Current member count.
+    pub member_count: Option<u64>,
+    /// Context age in seconds since creation.
+    pub context_age: Option<u64>,
+    /// Creator's DID.
+    pub creator_identity: Option<DID>,
+    /// Human-readable context name.
+    pub name: Option<String>,
+    /// Human-readable context description.
+    pub description: Option<String>,
+    /// Count of registered tool interfaces.
+    pub tool_interface_count: Option<u32>,
+    /// Child context summary information (e.g., parent context IDs, summaries).
+    pub child_context_info: Option<Vec<String>>,
+}
+
+// ---------------------------------------------------------------------------
+// filter_field helper
+// ---------------------------------------------------------------------------
+
+/// Returns `value` when `visibility` is [`FieldVisibility::PreJoin`], or
+/// `None` when it is [`FieldVisibility::MemberOnly`].
+fn filter_field<T>(visibility: FieldVisibility, value: Option<T>) -> Option<T> {
+    match visibility {
+        FieldVisibility::PreJoin => value,
+        FieldVisibility::MemberOnly => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ContextParams
 // ---------------------------------------------------------------------------
 
@@ -272,6 +473,18 @@ pub struct ContextParams {
     /// See spec section 19.3 and ADR-033.
     #[serde(default)]
     pub economic_policy: Option<EconomicPolicy>,
+
+    /// Per-field metadata visibility policy controlling which operational fields
+    /// are visible before joining (spec section 5.7). Structural fields are
+    /// always visible regardless. Defaults to all fields [`FieldVisibility::PreJoin`].
+    #[serde(default)]
+    pub metadata_visibility: MetadataVisibilityPolicy,
+
+    /// Projection access policy for broadcast contexts (spec section 18.11.2.1).
+    /// Controls whether projected HTTP content requires authentication, with
+    /// per-author overrides. `None` for non-broadcast contexts.
+    #[serde(default)]
+    pub projection_policy: Option<ProjectionPolicy>,
 }
 
 impl Default for ContextParams {
@@ -288,6 +501,55 @@ impl Default for ContextParams {
             governance: GovernanceModel::SingleAdmin,
             template_id: None,
             economic_policy: None,
+            metadata_visibility: MetadataVisibilityPolicy::default(),
+            projection_policy: None,
+        }
+    }
+}
+
+impl ContextParams {
+    /// Return metadata filtered by the visibility policy (spec section 5.7).
+    ///
+    /// Structural fields are always included. Operational fields are included
+    /// only when the corresponding [`FieldVisibility`] is
+    /// [`FieldVisibility::PreJoin`]; otherwise the field is `None`.
+    ///
+    /// Fields that live on `ContextParams` (e.g., `economic_policy`) are
+    /// filtered directly. Fields that are runtime state (member count, context
+    /// age, creator identity, name, description, tool interface count, child
+    /// context info) must be supplied via [`RuntimeMetadata`].
+    #[must_use]
+    pub fn public_metadata(&self, runtime: &RuntimeMetadata) -> PublicMetadata {
+        let vis = &self.metadata_visibility;
+
+        PublicMetadata {
+            // Structural fields — always visible.
+            template_id: self.template_id,
+            ceiling: self.ceiling.clone(),
+            ceiling_policy: self.ceiling_policy,
+            roles: self.roles.clone(),
+            governance: self.governance.clone(),
+            mode: self.mode,
+            ttl: self.ttl,
+            promotion_policy: self.promotion_policy,
+            memory_scope: self.memory_scope,
+            metadata_visibility: self.metadata_visibility.clone(),
+
+            // Operational fields — filtered by visibility policy.
+            member_count: filter_field(vis.member_count, runtime.member_count),
+            context_age: filter_field(vis.context_age, runtime.context_age),
+            creator_identity: filter_field(vis.creator_identity, runtime.creator_identity.clone()),
+            name: filter_field(vis.name, runtime.name.clone()),
+            description: filter_field(vis.description, runtime.description.clone()),
+            economic_policy: filter_field(vis.economic_policy, self.economic_policy.clone()),
+            tool_interface_count: filter_field(
+                vis.tool_interface_count,
+                runtime.tool_interface_count,
+            ),
+            child_context_info: filter_field(
+                vis.child_context_info,
+                runtime.child_context_info.clone(),
+            ),
         }
     }
 }
@@ -321,6 +583,11 @@ mod tests {
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
         assert!(params.template_id.is_none());
         assert!(params.economic_policy.is_none());
+        assert_eq!(
+            params.metadata_visibility,
+            MetadataVisibilityPolicy::default()
+        );
+        assert!(params.projection_policy.is_none());
     }
 
     #[test]
@@ -349,6 +616,8 @@ mod tests {
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::PublicBroadcast),
             economic_policy: None,
+            metadata_visibility: MetadataVisibilityPolicy::default(),
+            projection_policy: None,
         };
 
         assert_eq!(params.mode, ContextMode::Broadcast);
@@ -444,6 +713,8 @@ mod tests {
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::BilateralEphemeral),
             economic_policy: None,
+            metadata_visibility: MetadataVisibilityPolicy::default(),
+            projection_policy: None,
         };
 
         let json = serde_json::to_string(&params).ok();
@@ -459,7 +730,6 @@ mod tests {
             Amount, Coefficient, CostSchedule, CurrencyCode, EconomicPolicy, PricingFormula,
             PricingMetric, PricingVariable,
         };
-        use scp_identity::DID;
 
         let params = ContextParams {
             mode: ContextMode::Encrypted,
@@ -494,6 +764,8 @@ mod tests {
                 }),
                 payee: DID::from("did:dht:z6MkPayee"),
             }),
+            metadata_visibility: MetadataVisibilityPolicy::default(),
+            projection_policy: None,
         };
 
         let json = serde_json::to_string(&params).unwrap();
@@ -520,5 +792,417 @@ mod tests {
         }"#;
         let params: ContextParams = serde_json::from_str(json).unwrap();
         assert!(params.economic_policy.is_none());
+        // New fields should also get defaults via #[serde(default)].
+        assert_eq!(
+            params.metadata_visibility,
+            MetadataVisibilityPolicy::default()
+        );
+        assert!(params.projection_policy.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // FieldVisibility
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn field_visibility_default_is_pre_join() {
+        assert_eq!(FieldVisibility::default(), FieldVisibility::PreJoin);
+    }
+
+    #[test]
+    fn field_visibility_serialization_roundtrip() {
+        for vis in [FieldVisibility::PreJoin, FieldVisibility::MemberOnly] {
+            let json = serde_json::to_string(&vis).unwrap();
+            let deserialized: FieldVisibility = serde_json::from_str(&json).unwrap();
+            assert_eq!(vis, deserialized);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // MetadataVisibilityPolicy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn metadata_visibility_policy_default_all_pre_join() {
+        let policy = MetadataVisibilityPolicy::default();
+        assert_eq!(policy.member_count, FieldVisibility::PreJoin);
+        assert_eq!(policy.context_age, FieldVisibility::PreJoin);
+        assert_eq!(policy.creator_identity, FieldVisibility::PreJoin);
+        assert_eq!(policy.name, FieldVisibility::PreJoin);
+        assert_eq!(policy.description, FieldVisibility::PreJoin);
+        assert_eq!(policy.economic_policy, FieldVisibility::PreJoin);
+        assert_eq!(policy.tool_interface_count, FieldVisibility::PreJoin);
+        assert_eq!(policy.child_context_info, FieldVisibility::PreJoin);
+    }
+
+    #[test]
+    fn metadata_visibility_policy_serialization_roundtrip() {
+        let policy = MetadataVisibilityPolicy {
+            member_count: FieldVisibility::MemberOnly,
+            context_age: FieldVisibility::PreJoin,
+            creator_identity: FieldVisibility::MemberOnly,
+            name: FieldVisibility::PreJoin,
+            description: FieldVisibility::PreJoin,
+            economic_policy: FieldVisibility::MemberOnly,
+            tool_interface_count: FieldVisibility::PreJoin,
+            child_context_info: FieldVisibility::MemberOnly,
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        let deserialized: MetadataVisibilityPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(policy, deserialized);
+    }
+
+    // -----------------------------------------------------------------------
+    // ProjectionRule / ProjectionPolicy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn projection_rule_serialization_roundtrip() {
+        for rule in [
+            ProjectionRule::Public,
+            ProjectionRule::Gated,
+            ProjectionRule::AuthorChoice,
+        ] {
+            let json = serde_json::to_string(&rule).unwrap();
+            let deserialized: ProjectionRule = serde_json::from_str(&json).unwrap();
+            assert_eq!(rule, deserialized);
+        }
+    }
+
+    #[test]
+    fn projection_policy_serialization_roundtrip() {
+        let policy = ProjectionPolicy {
+            default_rule: ProjectionRule::Gated,
+            overrides: vec![ProjectionOverride {
+                did: DID::from("did:dht:z6MkAuthor1"),
+                rule: ProjectionRule::Public,
+            }],
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        let deserialized: ProjectionPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(policy, deserialized);
+    }
+
+    #[test]
+    fn projection_override_equality() {
+        let a = ProjectionOverride {
+            did: DID::from("did:dht:z6MkA"),
+            rule: ProjectionRule::Public,
+        };
+        let b = ProjectionOverride {
+            did: DID::from("did:dht:z6MkA"),
+            rule: ProjectionRule::Public,
+        };
+        let c = ProjectionOverride {
+            did: DID::from("did:dht:z6MkB"),
+            rule: ProjectionRule::Gated,
+        };
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    // -----------------------------------------------------------------------
+    // PublicMetadata / public_metadata()
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a `RuntimeMetadata` with all fields populated.
+    fn full_runtime() -> RuntimeMetadata {
+        RuntimeMetadata {
+            member_count: Some(42),
+            context_age: Some(86400),
+            creator_identity: Some(DID::from("did:dht:z6MkCreator")),
+            name: Some("Test Context".to_owned()),
+            description: Some("A test context".to_owned()),
+            tool_interface_count: Some(3),
+            child_context_info: Some(vec!["child-1".to_owned(), "child-2".to_owned()]),
+        }
+    }
+
+    #[test]
+    fn public_metadata_default_policy_returns_all_fields() {
+        // Default MetadataVisibilityPolicy has all fields PreJoin,
+        // so public_metadata() should return everything.
+        let params = ContextParams {
+            ceiling: vec![Capability::new("messages:read")],
+            mode: ContextMode::Encrypted,
+            ..ContextParams::default()
+        };
+        let runtime = full_runtime();
+        let meta = params.public_metadata(&runtime);
+
+        // Structural fields always present.
+        assert_eq!(meta.ceiling, params.ceiling);
+        assert_eq!(meta.ceiling_policy, CeilingPolicy::Immutable);
+        assert_eq!(meta.mode, ContextMode::Encrypted);
+        assert_eq!(meta.promotion_policy, PromotionPolicy::NoPromotion);
+        assert_eq!(meta.memory_scope, MemoryScope::Ephemeral);
+        assert_eq!(meta.governance, GovernanceModel::SingleAdmin);
+        assert!(meta.template_id.is_none());
+        assert!(meta.ttl.is_none());
+        assert!(meta.roles.is_empty());
+        assert_eq!(
+            meta.metadata_visibility,
+            MetadataVisibilityPolicy::default()
+        );
+
+        // Operational fields all visible (PreJoin default).
+        assert_eq!(meta.member_count, Some(42));
+        assert_eq!(meta.context_age, Some(86400));
+        assert_eq!(
+            meta.creator_identity,
+            Some(DID::from("did:dht:z6MkCreator"))
+        );
+        assert_eq!(meta.name, Some("Test Context".to_owned()));
+        assert_eq!(meta.description, Some("A test context".to_owned()));
+        assert_eq!(meta.tool_interface_count, Some(3));
+        assert_eq!(
+            meta.child_context_info,
+            Some(vec!["child-1".to_owned(), "child-2".to_owned()])
+        );
+    }
+
+    #[test]
+    fn public_metadata_member_count_hidden_when_member_only() {
+        let params = ContextParams {
+            metadata_visibility: MetadataVisibilityPolicy {
+                member_count: FieldVisibility::MemberOnly,
+                ..MetadataVisibilityPolicy::default()
+            },
+            ..ContextParams::default()
+        };
+        let runtime = full_runtime();
+        let meta = params.public_metadata(&runtime);
+
+        // member_count hidden.
+        assert!(meta.member_count.is_none());
+
+        // Other operational fields still visible.
+        assert_eq!(meta.context_age, Some(86400));
+        assert_eq!(
+            meta.creator_identity,
+            Some(DID::from("did:dht:z6MkCreator"))
+        );
+        assert_eq!(meta.name, Some("Test Context".to_owned()));
+    }
+
+    #[test]
+    fn public_metadata_name_hidden_when_member_only() {
+        let params = ContextParams {
+            metadata_visibility: MetadataVisibilityPolicy {
+                name: FieldVisibility::MemberOnly,
+                ..MetadataVisibilityPolicy::default()
+            },
+            ..ContextParams::default()
+        };
+        let runtime = full_runtime();
+        let meta = params.public_metadata(&runtime);
+
+        assert!(meta.name.is_none());
+        // Description still visible.
+        assert_eq!(meta.description, Some("A test context".to_owned()));
+    }
+
+    #[test]
+    fn public_metadata_structural_fields_always_present_regardless_of_policy() {
+        // Even with all operational fields MemberOnly, structural fields persist.
+        let params = ContextParams {
+            ceiling: vec![
+                Capability::new("messages:read"),
+                Capability::new("messages:write"),
+            ],
+            ceiling_policy: CeilingPolicy::Governed,
+            mode: ContextMode::Broadcast,
+            ttl: Some(Duration::from_secs(7200)),
+            promotion_policy: PromotionPolicy::Promotable,
+            memory_scope: MemoryScope::Full,
+            governance: GovernanceModel::SingleAdmin,
+            template_id: Some(TemplateId::PublicBroadcast),
+            roles: vec![RoleDefinition {
+                name: "admin".to_owned(),
+            }],
+            metadata_visibility: MetadataVisibilityPolicy {
+                member_count: FieldVisibility::MemberOnly,
+                context_age: FieldVisibility::MemberOnly,
+                creator_identity: FieldVisibility::MemberOnly,
+                name: FieldVisibility::MemberOnly,
+                description: FieldVisibility::MemberOnly,
+                economic_policy: FieldVisibility::MemberOnly,
+                tool_interface_count: FieldVisibility::MemberOnly,
+                child_context_info: FieldVisibility::MemberOnly,
+            },
+            ..ContextParams::default()
+        };
+        let runtime = full_runtime();
+        let meta = params.public_metadata(&runtime);
+
+        // Structural fields present.
+        assert_eq!(meta.ceiling.len(), 2);
+        assert_eq!(meta.ceiling_policy, CeilingPolicy::Governed);
+        assert_eq!(meta.mode, ContextMode::Broadcast);
+        assert_eq!(meta.ttl, Some(Duration::from_secs(7200)));
+        assert_eq!(meta.promotion_policy, PromotionPolicy::Promotable);
+        assert_eq!(meta.memory_scope, MemoryScope::Full);
+        assert_eq!(meta.governance, GovernanceModel::SingleAdmin);
+        assert_eq!(meta.template_id, Some(TemplateId::PublicBroadcast));
+        assert_eq!(meta.roles.len(), 1);
+        assert_eq!(
+            meta.metadata_visibility.member_count,
+            FieldVisibility::MemberOnly
+        );
+
+        // All operational fields hidden.
+        assert!(meta.member_count.is_none());
+        assert!(meta.context_age.is_none());
+        assert!(meta.creator_identity.is_none());
+        assert!(meta.name.is_none());
+        assert!(meta.description.is_none());
+        assert!(meta.economic_policy.is_none());
+        assert!(meta.tool_interface_count.is_none());
+        assert!(meta.child_context_info.is_none());
+    }
+
+    #[test]
+    fn public_metadata_economic_policy_filtered_from_context_params() {
+        // economic_policy is the one operational field that lives on ContextParams,
+        // not on RuntimeMetadata.
+        use crate::economy::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+
+        let policy = EconomicPolicy {
+            locked: false,
+            cost_schedule: CostSchedule {
+                currency: CurrencyCode::from("USD"),
+                per_message: Some(Amount(1)),
+                per_tool_invoke: None,
+                per_join: None,
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec!["x402".to_owned()],
+            pricing_formula: None,
+            payee: DID::from("did:dht:z6MkPayee"),
+        };
+
+        // Visible when PreJoin.
+        let params = ContextParams {
+            economic_policy: Some(policy.clone()),
+            metadata_visibility: MetadataVisibilityPolicy::default(),
+            ..ContextParams::default()
+        };
+        let meta = params.public_metadata(&RuntimeMetadata::default());
+        assert_eq!(meta.economic_policy, Some(policy.clone()));
+
+        // Hidden when MemberOnly.
+        let params_hidden = ContextParams {
+            economic_policy: Some(policy),
+            metadata_visibility: MetadataVisibilityPolicy {
+                economic_policy: FieldVisibility::MemberOnly,
+                ..MetadataVisibilityPolicy::default()
+            },
+            ..ContextParams::default()
+        };
+        let meta_hidden = params_hidden.public_metadata(&RuntimeMetadata::default());
+        assert!(meta_hidden.economic_policy.is_none());
+    }
+
+    #[test]
+    fn public_metadata_runtime_none_stays_none_even_when_pre_join() {
+        // When runtime doesn't supply a value, field is None regardless of policy.
+        let params = ContextParams::default();
+        let runtime = RuntimeMetadata::default();
+        let meta = params.public_metadata(&runtime);
+
+        assert!(meta.member_count.is_none());
+        assert!(meta.context_age.is_none());
+        assert!(meta.creator_identity.is_none());
+        assert!(meta.name.is_none());
+        assert!(meta.description.is_none());
+        assert!(meta.tool_interface_count.is_none());
+        assert!(meta.child_context_info.is_none());
+    }
+
+    #[test]
+    fn public_metadata_selective_field_hiding() {
+        // Hide member_count, context_age, and creator_identity (bilateral-ephemeral style).
+        let params = ContextParams {
+            metadata_visibility: MetadataVisibilityPolicy {
+                member_count: FieldVisibility::MemberOnly,
+                context_age: FieldVisibility::MemberOnly,
+                creator_identity: FieldVisibility::MemberOnly,
+                ..MetadataVisibilityPolicy::default()
+            },
+            ..ContextParams::default()
+        };
+        let runtime = full_runtime();
+        let meta = params.public_metadata(&runtime);
+
+        // These three are hidden.
+        assert!(meta.member_count.is_none());
+        assert!(meta.context_age.is_none());
+        assert!(meta.creator_identity.is_none());
+
+        // Remaining operational fields still visible.
+        assert_eq!(meta.name, Some("Test Context".to_owned()));
+        assert_eq!(meta.description, Some("A test context".to_owned()));
+        assert_eq!(meta.tool_interface_count, Some(3));
+        assert_eq!(
+            meta.child_context_info,
+            Some(vec!["child-1".to_owned(), "child-2".to_owned()])
+        );
+    }
+
+    #[test]
+    fn public_metadata_gated_broadcast_template_hides_member_count() {
+        use crate::context::templates::template_params;
+        let params = template_params(&TemplateId::GatedBroadcast);
+        let runtime = full_runtime();
+        let meta = params.public_metadata(&runtime);
+
+        // Gated-broadcast template: member_count MemberOnly, all others PreJoin.
+        assert!(meta.member_count.is_none(), "member_count should be hidden");
+        // Other operational fields remain visible.
+        assert!(meta.name.is_some());
+        assert!(meta.description.is_some());
+        assert!(meta.context_age.is_some());
+        assert!(meta.creator_identity.is_some());
+    }
+
+    #[test]
+    fn public_metadata_bilateral_ephemeral_template_hides_private_fields() {
+        use crate::context::templates::template_params;
+        let params = template_params(&TemplateId::BilateralEphemeral);
+        let runtime = full_runtime();
+        let meta = params.public_metadata(&runtime);
+
+        // Bilateral-ephemeral: member_count, context_age, creator_identity
+        // (and description, economic_policy, tool_interface_count, child_context_info)
+        // are all MemberOnly. Only name is PreJoin.
+        assert!(meta.member_count.is_none(), "member_count should be hidden");
+        assert!(meta.context_age.is_none(), "context_age should be hidden");
+        assert!(
+            meta.creator_identity.is_none(),
+            "creator_identity should be hidden"
+        );
+        assert!(
+            meta.description.is_none(),
+            "description should be hidden for bilateral-ephemeral"
+        );
+        // Name is PreJoin.
+        assert!(meta.name.is_some(), "name should be visible");
+        // Structural fields always present.
+        assert!(!meta.ceiling.is_empty());
+    }
+
+    #[test]
+    fn public_metadata_serialization_roundtrip() {
+        let params = ContextParams {
+            ceiling: vec![Capability::new("messages:read")],
+            ..ContextParams::default()
+        };
+        let runtime = full_runtime();
+        let meta = params.public_metadata(&runtime);
+
+        let json = serde_json::to_string(&meta).unwrap();
+        let deserialized: PublicMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(meta, deserialized);
     }
 }

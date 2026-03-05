@@ -278,6 +278,20 @@ where
 // GovernanceAction
 // ---------------------------------------------------------------------------
 
+/// Scope of content access revocation (§5.9, ADR-031).
+///
+/// Determines whether revocation is retroactive (destroying historical access keys)
+/// or forward-only (preserving access to already-distributed content).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RevocationScope {
+    /// Retroactive: destroy access keys for historical content AND
+    /// exclude from future content key distribution.
+    Full,
+    /// Forward-only: exclude from future content key distribution.
+    /// Historical content remains accessible.
+    FutureOnly,
+}
+
 /// Typed governance actions. Every governance change is one of these variants.
 ///
 /// The governance engine evaluates proposals containing these actions. This
@@ -316,6 +330,28 @@ pub enum GovernanceAction {
         author_did: DID,
         /// Optional reason for the block.
         reason: Option<String>,
+    },
+    /// Revoke a member's read access to context content (§5.9, ADR-031).
+    ///
+    /// Requires `MemberBan` capability in the context's ceiling (§5.3).
+    /// In broadcast contexts: removes subscriber from registry, adds to all
+    /// authors' block lists, forces key rotation on all authors (§5.14.8).
+    /// In encrypted contexts: removes from MLS group.
+    /// Does NOT remove the member -- they remain for governance/presence.
+    RevokeReadAccess {
+        /// The DID whose read access is revoked.
+        did: DID,
+        /// Whether revocation is retroactive or forward-only.
+        scope: RevocationScope,
+    },
+    /// Restore a member's read access to context content (§5.9, ADR-031).
+    ///
+    /// Requires `MemberBan` capability in the context's ceiling (§5.3).
+    /// Always forward-only -- historical content from before/during revocation
+    /// remains inaccessible (access keys were destroyed, not archived).
+    RestoreReadAccess {
+        /// The DID whose read access is restored.
+        did: DID,
     },
 }
 
@@ -984,6 +1020,31 @@ mod tests {
             current_epoch: Some(1),
             now: 1_700_000_000,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // RevocationScope serialization roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn revocation_scope_full_roundtrip() {
+        let scope = RevocationScope::Full;
+        let json = serde_json::to_string(&scope).unwrap();
+        let deserialized: RevocationScope = serde_json::from_str(&json).unwrap();
+        assert_eq!(scope, deserialized);
+    }
+
+    #[test]
+    fn revocation_scope_future_only_roundtrip() {
+        let scope = RevocationScope::FutureOnly;
+        let json = serde_json::to_string(&scope).unwrap();
+        let deserialized: RevocationScope = serde_json::from_str(&json).unwrap();
+        assert_eq!(scope, deserialized);
+    }
+
+    #[test]
+    fn revocation_scope_variants_are_distinct() {
+        assert_ne!(RevocationScope::Full, RevocationScope::FutureOnly);
     }
 
     // -----------------------------------------------------------------------

@@ -222,6 +222,25 @@ pub enum ContextEvent {
         /// The DID of the blocked author.
         author_did: DID,
     },
+    /// A member's read access was revoked via governance (ADR-031, §5.9).
+    ///
+    /// In broadcast mode: subscriber removed from registry, added to all
+    /// authors' block lists, all author keys rotated. The member remains
+    /// in the context for governance/presence purposes but cannot read
+    /// new content.
+    ReadAccessRevoked {
+        /// The DID whose read access was revoked.
+        did: DID,
+    },
+    /// A member's read access was restored via governance (ADR-031, §5.9).
+    ///
+    /// Removes the DID from all authors' block lists. The member must
+    /// re-subscribe to regain access. Restoration is always forward-only:
+    /// content missed during revocation remains inaccessible.
+    ReadAccessRestored {
+        /// The DID whose read access was restored.
+        did: DID,
+    },
     /// The context expired due to TTL.
     ///
     /// Replaces the former sentinel DID string `"__ttl_expiry_notification"`.

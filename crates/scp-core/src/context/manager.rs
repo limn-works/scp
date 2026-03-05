@@ -17,13 +17,15 @@ use tokio::sync::{Mutex, RwLock};
 
 use super::broadcast::{
     AuthorBlockResult, BlockResult, BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot,
-    KeyRequestDecision, SubscriptionResult, UnsubscribeResult,
+    GovernanceBanResult, KeyRequestDecision, SubscriptionResult, UnsubscribeResult,
 };
 use super::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
     create_context as builder_create_context,
 };
-use super::governance::{GovernanceAction, GovernanceProposal, ProposalId, ProposalStatus};
+use super::governance::{
+    GovernanceAction, GovernanceProposal, ProposalId, ProposalStatus, RevocationScope,
+};
 use super::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
 use super::params::{ContextMode, TemplateId};
 use super::roles::{self, Capability, CapabilityCeiling, ContextRoleState, RoleAssignment};
@@ -49,6 +51,17 @@ use scp_identity::DID;
 pub enum GovernanceActionResult {
     /// An author was blocked from a broadcast context (spec section 5.14.8).
     AuthorBlocked(AuthorBlockResult),
+    /// A subscriber's read access was revoked in a broadcast context
+    /// (ADR-031, §5.9). The subscriber was removed from the registry and
+    /// added to all authors' block lists; all author keys were rotated.
+    SubscriberBanned(GovernanceBanResult),
+    /// A subscriber's read access was restored in a broadcast context
+    /// (ADR-031, §5.9). The DID was removed from all authors' block lists.
+    /// The subscriber must re-subscribe to regain access.
+    SubscriberUnbanned {
+        /// The DID whose read access was restored.
+        did: DID,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1408,14 +1421,22 @@ impl ContextManager {
     /// Currently supports:
     /// - [`GovernanceAction::BlockAuthor`]: removes an author from a broadcast
     ///   context, destroying their sender key. See spec section 5.14.8.
+    /// - [`GovernanceAction::RevokeReadAccess`]: removes a subscriber from the
+    ///   broadcast context registry, adds to all authors' block lists, and
+    ///   rotates all author keys. Requires `MemberBan` in ceiling (ADR-031).
+    /// - [`GovernanceAction::RestoreReadAccess`]: removes a DID from all
+    ///   authors' block lists. The subscriber must re-subscribe to regain
+    ///   access. Requires `MemberBan` in ceiling (ADR-031).
     ///
     /// # Errors
     ///
     /// - [`ContextError::PermissionDenied`] if the proposal is not in
     ///   `Approved` status.
+    /// - [`ContextError::PermissionDenied`] if the context's ceiling does not
+    ///   include `MemberBan` (for `RevokeReadAccess`/`RestoreReadAccess`).
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
-    ///   context (for `BlockAuthor`).
+    ///   context (for `BlockAuthor`, `RevokeReadAccess`, `RestoreReadAccess`).
     /// - [`ContextError::MemberNotFound`] if the target DID is not registered.
     #[allow(clippy::significant_drop_tightening)]
     pub async fn execute_governance_action(
@@ -1445,6 +1466,17 @@ impl ContextManager {
                     .block_broadcast_author_internal(context_id, author_did, proposal.proposal_id)
                     .await?;
                 Ok(GovernanceActionResult::AuthorBlocked(result))
+            }
+            GovernanceAction::RevokeReadAccess { did, scope } => {
+                let result = self
+                    .revoke_read_access_internal(context_id, did, *scope, proposal.proposal_id)
+                    .await?;
+                Ok(GovernanceActionResult::SubscriberBanned(result))
+            }
+            GovernanceAction::RestoreReadAccess { did } => {
+                self.restore_read_access_internal(context_id, did, proposal.proposal_id)
+                    .await?;
+                Ok(GovernanceActionResult::SubscriberUnbanned { did: did.clone() })
             }
             action => Err(ContextError::PermissionDenied(format!(
                 "governance action not yet supported for execution: {action:?}"
@@ -1538,6 +1570,198 @@ impl ContextManager {
             .append_context_event(&context_id_bytes, "AuthorBlocked")?;
 
         Ok(result)
+    }
+
+    /// Internal implementation of read access revocation. Only callable within
+    /// the crate -- external callers must go through [`execute_governance_action`]
+    /// with an approved [`GovernanceProposal`] containing a
+    /// [`GovernanceAction::RevokeReadAccess`] action.
+    ///
+    /// In broadcast mode: removes the subscriber from the registry, adds them
+    /// to all authors' block lists, and rotates all author keys (via
+    /// [`BroadcastContext::governance_ban_subscriber`]). The member remains in
+    /// the context for governance/presence but cannot read new content.
+    ///
+    /// Requires the `MemberBan` capability in the context's ceiling (§5.3,
+    /// ADR-031). The `scope` parameter is stored but does not currently
+    /// differentiate behavior in broadcast mode (both `Full` and `FutureOnly`
+    /// trigger the same key rotation).
+    ///
+    /// Emits a `ReadAccessRevoked` event. See SCP-GG-006 and ADR-031.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::PermissionDenied`] if the proposal has already been
+    ///   executed (replay protection) or if the ceiling lacks `MemberBan`.
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
+    ///   context.
+    /// - [`ContextError::MemberNotFound`] if the subscriber DID is not
+    ///   registered.
+    #[allow(clippy::significant_drop_tightening)]
+    async fn revoke_read_access_internal(
+        &self,
+        context_id: &str,
+        did: &DID,
+        _scope: RevocationScope,
+        proposal_id: ProposalId,
+    ) -> Result<GovernanceBanResult, ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let (result, snapshot) = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+            // Gate: reject replayed proposals (defense-in-depth).
+            if ctx.executed_proposals.contains(&proposal_id) {
+                return Err(ContextError::PermissionDenied(
+                    "governance proposal has already been executed".into(),
+                ));
+            }
+
+            require_active(&ctx.handle)?;
+
+            // Gate: ceiling must include MemberBan (§5.3, ADR-031).
+            if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
+                return Err(ContextError::PermissionDenied(
+                    "context ceiling does not include member:ban capability".into(),
+                ));
+            }
+
+            let bc = ctx
+                .broadcast_context
+                .as_mut()
+                .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
+
+            let result = bc.governance_ban_subscriber(&did.0)?;
+
+            // Take snapshot for persistence before dropping lock.
+            let snapshot = bc.to_snapshot();
+
+            // Emit revocation event to receive buffer.
+            ctx.receive_buffer
+                .push(ContextEvent::ReadAccessRevoked { did: did.clone() });
+
+            // Record the proposal as executed (inside lock scope).
+            ctx.executed_proposals.insert(proposal_id);
+
+            (result, snapshot)
+        };
+        // Lock dropped.
+
+        // Persist broadcast state for crash recovery.
+        self.persist_broadcast_snapshot(context_id, &snapshot);
+
+        // Persist context state (executed_proposals updated) (best-effort).
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(context_id) {
+                let ctx_snapshot = Self::snapshot_context(ctx);
+                drop(contexts);
+                self.persist_context_snapshot(context_id, &ctx_snapshot);
+            }
+        }
+
+        self.event_log
+            .append_context_event(&context_id_bytes, "ReadAccessRevoked")?;
+
+        Ok(result)
+    }
+
+    /// Internal implementation of read access restoration. Only callable
+    /// within the crate -- external callers must go through
+    /// [`execute_governance_action`] with an approved [`GovernanceProposal`]
+    /// containing a [`GovernanceAction::RestoreReadAccess`] action.
+    ///
+    /// In broadcast mode: removes the DID from all authors' block lists
+    /// (via [`BroadcastContext::governance_unban_subscriber`]). The subscriber
+    /// must re-subscribe to regain access. Does **not** rotate keys -- unban
+    /// is access restoration, not revocation.
+    ///
+    /// Requires the `MemberBan` capability in the context's ceiling (§5.3,
+    /// ADR-031). Restoration is always forward-only: content missed during
+    /// the revocation period remains inaccessible.
+    ///
+    /// Emits a `ReadAccessRestored` event. See SCP-GG-006 and ADR-031.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::PermissionDenied`] if the proposal has already been
+    ///   executed (replay protection) or if the ceiling lacks `MemberBan`.
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
+    ///   context.
+    #[allow(clippy::significant_drop_tightening)]
+    async fn restore_read_access_internal(
+        &self,
+        context_id: &str,
+        did: &DID,
+        proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+            // Gate: reject replayed proposals (defense-in-depth).
+            if ctx.executed_proposals.contains(&proposal_id) {
+                return Err(ContextError::PermissionDenied(
+                    "governance proposal has already been executed".into(),
+                ));
+            }
+
+            require_active(&ctx.handle)?;
+
+            // Gate: ceiling must include MemberBan (§5.3, ADR-031).
+            if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
+                return Err(ContextError::PermissionDenied(
+                    "context ceiling does not include member:ban capability".into(),
+                ));
+            }
+
+            let bc = ctx
+                .broadcast_context
+                .as_mut()
+                .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
+
+            bc.governance_unban_subscriber(&did.0);
+
+            // Take snapshot for persistence before dropping lock.
+            let snapshot = bc.to_snapshot();
+
+            // Emit restoration event to receive buffer.
+            ctx.receive_buffer
+                .push(ContextEvent::ReadAccessRestored { did: did.clone() });
+
+            // Record the proposal as executed (inside lock scope).
+            ctx.executed_proposals.insert(proposal_id);
+
+            snapshot
+        };
+        // Lock dropped.
+
+        // Persist broadcast state for crash recovery.
+        self.persist_broadcast_snapshot(context_id, &snapshot);
+
+        // Persist context state (executed_proposals updated) (best-effort).
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(context_id) {
+                let ctx_snapshot = Self::snapshot_context(ctx);
+                drop(contexts);
+                self.persist_context_snapshot(context_id, &ctx_snapshot);
+            }
+        }
+
+        self.event_log
+            .append_context_event(&context_id_bytes, "ReadAccessRestored")?;
+
+        Ok(())
     }
 
     /// Evaluates whether a subscriber's broadcast key request should be
@@ -3593,7 +3817,10 @@ mod tests {
             approved_block_author_proposal(&"did:key:alice".into(), &ctx_id, &"did:key:bob".into());
         let action_result = manager.execute_governance_action(&ctx_id, &proposal).await;
         assert!(action_result.is_ok());
-        let super::GovernanceActionResult::AuthorBlocked(block_result) = action_result.unwrap();
+        let super::GovernanceActionResult::AuthorBlocked(block_result) = action_result.unwrap()
+        else {
+            panic!("expected AuthorBlocked result");
+        };
         assert_eq!(block_result.author_did, "did:key:bob");
         assert_eq!(block_result.final_epoch, 0);
 
@@ -3872,6 +4099,300 @@ mod tests {
                 ContextError::PermissionDenied(_)
             ),
             "should return PermissionDenied for replayed proposal"
+        );
+    }
+
+    // ===================================================================
+    // Read access revocation/restoration (SCP-GG-006) — governance-gated
+    // ===================================================================
+
+    /// Helper: creates a broadcast context with `MemberBan` in the ceiling,
+    /// one author (alice), and one subscriber (sub1).
+    async fn setup_broadcast_with_member_ban() -> (ContextManager, String) {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+        );
+
+        manager.register_local_did("did:key:alice".into()).await;
+
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+                crate::context::params::Capability::new("role:assign"),
+                crate::context::params::Capability::new("member:ban"),
+            ],
+            ..ContextParams::default()
+        };
+
+        let _handle = manager
+            .create_context("broadcast-ban-ctx".into(), params, "did:key:alice".into())
+            .await
+            .unwrap();
+
+        // Subscribe sub1 directly via BroadcastContext.
+        {
+            use crate::crypto::ucan::validate::{
+                InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+                InMemoryRevocationChecker,
+            };
+            use std::hash::RandomState;
+
+            manager
+                .subscribe_broadcast::<
+                    InMemoryDidResolver,
+                    InMemoryNonceTracker,
+                    InMemoryRevocationChecker,
+                    InMemoryProofResolver,
+                    RandomState,
+                >(
+                    "broadcast-ban-ctx",
+                    &DID("did:key:sub1".into()),
+                    None,
+                    1000,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let ctx_id = "broadcast-ban-ctx".to_owned();
+        (manager, ctx_id)
+    }
+
+    /// Helper: creates an approved governance proposal for an arbitrary action
+    /// using `SingleAdminEngine`. The admin is `admin_did`.
+    fn approved_governance_proposal(
+        admin_did: &DID,
+        context_id: &str,
+        target_did: &DID,
+        action: super::GovernanceAction,
+    ) -> super::GovernanceProposal {
+        use crate::context::governance::{GovernanceContext, GovernanceEngine, SingleAdminEngine};
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let mut engine = SingleAdminEngine::new(admin_did.clone());
+        let gov_ctx = GovernanceContext {
+            context_id: context_id.to_owned(),
+            members: vec![
+                (admin_did.clone(), "admin".to_owned()),
+                (target_did.clone(), "subscriber".to_owned()),
+            ],
+            admin_dids: vec![admin_did.clone()],
+            current_epoch: None,
+            now: 1000,
+        };
+
+        let (proposal, _events) = engine
+            .propose(admin_did, action, &gov_ctx, &signing_key)
+            .unwrap();
+        assert!(matches!(proposal.status, super::ProposalStatus::Approved));
+        proposal
+    }
+
+    /// SCP-GG-006: `RevokeReadAccess` on broadcast context bans subscriber.
+    #[tokio::test]
+    async fn revoke_read_access_bans_subscriber_in_broadcast() {
+        let (manager, ctx_id) = setup_broadcast_with_member_ban().await;
+
+        // Verify sub1 is subscribed before revocation.
+        assert!(
+            manager
+                .is_broadcast_subscriber(&ctx_id, "did:key:sub1")
+                .await,
+            "sub1 should be subscribed before revocation"
+        );
+
+        let action = super::GovernanceAction::RevokeReadAccess {
+            did: "did:key:sub1".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:sub1".into(),
+            action,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_ok(), "RevokeReadAccess should succeed");
+
+        let result = result.unwrap();
+        match result {
+            super::GovernanceActionResult::SubscriberBanned(ban_result) => {
+                assert_eq!(ban_result.banned_did, "did:key:sub1");
+                // At least one author should have rotated keys.
+                assert!(
+                    !ban_result.rotated_authors.is_empty(),
+                    "key rotation should occur on ban"
+                );
+            }
+            other => panic!("expected SubscriberBanned, got {other:?}"),
+        }
+
+        // Subscriber should no longer be tracked.
+        assert!(
+            !manager
+                .is_broadcast_subscriber(&ctx_id, "did:key:sub1")
+                .await,
+            "sub1 should not be subscribed after revocation"
+        );
+
+        // Verify ReadAccessRevoked event was emitted.
+        let events = manager.drain_events(&ctx_id).await;
+        let has_revoke_event = events.iter().any(|e| {
+            matches!(
+                e,
+                super::ContextEvent::ReadAccessRevoked { did } if did.0 == "did:key:sub1"
+            )
+        });
+        assert!(
+            has_revoke_event,
+            "ReadAccessRevoked event should have been emitted"
+        );
+    }
+
+    /// SCP-GG-006: `RevokeReadAccess` fails when ceiling lacks `MemberBan`.
+    #[tokio::test]
+    async fn revoke_read_access_rejected_without_member_ban_ceiling() {
+        // Use the standard two-author setup which does NOT have MemberBan.
+        let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
+
+        // Subscribe sub1.
+        {
+            use crate::crypto::ucan::validate::{
+                InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+                InMemoryRevocationChecker,
+            };
+            use std::hash::RandomState;
+
+            manager
+                .subscribe_broadcast::<
+                    InMemoryDidResolver,
+                    InMemoryNonceTracker,
+                    InMemoryRevocationChecker,
+                    InMemoryProofResolver,
+                    RandomState,
+                >(
+                    &ctx_id,
+                    &DID("did:key:sub1".into()),
+                    None,
+                    1000,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let action = super::GovernanceAction::RevokeReadAccess {
+            did: "did:key:sub1".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:sub1".into(),
+            action,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(
+            result.is_err(),
+            "RevokeReadAccess should fail without MemberBan in ceiling"
+        );
+        assert!(
+            matches!(result.unwrap_err(), ContextError::PermissionDenied(ref msg) if msg.contains("member:ban")),
+            "error should mention missing member:ban capability"
+        );
+    }
+
+    /// SCP-GG-006: `RestoreReadAccess` unbans subscriber in broadcast context.
+    #[tokio::test]
+    async fn restore_read_access_unbans_subscriber_in_broadcast() {
+        let (manager, ctx_id) = setup_broadcast_with_member_ban().await;
+
+        // First, revoke read access.
+        let revoke_action = super::GovernanceAction::RevokeReadAccess {
+            did: "did:key:sub1".into(),
+            scope: super::RevocationScope::FutureOnly,
+        };
+        let revoke_proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:sub1".into(),
+            revoke_action,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &revoke_proposal)
+            .await
+            .unwrap();
+
+        // Drain events from revocation so we can check restore events cleanly.
+        manager.drain_events(&ctx_id).await;
+
+        // Now restore read access.
+        let restore_action = super::GovernanceAction::RestoreReadAccess {
+            did: "did:key:sub1".into(),
+        };
+        let restore_proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:sub1".into(),
+            restore_action,
+        );
+
+        let result = manager
+            .execute_governance_action(&ctx_id, &restore_proposal)
+            .await;
+        assert!(result.is_ok(), "RestoreReadAccess should succeed");
+
+        match result.unwrap() {
+            super::GovernanceActionResult::SubscriberUnbanned { did } => {
+                assert_eq!(did.0, "did:key:sub1");
+            }
+            other => panic!("expected SubscriberUnbanned, got {other:?}"),
+        }
+
+        // Verify ReadAccessRestored event was emitted.
+        let events = manager.drain_events(&ctx_id).await;
+        let has_restore_event = events.iter().any(|e| {
+            matches!(
+                e,
+                super::ContextEvent::ReadAccessRestored { did } if did.0 == "did:key:sub1"
+            )
+        });
+        assert!(
+            has_restore_event,
+            "ReadAccessRestored event should have been emitted"
+        );
+    }
+
+    /// SCP-GG-006: `RestoreReadAccess` also fails without `MemberBan` in ceiling.
+    #[tokio::test]
+    async fn restore_read_access_rejected_without_member_ban_ceiling() {
+        let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
+
+        let action = super::GovernanceAction::RestoreReadAccess {
+            did: "did:key:sub1".into(),
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:sub1".into(),
+            action,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(
+            result.is_err(),
+            "RestoreReadAccess should fail without MemberBan in ceiling"
+        );
+        assert!(
+            matches!(result.unwrap_err(), ContextError::PermissionDenied(ref msg) if msg.contains("member:ban")),
+            "error should mention missing member:ban capability"
         );
     }
 
