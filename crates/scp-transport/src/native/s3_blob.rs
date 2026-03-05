@@ -307,6 +307,7 @@ impl S3BlobStore {
     }
 }
 
+#[async_trait::async_trait]
 impl BlobStorage for S3BlobStore {
     async fn store(
         &self,

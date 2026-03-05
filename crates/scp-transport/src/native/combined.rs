@@ -396,6 +396,7 @@ impl Storage for CombinedNodeStorage {
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::significant_drop_tightening)]
+#[async_trait::async_trait]
 impl BlobStorage for CombinedNodeStorage {
     async fn store(
         &self,

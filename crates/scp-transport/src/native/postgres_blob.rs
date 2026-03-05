@@ -133,6 +133,7 @@ impl PostgresBlobStore {
 // BlobStorage implementation
 // ---------------------------------------------------------------------------
 
+#[async_trait::async_trait]
 impl BlobStorage for PostgresBlobStore {
     async fn store(
         &self,

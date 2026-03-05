@@ -141,6 +141,7 @@ impl SqliteBlobStore {
 }
 
 #[allow(clippy::significant_drop_tightening)]
+#[async_trait::async_trait]
 impl BlobStorage for SqliteBlobStore {
     async fn store(
         &self,

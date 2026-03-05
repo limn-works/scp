@@ -121,6 +121,7 @@ pub type BlobBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, StorageError>>
 ///
 /// Phase 1 provides [`InMemoryBlobStorage`], a `HashMap`-backed implementation.
 /// Persistent backends are planned for later phases.
+#[async_trait::async_trait]
 pub trait BlobStorage: Send + Sync {
     /// Stores a blob and returns the stored metadata.
     ///
@@ -132,78 +133,67 @@ pub trait BlobStorage: Send + Sync {
     ///
     /// Returns [`StorageError::StorageFull`] if the backend cannot accept
     /// more blobs.
-    fn store(
+    async fn store(
         &self,
         routing_id: [u8; 32],
         blob_id: [u8; 32],
         recipient_hint: Option<[u8; 32]>,
         blob_ttl: u32,
         blob: Vec<u8>,
-    ) -> impl std::future::Future<Output = Result<StoredBlob, StorageError>> + Send;
+    ) -> Result<StoredBlob, StorageError>;
 
     /// Retrieves a specific blob by its `blob_id`.
     ///
     /// Returns `None` if the blob does not exist or has expired.
-    fn get(
-        &self,
-        blob_id: &[u8; 32],
-    ) -> impl std::future::Future<Output = Result<Option<StoredBlob>, StorageError>> + Send;
+    async fn get(&self, blob_id: &[u8; 32]) -> Result<Option<StoredBlob>, StorageError>;
 
     /// Queries stored blobs for a `routing_id`, optionally filtered by a
     /// `since` timestamp, with an optional `limit`.
     ///
     /// Results are ordered oldest-first (ascending `stored_at` timestamp).
-    fn query(
+    async fn query(
         &self,
         routing_id: &[u8; 32],
         since: Option<u64>,
         limit: u32,
-    ) -> impl std::future::Future<Output = Result<Vec<StoredBlob>, StorageError>> + Send;
+    ) -> Result<Vec<StoredBlob>, StorageError>;
 
     /// Deletes a blob by its `blob_id`. Best-effort; returns `true` if
     /// the blob was found and removed.
-    fn delete(
-        &self,
-        blob_id: &[u8; 32],
-    ) -> impl std::future::Future<Output = Result<bool, StorageError>> + Send;
+    async fn delete(&self, blob_id: &[u8; 32]) -> Result<bool, StorageError>;
 
     /// Removes all blobs whose TTL has expired. Returns the number of
     /// blobs purged.
-    fn purge_expired(
-        &self,
-    ) -> impl std::future::Future<Output = Result<usize, StorageError>> + Send;
+    async fn purge_expired(&self) -> Result<usize, StorageError>;
 
     /// Stores a blob from a stream of chunks.
     ///
     /// Default implementation collects the stream to `Vec<u8>` and delegates
     /// to [`store`](Self::store). Backends where streaming avoids materialization
     /// (e.g., S3) override this.
-    fn store_streaming(
+    async fn store_streaming(
         &self,
         routing_id: [u8; 32],
         blob_id: [u8; 32],
         recipient_hint: Option<[u8; 32]>,
         blob_ttl: u32,
         content_length: Option<u64>,
-        body: BlobBodyStream,
-    ) -> impl std::future::Future<Output = Result<BlobMetadata, StorageError>> + Send {
-        async move {
-            // content_length is advisory — used only as a capacity hint.
-            // Cap at 64 MiB to prevent a malicious hint from causing OOM.
-            const MAX_PREALLOC: u64 = 64 * 1024 * 1024;
-            #[allow(clippy::cast_possible_truncation)]
-            let mut buf = content_length.map_or_else(Vec::new, |len| {
-                Vec::with_capacity(len.min(MAX_PREALLOC) as usize)
-            });
-            let mut body = body;
-            while let Some(chunk) = body.next().await {
-                buf.extend_from_slice(&chunk?);
-            }
-            let stored = self
-                .store(routing_id, blob_id, recipient_hint, blob_ttl, buf)
-                .await?;
-            Ok(BlobMetadata::from(&stored))
+        mut body: BlobBodyStream,
+    ) -> Result<BlobMetadata, StorageError> {
+        // content_length is advisory — used only as a capacity hint.
+        // Cap at 64 MiB to prevent a malicious hint from causing OOM.
+        const MAX_PREALLOC: u64 = 64 * 1024 * 1024;
+        #[allow(clippy::cast_possible_truncation)]
+        let mut buf = content_length.map_or_else(Vec::new, |len| {
+            Vec::with_capacity(len.min(MAX_PREALLOC) as usize)
+        });
+        while let Some(chunk) = body.next().await {
+            buf.extend_from_slice(&chunk?);
         }
+        let stored = self
+            .store(routing_id, blob_id, recipient_hint, blob_ttl, buf)
+            .await?;
+        Ok(BlobMetadata::from(&stored))
     }
 
     /// Retrieves a blob as metadata + body stream.
@@ -211,21 +201,17 @@ pub trait BlobStorage: Send + Sync {
     /// Default implementation calls [`get`](Self::get) and wraps the `Vec<u8>`
     /// in a single-chunk stream. Backends where streaming avoids materialization
     /// (e.g., S3) override this.
-    fn get_streaming(
+    async fn get_streaming(
         &self,
         blob_id: &[u8; 32],
-    ) -> impl std::future::Future<
-        Output = Result<Option<(BlobMetadata, BlobBodyStream)>, StorageError>,
-    > + Send {
-        async move {
-            let Some(stored) = self.get(blob_id).await? else {
-                return Ok(None);
-            };
-            let meta = BlobMetadata::from(&stored);
-            let body: BlobBodyStream =
-                Box::pin(stream::once(async move { Ok(Bytes::from(stored.blob)) }));
-            Ok(Some((meta, body)))
-        }
+    ) -> Result<Option<(BlobMetadata, BlobBodyStream)>, StorageError> {
+        let Some(stored) = self.get(blob_id).await? else {
+            return Ok(None);
+        };
+        let meta = BlobMetadata::from(&stored);
+        let body: BlobBodyStream =
+            Box::pin(stream::once(async move { Ok(Bytes::from(stored.blob)) }));
+        Ok(Some((meta, body)))
     }
 }
 
@@ -313,6 +299,7 @@ impl Default for InMemoryBlobStorage {
 
 // Lock guards are held for the minimal scope needed across async operations.
 #[allow(clippy::significant_drop_tightening)]
+#[async_trait::async_trait]
 impl BlobStorage for InMemoryBlobStorage {
     async fn store(
         &self,
@@ -502,6 +489,9 @@ pub enum BlobStorageBackend {
     /// Combined SQLCipher-backed node storage (protocol + blob in one DB).
     #[cfg(feature = "combined")]
     Combined(super::combined::CombinedNodeStorage),
+    /// Size-limited local blob cache wrapping another backend.
+    #[cfg(feature = "local-cache")]
+    Cached(Box<super::local_cache::LocalBlobCache<BlobStorageBackend>>),
 }
 
 impl BlobStorageBackend {
@@ -549,6 +539,16 @@ impl BlobStorageBackend {
         Ok(Self::Combined(super::combined::CombinedNodeStorage::open(
             dir, key,
         )?))
+    }
+
+    /// Wraps an existing backend in a size-limited local cache.
+    #[cfg(feature = "local-cache")]
+    #[must_use]
+    pub fn cached(self, max_cache_size: usize) -> Self {
+        Self::Cached(Box::new(super::local_cache::LocalBlobCache::new(
+            self,
+            max_cache_size,
+        )))
     }
 }
 
@@ -599,6 +599,13 @@ impl From<super::combined::CombinedNodeStorage> for BlobStorageBackend {
     }
 }
 
+#[cfg(feature = "local-cache")]
+impl From<super::local_cache::LocalBlobCache<BlobStorageBackend>> for BlobStorageBackend {
+    fn from(cache: super::local_cache::LocalBlobCache<BlobStorageBackend>) -> Self {
+        Self::Cached(Box::new(cache))
+    }
+}
+
 /// Dispatch macro — generates a match arm for every `BlobStorageBackend` variant,
 /// forwarding to the inner implementation. Keeps the 7 trait methods DRY.
 macro_rules! dispatch {
@@ -615,10 +622,13 @@ macro_rules! dispatch {
             BlobStorageBackend::Postgres(s) => s.$method($($arg),*).await,
             #[cfg(feature = "combined")]
             BlobStorageBackend::Combined(s) => s.$method($($arg),*).await,
+            #[cfg(feature = "local-cache")]
+            BlobStorageBackend::Cached(s) => s.$method($($arg),*).await,
         }
     };
 }
 
+#[async_trait::async_trait]
 impl BlobStorage for BlobStorageBackend {
     async fn store(
         &self,

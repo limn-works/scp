@@ -24,6 +24,7 @@ coap = ["dep:coap-lite", "dep:openssl"]
 scp-core = { path = "../scp-core" }
 scp-identity = { path = "../scp-identity" }
 scp-platform = { path = "../scp-platform", optional = true }
+async-trait = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }

@@ -165,6 +165,7 @@ impl<S: BlobStorage> LocalBlobCache<S> {
 }
 
 #[allow(clippy::significant_drop_tightening)]
+#[async_trait::async_trait]
 impl<S: BlobStorage> BlobStorage for LocalBlobCache<S> {
     async fn store(
         &self,
