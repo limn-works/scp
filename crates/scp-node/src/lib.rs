@@ -22,6 +22,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use scp_core::store::ProtocolStore;
 use scp_identity::document::DidDocument;
 use scp_identity::{DidMethod, IdentityError, ScpIdentity};
 use scp_platform::traits::{KeyCustody, Storage};
@@ -205,8 +206,8 @@ pub struct ApplicationNode<S: Storage> {
     relay: RelayHandle,
     /// Handle to the node's identity.
     identity: IdentityHandle,
-    /// The storage backend.
-    storage: Arc<S>,
+    /// The protocol store wrapping the storage backend.
+    storage: Arc<ProtocolStore<S>>,
     /// Shared state for HTTP handlers (`.well-known/scp`, relay bridge).
     state: Arc<http::NodeState>,
     /// Handle to the periodic tier re-evaluation background task (§10.12.1, SCP-243).
@@ -256,9 +257,9 @@ impl<S: Storage> ApplicationNode<S> {
         &self.identity
     }
 
-    /// Returns a reference to the storage backend.
+    /// Returns a reference to the protocol store.
     #[must_use]
-    pub fn storage(&self) -> &S {
+    pub fn storage(&self) -> &ProtocolStore<S> {
         &self.storage
     }
 
@@ -1072,7 +1073,7 @@ pub struct ApplicationNodeBuilder<
 > {
     domain: Option<String>,
     identity_source: Option<IdentitySource<K, D>>,
-    storage: Option<Arc<S>>,
+    storage: Option<S>,
     blob_storage: Option<BlobStorageBackend>,
     bind_addr: Option<SocketAddr>,
     acme_email: Option<String>,
@@ -1442,7 +1443,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, Dom, Id>
     /// If not called, `.build()` uses a default no-op storage.
     pub fn storage<S2: Storage + 'static>(
         self,
-        storage: Arc<S2>,
+        storage: S2,
     ) -> ApplicationNodeBuilder<K, D, S2, Dom, Id> {
         ApplicationNodeBuilder {
             domain: self.domain,
@@ -1594,7 +1595,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
         let identity_source = self
             .identity_source
             .ok_or(NodeError::MissingField("identity"))?;
-        let storage = self.storage.unwrap_or_else(|| Arc::new(S::default()));
+        let protocol_store = Arc::new(ProtocolStore::new(self.storage.unwrap_or_default()));
 
         let (identity, document, did_method) = resolve_identity(identity_source).await?;
         let bridge_secret = generate_bridge_secret();
@@ -1619,7 +1620,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
         let tls_provider = resolve_tls(
             self.tls_provider,
             &domain,
-            &storage,
+            &protocol_store,
             self.acme_email.as_ref(),
         );
         match tls_provider.provision().await {
@@ -1629,7 +1630,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
                     identity,
                     document,
                     did_method,
-                    storage,
+                    protocol_store,
                     shutdown_handle,
                     bound_addr,
                     bridge_secret,
@@ -1663,7 +1664,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
                     identity,
                     document,
                     did_method,
-                    storage,
+                    protocol_store,
                     shutdown_handle,
                     bound_addr,
                     strategy,
@@ -1746,7 +1747,7 @@ fn generate_dev_token(addr: SocketAddr) -> String {
 fn resolve_tls<S: Storage + 'static>(
     provider: Option<Arc<dyn TlsProvider>>,
     domain: &str,
-    storage: &Arc<S>,
+    storage: &Arc<ProtocolStore<S>>,
     acme_email: Option<&String>,
 ) -> Arc<dyn TlsProvider> {
     provider.unwrap_or_else(|| {
@@ -1793,7 +1794,7 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     identity: ScpIdentity,
     mut document: DidDocument,
     did_method: Arc<D>,
-    storage: Arc<S>,
+    storage: Arc<ProtocolStore<S>>,
     shutdown_handle: ShutdownHandle,
     bound_addr: SocketAddr,
     bridge_secret: Zeroizing<[u8; 32]>,
@@ -1871,7 +1872,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     identity: ScpIdentity,
     mut document: DidDocument,
     did_method: Arc<D>,
-    storage: Arc<S>,
+    storage: Arc<ProtocolStore<S>>,
     shutdown_handle: ShutdownHandle,
     bound_addr: SocketAddr,
     nat_strategy: Arc<dyn NatStrategy>,
@@ -2019,7 +2020,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
             .identity_source
             .ok_or(NodeError::MissingField("identity"))?;
 
-        let storage = self.storage.unwrap_or_else(|| Arc::new(S::default()));
+        let protocol_store = Arc::new(ProtocolStore::new(self.storage.unwrap_or_default()));
         let (identity, document, did_method) = resolve_identity(identity_source).await?;
 
         // 3. Start relay server.
@@ -2056,7 +2057,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
             identity,
             document,
             did_method,
-            storage,
+            protocol_store,
             shutdown_handle,
             bound_addr,
             strategy,
@@ -2359,7 +2360,7 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
         ApplicationNodeBuilder::new()
-            .storage(Arc::new(InMemoryStorage::new()))
+            .storage(InMemoryStorage::new())
             .domain("test.example.com")
             .tls_provider(Arc::new(SucceedingTlsProvider {
                 domain: "test.example.com".to_owned(),
@@ -2717,7 +2718,7 @@ mod tests {
 
     #[tokio::test]
     async fn builder_with_custom_storage() {
-        let custom_storage = Arc::new(InMemoryStorage::new());
+        let custom_storage = InMemoryStorage::new();
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
 
@@ -2800,7 +2801,7 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
         ApplicationNodeBuilder::new()
-            .storage(Arc::new(InMemoryStorage::new()))
+            .storage(InMemoryStorage::new())
             .no_domain()
             .nat_strategy(Arc::new(MockNatStrategy { tier }))
             .generate_identity_with(custody, did_method)
@@ -3006,7 +3007,7 @@ mod tests {
         let did_method = Arc::new(make_test_dht(&custody));
 
         let node = ApplicationNodeBuilder::new()
-            .storage(Arc::new(InMemoryStorage::new()))
+            .storage(InMemoryStorage::new())
             .domain("fail.example.com")
             .tls_provider(Arc::new(FailingTlsProvider))
             .nat_strategy(Arc::new(RecordingNatStrategy {
@@ -3060,7 +3061,7 @@ mod tests {
         let did_method = Arc::new(make_test_dht(&custody));
 
         let result = ApplicationNodeBuilder::new()
-            .storage(Arc::new(InMemoryStorage::new()))
+            .storage(InMemoryStorage::new())
             .no_domain()
             .nat_strategy(Arc::new(FailingNatStrategy))
             .generate_identity_with(custody, did_method)
@@ -3140,7 +3141,7 @@ mod tests {
         };
 
         let _node = ApplicationNodeBuilder::new()
-            .storage(Arc::new(InMemoryStorage::new()))
+            .storage(InMemoryStorage::new())
             .no_domain()
             .nat_strategy(Arc::new(MockNatStrategy { tier }))
             .generate_identity_with(custody, counting_method)

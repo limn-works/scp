@@ -94,7 +94,7 @@ async fn build_test_node() -> (
     let (dht_client, did_dht) = make_shared_dht(&custody);
 
     let node = ApplicationNodeBuilder::new()
-        .storage(Arc::new(InMemoryStorage::new()))
+        .storage(InMemoryStorage::new())
         .domain("test.example.com")
         .tls_provider(Arc::new(SucceedingTlsProvider {
             domain: "test.example.com".to_owned(),
@@ -470,7 +470,7 @@ async fn build_test_node_with_dev_api() -> (
     let (dht_client, did_dht) = make_shared_dht(&custody);
 
     let node = ApplicationNodeBuilder::new()
-        .storage(Arc::new(InMemoryStorage::new()))
+        .storage(InMemoryStorage::new())
         .domain("test.example.com")
         .tls_provider(Arc::new(SucceedingTlsProvider {
             domain: "test.example.com".to_owned(),

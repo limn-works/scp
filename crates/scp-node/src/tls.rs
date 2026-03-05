@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
+use scp_core::store::ProtocolStore;
 use scp_platform::traits::Storage;
 use tokio::sync::RwLock;
 use zeroize::Zeroizing;
@@ -359,8 +360,8 @@ impl ResolvesServerCert for CertResolver {
 pub struct AcmeProvider<S: Storage> {
     /// The domain to provision a certificate for.
     domain: String,
-    /// Platform storage for certificate persistence.
-    storage: Arc<S>,
+    /// Protocol store wrapping the platform storage backend.
+    storage: Arc<ProtocolStore<S>>,
     /// Optional contact email for the ACME account.
     email: Option<String>,
     /// ACME directory URL (defaults to Let's Encrypt production).
@@ -385,7 +386,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
     /// Uses the Let's Encrypt production directory by default. Call
     /// [`with_directory_url`](Self::with_directory_url) to change.
     #[must_use]
-    pub fn new(domain: &str, storage: Arc<S>) -> Self {
+    pub fn new(domain: &str, storage: Arc<ProtocolStore<S>>) -> Self {
         Self {
             domain: domain.to_owned(),
             storage,
@@ -518,7 +519,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
         };
 
         // 8. Store in platform storage.
-        store_certificate(&*self.storage, &cert_data).await?;
+        store_certificate(self.storage.storage(), &cert_data).await?;
 
         tracing::info!(domain = %self.domain, "TLS certificate provisioned via ACME");
 
@@ -532,7 +533,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
     ///
     /// Returns [`TlsError`] if loading, provisioning, or storage fails.
     pub async fn load_or_provision(&self) -> Result<CertificateData, TlsError> {
-        if let Some(cert_data) = load_certificate(&*self.storage).await? {
+        if let Some(cert_data) = load_certificate(self.storage.storage()).await? {
             if !cert_data.needs_renewal()? {
                 tracing::info!(domain = %self.domain, "loaded existing TLS certificate from storage");
                 return Ok(cert_data);
@@ -557,7 +558,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
             loop {
                 tokio::time::sleep(RENEWAL_CHECK_INTERVAL).await;
 
-                match load_certificate(&*self.storage).await {
+                match load_certificate(self.storage.storage()).await {
                     Ok(Some(cert_data)) => match cert_data.needs_renewal() {
                         Ok(true) => {
                             tracing::info!(
@@ -1054,7 +1055,7 @@ mod tests {
 
     #[test]
     fn acme_provider_new_sets_defaults() {
-        let storage = Arc::new(InMemoryStorage::new());
+        let storage = Arc::new(ProtocolStore::new(InMemoryStorage::new()));
         let provider = AcmeProvider::new("example.com", storage);
 
         assert_eq!(provider.domain, "example.com");
@@ -1064,7 +1065,7 @@ mod tests {
 
     #[test]
     fn acme_provider_with_email() {
-        let storage = Arc::new(InMemoryStorage::new());
+        let storage = Arc::new(ProtocolStore::new(InMemoryStorage::new()));
         let provider = AcmeProvider::new("example.com", storage).with_email("admin@example.com");
 
         assert_eq!(provider.email.as_deref(), Some("admin@example.com"));
@@ -1072,7 +1073,7 @@ mod tests {
 
     #[test]
     fn acme_provider_with_directory_url() {
-        let storage = Arc::new(InMemoryStorage::new());
+        let storage = Arc::new(ProtocolStore::new(InMemoryStorage::new()));
         let provider = AcmeProvider::new("example.com", storage)
             .with_directory_url("https://acme-staging-v02.api.letsencrypt.org/directory");
 
@@ -1081,7 +1082,7 @@ mod tests {
 
     #[test]
     fn acme_provider_with_cert_resolver() {
-        let storage = Arc::new(InMemoryStorage::new());
+        let storage = Arc::new(ProtocolStore::new(InMemoryStorage::new()));
         let cert = generate_self_signed("example.com").unwrap();
         let certs = cert.certificate_chain_der().unwrap();
         let key = cert.private_key_der().unwrap();
