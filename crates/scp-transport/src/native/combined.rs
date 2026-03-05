@@ -24,7 +24,7 @@ use super::storage::{BlobStorage, StorageError, StoredBlob};
 /// A clock function that returns the current Unix timestamp in seconds.
 ///
 /// The default ([`system_clock`]) delegates to [`scp_core::time::now_secs`].
-/// Tests inject a deterministic clock via [`CombinedNodeStorage::with_clock`].
+/// Tests inject a deterministic clock via [`CombinedNodeStorage::open_with_clock`].
 pub type ClockFn = Arc<dyn Fn() -> Result<u64, StorageError> + Send + Sync>;
 
 /// Returns a [`ClockFn`] backed by the real system clock.
@@ -94,7 +94,7 @@ fn prefix_successor(prefix: &str) -> Option<String> {
 /// # Construction
 ///
 /// ```ignore
-/// let storage = CombinedNodeStorage::new(dir, encryption_key)?;
+/// let storage = CombinedNodeStorage::open(dir, encryption_key)?;
 /// ```
 ///
 /// Creates `node.db` inside `dir` with WAL mode and `SQLCipher` encryption.
@@ -124,8 +124,8 @@ impl CombinedNodeStorage {
     ///
     /// Returns [`StorageError::Internal`] if the database cannot be opened or
     /// the schema cannot be initialized.
-    pub fn new(dir: &Path, key: &[u8]) -> Result<Self, StorageError> {
-        Self::new_with_clock(dir, key, system_clock())
+    pub fn open(dir: &Path, key: &[u8]) -> Result<Self, StorageError> {
+        Self::open_impl(dir, key, system_clock())
     }
 
     /// Opens (or creates) a combined node database with an injectable clock.
@@ -136,11 +136,11 @@ impl CombinedNodeStorage {
     ///
     /// Returns [`StorageError::Internal`] if the database cannot be opened or
     /// the schema cannot be initialized.
-    pub fn with_clock(dir: &Path, key: &[u8], clock: ClockFn) -> Result<Self, StorageError> {
-        Self::new_with_clock(dir, key, clock)
+    pub fn open_with_clock(dir: &Path, key: &[u8], clock: ClockFn) -> Result<Self, StorageError> {
+        Self::open_impl(dir, key, clock)
     }
 
-    fn new_with_clock(dir: &Path, key: &[u8], clock: ClockFn) -> Result<Self, StorageError> {
+    fn open_impl(dir: &Path, key: &[u8], clock: ClockFn) -> Result<Self, StorageError> {
         // Ensure the target directory exists.
         std::fs::create_dir_all(dir)
             .map_err(|e| StorageError::Internal(format!("failed to create directory: {e}")))?;
@@ -582,7 +582,7 @@ mod tests {
     fn make_test_storage(dir: &Path, start_time: u64) -> (CombinedNodeStorage, Arc<AtomicU64>) {
         let key = [0u8; 32]; // Test encryption key.
         let (clock, time) = test_clock(start_time);
-        let storage = CombinedNodeStorage::with_clock(dir, &key, clock)
+        let storage = CombinedNodeStorage::open_with_clock(dir, &key, clock)
             .expect("failed to create test storage");
         (storage, time)
     }
@@ -1026,8 +1026,8 @@ mod tests {
         // Create storage, write data, drop it.
         {
             let (clock, _time) = test_clock(1_000_000);
-            let storage =
-                CombinedNodeStorage::with_clock(dir.path(), &key, clock).expect("create storage");
+            let storage = CombinedNodeStorage::open_with_clock(dir.path(), &key, clock)
+                .expect("create storage");
             Storage::store(&storage, "identity/did", b"did:dht:test")
                 .await
                 .unwrap();
@@ -1042,8 +1042,8 @@ mod tests {
         // Re-open from same directory — data should survive.
         {
             let (clock, _time) = test_clock(1_000_000);
-            let storage =
-                CombinedNodeStorage::with_clock(dir.path(), &key, clock).expect("reopen storage");
+            let storage = CombinedNodeStorage::open_with_clock(dir.path(), &key, clock)
+                .expect("reopen storage");
             let did = Storage::retrieve(&storage, "identity/did").await.unwrap();
             assert_eq!(did, Some(b"did:dht:test".to_vec()));
 
