@@ -106,6 +106,9 @@ tofu/{did}
 key_package/{relay_url}/{index}
 relay_score/{relay_url}
 
+tls/certificate_chain
+tls/private_key
+
 mls/{context_id}/...
 ```
 
@@ -229,6 +232,11 @@ impl<S: Storage> ProtocolStore<S> {
     pub async fn store_adapter_credentials(&self, did: &DID, adapter_id: &str, credentials: &[u8]) -> Result<(), StoreError>;
     pub async fn load_adapter_credentials(&self, did: &DID, adapter_id: &str) -> Result<Option<Vec<u8>>, StoreError>;
     pub async fn list_adapter_credentials(&self, did: &DID) -> Result<Vec<String>, StoreError>;
+
+    // --- TLS certificates (§18.6.3) ---
+    pub async fn store_tls_certificate(&self, certificate_chain_pem: &str, private_key_pem: &str) -> Result<(), StoreError>;
+    pub async fn load_tls_certificate(&self) -> Result<Option<(String, Zeroizing<String>)>, StoreError>;
+    pub async fn delete_tls_certificate(&self) -> Result<(), StoreError>;
 }
 ```
 
@@ -243,6 +251,7 @@ scp-core/src/store/
     event_log.rs    # Event log persistence, tree nodes, roots
     identity.rs     # Identity documents, private state, TOFU, DID cache
     nonce.rs        # UCAN nonce tracking, pruning
+    tls.rs          # TLS certificate chain + private key (§18.6.3)
     tools.rs        # Tool registration, sessions
     transport.rs    # Relay scores, key packages
     economy.rs      # Economic policy, payment receipts, spending UCANs, adapter credentials
@@ -460,6 +469,12 @@ mls/{context_id}/encryption_key/{epoch}/{generation}
 ```
 
 The exact sub-prefix structure follows OpenMLS's `StorageProvider` method signatures. The bridge is a thin translation layer — it adds no behavior beyond key construction and serialization.
+
+**Why this bypasses `ProtocolStore` domain methods.** Every other domain area stores data through typed `ProtocolStore` methods that apply `StoredValue` version envelopes. The MLS bridge is the sole exception — it accesses the raw `Storage` backend via `ProtocolStore::storage()`. This is intentional:
+
+- **OpenMLS owns the storage contract.** The `StorageProvider` trait dictates what gets stored, key structure, and serialization format. Wrapping values in `StoredValue` envelopes would break OpenMLS deserialization on read-back.
+- **The bridge is the domain layer.** It constructs namespaced keys, validates context IDs via `sanitize_key_component`, and handles serialization. ProtocolStore wrapper methods would be pure indirection.
+- **Migration is OpenMLS's concern.** MLS state serialization is governed by the OpenMLS version, not SCP's `StoredValue` versioning. Format changes across OpenMLS upgrades follow OpenMLS's own compatibility guarantees.
 
 ## 17.10 Migration Strategy
 

@@ -28,12 +28,6 @@ use zeroize::Zeroizing;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Storage key for the PEM-encoded certificate chain.
-const CERT_STORAGE_KEY: &str = "scp.tls.certificate_chain_pem";
-
-/// Storage key for the PEM-encoded private key.
-const KEY_STORAGE_KEY: &str = "scp.tls.private_key_pem";
-
 /// Renew certificates this many days before expiry (spec section 18.6.3).
 const RENEWAL_THRESHOLD_DAYS: i64 = 30;
 
@@ -168,69 +162,6 @@ impl CertificateData {
 
         let threshold = RENEWAL_THRESHOLD_DAYS * 24 * 60 * 60;
         Ok(expiry - now < threshold)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Storage helpers
-// ---------------------------------------------------------------------------
-
-/// Store a certificate and private key in platform storage.
-///
-/// # Errors
-///
-/// Returns [`TlsError::Storage`] if the storage operation fails.
-pub async fn store_certificate<S: Storage>(
-    storage: &S,
-    cert_data: &CertificateData,
-) -> Result<(), TlsError> {
-    storage
-        .store(CERT_STORAGE_KEY, cert_data.certificate_chain_pem.as_bytes())
-        .await
-        .map_err(|e| TlsError::Storage(format!("failed to store certificate: {e}")))?;
-
-    storage
-        .store(KEY_STORAGE_KEY, cert_data.private_key_pem.as_bytes())
-        .await
-        .map_err(|e| TlsError::Storage(format!("failed to store private key: {e}")))?;
-
-    Ok(())
-}
-
-/// Load a certificate and private key from platform storage.
-///
-/// Returns `None` if no certificate is stored.
-///
-/// # Errors
-///
-/// Returns [`TlsError::Storage`] if the storage operation fails.
-pub async fn load_certificate<S: Storage>(
-    storage: &S,
-) -> Result<Option<CertificateData>, TlsError> {
-    let cert_bytes = storage
-        .retrieve(CERT_STORAGE_KEY)
-        .await
-        .map_err(|e| TlsError::Storage(format!("failed to retrieve certificate: {e}")))?;
-
-    let key_bytes = storage
-        .retrieve(KEY_STORAGE_KEY)
-        .await
-        .map_err(|e| TlsError::Storage(format!("failed to retrieve private key: {e}")))?;
-
-    match (cert_bytes, key_bytes) {
-        (Some(cert), Some(key)) => {
-            let certificate_chain_pem = String::from_utf8(cert)
-                .map_err(|e| TlsError::Storage(format!("certificate is not valid UTF-8: {e}")))?;
-            let private_key_pem =
-                Zeroizing::new(String::from_utf8(key).map_err(|e| {
-                    TlsError::Storage(format!("private key is not valid UTF-8: {e}"))
-                })?);
-            Ok(Some(CertificateData {
-                certificate_chain_pem,
-                private_key_pem,
-            }))
-        }
-        _ => Ok(None),
     }
 }
 
@@ -417,6 +348,23 @@ impl<S: Storage + 'static> AcmeProvider<S> {
         self
     }
 
+    /// Load a TLS certificate from the protocol store, converting to
+    /// [`CertificateData`].
+    async fn load_tls_cert(&self) -> Result<Option<CertificateData>, TlsError> {
+        match self
+            .storage
+            .load_tls_certificate()
+            .await
+            .map_err(|e| TlsError::Storage(format!("failed to load certificate: {e}")))?
+        {
+            Some((certificate_chain_pem, private_key_pem)) => Ok(Some(CertificateData {
+                certificate_chain_pem,
+                private_key_pem,
+            })),
+            None => Ok(None),
+        }
+    }
+
     /// Provision a new certificate via ACME HTTP-01.
     ///
     /// This performs the full ACME flow:
@@ -519,7 +467,10 @@ impl<S: Storage + 'static> AcmeProvider<S> {
         };
 
         // 8. Store in platform storage.
-        store_certificate(self.storage.storage(), &cert_data).await?;
+        self.storage
+            .store_tls_certificate(&cert_data.certificate_chain_pem, &cert_data.private_key_pem)
+            .await
+            .map_err(|e| TlsError::Storage(format!("failed to store certificate: {e}")))?;
 
         tracing::info!(domain = %self.domain, "TLS certificate provisioned via ACME");
 
@@ -533,7 +484,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
     ///
     /// Returns [`TlsError`] if loading, provisioning, or storage fails.
     pub async fn load_or_provision(&self) -> Result<CertificateData, TlsError> {
-        if let Some(cert_data) = load_certificate(self.storage.storage()).await? {
+        if let Some(cert_data) = self.load_tls_cert().await? {
             if !cert_data.needs_renewal()? {
                 tracing::info!(domain = %self.domain, "loaded existing TLS certificate from storage");
                 return Ok(cert_data);
@@ -558,7 +509,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
             loop {
                 tokio::time::sleep(RENEWAL_CHECK_INTERVAL).await;
 
-                match load_certificate(self.storage.storage()).await {
+                match self.load_tls_cert().await {
                     Ok(Some(cert_data)) => match cert_data.needs_renewal() {
                         Ok(true) => {
                             tracing::info!(
@@ -982,26 +933,29 @@ mod tests {
         }
     }
 
-    // -- Storage round-trip --
+    // -- Storage round-trip (through ProtocolStore domain methods) --
 
     #[tokio::test]
     async fn certificate_storage_roundtrip() {
-        let storage = InMemoryStorage::new();
+        let store = ProtocolStore::new(InMemoryStorage::new());
         let original = generate_self_signed("roundtrip.example.com").unwrap();
 
-        // Store.
-        store_certificate(&storage, &original).await.unwrap();
+        // Store via domain method.
+        store
+            .store_tls_certificate(&original.certificate_chain_pem, &original.private_key_pem)
+            .await
+            .unwrap();
 
-        // Load.
-        let loaded = load_certificate(&storage).await.unwrap().unwrap();
-        assert_eq!(loaded.certificate_chain_pem, original.certificate_chain_pem);
-        assert_eq!(loaded.private_key_pem, original.private_key_pem);
+        // Load via domain method.
+        let (cert, key) = store.load_tls_certificate().await.unwrap().unwrap();
+        assert_eq!(cert, original.certificate_chain_pem);
+        assert_eq!(key, original.private_key_pem);
     }
 
     #[tokio::test]
     async fn load_certificate_returns_none_when_empty() {
-        let storage = InMemoryStorage::new();
-        let result = load_certificate(&storage).await.unwrap();
+        let store = ProtocolStore::new(InMemoryStorage::new());
+        let result = store.load_tls_certificate().await.unwrap();
         assert!(result.is_none());
     }
 

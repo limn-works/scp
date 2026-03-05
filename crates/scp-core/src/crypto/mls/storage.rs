@@ -16,6 +16,32 @@
 //! [`ScpMlsProvider`] combines `RustCrypto` (crypto + randomness) with
 //! `MlsStorageBridge<S>` for a complete `OpenMlsProvider` implementation.
 //!
+//! # Why this bypasses `ProtocolStore` domain methods
+//!
+//! Every other domain area (contexts, identity, TLS, UCANs, etc.) stores
+//! data through typed `ProtocolStore` methods that apply `StoredValue`
+//! version envelopes and follow SCP key conventions. This module is the
+//! sole exception: it accesses `ProtocolStore::storage()` to call raw
+//! `Storage` trait methods directly. This is intentional because:
+//!
+//! 1. **`OpenMLS` owns the storage contract.** The `StorageProvider` trait
+//!    dictates what gets stored, the key structure, and the serialization
+//!    format. Wrapping values in `StoredValue` envelopes would break
+//!    `OpenMLS` deserialization on read-back.
+//!
+//! 2. **The bridge *is* the domain layer for MLS.** It constructs
+//!    namespaced keys (`mls/{context_id}/{label}/{hex_key}`), validates
+//!    context IDs via `sanitize_key_component`, and handles serialization.
+//!    Adding `ProtocolStore` wrapper methods would be indirection with no
+//!    added value — they would just call `self.storage.store(key, value)`.
+//!
+//! 3. **Migration is `OpenMLS`'s concern.** `ProtocolStore`'s version
+//!    envelopes and `Migratable` trait enable lazy on-read migration for
+//!    SCP-owned data. MLS state serialization is governed by the `OpenMLS`
+//!    version. If the format changes across `OpenMLS` upgrades, migration
+//!    must follow `OpenMLS`'s own compatibility guarantees, not SCP's
+//!    `StoredValue` versioning.
+//!
 //! # Sync-to-Async Bridge
 //!
 //! `OpenMLS` `StorageProvider` is a synchronous trait, but `Storage` is async.
