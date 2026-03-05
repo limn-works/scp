@@ -82,8 +82,12 @@ pub fn compute_key_continuity_fingerprint(
     hasher.update(b"SCP-KEY-CONTINUITY-V1:");
 
     // Length-prefix variable-length DID strings (prevents concatenation ambiguity).
+    // DID strings are validated to ≤512 bytes at the FFI boundary, so the u32
+    // conversion is always safe. `unwrap_or(u32::MAX)` is unreachable
+    // defense-in-depth to satisfy clippy's `cast_possible_truncation` lint.
     let len_prefix = |h: &mut Sha256, data: &[u8]| {
-        h.update((data.len() as u32).to_be_bytes());
+        let len = u32::try_from(data.len()).unwrap_or(u32::MAX);
+        h.update(len.to_be_bytes());
         h.update(data);
     };
     len_prefix(&mut hasher, first.did.as_bytes());

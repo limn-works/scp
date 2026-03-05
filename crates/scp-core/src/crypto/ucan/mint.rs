@@ -250,14 +250,15 @@ pub async fn mint_ucan(
     // Build header — include kid when signing_key_id or key_scope is present
     // (ADR-039). signing_key_id takes precedence over key_scope for the kid
     // header value.
-    let header = if let Some(ref signing_key_id) = params.signing_key_id {
-        UcanHeader::with_kid(signing_key_id.as_fragment().to_owned())
-    } else {
-        match &params.key_scope {
-            Some(scope) => UcanHeader::with_kid(scope.clone()),
-            None => UcanHeader::new(),
-        }
-    };
+    let header = params.signing_key_id.as_ref().map_or_else(
+        || {
+            params
+                .key_scope
+                .as_ref()
+                .map_or_else(UcanHeader::new, |scope| UcanHeader::with_kid(scope.clone()))
+        },
+        |signing_key_id| UcanHeader::with_kid(signing_key_id.as_fragment().to_owned()),
+    );
 
     // Build facts — merge scp_key_scope into existing facts when key_scope
     // is present (ADR-039 acceptance criterion 6).
@@ -484,14 +485,15 @@ pub async fn delegate_ucan(
 
     // Build header — include kid when signing_key_id or key_scope is present
     // (ADR-039). signing_key_id takes precedence.
-    let header = if let Some(ref signing_key_id) = params.signing_key_id {
-        UcanHeader::with_kid(signing_key_id.as_fragment().to_owned())
-    } else {
-        match &params.key_scope {
-            Some(scope) => UcanHeader::with_kid(scope.clone()),
-            None => UcanHeader::new(),
-        }
-    };
+    let header = params.signing_key_id.as_ref().map_or_else(
+        || {
+            params
+                .key_scope
+                .as_ref()
+                .map_or_else(UcanHeader::new, |scope| UcanHeader::with_kid(scope.clone()))
+        },
+        |signing_key_id| UcanHeader::with_kid(signing_key_id.as_fragment().to_owned()),
+    );
 
     // Build facts — merge scp_key_scope into existing facts when key_scope
     // is present (ADR-039).

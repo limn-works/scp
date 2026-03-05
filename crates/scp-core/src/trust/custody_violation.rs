@@ -369,7 +369,7 @@ impl CounterAttestation {
     /// # Errors
     ///
     /// Returns [`CustodyViolationError`] if any required field is empty.
-    pub fn validate(&self) -> Result<(), CustodyViolationError> {
+    pub const fn validate(&self) -> Result<(), CustodyViolationError> {
         if self.violation_reference.is_empty() {
             return Err(CustodyViolationError::EmptyField {
                 field: "violation_reference",
