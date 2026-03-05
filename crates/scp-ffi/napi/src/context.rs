@@ -278,7 +278,7 @@ pub struct NapiMessage {
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-VAL-7000` if `params_json` is malformed JSON.
+/// - Rejects with `SCP-VALID-7000` if `params_json` is malformed JSON.
 /// - Rejects with `SCP-CTX-2000` if context creation fails.
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
@@ -291,7 +291,7 @@ pub async fn context_create(
             message: format!(
                 "params_json is not valid JSON: {e} — pass a JSON-encoded context parameters object"
             ),
-            code: "SCP-VAL-7000".to_owned(),
+            code: "SCP-VALID-7000".to_owned(),
         })
     })?;
 

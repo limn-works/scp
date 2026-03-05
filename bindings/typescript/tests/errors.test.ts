@@ -128,10 +128,10 @@ describe("mapBridgeError", () => {
     expect(err.code).toBe("SCP-PERM-3001");
   });
 
-  it("maps PRM prefix to UcanPermissionError", () => {
-    const err = mapBridgeError(new Error("[SCP-PRM-4002] permission error: denied"));
+  it("maps PERM error codes in correct range to UcanPermissionError", () => {
+    const err = mapBridgeError(new Error("[SCP-PERM-3023] permission error: denied"));
     expect(err).toBeInstanceOf(UcanPermissionError);
-    expect(err.code).toBe("SCP-PRM-4002");
+    expect(err.code).toBe("SCP-PERM-3023");
   });
 
   it("maps crypto error codes to CryptoError", () => {
@@ -158,10 +158,10 @@ describe("mapBridgeError", () => {
     expect(err.code).toBe("SCP-VALID-7001");
   });
 
-  it("maps VAL prefix to ValidationError", () => {
-    const err = mapBridgeError(new Error("[SCP-VAL-7000] validation error: failed"));
+  it("maps VALID error codes to ValidationError", () => {
+    const err = mapBridgeError(new Error("[SCP-VALID-7000] validation error: failed"));
     expect(err).toBeInstanceOf(ValidationError);
-    expect(err.code).toBe("SCP-VAL-7000");
+    expect(err.code).toBe("SCP-VALID-7000");
   });
 
   it("maps storage error codes to StorageError", () => {
