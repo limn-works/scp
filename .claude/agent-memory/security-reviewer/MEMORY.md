@@ -186,12 +186,21 @@
 - MEDIUM x7: IP in storage key; no key length validation; encryptionKey retained; non-atomic count; TTL reset; MLS JSON key material; error echoes input
 - GOOD: Parameterized SQL; B-tree range scans; atomic fs writes; SQLCipher 256000 KDF
 
+### Governance Gaps (closes #266) -- 2026-03-05
+- See `governance-gaps-findings.md` for full details
+- HIGH: validate_projection_ucan skips Ed25519 sig verify, expiry, delegation, revocation -- structural-only validation is auth theater
+- HIGH: message_handler per-author Gated override checked AFTER decryption -- timing oracle + content leak
+- MEDIUM: feed_handler ignores per-author Gated overrides -- content protected per-message is open via feed
+- MEDIUM: RevocationScope accepted but ignored (_scope) -- Full/FutureOnly identical in broadcast
+- MEDIUM: governance_unban_subscriber no check if DID was actually banned -- meaningless proposals
+- MEDIUM: conflict_resolution missing RestoreReadAccess vs RestoreReadAccess pair
+- GOOD: BLACK-HTTP-005 cross-context blob oracle defense; private cache-control on gated; proposal replay protection; key zeroization; uniform deny reasons; MemberBan ceiling enforcement
+
 ### General Patterns
 - clippy deny unwrap/expect in lib code; thiserror; Rust 2024; #![forbid(unsafe_code)] except scp-ffi
 - zeroize inconsistent: store layer yes, identity signing keys and MLS key pairs no
 - unwrap_or_default() on clock ops is recurring systemic pattern
 - DashMap shard locks must not cross Python GIL; clone Arc first
 - Static DashMap registries (CONTEXT_REGISTRY, KNOWN_CONTEXTS, IDENTITY_ROUTING_SECRETS) lack eviction
-- MLS StorageProvider bridge bypasses ProtocolStore -- loses sanitization and zeroization
-- Storage keys from user-controlled strings MUST call sanitize_key_component()
+- validate_projection_ucan (scp-node) is structural-only -- recurring UCAN validation gap pattern (see also validate_ucan_stateless)
 - B-tree range scans eliminate LIKE wildcard injection risk across all platforms
