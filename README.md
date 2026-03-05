@@ -244,6 +244,7 @@ scp-node --health
 |---|---|---|
 | `SCP_NODE_DOMAIN` | *(required)* | Domain for DID document and relay URL |
 | `SCP_NODE_BIND_ADDR` | `0.0.0.0:9000` | HTTP listen address |
+| `SCP_NODE_PROJECTION_RATE_LIMIT` | `60` | Per-IP rate limit (req/s) for broadcast projection endpoints |
 
 ## License
 

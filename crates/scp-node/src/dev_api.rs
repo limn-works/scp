@@ -585,6 +585,9 @@ mod tests {
             http_bind_addr: SocketAddr::from(([0, 0, 0, 0], 8443)),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             cors_origins: None,
+            projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
+                1000,
+            ),
             tls_config: None,
             cert_resolver: None,
         })

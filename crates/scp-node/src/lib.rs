@@ -64,6 +64,14 @@ pub const DEFAULT_HTTP_BIND_ADDR: SocketAddr =
 /// growth from registration floods.
 pub(crate) const MAX_BROADCAST_CONTEXTS: usize = 1024;
 
+/// Default per-IP rate limit for broadcast projection endpoints (requests per second).
+///
+/// Configurable via `SCP_NODE_PROJECTION_RATE_LIMIT` env var or
+/// [`ApplicationNodeBuilder::projection_rate_limit`].
+///
+/// See spec section 18.11.6.
+pub const DEFAULT_PROJECTION_RATE_LIMIT: u32 = 60;
+
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
@@ -1092,6 +1100,10 @@ pub struct ApplicationNodeBuilder<
     /// CORS allowed origins for public endpoints. `None` = permissive (`*`).
     /// See issue #231.
     cors_origins: Option<Vec<String>>,
+    /// Per-IP rate limit for broadcast projection endpoints (req/s).
+    /// `None` uses the default of 60 req/s. Configurable via
+    /// `SCP_NODE_PROJECTION_RATE_LIMIT` env var.
+    projection_rate_limit: Option<u32>,
     /// HTTP/3 configuration (spec §10.15.1). `None` = HTTP/3 disabled.
     #[cfg(feature = "http3")]
     http3_config: Option<scp_transport::http3::Http3Config>,
@@ -1123,6 +1135,7 @@ impl ApplicationNodeBuilder {
             local_api_addr: None,
             http_bind_addr: None,
             cors_origins: None,
+            projection_rate_limit: None,
             #[cfg(feature = "http3")]
             http3_config: None,
             _domain_state: PhantomData,
@@ -1166,6 +1179,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Id>
             local_api_addr: self.local_api_addr,
             http_bind_addr: self.http_bind_addr,
             cors_origins: self.cors_origins,
+            projection_rate_limit: self.projection_rate_limit,
             #[cfg(feature = "http3")]
             http3_config: self.http3_config,
             _domain_state: PhantomData,
@@ -1201,6 +1215,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Id>
             local_api_addr: self.local_api_addr,
             http_bind_addr: self.http_bind_addr,
             cors_origins: self.cors_origins,
+            projection_rate_limit: self.projection_rate_limit,
             #[cfg(feature = "http3")]
             http3_config: self.http3_config,
             _domain_state: PhantomData,
@@ -1388,6 +1403,21 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Dom,
         self
     }
 
+    /// Sets the per-IP rate limit for broadcast projection endpoints.
+    ///
+    /// Controls the maximum number of requests per second from a single IP
+    /// address to the `/scp/broadcast/*` endpoints. Exceeding this rate
+    /// returns HTTP 429 Too Many Requests.
+    ///
+    /// Default: 60 req/s. Also configurable via `SCP_NODE_PROJECTION_RATE_LIMIT`.
+    ///
+    /// See spec section 18.11.6.
+    #[must_use]
+    pub const fn projection_rate_limit(mut self, rate: u32) -> Self {
+        self.projection_rate_limit = Some(rate);
+        self
+    }
+
     /// Configures HTTP/3 support for the node (spec §10.15.1).
     ///
     /// When set, the node starts an HTTP/3 listener on a QUIC endpoint
@@ -1431,6 +1461,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, Dom, Id>
             local_api_addr: self.local_api_addr,
             http_bind_addr: self.http_bind_addr,
             cors_origins: self.cors_origins,
+            projection_rate_limit: self.projection_rate_limit,
             #[cfg(feature = "http3")]
             http3_config: self.http3_config,
             _domain_state: PhantomData,
@@ -1487,6 +1518,7 @@ impl<S: Storage + 'static, Dom>
             local_api_addr: self.local_api_addr,
             http_bind_addr: self.http_bind_addr,
             cors_origins: self.cors_origins,
+            projection_rate_limit: self.projection_rate_limit,
             #[cfg(feature = "http3")]
             http3_config: self.http3_config,
             _domain_state: PhantomData,
@@ -1522,6 +1554,7 @@ impl<S: Storage + 'static, Dom>
             local_api_addr: self.local_api_addr,
             http_bind_addr: self.http_bind_addr,
             cors_origins: self.cors_origins,
+            projection_rate_limit: self.projection_rate_limit,
             #[cfg(feature = "http3")]
             http3_config: self.http3_config,
             _domain_state: PhantomData,
@@ -1606,6 +1639,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
                     relay_config,
                     http_bind_addr,
                     self.cors_origins.clone(),
+                    self.projection_rate_limit
+                        .unwrap_or(DEFAULT_PROJECTION_RATE_LIMIT),
                     cert_data,
                     #[cfg(feature = "http3")]
                     self.http3_config,
@@ -1639,6 +1674,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
                     relay_config,
                     Some(http_bind_addr),
                     self.cors_origins,
+                    self.projection_rate_limit
+                        .unwrap_or(DEFAULT_PROJECTION_RATE_LIMIT),
                     self.network_detector,
                 )
                 .await
@@ -1766,6 +1803,7 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     relay_config: RelayConfig,
     http_bind_addr: SocketAddr,
     cors_origins: Option<Vec<String>>,
+    projection_rate_limit: u32,
     cert_data: tls::CertificateData,
     #[cfg(feature = "http3")] http3_config: Option<scp_transport::http3::Http3Config>,
 ) -> Result<ApplicationNode<S>, NodeError> {
@@ -1800,6 +1838,9 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         http_bind_addr,
         shutdown_token: CancellationToken::new(),
         cors_origins,
+        projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
+            projection_rate_limit,
+        ),
         tls_config: Some(Arc::new(tls_server_config)),
         cert_resolver: Some(cert_resolver),
     });
@@ -1841,6 +1882,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     relay_config: RelayConfig,
     http_bind_addr: Option<SocketAddr>,
     cors_origins: Option<Vec<String>>,
+    projection_rate_limit: u32,
     network_detector: Option<Arc<dyn NetworkChangeDetector>>,
 ) -> Result<ApplicationNode<S>, NodeError> {
     let tier = nat_strategy.select_tier(bound_addr.port()).await?;
@@ -1917,6 +1959,9 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         http_bind_addr,
         shutdown_token: CancellationToken::new(),
         cors_origins,
+        projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
+            projection_rate_limit,
+        ),
         tls_config: None,
         cert_resolver: None,
     });
@@ -2021,6 +2066,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
             relay_config,
             self.http_bind_addr,
             self.cors_origins,
+            self.projection_rate_limit
+                .unwrap_or(DEFAULT_PROJECTION_RATE_LIMIT),
             self.network_detector,
         )
         .await

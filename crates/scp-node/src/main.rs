@@ -231,12 +231,18 @@ async fn run_full_node() {
 
     // The relay binds to an ephemeral port on localhost; the public HTTP
     // server (serve()) binds separately on http_addr.
+    let projection_rate: u32 = env_or(
+        "SCP_NODE_PROJECTION_RATE_LIMIT",
+        scp_node::DEFAULT_PROJECTION_RATE_LIMIT,
+    );
+
     let mut builder = ApplicationNodeBuilder::new()
         .storage(Arc::new(InMemoryStorage::new()))
         .domain(&domain)
         .generate_identity_with(custody, did_method)
         .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .http_bind_addr(http_addr);
+        .http_bind_addr(http_addr)
+        .projection_rate_limit(projection_rate);
 
     if use_self_signed {
         tracing::info!(domain = %domain, "using self-signed TLS certificate (development mode)");

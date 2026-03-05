@@ -527,6 +527,7 @@ Request bodies are limited to **64 KiB**. Requests exceeding this limit are reje
 - **Broadcast context limit.** A maximum of 1024 broadcast contexts may be registered per node. This prevents unbounded memory growth from registration floods via the dev API or SDK.
 - **Production default: disabled.** The dev API is opt-in via `local_api()`. Deployments that do not call this method have zero additional attack surface.
 - **Separate port** from the public HTTPS listener. Reverse proxy configurations that forward to the public port never accidentally expose the dev API.
+- **No rate limiting required.** The dev API's localhost binding + bearer token authentication provide sufficient protection. Per-IP rate limiting is applied only to public projection endpoints (§18.11.6).
 
 ## 18.11 HTTP Broadcast Projection
 
@@ -645,6 +646,7 @@ Keys are retained per epoch for the blob TTL window. When a key epoch advances, 
 - **Public endpoint.** Broadcast content was intended for broad distribution (§5.14 design). The projection makes already-public content accessible via HTTP without requiring SCP client software.
 - **No authentication on projection endpoints.** The content is public by design. Operators wanting access control can place a reverse proxy with authentication in front of the projection endpoints.
 - **`routing_id` is not new disclosure.** The `routing_id = SHA-256(context_id)` is already visible to relays (§5.14.6). Using it in URL paths reveals nothing beyond what relays already observe.
+- **Per-IP rate limiting.** Projection endpoints apply a per-IP token-bucket rate limiter (default 60 req/s, configurable via `SCP_NODE_PROJECTION_RATE_LIMIT`). Requests exceeding the limit receive HTTP 429 Too Many Requests. This prevents abuse of the public, unauthenticated endpoints that perform crypto decryption and blob reads per request.
 
 ### 18.11.7 `scp://` URI Integration
 
