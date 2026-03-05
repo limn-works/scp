@@ -2550,8 +2550,12 @@ impl ContextManager {
                     // execution; mark it as executed to prevent double-execution.
                     let loser = if *winner_id == *proposal_a {
                         proposal_b
-                    } else {
+                    } else if *winner_id == *proposal_b {
                         proposal_a
+                    } else {
+                        return Err(ContextError::PermissionDenied(format!(
+                            "winner_id {winner_id:?} is not one of the conflicting proposals"
+                        )));
                     };
                     ctx.executed_proposals.insert(*loser);
                     ctx.executed_proposals.insert(*winner_id);
