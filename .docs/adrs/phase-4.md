@@ -29,16 +29,16 @@ Build order: ADR-017 + ADR-019 (parallel, both depend on Phase 1-3) --> ADR-018 
 
 ### Context
 
-Spec §7 defines four layers of trust evaluation, from hardest (pure validation) to softest (pure judgment). Layer 1 (UCAN enforcement) was implemented in ADR-016. The trust engine implements Layers 2-4: behavioral validation (verifiable event logs), behavioral records, attestation verification, challenge-response, and consequence evaluation. The trust engine provides validated inputs for agent-level evaluation — it does not produce trust "scores."
+Spec §7 defines four layers of trust evaluation, from hardest (pure validation) to softest (pure judgment). Layer 1 (UCAN enforcement) was implemented in ADR-016. The trust engine implements Layers 2-4: participation validation (verifiable event logs), participation records, attestation verification, challenge-response, and consequence evaluation. The trust engine provides validated inputs for agent-level evaluation — it does not produce trust "scores."
 
 ### Decision
 
-Implement `scp-core/trust/` module. Behavioral records are computed locally from event logs (not stored centrally) — any agent computes from accessible logs. Attestation verification follows the common envelope format (§7.4.1). Challenge-response protocol enables verification of testable capabilities. Consequence rules are declared at context creation and protocol-enforced. Trust evaluation is agent-level — the engine provides validated inputs, not decisions.
+Implement `scp-core/trust/` module. Participation records are computed locally from event logs (not stored centrally) — any agent computes from accessible logs. Attestation verification follows the common envelope format (§7.4.1). Challenge-response protocol enables verification of testable capabilities. Consequence rules are declared at context creation and protocol-enforced. Trust evaluation is agent-level — the engine provides validated inputs, not decisions.
 
 ### Rationale
 
-- **Agent-level evaluation over protocol scores:** Trust is contextual (protocol tenet). The engine provides verifiable facts (behavioral records, verified attestations, challenge results, consequence structures), and each agent's trust evaluation logic consumes these facts according to its own criteria. No universal trust score.
-- **Local computation over central storage:** Behavioral records are derived from event logs that every member has. No central behavioral database. Two agents may compute different records from different event log views — this is correct behavior, not a bug.
+- **Agent-level evaluation over protocol scores:** Trust is contextual (protocol tenet). The engine provides verifiable facts (participation records, verified attestations, challenge results, consequence structures), and each agent's trust evaluation logic consumes these facts according to its own criteria. No universal trust score.
+- **Local computation over central storage:** Participation records are derived from event logs that every member has. No central participation database. Two agents may compute different records from different event log views — this is correct behavior, not a bug.
 - **Common attestation envelope:** Uniform structure for all attestation types (§7.4.1) enables generic verification logic and interoperable attestation exchange.
 - **Declared consequence rules:** Consequences are part of the opt-in contract — visible before joining, protocol-enforced, verifiable. No hidden penalties.
 
@@ -51,7 +51,7 @@ Implement `scp-core/trust/` module. Behavioral records are computed locally from
 
 ### Dependencies
 
-- **ADR-011 (Event Log):** Behavioral records are derived from event log entries.
+- **ADR-011 (Event Log):** Participation records are derived from event log entries.
 - **ADR-016 (UCAN):** Layer 1 enforcement. Trust engine operates on Layers 2-4.
 - **ADR-009 (Roles/Capabilities):** Governance action types, role history.
 
@@ -61,7 +61,7 @@ Implement `scp-core/trust/` module. Behavioral records are computed locally from
 
 ```rust
 /// Verifiable facts computed from context event logs.
-pub struct BehavioralRecord {
+pub struct ParticipationRecord {
     pub subject_did: DID,
     pub context_id: ContextId,
     pub participation_count: u64,
@@ -149,14 +149,14 @@ pub struct ThresholdRequirement {
 /// Aggregated trust inputs for agent-level evaluation.
 pub struct TrustInput {
     pub verified_attestations: Vec<Attestation>,
-    pub behavioral_record: BehavioralRecord,
+    pub participation_record: ParticipationRecord,
     pub challenge_results: Vec<(ChallengeRequest, ChallengeResponse)>,
     pub consequence_structure: Vec<ConsequenceRule>,
     pub threshold_counts: HashMap<AttestationType, (u32, u32)>,  // (met, required)
 }
 ```
 
-2. **`compute_behavioral_record(event_log, subject_did) -> Result<BehavioralRecord, TrustError>`**
+2. **`compute_participation_record(event_log, subject_did) -> Result<ParticipationRecord, TrustError>`**
    - Scans event log entries for the subject DID.
    - Computes: participation count/duration, tool invocations by type/frequency, governance actions against/by identity, role progression, attestation history, context creation history.
    - Captures the Merkle root at computation time for verifiability.
@@ -195,7 +195,7 @@ pub struct TrustInput {
    - Returns `Fresh`, `Stale { since }`, or `Expired`.
 
 9. **`aggregate_trust_input(context, subject_did) -> Result<TrustInput, TrustError>`**
-   - Computes behavioral record from event log.
+   - Computes participation record from event log.
    - Collects and verifies attestations from cache.
    - Collects challenge results with timestamps.
    - Collects consequence structure from context params.
@@ -214,7 +214,7 @@ pub struct TrustInput {
 | File | Purpose |
 |------|---------|
 | `mod.rs` | Module root, `TrustInput`, re-exports |
-| `behavioral.rs` | `BehavioralRecord`, `compute_behavioral_record` |
+| `participation.rs` | `ParticipationRecord`, `compute_participation_record` |
 | `attestation.rs` | `Attestation`, `AttestationType`, `verify_attestation`, `check_attestation_freshness`, `check_threshold_attestation` |
 | `challenge.rs` | `ChallengeRequest`, `ChallengeResponse`, `issue_challenge`, `verify_challenge_response` |
 | `consequence.rs` | `ConsequenceRule`, `evaluate_consequence_rules` |
@@ -530,7 +530,7 @@ pub struct DiscoveryResult {
 pub struct DiscoveryResultEntry {
     pub did: DID,
     pub capabilities: Vec<String>,
-    pub behavioral_summary: Option<serde_json::Value>,
+    pub participation_summary: Option<serde_json::Value>,
     pub provenance: DataProvenance,
     pub relevance_score: f64,
 }
@@ -551,7 +551,7 @@ pub struct DiscoveryBootstrap {
 **Standard tool schemas (conventions, not mandates — per §6.2.2B):**
 
 ```
-agent_search(query) -> { results: [{ did, capabilities, behavioral_summary }] }
+agent_search(query) -> { results: [{ did, capabilities, participation_summary }] }
 agent_register(did, capabilities, metadata) -> { registered, entry_id }
 agent_deregister(did) -> { removed }
 ```
@@ -1451,3 +1451,115 @@ The re-implementation is NOT a fork — it is a second implementation of the sam
 
 - **ADR-022 (TypeScript SDK):** Defines the TypeScript wrapper layer that consumes both bridges.
 - **ADR-006 (Platform Adapter):** The WASM bridge implements the `Storage` and `KeyCustody` traits using browser-native APIs (wa-sqlite, WebCrypto).
+
+---
+
+## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)
+
+**Status:** Decided
+
+### Context
+
+The protocol specifies agent capability metadata in §4.4 and challenge-response verification in §7.3.4. The existing implementation has two problems:
+
+1. **Fragmented identifier space.** `ChallengeType` in `scp-core/trust/challenge.rs` defines three hardcoded enum variants (`PromptInjectionResistance`, `SchemaValidation`, `RateLimitCompliance`) plus `Custom(String)` — but there is no structure to custom strings, no namespace authority, and no way to distinguish protocol-defined capabilities from user-defined ones. `CapabilityEntry` in `scp-core/discovery/did_capabilities.rs` uses unstructured `Vec<String>` for capability names with the `scp:capabilities:` prefix for DID document service endpoints — a different format from `ChallengeType`. These two systems describe the same concept (agent capabilities) with incompatible identifiers.
+
+2. **No anti-spoofing.** Any agent can declare any capability string in its DID document. There is no reserved namespace for protocol-defined capabilities, no mechanism to reject unknown protocol-scoped URIs, and no way to distinguish a self-attested claim from a challenge-verified capability at the identifier level.
+
+The challenge suite standards open question (00-open-questions.md) identified these gaps. The design decision resolves them with a structured URI namespace, a signed protocol registry, and clear authority boundaries.
+
+### Decision
+
+Define a three-authority URI namespace for agent capabilities:
+
+**1. Protocol-defined challenge capabilities (`scp:capability:*`):**
+
+```
+scp:capability:{kebab-case-name}/v{integer}
+```
+
+Reserved prefix. SDKs MUST reject any `scp:capability:*` URI not present in the signed protocol registry. Fixed structure: no deeper nesting. Capabilities are atomic — exact string equality for matching.
+
+Initial protocol registry defines 27 challenge capabilities across 10 categories:
+
+| Category | Capabilities |
+|----------|-------------|
+| Safety & Security | `prompt-injection-resistance/v1`, `content-safety/v1`, `privacy-compliance/v1`, `credential-handling/v1` |
+| Schema & Protocol Compliance | `schema-validation/v1`, `tool-schema-compliance/v1`, `output-format-compliance/v1` |
+| Behavioral Compliance | `rate-limit-compliance/v1`, `instruction-adherence/v1`, `context-policy-adherence/v1`, `graceful-degradation/v1` |
+| Operational | `latency-compliance/v1` (param: `max_ms`), `idempotency/v1`, `multilingual/v1` (param: `languages`) |
+| Spending / Commerce | `spending-compliance/v1`, `cost-awareness/v1` |
+| Reasoning / Logic | `logical-reasoning/v1`, `mathematical-reasoning/v1` (param: `difficulty`), `causal-reasoning/v1` |
+| Code | `code-generation/v1` (param: `languages`), `code-review/v1` |
+| Recall / Fidelity | `context-recall/v1`, `instruction-retention/v1` |
+| Bias / Fairness | `bias-resistance/v1`, `viewpoint-diversity/v1` |
+| Factual / Hallucination | `factual-accuracy/v1`, `hallucination-resistance/v1`, `source-attribution/v1` |
+
+**2. DID-scoped custom capabilities:**
+
+```
+did:{method}:{id}:capability:{kebab-case-name}/v{integer}
+```
+
+Anyone can define capabilities under their own DID. Authority is the definer's identity. Verifiers evaluate the capability based on who defined it — trust in the capability is trust in the definer.
+
+**3. System capabilities (`scp:system:*`):**
+
+```
+scp:system:{kebab-case-name}
+```
+
+Protocol-level feature flags for node roles. Not challenge-testable — these describe what a node does, not what an agent can prove. Initial set: `mls-group-management`, `key-rotation`, `governance-participation`, `relay-operation`, `bridge-operation`.
+
+**Anti-spoofing model:**
+
+- Declaring a URI in a DID document = self-attested claim (anyone can do this).
+- Having a signed `ChallengeVerification` record = challenge-verified (can't fake verifier's signature).
+- `scp:capability:*` prefix is reserved. SDKs reject unknown `scp:capability:*` URIs at parse time.
+- Custom capabilities use DID-scoped namespace — authority is the definer's identity.
+
+### Rationale
+
+- **Structured URIs over free-form strings:** Free-form strings (the `Custom(String)` approach) provide no authority boundary, no versioning, and no way to distinguish protocol-defined from user-defined capabilities. URI structure solves all three: the prefix identifies authority, `/v{N}` provides versioning, and kebab-case enforces naming consistency.
+- **DID-scoped custom namespace over centralized registry:** A centralized registry (maintained by Limn or a standards body) would violate the "protocol requires no operator" tenet. DID-scoped custom capabilities are self-sovereign — anyone can define them under their own DID without permission from any authority.
+- **SDK-enforced prefix reservation over social convention:** Social convention ("please don't use `scp:capability:*` for your own capabilities") is unenforceable. SDK-level rejection of unknown `scp:capability:*` URIs makes spoofing mechanically impossible for conformant implementations.
+- **Versioned capabilities over unversioned:** Challenge suites will evolve as attack vectors and verification techniques improve. Version numbers enable breaking changes without invalidating existing verifications.
+- **System capabilities as separate namespace:** System capabilities (`scp:system:*`) describe node roles, not agent behaviors. They are not challenge-testable. Mixing them with challenge capabilities would create confusion about what can and cannot be verified.
+
+### Alternatives Considered
+
+1. **Free-form strings with no namespace structure.** The current `Custom(String)` approach. No authority boundary, no versioning, no anti-spoofing. Anyone can claim any string. This is what the protocol had before this ADR. Rejected because it provides no mechanism to distinguish protocol-defined from user-defined capabilities, and no way to prevent capability impersonation.
+
+2. **Centralized registry maintained by a standards body or Limn.** A single authority defines and maintains the canonical capability list. New capabilities require registry approval. Rejected because it violates the "protocol requires no operator" tenet and creates a bottleneck for ecosystem evolution. The DID-scoped namespace provides the same extensibility without central authority.
+
+3. **Capability ontology (OWL/RDF).** Formal semantic web vocabulary for capability relationships (subsumption, composition, equivalence). Provides rich reasoning but adds enormous complexity. Rejected because SCP capabilities are atomic (exact string match) and do not require subsumption reasoning. The URI structure provides sufficient expressiveness for the protocol's needs.
+
+### Consequences
+
+- `ChallengeType` enum evolves to support URI-based matching: existing variants map to `scp:capability:*` URIs, and `Custom(String)` is replaced by URI-validated custom types.
+- `CapabilityEntry` in `did_capabilities.rs` adopts the URI format for capability strings.
+- Context admission requirements can reference specific capability URIs (e.g., "requires `scp:capability:prompt-injection-resistance/v1` challenge-verified").
+- SDK implementations across all languages must include the protocol registry and reject unknown `scp:capability:*` URIs.
+- The protocol registry is versioned and signed. Adding new `scp:capability:*` URIs requires a protocol version bump.
+- DID-scoped custom capabilities enable ecosystem-driven extension without protocol changes.
+
+### Dependencies
+
+- **ADR-017 (Trust Engine):** Challenge-response protocol that verifies capabilities.
+- **ADR-020 (Tool-Interface Discovery):** DID document capability advertising that uses the URI format.
+- **ADR-003 (DID Creation):** DID-scoped custom capabilities require DID resolution.
+- **ADR-008 (Context Lifecycle):** Context admission requirements reference capability URIs.
+
+### Acceptance Criteria
+
+1. **URI parser** validates `scp:capability:{kebab-case}/v{N}`, `did:{method}:{id}:capability:{kebab-case}/v{N}`, and `scp:system:{kebab-case}`. Rejects malformed URIs with specific error variants.
+
+2. **Protocol registry** contains all 27 challenge capability URIs and 5 system capability URIs. Lookup by URI returns registry metadata (category, description, parameter schema). Unknown `scp:capability:*` URIs return `Err(UnknownProtocolCapability)`.
+
+3. **`ChallengeType` unification:** existing `PromptInjectionResistance` maps to `scp:capability:prompt-injection-resistance/v1`, `SchemaValidation` maps to `scp:capability:schema-validation/v1`, `RateLimitCompliance` maps to `scp:capability:rate-limit-compliance/v1`. `Custom(String)` is replaced by `Uri(CapabilityUri)` which must be a valid DID-scoped or protocol-scoped URI.
+
+4. **`CapabilityEntry` update:** `capabilities: Vec<String>` becomes `capabilities: Vec<CapabilityUri>` where `CapabilityUri` is the validated URI type. DID document service endpoint parsing validates URIs.
+
+5. **SDK validation:** `validate_capability_uri(uri) -> Result<CapabilityUri, CapabilityError>` rejects unknown `scp:capability:*` URIs, accepts known protocol URIs and all valid DID-scoped URIs.
+
+6. **Context admission integration:** admission requirements can specify `required_capabilities: Vec<(CapabilityUri, VerificationLevel)>` where `VerificationLevel` is `SelfAttested` or `ChallengeVerified`.

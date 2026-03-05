@@ -661,7 +661,7 @@ pub struct TrustInput {
     pub context_id: String,
     /// Number of verified attestations from independent attestors.
     pub verified_attestation_count: u32,
-    /// Participation count from the behavioral record.
+    /// Participation count from the participation record.
     pub participation_count: u64,
     /// Number of triggered consequence rules in the evaluation window.
     pub triggered_consequences: u32,

@@ -64,7 +64,7 @@ Publishing the protocol is the differentiator — not the existence of encryptio
 **Different:**
 
 - **Transport coupling.** Hyperswarm IS the transport — Kademlia DHT discovery, UDP hole punching, Noise XX handshake, all tightly integrated. SCP is transport-agnostic (17 adapters, §10.5). Hyperswarm could be one SCP adapter. SCP's design never depends on it.
-- **Trust model.** Holepunch: trust whoever has the public key of a Hypercore feed. No governance, no capabilities, no accountability chains. SCP: DID + UCAN + context governance + behavioral records (§3, §4, §5.3, §7).
+- **Trust model.** Holepunch: trust whoever has the public key of a Hypercore feed. No governance, no capabilities, no accountability chains. SCP: DID + UCAN + context governance + participation records (§3, §4, §5.3, §7).
 - **Group membership.** MLS in SCP enforces membership cryptographically — you cannot read messages without the group key. Hyperswarm: app-level access control.
 - **Context isolation.** SCP's security boundary (§5). No Hyperswarm or Hypercore equivalent. There is no concept of bounded, governed interaction spaces with cryptographic boundaries.
 - **Offline/async delivery.** Hypercore requires synchronous peer connections (at least intermittently) — if no peer is online, you wait. SCP's relay architecture provides store-and-forward async delivery. You send a message even if the recipient is offline. Relays buffer with three-tier degradation (§23).

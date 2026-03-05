@@ -362,12 +362,12 @@
         ".docs/specs/23-sync-and-offline-strategy.md",
         ".docs/specs/00-open-questions.md"
       ],
-      "description": "Update all secondary spec files that reference agent identity, agent DIDs, or agent-human binding to reflect the shared-DID model from ADR-039. \u00a71 (Thesis): update 'human accountability' principle to note structural enforcement. \u00a75 (Contexts): update \u00a75.6 (Membership) and \u00a75.9 (Governance) for one-DID-one-vote and Category C context restrictions (agent_keys_allowed, agent_rate_limit, agent_cosign_required). \u00a77 (Trust): update \u00a77.3.2 (Behavioral Records) for per-key behavioral tracking. \u00a78 (Products): update \u00a78.2 (App Interface) for agent key access. \u00a717 (Persistence): update storage key conventions if agent key material requires new store keys. \u00a718 (Addressability): update \u00a718.2 (DID Document Service Endpoints) for ScpKeyCustodyAttestation service entry. \u00a719 (Economic Governance): update \u00a719.5 (Spending Capability) for refactored MintSpendingParams. \u00a723 (Sync): update \u00a723.8 (Multi-Device Coordination) for agent key rotation sync. \u00a700 (Open Questions): close the agent binding question if listed, or add a closed entry.",
+      "description": "Update all secondary spec files that reference agent identity, agent DIDs, or agent-human binding to reflect the shared-DID model from ADR-039. \u00a71 (Thesis): update 'human accountability' principle to note structural enforcement. \u00a75 (Contexts): update \u00a75.6 (Membership) and \u00a75.9 (Governance) for one-DID-one-vote and Category C context restrictions (agent_keys_allowed, agent_rate_limit, agent_cosign_required). \u00a77 (Trust): update \u00a77.3.2 (Participation Records) for per-key participation tracking. \u00a78 (Products): update \u00a78.2 (App Interface) for agent key access. \u00a717 (Persistence): update storage key conventions if agent key material requires new store keys. \u00a718 (Addressability): update \u00a718.2 (DID Document Service Endpoints) for ScpKeyCustodyAttestation service entry. \u00a719 (Economic Governance): update \u00a719.5 (Spending Capability) for refactored MintSpendingParams. \u00a723 (Sync): update \u00a723.8 (Multi-Device Coordination) for agent key rotation sync. \u00a700 (Open Questions): close the agent binding question if listed, or add a closed entry.",
       "acceptanceCriteria": [
         "\u00a71 human accountability principle references structural enforcement via shared-DID",
         "\u00a75.6 membership reflects that human and agent share one DID (one membership entry)",
         "\u00a75.9 governance documents one-DID-one-vote regardless of signing key, and Category C restrictions",
-        "\u00a77.3.2 behavioral records note per-key tracking (actions by #active vs #agent distinguishable)",
+        "\u00a77.3.2 participation records note per-key tracking (actions by #active vs #agent distinguishable)",
         "\u00a78.2 app interface notes agent key access for SDK consumers",
         "\u00a717 persistence documents any new storage keys for agent key material",
         "\u00a718.2 documents ScpKeyCustodyAttestation service entry in DID documents",
@@ -379,7 +379,7 @@
       "actionItems": [
         "Update \u00a71 thesis for structural enforcement reference",
         "Update \u00a75.6 and \u00a75.9 for shared-DID membership and governance",
-        "Update \u00a77.3.2 for per-key behavioral tracking",
+        "Update \u00a77.3.2 for per-key participation tracking",
         "Update \u00a78.2 for agent key SDK access",
         "Update \u00a717 for agent key storage conventions",
         "Update \u00a718.2 for custody attestation service entry",
@@ -405,7 +405,7 @@
         },
         {
           "file": ".docs/specs/07-trust-validation-and-capabilities.md",
-          "section": "### 7.3.2 Behavioral Records"
+          "section": "### 7.3.2 Participation Records"
         },
         {
           "file": ".docs/specs/18-addressability-and-deployment.md",
@@ -1068,7 +1068,7 @@
         },
         {
           "file": ".docs/specs/07-trust-validation-and-capabilities.md",
-          "section": "### 7.3.2 Behavioral Records"
+          "section": "### 7.3.2 Participation Records"
         },
         {
           "file": ".docs/specs/09-security-model.md",

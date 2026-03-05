@@ -1707,7 +1707,7 @@ QueueDrained {
 
 ### Context
 
-Every SCP context maintains an append-only Merkle event log (ADR-011) that records all protocol events — membership changes, governance actions, tool invocations, messages, role assignments, block notifications, and consistency checkpoints. The log is the foundation for behavioral validation (§7.3.1), equivocation detection (§9.9.3), and the trust model's Layer 2 (verifiable behavioral records, §7.3.2). Its append-only structure is what makes claims about context history verifiable rather than trust-dependent.
+Every SCP context maintains an append-only Merkle event log (ADR-011) that records all protocol events — membership changes, governance actions, tool invocations, messages, role assignments, block notifications, and consistency checkpoints. The log is the foundation for participation validation (§7.3.1), equivocation detection (§9.9.3), and the trust model's Layer 2 (verifiable participation records, §7.3.2). Its append-only structure is what makes claims about context history verifiable rather than trust-dependent.
 
 The problem is that event logs grow without bound. A long-lived context with active participants accumulates millions of events. Each event is a leaf in the Merkle tree, with interior nodes stored for proof generation (ADR-011, key convention: `context/{context_id}/event/{seq:020d}` for events, `context/{context_id}/event_tree/{level}/{index}` for tree nodes — §17.3). On mobile devices with constrained storage, maintaining full history for every active context is unsustainable. A context with 1 million events at ~200 bytes per event plus Merkle tree overhead consumes hundreds of megabytes for a single context.
 
@@ -1859,7 +1859,7 @@ Event-type retention interacts with time-based pruning: the effective retention 
 **Pruning invariants (enforced mechanically):**
 
 1. Events are never pruned unless they are behind a valid, locally-verified checkpoint. No checkpoint = no pruning.
-2. The protocol-enforced minimum retention period is 30 days. A context cannot configure a retention shorter than 30 days. This ensures behavioral validation (§7.3.1) has sufficient history for meaningful evaluation.
+2. The protocol-enforced minimum retention period is 30 days. A context cannot configure a retention shorter than 30 days. This ensures participation validation (§7.3.1) has sufficient history for meaningful evaluation.
 3. Pruning never removes checkpoint events themselves. Checkpoints are retained indefinitely (they are small and serve as trust anchors).
 4. Pruning is always local. A member's decision to prune does not affect other members' logs. Members who need full history can retain it regardless of the context's pruning policy.
 5. The hash chain is preserved: even when event payloads are pruned, the `prev_hash` chain continuity is maintained through retained leaf hashes.
@@ -2030,7 +2030,7 @@ pub struct PruningPolicy {
 
 - **Setting at creation.** The context creator includes `PruningPolicy` in `ContextParameters`. If omitted, the default policy applies: no time-based pruning, no size-based pruning, default checkpoint schedule (every 10,000 events or 24 hours), structural events retained 3x longer than operational events, full history requests allowed.
 - **Modifying via governance.** The pruning policy can be modified through the context's governance model (admin decision in single-admin, governance vote in multi-admin). Changes are recorded in the event log as a `GovernanceAction` event.
-- **Protocol minimum.** The protocol enforces a 30-day minimum for `time_based.retention_secs`. Governance cannot set a shorter retention. This floor ensures behavioral validation (§7.3.1) and equivocation detection (§9.9.3) have meaningful history to work with.
+- **Protocol minimum.** The protocol enforces a 30-day minimum for `time_based.retention_secs`. Governance cannot set a shorter retention. This floor ensures participation validation (§7.3.1) and equivocation detection (§9.9.3) have meaningful history to work with.
 - **Structural event floor.** Governance and membership events (structural events) cannot have an effective retention shorter than 90 days (`structural_retention_multiplier` is clamped to produce at least 90 days of structural event retention). This ensures that context governance history — who joined, who left, what roles changed, what governance actions occurred — is preserved long enough for accountability.
 - **Member autonomy.** A member's SDK can retain the full unprocessed event log locally regardless of the context's pruning policy. The pruning policy governs what the protocol considers the minimum retention obligation and what peers are expected to serve. A member who wants full history retains it; a member on a constrained device prunes according to policy.
 
@@ -2127,7 +2127,7 @@ A rolling window (keep last N events, discard older) breaks Merkle proof continu
 
 **Why 30-day minimum retention:**
 
-Behavioral validation (§7.3.1) computes records from event log history. A 30-day minimum ensures at least one month of behavioral data is available for trust evaluation. Shorter windows would make behavioral records unreliable — a participant could misbehave, wait for pruning, and have no verifiable behavioral record of the misbehavior. The 30-day floor is a practical balance between storage and accountability. Contexts that need longer accountability windows (governance, financial) set longer retention.
+Participation validation (§7.3.1) computes records from event log history. A 30-day minimum ensures at least one month of participation data is available for trust evaluation. Shorter windows would make participation records unreliable — a participant could misbehave, wait for pruning, and have no verifiable participation record of the misbehavior. The 30-day floor is a practical balance between storage and accountability. Contexts that need longer accountability windows (governance, financial) set longer retention.
 
 **Why event-type tiers:**
 

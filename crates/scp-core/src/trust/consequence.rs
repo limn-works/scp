@@ -177,7 +177,7 @@ pub struct TriggeredConsequence {
 /// - Pure computation -- no side effects, no storage.
 /// - The `now` parameter is passed explicitly (rather than using a `Clock`
 ///   trait) for simplicity and testability, following the pattern established
-///   by `compute_behavioral_record`.
+///   by `compute_participation_record`.
 /// - Custom triggers match `GovernanceAction` events whose payload starts
 ///   with the custom key string.
 ///

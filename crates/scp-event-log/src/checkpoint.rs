@@ -2300,9 +2300,9 @@ mod tests {
         assert_eq!(result, CrossCheckpointResult::Consistent);
     }
 
-    // NOTE: Test "26. Behavioral validation works with checkpointed logs (SCP-125 AC6)"
+    // NOTE: Test "26. Participation validation works with checkpointed logs (SCP-125 AC6)"
     // has been moved to scp-core integration tests because it depends on
-    // crate::trust::compute_behavioral_record which crosses crate boundaries.
+    // crate::trust::compute_participation_record which crosses crate boundaries.
     // 27. Pruned proofs work for all leaf positions in various tree sizes
     // -------------------------------------------------------------------
 

@@ -9,9 +9,9 @@
 //!
 //! The trust engine implements Layers 2-4 of the trust model:
 //!
-//! - **Layer 2 (Behavioral):** [`BehavioralRecord`] computed locally from event
-//!   logs. Two agents may compute different records from different event log
-//!   views -- this is correct behavior, not a bug.
+//! - **Layer 2 (Participation):** [`ParticipationRecord`] computed locally from
+//!   event logs. Two agents may compute different records from different event
+//!   log views -- this is correct behavior, not a bug.
 //! - **Layer 3 (Attestation):** [`Attestation`] verification with common
 //!   envelope format. [`verify_attestation`] checks signatures, evidence,
 //!   expiry, and revocation. [`check_attestation_freshness`] evaluates renewal
@@ -33,7 +33,7 @@
 //!
 //! - [`TrustInput`] -- Aggregated trust inputs for agent-level evaluation.
 //! - [`TrustError`] -- Error type for trust engine operations.
-//! - [`BehavioralRecord`] -- Verifiable facts computed from context event logs.
+//! - [`ParticipationRecord`] -- Verifiable facts computed from context event logs.
 //! - [`GovernanceActionSummary`] -- Summary of a governance action.
 //! - [`RoleTransition`] -- A role change event.
 //! - [`Attestation`] -- Common attestation envelope (ADR-017, section 7.4.1).
@@ -62,7 +62,7 @@
 
 pub mod aggregate;
 pub mod attestation;
-pub mod behavioral;
+pub(crate) mod participation;
 pub mod challenge;
 pub mod consequence;
 pub mod custody_violation;
@@ -80,7 +80,12 @@ pub use attestation::{
     RevocationStatus, ThresholdRequirement, ThresholdResult, check_attestation_freshness,
     check_threshold_attestation, verify_attestation,
 };
-pub use behavioral::{BehavioralRecord, compute_behavioral_record};
+// ParticipationRecord and compute_participation_record are not part of
+// the public API. The module is pub(crate); the testing feature gate
+// re-exports compute_participation_record for integration tests.
+pub(crate) use participation::ParticipationRecord;
+#[cfg(feature = "testing")]
+pub use participation::compute_participation_record;
 pub use challenge::{
     ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,
     VerificationMethod, issue_challenge, verify_challenge_response,
@@ -123,7 +128,7 @@ pub enum TrustError {
     #[error("event log is empty")]
     EmptyEventLog,
 
-    /// A behavioral record computation failed due to invalid event data.
+    /// A participation record computation failed due to invalid event data.
     #[error("invalid event data at sequence {sequence}: {reason}")]
     InvalidEventData {
         /// The sequence number of the problematic event.
@@ -270,7 +275,7 @@ pub const fn attestation_type_tag(at: &AttestationType) -> u16 {
 // re-exported above.
 
 // ---------------------------------------------------------------------------
-// Supporting types for BehavioralRecord
+// Supporting types for ParticipationRecord
 // ---------------------------------------------------------------------------
 
 /// Summary of a governance action (by or against a participant).
@@ -326,9 +331,9 @@ pub struct TrustInput {
     /// verified and checked for expiry and revocation.
     pub verified_attestations: Vec<Attestation>,
 
-    /// Behavioral record (Layer 2). Computed from the local view of the
+    /// Participation profile (Layer 2). Computed from the local view of the
     /// event log for the subject DID.
-    pub behavioral_record: BehavioralRecord,
+    pub participation_profile: ParticipationRecord,
 
     /// Challenge-response results (Layer 3). Each entry is a verified
     /// challenge-response pair with metadata distinguishing self-attested

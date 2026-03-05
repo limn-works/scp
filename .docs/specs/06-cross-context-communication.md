@@ -88,7 +88,7 @@ Discovery contexts are standard SCP contexts with open join policies and standar
 ```
 agent_search(query) → results
   input:  { capability: string?, keywords: [string]?, min_history: int? }
-  output: { results: [{ did: DID, capabilities: [string], behavioral_summary: object }] }
+  output: { results: [{ did: DID, capabilities: [string], participation_summary: object }] }
 
 agent_register(did, capabilities, metadata) → confirmation
   input:  { did: DID, capabilities: [string], metadata: { description: string?, tags: [string]? } }

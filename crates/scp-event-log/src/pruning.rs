@@ -41,7 +41,7 @@ use crate::tree;
 /// Protocol-enforced minimum retention period: 30 days in seconds.
 ///
 /// Contexts cannot configure retention shorter than this. Ensures
-/// behavioral validation (section 7.3.1) has sufficient history.
+/// participation validation (section 7.3.1) has sufficient history.
 ///
 /// See ADR-030 section 2a.
 const MIN_RETENTION_SECS: u64 = 2_592_000;
@@ -1168,10 +1168,10 @@ mod tests {
         assert_eq!(boundary, 2);
     }
     // NOTE: Test moved to scp-core integration tests
-    // (depends on trust::behavioral::compute_behavioral_record).
+    // (depends on trust::participation::compute_participation_record).
 
     // NOTE: Test moved to scp-core integration tests
-    // (depends on trust::behavioral::compute_behavioral_record).
+    // (depends on trust::participation::compute_participation_record).
 
     // ===================================================================
     // Configurable retention: last N checkpoints

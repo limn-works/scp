@@ -676,7 +676,7 @@ pub struct ToolSession {
 
 Every context maintains a verifiable event log — an append-only Merkle tree of all protocol events (spec section 7.3.1). The event log transforms claims about context history from trust-dependent to validation-dependent. Any participant can verify claims against the Merkle root: proof-of-inclusion ("this event happened"), proof-of-absence ("this event did not happen"), and consistency ("our views of history match").
 
-The event log is the foundation for behavioral validation (spec Layer 2), behavioral records (spec section 7.3.2), the Relay Consistency Protocol (spec section 9.9.3), and equivocation detection. Without a verifiable event log, accountability claims are unverifiable assertions.
+The event log is the foundation for participation validation (spec Layer 2), participation records (spec section 7.3.2), the Relay Consistency Protocol (spec section 9.9.3), and equivocation detection. Without a verifiable event log, accountability claims are unverifiable assertions.
 
 ### Decision
 
