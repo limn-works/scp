@@ -69,6 +69,15 @@ pub struct PostgresBlobStore {
     clock: ClockFn,
 }
 
+impl std::fmt::Debug for PostgresBlobStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresBlobStore")
+            .field("pool", &"<PgPool>")
+            .field("clock", &"<fn>")
+            .finish()
+    }
+}
+
 impl Clone for PostgresBlobStore {
     fn clone(&self) -> Self {
         Self {

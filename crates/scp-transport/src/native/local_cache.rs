@@ -62,6 +62,16 @@ pub struct LocalBlobCache<S: BlobStorage> {
     clock: ClockFn,
 }
 
+impl<S: BlobStorage + std::fmt::Debug> std::fmt::Debug for LocalBlobCache<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalBlobCache")
+            .field("inner", &self.inner)
+            .field("max_cache_size", &self.max_cache_size)
+            .field("clock", &"<fn>")
+            .finish()
+    }
+}
+
 impl<S: BlobStorage + Clone> Clone for LocalBlobCache<S> {
     fn clone(&self) -> Self {
         Self {
