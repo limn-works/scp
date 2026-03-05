@@ -4,31 +4,38 @@
 
 An agent with no prior context should be able to visit the SCP repository, understand the protocol, build the project, use the SDK in any target language, run tests, and implement features or write a conforming implementation — without human guidance.
 
-## 21.2 Current State as of 27 Feb 2026 2PM EST
+## 21.2 Status
 
-### Strong
-- Protocol specification: 95% complete (21 spec files, 6,700+ lines)
-- ADRs: 6 phase documents covering all architectural decisions
-- Module-level code documentation: 100% of Rust files have `//!` headers
-- Trait contracts: ~100% documented with invariants and error conditions
-- Standards: 8 languages, error hierarchy, async patterns, CI tiers
+### Done
+
+- Protocol specification: modular spec files under `.docs/specs/`, covering all protocol areas
+- ADRs: phase documents covering all architectural decisions
+- Module-level code documentation: nearly all Rust source files have `//!` headers
+- Trait contracts: documented with invariants and error conditions
+- Standards: all SDK languages, error hierarchy, async patterns, CI tiers
+- SDK binding READMEs: all binding directories have README files
+- CI workflows: `ci.yml`, `build-matrix.yml`, `docs.yml`, `release.yml`, and supporting workflows
+- Architecture reading guide: `docs/guides/architecture.md`
+- Transport adapter guide: `docs/guides/transport-adapters.md`
+- scp-mcp and scp-node module docs: all source files have `//!` headers
+- Runnable Rust examples: relay chat/send/listen in `crates/scp-transport/examples/`
 
 ### Gaps
 
 | Category | Current | Target | Priority |
 |---|---|---|---|
-| Getting started | None | Build guide, environment setup | P0 |
-| SDK binding READMEs | None | README per language with install + quickstart | P0 |
-| Example applications | Pseudocode only | Runnable examples per language | P0 |
-| Testing guide | Commands in standards only | Standalone how-to | P0 |
-| Inline doc coverage | 57% (scp-core) | 90%+ | P1 |
-| Architecture navigation | Dense 1,054-line doc | Reading guide with entry points | P1 |
-| Generated API reference | None | Hosted rustdoc, typedoc, etc. | P1 |
-| CI workflow | Placeholder | Working GitHub Actions | P1 |
+| Getting started | None | `GETTING-STARTED.md` — clone, build, run in 15 minutes | P0 |
+| Example applications | Rust relay examples only | Runnable examples per language | P0 |
+| Testing guide | Commands in standards only | Standalone `TESTING.md` how-to | P0 |
+| Inline doc coverage | Struct fields, enum variants, constants under-documented | Field/variant-level `///` docs on public items | P1 |
+| Generated API reference | None | Hosted rustdoc, typedoc, pdoc, DocC | P1 |
+| Crate/FFI README files | None | README per crate and FFI bridge | P1 |
+| Storage backend guide | None | `docs/guides/storage-backends.md` | P2 |
+| Relay operator guide | None | `docs/guides/relay-operations.md` | P2 |
+| Conformance testing guide | None | `docs/guides/conformance-testing.md` | P2 |
 | Integration guides | None | "Add SCP to existing app" | P2 |
-| Transport adapter guide | None | "Implement a new transport" | P2 |
-| Relay operator guide | None | "Run and monitor a relay" | P2 |
-| Conformance testing guide | Spec only | Working macro examples | P2 |
+| SDK quickstart guide | None | Unified `docs/guides/sdk-quickstart.md` | P2 |
+| Compliance documentation | None | Wire format reference, test vectors, conformance suite | P2 |
 
 ## 21.3 Documentation Architecture
 
@@ -41,45 +48,42 @@ TESTING.md                       # How to run tests, write tests, debug failures
 
 docs/                            # Published documentation (agent-facing)
 ├── guides/
-│   ├── architecture.md          # Reading guide: where to start, what to focus on
-│   ├── sdk-quickstart.md        # Unified quickstart (all languages)
-│   ├── transport-adapters.md    # How to implement a new transport adapter
-│   ├── storage-backends.md      # How to implement a new storage backend
-│   ├── relay-operations.md      # How to run, monitor, and upgrade a relay
-│   └── conformance-testing.md   # How to use conformance macros
+│   ├── architecture.md          ✓ exists
+│   ├── sdk-quickstart.md
+│   ├── transport-adapters.md    ✓ exists
+│   ├── storage-backends.md
+│   ├── relay-operations.md
+│   └── conformance-testing.md
 ├── examples/
-│   ├── python/                  # Working Python examples
-│   ├── typescript/              # Working TypeScript examples
-│   ├── swift/                   # Working Swift examples
-│   └── rust/                    # Working Rust examples
+│   ├── python/
+│   ├── typescript/
+│   ├── swift/
+│   └── rust/
 └── api/                         # Generated API reference (rustdoc output, etc.)
 
 scaffolds/                       # Clonable barebones project setups
-├── rust-client/                 # Minimal Rust binary using scp-core
-├── python-agent/                # Python agent skeleton with async runtime
-├── typescript-web/              # Browser app with WASM binding
-├── typescript-node/             # Node.js agent with NAPI binding
-├── swift-ios/                   # iOS app with Keychain custody
-├── swift-macos/                 # macOS app with Secure Enclave custody
-├── kotlin-android/              # Android app with Keystore custody
-└── relay/                       # Minimal relay with scp-node, TLS, monitoring
+├── rust-client/
+├── python-agent/
+├── typescript-web/
+├── typescript-node/
+├── swift-ios/
+├── swift-macos/
+├── kotlin-android/
+└── relay/
 
 templates/                       # Clonable working applications for common use cases
-├── chat/                        # Two-party encrypted chat (CLI + web)
-├── agent-tool-provider/         # Agent exposing tools via SCP context + MCP
-├── collaborative-workspace/     # Multi-party context with roles and tools
-├── personal-relay/              # Self-hosted relay with auto-TLS
-├── broadcast-feed/              # Broadcast context with subscriber management
-└── cross-context-bridge/        # Tool interface bridging two contexts
+├── chat/
+├── agent-tool-provider/
+├── collaborative-workspace/
+├── personal-relay/
+├── broadcast-feed/
+└── cross-context-bridge/
 
-bindings/python/README.md        # Python SDK: install, quickstart, platform notes
-bindings/swift/README.md         # Swift SDK: install, quickstart, platform notes
-bindings/typescript/README.md    # TypeScript SDK: install, quickstart, platform notes (when created)
-
-crates/scp-ffi/README.md         # PyO3 bridge: build, architecture, for maintainers
-crates/scp-ffi/napi/README.md    # NAPI bridge: build, native addon compilation
-crates/scp-ffi/wasm/README.md    # WASM bridge: build, JS callback injection
-crates/scp-ffi/uniffi/README.md  # UniFFI bridge: build, XCFramework generation
+bindings/*/README.md             ✓ all exist
+crates/scp-ffi/README.md
+crates/scp-ffi/napi/README.md
+crates/scp-ffi/wasm/README.md
+crates/scp-ffi/uniffi/README.md
 
 .docs/                           # Internal project knowledge (unchanged)
 ```
@@ -176,28 +180,14 @@ Each example should be:
 
 ## 21.8 P1: Inline Documentation
 
-### scp-core targets
+### Targets
 
-| Area | Gap | Items | Action |
-|---|---|---|---|
-| Struct fields | Most public fields undocumented | ~180 structs | Add field-level `///` docs |
-| Enum variants | Large enums lack per-variant docs | ~92 enums | Add variant-level `///` docs |
-| Utility functions | Helper functions undocumented | ~228 functions | Add `///` docs with contract |
-| Constants | Magic numbers unexplained | ~70 constants | Add "why this value" docs |
+Public struct fields, enum variants, utility functions, and constants across all crates — especially `scp-core` — need field/variant-level `///` doc comments explaining contracts, valid ranges, and "why this value."
 
-Priority files (most undocumented items):
-1. `src/context/mod.rs` (40 items)
-2. `src/context/ttl.rs` (37 items)
-3. `src/context/roles.rs` (24 items)
-4. `src/economy/types.rs` (23 items)
-5. `src/discovery/context.rs` (23 items)
-
-### Supporting crate targets
-
-| Crate | Gap | Action |
-|---|---|---|
-| scp-mcp | `client.rs`, `stdio.rs`, `sse.rs` missing module docs | Add `//!` headers |
-| scp-node | `http.rs`, `tls.rs`, `well_known.rs` missing module docs | Add `//!` headers |
+Priority modules (densest undocumented surface area):
+1. `scp-core/src/context/` — context lifecycle, TTL, roles
+2. `scp-core/src/economy/` — types, policy
+3. `scp-core/src/discovery/` — context discovery, addressing
 
 ### FFI crate targets
 
@@ -341,7 +331,7 @@ For public-facing documentation, a static site generated from `docs/`:
 
 This is P2 — the content in `docs/` is the priority. The website is presentation.
 
-## 21.13 Compliance Documentation (Agent-Optimized)
+## 21.14 Compliance Documentation (Agent-Optimized)
 
 For agents implementing SCP from the spec (not using the reference implementation):
 
