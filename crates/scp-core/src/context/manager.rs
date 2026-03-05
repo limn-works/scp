@@ -1670,9 +1670,9 @@ impl ContextManager {
             }
             // PromoteContext is handled in dispatch_governance_action (needs
             // proposal.approvals for unanimity check).
-            GovernanceAction::PromoteContext => unreachable!(
-                "PromoteContext is dispatched directly by dispatch_governance_action"
-            ),
+            GovernanceAction::PromoteContext => {
+                unreachable!("PromoteContext is dispatched directly by dispatch_governance_action")
+            }
             GovernanceAction::RevokeWriteAccess { did, scope } => {
                 self.execute_revoke_write_access(context_id, did, *scope, pid)
                     .await
@@ -2631,11 +2631,8 @@ impl ContextManager {
             // members (§5.10) because promotion changes the opt-in contract
             // (ephemeral → persistent). This is a protocol-level override
             // that applies regardless of governance model.
-            let member_dids: std::collections::HashSet<&str> = ctx
-                .membership
-                .member_dids()
-                .map(|d| &**d)
-                .collect();
+            let member_dids: std::collections::HashSet<&str> =
+                ctx.membership.member_dids().map(|d| &**d).collect();
             let approval_dids: std::collections::HashSet<&str> =
                 approvals.iter().map(|v| &*v.voter_did).collect();
             let missing: Vec<&str> = member_dids.difference(&approval_dids).copied().collect();
@@ -2675,7 +2672,7 @@ impl ContextManager {
         // the event for downstream differentiation.
         let _ = scope;
 
-        let snapshot = {
+        let (snapshot, bc_snapshot) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
@@ -2693,10 +2690,26 @@ impl ContextManager {
             // Mark member as write-revoked. The member remains present but
             // their messages will be rejected by the send path.
             ctx.write_revoked_members.insert(did.to_string());
-            Self::snapshot_context(ctx)
+
+            // Broadcast mode: also destroy the author's broadcast key so
+            // key requests return Deny (§5.14.8 "Author removal").
+            let bc_snap = if let Some(ref mut bc) = ctx.broadcast_context {
+                // block_author removes the author from the authors map,
+                // destroying their key and preventing future key distribution.
+                // Ignore error if DID is not an author (may be a subscriber).
+                let _ = bc.block_author(&did.0);
+                Some(bc.to_snapshot())
+            } else {
+                None
+            };
+
+            (Self::snapshot_context(ctx), bc_snap)
         };
 
         self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref bc_snap) = bc_snapshot {
+            self.persist_broadcast_snapshot(context_id, bc_snap);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "WriteAccessRevoked")?;
         Ok(())

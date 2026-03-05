@@ -178,6 +178,20 @@ pub fn generate_mls_operations(
             did: did.clone(),
             reason: reason.clone(),
         }),
+        // RevokeReadAccess in encrypted mode is MLS group removal (same as
+        // RemoveMember at the MLS layer). In broadcast mode, the manager
+        // handles this directly without MLS.
+        GovernanceAction::RevokeReadAccess { did, .. } => Some(MlsOperation::RemoveMember {
+            did: did.clone(),
+            reason: Some("read access revoked".to_owned()),
+        }),
+        // ResetMember is MLS remove + re-add. The manager handles both
+        // operations directly, but we classify the MLS impact as removal
+        // for coordination purposes.
+        GovernanceAction::ResetMember { did, reason } => Some(MlsOperation::RemoveMember {
+            did: did.clone(),
+            reason: Some(reason.clone()),
+        }),
         // All other actions do not affect MLS membership.
         _ => None,
     };

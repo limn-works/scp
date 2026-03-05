@@ -400,7 +400,9 @@ impl<S: Storage> ApplicationNode<S> {
     ///
     /// The `admission` mode and optional `projection_policy` are stored on the
     /// [`ProjectedContext`] so that projection handlers can enforce
-    /// authentication requirements per spec section 18.11.2.1.
+    /// authentication requirements per spec section 18.11.2.1. If the context
+    /// is already projected, the key is added and `admission`/`projection_policy`
+    /// are updated (use this to propagate governance `ModifyCeiling` changes).
     ///
     /// See spec sections 18.11.2 and 18.11.8.
     ///
@@ -432,6 +434,8 @@ impl<S: Storage> ApplicationNode<S> {
         let mut registry = self.state.projected_contexts.write().await;
         if let Some(existing) = registry.get_mut(&routing_id) {
             existing.insert_key(broadcast_key);
+            existing.admission = admission;
+            existing.projection_policy = projection_policy;
         } else {
             if registry.len() >= Self::MAX_PROJECTED_CONTEXTS {
                 return Err(NodeError::InvalidConfig(format!(
