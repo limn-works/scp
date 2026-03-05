@@ -1385,3 +1385,39 @@ Both options: no persistent subscriptions (poll via QUERY), no cover traffic, si
 | `crates/scp-ffi/wasm/src/transport.rs` | WebTransport API usage with WebSocket fallback |
 
 **Estimated functions:** ~40-50 public functions, ~30-40 internal helpers across all new and modified files.
+
+---
+
+## ADR-040: Streaming BlobStore API
+
+**Status:** Accepted
+**Closes:** #269
+
+### Context
+
+The `BlobStorage` trait requires full `Vec<u8>` materialization for all blob operations. This is a bottleneck for large blobs (video, voice, file transfers) — streaming is a core protocol competency, and all transport layers already support it. The storage layer is the only component that forces full materialization.
+
+### Decision
+
+Add streaming variants (`store_streaming`, `get_streaming`) to `BlobStorage` with **default implementations** that delegate to the existing `Vec<u8>` methods. This is fully additive — no existing method signatures change, no existing implementations break.
+
+Key design choices:
+
+- **`Stream<Item = Result<Bytes, StorageError>>` over `AsyncRead`** — matches the `futures::Stream` ecosystem used throughout the codebase (tokio-tungstenite, h3, aws-sdk-s3). No adapter conversion needed at call sites.
+- **Split return (`BlobMetadata` + `BlobBodyStream`)** — metadata is available immediately; body can be forwarded without waiting for full consumption.
+- **`Option<u64>` content length** — hint for pre-allocation, not a security boundary.
+- **Default implementations** — all 7 existing backends work immediately. Only S3 gets a native override initially; others can be optimized without trait changes.
+- **Caller-provided blob_id** — the relay computes SHA-256 incrementally as it receives the blob over the wire. The storage layer trusts the relay's computation (same trust model as today).
+
+### Alternatives Considered
+
+1. **Replace `Vec<u8>` methods with streaming-only** — breaks all 7 implementations and all call sites simultaneously. Massive blast radius for no benefit (the `Vec<u8>` path is still correct for small blobs).
+2. **`AsyncRead + AsyncWrite`** — requires `tokio::io` adapters at every boundary. The codebase uses `Stream`-based patterns throughout.
+3. **Chunk-based API (`store_chunk`/`finalize`)** — complex state machine, partial-upload cleanup, resumable upload complexity. Over-engineered for the current need.
+
+### Consequences
+
+- All existing backends work via defaults. Zero breaking changes.
+- S3 backend can stream multi-GB blobs without memory pressure.
+- Future backends (e.g., PostgreSQL large objects) can override defaults when ready.
+- Current wire protocol delivers blobs as single MessagePack-framed messages (already materialized in memory), so streaming call sites provide no benefit until chunked wire delivery exists. The streaming storage API is complete — it serves developers building chunked delivery.
