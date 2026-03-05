@@ -97,6 +97,9 @@ pub enum Capability {
     MediaVideo,
     /// Screen sharing via delegated media transport (spec section 10.9.1).
     MediaScreenShare,
+    /// Ban a member from the context, revoking all access permanently (spec section 5.3).
+    /// Gates the `RevokeReadAccess` governance action.
+    MemberBan,
     /// Context-specific custom capability.
     Custom(String),
 }
@@ -109,7 +112,7 @@ impl Capability {
     /// `"member:remove"`, `"role:assign"`, `"governance:propose"`,
     /// `"governance:vote"`, `"context:close"`, `"context:child:create"`,
     /// `"tool:interface"`, `"bridging"`, `"media:voice"`, `"media:video"`,
-    /// `"media:screen_share"`.
+    /// `"media:screen_share"`, `"member:ban"`.
     /// Names starting with `"tool:invoke:"` are parsed as `ToolInvoke(id)`.
     /// Anything else maps to `Custom(name)`.
     #[must_use]
@@ -131,6 +134,7 @@ impl Capability {
             "media:voice" => Self::MediaVoice,
             "media:video" => Self::MediaVideo,
             "media:screen_share" => Self::MediaScreenShare,
+            "member:ban" => Self::MemberBan,
             other => other.strip_prefix("tool:invoke:").map_or_else(
                 || Self::Custom(other.to_owned()),
                 |tool_id| Self::ToolInvoke(tool_id.to_owned()),
@@ -159,6 +163,7 @@ impl Capability {
             Self::MediaVoice => "media:voice",
             Self::MediaVideo => "media:video",
             Self::MediaScreenShare => "media:screen_share",
+            Self::MemberBan => "member:ban",
             Self::Custom(name) => name,
         }
     }
@@ -184,6 +189,7 @@ impl std::fmt::Display for Capability {
             Self::MediaVoice => write!(f, "media:voice"),
             Self::MediaVideo => write!(f, "media:video"),
             Self::MediaScreenShare => write!(f, "media:screen_share"),
+            Self::MemberBan => write!(f, "member:ban"),
             Self::Custom(name) => write!(f, "custom:{name}"),
         }
     }
@@ -917,6 +923,7 @@ mod tests {
             Capability::MessagesWrite,
             Capability::ToolInvoke("search".to_owned()),
             Capability::ToolInvokeAll,
+            Capability::MemberBan,
             Capability::Custom("my-cap".to_owned()),
         ];
         for cap in &caps {
@@ -924,6 +931,14 @@ mod tests {
             let deserialized: Capability = serde_json::from_str(&json).unwrap();
             assert_eq!(cap, &deserialized, "roundtrip failed for {cap:?}");
         }
+    }
+
+    #[test]
+    fn member_ban_capability_new_and_name() {
+        let cap = Capability::new("member:ban");
+        assert_eq!(cap, Capability::MemberBan);
+        assert_eq!(cap.name(), "member:ban");
+        assert_eq!(format!("{cap}"), "member:ban");
     }
 
     // -----------------------------------------------------------------------

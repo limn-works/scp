@@ -59,9 +59,12 @@ pub enum MlsImpact {
 
 /// Classify a [`GovernanceAction`] by its MLS impact.
 ///
-/// Only `AddMember` and `RemoveMember` require MLS group operations. All other
-/// governance actions (role changes, settings changes, tool registration, etc.)
-/// operate at the governance layer without touching MLS state.
+/// `AddMember`, `RemoveMember`, and `RevokeReadAccess` require MLS group
+/// operations (in encrypted contexts, revocation removes the member from the
+/// MLS group). All other governance actions (role changes, settings changes,
+/// tool registration, `RestoreReadAccess`, etc.) operate at the governance
+/// layer without touching MLS state. `RestoreReadAccess` is `NoMlsChange`
+/// because re-adding a member to the MLS group is a separate flow.
 ///
 /// # Examples
 ///
@@ -82,9 +85,13 @@ pub enum MlsImpact {
 #[must_use]
 pub const fn classify_action(action: &GovernanceAction) -> MlsImpact {
     match action {
-        GovernanceAction::AddMember { .. } | GovernanceAction::RemoveMember { .. } => {
-            MlsImpact::MembershipChange
-        }
+        // Membership changes trigger MLS Commit (epoch advance).
+        GovernanceAction::AddMember { .. }
+        | GovernanceAction::RemoveMember { .. }
+        | GovernanceAction::RevokeReadAccess { .. }
+        | GovernanceAction::ResetMember { .. } => MlsImpact::MembershipChange,
+        // All other actions are governance-level state changes that do not
+        // affect MLS group membership (ADR-031 §8).
         GovernanceAction::ChangeRole { .. }
         | GovernanceAction::RegisterTool { .. }
         | GovernanceAction::RemoveTool { .. }
@@ -93,7 +100,19 @@ pub const fn classify_action(action: &GovernanceAction) -> MlsImpact {
         | GovernanceAction::ExtendTtl { .. }
         | GovernanceAction::TransferAdmin { .. }
         | GovernanceAction::CreateChildContext { .. }
-        | GovernanceAction::BlockAuthor { .. } => MlsImpact::NoMlsChange,
+        | GovernanceAction::BlockAuthor { .. }
+        | GovernanceAction::RestoreReadAccess { .. }
+        | GovernanceAction::ModifyPruningPolicy { .. }
+        | GovernanceAction::AddSigner { .. }
+        | GovernanceAction::RemoveSigner { .. }
+        | GovernanceAction::ModifyThreshold { .. }
+        | GovernanceAction::EstablishToolInterface { .. }
+        | GovernanceAction::ResolveConflict { .. }
+        | GovernanceAction::PromoteContext
+        | GovernanceAction::RevokeWriteAccess { .. }
+        | GovernanceAction::RestoreWriteAccess { .. }
+        | GovernanceAction::RotateContentKeys { .. }
+        | GovernanceAction::ReconfigureGovernance { .. } => MlsImpact::NoMlsChange,
     }
 }
 
@@ -158,6 +177,20 @@ pub fn generate_mls_operations(
         GovernanceAction::RemoveMember { did, reason } => Some(MlsOperation::RemoveMember {
             did: did.clone(),
             reason: reason.clone(),
+        }),
+        // RevokeReadAccess in encrypted mode is MLS group removal (same as
+        // RemoveMember at the MLS layer). In broadcast mode, the manager
+        // handles this directly without MLS.
+        GovernanceAction::RevokeReadAccess { did, .. } => Some(MlsOperation::RemoveMember {
+            did: did.clone(),
+            reason: Some("read access revoked".to_owned()),
+        }),
+        // ResetMember is MLS remove + re-add. The manager handles both
+        // operations directly, but we classify the MLS impact as removal
+        // for coordination purposes.
+        GovernanceAction::ResetMember { did, reason } => Some(MlsOperation::RemoveMember {
+            did: did.clone(),
+            reason: Some(reason.clone()),
         }),
         // All other actions do not affect MLS membership.
         _ => None,
@@ -431,7 +464,7 @@ pub const fn is_proposal_epoch_valid(
 mod tests {
     use super::*;
     use crate::context::governance::{
-        GovernanceAction, GovernanceProposal, ProposalStatus, VoteType, sign_vote,
+        GovernanceAction, GovernanceProposal, ProposalStatus, RevocationScope, VoteType, sign_vote,
     };
     use crate::context::params::{Capability, ContextParams, ToolRegistration};
     use scp_identity::DID;
@@ -592,6 +625,30 @@ mod tests {
         let action = GovernanceAction::CreateChildContext {
             params: Box::new(ContextParams::default()),
         };
+        assert_eq!(classify_action(&action), MlsImpact::NoMlsChange);
+    }
+
+    #[test]
+    fn classify_revoke_read_access_is_membership_change() {
+        let action = GovernanceAction::RevokeReadAccess {
+            did: bob(),
+            scope: RevocationScope::Full,
+        };
+        assert_eq!(classify_action(&action), MlsImpact::MembershipChange);
+    }
+
+    #[test]
+    fn classify_revoke_read_access_future_only_is_membership_change() {
+        let action = GovernanceAction::RevokeReadAccess {
+            did: bob(),
+            scope: RevocationScope::FutureOnly,
+        };
+        assert_eq!(classify_action(&action), MlsImpact::MembershipChange);
+    }
+
+    #[test]
+    fn classify_restore_read_access_is_no_mls_change() {
+        let action = GovernanceAction::RestoreReadAccess { did: bob() };
         assert_eq!(classify_action(&action), MlsImpact::NoMlsChange);
     }
 

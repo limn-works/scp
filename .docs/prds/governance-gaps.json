@@ -1,0 +1,366 @@
+{
+  "project": "scp",
+  "description": "Three governance gaps where the SCP governance model is not fully applied: (1) broadcast projection endpoints ignore context admission policy — gated contexts serve content publicly (§18.11, §5.14.4), (2) metadata visibility exposes all operational fields to anyone with context_id — no governance-configurable per-field visibility (§5.7), (3) no governance-level subscriber ban in broadcast contexts — blocking is per-author only, no cross-author revocation (§5.14.8, §5.9). Fix: ProjectionPolicy with per-author granularity, MetadataVisibilityPolicy with per-field PreJoin/MemberOnly, MemberBan capability gating RevokeReadAccess governance action.",
+  "gates": [
+    {
+      "id": "gate-foundation-types",
+      "name": "Foundation Types",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-GG-001",
+        "SCP-GG-002"
+      ]
+    },
+    {
+      "id": "gate-metadata-visibility",
+      "name": "Metadata Visibility",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-GG-003",
+        "SCP-GG-004"
+      ]
+    },
+    {
+      "id": "gate-governance-bans",
+      "name": "Governance Bans",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-GG-005",
+        "SCP-GG-006"
+      ]
+    },
+    {
+      "id": "gate-projection-auth",
+      "name": "Projection Auth",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-GG-007",
+        "SCP-GG-008"
+      ]
+    }
+  ],
+  "stories": [
+    {
+      "id": "SCP-GG-001",
+      "title": "Add MemberBan capability, MetadataVisibilityPolicy, ProjectionPolicy, and FieldVisibility types",
+      "gate": "gate-foundation-types",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/roles.rs",
+        "crates/scp-core/src/context/params.rs"
+      ],
+      "description": "Add foundation types for the three governance gaps. MemberBan capability variant gates RevokeReadAccess governance action per §5.3. MetadataVisibilityPolicy controls per-field metadata visibility per §5.7. ProjectionPolicy controls per-author projection access rules per §18.11. FieldVisibility is the shared enum for pre-join vs member-only visibility. All types added to ContextParams.",
+      "acceptanceCriteria": [
+        "Capability::MemberBan variant exists in Capability enum in roles.rs",
+        "Capability::new(\"member:ban\") returns Some(Capability::MemberBan)",
+        "Capability::MemberBan.name() returns \"member:ban\"",
+        "FieldVisibility enum has variants PreJoin and MemberOnly, derives Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default",
+        "FieldVisibility::default() returns PreJoin",
+        "MetadataVisibilityPolicy struct has fields: member_count, context_age, creator_identity, name, description, economic_policy, tool_interface_count, child_context_info — all FieldVisibility",
+        "MetadataVisibilityPolicy derives Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default",
+        "MetadataVisibilityPolicy::default() returns all fields PreJoin (backward-compatible)",
+        "ProjectionPolicy struct has default_rule: ProjectionRule and overrides: Vec<ProjectionOverride>",
+        "ProjectionRule enum has variants Public, Gated, AuthorChoice",
+        "ProjectionOverride struct has did: DID and rule: ProjectionRule",
+        "ContextParams has metadata_visibility: MetadataVisibilityPolicy field",
+        "ContextParams has projection_policy: Option<ProjectionPolicy> field (None for non-broadcast)",
+        "All existing tests pass after field additions (default values preserve backward compatibility)",
+        "All new types have rustdoc"
+      ],
+      "actionItems": [
+        "Add MemberBan variant to Capability enum in roles.rs",
+        "Update Capability::new() match arm for \"member:ban\"",
+        "Update Capability::name() match arm for MemberBan",
+        "Add FieldVisibility enum to params.rs",
+        "Add MetadataVisibilityPolicy struct to params.rs",
+        "Add ProjectionRule enum, ProjectionOverride struct, ProjectionPolicy struct to params.rs",
+        "Add metadata_visibility and projection_policy fields to ContextParams",
+        "Update all ContextParams construction sites with defaults",
+        "Add unit tests for new types"
+      ],
+      "blockedBy": [],
+      "sources": [
+        { "file": ".docs/specs/05-contexts.md", "section": "## 5.3 Capability Ceiling" },
+        { "file": ".docs/specs/05-contexts.md", "section": "## 5.7 Metadata" },
+        { "file": ".docs/specs/18-addressability-and-deployment.md", "section": "#### 18.11.2.1 Projection Policy" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-GG-002",
+      "title": "Add RevokeReadAccess, RestoreReadAccess, and RevocationScope to governance types",
+      "gate": "gate-foundation-types",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/governance/mod.rs",
+        "crates/scp-core/src/context/governance/mls_integration.rs",
+        "crates/scp-core/src/sync/conflict_resolution.rs"
+      ],
+      "description": "ADR-031 specifies 24 GovernanceAction variants but code only has 11. This story adds RevokeReadAccess and RestoreReadAccess (needed for governance-level bans). Also adds RevocationScope enum (Full, FutureOnly) per §5.9 content access governance table. Updates MLS impact classification and conflict detection.",
+      "acceptanceCriteria": [
+        "RevocationScope enum has variants Full and FutureOnly, derives Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize",
+        "GovernanceAction::RevokeReadAccess { did: DID, scope: RevocationScope } variant exists",
+        "GovernanceAction::RestoreReadAccess { did: DID } variant exists",
+        "classify_action in mls_integration.rs returns MlsImpact::MembershipChange for RevokeReadAccess (encrypted mode removes from MLS group)",
+        "classify_action returns MlsImpact::NoMlsChange for RestoreReadAccess (re-add is a separate flow)",
+        "Conflict detection: two RevokeReadAccess targeting the same DID conflict",
+        "Conflict detection: RevokeReadAccess and RestoreReadAccess for the same DID conflict",
+        "All existing governance tests pass",
+        "New variants have rustdoc referencing §5.9 and ADR-031"
+      ],
+      "actionItems": [
+        "Add RevocationScope enum to governance/mod.rs",
+        "Add RevokeReadAccess and RestoreReadAccess variants to GovernanceAction",
+        "Update classify_action in mls_integration.rs",
+        "Update conflict detection in conflict_resolution.rs",
+        "Add unit tests for new variant classification and conflict detection"
+      ],
+      "blockedBy": [],
+      "sources": [
+        { "file": ".docs/adrs/phase-6.md", "section": "## ADR-031: Multi-Admin Governance Models" },
+        { "file": ".docs/specs/05-contexts.md", "section": "## 5.9 Governance" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-GG-003",
+      "title": "Update template definitions with new fields",
+      "gate": "gate-metadata-visibility",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/templates.rs"
+      ],
+      "description": "Add MemberBan to capability ceilings for encrypted templates per §5.3. Set MetadataVisibilityPolicy defaults per template per §5.7. Set ProjectionPolicy defaults for broadcast templates per §18.11. Encrypted templates include MemberBan by default; broadcast templates do not.",
+      "acceptanceCriteria": [
+        "template_params(BilateralEphemeral).ceiling contains Capability::MemberBan",
+        "template_params(BilateralPersistent).ceiling contains Capability::MemberBan",
+        "template_params(Coordination).ceiling contains Capability::MemberBan",
+        "template_params(GroupDiscussion).ceiling contains Capability::MemberBan",
+        "template_params(ToolInterfaceTemplate).ceiling contains Capability::MemberBan",
+        "template_params(PaidService).ceiling contains Capability::MemberBan",
+        "template_params(PublicBroadcast).ceiling does NOT contain Capability::MemberBan",
+        "template_params(GatedBroadcast).ceiling does NOT contain Capability::MemberBan",
+        "template_params(PaidBroadcast).ceiling does NOT contain Capability::MemberBan",
+        "template_params(PublicBroadcast).metadata_visibility has all fields PreJoin",
+        "template_params(GatedBroadcast).metadata_visibility.member_count is MemberOnly",
+        "template_params(BilateralEphemeral).metadata_visibility.member_count is MemberOnly",
+        "template_params(PublicBroadcast).projection_policy is Some(ProjectionPolicy { default_rule: Public, overrides: vec![] })",
+        "template_params(GatedBroadcast).projection_policy is Some(ProjectionPolicy { default_rule: Gated, overrides: vec![] })",
+        "All existing template tests pass",
+        "Template validation rejects ProjectionPolicy on encrypted contexts (projection is broadcast-only)"
+      ],
+      "actionItems": [
+        "Add MemberBan to ceiling arrays for encrypted templates",
+        "Set MetadataVisibilityPolicy per template",
+        "Set ProjectionPolicy per broadcast template (None for encrypted)",
+        "Update validation to reject projection_policy: Some(...) when mode != Broadcast",
+        "Update existing tests for new fields",
+        "Add tests for template-specific defaults"
+      ],
+      "blockedBy": ["SCP-GG-001"],
+      "sources": [
+        { "file": ".docs/specs/05-contexts.md", "section": "### 5.12.1 Well-Known Templates" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-GG-004",
+      "title": "Implement metadata visibility filtering",
+      "gate": "gate-metadata-visibility",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/params.rs"
+      ],
+      "description": "Add methods to ContextParams that filter metadata based on MetadataVisibilityPolicy. Pre-join callers get structural fields plus operational fields where visibility is PreJoin; members get everything. Structural fields are always visible regardless of policy: template_id, ceiling, ceiling_policy, roles, governance, mode, ttl, promotion_policy, memory_scope, metadata_visibility itself.",
+      "acceptanceCriteria": [
+        "ContextParams::public_metadata() returns a struct/map containing only structural fields + operational fields where visibility is PreJoin",
+        "ContextParams::public_metadata() always includes: ceiling, ceiling_policy, roles, governance, mode, ttl, promotion_policy, memory_scope, template_id, metadata_visibility",
+        "ContextParams::public_metadata() omits fields where visibility is MemberOnly (returns None for those fields)",
+        "With MetadataVisibilityPolicy::default() (all PreJoin), public_metadata() returns all fields (backward compatible)",
+        "With member_count: MemberOnly, public_metadata() omits member_count",
+        "Test: gated-broadcast template default hides member_count from public_metadata",
+        "Test: bilateral-ephemeral template default hides member_count, context_age, creator from public_metadata"
+      ],
+      "actionItems": [
+        "Define PublicMetadata struct (or use Option fields on a metadata projection)",
+        "Implement public_metadata() on ContextParams",
+        "Add unit tests for filtering with various policies"
+      ],
+      "blockedBy": ["SCP-GG-003"],
+      "sources": [
+        { "file": ".docs/specs/05-contexts.md", "section": "## 5.7 Metadata" },
+        { "file": ".docs/specs/05-contexts.md", "section": "### 5.7.1 Metadata Publication and Retrieval" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-GG-005",
+      "title": "Implement governance-level subscriber ban in BroadcastContext",
+      "gate": "gate-governance-bans",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/broadcast.rs"
+      ],
+      "description": "Add governance-directed subscriber ban to BroadcastContext. Unlike per-author blocking (which is unilateral), governance bans remove the subscriber from the registry AND add them to ALL authors' block lists simultaneously. All authors MUST rotate keys after a governance ban (mandatory KeyEpochAdvance). This mirrors RevokeReadAccess semantics in encrypted contexts (MLS group removal), adapted for broadcast's per-author key model. Does NOT check ceiling — that's the ContextManager's responsibility (SCP-GG-006).",
+      "acceptanceCriteria": [
+        "BroadcastContext::governance_ban_subscriber(did) removes subscriber from self.subscribers",
+        "governance_ban_subscriber adds the DID to every author's block list in self.authors",
+        "governance_ban_subscriber increments epoch and generates new key for every author",
+        "governance_ban_subscriber returns a GovernanceBanResult containing: banned DID, list of author DIDs that rotated, new epochs per author",
+        "governance_ban_subscriber returns MemberNotFound if subscriber not in registry",
+        "BroadcastContext::governance_unban_subscriber(did) removes the DID from every author's block list",
+        "governance_unban_subscriber does NOT re-register the subscriber (they must re-register manually)",
+        "governance_unban_subscriber does NOT rotate keys (unban is access restoration, not revocation)",
+        "Test: ban subscriber with 3 authors — all 3 block lists updated, all 3 keys rotated",
+        "Test: ban non-existent subscriber — MemberNotFound error",
+        "Test: ban then unban — subscriber removed from all block lists, not re-registered",
+        "Test: after ban, handle_key_request from banned subscriber returns Deny for all authors"
+      ],
+      "actionItems": [
+        "Add GovernanceBanResult struct",
+        "Implement governance_ban_subscriber() on BroadcastContext",
+        "Implement governance_unban_subscriber() on BroadcastContext",
+        "Add comprehensive tests"
+      ],
+      "blockedBy": ["SCP-GG-001"],
+      "sources": [
+        { "file": ".docs/specs/05-contexts.md", "section": "### 5.14.8 Blocking" },
+        { "file": ".docs/specs/05-contexts.md", "section": "## 5.9 Governance" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-GG-006",
+      "title": "Wire RevokeReadAccess execution in ContextManager for broadcast mode",
+      "gate": "gate-governance-bans",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/manager.rs"
+      ],
+      "description": "Extend execute_governance_action() in ContextManager to handle RevokeReadAccess for broadcast contexts. Before execution, verify MemberBan capability is in the context's ceiling. Delegate to BroadcastContext::governance_ban_subscriber(). Emit ReadAccessRevoked event. Persist broadcast state snapshot. Follow existing BlockAuthor execution pattern in block_broadcast_author_internal() for structure.",
+      "acceptanceCriteria": [
+        "execute_governance_action match arm for GovernanceAction::RevokeReadAccess exists",
+        "Execution checks context ceiling for Capability::MemberBan — returns PermissionDenied if absent",
+        "For broadcast contexts: delegates to governance_ban_subscriber(did)",
+        "ReadAccessRevoked event pushed to receive_buffer and appended to event log",
+        "Broadcast state persisted via persist_broadcast_snapshot (same pattern as block_broadcast_author_internal)",
+        "RestoreReadAccess match arm delegates to governance_unban_subscriber(did)",
+        "ReadAccessRestored event emitted for RestoreReadAccess",
+        "Test: proposal with RevokeReadAccess — ceiling check passes — subscriber banned — event emitted",
+        "Test: proposal with RevokeReadAccess on context WITHOUT MemberBan in ceiling — PermissionDenied",
+        "Test: proposal with RestoreReadAccess — subscriber unbanned — event emitted",
+        "All existing execute_governance_action tests pass"
+      ],
+      "actionItems": [
+        "Add RevokeReadAccess match arm to execute_governance_action()",
+        "Add ceiling capability check (verify MemberBan in ceiling)",
+        "Add RestoreReadAccess match arm",
+        "Add event emission (reuse event log pattern from block_broadcast_author_internal)",
+        "Add broadcast state persistence",
+        "Add tests"
+      ],
+      "blockedBy": ["SCP-GG-002", "SCP-GG-005"],
+      "sources": [
+        { "file": ".docs/specs/05-contexts.md", "section": "## 5.9 Governance" },
+        { "file": ".docs/specs/05-contexts.md", "section": "### 5.14.8 Blocking" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-GG-007",
+      "title": "Update ProjectedContext to store admission mode and projection policy",
+      "gate": "gate-projection-auth",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/projection.rs",
+        "crates/scp-node/src/lib.rs"
+      ],
+      "description": "Extend ProjectedContext to store BroadcastAdmission and optional ProjectionPolicy. Update enable_broadcast_projection signature to accept these fields. The admission mode and policy are needed by projection handlers (SCP-GG-008) to decide whether to require auth.",
+      "acceptanceCriteria": [
+        "ProjectedContext has admission: BroadcastAdmission field",
+        "ProjectedContext has projection_policy: Option<ProjectionPolicy> field",
+        "ProjectedContext::new() accepts admission and projection_policy parameters",
+        "ApplicationNode::enable_broadcast_projection accepts admission: BroadcastAdmission parameter",
+        "ApplicationNode::enable_broadcast_projection accepts projection_policy: Option<ProjectionPolicy> parameter",
+        "Admission and policy are stored on the ProjectedContext in the registry",
+        "All existing projection tests updated for new constructor/signature",
+        "All existing projection tests pass"
+      ],
+      "actionItems": [
+        "Add admission and projection_policy fields to ProjectedContext",
+        "Update ProjectedContext::new() signature and all call sites",
+        "Update enable_broadcast_projection signature in lib.rs and all call sites",
+        "Update test helpers for new fields"
+      ],
+      "blockedBy": ["SCP-GG-001"],
+      "sources": [
+        { "file": ".docs/specs/18-addressability-and-deployment.md", "section": "## 18.11 HTTP Broadcast Projection" },
+        { "file": ".docs/specs/05-contexts.md", "section": "### 5.14.4 Open vs. Gated Broadcast" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-GG-008",
+      "title": "Add UCAN validation to projection endpoints for gated contexts",
+      "gate": "gate-projection-auth",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-node/src/projection.rs"
+      ],
+      "description": "Enforce access control on projection endpoints based on admission mode and projection policy. For gated contexts, extract UCAN from Authorization: Bearer <token> header and validate via the same validate_messages_read_ucan() pipeline used in handle_key_request(). For open contexts, serve without auth (current behavior). Per-author overrides in ProjectionPolicy can narrow or specify rules per author DID. Gated projection endpoints use Cache-Control: private (CDN must not cache authenticated content). Reuse validate_messages_read_ucan() from broadcast.rs.",
+      "acceptanceCriteria": [
+        "feed_handler: when admission == Open, serves without auth (current behavior unchanged)",
+        "feed_handler: when admission == Gated, extracts Authorization: Bearer <token> header",
+        "feed_handler: when admission == Gated and no Authorization header, returns 401 with JSON error body {\"error\": \"...\", \"code\": \"UNAUTHORIZED\"}",
+        "feed_handler: when admission == Gated and invalid UCAN, returns 401",
+        "feed_handler: when admission == Gated and valid messagesRead UCAN, serves content",
+        "message_handler: same auth behavior as feed_handler",
+        "Gated feed responses use Cache-Control: private, max-age=30 (not public)",
+        "Gated per-message responses use Cache-Control: private, immutable, max-age=31536000 (not public)",
+        "Per-author projection override: if ProjectionPolicy has override for author DID of requested content, that rule applies instead of default",
+        "Per-author override Public on a Gated context is rejected during enable_broadcast_projection (ceiling constraint)",
+        "Test: open context serves feed without auth",
+        "Test: gated context rejects feed without Authorization header (401)",
+        "Test: gated context rejects feed with malformed Authorization header (401)",
+        "Test: gated context serves feed with valid messagesRead UCAN",
+        "Test: gated context returns private Cache-Control headers",
+        "Test: per-author override applies to specific author's content"
+      ],
+      "actionItems": [
+        "Add UCAN extraction helper (parse Authorization: Bearer <token> header)",
+        "Add auth check to feed_handler — branch on admission mode",
+        "Add auth check to message_handler — same pattern",
+        "Add per-author override lookup from ProjectionPolicy",
+        "Update Cache-Control headers for gated contexts",
+        "Validate projection policy constraints in enable_broadcast_projection",
+        "Add comprehensive tests"
+      ],
+      "blockedBy": ["SCP-GG-007"],
+      "sources": [
+        { "file": ".docs/specs/18-addressability-and-deployment.md", "section": "### 18.11.2 Activation" },
+        { "file": ".docs/specs/05-contexts.md", "section": "### 5.14.4 Open vs. Gated Broadcast" }
+      ],
+      "details": {}
+    }
+  ]
+}

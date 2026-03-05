@@ -80,11 +80,12 @@ pub struct PruningConfig {
     pub retention_secs: Option<u64>,
 
     /// Retention multiplier for structural events (governance, membership).
+    /// Basis points where 10000 = 1.0x multiplier. E.g. 30000 = 3.0x.
     /// Structural events are retained `multiplier` times longer than
-    /// operational events. Default: 3.0.
+    /// operational events. Default: 30000 (3.0x).
     ///
     /// See ADR-030 section 2c.
-    pub structural_retention_multiplier: f64,
+    pub structural_retention_multiplier: u32,
 }
 
 impl Default for PruningConfig {
@@ -92,7 +93,7 @@ impl Default for PruningConfig {
         Self {
             retain_last_n_checkpoints: Some(2),
             retention_secs: None,
-            structural_retention_multiplier: 3.0,
+            structural_retention_multiplier: 30_000,
         }
     }
 }
@@ -407,14 +408,9 @@ fn compute_prune_boundary(
             let take_count = max_boundary as usize;
             for event in events.iter().take(take_count) {
                 let effective_retention = if is_structural_event(&event.event_type) {
-                    #[allow(
-                        clippy::cast_sign_loss,
-                        clippy::cast_possible_truncation,
-                        clippy::cast_precision_loss
-                    )]
-                    let multiplied =
-                        (retention_secs as f64 * config.structural_retention_multiplier) as u64;
-                    multiplied
+                    // effective = retention_secs * multiplier_bp / 10000
+                    retention_secs.saturating_mul(u64::from(config.structural_retention_multiplier))
+                        / 10_000
                 } else {
                     retention_secs
                 };
@@ -645,7 +641,7 @@ mod tests {
         let config = PruningConfig::default();
         assert_eq!(config.retain_last_n_checkpoints, Some(2));
         assert!(config.retention_secs.is_none());
-        assert!((config.structural_retention_multiplier - 3.0).abs() < f64::EPSILON);
+        assert_eq!(config.structural_retention_multiplier, 30_000);
     }
 
     #[test]
@@ -744,7 +740,7 @@ mod tests {
         let config = PruningConfig {
             retain_last_n_checkpoints: None,
             retention_secs: Some(MIN_RETENTION_SECS),
-            structural_retention_multiplier: 3.0,
+            structural_retention_multiplier: 30_000,
         };
 
         // cp1 at 1_001_000 is well outside retention. cp2 is recent.
@@ -765,7 +761,7 @@ mod tests {
         let config = PruningConfig {
             retain_last_n_checkpoints: None,
             retention_secs: None,
-            structural_retention_multiplier: 1.0,
+            structural_retention_multiplier: 10_000,
         };
 
         let (truncated, result) =
@@ -836,7 +832,7 @@ mod tests {
         let config = PruningConfig {
             retain_last_n_checkpoints: None,
             retention_secs: Some(MIN_RETENTION_SECS),
-            structural_retention_multiplier: 1.0,
+            structural_retention_multiplier: 10_000,
         };
 
         let result = prune_before_checkpoint(&log, &checkpoint, &events, &config, 1_002_000);
@@ -852,7 +848,7 @@ mod tests {
         let config = PruningConfig {
             retain_last_n_checkpoints: None,
             retention_secs: Some(MIN_RETENTION_SECS),
-            structural_retention_multiplier: 1.0,
+            structural_retention_multiplier: 10_000,
         };
 
         // now is well past the retention window.
@@ -876,7 +872,7 @@ mod tests {
         let config = PruningConfig {
             retain_last_n_checkpoints: None,
             retention_secs: None,
-            structural_retention_multiplier: 1.0,
+            structural_retention_multiplier: 10_000,
         };
 
         let (truncated, _) =
@@ -899,7 +895,7 @@ mod tests {
         let config = PruningConfig {
             retain_last_n_checkpoints: None,
             retention_secs: None,
-            structural_retention_multiplier: 1.0,
+            structural_retention_multiplier: 10_000,
         };
 
         let (truncated, _) =
@@ -925,7 +921,7 @@ mod tests {
         let config = PruningConfig {
             retain_last_n_checkpoints: None,
             retention_secs: None,
-            structural_retention_multiplier: 1.0,
+            structural_retention_multiplier: 10_000,
         };
 
         let (truncated, _) =
@@ -949,7 +945,7 @@ mod tests {
         let config = PruningConfig {
             retain_last_n_checkpoints: None,
             retention_secs: None,
-            structural_retention_multiplier: 1.0,
+            structural_retention_multiplier: 10_000,
         };
 
         let (truncated, _) =
@@ -969,7 +965,7 @@ mod tests {
         let config = PruningConfig {
             retain_last_n_checkpoints: None,
             retention_secs: None,
-            structural_retention_multiplier: 1.0,
+            structural_retention_multiplier: 10_000,
         };
 
         let (truncated, _) =
@@ -991,7 +987,7 @@ mod tests {
         let config = PruningConfig {
             retain_last_n_checkpoints: None,
             retention_secs: None,
-            structural_retention_multiplier: 1.0,
+            structural_retention_multiplier: 10_000,
         };
 
         let (truncated, _) =
@@ -1015,7 +1011,7 @@ mod tests {
         let config = PruningConfig {
             retain_last_n_checkpoints: None,
             retention_secs: None,
-            structural_retention_multiplier: 1.0,
+            structural_retention_multiplier: 10_000,
         };
 
         let (_, result) =
@@ -1142,7 +1138,7 @@ mod tests {
         let config = PruningConfig {
             retain_last_n_checkpoints: None,
             retention_secs: Some(MIN_RETENTION_SECS),
-            structural_retention_multiplier: 3.0,
+            structural_retention_multiplier: 30_000,
         };
 
         let now = MIN_RETENTION_SECS + 10_000;
@@ -1193,7 +1189,7 @@ mod tests {
         let config = PruningConfig {
             retain_last_n_checkpoints: Some(1),
             retention_secs: None,
-            structural_retention_multiplier: 1.0,
+            structural_retention_multiplier: 10_000,
         };
 
         // Retain last 1: only cp2 is retained. cp1 is prunable.
@@ -1214,7 +1210,7 @@ mod tests {
         let config = PruningConfig {
             retain_last_n_checkpoints: None,
             retention_secs: None,
-            structural_retention_multiplier: 1.0,
+            structural_retention_multiplier: 10_000,
         };
 
         let (truncated, result) =
@@ -1234,7 +1230,7 @@ mod tests {
         let config = PruningConfig {
             retain_last_n_checkpoints: None,
             retention_secs: None,
-            structural_retention_multiplier: 1.0,
+            structural_retention_multiplier: 10_000,
         };
 
         let (truncated, result) =
@@ -1254,7 +1250,7 @@ mod tests {
         let config = PruningConfig {
             retain_last_n_checkpoints: None,
             retention_secs: None,
-            structural_retention_multiplier: 1.0,
+            structural_retention_multiplier: 10_000,
         };
 
         let (truncated, _) =
@@ -1286,7 +1282,7 @@ mod tests {
         let config = PruningConfig {
             retain_last_n_checkpoints: Some(2),
             retention_secs: None,
-            structural_retention_multiplier: 1.0,
+            structural_retention_multiplier: 10_000,
         };
 
         let selected = select_pruning_checkpoint(&checkpoints, &config, 3_000_000);

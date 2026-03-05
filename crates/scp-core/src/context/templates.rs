@@ -16,8 +16,9 @@
 //! and ADR-033 in `.docs/adrs/phase-3.md` for paid templates (§19.10).
 
 use super::params::{
-    Capability, CeilingPolicy, ContextMode, ContextParams, GovernanceModel, MemoryScope,
-    PromotionPolicy, TemplateId,
+    Capability, CeilingPolicy, ContextMode, ContextParams, FieldVisibility, GovernanceModel,
+    MemoryScope, MetadataVisibilityPolicy, ProjectionPolicy, ProjectionRule, PromotionPolicy,
+    TemplateId,
 };
 
 // ---------------------------------------------------------------------------
@@ -73,6 +74,11 @@ pub enum TemplateError {
         /// The cost field that must be set (e.g., `"per_tool_invoke"`).
         field: &'static str,
     },
+
+    /// A projection policy was set on an encrypted context, which is not
+    /// permitted. Projection is only meaningful for broadcast contexts.
+    #[error("projection_policy is only valid for Broadcast contexts, but mode is Encrypted")]
+    ProjectionPolicyOnEncrypted,
 }
 
 // ---------------------------------------------------------------------------
@@ -89,12 +95,16 @@ const CAP_TOOL_INVOKE_ALL: &str = "tool:invoke:*";
 const CAP_TOOL_REGISTER: &str = "tool:register";
 /// Standard capability name for inviting new members.
 const CAP_MEMBER_INVITE: &str = "member:invite";
+/// Standard capability name for banning members from a context.
+const CAP_MEMBER_BAN: &str = "member:ban";
 
 // ---------------------------------------------------------------------------
 // Template definitions
 // ---------------------------------------------------------------------------
 
 /// Returns the messaging-only ceiling: `messages:read` + `messages:write`.
+///
+/// Used by broadcast templates where `member:ban` is not applicable.
 fn messaging_ceiling() -> Vec<Capability> {
     vec![
         Capability::new(CAP_MESSAGES_READ),
@@ -102,24 +112,40 @@ fn messaging_ceiling() -> Vec<Capability> {
     ]
 }
 
-/// Returns the messaging + tool invoke ceiling: messaging + `tool:invoke_all`.
+/// Returns the messaging ceiling with ban: `messages:read` + `messages:write`
+/// + `member:ban`.
+///
+/// Used by encrypted templates that support member banning (bilateral
+/// ephemeral, bilateral persistent).
+fn messaging_ban_ceiling() -> Vec<Capability> {
+    vec![
+        Capability::new(CAP_MESSAGES_READ),
+        Capability::new(CAP_MESSAGES_WRITE),
+        Capability::new(CAP_MEMBER_BAN),
+    ]
+}
+
+/// Returns the messaging + tool invoke + ban ceiling: messaging +
+/// `tool:invoke_all` + `member:ban`.
 ///
 /// Used by the Coordination template (spec section 5.12.1). Tools are
 /// creator-defined at creation time, so only `tool:invoke_all` is in the
 /// ceiling — members can invoke tools but not dynamically register new ones.
-fn messaging_tool_invoke_ceiling() -> Vec<Capability> {
+fn messaging_tool_invoke_ban_ceiling() -> Vec<Capability> {
     vec![
         Capability::new(CAP_MESSAGES_READ),
         Capability::new(CAP_MESSAGES_WRITE),
         Capability::new(CAP_TOOL_INVOKE_ALL),
+        Capability::new(CAP_MEMBER_BAN),
     ]
 }
 
 /// Returns the messaging + full tools ceiling: messaging + `tool:invoke_all` +
 /// `tool:register`.
 ///
-/// Used by broadcast templates and the tool-interface template (spec section
-/// 5.12.1) where participants can both invoke and register tools.
+/// Used by broadcast templates (spec section 5.12.1) where participants can
+/// both invoke and register tools. Does NOT include `member:ban` — broadcast
+/// contexts do not support member banning.
 fn messaging_tools_ceiling() -> Vec<Capability> {
     vec![
         Capability::new(CAP_MESSAGES_READ),
@@ -129,13 +155,87 @@ fn messaging_tools_ceiling() -> Vec<Capability> {
     ]
 }
 
-/// Returns the messaging + invite ceiling: messaging + `member:invite`.
-fn messaging_invite_ceiling() -> Vec<Capability> {
+/// Returns the messaging + full tools + ban ceiling: messaging +
+/// `tool:invoke_all` + `tool:register` + `member:ban`.
+///
+/// Used by encrypted templates with full tool support (tool-interface,
+/// paid-service) where participants can invoke and register tools, and
+/// member banning is supported.
+fn messaging_tools_ban_ceiling() -> Vec<Capability> {
+    vec![
+        Capability::new(CAP_MESSAGES_READ),
+        Capability::new(CAP_MESSAGES_WRITE),
+        Capability::new(CAP_TOOL_INVOKE_ALL),
+        Capability::new(CAP_TOOL_REGISTER),
+        Capability::new(CAP_MEMBER_BAN),
+    ]
+}
+
+/// Returns the messaging + invite + ban ceiling: messaging + `member:invite`
+/// + `member:ban`.
+fn messaging_invite_ban_ceiling() -> Vec<Capability> {
     vec![
         Capability::new(CAP_MESSAGES_READ),
         Capability::new(CAP_MESSAGES_WRITE),
         Capability::new(CAP_MEMBER_INVITE),
+        Capability::new(CAP_MEMBER_BAN),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Metadata visibility helpers
+// ---------------------------------------------------------------------------
+
+/// Returns the private-encrypted metadata visibility policy.
+///
+/// Used by bilateral-ephemeral, bilateral-persistent, and coordination
+/// templates. Only the context name is visible pre-join; all other operational
+/// fields are member-only.
+const fn private_encrypted_visibility() -> MetadataVisibilityPolicy {
+    MetadataVisibilityPolicy {
+        member_count: FieldVisibility::MemberOnly,
+        context_age: FieldVisibility::MemberOnly,
+        creator_identity: FieldVisibility::MemberOnly,
+        name: FieldVisibility::PreJoin,
+        description: FieldVisibility::MemberOnly,
+        economic_policy: FieldVisibility::MemberOnly,
+        tool_interface_count: FieldVisibility::MemberOnly,
+        child_context_info: FieldVisibility::MemberOnly,
+    }
+}
+
+/// Returns the group-discussion metadata visibility policy.
+///
+/// Name, description, member count, and creator identity are pre-join visible
+/// to help potential members evaluate the group. Other fields are member-only.
+const fn group_discussion_visibility() -> MetadataVisibilityPolicy {
+    MetadataVisibilityPolicy {
+        member_count: FieldVisibility::PreJoin,
+        context_age: FieldVisibility::MemberOnly,
+        creator_identity: FieldVisibility::PreJoin,
+        name: FieldVisibility::PreJoin,
+        description: FieldVisibility::PreJoin,
+        economic_policy: FieldVisibility::MemberOnly,
+        tool_interface_count: FieldVisibility::MemberOnly,
+        child_context_info: FieldVisibility::MemberOnly,
+    }
+}
+
+/// Returns a metadata visibility policy with only `member_count` set to
+/// member-only and all other fields pre-join visible.
+///
+/// Used by gated-broadcast, paid-service, and paid-broadcast templates.
+const fn member_count_hidden_visibility() -> MetadataVisibilityPolicy {
+    MetadataVisibilityPolicy {
+        member_count: FieldVisibility::MemberOnly,
+        context_age: FieldVisibility::PreJoin,
+        creator_identity: FieldVisibility::PreJoin,
+        name: FieldVisibility::PreJoin,
+        description: FieldVisibility::PreJoin,
+        economic_policy: FieldVisibility::PreJoin,
+        tool_interface_count: FieldVisibility::PreJoin,
+        child_context_info: FieldVisibility::PreJoin,
+    }
 }
 
 /// Constructs the canonical [`ContextParams`] for a given [`TemplateId`].
@@ -149,23 +249,24 @@ fn messaging_invite_ceiling() -> Vec<Capability> {
 ///
 /// # Template definitions
 ///
-/// | Template | Mode | Ceiling | Ceiling Policy | Promotion | Memory | Governance | TTL | Economic |
-/// |----------|------|---------|----------------|-----------|--------|------------|-----|----------|
-/// | `BilateralEphemeral` | Encrypted | messages | Immutable | NoPromotion | Ephemeral | SingleAdmin | Required | None |
-/// | `BilateralPersistent` | Encrypted | messages | Immutable | NoPromotion | Full | SingleAdmin | Forbidden | None |
-/// | `Coordination` | Encrypted | messages + invoke | Immutable | NoPromotion | Summary | SingleAdmin | Required | None |
-/// | `GroupDiscussion` | Encrypted | messages + invite | Immutable | Promotable | Full | SingleAdmin | Optional | None |
-/// | `PublicBroadcast` | Broadcast | messages + tools | Immutable | NoPromotion | Full | SingleAdmin | Optional | None |
-/// | `GatedBroadcast` | Broadcast | messages + tools | Immutable | NoPromotion | Full | SingleAdmin | Optional | None |
-/// | `PaidService` | Encrypted | messages + tools | Immutable | NoPromotion | Full | SingleAdmin | Optional | Required (per_tool_invoke) |
-/// | `PaidBroadcast` | Broadcast | messages | Immutable | NoPromotion | Full | SingleAdmin | Optional | Required (per_period) |
+/// | Template | Mode | Ceiling | MemberBan | Metadata | Projection | TTL | Economic |
+/// |----------|------|---------|-----------|----------|------------|-----|----------|
+/// | `BilateralEphemeral` | Encrypted | messages + ban | Yes | private | None | Required | None |
+/// | `BilateralPersistent` | Encrypted | messages + ban | Yes | private | None | Forbidden | None |
+/// | `Coordination` | Encrypted | messages + invoke + ban | Yes | private | None | Required | None |
+/// | `GroupDiscussion` | Encrypted | messages + invite + ban | Yes | group | None | Optional | None |
+/// | `PublicBroadcast` | Broadcast | messages + tools | No | default | Public | Optional | None |
+/// | `GatedBroadcast` | Broadcast | messages + tools | No | member_count_hidden | Gated | Optional | None |
+/// | `ToolInterfaceTemplate` | Encrypted | messages + tools + ban | Yes | default | None | Optional | None |
+/// | `PaidService` | Encrypted | messages + tools + ban | Yes | member_count_hidden | None | Optional | Required (per_tool_invoke) |
+/// | `PaidBroadcast` | Broadcast | messages | No | member_count_hidden | Gated | Optional | Required (per_period) |
 #[must_use]
 #[allow(clippy::too_many_lines)] // one arm per template variant; splitting hurts readability
 pub fn template_params(template_id: &TemplateId) -> ContextParams {
     match template_id {
         TemplateId::BilateralEphemeral => ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: messaging_ceiling(),
+            ceiling: messaging_ban_ceiling(),
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: Vec::new(),
@@ -175,10 +276,12 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::BilateralEphemeral),
             economic_policy: None,
+            metadata_visibility: private_encrypted_visibility(),
+            projection_policy: None,
         },
         TemplateId::BilateralPersistent => ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: messaging_ceiling(),
+            ceiling: messaging_ban_ceiling(),
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: Vec::new(),
@@ -188,10 +291,12 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::BilateralPersistent),
             economic_policy: None,
+            metadata_visibility: private_encrypted_visibility(),
+            projection_policy: None,
         },
         TemplateId::Coordination => ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: messaging_tool_invoke_ceiling(),
+            ceiling: messaging_tool_invoke_ban_ceiling(),
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: Vec::new(),
@@ -201,10 +306,12 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::Coordination),
             economic_policy: None,
+            metadata_visibility: private_encrypted_visibility(),
+            projection_policy: None,
         },
         TemplateId::GroupDiscussion => ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: messaging_invite_ceiling(),
+            ceiling: messaging_invite_ban_ceiling(),
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::Promotable,
             roles: Vec::new(),
@@ -214,6 +321,8 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::GroupDiscussion),
             economic_policy: None,
+            metadata_visibility: group_discussion_visibility(),
+            projection_policy: None,
         },
         TemplateId::PublicBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
@@ -227,6 +336,11 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::PublicBroadcast),
             economic_policy: None,
+            metadata_visibility: MetadataVisibilityPolicy::default(),
+            projection_policy: Some(ProjectionPolicy {
+                default_rule: ProjectionRule::Public,
+                overrides: vec![],
+            }),
         },
         TemplateId::GatedBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
@@ -240,10 +354,15 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::GatedBroadcast),
             economic_policy: None,
+            metadata_visibility: member_count_hidden_visibility(),
+            projection_policy: Some(ProjectionPolicy {
+                default_rule: ProjectionRule::Gated,
+                overrides: vec![],
+            }),
         },
         TemplateId::ToolInterfaceTemplate => ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: messaging_tools_ceiling(),
+            ceiling: messaging_tools_ban_ceiling(),
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: Vec::new(),
@@ -253,12 +372,14 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::ToolInterfaceTemplate),
             economic_policy: None,
+            metadata_visibility: MetadataVisibilityPolicy::default(),
+            projection_policy: None,
         },
         // Extends scp:template/tool-interface -- same ceiling and governance,
         // but economic_policy is caller-provided and validated separately.
         TemplateId::PaidService => ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: messaging_tools_ceiling(),
+            ceiling: messaging_tools_ban_ceiling(),
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: Vec::new(),
@@ -268,6 +389,8 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::PaidService),
             economic_policy: None,
+            metadata_visibility: member_count_hidden_visibility(),
+            projection_policy: None,
         },
         // Extends scp:template/gated-broadcast -- broadcast mode with gated
         // subscriber admission. economic_policy is caller-provided.
@@ -283,6 +406,11 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::PaidBroadcast),
             economic_policy: None,
+            metadata_visibility: member_count_hidden_visibility(),
+            projection_policy: Some(ProjectionPolicy {
+                default_rule: ProjectionRule::Gated,
+                overrides: vec![],
+            }),
         },
     }
 }
@@ -457,6 +585,9 @@ pub fn validate_against_template(params: &ContextParams) -> Result<(), TemplateE
         });
     }
 
+    // Governance-gaps fields: metadata visibility and projection policy.
+    validate_governance_gaps_fields(*template_id, params, &expected)?;
+
     // TTL policy enforcement
     match ttl_policy(*template_id) {
         TtlPolicy::Required => {
@@ -480,6 +611,52 @@ pub fn validate_against_template(params: &ContextParams) -> Result<(), TemplateE
     // Paid templates require economic_policy to be present and specific cost
     // fields to be set. See spec section 19.10 and ADR-033 criterion 13.
     validate_economic_policy_for_template(*template_id, params.economic_policy.as_ref())?;
+
+    Ok(())
+}
+
+/// Validates cross-field invariants for [`ContextParams`] that apply regardless
+/// of whether a template is used.
+///
+/// Currently enforces:
+/// - `projection_policy` must be `None` for [`ContextMode::Encrypted`] contexts.
+///   Projection is a broadcast-only feature (spec section 18.11.2.1).
+///
+/// # Errors
+///
+/// Returns [`TemplateError::ProjectionPolicyOnEncrypted`] if `projection_policy`
+/// is `Some(_)` and `mode` is `Encrypted`.
+pub fn validate_context_params(params: &ContextParams) -> Result<(), TemplateError> {
+    if params.mode == ContextMode::Encrypted && params.projection_policy.is_some() {
+        return Err(TemplateError::ProjectionPolicyOnEncrypted);
+    }
+    Ok(())
+}
+
+/// Validates metadata visibility and projection policy against template
+/// definitions.
+fn validate_governance_gaps_fields(
+    template_id: TemplateId,
+    params: &ContextParams,
+    expected: &ContextParams,
+) -> Result<(), TemplateError> {
+    if params.metadata_visibility != expected.metadata_visibility {
+        return Err(TemplateError::Mismatch {
+            template: template_id,
+            field: "metadata_visibility",
+            expected: format!("{:?}", expected.metadata_visibility),
+            actual: format!("{:?}", params.metadata_visibility),
+        });
+    }
+
+    if params.projection_policy != expected.projection_policy {
+        return Err(TemplateError::Mismatch {
+            template: template_id,
+            field: "projection_policy",
+            expected: format!("{:?}", expected.projection_policy),
+            actual: format!("{:?}", params.projection_policy),
+        });
+    }
 
     Ok(())
 }
@@ -568,7 +745,7 @@ mod tests {
     fn bilateral_ephemeral_params_have_correct_fields() {
         let params = template_params(&TemplateId::BilateralEphemeral);
         assert_eq!(params.mode, ContextMode::Encrypted);
-        assert_eq!(params.ceiling.len(), 2);
+        assert_eq!(params.ceiling.len(), 3);
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MESSAGES_READ));
         assert!(
             params
@@ -576,6 +753,7 @@ mod tests {
                 .iter()
                 .any(|c| c.name() == CAP_MESSAGES_WRITE)
         );
+        assert!(params.ceiling.iter().any(|c| c.name() == CAP_MEMBER_BAN));
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
@@ -584,13 +762,15 @@ mod tests {
         assert_eq!(params.memory_scope, MemoryScope::Ephemeral);
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
         assert_eq!(params.template_id, Some(TemplateId::BilateralEphemeral));
+        assert_eq!(params.metadata_visibility, private_encrypted_visibility());
+        assert!(params.projection_policy.is_none());
     }
 
     #[test]
     fn bilateral_persistent_params_have_correct_fields() {
         let params = template_params(&TemplateId::BilateralPersistent);
         assert_eq!(params.mode, ContextMode::Encrypted);
-        assert_eq!(params.ceiling.len(), 2);
+        assert_eq!(params.ceiling.len(), 3);
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MESSAGES_READ));
         assert!(
             params
@@ -598,6 +778,7 @@ mod tests {
                 .iter()
                 .any(|c| c.name() == CAP_MESSAGES_WRITE)
         );
+        assert!(params.ceiling.iter().any(|c| c.name() == CAP_MEMBER_BAN));
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
@@ -606,13 +787,15 @@ mod tests {
         assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
         assert_eq!(params.template_id, Some(TemplateId::BilateralPersistent));
+        assert_eq!(params.metadata_visibility, private_encrypted_visibility());
+        assert!(params.projection_policy.is_none());
     }
 
     #[test]
     fn coordination_params_have_correct_fields() {
         let params = template_params(&TemplateId::Coordination);
         assert_eq!(params.mode, ContextMode::Encrypted);
-        assert_eq!(params.ceiling.len(), 3);
+        assert_eq!(params.ceiling.len(), 4);
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MESSAGES_READ));
         assert!(
             params
@@ -626,6 +809,7 @@ mod tests {
                 .iter()
                 .any(|c| c.name() == CAP_TOOL_INVOKE_ALL)
         );
+        assert!(params.ceiling.iter().any(|c| c.name() == CAP_MEMBER_BAN));
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
@@ -634,13 +818,15 @@ mod tests {
         assert_eq!(params.memory_scope, MemoryScope::Summary);
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
         assert_eq!(params.template_id, Some(TemplateId::Coordination));
+        assert_eq!(params.metadata_visibility, private_encrypted_visibility());
+        assert!(params.projection_policy.is_none());
     }
 
     #[test]
     fn group_discussion_params_have_correct_fields() {
         let params = template_params(&TemplateId::GroupDiscussion);
         assert_eq!(params.mode, ContextMode::Encrypted);
-        assert_eq!(params.ceiling.len(), 3);
+        assert_eq!(params.ceiling.len(), 4);
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MESSAGES_READ));
         assert!(
             params
@@ -649,6 +835,7 @@ mod tests {
                 .any(|c| c.name() == CAP_MESSAGES_WRITE)
         );
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MEMBER_INVITE));
+        assert!(params.ceiling.iter().any(|c| c.name() == CAP_MEMBER_BAN));
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::Promotable);
         assert!(params.roles.is_empty());
@@ -657,6 +844,8 @@ mod tests {
         assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
         assert_eq!(params.template_id, Some(TemplateId::GroupDiscussion));
+        assert_eq!(params.metadata_visibility, group_discussion_visibility());
+        assert!(params.projection_policy.is_none());
     }
 
     #[test]
@@ -678,6 +867,7 @@ mod tests {
                 .any(|c| c.name() == CAP_TOOL_INVOKE_ALL)
         );
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_TOOL_REGISTER));
+        assert!(!params.ceiling.iter().any(|c| c.name() == CAP_MEMBER_BAN));
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
@@ -686,6 +876,17 @@ mod tests {
         assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
         assert_eq!(params.template_id, Some(TemplateId::PublicBroadcast));
+        assert_eq!(
+            params.metadata_visibility,
+            MetadataVisibilityPolicy::default()
+        );
+        assert_eq!(
+            params.projection_policy,
+            Some(ProjectionPolicy {
+                default_rule: ProjectionRule::Public,
+                overrides: vec![],
+            })
+        );
     }
 
     #[test]
@@ -707,6 +908,7 @@ mod tests {
                 .any(|c| c.name() == CAP_TOOL_INVOKE_ALL)
         );
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_TOOL_REGISTER));
+        assert!(!params.ceiling.iter().any(|c| c.name() == CAP_MEMBER_BAN));
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
@@ -715,6 +917,14 @@ mod tests {
         assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
         assert_eq!(params.template_id, Some(TemplateId::GatedBroadcast));
+        assert_eq!(params.metadata_visibility, member_count_hidden_visibility());
+        assert_eq!(
+            params.projection_policy,
+            Some(ProjectionPolicy {
+                default_rule: ProjectionRule::Gated,
+                overrides: vec![],
+            })
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -915,6 +1125,7 @@ mod tests {
         params.ttl = Some(Duration::from_secs(300));
         // Reverse the ceiling order
         params.ceiling = vec![
+            Capability::new(CAP_MEMBER_BAN),
             Capability::new(CAP_MESSAGES_WRITE),
             Capability::new(CAP_MESSAGES_READ),
         ];
@@ -1139,7 +1350,7 @@ mod tests {
     fn from_template_coordination_produces_valid_params() {
         let params = ContextParams::from_template(TemplateId::Coordination);
         assert_eq!(params.mode, ContextMode::Encrypted);
-        assert_eq!(params.ceiling.len(), 3);
+        assert_eq!(params.ceiling.len(), 4);
         assert_eq!(params.memory_scope, MemoryScope::Summary);
         assert_eq!(params.template_id, Some(TemplateId::Coordination));
     }
@@ -1148,7 +1359,7 @@ mod tests {
     fn from_template_group_discussion_produces_valid_params() {
         let params = ContextParams::from_template(TemplateId::GroupDiscussion);
         assert_eq!(params.mode, ContextMode::Encrypted);
-        assert_eq!(params.ceiling.len(), 3);
+        assert_eq!(params.ceiling.len(), 4);
         assert_eq!(params.promotion_policy, PromotionPolicy::Promotable);
         assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.template_id, Some(TemplateId::GroupDiscussion));
@@ -1288,7 +1499,7 @@ mod tests {
     fn paid_service_params_have_correct_fields() {
         let params = template_params(&TemplateId::PaidService);
         assert_eq!(params.mode, ContextMode::Encrypted);
-        assert_eq!(params.ceiling.len(), 4);
+        assert_eq!(params.ceiling.len(), 5);
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MESSAGES_READ));
         assert!(
             params
@@ -1303,6 +1514,7 @@ mod tests {
                 .any(|c| c.name() == CAP_TOOL_INVOKE_ALL)
         );
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_TOOL_REGISTER));
+        assert!(params.ceiling.iter().any(|c| c.name() == CAP_MEMBER_BAN));
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
@@ -1313,6 +1525,8 @@ mod tests {
         assert_eq!(params.template_id, Some(TemplateId::PaidService));
         // economic_policy is None in template defaults; caller must supply it.
         assert!(params.economic_policy.is_none());
+        assert_eq!(params.metadata_visibility, member_count_hidden_visibility());
+        assert!(params.projection_policy.is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -1331,6 +1545,7 @@ mod tests {
                 .iter()
                 .any(|c| c.name() == CAP_MESSAGES_WRITE)
         );
+        assert!(!params.ceiling.iter().any(|c| c.name() == CAP_MEMBER_BAN));
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
@@ -1340,6 +1555,14 @@ mod tests {
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
         assert_eq!(params.template_id, Some(TemplateId::PaidBroadcast));
         assert!(params.economic_policy.is_none());
+        assert_eq!(params.metadata_visibility, member_count_hidden_visibility());
+        assert_eq!(
+            params.projection_policy,
+            Some(ProjectionPolicy {
+                default_rule: ProjectionRule::Gated,
+                overrides: vec![],
+            })
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1532,7 +1755,7 @@ mod tests {
     fn from_template_paid_service_produces_valid_params() {
         let params = ContextParams::from_template(TemplateId::PaidService);
         assert_eq!(params.mode, ContextMode::Encrypted);
-        assert_eq!(params.ceiling.len(), 4);
+        assert_eq!(params.ceiling.len(), 5);
         assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
@@ -1567,5 +1790,299 @@ mod tests {
             matches!(err, ContextError::TemplateMismatch(_)),
             "expected ContextError::TemplateMismatch, got {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // MemberBan: encrypted templates include it, broadcast templates do not
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn encrypted_templates_include_member_ban_in_ceiling() {
+        let encrypted_templates = [
+            TemplateId::BilateralEphemeral,
+            TemplateId::BilateralPersistent,
+            TemplateId::Coordination,
+            TemplateId::GroupDiscussion,
+            TemplateId::ToolInterfaceTemplate,
+            TemplateId::PaidService,
+        ];
+        for tid in &encrypted_templates {
+            let params = template_params(tid);
+            assert!(
+                params.ceiling.iter().any(|c| c.name() == CAP_MEMBER_BAN),
+                "encrypted template {tid:?} should include member:ban in ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn broadcast_templates_do_not_include_member_ban_in_ceiling() {
+        let broadcast_templates = [
+            TemplateId::PublicBroadcast,
+            TemplateId::GatedBroadcast,
+            TemplateId::PaidBroadcast,
+        ];
+        for tid in &broadcast_templates {
+            let params = template_params(tid);
+            assert!(
+                !params.ceiling.iter().any(|c| c.name() == CAP_MEMBER_BAN),
+                "broadcast template {tid:?} should NOT include member:ban in ceiling"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Metadata visibility: template-specific defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn private_encrypted_templates_have_private_visibility() {
+        let private_templates = [
+            TemplateId::BilateralEphemeral,
+            TemplateId::BilateralPersistent,
+            TemplateId::Coordination,
+        ];
+        let expected = private_encrypted_visibility();
+        for tid in &private_templates {
+            let params = template_params(tid);
+            assert_eq!(
+                params.metadata_visibility, expected,
+                "template {tid:?} should have private encrypted visibility"
+            );
+        }
+    }
+
+    #[test]
+    fn group_discussion_has_group_visibility() {
+        let params = template_params(&TemplateId::GroupDiscussion);
+        let expected = group_discussion_visibility();
+        assert_eq!(params.metadata_visibility, expected);
+        // Verify specific fields
+        assert_eq!(
+            params.metadata_visibility.member_count,
+            FieldVisibility::PreJoin
+        );
+        assert_eq!(
+            params.metadata_visibility.creator_identity,
+            FieldVisibility::PreJoin
+        );
+        assert_eq!(
+            params.metadata_visibility.context_age,
+            FieldVisibility::MemberOnly
+        );
+    }
+
+    #[test]
+    fn public_broadcast_has_all_pre_join_visibility() {
+        let params = template_params(&TemplateId::PublicBroadcast);
+        assert_eq!(
+            params.metadata_visibility,
+            MetadataVisibilityPolicy::default()
+        );
+    }
+
+    #[test]
+    fn tool_interface_has_all_pre_join_visibility() {
+        let params = template_params(&TemplateId::ToolInterfaceTemplate);
+        assert_eq!(
+            params.metadata_visibility,
+            MetadataVisibilityPolicy::default()
+        );
+    }
+
+    #[test]
+    fn gated_broadcast_has_member_count_hidden_visibility() {
+        let params = template_params(&TemplateId::GatedBroadcast);
+        assert_eq!(
+            params.metadata_visibility.member_count,
+            FieldVisibility::MemberOnly
+        );
+        // All other fields remain PreJoin.
+        assert_eq!(
+            params.metadata_visibility.context_age,
+            FieldVisibility::PreJoin
+        );
+        assert_eq!(params.metadata_visibility.name, FieldVisibility::PreJoin);
+    }
+
+    #[test]
+    fn paid_service_has_member_count_hidden_visibility() {
+        let params = template_params(&TemplateId::PaidService);
+        assert_eq!(params.metadata_visibility, member_count_hidden_visibility());
+    }
+
+    #[test]
+    fn paid_broadcast_has_member_count_hidden_visibility() {
+        let params = template_params(&TemplateId::PaidBroadcast);
+        assert_eq!(params.metadata_visibility, member_count_hidden_visibility());
+    }
+
+    // -----------------------------------------------------------------------
+    // Projection policy: template-specific defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn encrypted_templates_have_no_projection_policy() {
+        let encrypted_templates = [
+            TemplateId::BilateralEphemeral,
+            TemplateId::BilateralPersistent,
+            TemplateId::Coordination,
+            TemplateId::GroupDiscussion,
+            TemplateId::ToolInterfaceTemplate,
+            TemplateId::PaidService,
+        ];
+        for tid in &encrypted_templates {
+            let params = template_params(tid);
+            assert!(
+                params.projection_policy.is_none(),
+                "encrypted template {tid:?} should have no projection_policy"
+            );
+        }
+    }
+
+    #[test]
+    fn public_broadcast_has_public_projection_policy() {
+        let params = template_params(&TemplateId::PublicBroadcast);
+        let policy = params.projection_policy.unwrap();
+        assert_eq!(policy.default_rule, ProjectionRule::Public);
+        assert!(policy.overrides.is_empty());
+    }
+
+    #[test]
+    fn gated_broadcast_has_gated_projection_policy() {
+        let params = template_params(&TemplateId::GatedBroadcast);
+        let policy = params.projection_policy.unwrap();
+        assert_eq!(policy.default_rule, ProjectionRule::Gated);
+        assert!(policy.overrides.is_empty());
+    }
+
+    #[test]
+    fn paid_broadcast_has_gated_projection_policy() {
+        let params = template_params(&TemplateId::PaidBroadcast);
+        let policy = params.projection_policy.unwrap();
+        assert_eq!(policy.default_rule, ProjectionRule::Gated);
+        assert!(policy.overrides.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_context_params: projection_policy on encrypted is rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_context_params_rejects_projection_policy_on_encrypted() {
+        let params = ContextParams {
+            mode: ContextMode::Encrypted,
+            projection_policy: Some(ProjectionPolicy {
+                default_rule: ProjectionRule::Public,
+                overrides: vec![],
+            }),
+            ..ContextParams::default()
+        };
+        let err = validate_context_params(&params).unwrap_err();
+        assert!(matches!(err, TemplateError::ProjectionPolicyOnEncrypted));
+    }
+
+    #[test]
+    fn validate_context_params_accepts_projection_policy_on_broadcast() {
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            projection_policy: Some(ProjectionPolicy {
+                default_rule: ProjectionRule::Public,
+                overrides: vec![],
+            }),
+            ..ContextParams::default()
+        };
+        assert!(validate_context_params(&params).is_ok());
+    }
+
+    #[test]
+    fn validate_context_params_accepts_no_projection_policy_on_encrypted() {
+        let params = ContextParams {
+            mode: ContextMode::Encrypted,
+            projection_policy: None,
+            ..ContextParams::default()
+        };
+        assert!(validate_context_params(&params).is_ok());
+    }
+
+    #[test]
+    fn validate_context_params_accepts_no_projection_policy_on_broadcast() {
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            projection_policy: None,
+            ..ContextParams::default()
+        };
+        assert!(validate_context_params(&params).is_ok());
+    }
+
+    #[test]
+    fn projection_policy_on_encrypted_error_display() {
+        let err = TemplateError::ProjectionPolicyOnEncrypted;
+        let msg = format!("{err}");
+        assert!(msg.contains("projection_policy"));
+        assert!(msg.contains("Broadcast"));
+        assert!(msg.contains("Encrypted"));
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_against_template: metadata_visibility mismatch
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_rejects_wrong_metadata_visibility() {
+        let mut params = template_params(&TemplateId::BilateralEphemeral);
+        params.ttl = Some(Duration::from_secs(300));
+        // Set all-PreJoin visibility (the default), which does not match the
+        // private_encrypted_visibility expected by BilateralEphemeral.
+        params.metadata_visibility = MetadataVisibilityPolicy::default();
+        let err = validate_against_template(&params).unwrap_err();
+        assert!(matches!(
+            err,
+            TemplateError::Mismatch {
+                field: "metadata_visibility",
+                ..
+            }
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_against_template: projection_policy mismatch
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_rejects_wrong_projection_policy_for_broadcast() {
+        let mut params = template_params(&TemplateId::PublicBroadcast);
+        // PublicBroadcast expects Public projection, set to Gated.
+        params.projection_policy = Some(ProjectionPolicy {
+            default_rule: ProjectionRule::Gated,
+            overrides: vec![],
+        });
+        let err = validate_against_template(&params).unwrap_err();
+        assert!(matches!(
+            err,
+            TemplateError::Mismatch {
+                field: "projection_policy",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_projection_policy_on_encrypted_template() {
+        let mut params = template_params(&TemplateId::BilateralEphemeral);
+        params.ttl = Some(Duration::from_secs(300));
+        // BilateralEphemeral expects projection_policy: None
+        params.projection_policy = Some(ProjectionPolicy {
+            default_rule: ProjectionRule::Public,
+            overrides: vec![],
+        });
+        let err = validate_against_template(&params).unwrap_err();
+        assert!(matches!(
+            err,
+            TemplateError::Mismatch {
+                field: "projection_policy",
+                ..
+            }
+        ));
     }
 }

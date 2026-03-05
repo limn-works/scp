@@ -38,6 +38,17 @@ impl ApiError {
         )
     }
 
+    /// Returns an unauthorized error response (HTTP 401) with a custom message.
+    pub(crate) fn unauthorized_with(msg: impl Into<String>) -> (StatusCode, Json<Self>) {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(Self {
+                error: msg.into(),
+                code: "UNAUTHORIZED".to_owned(),
+            }),
+        )
+    }
+
     /// Returns a not-found error response (HTTP 404) with the given message.
     pub(crate) fn not_found(msg: impl Into<String>) -> (StatusCode, Json<Self>) {
         (
@@ -78,6 +89,20 @@ impl ApiError {
             Json(Self {
                 error: msg.into(),
                 code: "FORBIDDEN".to_owned(),
+            }),
+        )
+    }
+
+    /// Returns a gone error response (HTTP 410) with the given message.
+    ///
+    /// Used when content has been intentionally revoked (e.g., after a
+    /// `Full`-scope governance ban purges old-epoch broadcast keys).
+    pub(crate) fn gone(msg: impl Into<String>) -> (StatusCode, Json<Self>) {
+        (
+            StatusCode::GONE,
+            Json(Self {
+                error: msg.into(),
+                code: "GONE".to_owned(),
             }),
         )
     }

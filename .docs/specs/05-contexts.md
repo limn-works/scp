@@ -32,6 +32,7 @@ Every context declares a capability ceiling at creation: the maximum set of thin
 - **`bridging`** — bridge connector participation (§12)
 - **`toolInterface`** — cross-context tool interface exposure (§6.2)
 - **`childContext`** — creating child contexts (§5.13)
+- **`memberBan`** — governance-level member removal (ban/unban). Gates whether governance can execute `RevokeReadAccess` / `RestoreReadAccess` against members (§5.9). Without this capability in the ceiling, governance cannot ban members regardless of governance model.
 
 Media capabilities (`media.*`) enable the delegated media transport model (§10.9.1) where the context establishes identity, trust, and governance while media flows over WebRTC/DTLS-SRTP. A context without media capabilities in its ceiling cannot initiate voice or video sessions regardless of participant roles.
 
@@ -88,24 +89,58 @@ One agent per human per context. Membership is transparent — participants can 
 
 ## 5.7 Metadata
 
-The following are visible before opting in to any context:
+Context metadata follows a two-tier visibility model that balances legibility (informed consent before joining) with privacy (operational details that may be sensitive).
+
+**Structural fields** (always visible — required for informed consent):
 
 - Template ID, if created from a well-known template (§5.12)
 - Capability ceiling and ceiling policy (`immutable` or `governed`, §5.3)
 - Available roles and their permission sets
 - Governance model
-- Creator identity
-- Member count
-- Context age
 - TTL / time-to-live, if set (§5.10)
 - Promotion policy (`no_promotion` or `promotable`), if context has a TTL (§5.10)
 - Memory scope (§5.11)
 - Context mode (`Encrypted` or `Broadcast`, §5.14)
+- Metadata visibility policy itself (so prospective members know what's hidden)
+
+Structural fields are always public regardless of `MetadataVisibilityPolicy`. These are the parameters a prospective member needs to evaluate whether to join — hiding them would undermine informed consent.
+
+**Operational fields** (governed by `MetadataVisibilityPolicy`):
+
+- Member count
+- Context age
+- Creator identity
+- Name
+- Description
 - Economic policy, if set (§19.3) — pricing, accepted adapters, payee
 - Active tool interface count (inbound and outbound, §6.2, §9.2.1)
 - For child contexts (§5.13): parent context IDs, parent metadata summaries, parent governance configuration, and the prospective member's eligibility basis (§5.13.6)
 
-This is protocol-level metadata, not optional. Full legibility of any space before you enter it. When a template ID is present, the joining party can evaluate the context with a single template-level check rather than inspecting each parameter individually — the template is a commitment that the parameters match the well-known definition exactly (§5.12.1).
+Each operational field has a visibility of `PreJoin` (visible to anyone with the context_id) or `MemberOnly` (visible only to context members). The `MetadataVisibilityPolicy` is declared at context creation and follows the context's ceiling policy — immutable or governed via `ModifyCeiling`.
+
+```rust
+/// Controls whether a metadata field is visible before joining.
+pub enum FieldVisibility {
+    PreJoin,    // Visible to anyone with context_id
+    MemberOnly, // Visible only to context members
+}
+
+/// Per-field metadata visibility policy.
+pub struct MetadataVisibilityPolicy {
+    pub member_count: FieldVisibility,
+    pub context_age: FieldVisibility,
+    pub creator_identity: FieldVisibility,
+    pub name: FieldVisibility,
+    pub description: FieldVisibility,
+    pub economic_policy: FieldVisibility,
+    pub tool_interface_count: FieldVisibility,
+    pub child_context_info: FieldVisibility,
+}
+```
+
+Default: all fields `PreJoin` (backward-compatible — existing contexts expose everything). Well-known templates override defaults per template (§5.12.1). For example, `bilateral-ephemeral` defaults member_count, context_age, and creator_identity to `MemberOnly`; `public-broadcast` defaults all fields to `PreJoin`.
+
+When a template ID is present, the joining party can evaluate the context with a single template-level check rather than inspecting each parameter individually — the template is a commitment that the parameters match the well-known definition exactly (§5.12.1).
 
 ### 5.7.1 Metadata Publication and Retrieval
 
@@ -115,11 +150,11 @@ Contexts publish their parameters to a publicly derivable routing address, enabl
 metadata_routing_id = SHA-256(context_id || "scp-metadata")
 ```
 
-Published metadata includes: name, description, capability ceiling, ceiling policy, governance mode, TTL, memory scope, context mode, roles, and membership requirements. This is the same parameter set listed in §5.7, serialized as a signed metadata record by the context creator (or governance delegate).
+Published metadata includes structural fields (always) and operational fields filtered by `MetadataVisibilityPolicy`. Fields with `MemberOnly` visibility are omitted from the published metadata record. Members retrieve full metadata through the context's internal state, not the public metadata record.
 
-Prospective members retrieve context parameters by subscribing to the `metadata_routing_id` on the relay without joining the context. The metadata record is signed by a current context admin, enabling verification of authenticity without membership. This makes the legibility guarantee mechanical — any identity with the context ID can derive the metadata address and inspect the context's parameters before deciding whether to join.
+Prospective members retrieve context parameters by subscribing to the `metadata_routing_id` on the relay without joining the context. The metadata record is signed by a current context admin, enabling verification of authenticity without membership. This makes the legibility guarantee mechanical — any identity with the context ID can derive the metadata address and inspect the context's visible parameters before deciding whether to join.
 
-Metadata updates (e.g., member count changes, governance-driven ceiling modifications in `governed` contexts) are republished to the same routing address. Relays treat metadata records as standard relay messages — no special relay-side logic is required.
+Metadata updates (e.g., governance-driven ceiling modifications in `governed` contexts) are republished to the same routing address. Relays treat metadata records as standard relay messages — no special relay-side logic is required.
 
 ## 5.8 Context Identity
 
@@ -226,36 +261,40 @@ The protocol defines a set of well-known templates — named parameter bundles w
 
 ```
 Template: "scp:template/bilateral-ephemeral"
-  ceiling:     [messagesRead, messagesWrite]
+  ceiling:     [messagesRead, messagesWrite, memberBan]
   roles:       [admin (creator), member (joiner)]
   governance:  single-admin
   memory_scope: ephemeral
   ttl:         required (creator sets duration, no default — forces intentionality)
   tools:       none
+  metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, tool_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/bilateral-persistent"
-  ceiling:     [messagesRead, messagesWrite]
+  ceiling:     [messagesRead, messagesWrite, memberBan]
   roles:       [admin (creator), member (joiner)]
   governance:  single-admin
   memory_scope: full
   ttl:         none
   tools:       none
+  metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, tool_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/coordination"
-  ceiling:     [messagesRead, messagesWrite, toolInvokeAll]
+  ceiling:     [messagesRead, messagesWrite, toolInvokeAll, memberBan]
   roles:       [admin (creator), member (joiner)]
   governance:  single-admin
   memory_scope: summary
   ttl:         required (creator sets duration)
   tools:       creator-defined at creation
+  metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, tool_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/group-discussion"
-  ceiling:     [messagesRead, messagesWrite, memberInvite]
+  ceiling:     [messagesRead, messagesWrite, memberInvite, memberBan]
   roles:       [admin, member, observer]
   governance:  single-admin
   memory_scope: full
   ttl:         optional
   tools:       none
+  metadata_visibility: { member_count: PreJoin, context_age: MemberOnly, creator_identity: PreJoin, name: PreJoin, description: PreJoin, economic_policy: MemberOnly, tool_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/public-broadcast"
   mode:          Broadcast
@@ -267,6 +306,8 @@ Template: "scp:template/public-broadcast"
   governance:    single-admin
   memory_scope:  full
   ttl:           optional
+  metadata_visibility: all PreJoin
+  projection_policy: { default_rule: Public, overrides: [] }
 
 Template: "scp:template/gated-broadcast"
   mode:          Broadcast
@@ -278,17 +319,20 @@ Template: "scp:template/gated-broadcast"
   governance:    single-admin
   memory_scope:  full
   ttl:           optional
+  metadata_visibility: { member_count: MemberOnly, all others: PreJoin }
+  projection_policy: { default_rule: Gated, overrides: [] }
 
 Template: "scp:template/tool-interface"
-  ceiling:       [messagesRead, messagesWrite, toolRegister, toolInvokeAll]
+  ceiling:       [messagesRead, messagesWrite, toolRegister, toolInvokeAll, memberBan]
   roles:         [admin (creator), member (joiner)]
   governance:    single-admin
   memory_scope:  full
   ttl:           optional
   tools:         creator-defined at creation
+  metadata_visibility: all PreJoin
 
 Template: "scp:template/paid-service"
-  ceiling:       [messagesRead, messagesWrite, toolRegister, toolInvokeAll]
+  ceiling:       [messagesRead, messagesWrite, toolRegister, toolInvokeAll, memberBan]
   ceiling_policy: immutable
   roles:         [admin (creator), member (joiner)]
   governance:    single-admin
@@ -296,6 +340,7 @@ Template: "scp:template/paid-service"
   economic_policy: required — per_tool_invoke must be set at creation
   extends:       scp:template/tool-interface
   ttl:           optional
+  metadata_visibility: { economic_policy: PreJoin, member_count: MemberOnly, all others: PreJoin }
 
 Template: "scp:template/paid-broadcast"
   mode:          Broadcast
@@ -310,6 +355,8 @@ Template: "scp:template/paid-broadcast"
   economic_policy: required — per_period must be set at creation
   extends:       scp:template/gated-broadcast
   ttl:           optional
+  metadata_visibility: { member_count: MemberOnly, economic_policy: PreJoin, all others: PreJoin }
+  projection_policy: { default_rule: Gated, overrides: [] }
 ```
 
 The ONLY difference between `public-broadcast` and `gated-broadcast` is whether the subscriber role's `messagesRead` is auto-granted (DID-authenticated, following the discovery context reader-tier pattern §6.2.2B) or requires an explicit admin-issued UCAN (like encrypted context membership). The open/gated distinction is expressed through the template's role definitions, not through a new enum type.
@@ -862,6 +909,8 @@ The distinction between open and gated broadcast is expressed through the existi
 
 Gated contexts enable: paid subscriptions (admin grants `messagesRead` after payment verification — see §19.10 `paid-broadcast` template), invite-only communities (admin grants `messagesRead` to approved members), and tiered access (scoped UCANs for different content levels).
 
+The open/gated distinction governs all access paths to context content, not just key distribution. This includes HTTP broadcast projection (§18.11) — gated contexts require UCAN authentication on projection endpoints; open contexts serve publicly. The `ProjectionPolicy` on `ContextParams` provides per-author granularity within the bounds set by the admission mode. See §18.11.2.1 for the full projection policy specification.
+
 ### 5.14.5 BroadcastEnvelope
 
 ```rust
@@ -914,6 +963,21 @@ Author-level, cryptographic, pull-based — the same protocol as encrypted conte
 4. Non-blocked subscribers request → get HPKE-encrypted key → continue reading.
 
 Blocking is per-author. Author A blocking a subscriber does not affect the subscriber's access to Author B's content.
+
+**Governance-level subscriber ban.** When the context's capability ceiling includes `memberBan` (§5.3), governance can execute `RevokeReadAccess` (§5.9, ADR-031) against broadcast subscribers. Unlike per-author blocking (which is unilateral and affects only one author's content), a governance ban removes the subscriber from the registry AND adds them to ALL authors' block lists simultaneously. All authors MUST rotate keys after a governance ban (mandatory `KeyEpochAdvance`). This mirrors `RevokeReadAccess` semantics in encrypted contexts (MLS group removal), adapted for broadcast's per-author key model.
+
+Governance ban lifecycle:
+
+1. Governance proposal: `RevokeReadAccess { did, scope }` — proposed via the standard governance flow (§5.9).
+2. Context manager verifies `MemberBan` capability in ceiling — rejects with `PermissionDenied` if absent.
+3. On approval: subscriber removed from registry, added to all authors' block lists.
+4. All authors rotate keys — mandatory `KeyEpochAdvance` per author.
+5. `ReadAccessRevoked` event emitted to event log.
+6. Future `handle_key_request` from banned subscriber returns `Deny` for all authors.
+
+`RestoreReadAccess { did }` reverses the ban: subscriber removed from all authors' block lists, but NOT re-registered (they must re-register manually). No key rotation on restore (forward-only — unban grants future access, the registration gap is permanent). `ReadAccessRestored` event emitted.
+
+Default template configuration: encrypted templates include `memberBan` in their ceiling by default (§5.12.1); broadcast templates do not. Broadcast contexts can add `memberBan` via explicit `ContextParams` at creation or via `ModifyCeiling` governance action if `CeilingPolicy::Governed`.
 
 **Author removal.** Removing an author from a broadcast context (revoking their broadcast key and preventing future publishing) is a governance-gated action. Author removal uses `GovernanceAction::RevokeWriteAccess { did, scope }` — the general content access revocation mechanism (§5.9, ADR-031). `RevokeWriteAccess` with `scope: Full` stops publishing AND suppresses historical content; `scope: FutureOnly` stops future publishing only. There is no standalone API to remove an author without governance approval. This enforces the protocol tenet: "Agents are participants, not enforcers." When the governance proposal is approved and executed: the author's broadcast key is destroyed, `publish()` returns `PermissionDenied`, key requests for the author return `Deny`, and a `WriteAccessRevoked` event is emitted. Subscribers who cached the author's old key can still decrypt historical messages (unless `scope: Full` was used, in which case access keys are also destroyed per §9.17).
 

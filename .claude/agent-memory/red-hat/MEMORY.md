@@ -47,12 +47,20 @@ After commit 54b8096 ("close 6 remaining gaps"), reassessed all chains.
 - **Replay without nonce**: BRIDGE_REGISTER uses timestamp-only replay protection (60s window). No nonce, no connection binding. Captured frames are replayable within window.
 - **Unbounded event-driven loops**: tier re-evaluation loop has no debounce. Any channel sender can trigger unlimited STUN probes + DID publishes.
 
+## Governance-Gaps PR Assessment (2026-03-05)
+- **RED-301 (CRITICAL)**: validate_projection_ucan does parse_ucan + att string match ONLY (3/11 steps). Missing: sig verify, delegation, root issuer, audience, nonce, revocation, expiry, ceiling, attenuation, key_scope. Attacker crafts JWT with correct att field => full access to gated content. File: projection.rs:275-305.
+- **RED-302 (HIGH)**: Feed endpoint leaks per-author-gated content. Open context + per-author Gated override on did:X: feed_handler uses effective_projection_rule(admission, policy, None) -- author_did=None means no override match, falls back to default (Public). All content from all authors served without auth. File: projection.rs:618.
+- **RED-303 (HIGH)**: Post-ban projection access. governance_ban_subscriber rotates keys in BroadcastContext, but ProjectedContext in scp-node has its OWN key copy (HashMap<u64, BroadcastKey>). No mechanism propagates ban-triggered rotation to ProjectedContext. Banned subscriber's old-epoch content remains served. New-epoch content may or may not be served depending on whether key propagation happens externally.
+- **RED-304 (MEDIUM)**: Metadata oracle distinguishable. PublicMetadata includes metadata_visibility policy itself as structural (always visible). Attacker reads metadata_visibility.member_count=MemberOnly + observes member_count=None => knows value exists but is hidden. Vs metadata_visibility.member_count=PreJoin + member_count=None => genuinely no value. The visibility policy being exposed creates a distinguishable oracle.
+- **RED-305 (LOW)**: No CDN cache poisoning -- gated responses correctly use Cache-Control: private. Holds.
+
 ## Critical Files
 - `crates/scp-ffi/wasm/src/ucan.rs` -- Missing 5 validation steps (RED-101), wildcard bypass (RED-105)
-- `crates/scp-core/src/context/broadcast.rs` -- Stub UcanToken no sig (RED-103), block doesn't remove (RED-108)
+- `crates/scp-core/src/context/broadcast.rs` -- Governance ban + block_subscriber now removes from subscribers (RED-108 partially fixed)
 - `crates/scp-core/src/context/roles.rs` -- Stub UcanToken struct (no signature field)
 - `crates/scp-ffi/napi/src/ucan.rs` -- Zero-sig mint (RED-102), wrong proof CID function (RED-111)
 - `crates/scp-mcp/src/sse.rs` -- No auth (RED-107), notification confusion (RED-106)
 - `crates/scp-core/src/discovery/handles.rs` -- Context target squatting (RED-109)
 - `crates/scp-transport/src/relay/bridge.rs` -- Replay within 60s window (RED-204)
 - `crates/scp-node/src/lib.rs` -- No debounce on re-eval loop (RED-206), no post-change self-test (RED-208)
+- `crates/scp-node/src/projection.rs` -- Projection UCAN bypass (RED-301), feed author-override leak (RED-302), no ban propagation (RED-303)

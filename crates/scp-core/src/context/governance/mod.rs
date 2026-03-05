@@ -56,6 +56,7 @@ use sha2::{Digest, Sha256};
 
 use super::params::{Capability, ContextParams, ToolRegistration};
 use super::roles::ToolId;
+use super::tools::interface::ToolInterface;
 use scp_event_log::{ContextId, Ed25519Signature};
 use scp_identity::DID;
 
@@ -278,11 +279,175 @@ where
 // GovernanceAction
 // ---------------------------------------------------------------------------
 
-/// Typed governance actions. Every governance change is one of these variants.
+/// Scope of content access revocation (§5.9, ADR-031).
+///
+/// Determines whether revocation is retroactive (destroying historical access keys)
+/// or forward-only (preserving access to already-distributed content).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RevocationScope {
+    /// Retroactive: destroy access keys for historical content AND
+    /// exclude from future content key distribution.
+    Full,
+    /// Forward-only: exclude from future content key distribution.
+    /// Historical content remains accessible.
+    FutureOnly,
+}
+
+// ---------------------------------------------------------------------------
+// PruningPolicy (ADR-030 §6)
+// ---------------------------------------------------------------------------
+
+/// Time-based pruning configuration (ADR-030 §2a).
+///
+/// Protocol minimum: 30 days (2,592,000 seconds). Contexts may set higher.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeBasedPolicy {
+    /// Minimum age (seconds) before an event becomes prunable.
+    pub retention_secs: u64,
+}
+
+/// Size-based pruning configuration (ADR-030 §2b).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SizeBasedPolicy {
+    /// Maximum number of events to retain locally.
+    pub max_event_count: u64,
+    /// Maximum total storage bytes for event log data.
+    pub max_storage_bytes: u64,
+}
+
+/// Event-type retention multipliers (ADR-030 §2c).
+///
+/// Structural events (governance, membership) are retained longer than
+/// operational events (messages, tool invocations).
+///
+/// Multipliers are expressed in basis points where 10000 = 1.0x multiplier.
+/// E.g. 30000 = 3.0x.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventTypeRetention {
+    /// Basis points where 10000 = 1.0x multiplier. E.g. 30000 = 3.0x.
+    /// Default: 30000 (3.0x).
+    pub structural_retention_multiplier: u32,
+    /// Basis points where 10000 = 1.0x multiplier. E.g. 30000 = 3.0x.
+    /// Default: 10000 (1.0x).
+    pub operational_retention_multiplier: u32,
+}
+
+/// Checkpoint creation schedule (ADR-030 §3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointSchedule {
+    /// Create a checkpoint every N events. Default: 10,000.
+    pub event_interval: u64,
+    /// Create a checkpoint every N seconds. Default: 86,400 (24 hours).
+    pub time_interval_secs: u64,
+    /// Minimum events since last checkpoint before a new one is created.
+    /// Default: 100.
+    pub min_events_since_last: u64,
+}
+
+/// Pruning policy for a context's event log (ADR-030 §6).
+///
+/// Set at context creation or modified via governance. Included in
+/// publicly visible metadata (§5.7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruningPolicy {
+    /// Time-based pruning. `None` = no time-based pruning.
+    pub time_based: Option<TimeBasedPolicy>,
+    /// Size-based pruning. `None` = no size-based pruning.
+    pub size_based: Option<SizeBasedPolicy>,
+    /// Event-type retention multipliers.
+    pub event_type_retention: EventTypeRetention,
+    /// Checkpoint creation schedule.
+    pub checkpoint_schedule: CheckpointSchedule,
+    /// Whether members may request full log history from peers.
+    pub allow_full_history_requests: bool,
+}
+
+impl Default for PruningPolicy {
+    fn default() -> Self {
+        Self {
+            time_based: None,
+            size_based: None,
+            event_type_retention: EventTypeRetention {
+                structural_retention_multiplier: 30_000,
+                operational_retention_multiplier: 10_000,
+            },
+            checkpoint_schedule: CheckpointSchedule {
+                event_interval: 10_000,
+                time_interval_secs: 86_400,
+                min_events_since_last: 100,
+            },
+            allow_full_history_requests: true,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ConflictResolution (ADR-031 §7)
+// ---------------------------------------------------------------------------
+
+/// Governance-level conflict resolution for simultaneous-commit scenarios
+/// (ADR-031 §7).
+///
+/// When two conflicting proposals land at the same event log sequence,
+/// governance enters a freeze. A `ResolveConflict` action with this payload
+/// specifies how to lift the freeze.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ConflictResolution {
+    /// Accept one proposal, invalidate the other.
+    AcceptProposal {
+        /// The winning proposal ID.
+        winner_id: ProposalId,
+    },
+    /// Invalidate both proposals, return to pre-proposal state.
+    InvalidateBoth,
+}
+
+// ---------------------------------------------------------------------------
+// Deadlock recovery types (ADR-031 §10)
+// ---------------------------------------------------------------------------
+
+/// Actions that can be taken during deadlock recovery (ADR-031 §10).
+///
+/// These modify governance parameters without changing the model type.
+/// Used by `ReconfigureGovernance`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GovernanceReconfigAction {
+    /// Remove an inactive signer (Threshold model).
+    RemoveInactiveSigner {
+        /// The DID of the inactive signer.
+        did: DID,
+    },
+    /// Reduce the threshold (Threshold model). New value must be
+    /// >= 1 and <= remaining active signers.
+    ReduceThreshold {
+        /// The new threshold value.
+        new_threshold: u32,
+    },
+}
+
+/// Justification for a deadlock recovery action (ADR-031 §10).
+///
+/// Attached to `ReconfigureGovernance` to record evidence of deadlock.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadlockJustification {
+    /// DIDs that are unavailable.
+    pub unavailable_dids: Vec<DID>,
+    /// Evidence of unavailability: (DID, consecutive missed voting windows).
+    pub missed_windows: Vec<(DID, u32)>,
+    /// Timestamp of deadlock detection (Unix seconds).
+    pub detected_at: u64,
+}
+
+// ---------------------------------------------------------------------------
+// GovernanceAction
+// ---------------------------------------------------------------------------
+
+/// Typed governance actions (ADR-031 §2). Every governance change is one of
+/// these variants.
 ///
 /// The governance engine evaluates proposals containing these actions. This
-/// covers: role changes, membership changes, settings changes, ceiling
-/// expansion, and interface decisions per spec section 5.9.
+/// covers: membership, roles, settings, ceiling, content access, tool
+/// interfaces, pruning, conflict resolution, and deadlock recovery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GovernanceAction {
     /// Add a member to the context with a specified role.
@@ -313,9 +478,124 @@ pub enum GovernanceAction {
     /// the context's governance model. See spec section 5.14.8.
     BlockAuthor {
         /// The DID of the author to block.
-        author_did: DID,
+        did: DID,
         /// Optional reason for the block.
         reason: Option<String>,
+    },
+    /// Revoke a member's read access to context content (§5.9, ADR-031).
+    ///
+    /// Requires `MemberBan` capability in the context's ceiling (§5.3).
+    /// In broadcast contexts: removes subscriber from registry, adds to all
+    /// authors' block lists, forces key rotation on all authors (§5.14.8).
+    /// In encrypted contexts: removes from MLS group.
+    /// Does NOT remove the member -- they remain for governance/presence.
+    RevokeReadAccess {
+        /// The DID whose read access is revoked.
+        did: DID,
+        /// Whether revocation is retroactive or forward-only.
+        scope: RevocationScope,
+    },
+    /// Restore a member's read access to context content (§5.9, ADR-031).
+    ///
+    /// Requires `MemberBan` capability in the context's ceiling (§5.3).
+    /// Always forward-only -- historical content from before/during revocation
+    /// remains inaccessible (access keys were destroyed, not archived).
+    RestoreReadAccess {
+        /// The DID whose read access is restored.
+        did: DID,
+    },
+    /// Modify the context's event log pruning policy (ADR-030 §6).
+    ModifyPruningPolicy {
+        /// The new pruning policy to apply.
+        new_policy: PruningPolicy,
+    },
+    /// Add a signer to the threshold set (Threshold model only, ADR-031 §4b).
+    AddSigner {
+        /// The DID of the new signer.
+        did: DID,
+    },
+    /// Remove a signer from the threshold set (Threshold model only, ADR-031 §4b).
+    RemoveSigner {
+        /// The DID of the signer to remove.
+        did: DID,
+    },
+    /// Modify the threshold value (Threshold model only, ADR-031 §4b).
+    ///
+    /// New value must be >= 1 and <= the number of signers.
+    ModifyThreshold {
+        /// The new threshold value.
+        new_threshold: u32,
+    },
+    /// Establish a tool interface with another context (§6.2).
+    EstablishToolInterface {
+        /// The tool interface to establish.
+        interface: ToolInterface,
+    },
+    /// Governance-triggered member reset (ADR-029, Tier 3).
+    ///
+    /// Forces a group state reset for the target member. Invalidates any
+    /// pending proposals. The member must re-sync after the reset.
+    ResetMember {
+        /// The DID of the member to reset.
+        did: DID,
+        /// Reason for the reset.
+        reason: String,
+    },
+    /// Resolve a governance conflict (ADR-031 §7).
+    ///
+    /// Used when two conflicting proposals land at the same event log
+    /// sequence. Exempt from governance freeze — this is the designated
+    /// mechanism for lifting the freeze.
+    ResolveConflict {
+        /// The first conflicting proposal ID.
+        proposal_a: ProposalId,
+        /// The second conflicting proposal ID.
+        proposal_b: ProposalId,
+        /// How to resolve the conflict.
+        resolution: ConflictResolution,
+    },
+    /// Promote a context from ephemeral to persistent (§5.10).
+    ///
+    /// Requires unanimous consent from ALL current members regardless of
+    /// governance model — protocol-level override enforced by
+    /// `ContextManager`.
+    PromoteContext,
+    /// Revoke a member's write access to context content (§9.17, ADR-038).
+    ///
+    /// `Full` scope: stop publishing and suppress historical content.
+    /// `FutureOnly` scope: stop future publishing only.
+    /// Does NOT remove the member — they remain for governance/presence.
+    RevokeWriteAccess {
+        /// The DID whose write access is revoked.
+        did: DID,
+        /// Whether revocation is retroactive or forward-only.
+        scope: RevocationScope,
+    },
+    /// Restore a member's write access to context content (§9.17, ADR-038).
+    ///
+    /// Always forward-only — previously suppressed content remains suppressed.
+    RestoreWriteAccess {
+        /// The DID whose write access is restored.
+        did: DID,
+    },
+    /// Context-wide content key rotation (§9.17, ADR-038).
+    ///
+    /// Not DID-targeted — rotates keys for all members. Use after compromise
+    /// detection, bulk revocations, or periodic key hygiene.
+    RotateContentKeys {
+        /// Optional reason for the rotation.
+        reason: Option<String>,
+    },
+    /// Deadlock recovery: modify governance parameters without changing model
+    /// type (ADR-031 §10).
+    ///
+    /// Uses fallback quorum (majority-of-active) regardless of original
+    /// governance model. 48-hour voting window.
+    ReconfigureGovernance {
+        /// The reconfiguration actions to apply.
+        changes: Vec<GovernanceReconfigAction>,
+        /// Justification for the deadlock recovery.
+        justification: DeadlockJustification,
     },
 }
 
@@ -987,6 +1267,31 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // RevocationScope serialization roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn revocation_scope_full_roundtrip() {
+        let scope = RevocationScope::Full;
+        let json = serde_json::to_string(&scope).unwrap();
+        let deserialized: RevocationScope = serde_json::from_str(&json).unwrap();
+        assert_eq!(scope, deserialized);
+    }
+
+    #[test]
+    fn revocation_scope_future_only_roundtrip() {
+        let scope = RevocationScope::FutureOnly;
+        let json = serde_json::to_string(&scope).unwrap();
+        let deserialized: RevocationScope = serde_json::from_str(&json).unwrap();
+        assert_eq!(scope, deserialized);
+    }
+
+    #[test]
+    fn revocation_scope_variants_are_distinct() {
+        assert_ne!(RevocationScope::Full, RevocationScope::FutureOnly);
+    }
+
+    // -----------------------------------------------------------------------
     // ProposalStatus tests
     // -----------------------------------------------------------------------
 
@@ -1105,7 +1410,7 @@ mod tests {
             },
             GovernanceAction::TransferAdmin { new_admin: bob() },
             GovernanceAction::BlockAuthor {
-                author_did: bob(),
+                did: bob(),
                 reason: Some("spam".to_owned()),
             },
         ];

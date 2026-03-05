@@ -398,6 +398,12 @@ impl<S: Storage> ApplicationNode<S> {
     /// content at `/scp/broadcast/<routing_id_hex>/feed` and
     /// `/scp/broadcast/<routing_id_hex>/messages/<blob_id_hex>`.
     ///
+    /// The `admission` mode and optional `projection_policy` are stored on the
+    /// [`ProjectedContext`] so that projection handlers can enforce
+    /// authentication requirements per spec section 18.11.2.1. If the context
+    /// is already projected, the key is added and `admission`/`projection_policy`
+    /// are updated (use this to propagate governance `ModifyCeiling` changes).
+    ///
     /// See spec sections 18.11.2 and 18.11.8.
     ///
     /// # Limits
@@ -408,17 +414,28 @@ impl<S: Storage> ApplicationNode<S> {
     ///
     /// # Errors
     ///
-    /// Returns [`NodeError::InvalidConfig`] if the projected context limit
-    /// (1024) has been reached.
+    /// Returns [`NodeError::InvalidConfig`] if:
+    /// - The projected context limit (1024) has been reached.
+    /// - A gated context has a `Public` default projection rule (violates
+    ///   spec section 18.11.2.1: gated contexts cannot have public projection).
+    /// - A gated context has a `Public` per-author projection override.
     pub async fn enable_broadcast_projection(
         &self,
         context_id: &str,
         broadcast_key: scp_core::crypto::sender_keys::BroadcastKey,
+        admission: scp_core::context::broadcast::BroadcastAdmission,
+        projection_policy: Option<scp_core::context::params::ProjectionPolicy>,
     ) -> Result<(), NodeError> {
+        // Validate: gated contexts cannot have public projection rules.
+        projection::validate_projection_policy(admission, projection_policy.as_ref())
+            .map_err(NodeError::InvalidConfig)?;
+
         let routing_id = projection::compute_routing_id(context_id);
         let mut registry = self.state.projected_contexts.write().await;
         if let Some(existing) = registry.get_mut(&routing_id) {
             existing.insert_key(broadcast_key);
+            existing.admission = admission;
+            existing.projection_policy = projection_policy;
         } else {
             if registry.len() >= Self::MAX_PROJECTED_CONTEXTS {
                 return Err(NodeError::InvalidConfig(format!(
@@ -426,7 +443,8 @@ impl<S: Storage> ApplicationNode<S> {
                     Self::MAX_PROJECTED_CONTEXTS
                 )));
             }
-            let projected = ProjectedContext::new(context_id, broadcast_key);
+            let projected =
+                ProjectedContext::new(context_id, broadcast_key, admission, projection_policy);
             registry.insert(routing_id, projected);
         }
         drop(registry);
@@ -444,6 +462,53 @@ impl<S: Storage> ApplicationNode<S> {
         let routing_id = projection::compute_routing_id(context_id);
         let mut registry = self.state.projected_contexts.write().await;
         registry.remove(&routing_id);
+    }
+
+    /// Propagates rotated broadcast keys to the projection registry after a
+    /// governance ban.
+    ///
+    /// After [`ContextManager::execute_governance_action`] returns
+    /// [`GovernanceActionResult::SubscriberBanned`], call this method with
+    /// the `context_id` and the [`GovernanceBanResult`] to ensure the
+    /// projection endpoint can decrypt content encrypted under the new
+    /// post-rotation keys.
+    ///
+    /// For each rotated author, inserts the new-epoch key into the
+    /// [`ProjectedContext`] key registry. If the context is not projected
+    /// (not registered via [`enable_broadcast_projection`]), this is a no-op.
+    ///
+    /// When the ban's [`RevocationScope`] is `Full`, old-epoch keys are
+    /// purged from the projection registry so historical content encrypted
+    /// under pre-ban keys is no longer served. `FutureOnly` retains old
+    /// keys (historical content remains accessible).
+    pub async fn propagate_ban_keys(
+        &self,
+        context_id: &str,
+        ban_result: &scp_core::context::broadcast::GovernanceBanResult,
+    ) {
+        use scp_core::context::governance::RevocationScope;
+
+        let routing_id = projection::compute_routing_id(context_id);
+        let mut registry = self.state.projected_contexts.write().await;
+        if let Some(projected) = registry.get_mut(&routing_id) {
+            // Insert new post-rotation keys.
+            for rotation in &ban_result.rotated_authors {
+                projected.insert_key(rotation.new_key.clone());
+            }
+
+            // Full scope: retain only the new post-rotation keys, purging
+            // all pre-ban keys so historical content is no longer
+            // decryptable via projection. Uses retain_only_epochs to
+            // correctly handle epoch-divergent multi-author contexts.
+            if ban_result.scope == RevocationScope::Full {
+                let new_epochs: std::collections::HashSet<u64> = ban_result
+                    .rotated_authors
+                    .iter()
+                    .map(|r| r.new_epoch)
+                    .collect();
+                projected.retain_only_epochs(&new_epochs);
+            }
+        }
     }
 }
 
