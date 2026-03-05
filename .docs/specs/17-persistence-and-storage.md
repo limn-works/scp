@@ -461,6 +461,12 @@ mls/{context_id}/encryption_key/{epoch}/{generation}
 
 The exact sub-prefix structure follows OpenMLS's `StorageProvider` method signatures. The bridge is a thin translation layer — it adds no behavior beyond key construction and serialization.
 
+**Why this bypasses `ProtocolStore` domain methods.** Every other domain area stores data through typed `ProtocolStore` methods that apply `StoredValue` version envelopes. The MLS bridge is the sole exception — it accesses the raw `Storage` backend via `ProtocolStore::storage()`. This is intentional:
+
+- **OpenMLS owns the storage contract.** The `StorageProvider` trait dictates what gets stored, key structure, and serialization format. Wrapping values in `StoredValue` envelopes would break OpenMLS deserialization on read-back.
+- **The bridge is the domain layer.** It constructs namespaced keys, validates context IDs via `sanitize_key_component`, and handles serialization. ProtocolStore wrapper methods would be pure indirection.
+- **Migration is OpenMLS's concern.** MLS state serialization is governed by the OpenMLS version, not SCP's `StoredValue` versioning. Format changes across OpenMLS upgrades follow OpenMLS's own compatibility guarantees.
+
 ## 17.10 Migration Strategy
 
 **Lazy on-read migration.** `ProtocolStore` checks the version envelope on every read:
