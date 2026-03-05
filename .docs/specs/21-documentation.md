@@ -19,14 +19,11 @@ An agent with no prior context should be able to visit the SCP repository, under
 - Transport adapter guide: `docs/guides/transport-adapters.md`
 - scp-mcp and scp-node module docs: all source files have `//!` headers
 - Runnable Rust examples: relay chat/send/listen in `crates/scp-transport/examples/`
+- SDK examples: Python, TypeScript, Swift, and Kotlin each have 4 runnable examples (basic messaging, tool invocation, MCP integration, multi-agent)
+- Getting started guide: `GETTING-STARTED.md` at repo root
+- Testing guide: `TESTING.md` at repo root
 
 ### Gaps
-
-| Category | Current | Target | Priority |
-|---|---|---|---|
-| Getting started | None | `GETTING-STARTED.md` — clone, build, run in 15 minutes | P0 |
-| Example applications | Rust relay examples only | Runnable examples per language | P0 |
-| Testing guide | Commands in standards only | Standalone `TESTING.md` how-to | P0 |
 | Inline doc coverage | Struct fields, enum variants, constants under-documented | Field/variant-level `///` docs on public items | P1 |
 | Generated API reference | None | Hosted rustdoc, typedoc, pdoc, DocC | P1 |
 | Crate/FFI README files | None | README per crate and FFI bridge | P1 |
@@ -42,9 +39,9 @@ An agent with no prior context should be able to visit the SCP repository, under
 ```
 README.md                        # What SCP is, capabilities, architecture, license
 LICENSING.md                     # License structure and FAQ
-GETTING-STARTED.md               # Clone → build → run in 15 minutes
+GETTING-STARTED.md               ✓ exists
 CONTRIBUTING.md                  # Branch naming, commits, testing, PR process, CLA
-TESTING.md                       # How to run tests, write tests, debug failures
+TESTING.md                       ✓ exists
 
 docs/                            # Published documentation (agent-facing)
 ├── guides/
