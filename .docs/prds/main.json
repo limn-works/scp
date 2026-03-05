@@ -6418,7 +6418,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/kotlin/scp-sdk-kotlin-android/src/main/kotlin/com/limn/scp/android/platform/PlatformAdapter.kt"
       ],
@@ -6662,7 +6662,7 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/kotlin/build.gradle.kts"
       ],
@@ -9835,7 +9835,7 @@
       "gate": "gate-3",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/src/context.rs",
         ".docs/adrs/phase-3.md",
@@ -9895,7 +9895,7 @@
       "gate": "gate-3",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/src/identity.rs",
         "crates/scp-ffi/src/runtime.rs",
@@ -9976,7 +9976,7 @@
       "id": "SCP-219",
       "title": "Wire NAPI bridge to scp-core for UCAN and event log",
       "gate": "gate-audit",
-      "status": "pending",
+      "status": "done",
       "blockedBy": [
         "SCP-080"
       ],
@@ -10080,7 +10080,7 @@
       "id": "SCP-222",
       "title": "Implement ProtocolStore typed domain layer over Storage trait",
       "gate": "gate-audit",
-      "status": "pending",
+      "status": "done",
       "blockedBy": [
         "SCP-001"
       ],
@@ -10118,7 +10118,7 @@
       "id": "SCP-223",
       "title": "Implement human-readable addressing types and discovery handle tools",
       "gate": "gate-audit",
-      "status": "pending",
+      "status": "done",
       "blockedBy": [
         "SCP-074",
         "SCP-075"
@@ -10158,7 +10158,7 @@
       "id": "SCP-224",
       "title": "Implement broadcast key lifecycle and BroadcastEnvelope seal/open",
       "gate": "gate-audit",
-      "status": "pending",
+      "status": "done",
       "blockedBy": [
         "SCP-018",
         "SCP-012",
@@ -10197,7 +10197,7 @@
       "id": "SCP-225",
       "title": "Implement cover traffic generation and heartbeat messages",
       "gate": "gate-audit",
-      "status": "pending",
+      "status": "done",
       "blockedBy": [
         "SCP-016"
       ],
@@ -10235,7 +10235,7 @@
       "id": "SCP-226",
       "title": "Implement attestation renewal orchestration",
       "gate": "gate-audit",
-      "status": "pending",
+      "status": "done",
       "blockedBy": [],
       "files": [
         "crates/scp-core/src/trust/renewal.rs"
@@ -10307,7 +10307,7 @@
       "gate": "gate-audit",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "blockedBy": [
         "SCP-222"
       ],
@@ -10341,7 +10341,7 @@
       "gate": "gate-audit",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "blockedBy": [
         "SCP-222"
       ],
