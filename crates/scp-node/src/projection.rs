@@ -719,7 +719,28 @@ pub async fn feed_handler(
     };
 
     // Decrypt each blob into a FeedMessage.
-    let (messages, latest_blob_id) = decrypt_blobs(&blobs, &keys);
+    let (mut messages, latest_blob_id) = decrypt_blobs(&blobs, &keys);
+
+    // Per-author override filtering: if any per-author override makes an
+    // author's content Gated (or stricter than the default rule), filter
+    // out their messages when the request lacks valid auth. This prevents
+    // the feed from leaking per-author-gated content to unauthenticated
+    // clients (RED-302).
+    if let Some(ref policy) = projection_policy
+        && !policy.overrides.is_empty()
+    {
+        messages.retain(|msg| {
+            let author_rule =
+                effective_projection_rule(admission, Some(policy), Some(&msg.author_did));
+            // If the per-author rule matches the default, it already passed
+            // pre-auth. Otherwise, check the stricter per-author rule.
+            if author_rule == rule {
+                true
+            } else {
+                check_projection_auth(&headers, &context_id, author_rule).is_ok()
+            }
+        });
+    }
 
     // Determine author_did for the top-level response.
     let author_did = messages
@@ -740,9 +761,17 @@ pub async fn feed_handler(
         .map(|id| format!("\"{}\"", hex_encode(&id)))
         .unwrap_or_default();
 
+    // If any per-author override exists, the response content varies based on
+    // auth state — use `private` even if the default rule is Public.
+    let has_per_author_overrides = projection_policy
+        .as_ref()
+        .is_some_and(|p| !p.overrides.is_empty());
+
     let cache_control = match rule {
-        ProjectionRule::Public => "public, max-age=30, stale-while-revalidate=300",
-        ProjectionRule::Gated | ProjectionRule::AuthorChoice => "private, max-age=30",
+        ProjectionRule::Public if !has_per_author_overrides => {
+            "public, max-age=30, stale-while-revalidate=300"
+        }
+        _ => "private, max-age=30",
     };
 
     let mut resp_headers = axum::http::HeaderMap::new();
@@ -2661,6 +2690,127 @@ mod tests {
     #[test]
     fn validate_policy_accepts_none_on_gated() {
         assert!(validate_projection_policy(BroadcastAdmission::Gated, None).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-GG-008: feed per-author override filtering (RED-302)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn feed_filters_per_author_gated_messages_without_auth() {
+        use scp_core::crypto::sender_keys::broadcast::rotate_broadcast_key;
+
+        // Open context with per-author Gated override for alice.
+        // Bob's messages should be visible without auth; alice's should not.
+        let alice_key = generate_broadcast_key("did:dht:alice");
+        let bob_key_epoch0 = generate_broadcast_key("did:dht:bob");
+        let (bob_key, _) = rotate_broadcast_key(&bob_key_epoch0, 1_000).unwrap();
+        let context_id = "feed_per_author_filter_ctx";
+
+        let policy = ProjectionPolicy {
+            default_rule: ProjectionRule::Public,
+            overrides: vec![ProjectionOverride {
+                did: DID::from("did:dht:alice"),
+                rule: ProjectionRule::Gated,
+            }],
+        };
+
+        let mut projected = ProjectedContext::new(
+            context_id,
+            alice_key.clone(),
+            BroadcastAdmission::Open,
+            Some(policy),
+        );
+        projected.keys.insert(bob_key.epoch(), bob_key.clone());
+        let routing_id = projected.routing_id;
+
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let storage = InMemoryBlobStorage::new();
+
+        // Store alice's message (should be filtered from unauthenticated feed).
+        let alice_env = seal_broadcast(&alice_key, b"alice secret").unwrap();
+        let alice_bytes = rmp_serde::to_vec(&alice_env).unwrap();
+        let alice_blob_id = {
+            let mut h = Sha256::new();
+            h.update(&alice_bytes);
+            let r: [u8; 32] = h.finalize().into();
+            r
+        };
+        storage
+            .store(routing_id, alice_blob_id, None, 3600, alice_bytes)
+            .await
+            .unwrap();
+
+        // Store bob's message (should be visible without auth).
+        let bob_env = seal_broadcast(&bob_key, b"bob public").unwrap();
+        let bob_bytes = rmp_serde::to_vec(&bob_env).unwrap();
+        let bob_blob_id = {
+            let mut h = Sha256::new();
+            h.update(&bob_bytes);
+            let r: [u8; 32] = h.finalize().into();
+            r
+        };
+        storage
+            .store(routing_id, bob_blob_id, None, 3600, bob_bytes)
+            .await
+            .unwrap();
+
+        let state = test_state_with(projected_map, storage);
+        let routing_hex = hex_encode(&routing_id);
+
+        // Request feed WITHOUT auth — should only include bob's message.
+        let router = broadcast_projection_router(Arc::clone(&state));
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/feed"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+
+        // Verify private cache-control (response varies by auth).
+        let cache_control = resp
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cache_control, "private, max-age=30");
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let messages = json["messages"].as_array().unwrap();
+
+        // Only bob's message should be in the feed.
+        assert_eq!(
+            messages.len(),
+            1,
+            "feed should filter alice's gated message"
+        );
+        assert_eq!(messages[0]["author_did"], "did:dht:bob");
+
+        // Request feed WITH valid UCAN — should include both messages.
+        let ucan_token = build_test_ucan(context_id);
+        let router = broadcast_projection_router(state);
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/feed"))
+            .header("Authorization", format!("Bearer {ucan_token}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let messages = json["messages"].as_array().unwrap();
+        assert_eq!(
+            messages.len(),
+            2,
+            "authenticated feed should include both messages"
+        );
     }
 
     // -----------------------------------------------------------------------
