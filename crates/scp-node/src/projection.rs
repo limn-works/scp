@@ -699,8 +699,15 @@ async fn projection_rate_limit_middleware(
     let ip = request
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map_or(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        .map_or_else(
+            || {
+                tracing::warn!(
+                    "ConnectInfo missing from request extensions; \
+                     projection rate limiting falls back to shared 0.0.0.0 bucket \
+                     (per-IP isolation lost)"
+                );
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+            },
             |ci| ci.0.ip(),
         );
     if !limiter.check(ip).await {
