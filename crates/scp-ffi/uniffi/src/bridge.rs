@@ -2103,6 +2103,8 @@ async fn ucan_mint_impl(
                 not_before: None,
                 proofs: vec![],
                 facts: None,
+                key_scope: None,
+                signing_key_id: None,
             };
 
             let token = scp_core::crypto::ucan::mint::mint_ucan(&params, &custody.0)

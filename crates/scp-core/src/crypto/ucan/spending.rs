@@ -1453,7 +1453,7 @@ mod tests {
         let now = crate::time::now_secs().expect("clock unavailable in test");
 
         UcanToken {
-            header: super::super::UcanHeader::new(),
+            header: super::super::UcanHeader::with_kid("#agent".to_owned()),
             payload: UcanPayload {
                 iss: "did:dht:z6MkShared".to_owned(),
                 aud: "did:dht:z6MkShared".to_owned(),
