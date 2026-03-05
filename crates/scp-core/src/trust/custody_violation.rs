@@ -22,6 +22,8 @@
 //! - [`CounterAttestation`] — Counter-evidence for reputation restoration.
 //! - [`CustodyViolationError`] — Validation errors for custody violation types.
 //! - [`CustodyViolationResult`] — Result of a Category A enforcement check.
+//! - [`ViolationStore`] — Trait for custody violation storage (append-only).
+//! - [`InMemoryViolationStore`] — In-memory implementation for testing.
 //!
 //! # Action Classification
 //!
@@ -38,6 +40,8 @@
 //! by the DID document's own structure.
 //!
 //! See ADR-039 in `.docs/adrs/phase-6.md` and spec section §3.6.
+
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -581,6 +585,119 @@ pub fn enforce_category_a(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ViolationStore trait (AB-019)
+// ---------------------------------------------------------------------------
+
+/// Trait for custody violation storage.
+///
+/// Implementations must enforce append-only semantics: once a violation is
+/// logged, it cannot be deleted or modified. Counter-attestations augment
+/// but never remove violations.
+///
+/// See ADR-039 acceptance criteria 17-18.
+pub trait ViolationStore {
+    /// Log a custody violation attestation.
+    ///
+    /// Validates the attestation before storing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CustodyViolationError`] if the attestation fails structural
+    /// validation.
+    fn log_violation(
+        &mut self,
+        attestation: ScpCustodyViolationAttestation,
+    ) -> Result<(), CustodyViolationError>;
+
+    /// Log a counter-attestation against a previously recorded violation.
+    ///
+    /// Validates the counter-attestation before storing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CustodyViolationError`] if the counter-attestation fails
+    /// structural validation.
+    fn log_counter_attestation(
+        &mut self,
+        counter: CounterAttestation,
+    ) -> Result<(), CustodyViolationError>;
+
+    /// Retrieve all violation attestations for a DID.
+    ///
+    /// Returns an empty vec if no violations have been recorded for the DID.
+    fn get_violations_for_did(&self, did: &DID) -> Vec<&ScpCustodyViolationAttestation>;
+
+    /// Retrieve all counter-attestations for a DID.
+    ///
+    /// Returns counter-attestations where `subject_did` matches the given DID.
+    fn get_counter_attestations_for_did(&self, did: &DID) -> Vec<&CounterAttestation>;
+}
+
+// ---------------------------------------------------------------------------
+// InMemoryViolationStore
+// ---------------------------------------------------------------------------
+
+/// In-memory implementation of [`ViolationStore`].
+///
+/// Suitable for testing and short-lived processes. Production deployments
+/// should use a persistent store via the `Storage` trait.
+#[derive(Debug, Default)]
+pub struct InMemoryViolationStore {
+    /// Violations keyed by subject DID.
+    violations: HashMap<DID, Vec<ScpCustodyViolationAttestation>>,
+
+    /// Counter-attestations keyed by subject DID.
+    counter_attestations: HashMap<DID, Vec<CounterAttestation>>,
+}
+
+impl InMemoryViolationStore {
+    /// Create a new empty in-memory violation store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl ViolationStore for InMemoryViolationStore {
+    fn log_violation(
+        &mut self,
+        attestation: ScpCustodyViolationAttestation,
+    ) -> Result<(), CustodyViolationError> {
+        attestation.validate()?;
+        let did = attestation.subject_did.clone();
+        self.violations.entry(did).or_default().push(attestation);
+        Ok(())
+    }
+
+    fn log_counter_attestation(
+        &mut self,
+        counter: CounterAttestation,
+    ) -> Result<(), CustodyViolationError> {
+        counter.validate()?;
+        let did = counter.subject_did.clone();
+        self.counter_attestations
+            .entry(did)
+            .or_default()
+            .push(counter);
+        Ok(())
+    }
+
+    fn get_violations_for_did(&self, did: &DID) -> Vec<&ScpCustodyViolationAttestation> {
+        self.violations
+            .get(did)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default()
+    }
+
+    fn get_counter_attestations_for_did(&self, did: &DID) -> Vec<&CounterAttestation> {
+        self.counter_attestations
+            .get(did)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1253,5 +1370,126 @@ mod tests {
             let deserialized: ActionCategory = serde_json::from_str(&json).unwrap();
             assert_eq!(cat, deserialized);
         }
+    }
+
+    // -------------------------------------------------------------------
+    // ViolationStore tests (AB-019)
+    // -------------------------------------------------------------------
+
+    fn make_test_violation(subject: &str, action: &str) -> ScpCustodyViolationAttestation {
+        ScpCustodyViolationAttestation {
+            subject_did: DID(subject.to_string()),
+            timestamp: 1_700_000_000,
+            violation: CustodyViolationType::CategoryAViolation {
+                action: action.to_string(),
+                signer_key_id: SigningKeyId::Agent,
+                signature_evidence: vec![0xDE, 0xAD],
+            },
+            verifier_signature: vec![0xAA, 0xBB],
+            verifier_did: DID("did:dht:verifier".to_string()),
+        }
+    }
+
+    fn make_test_counter(subject: &str, violation_ref: &str) -> CounterAttestation {
+        CounterAttestation {
+            subject_did: DID(subject.to_string()),
+            violation_reference: violation_ref.to_string(),
+            explanation: "key rotated, incident resolved".to_string(),
+            timestamp: 1_700_001_000,
+            signature: vec![0xCC, 0xDD],
+        }
+    }
+
+    #[test]
+    fn violation_store_log_and_retrieve() {
+        let mut store = InMemoryViolationStore::new();
+        let did = DID("did:dht:alice".to_string());
+        let violation = make_test_violation("did:dht:alice", "did_document_update");
+
+        store.log_violation(violation).unwrap();
+
+        let results = store.get_violations_for_did(&did);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            &results[0].violation,
+            CustodyViolationType::CategoryAViolation { action, .. }
+                if action == "did_document_update"
+        ));
+    }
+
+    #[test]
+    fn violation_store_multiple_dids() {
+        let mut store = InMemoryViolationStore::new();
+
+        store
+            .log_violation(make_test_violation("did:dht:alice", "did_document_update"))
+            .unwrap();
+        store
+            .log_violation(make_test_violation("did:dht:bob", "pre_rotation"))
+            .unwrap();
+        store
+            .log_violation(make_test_violation("did:dht:alice", "identity_migration"))
+            .unwrap();
+
+        let alice_did = DID("did:dht:alice".to_string());
+        let bob_did = DID("did:dht:bob".to_string());
+
+        assert_eq!(store.get_violations_for_did(&alice_did).len(), 2);
+        assert_eq!(store.get_violations_for_did(&bob_did).len(), 1);
+    }
+
+    #[test]
+    fn violation_store_counter_attestation() {
+        let mut store = InMemoryViolationStore::new();
+
+        store
+            .log_violation(make_test_violation("did:dht:alice", "did_document_update"))
+            .unwrap();
+
+        let counter = make_test_counter("did:dht:alice", "violation-hash-abc");
+        store.log_counter_attestation(counter).unwrap();
+
+        let alice_did = DID("did:dht:alice".to_string());
+        let counters = store.get_counter_attestations_for_did(&alice_did);
+        assert_eq!(counters.len(), 1);
+        assert_eq!(counters[0].violation_reference, "violation-hash-abc");
+    }
+
+    #[test]
+    fn violation_store_empty_query() {
+        let store = InMemoryViolationStore::new();
+        let nobody = DID("did:dht:nobody".to_string());
+
+        assert!(store.get_violations_for_did(&nobody).is_empty());
+        assert!(store.get_counter_attestations_for_did(&nobody).is_empty());
+    }
+
+    #[test]
+    fn violation_store_append_only() {
+        let mut store = InMemoryViolationStore::new();
+
+        store
+            .log_violation(make_test_violation("did:dht:alice", "did_document_update"))
+            .unwrap();
+        let alice_did = DID("did:dht:alice".to_string());
+        assert_eq!(store.get_violations_for_did(&alice_did).len(), 1);
+
+        store
+            .log_violation(make_test_violation("did:dht:alice", "pre_rotation"))
+            .unwrap();
+        assert_eq!(store.get_violations_for_did(&alice_did).len(), 2);
+
+        // Both violations preserved in order.
+        let violations = store.get_violations_for_did(&alice_did);
+        assert!(matches!(
+            &violations[0].violation,
+            CustodyViolationType::CategoryAViolation { action, .. }
+                if action == "did_document_update"
+        ));
+        assert!(matches!(
+            &violations[1].violation,
+            CustodyViolationType::CategoryAViolation { action, .. }
+                if action == "pre_rotation"
+        ));
     }
 }

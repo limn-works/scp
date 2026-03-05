@@ -229,7 +229,9 @@ impl NapiIdentity {
     ///
     /// # Returns
     ///
-    /// A new `NapiIdentity` with the agent key added.
+    /// A new `NapiIdentity` with the agent key added. The original
+    /// `NapiIdentity` is NOT mutated — callers must use the returned value.
+    /// Any references to the original instance retain the old state (pre-agent-key).
     ///
     /// # Errors
     ///
@@ -269,7 +271,9 @@ impl NapiIdentity {
     ///
     /// # Returns
     ///
-    /// A new `NapiIdentity` with the rotated agent key.
+    /// A new `NapiIdentity` with the rotated agent key. The original
+    /// `NapiIdentity` is NOT mutated — callers must use the returned value.
+    /// Any references to the original instance retain the old (pre-rotation) state.
     ///
     /// # Errors
     ///
@@ -309,7 +313,9 @@ impl NapiIdentity {
     ///
     /// # Returns
     ///
-    /// A new `NapiIdentity` with the agent key removed.
+    /// A new `NapiIdentity` with the agent key removed. The original
+    /// `NapiIdentity` is NOT mutated — callers must use the returned value.
+    /// Any references to the original instance retain the old (pre-removal) state.
     ///
     /// # Errors
     ///

@@ -1014,7 +1014,7 @@ pub fn verify_self_certification(
 ///
 /// Returns [`IdentityError::InvalidDidFormat`] if the key is not properly
 /// base58btc encoded.
-pub(crate) fn decode_multibase_key(encoded: &str) -> Result<[u8; 32], IdentityError> {
+pub fn decode_multibase_key(encoded: &str) -> Result<[u8; 32], IdentityError> {
     let b58_str = encoded.strip_prefix('z').ok_or_else(|| {
         IdentityError::InvalidDidFormat("multibase key must start with 'z' (base58btc)".to_owned())
     })?;

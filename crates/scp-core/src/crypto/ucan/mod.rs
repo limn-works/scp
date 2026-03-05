@@ -194,12 +194,21 @@ pub enum UcanError {
     SelfDelegationWithoutKeyScope,
 
     /// An agent key (`#agent`) attempted a Category A action (DID document
-    /// modification). The action was rejected and a custody violation
-    /// attestation was generated.
+    /// modification, pre-rotation, identity migration). The action was rejected
+    /// and a custody violation attestation should be generated.
+    ///
+    /// Category A actions are protocol-immutable: only `#0` or `#active` may
+    /// sign them. This is Enforcement Stack layer 3 (ADR-039): all conformant
+    /// verifiers reject these actions and log a custody violation.
     ///
     /// See ADR-039 and SCP-AB-020.
-    #[error("Category A violation: {0}")]
-    CategoryAViolation(String),
+    #[error("Category A violation: {action} signed by agent key (kid={kid})")]
+    CategoryAViolation {
+        /// The action that was attempted (e.g., `"did_document:update"`).
+        action: String,
+        /// The key identifier that signed the token (e.g., `"#agent"`).
+        kid: String,
+    },
 
     /// The revoker is not authorized to revoke the token (must be the token's
     /// issuer or the context creator).

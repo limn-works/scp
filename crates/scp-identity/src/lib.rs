@@ -45,8 +45,8 @@ pub use attestation::{
 };
 pub use cache::{DidCache, DidResolutionResult, Staleness};
 pub use dht::{
-    DidDht, did_from_ed25519_public_key, extract_public_key, verify_bep44_signature,
-    verify_migration, verify_self_certification,
+    DidDht, decode_multibase_key, did_from_ed25519_public_key, extract_public_key,
+    verify_bep44_signature, verify_migration, verify_self_certification,
 };
 // SigningKeyId is defined in this module and exported directly.
 pub use dht_client::{DhtClient, InMemoryDhtClient};

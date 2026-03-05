@@ -6,7 +6,7 @@
 //! an MLS `BasicCredential` identity payload. See ADR-001 and spec section
 //! 9.7.1 for the credential design, and ADR-039 for the signing key model.
 
-use scp_identity::SigningKeyId;
+use scp_identity::{DidDocument, SigningKeyId, decode_multibase_key};
 use serde::{Deserialize, Serialize};
 
 use super::error::MlsError;
@@ -126,6 +126,39 @@ impl ScpCredential {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, MlsError> {
         rmp_serde::from_slice(bytes)
             .map_err(|e| MlsError::CredentialSerializationFailed(e.to_string()))
+    }
+
+    /// Resolves the signing public key bytes from a DID document based on
+    /// this credential's [`signing_key_id`](Self::signing_key_id).
+    ///
+    /// - [`SigningKeyId::Active`] resolves the `#active` verification method.
+    /// - [`SigningKeyId::Agent`] resolves the `#agent` verification method.
+    ///
+    /// The returned bytes are the raw 32-byte Ed25519 public key, decoded
+    /// from the verification method's `publicKeyMultibase` field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlsError::InvalidCredential`] if:
+    /// - The DID document does not contain the required verification method
+    ///   (e.g., `#agent` is absent).
+    /// - The public key multibase encoding is invalid or not 32 bytes.
+    pub fn resolve_signing_key(&self, did_doc: &DidDocument) -> Result<[u8; 32], MlsError> {
+        let fragment = self.signing_key_id.fragment();
+        let vm = did_doc
+            .verification_method_by_fragment(fragment)
+            .ok_or_else(|| {
+                MlsError::InvalidCredential(format!(
+                    "DID document for {} has no #{fragment} verification method",
+                    self.did
+                ))
+            })?;
+
+        decode_multibase_key(&vm.public_key_multibase).map_err(|e| {
+            MlsError::InvalidCredential(format!(
+                "failed to decode #{fragment} public key from DID document: {e}"
+            ))
+        })
     }
 }
 
@@ -302,5 +335,85 @@ mod tests {
             let decoded = ScpCredential::from_bytes(&bytes).unwrap();
             assert_eq!(decoded.signing_key_id, key_id);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_signing_key tests (SCP-AB-011 AC4-7)
+    // -----------------------------------------------------------------------
+
+    const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+
+    /// Helper: creates a DID document with `#active` and optionally `#agent` VMs.
+    fn test_did_doc(active_key: &[u8; 32], agent_key: Option<&[u8; 32]>) -> DidDocument {
+        let identity_key = [0u8; 32];
+        let commitment = [0u8; 32];
+        let mut doc = DidDocument::new(TEST_DID, &identity_key, active_key, &commitment);
+
+        if let Some(agent_pk) = agent_key {
+            let agent_vm = scp_identity::document::VerificationMethod {
+                id: format!("{TEST_DID}#agent"),
+                method_type: "Ed25519VerificationKey2020".to_owned(),
+                controller: TEST_DID.to_owned(),
+                public_key_multibase: format!("z{}", bs58::encode(agent_pk).into_string()),
+            };
+            doc.verification_method.push(agent_vm);
+        }
+
+        doc
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn resolve_signing_key_active_returns_active_vm() {
+        let active_key = [2u8; 32];
+        let doc = test_did_doc(&active_key, None);
+
+        let cred = ScpCredential::new(TEST_DID.to_string(), None, SigningKeyId::Active).unwrap();
+        let resolved = cred.resolve_signing_key(&doc).unwrap();
+        assert_eq!(resolved, active_key);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn resolve_signing_key_agent_returns_agent_vm() {
+        let active_key = [2u8; 32];
+        let agent_key = [3u8; 32];
+        let doc = test_did_doc(&active_key, Some(&agent_key));
+
+        let cred = ScpCredential::new(TEST_DID.to_string(), None, SigningKeyId::Agent).unwrap();
+        let resolved = cred.resolve_signing_key(&doc).unwrap();
+        assert_eq!(resolved, agent_key);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn resolve_signing_key_agent_missing_vm_returns_error() {
+        let active_key = [2u8; 32];
+        // No agent key in this document.
+        let doc = test_did_doc(&active_key, None);
+
+        let cred = ScpCredential::new(TEST_DID.to_string(), None, SigningKeyId::Agent).unwrap();
+        let result = cred.resolve_signing_key(&doc);
+        assert!(result.is_err(), "must error when #agent VM is absent");
+
+        let err_msg = format!("{result:?}");
+        assert!(
+            err_msg.contains("#agent"),
+            "error should mention #agent, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn resolve_signing_key_active_with_agent_present_still_returns_active() {
+        let active_key = [2u8; 32];
+        let agent_key = [3u8; 32];
+        let doc = test_did_doc(&active_key, Some(&agent_key));
+
+        // Credential uses Active — should get the active key, not the agent key.
+        let cred = ScpCredential::new(TEST_DID.to_string(), None, SigningKeyId::Active).unwrap();
+        let resolved = cred.resolve_signing_key(&doc).unwrap();
+        assert_eq!(resolved, active_key);
+        assert_ne!(resolved, agent_key);
     }
 }

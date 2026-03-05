@@ -153,9 +153,11 @@ impl WasmIdentity {
     ///
     /// The caller (TypeScript SDK) **MUST** have already updated the DID
     /// document on the DHT to include the `#agent` verification method
-    /// **BEFORE** calling this method. Calling this method without completing
-    /// the DHT update first will result in inconsistent state between the
-    /// local `WasmIdentity` and the published DID document.
+    /// **BEFORE** calling this method. Local state is **NOT** automatically
+    /// synced with the DHT — this method only updates the in-memory
+    /// `WasmIdentity`. Calling this method without completing the DHT update
+    /// first will result in inconsistent state between the local
+    /// `WasmIdentity` and the published DID document.
     ///
     /// ## Required steps (in order)
     ///
@@ -197,9 +199,11 @@ impl WasmIdentity {
     ///
     /// The caller (TypeScript SDK) **MUST** have already updated the DID
     /// document on the DHT to remove the `#agent` verification method
-    /// **BEFORE** calling this method. Calling this method without completing
-    /// the DHT update first will result in inconsistent state between the
-    /// local `WasmIdentity` and the published DID document.
+    /// **BEFORE** calling this method. Local state is **NOT** automatically
+    /// synced with the DHT — this method only updates the in-memory
+    /// `WasmIdentity`. Calling this method without completing the DHT update
+    /// first will result in inconsistent state between the local
+    /// `WasmIdentity` and the published DID document.
     ///
     /// ## Required steps (in order)
     ///
@@ -229,10 +233,11 @@ impl WasmIdentity {
     ///
     /// The caller (TypeScript SDK) **MUST** have already updated the DID
     /// document on the DHT to retire the old `#agent` verification method
-    /// and install the new one **BEFORE** calling this method. Calling this
-    /// method without completing the DHT update first will result in
-    /// inconsistent state between the local `WasmIdentity` and the published
-    /// DID document.
+    /// and install the new one **BEFORE** calling this method. Local state
+    /// is **NOT** automatically synced with the DHT — this method only
+    /// updates the in-memory `WasmIdentity`. Calling this method without
+    /// completing the DHT update first will result in inconsistent state
+    /// between the local `WasmIdentity` and the published DID document.
     ///
     /// ## Required steps (in order)
     ///

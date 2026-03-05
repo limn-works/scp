@@ -14,6 +14,7 @@
 //!    5a. **Self-delegation** — Reject `iss == aud` unless `scp_key_scope` present (ADR-039).
 //!    5b. **Key scope** — If `fct.scp_key_scope` present, verify signing key matches scope (ADR-039).
 //! 6. **Capability match** — Verify `att` includes required capability.
+//!    6b. **Category A enforcement** — If `kid` is `#agent`, reject Category A capabilities (ADR-039).
 //! 7. **Attenuation** — Verify delegations narrow or preserve.
 //! 8. **Ceiling** — Verify capability is within context ceiling.
 //! 9. **Nonce** — Validate format, freshness, uniqueness.
@@ -28,9 +29,12 @@ use std::hash::BuildHasher;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
+use scp_identity::SigningKeyId;
+
 use super::capability::{CapabilityUri, check_capability_match, verify_ceiling_compliance};
 use super::revoke::compute_revocation_cid;
 use super::{UcanError, UcanHeader, UcanPayload, UcanToken};
+use crate::trust::custody_violation::{ActionCategory, classify_action};
 
 /// Maximum token lifetime: 24 hours in seconds (spec section 9.5).
 const MAX_EXPIRY_SECS: u64 = 24 * 60 * 60;
@@ -530,6 +534,11 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     check_capability_match(&granted_caps, required_capability)?;
 
+    // Step 6b: Category A enforcement (ADR-039 Enforcement Stack layer 3).
+    // If the token is signed by #agent, reject any Category A capabilities
+    // (DID document modifications, pre-rotation, identity migration).
+    enforce_ucan_category_a(token, &granted_caps)?;
+
     // Step 7: Attenuation — verify delegations narrow or preserve.
     // For root tokens (empty prf), this is a no-op.
     if !token.payload.prf.is_empty() {
@@ -565,9 +574,10 @@ where
 /// manages nonce tracking and revocation externally, or for quick signature
 /// and structure checks.
 ///
-/// Performs steps 1, 2, 4, 5, 5a, 5b, 6, 8, and 11 of the 11-step pipeline.
+/// Performs steps 1, 2, 4, 5, 5a, 5b, 6, 6b, 8, and 11 of the 11-step pipeline.
 /// Steps 5a (self-delegation without key scope) and 5b (key scope / kid
-/// mismatch) are enforced via [`validate_key_scope`].
+/// mismatch) are enforced via [`validate_key_scope`]. Step 6b (Category A
+/// enforcement) rejects agent-signed tokens granting Category A capabilities.
 ///
 /// # Errors
 ///
@@ -626,6 +636,9 @@ where
         })
         .collect::<Result<Vec<_>, _>>()?;
     check_capability_match(&granted_caps, required_capability)?;
+
+    // Step 6b: Category A enforcement (ADR-039).
+    enforce_ucan_category_a(token, &granted_caps)?;
 
     // Step 8: Ceiling.
     verify_ceiling_compliance(std::slice::from_ref(required_capability), ceiling)?;
@@ -692,6 +705,59 @@ fn validate_key_scope(token: &UcanToken) -> Result<(), UcanError> {
             return Err(UcanError::KeyScopeMismatch {
                 expected_scope: scope.clone(),
                 actual_kid: actual_kid.to_owned(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Step 6b: Enforces Category A restrictions on a UCAN token (ADR-039
+/// Enforcement Stack layer 3).
+///
+/// If the token is signed by `#agent` (indicated by the `kid` header field)
+/// and any granted capability is a Category A action, the token is rejected
+/// with [`UcanError::CategoryAViolation`].
+///
+/// This is a network-level enforcement point: non-conformant SDKs can produce
+/// these signatures but they cannot propagate through the network.
+///
+/// # Arguments
+///
+/// * `token` - The parsed UCAN token (reads `kid` from the header).
+/// * `granted_caps` - The parsed capability URIs from the token's attestations.
+///
+/// # Errors
+///
+/// Returns [`UcanError::CategoryAViolation`] if any capability is Category A
+/// and the signing key is `#agent`.
+fn enforce_ucan_category_a(
+    token: &UcanToken,
+    granted_caps: &[CapabilityUri],
+) -> Result<(), UcanError> {
+    let kid_str = token.header.kid.as_deref().unwrap_or("#active");
+
+    // Parse kid to SigningKeyId. Only #active and #agent are valid UCAN signing
+    // keys. Unknown kid values are rejected fail-closed.
+    let signing_key_id = match kid_str {
+        "#active" => SigningKeyId::Active,
+        "#agent" => SigningKeyId::Agent,
+        _ => {
+            return Err(UcanError::MalformedToken(format!(
+                "unrecognized signing key ID (kid): {kid_str}"
+            )));
+        }
+    };
+
+    if signing_key_id != SigningKeyId::Agent {
+        return Ok(());
+    }
+
+    for cap in granted_caps {
+        if classify_action(cap.resource()) == ActionCategory::CategoryA {
+            return Err(UcanError::CategoryAViolation {
+                action: cap.capability_name(),
+                kid: kid_str.to_owned(),
             });
         }
     }

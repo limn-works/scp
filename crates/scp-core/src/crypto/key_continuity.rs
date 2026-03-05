@@ -362,4 +362,173 @@ mod tests {
             "000000000000000000000000000000000000000000000000000000000000"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Agent key rotation and removal tests (SCP-AB-022 AC5-6)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn agent_key_rotation_changes_fingerprint() {
+        let alice_id = [1u8; 32];
+        let alice_active = [2u8; 32];
+        let alice_agent_a = [10u8; 32];
+        let alice_agent_b = [20u8; 32];
+        let bob_id = [3u8; 32];
+        let bob_active = [4u8; 32];
+
+        let alice_a = party(
+            "did:dht:z6MkAlice",
+            &alice_id,
+            &alice_active,
+            Some(&alice_agent_a),
+        );
+        let bob = party("did:dht:z6MkBob", &bob_id, &bob_active, None);
+
+        let fp_before = compute_key_continuity_fingerprint(&alice_a, &bob);
+
+        // Rotate Alice's agent key.
+        let alice_b = party(
+            "did:dht:z6MkAlice",
+            &alice_id,
+            &alice_active,
+            Some(&alice_agent_b),
+        );
+        let fp_after = compute_key_continuity_fingerprint(&alice_b, &bob);
+
+        assert_ne!(
+            fp_before, fp_after,
+            "rotating an agent key must change the fingerprint"
+        );
+    }
+
+    #[test]
+    fn agent_key_removal_changes_fingerprint() {
+        let alice_id = [1u8; 32];
+        let alice_active = [2u8; 32];
+        let alice_agent = [10u8; 32];
+        let bob_id = [3u8; 32];
+        let bob_active = [4u8; 32];
+
+        let alice_with = party(
+            "did:dht:z6MkAlice",
+            &alice_id,
+            &alice_active,
+            Some(&alice_agent),
+        );
+        let bob = party("did:dht:z6MkBob", &bob_id, &bob_active, None);
+
+        let fp_with = compute_key_continuity_fingerprint(&alice_with, &bob);
+
+        // Remove Alice's agent key.
+        let alice_without = party("did:dht:z6MkAlice", &alice_id, &alice_active, None);
+        let fp_without = compute_key_continuity_fingerprint(&alice_without, &bob);
+
+        assert_ne!(
+            fp_with, fp_without,
+            "removing an agent key must change the fingerprint (None uses sentinel)"
+        );
+    }
+
+    #[test]
+    fn different_agent_keys_produce_different_fingerprints() {
+        let alice_id = [1u8; 32];
+        let alice_active = [2u8; 32];
+        let alice_agent = [10u8; 32];
+        let bob_id = [3u8; 32];
+        let bob_active = [4u8; 32];
+        let bob_agent_a = [20u8; 32];
+        let bob_agent_b = [30u8; 32];
+
+        let alice = party(
+            "did:dht:z6MkAlice",
+            &alice_id,
+            &alice_active,
+            Some(&alice_agent),
+        );
+        let bob_a = party("did:dht:z6MkBob", &bob_id, &bob_active, Some(&bob_agent_a));
+
+        let fp1 = compute_key_continuity_fingerprint(&alice, &bob_a);
+
+        // Change Bob's agent key.
+        let bob_b = party("did:dht:z6MkBob", &bob_id, &bob_active, Some(&bob_agent_b));
+        let fp2 = compute_key_continuity_fingerprint(&alice, &bob_b);
+
+        assert_ne!(
+            fp1, fp2,
+            "different agent keys must produce different fingerprints"
+        );
+    }
+
+    #[test]
+    fn agent_key_rotation_one_side_only() {
+        let alice_id = [1u8; 32];
+        let alice_active = [2u8; 32];
+        let alice_agent_v1 = [10u8; 32];
+        let alice_agent_v2 = [11u8; 32];
+        let bob_id = [3u8; 32];
+        let bob_active = [4u8; 32];
+        let bob_agent = [20u8; 32];
+
+        let alice_v1 = party(
+            "did:dht:z6MkAlice",
+            &alice_id,
+            &alice_active,
+            Some(&alice_agent_v1),
+        );
+        let bob = party("did:dht:z6MkBob", &bob_id, &bob_active, Some(&bob_agent));
+
+        let fp_before = compute_key_continuity_fingerprint(&alice_v1, &bob);
+
+        // Alice rotates her agent key.
+        let alice_v2 = party(
+            "did:dht:z6MkAlice",
+            &alice_id,
+            &alice_active,
+            Some(&alice_agent_v2),
+        );
+        let fp_after = compute_key_continuity_fingerprint(&alice_v2, &bob);
+
+        assert_ne!(
+            fp_before, fp_after,
+            "one-sided agent key rotation must change the fingerprint"
+        );
+    }
+
+    #[test]
+    fn fingerprint_stability_across_agent_key_re_addition() {
+        let alice_id = [1u8; 32];
+        let alice_active = [2u8; 32];
+        let alice_agent = [10u8; 32];
+        let bob_id = [3u8; 32];
+        let bob_active = [4u8; 32];
+
+        let alice_with = party(
+            "did:dht:z6MkAlice",
+            &alice_id,
+            &alice_active,
+            Some(&alice_agent),
+        );
+        let bob = party("did:dht:z6MkBob", &bob_id, &bob_active, None);
+
+        let fp_original = compute_key_continuity_fingerprint(&alice_with, &bob);
+
+        // Remove agent key.
+        let alice_none = party("did:dht:z6MkAlice", &alice_id, &alice_active, None);
+        let fp_removed = compute_key_continuity_fingerprint(&alice_none, &bob);
+        assert_ne!(fp_original, fp_removed, "removal must change fingerprint");
+
+        // Re-add the same agent key.
+        let alice_re_added = party(
+            "did:dht:z6MkAlice",
+            &alice_id,
+            &alice_active,
+            Some(&alice_agent),
+        );
+        let fp_re_added = compute_key_continuity_fingerprint(&alice_re_added, &bob);
+
+        assert_eq!(
+            fp_original, fp_re_added,
+            "re-adding the same agent key must restore the original fingerprint"
+        );
+    }
 }
