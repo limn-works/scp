@@ -1050,6 +1050,13 @@ impl ContextManager {
             // State check inside lock -- eliminates TOCTOU race.
             require_active(&ctx.handle)?;
 
+            // Governance-level write revocation check (§9.17, ADR-038).
+            if ctx.write_revoked_members.contains(sender_did.as_ref()) {
+                return Err(ContextError::PermissionDenied(format!(
+                    "write access has been revoked for {sender_did}"
+                )));
+            }
+
             if let Some(ref bc) = ctx.broadcast_context {
                 // Broadcast path: capability check + seal under lock.
                 let envelope = bc.publish(sender_did, payload)?;
@@ -1371,6 +1378,13 @@ impl ContextManager {
 
             require_active(&ctx.handle)?;
 
+            // Governance-level write revocation check (§9.17, ADR-038).
+            if ctx.write_revoked_members.contains(author_did.as_ref()) {
+                return Err(ContextError::PermissionDenied(format!(
+                    "write access has been revoked for {author_did}"
+                )));
+            }
+
             let bc = ctx
                 .broadcast_context
                 .as_ref()
@@ -1508,7 +1522,34 @@ impl ContextManager {
             )));
         }
 
-        self.dispatch_governance_action(context_id, proposal).await
+        // Gate: reject replayed proposals (defense-in-depth).
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(context_id)
+                && ctx.executed_proposals.contains(&proposal.proposal_id)
+            {
+                return Err(ContextError::PermissionDenied(
+                    "governance proposal has already been executed".into(),
+                ));
+            }
+        }
+
+        let result = self
+            .dispatch_governance_action(context_id, proposal)
+            .await?;
+
+        // Record the proposal as executed (post-dispatch, covers all 25 variants).
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.executed_proposals.insert(proposal.proposal_id);
+                let snapshot = Self::snapshot_context(ctx);
+                drop(contexts);
+                self.persist_context_snapshot(context_id, &snapshot);
+            }
+        }
+
+        Ok(result)
     }
 
     /// Dispatches an approved governance action to its implementation method.
@@ -2342,6 +2383,11 @@ impl ContextManager {
 
             if !ctx.membership.contains(did) {
                 return Err(ContextError::MemberNotFound(did.to_string()));
+            }
+            if ctx.threshold_signers.contains(did) {
+                return Err(ContextError::PermissionDenied(format!(
+                    "DID is already a signer: {did}"
+                )));
             }
             ctx.threshold_signers.push(did.clone());
             Self::snapshot_context(ctx)
