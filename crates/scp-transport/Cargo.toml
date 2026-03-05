@@ -16,7 +16,7 @@ postgres-blob = ["dep:sqlx"]
 s3-blob = ["dep:aws-sdk-s3", "dep:aws-config"]
 quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:zeroize"]
 udp = ["dep:openssl", "dep:socket2"]
-http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:rustls", "dep:bytes", "dep:http"]
+http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:rustls", "dep:http"]
 webtransport-wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:web-sys", "dep:wasm-bindgen-futures", "dep:getrandom_02", "dep:getrandom_03"]
 coap = ["dep:coap-lite", "dep:openssl"]
 
@@ -53,7 +53,7 @@ h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
 rcgen = { version = "0.13", optional = true }
-bytes = { version = "1", optional = true }
+bytes = "1"
 http = { version = "1", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 js-sys = { version = "0.3", optional = true }

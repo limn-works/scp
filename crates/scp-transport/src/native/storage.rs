@@ -16,8 +16,11 @@
 //! See ADR-004 in `.docs/adrs/phase-1.md` for the full specification.
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 
+use bytes::Bytes;
+use futures::stream::{self, Stream, StreamExt};
 use tokio::sync::RwLock;
 
 /// A clock function that returns the current Unix timestamp in seconds.
@@ -73,6 +76,40 @@ pub enum StorageError {
     #[error("internal error: {0}")]
     Internal(String),
 }
+
+/// Blob metadata without the body. Returned by streaming operations
+/// so metadata is available before the body stream is consumed.
+#[derive(Debug, Clone)]
+pub struct BlobMetadata {
+    /// Per-context pseudonym this blob was published to (32 bytes).
+    pub routing_id: [u8; 32],
+    /// SHA-256 hash identifying the blob (32 bytes).
+    pub blob_id: [u8; 32],
+    /// Optional recipient pseudonym for directed delivery (32 bytes).
+    pub recipient_hint: Option<[u8; 32]>,
+    /// TTL at time of storage (seconds).
+    pub blob_ttl: u32,
+    /// Unix timestamp when the relay stored the blob.
+    pub stored_at: u64,
+    /// Content length in bytes, if known.
+    pub content_length: Option<u64>,
+}
+
+impl From<&StoredBlob> for BlobMetadata {
+    fn from(sb: &StoredBlob) -> Self {
+        Self {
+            routing_id: sb.routing_id,
+            blob_id: sb.blob_id,
+            recipient_hint: sb.recipient_hint,
+            blob_ttl: sb.blob_ttl,
+            stored_at: sb.stored_at,
+            content_length: Some(sb.blob.len() as u64),
+        }
+    }
+}
+
+/// A stream of blob body chunks.
+pub type BlobBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, StorageError>> + Send>>;
 
 /// Trait defining the blob storage interface for the SCP native relay.
 ///
@@ -135,6 +172,61 @@ pub trait BlobStorage: Send + Sync {
     fn purge_expired(
         &self,
     ) -> impl std::future::Future<Output = Result<usize, StorageError>> + Send;
+
+    /// Stores a blob from a stream of chunks.
+    ///
+    /// Default implementation collects the stream to `Vec<u8>` and delegates
+    /// to [`store`](Self::store). Backends where streaming avoids materialization
+    /// (e.g., S3) override this.
+    fn store_streaming(
+        &self,
+        routing_id: [u8; 32],
+        blob_id: [u8; 32],
+        recipient_hint: Option<[u8; 32]>,
+        blob_ttl: u32,
+        content_length: Option<u64>,
+        body: BlobBodyStream,
+    ) -> impl std::future::Future<Output = Result<BlobMetadata, StorageError>> + Send {
+        async move {
+            // content_length is advisory — used only as a capacity hint.
+            // Cap at 64 MiB to prevent a malicious hint from causing OOM.
+            const MAX_PREALLOC: u64 = 64 * 1024 * 1024;
+            #[allow(clippy::cast_possible_truncation)]
+            let mut buf = content_length.map_or_else(Vec::new, |len| {
+                Vec::with_capacity(len.min(MAX_PREALLOC) as usize)
+            });
+            let mut body = body;
+            while let Some(chunk) = body.next().await {
+                buf.extend_from_slice(&chunk?);
+            }
+            let stored = self
+                .store(routing_id, blob_id, recipient_hint, blob_ttl, buf)
+                .await?;
+            Ok(BlobMetadata::from(&stored))
+        }
+    }
+
+    /// Retrieves a blob as metadata + body stream.
+    ///
+    /// Default implementation calls [`get`](Self::get) and wraps the `Vec<u8>`
+    /// in a single-chunk stream. Backends where streaming avoids materialization
+    /// (e.g., S3) override this.
+    fn get_streaming(
+        &self,
+        blob_id: &[u8; 32],
+    ) -> impl std::future::Future<
+        Output = Result<Option<(BlobMetadata, BlobBodyStream)>, StorageError>,
+    > + Send {
+        async move {
+            let Some(stored) = self.get(blob_id).await? else {
+                return Ok(None);
+            };
+            let meta = BlobMetadata::from(&stored);
+            let body: BlobBodyStream =
+                Box::pin(stream::once(async move { Ok(Bytes::from(stored.blob)) }));
+            Ok(Some((meta, body)))
+        }
+    }
 }
 
 /// Internal entry stored in the in-memory map.
@@ -351,39 +443,28 @@ impl BlobStorage for InMemoryBlobStorage {
     async fn purge_expired(&self) -> Result<usize, StorageError> {
         let now = (self.clock)();
 
-        // Phase 1: identify expired blob IDs under a read lock.
-        let expired_ids: Vec<([u8; 32], [u8; 32])> = {
-            let blobs = self.blobs.read().await;
-            blobs
-                .iter()
-                .filter(|(_, entry)| entry.expires_at <= now)
-                .map(|(blob_id, entry)| (*blob_id, entry.stored_blob.routing_id))
-                .collect()
-        };
+        // Single write lock to avoid TOCTOU: a concurrent store() with the same
+        // blob_id between a read-scan and write-remove could delete a renewed blob.
+        let mut blobs = self.blobs.write().await;
+        let mut index = self.routing_index.write().await;
 
-        if expired_ids.is_empty() {
-            return Ok(0);
-        }
+        let expired_ids: Vec<([u8; 32], [u8; 32])> = blobs
+            .iter()
+            .filter(|(_, entry)| entry.expires_at <= now)
+            .map(|(blob_id, entry)| (*blob_id, entry.stored_blob.routing_id))
+            .collect();
 
-        let count = expired_ids.len();
-
-        // Phase 2: remove expired entries under a brief write lock.
-        {
-            let mut blobs = self.blobs.write().await;
-            let mut index = self.routing_index.write().await;
-
-            for (blob_id, routing_id) in &expired_ids {
-                blobs.remove(blob_id);
-                if let Some(ids) = index.get_mut(routing_id) {
-                    ids.retain(|id| id != blob_id);
-                    if ids.is_empty() {
-                        index.remove(routing_id);
-                    }
+        for (blob_id, routing_id) in &expired_ids {
+            blobs.remove(blob_id);
+            if let Some(ids) = index.get_mut(routing_id) {
+                ids.retain(|id| id != blob_id);
+                if ids.is_empty() {
+                    index.remove(routing_id);
                 }
             }
         }
 
-        Ok(count)
+        Ok(expired_ids.len())
     }
 }
 
@@ -406,6 +487,21 @@ impl BlobStorage for InMemoryBlobStorage {
 pub enum BlobStorageBackend {
     /// In-memory `HashMap`-backed storage (development / testing).
     InMemory(InMemoryBlobStorage),
+    /// SQLite-backed blob storage.
+    #[cfg(feature = "sqlite-blob")]
+    Sqlite(super::sqlite_blob::SqliteBlobStore),
+    /// redb-backed blob storage.
+    #[cfg(feature = "redb-blob")]
+    Redb(super::redb_blob::RedbBlobStore),
+    /// S3-compatible blob storage.
+    #[cfg(feature = "s3-blob")]
+    S3(super::s3_blob::S3BlobStore),
+    /// PostgreSQL-backed blob storage.
+    #[cfg(feature = "postgres-blob")]
+    Postgres(super::postgres_blob::PostgresBlobStore),
+    /// Combined SQLCipher-backed node storage (protocol + blob in one DB).
+    #[cfg(feature = "combined")]
+    Combined(super::combined::CombinedNodeStorage),
 }
 
 impl BlobStorageBackend {
@@ -419,6 +515,40 @@ impl BlobStorageBackend {
     #[must_use]
     pub fn in_memory_with_capacity(max_blobs: usize) -> Self {
         Self::InMemory(InMemoryBlobStorage::with_capacity(max_blobs))
+    }
+
+    /// Opens an SQLite-backed blob storage at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the database cannot be opened.
+    #[cfg(feature = "sqlite-blob")]
+    pub fn sqlite(path: &std::path::Path) -> Result<Self, StorageError> {
+        Ok(Self::Sqlite(super::sqlite_blob::SqliteBlobStore::open(
+            path,
+        )?))
+    }
+
+    /// Opens a redb-backed blob storage at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the database cannot be opened.
+    #[cfg(feature = "redb-blob")]
+    pub fn redb(path: &std::path::Path) -> Result<Self, StorageError> {
+        Ok(Self::Redb(super::redb_blob::RedbBlobStore::open(path)?))
+    }
+
+    /// Opens a combined SQLCipher-backed node storage at `dir/node.db`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the database cannot be opened.
+    #[cfg(feature = "combined")]
+    pub fn combined(dir: &std::path::Path, key: &[u8]) -> Result<Self, StorageError> {
+        Ok(Self::Combined(super::combined::CombinedNodeStorage::open(
+            dir, key,
+        )?))
     }
 }
 
@@ -434,6 +564,61 @@ impl From<InMemoryBlobStorage> for BlobStorageBackend {
     }
 }
 
+#[cfg(feature = "sqlite-blob")]
+impl From<super::sqlite_blob::SqliteBlobStore> for BlobStorageBackend {
+    fn from(storage: super::sqlite_blob::SqliteBlobStore) -> Self {
+        Self::Sqlite(storage)
+    }
+}
+
+#[cfg(feature = "redb-blob")]
+impl From<super::redb_blob::RedbBlobStore> for BlobStorageBackend {
+    fn from(storage: super::redb_blob::RedbBlobStore) -> Self {
+        Self::Redb(storage)
+    }
+}
+
+#[cfg(feature = "s3-blob")]
+impl From<super::s3_blob::S3BlobStore> for BlobStorageBackend {
+    fn from(storage: super::s3_blob::S3BlobStore) -> Self {
+        Self::S3(storage)
+    }
+}
+
+#[cfg(feature = "postgres-blob")]
+impl From<super::postgres_blob::PostgresBlobStore> for BlobStorageBackend {
+    fn from(storage: super::postgres_blob::PostgresBlobStore) -> Self {
+        Self::Postgres(storage)
+    }
+}
+
+#[cfg(feature = "combined")]
+impl From<super::combined::CombinedNodeStorage> for BlobStorageBackend {
+    fn from(storage: super::combined::CombinedNodeStorage) -> Self {
+        Self::Combined(storage)
+    }
+}
+
+/// Dispatch macro — generates a match arm for every `BlobStorageBackend` variant,
+/// forwarding to the inner implementation. Keeps the 7 trait methods DRY.
+macro_rules! dispatch {
+    ($self:expr, $method:ident ( $($arg:expr),* $(,)? )) => {
+        match $self {
+            BlobStorageBackend::InMemory(s) => s.$method($($arg),*).await,
+            #[cfg(feature = "sqlite-blob")]
+            BlobStorageBackend::Sqlite(s) => s.$method($($arg),*).await,
+            #[cfg(feature = "redb-blob")]
+            BlobStorageBackend::Redb(s) => s.$method($($arg),*).await,
+            #[cfg(feature = "s3-blob")]
+            BlobStorageBackend::S3(s) => s.$method($($arg),*).await,
+            #[cfg(feature = "postgres-blob")]
+            BlobStorageBackend::Postgres(s) => s.$method($($arg),*).await,
+            #[cfg(feature = "combined")]
+            BlobStorageBackend::Combined(s) => s.$method($($arg),*).await,
+        }
+    };
+}
+
 impl BlobStorage for BlobStorageBackend {
     async fn store(
         &self,
@@ -443,18 +628,14 @@ impl BlobStorage for BlobStorageBackend {
         blob_ttl: u32,
         blob: Vec<u8>,
     ) -> Result<StoredBlob, StorageError> {
-        match self {
-            Self::InMemory(s) => {
-                s.store(routing_id, blob_id, recipient_hint, blob_ttl, blob)
-                    .await
-            }
-        }
+        dispatch!(
+            self,
+            store(routing_id, blob_id, recipient_hint, blob_ttl, blob)
+        )
     }
 
     async fn get(&self, blob_id: &[u8; 32]) -> Result<Option<StoredBlob>, StorageError> {
-        match self {
-            Self::InMemory(s) => s.get(blob_id).await,
-        }
+        dispatch!(self, get(blob_id))
     }
 
     async fn query(
@@ -463,21 +644,44 @@ impl BlobStorage for BlobStorageBackend {
         since: Option<u64>,
         limit: u32,
     ) -> Result<Vec<StoredBlob>, StorageError> {
-        match self {
-            Self::InMemory(s) => s.query(routing_id, since, limit).await,
-        }
+        dispatch!(self, query(routing_id, since, limit))
     }
 
     async fn delete(&self, blob_id: &[u8; 32]) -> Result<bool, StorageError> {
-        match self {
-            Self::InMemory(s) => s.delete(blob_id).await,
-        }
+        dispatch!(self, delete(blob_id))
     }
 
     async fn purge_expired(&self) -> Result<usize, StorageError> {
-        match self {
-            Self::InMemory(s) => s.purge_expired().await,
-        }
+        dispatch!(self, purge_expired())
+    }
+
+    async fn store_streaming(
+        &self,
+        routing_id: [u8; 32],
+        blob_id: [u8; 32],
+        recipient_hint: Option<[u8; 32]>,
+        blob_ttl: u32,
+        content_length: Option<u64>,
+        body: BlobBodyStream,
+    ) -> Result<BlobMetadata, StorageError> {
+        dispatch!(
+            self,
+            store_streaming(
+                routing_id,
+                blob_id,
+                recipient_hint,
+                blob_ttl,
+                content_length,
+                body
+            )
+        )
+    }
+
+    async fn get_streaming(
+        &self,
+        blob_id: &[u8; 32],
+    ) -> Result<Option<(BlobMetadata, BlobBodyStream)>, StorageError> {
+        dispatch!(self, get_streaming(blob_id))
     }
 }
 

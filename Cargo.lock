@@ -4974,6 +4974,7 @@ dependencies = [
 name = "scp-testing"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures",
  "hex",
  "openmls",
