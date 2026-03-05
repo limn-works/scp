@@ -542,8 +542,10 @@ pub enum GovernanceAction {
     /// sequence. Exempt from governance freeze — this is the designated
     /// mechanism for lifting the freeze.
     ResolveConflict {
-        /// The proposal ID that caused the conflict.
-        conflicting_proposal_id: ProposalId,
+        /// The first conflicting proposal ID.
+        proposal_a: ProposalId,
+        /// The second conflicting proposal ID.
+        proposal_b: ProposalId,
         /// How to resolve the conflict.
         resolution: ConflictResolution,
     },

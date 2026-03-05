@@ -1662,10 +1662,11 @@ impl ContextManager {
                     .await
             }
             GovernanceAction::ResolveConflict {
-                conflicting_proposal_id,
+                proposal_a,
+                proposal_b,
                 resolution,
             } => {
-                self.execute_resolve_conflict(context_id, conflicting_proposal_id, resolution, pid)
+                self.execute_resolve_conflict(context_id, proposal_a, proposal_b, resolution, pid)
                     .await
             }
             // PromoteContext is handled in dispatch_governance_action (needs
@@ -1718,8 +1719,6 @@ impl ContextManager {
     ///
     /// # Errors
     ///
-    /// - [`ContextError::PermissionDenied`] if the proposal has already been
-    ///   executed (replay protection).
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
     ///   context.
@@ -1729,23 +1728,17 @@ impl ContextManager {
         &self,
         context_id: &str,
         author_did: &DID,
-        proposal_id: ProposalId,
+        _proposal_id: ProposalId,
     ) -> Result<AuthorBlockResult, ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
+        // Replay check and executed_proposals tracking are handled by the
+        // outer execute_governance_action wrapper — not duplicated here.
         let (result, snapshot) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
-
-            // Gate: reject replayed proposals (defense-in-depth).
-            if ctx.executed_proposals.contains(&proposal_id) {
-                return Err(ContextError::PermissionDenied(
-                    "governance proposal has already been executed".into(),
-                ));
-            }
-
             require_active(&ctx.handle)?;
 
             let bc = ctx
@@ -1763,25 +1756,11 @@ impl ContextManager {
                 author_did: author_did.clone(),
             });
 
-            // Record the proposal as executed (inside lock scope).
-            ctx.executed_proposals.insert(proposal_id);
-
             (result, snapshot)
         };
-        // Lock dropped.
 
         // Persist broadcast state for crash recovery.
         self.persist_broadcast_snapshot(context_id, &snapshot);
-
-        // Persist context state (executed_proposals updated) (best-effort).
-        {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(context_id) {
-                let ctx_snapshot = Self::snapshot_context(ctx);
-                drop(contexts);
-                self.persist_context_snapshot(context_id, &ctx_snapshot);
-            }
-        }
 
         self.event_log
             .append_context_event(&context_id_bytes, "AuthorBlocked")?;
@@ -1808,8 +1787,7 @@ impl ContextManager {
     ///
     /// # Errors
     ///
-    /// - [`ContextError::PermissionDenied`] if the proposal has already been
-    ///   executed (replay protection) or if the ceiling lacks `MemberBan`.
+    /// - [`ContextError::PermissionDenied`] if the ceiling lacks `MemberBan`.
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
     ///   context.
@@ -1821,23 +1799,17 @@ impl ContextManager {
         context_id: &str,
         did: &DID,
         scope: RevocationScope,
-        proposal_id: ProposalId,
+        _proposal_id: ProposalId,
     ) -> Result<GovernanceBanResult, ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
+        // Replay check and executed_proposals tracking are handled by the
+        // outer execute_governance_action wrapper — not duplicated here.
         let (result, snapshot) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
-
-            // Gate: reject replayed proposals (defense-in-depth).
-            if ctx.executed_proposals.contains(&proposal_id) {
-                return Err(ContextError::PermissionDenied(
-                    "governance proposal has already been executed".into(),
-                ));
-            }
-
             require_active(&ctx.handle)?;
 
             // Gate: ceiling must include MemberBan (§5.3, ADR-031).
@@ -1861,25 +1833,11 @@ impl ContextManager {
             ctx.receive_buffer
                 .push(ContextEvent::ReadAccessRevoked { did: did.clone() });
 
-            // Record the proposal as executed (inside lock scope).
-            ctx.executed_proposals.insert(proposal_id);
-
             (result, snapshot)
         };
-        // Lock dropped.
 
         // Persist broadcast state for crash recovery.
         self.persist_broadcast_snapshot(context_id, &snapshot);
-
-        // Persist context state (executed_proposals updated) (best-effort).
-        {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(context_id) {
-                let ctx_snapshot = Self::snapshot_context(ctx);
-                drop(contexts);
-                self.persist_context_snapshot(context_id, &ctx_snapshot);
-            }
-        }
 
         self.event_log
             .append_context_event(&context_id_bytes, "ReadAccessRevoked")?;
@@ -1905,8 +1863,7 @@ impl ContextManager {
     ///
     /// # Errors
     ///
-    /// - [`ContextError::PermissionDenied`] if the proposal has already been
-    ///   executed (replay protection) or if the ceiling lacks `MemberBan`.
+    /// - [`ContextError::PermissionDenied`] if the ceiling lacks `MemberBan`.
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
     ///   context.
@@ -1915,23 +1872,17 @@ impl ContextManager {
         &self,
         context_id: &str,
         did: &DID,
-        proposal_id: ProposalId,
+        _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
+        // Replay check and executed_proposals tracking are handled by the
+        // outer execute_governance_action wrapper — not duplicated here.
         let snapshot = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
-
-            // Gate: reject replayed proposals (defense-in-depth).
-            if ctx.executed_proposals.contains(&proposal_id) {
-                return Err(ContextError::PermissionDenied(
-                    "governance proposal has already been executed".into(),
-                ));
-            }
-
             require_active(&ctx.handle)?;
 
             // Gate: ceiling must include MemberBan (§5.3, ADR-031).
@@ -1955,25 +1906,11 @@ impl ContextManager {
             ctx.receive_buffer
                 .push(ContextEvent::ReadAccessRestored { did: did.clone() });
 
-            // Record the proposal as executed (inside lock scope).
-            ctx.executed_proposals.insert(proposal_id);
-
             snapshot
         };
-        // Lock dropped.
 
         // Persist broadcast state for crash recovery.
         self.persist_broadcast_snapshot(context_id, &snapshot);
-
-        // Persist context state (executed_proposals updated) (best-effort).
-        {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(context_id) {
-                let ctx_snapshot = Self::snapshot_context(ctx);
-                drop(contexts);
-                self.persist_context_snapshot(context_id, &ctx_snapshot);
-            }
-        }
 
         self.event_log
             .append_context_event(&context_id_bytes, "ReadAccessRestored")?;
@@ -1989,6 +1926,7 @@ impl ContextManager {
     // `execute_governance_action` after proposal approval.
     // -----------------------------------------------------------------------
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn execute_add_member(
         &self,
         context_id: &str,
@@ -2034,6 +1972,7 @@ impl ContextManager {
         Ok(())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn execute_remove_member(
         &self,
         context_id: &str,
@@ -2042,16 +1981,29 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
+        // Pre-check membership while holding the lock briefly.
+        {
+            let contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+            if !ctx.membership.contains(did) {
+                return Err(ContextError::MemberNotFound(did.to_string()));
+            }
+        }
+
+        // Crypto first: remove from MLS group before mutating state.
+        // Matches execute_add_member's pattern (crypto → state).
+        self.crypto
+            .remove_member(&context_id_bytes, did)
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
         let snapshot = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
-            require_active(&ctx.handle)?;
-
-            if !ctx.membership.contains(did) {
-                return Err(ContextError::MemberNotFound(did.to_string()));
-            }
 
             ctx.membership.remove_member(did);
             ctx.role_state.members.remove(did.as_ref());
@@ -2065,17 +2017,13 @@ impl ContextManager {
             Self::snapshot_context(ctx)
         };
 
-        // Crypto: remove from MLS group (no lock held).
-        self.crypto
-            .remove_member(&context_id_bytes, did)
-            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-
         self.persist_context_snapshot(context_id, &snapshot);
         self.event_log
             .append_context_event(&context_id_bytes, "MemberLeft")?;
         Ok(())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn execute_change_role(
         &self,
         context_id: &str,
@@ -2117,6 +2065,7 @@ impl ContextManager {
         Ok(())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn execute_register_tool(
         &self,
         context_id: &str,
@@ -2142,6 +2091,7 @@ impl ContextManager {
         Ok(())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn execute_remove_tool(
         &self,
         context_id: &str,
@@ -2167,6 +2117,7 @@ impl ContextManager {
         Ok(())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn execute_modify_ceiling(
         &self,
         context_id: &str,
@@ -2203,6 +2154,7 @@ impl ContextManager {
         Ok(())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn execute_close_context(
         &self,
         context_id: &str,
@@ -2238,6 +2190,7 @@ impl ContextManager {
         Ok(())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn execute_extend_ttl(
         &self,
         context_id: &str,
@@ -2267,6 +2220,7 @@ impl ContextManager {
         Ok(())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn execute_transfer_admin(
         &self,
         context_id: &str,
@@ -2319,6 +2273,7 @@ impl ContextManager {
         Ok(())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn execute_create_child_context(
         &self,
         context_id: &str,
@@ -2342,6 +2297,7 @@ impl ContextManager {
         Ok(())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn execute_modify_pruning_policy(
         &self,
         context_id: &str,
@@ -2366,7 +2322,12 @@ impl ContextManager {
                 .event_type_retention
                 .structural_retention_multiplier;
             // Scale multiplier to integer (3 decimal places of precision).
-            let multiplier_scaled = (multiplier * 1000.0).round() as u32;
+            // Clamp to valid u32 range — multiplier is always non-negative
+            // and well under u32::MAX in practice (typically 1.0–10.0).
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let multiplier_scaled = (multiplier * 1000.0)
+                .round()
+                .clamp(0.0, f64::from(u32::MAX)) as u32;
             // effective = retention_secs * multiplier_scaled / 1000
             let effective = tb
                 .retention_secs
@@ -2397,6 +2358,7 @@ impl ContextManager {
         Ok(())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn execute_add_signer(
         &self,
         context_id: &str,
@@ -2430,6 +2392,7 @@ impl ContextManager {
         Ok(())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn execute_remove_signer(
         &self,
         context_id: &str,
@@ -2471,6 +2434,7 @@ impl ContextManager {
         Ok(())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn execute_modify_threshold(
         &self,
         context_id: &str,
@@ -2502,6 +2466,7 @@ impl ContextManager {
         Ok(())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn execute_establish_tool_interface(
         &self,
         context_id: &str,
@@ -2527,6 +2492,7 @@ impl ContextManager {
         Ok(())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn execute_reset_member(
         &self,
         context_id: &str,
@@ -2564,7 +2530,8 @@ impl ContextManager {
     async fn execute_resolve_conflict(
         &self,
         context_id: &str,
-        conflicting_proposal_id: &ProposalId,
+        proposal_a: &ProposalId,
+        proposal_b: &ProposalId,
         resolution: &super::governance::ConflictResolution,
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
@@ -2578,19 +2545,24 @@ impl ContextManager {
             require_active(&ctx.handle)?;
 
             // Mark the conflicting proposal(s) as executed (invalidated) so
-            // they cannot be replayed. For AcceptProposal the loser is
-            // invalidated; for InvalidateBoth, both are.
+            // they cannot be replayed. For AcceptProposal the winner is
+            // accepted and the loser invalidated; for InvalidateBoth, both
+            // are invalidated.
             match resolution {
                 super::governance::ConflictResolution::AcceptProposal { winner_id } => {
-                    // Invalidate the conflicting proposal (the loser).
-                    ctx.executed_proposals.insert(*conflicting_proposal_id);
-                    // The winner is accepted — it proceeds through normal execution.
-                    // Mark it as executed to prevent double-execution.
+                    // Invalidate the loser. The winner proceeds through normal
+                    // execution; mark it as executed to prevent double-execution.
+                    let loser = if *winner_id == *proposal_a {
+                        proposal_b
+                    } else {
+                        proposal_a
+                    };
+                    ctx.executed_proposals.insert(*loser);
                     ctx.executed_proposals.insert(*winner_id);
                 }
                 super::governance::ConflictResolution::InvalidateBoth => {
-                    // Both proposals are invalidated.
-                    ctx.executed_proposals.insert(*conflicting_proposal_id);
+                    ctx.executed_proposals.insert(*proposal_a);
+                    ctx.executed_proposals.insert(*proposal_b);
                 }
             }
 
@@ -2603,6 +2575,7 @@ impl ContextManager {
         Ok(())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn execute_promote_context(
         &self,
         context_id: &str,
@@ -2661,6 +2634,7 @@ impl ContextManager {
         Ok(())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn execute_revoke_write_access(
         &self,
         context_id: &str,
@@ -2672,8 +2646,9 @@ impl ContextManager {
         // Both Full and FutureOnly block future writes via write_revoked_members.
         // Full additionally suppresses historical content via access key
         // destruction (ADR-038 §3) — delegated to the access key layer when
-        // it processes the WriteAccessRevoked event. The scope is recorded in
-        // the event for downstream differentiation.
+        // it processes the WriteAccessRevoked event. Scope differentiation
+        // is deferred to the content-access stories (SCP-CAC-007, SCP-CAC-008)
+        // which will thread scope into write_revoked_members and the event.
         let _ = scope;
 
         let (snapshot, bc_snapshot) = {
@@ -2697,15 +2672,13 @@ impl ContextManager {
 
             // Broadcast mode: also destroy the author's broadcast key so
             // key requests return Deny (§5.14.8 "Author removal").
-            let bc_snap = if let Some(ref mut bc) = ctx.broadcast_context {
+            let bc_snap = ctx.broadcast_context.as_mut().map(|bc| {
                 // block_author removes the author from the authors map,
                 // destroying their key and preventing future key distribution.
                 // Ignore error if DID is not an author (may be a subscriber).
                 let _ = bc.block_author(&did.0);
-                Some(bc.to_snapshot())
-            } else {
-                None
-            };
+                bc.to_snapshot()
+            });
 
             (Self::snapshot_context(ctx), bc_snap)
         };
@@ -2719,6 +2692,7 @@ impl ContextManager {
         Ok(())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn execute_restore_write_access(
         &self,
         context_id: &str,
@@ -2822,6 +2796,18 @@ impl ContextManager {
                         }
                         ctx.threshold_value = *new_threshold;
                     }
+                }
+            }
+
+            // Post-loop invariant: threshold must still be satisfiable after
+            // all removals and reductions (ADR-031 §10).
+            if ctx.threshold_value > 0 {
+                let remaining = u32::try_from(ctx.threshold_signers.len()).unwrap_or(u32::MAX);
+                if ctx.threshold_value > remaining {
+                    return Err(ContextError::PermissionDenied(format!(
+                        "reconfiguration left {remaining} signers < threshold {}",
+                        ctx.threshold_value,
+                    )));
                 }
             }
 

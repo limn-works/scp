@@ -385,7 +385,7 @@ impl ContextHandle {
     /// (§5.10). This is the only spec-authorized mutation of `ContextParams`
     /// after creation — promotion changes the opt-in contract from ephemeral
     /// to persistent.
-    pub fn promote_memory_scope(&mut self) {
+    pub const fn promote_memory_scope(&mut self) {
         self.params.memory_scope = params::MemoryScope::Full;
     }
 
