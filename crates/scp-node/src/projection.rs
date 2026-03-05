@@ -182,15 +182,19 @@ impl ProjectedContext {
         self.keys.insert(epoch, broadcast_key);
     }
 
-    /// Removes all keys with epoch strictly less than `epoch`.
+    /// Removes all keys whose epoch is NOT in the given set.
     ///
     /// Used after a `Full`-scope governance ban to ensure historical content
     /// encrypted under pre-ban keys is no longer decryptable by the
     /// projection endpoint. Messages referencing purged epochs will return
-    /// 500 (decryption failure) rather than serving content that a banned
-    /// subscriber may have previously accessed.
-    pub fn purge_keys_before(&mut self, epoch: u64) {
-        self.keys.retain(|&e, _| e >= epoch);
+    /// 410 Gone rather than serving content that a banned subscriber may
+    /// have previously accessed.
+    ///
+    /// Takes a set of epochs to retain (typically the new post-rotation
+    /// epochs). This correctly handles epoch-divergent multi-author contexts
+    /// where authors may be at different epochs.
+    pub fn retain_only_epochs(&mut self, epochs: &std::collections::HashSet<u64>) {
+        self.keys.retain(|e, _| epochs.contains(e));
     }
 
     /// Returns the broadcast key for the given epoch, if present.
@@ -824,8 +828,9 @@ pub async fn feed_handler(
 /// - **400** — Invalid hex in `routing_id` or `blob_id` path segment.
 /// - **404** — Unknown routing ID (no projected context registered) or
 ///   unknown blob ID (not in storage or routing ID mismatch).
-/// - **500** — Decryption failure (missing epoch key, corrupt envelope, or
-///   AEAD open failure).
+/// - **410** — Content revoked (epoch key purged after a `Full`-scope
+///   governance ban).
+/// - **500** — Decryption failure (corrupt envelope or AEAD open failure).
 ///
 /// See spec section 18.11.4.
 #[allow(clippy::too_many_lines)]
@@ -938,14 +943,16 @@ pub async fn message_handler(
         return *resp;
     }
 
-    // Find the matching broadcast key for this epoch.
+    // Find the matching broadcast key for this epoch. A missing key
+    // indicates the epoch was purged after a Full-scope governance ban
+    // (intentional revocation) — return 410 Gone rather than 500.
     let Some(key) = keys.get(&envelope.key_epoch) else {
-        tracing::error!(
+        tracing::warn!(
             blob_id = blob_id_hex,
             epoch = envelope.key_epoch,
-            "no broadcast key for epoch"
+            "no broadcast key for epoch (likely purged after governance ban)"
         );
-        return ApiError::internal_error("decryption failure").into_response();
+        return ApiError::gone("content revoked").into_response();
     };
 
     // Decrypt.
@@ -1841,6 +1848,76 @@ mod tests {
         assert!(ctx.key_for_epoch(0).is_some());
     }
 
+    #[test]
+    fn retain_only_epochs_keeps_specified_purges_rest() {
+        let key0 = generate_broadcast_key("did:dht:alice");
+        let mut ctx = ProjectedContext::new("purge_test", key0, BroadcastAdmission::Open, None);
+
+        // Build up epochs 0, 1, 2.
+        let k0 = ctx.key_for_epoch(0).unwrap().clone();
+        let (k1, _) = rotate_broadcast_key(&k0, 1000).unwrap();
+        ctx.insert_key(k1.clone());
+        let (k2, _) = rotate_broadcast_key(&k1, 2000).unwrap();
+        ctx.insert_key(k2);
+        assert_eq!(ctx.keys().len(), 3);
+
+        // Retain only epoch 2 (simulates Full-scope ban where author
+        // rotated to epoch 2).
+        let retain = std::collections::HashSet::from([2]);
+        ctx.retain_only_epochs(&retain);
+
+        assert!(ctx.key_for_epoch(0).is_none(), "epoch 0 purged");
+        assert!(ctx.key_for_epoch(1).is_none(), "epoch 1 purged");
+        assert!(ctx.key_for_epoch(2).is_some(), "epoch 2 retained");
+        assert_eq!(ctx.keys().len(), 1);
+    }
+
+    #[test]
+    fn retain_only_epochs_handles_divergent_authors() {
+        // Simulate two authors at different epochs: alice at epoch 3,
+        // bob at epoch 1. Full-scope ban should retain only {3, 1}.
+        let alice_key = generate_broadcast_key("did:dht:alice");
+        let mut ctx = ProjectedContext::new(
+            "divergent_test",
+            alice_key.clone(),
+            BroadcastAdmission::Open,
+            None,
+        );
+
+        // Alice: epochs 0, 1, 2, 3.
+        let (a1, _) = rotate_broadcast_key(&alice_key, 1000).unwrap();
+        ctx.insert_key(a1.clone());
+        let (a2, _) = rotate_broadcast_key(&a1, 2000).unwrap();
+        ctx.insert_key(a2.clone());
+        let (a3, _) = rotate_broadcast_key(&a2, 3000).unwrap();
+        ctx.insert_key(a3);
+
+        // Bob: epochs 4, 5 (start at epoch 4 to avoid collision with
+        // alice's epochs in the HashMap).
+        let bob_key = generate_broadcast_key("did:dht:bob");
+        let (b1, _) = rotate_broadcast_key(&bob_key, 1000).unwrap();
+        let (b2, _) = rotate_broadcast_key(&b1, 2000).unwrap();
+        let (b3, _) = rotate_broadcast_key(&b2, 3000).unwrap();
+        let (b4, _) = rotate_broadcast_key(&b3, 4000).unwrap();
+        ctx.insert_key(b4.clone());
+        let (b5, _) = rotate_broadcast_key(&b4, 5000).unwrap();
+        ctx.insert_key(b5);
+
+        assert_eq!(ctx.keys().len(), 6); // epochs 0,1,2,3 (alice) + 4,5 (bob)
+
+        // Full-scope ban: alice rotated to 3, bob rotated to 5.
+        let retain = std::collections::HashSet::from([3, 5]);
+        ctx.retain_only_epochs(&retain);
+
+        assert_eq!(ctx.keys().len(), 2);
+        assert!(ctx.key_for_epoch(3).is_some(), "alice new epoch retained");
+        assert!(ctx.key_for_epoch(5).is_some(), "bob new epoch retained");
+        assert!(ctx.key_for_epoch(0).is_none(), "old alice epoch purged");
+        assert!(ctx.key_for_epoch(1).is_none(), "old alice epoch purged");
+        assert!(ctx.key_for_epoch(2).is_none(), "old alice epoch purged");
+        assert!(ctx.key_for_epoch(4).is_none(), "old bob epoch purged");
+    }
+
     // -------------------------------------------------------------------
     // Test A: Cross-context routing_id mismatch (BLACK-HTTP-005 defense)
     // -------------------------------------------------------------------
@@ -2197,6 +2274,66 @@ mod tests {
         let content_b64 = messages[0]["content"].as_str().unwrap();
         let decoded = BASE64.decode(content_b64).unwrap();
         assert_eq!(decoded, b"valid message");
+    }
+
+    // -------------------------------------------------------------------
+    // Test D2: Purged epoch key returns 410 Gone (not 500)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn message_purged_epoch_returns_410_gone() {
+        // Seal a message at epoch 0, then purge epoch 0 from the
+        // projected context (simulating a Full-scope governance ban).
+        // The message_handler should return 410 Gone.
+        let key = generate_broadcast_key("did:dht:alice");
+        let context_id = "purge_410_ctx";
+        let mut projected =
+            ProjectedContext::new(context_id, key.clone(), BroadcastAdmission::Open, None);
+
+        // Rotate to epoch 1 and retain only epoch 1 (purge epoch 0).
+        let (key1, _) = rotate_broadcast_key(&key, 1000).unwrap();
+        projected.insert_key(key1);
+        let retain = std::collections::HashSet::from([1]);
+        projected.retain_only_epochs(&retain);
+        assert!(projected.key_for_epoch(0).is_none());
+        assert!(projected.key_for_epoch(1).is_some());
+
+        let routing_id = projected.routing_id;
+        let mut projected_map = HashMap::new();
+        projected_map.insert(routing_id, projected);
+
+        let storage = InMemoryBlobStorage::new();
+
+        // Store a blob encrypted at epoch 0 (the purged epoch).
+        let envelope = seal_broadcast(&key, b"old content").unwrap();
+        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_id = {
+            let mut h = Sha256::new();
+            h.update(&blob_bytes);
+            let r: [u8; 32] = h.finalize().into();
+            r
+        };
+        storage
+            .store(routing_id, blob_id, None, 3600, blob_bytes)
+            .await
+            .unwrap();
+
+        let state = test_state_with(projected_map, storage);
+        let router = broadcast_projection_router(state);
+        let routing_hex = hex_encode(&routing_id);
+        let blob_hex = hex_encode(&blob_id);
+        let req = Request::builder()
+            .uri(format!("/scp/broadcast/{routing_hex}/messages/{blob_hex}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), HttpStatus::GONE);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "content revoked");
+        assert_eq!(json["code"], "GONE");
     }
 
     // -------------------------------------------------------------------

@@ -93,6 +93,20 @@ impl ApiError {
         )
     }
 
+    /// Returns a gone error response (HTTP 410) with the given message.
+    ///
+    /// Used when content has been intentionally revoked (e.g., after a
+    /// `Full`-scope governance ban purges old-epoch broadcast keys).
+    pub(crate) fn gone(msg: impl Into<String>) -> (StatusCode, Json<Self>) {
+        (
+            StatusCode::GONE,
+            Json(Self {
+                error: msg.into(),
+                code: "GONE".to_owned(),
+            }),
+        )
+    }
+
     /// Returns an internal server error response (HTTP 500) with the given message.
     pub(crate) fn internal_error(msg: impl Into<String>) -> (StatusCode, Json<Self>) {
         (

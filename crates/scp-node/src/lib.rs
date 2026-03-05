@@ -492,13 +492,17 @@ impl<S: Storage> ApplicationNode<S> {
                 projected.insert_key(rotation.new_key.clone());
             }
 
-            // Full scope: purge old-epoch keys so historical content is no
-            // longer decryptable via projection.
-            if ban_result.scope == RevocationScope::Full
-                && let Some(min_new_epoch) =
-                    ban_result.rotated_authors.iter().map(|r| r.new_epoch).min()
-            {
-                projected.purge_keys_before(min_new_epoch);
+            // Full scope: retain only the new post-rotation keys, purging
+            // all pre-ban keys so historical content is no longer
+            // decryptable via projection. Uses retain_only_epochs to
+            // correctly handle epoch-divergent multi-author contexts.
+            if ban_result.scope == RevocationScope::Full {
+                let new_epochs: std::collections::HashSet<u64> = ban_result
+                    .rotated_authors
+                    .iter()
+                    .map(|r| r.new_epoch)
+                    .collect();
+                projected.retain_only_epochs(&new_epochs);
             }
         }
     }

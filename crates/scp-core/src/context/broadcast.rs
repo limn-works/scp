@@ -3204,6 +3204,29 @@ mod tests {
     }
 
     #[test]
+    fn governance_ban_full_scope_threads_through_result() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        ctx.add_author("did:example:bob").unwrap();
+        subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
+
+        let result = ctx
+            .governance_ban_subscriber("did:example:sub1", RevocationScope::Full)
+            .unwrap();
+
+        // Scope is preserved on the result.
+        assert_eq!(result.scope, RevocationScope::Full);
+        assert_eq!(result.rotated_authors.len(), 2);
+
+        // Each rotation includes a usable new key.
+        for rotation in &result.rotated_authors {
+            assert_eq!(rotation.new_epoch, 1);
+            assert_eq!(rotation.new_key.epoch(), 1);
+            assert_eq!(rotation.new_key.author_did(), rotation.author_did);
+        }
+    }
+
+    #[test]
     fn governance_unban_idempotent_on_unknown_did() {
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
