@@ -237,7 +237,7 @@ async fn run_full_node() {
     );
 
     let mut builder = ApplicationNodeBuilder::new()
-        .storage(Arc::new(InMemoryStorage::new()))
+        .storage(InMemoryStorage::new())
         .domain(&domain)
         .generate_identity_with(custody, did_method)
         .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
