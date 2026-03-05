@@ -41,7 +41,9 @@ use std::sync::Arc;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 
-use super::storage::{BlobStorage, ClockFn, StorageError, StoredBlob, system_clock};
+use super::storage::{
+    BlobBodyStream, BlobMetadata, BlobStorage, ClockFn, StorageError, StoredBlob, system_clock,
+};
 
 /// S3-compatible blob storage backend for the SCP native relay.
 ///
@@ -58,6 +60,17 @@ pub struct S3BlobStore {
     bucket: String,
     prefix: String,
     clock: ClockFn,
+}
+
+impl std::fmt::Debug for S3BlobStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3BlobStore")
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("client", &"<aws_sdk_s3::Client>")
+            .field("clock", &"<fn>")
+            .finish()
+    }
 }
 
 impl Clone for S3BlobStore {
@@ -211,6 +224,23 @@ impl S3BlobStore {
         metadata: &HashMap<String, String>,
         body: Vec<u8>,
     ) -> Result<StoredBlob, StorageError> {
+        let content_length = Some(body.len() as u64);
+        let meta = Self::metadata_from_response(metadata, content_length)?;
+        Ok(StoredBlob {
+            routing_id: meta.routing_id,
+            blob_id: meta.blob_id,
+            recipient_hint: meta.recipient_hint,
+            blob_ttl: meta.blob_ttl,
+            stored_at: meta.stored_at,
+            blob: body,
+        })
+    }
+
+    /// Reconstructs [`BlobMetadata`] from S3 object metadata headers.
+    fn metadata_from_response(
+        metadata: &HashMap<String, String>,
+        content_length: Option<u64>,
+    ) -> Result<BlobMetadata, StorageError> {
         let routing_id = Self::parse_hex_32(Self::require_metadata(metadata, "routing_id")?)?;
         let blob_id = Self::parse_hex_32(Self::require_metadata(metadata, "blob_id")?)?;
         let blob_ttl = Self::parse_u32(Self::require_metadata(metadata, "blob_ttl")?)?;
@@ -221,13 +251,13 @@ impl S3BlobStore {
             .map(|v| Self::parse_hex_32(v))
             .transpose()?;
 
-        Ok(StoredBlob {
+        Ok(BlobMetadata {
             routing_id,
             blob_id,
             recipient_hint,
             blob_ttl,
             stored_at,
-            blob: body,
+            content_length,
         })
     }
 
@@ -277,6 +307,7 @@ impl S3BlobStore {
     }
 }
 
+#[async_trait::async_trait]
 impl BlobStorage for S3BlobStore {
     async fn store(
         &self,
@@ -652,6 +683,184 @@ impl BlobStorage for S3BlobStore {
         }
 
         Ok(count)
+    }
+
+    async fn store_streaming(
+        &self,
+        routing_id: [u8; 32],
+        blob_id: [u8; 32],
+        recipient_hint: Option<[u8; 32]>,
+        blob_ttl: u32,
+        content_length: Option<u64>,
+        body: BlobBodyStream,
+    ) -> Result<BlobMetadata, StorageError> {
+        use bytes::Bytes;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        let stored_at = self.now();
+        let expires_at = stored_at.saturating_add(u64::from(blob_ttl));
+
+        // Build metadata map for S3 object user metadata.
+        let mut metadata = HashMap::new();
+        metadata.insert("routing_id".to_owned(), hex::encode(routing_id));
+        metadata.insert("blob_id".to_owned(), hex::encode(blob_id));
+        metadata.insert("blob_ttl".to_owned(), blob_ttl.to_string());
+        metadata.insert("stored_at".to_owned(), stored_at.to_string());
+        metadata.insert("expires_at".to_owned(), expires_at.to_string());
+        if let Some(hint) = &recipient_hint {
+            metadata.insert("recipient_hint".to_owned(), hex::encode(hint));
+        }
+
+        // Adapt BlobBodyStream → http_body::Body → ByteStream for S3 PutObject.
+        // This streams directly to S3 without collecting the full blob in memory.
+        //
+        // Mutex satisfies the `Sync` bound required by `from_body_1_x` without
+        // unsafe code. The stream is only polled sequentially by the HTTP client,
+        // so the Mutex never actually contends.
+        struct StreamBody(std::sync::Mutex<BlobBodyStream>);
+
+        impl http_body::Body for StreamBody {
+            type Data = Bytes;
+            type Error = Box<dyn std::error::Error + Send + Sync>;
+
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+                let mut guard = self.0.lock().expect("StreamBody mutex poisoned");
+                match guard.as_mut().poll_next(cx) {
+                    Poll::Ready(Some(Ok(bytes))) => {
+                        Poll::Ready(Some(Ok(http_body::Frame::data(bytes))))
+                    }
+                    Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(Box::new(e) as _))),
+                    Poll::Ready(None) => Poll::Ready(None),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+
+        let adapter = StreamBody(std::sync::Mutex::new(body));
+        let mut put_builder = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.blob_key(&blob_id))
+            .set_metadata(Some(metadata.clone()));
+
+        // Set content length if provided — S3 can use it for validation.
+        if let Some(len) = content_length {
+            #[allow(clippy::cast_possible_wrap)]
+            {
+                put_builder = put_builder.content_length(len as i64);
+            }
+        }
+
+        put_builder
+            .body(ByteStream::from_body_1_x(adapter))
+            .send()
+            .await
+            .map_err(|e| StorageError::Internal(format!("S3 streaming put failed: {e}")))?;
+
+        // Put routing index entry (empty body, metadata with stored_at).
+        let routing_key = self.routing_key(&routing_id, &blob_id);
+        let mut routing_metadata = HashMap::new();
+        routing_metadata.insert("stored_at".to_owned(), stored_at.to_string());
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&routing_key)
+            .body(ByteStream::from(Vec::<u8>::new()))
+            .set_metadata(Some(routing_metadata))
+            .send()
+            .await
+            .map_err(|e| {
+                StorageError::Internal(format!(
+                    "S3 put routing index failed for {routing_key}: {e}"
+                ))
+            })?;
+
+        // Put expiry index entry (empty body, metadata with routing_id).
+        let expiry_key = self.expiry_key(expires_at, &blob_id);
+        let mut expiry_metadata = HashMap::new();
+        expiry_metadata.insert("routing_id".to_owned(), hex::encode(routing_id));
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&expiry_key)
+            .body(ByteStream::from(Vec::<u8>::new()))
+            .set_metadata(Some(expiry_metadata))
+            .send()
+            .await
+            .map_err(|e| {
+                StorageError::Internal(format!("S3 put expiry index failed for {expiry_key}: {e}"))
+            })?;
+
+        Ok(BlobMetadata {
+            routing_id,
+            blob_id,
+            recipient_hint,
+            blob_ttl,
+            stored_at,
+            content_length,
+        })
+    }
+
+    async fn get_streaming(
+        &self,
+        blob_id: &[u8; 32],
+    ) -> Result<Option<(BlobMetadata, BlobBodyStream)>, StorageError> {
+        use futures::stream::unfold;
+
+        let key = self.blob_key(blob_id);
+
+        let output = match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+        {
+            Ok(output) => output,
+            Err(e) => {
+                let service_err = e.into_service_error();
+                if service_err.is_no_such_key() {
+                    return Ok(None);
+                }
+                return Err(StorageError::Internal(format!(
+                    "S3 get failed for {key}: {service_err}"
+                )));
+            }
+        };
+
+        let metadata = output.metadata().cloned().unwrap_or_default();
+        let s3_content_length = output.content_length().and_then(|l| u64::try_from(l).ok());
+
+        let meta = Self::metadata_from_response(&metadata, s3_content_length)?;
+
+        // Check expiry.
+        let expires_at = meta.stored_at.saturating_add(u64::from(meta.blob_ttl));
+        if expires_at <= self.now() {
+            return Ok(None);
+        }
+
+        // Stream the S3 body directly without collecting to Vec<u8>.
+        // Wrap ByteStream in Option so the stream terminates on error (returning
+        // None from the unfold closure).
+        let body: BlobBodyStream = Box::pin(unfold(Some(output.body), |state| async move {
+            let mut byte_stream = state?;
+            match byte_stream.next().await {
+                Some(Ok(bytes)) => Some((Ok(bytes), Some(byte_stream))),
+                Some(Err(e)) => Some((
+                    Err(StorageError::Internal(format!("S3 body read error: {e}"))),
+                    None, // terminate stream after error
+                )),
+                None => None,
+            }
+        }));
+
+        Ok(Some((meta, body)))
     }
 }
 

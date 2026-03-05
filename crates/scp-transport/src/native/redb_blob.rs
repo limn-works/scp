@@ -154,6 +154,7 @@ impl RedbBlobStore {
 }
 
 #[allow(clippy::significant_drop_tightening)]
+#[async_trait::async_trait]
 impl BlobStorage for RedbBlobStore {
     async fn store(
         &self,

@@ -1,6 +1,6 @@
 //! Blob store conformance test macro.
 //!
-//! The [`blob_store_conformance`] macro generates 11 test cases that validate
+//! The [`blob_store_conformance`] macro generates 19 test cases that validate
 //! any [`BlobStorage`](scp_transport::native::storage::BlobStorage)
 //! implementation against the spec (section 17.11, 17.13):
 //!
@@ -15,10 +15,18 @@
 //! 9. `concurrent_store_purge` — concurrent store + `purge_expired` is safe
 //! 10. `purge_expired_only` — `purge_expired` removes only expired blobs
 //! 11. `query_empty_returns_empty` — query for unknown `routing_id` returns empty Vec
+//! 12. `store_streaming_roundtrip` — store via stream, verify via get
+//! 13. `get_streaming_roundtrip` — store via regular store, retrieve via `get_streaming`
+//! 14. `store_streaming_get_streaming_roundtrip` — full streaming roundtrip
+//! 15. `store_streaming_empty_body` — streaming store with empty body
+//! 16. `store_streaming_content_length_hint` — `content_length` hint is advisory
+//! 17. `get_streaming_nonexistent` — `get_streaming` for missing blob returns None
+//! 18. `store_streaming_query_interop` — streaming-stored blob findable via query
+//! 19. `get_streaming_expired` — `get_streaming` returns None for expired blobs
 //!
 //! See spec section 17.11 "Custom `BlobStore` Adapters" and 17.13 "Conformance Testing".
 
-/// Generates 11 conformance tests for a [`BlobStorage`] implementation.
+/// Generates 19 conformance tests for a [`BlobStorage`] implementation.
 ///
 /// # Arguments
 ///
@@ -64,7 +72,10 @@ macro_rules! blob_store_conformance {
             use std::sync::Arc;
             use std::sync::atomic::{AtomicU64, Ordering};
 
-            use scp_transport::native::storage::BlobStorage;
+            use bytes::Bytes;
+            use futures::StreamExt;
+            use futures::stream;
+            use scp_transport::native::storage::{BlobBodyStream, BlobMetadata, BlobStorage};
             use sha2::{Digest, Sha256};
 
             /// Compute SHA-256 `blob_id` from content bytes.
@@ -428,6 +439,230 @@ macro_rules! blob_store_conformance {
                     "query for unknown routing_id should return empty Vec"
                 );
             }
+
+            // ── Streaming API conformance tests ─────────────────────────────
+
+            #[tokio::test]
+            async fn store_streaming_roundtrip() {
+                let (store, _clock) = $factory;
+                let routing_id = [0xAA; 32];
+                let blob_data = vec![1, 2, 3, 4, 5];
+                let blob_id = sha256_blob_id(&blob_data);
+
+                let body: BlobBodyStream =
+                    Box::pin(stream::once(async { Ok(Bytes::from(vec![1, 2, 3, 4, 5])) }));
+
+                let meta = store
+                    .store_streaming(routing_id, blob_id, Some([0xBB; 32]), 3600, Some(5), body)
+                    .await
+                    .expect("store_streaming should succeed");
+
+                assert_eq!(meta.blob_id, blob_id, "blob_id mismatch");
+                assert_eq!(meta.routing_id, routing_id, "routing_id mismatch");
+                assert_eq!(meta.blob_ttl, 3600, "blob_ttl mismatch");
+                assert_eq!(
+                    meta.recipient_hint,
+                    Some([0xBB; 32]),
+                    "recipient_hint mismatch"
+                );
+                assert_eq!(meta.content_length, Some(5), "content_length mismatch");
+                assert!(meta.stored_at > 0, "stored_at should be positive");
+
+                // Verify via regular get.
+                let stored = store
+                    .get(&blob_id)
+                    .await
+                    .expect("get should succeed")
+                    .expect("blob should exist");
+                assert_eq!(stored.blob, blob_data, "blob content mismatch");
+            }
+
+            #[tokio::test]
+            async fn get_streaming_roundtrip() {
+                let (store, _clock) = $factory;
+                let routing_id = [0xAA; 32];
+                let blob_data = vec![10, 20, 30, 40, 50];
+                let blob_id = sha256_blob_id(&blob_data);
+
+                // Store via regular store.
+                store
+                    .store(routing_id, blob_id, None, 3600, blob_data.clone())
+                    .await
+                    .expect("store should succeed");
+
+                // Retrieve via get_streaming.
+                let (meta, body) = store
+                    .get_streaming(&blob_id)
+                    .await
+                    .expect("get_streaming should succeed")
+                    .expect("blob should exist");
+
+                assert_eq!(meta.blob_id, blob_id, "blob_id mismatch");
+                assert_eq!(meta.routing_id, routing_id, "routing_id mismatch");
+                assert_eq!(meta.blob_ttl, 3600, "blob_ttl mismatch");
+                assert_eq!(meta.content_length, Some(5), "content_length mismatch");
+
+                // Collect the body stream.
+                let collected =
+                    $crate::conformance::blob_store::test_helpers::collect_body(body).await;
+                assert_eq!(collected, blob_data, "streamed body mismatch");
+            }
+
+            #[tokio::test]
+            async fn store_streaming_get_streaming_roundtrip() {
+                let (store, _clock) = $factory;
+                let routing_id = [0xCC; 32];
+                let blob_data = vec![99, 88, 77, 66, 55];
+                let blob_id = sha256_blob_id(&blob_data);
+
+                // Store via streaming.
+                let body: BlobBodyStream = Box::pin(stream::once(async {
+                    Ok(Bytes::from(vec![99, 88, 77, 66, 55]))
+                }));
+                store
+                    .store_streaming(routing_id, blob_id, None, 3600, Some(5), body)
+                    .await
+                    .expect("store_streaming should succeed");
+
+                // Retrieve via streaming.
+                let (meta, body) = store
+                    .get_streaming(&blob_id)
+                    .await
+                    .expect("get_streaming should succeed")
+                    .expect("blob should exist");
+
+                assert_eq!(meta.blob_id, blob_id);
+                assert_eq!(meta.routing_id, routing_id);
+
+                let collected =
+                    $crate::conformance::blob_store::test_helpers::collect_body(body).await;
+                assert_eq!(collected, blob_data);
+            }
+
+            #[tokio::test]
+            async fn store_streaming_empty_body() {
+                let (store, _clock) = $factory;
+                let routing_id = [0xDD; 32];
+                let blob_data: Vec<u8> = vec![];
+                let blob_id = sha256_blob_id(&blob_data);
+
+                let body: BlobBodyStream = Box::pin(stream::empty());
+
+                let meta = store
+                    .store_streaming(routing_id, blob_id, None, 3600, Some(0), body)
+                    .await
+                    .expect("store_streaming with empty body should succeed");
+
+                assert_eq!(meta.blob_id, blob_id);
+
+                let stored = store
+                    .get(&blob_id)
+                    .await
+                    .expect("get should succeed")
+                    .expect("empty blob should exist");
+                assert!(
+                    stored.blob.is_empty(),
+                    "empty blob should have empty content"
+                );
+            }
+
+            #[tokio::test]
+            async fn store_streaming_content_length_hint() {
+                let (store, _clock) = $factory;
+                let routing_id = [0xEE; 32];
+                let blob_data = vec![1, 2, 3];
+                let blob_id = sha256_blob_id(&blob_data);
+
+                // Provide a content_length hint that differs from actual length.
+                // The hint is advisory — actual streamed length governs.
+                let body: BlobBodyStream =
+                    Box::pin(stream::once(async { Ok(Bytes::from(vec![1, 2, 3])) }));
+
+                let meta = store
+                    .store_streaming(routing_id, blob_id, None, 3600, Some(100), body)
+                    .await
+                    .expect("store_streaming should accept mismatched content_length hint");
+
+                assert_eq!(meta.blob_id, blob_id);
+
+                let stored = store
+                    .get(&blob_id)
+                    .await
+                    .expect("get should succeed")
+                    .expect("blob should exist");
+                assert_eq!(stored.blob, blob_data);
+            }
+
+            #[tokio::test]
+            async fn get_streaming_nonexistent() {
+                let (store, _clock) = $factory;
+                let blob_id = [0xFF; 32];
+
+                let result = store
+                    .get_streaming(&blob_id)
+                    .await
+                    .expect("get_streaming should succeed");
+
+                assert!(result.is_none(), "nonexistent blob should return None");
+            }
+
+            #[tokio::test]
+            async fn store_streaming_query_interop() {
+                let (store, _clock) = $factory;
+                let routing_id = [0xAA; 32];
+                let blob_data = vec![11, 22, 33];
+                let blob_id = sha256_blob_id(&blob_data);
+
+                // Store via streaming.
+                let body: BlobBodyStream =
+                    Box::pin(stream::once(async { Ok(Bytes::from(vec![11, 22, 33])) }));
+                store
+                    .store_streaming(routing_id, blob_id, None, 3600, Some(3), body)
+                    .await
+                    .expect("store_streaming should succeed");
+
+                // Query via regular query — should find the blob.
+                let results = store
+                    .query(&routing_id, None, 100)
+                    .await
+                    .expect("query should succeed");
+
+                assert_eq!(results.len(), 1, "query should find streaming-stored blob");
+                assert_eq!(
+                    results[0].blob, blob_data,
+                    "query should return correct content"
+                );
+                assert_eq!(results[0].blob_id, blob_id);
+            }
+
+            #[tokio::test]
+            async fn get_streaming_expired() {
+                let (store, clock) = $factory;
+                let routing_id = [0xAA; 32];
+                let blob_data = vec![44, 55, 66];
+                let blob_id = sha256_blob_id(&blob_data);
+
+                // Store with short TTL.
+                store
+                    .store(routing_id, blob_id, None, 60, blob_data)
+                    .await
+                    .expect("store should succeed");
+
+                // Advance clock past TTL.
+                let current = clock.load(Ordering::Relaxed);
+                clock.store(current + 61, Ordering::Relaxed);
+
+                // get_streaming should return None for expired blobs.
+                let result = store
+                    .get_streaming(&blob_id)
+                    .await
+                    .expect("get_streaming should succeed");
+
+                assert!(
+                    result.is_none(),
+                    "expired blob should return None from get_streaming"
+                );
+            }
         }
     };
 }
@@ -440,7 +675,23 @@ pub mod test_helpers {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use scp_transport::native::storage::ClockFn;
+    use futures::StreamExt;
+    use scp_transport::native::storage::{BlobBodyStream, ClockFn, StorageError};
+
+    /// Collects a [`BlobBodyStream`] into a single `Vec<u8>`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any chunk in the stream is an `Err`.
+    #[allow(clippy::expect_used)]
+    pub async fn collect_body(body: BlobBodyStream) -> Vec<u8> {
+        let chunks: Vec<Result<bytes::Bytes, StorageError>> = body.collect().await;
+        let mut buf = Vec::new();
+        for chunk in chunks {
+            buf.extend_from_slice(&chunk.expect("chunk should be Ok"));
+        }
+        buf
+    }
 
     /// Default starting timestamp for conformance test clocks.
     ///

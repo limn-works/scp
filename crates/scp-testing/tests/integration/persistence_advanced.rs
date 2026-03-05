@@ -851,7 +851,7 @@ async fn combined_node_storage_both_traits_roundtrip() {
 
     let dir = tempfile::tempdir().unwrap();
     let key = [0xABu8; 32];
-    let combined = CombinedNodeStorage::new(dir.path(), &key).unwrap();
+    let combined = CombinedNodeStorage::open(dir.path(), &key).unwrap();
 
     // Use as Storage (KV) — UFCS to disambiguate from BlobStorage::store.
     Storage::store(&combined, "context/test/state", b"active")

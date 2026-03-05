@@ -23,7 +23,7 @@ The `Storage` trait (defined in `scp-platform`) is deliberately thin — six asy
 ```
 Relay Server (blob routing, TTL enforcement, subscription registry)
         |
-BlobStore trait (store/get/list/delete/expire with routing_id + TTL)
+BlobStorage trait (store/get/query/delete/purge_expired with routing_id + TTL)
         |
 Backend adapter (SQLite, redb, PostgreSQL, S3-compatible, in-memory)
 ```
@@ -393,6 +393,26 @@ Uses redb's native table API with two tables:
 
 TTL enforcement via periodic scan of the blobs table (redb does not support secondary indexes natively; the routing multimap serves as the primary index for listing).
 
+### 17.7.1 Streaming API
+
+The `BlobStorage` trait provides streaming variants of `store` and `get` for backends that can avoid full in-memory materialization. All streaming methods have default implementations that delegate to their `Vec<u8>` counterparts, so existing adapters work without modification.
+
+**Types:**
+
+- `BlobMetadata` — all `StoredBlob` fields except `blob: Vec<u8>`, plus an optional `content_length: Option<u64>`. Returned by streaming get so metadata is available before the body stream is consumed.
+- `BlobBodyStream` — `Pin<Box<dyn Stream<Item = Result<Bytes, StorageError>> + Send>>`. The body of a blob as a stream of chunks.
+
+**Trait methods (with defaults):**
+
+- `store_streaming(routing_id, blob_id, recipient_hint, blob_ttl, content_length: Option<u64>, body: BlobBodyStream) -> Result<BlobMetadata, StorageError>` — Default: collects stream to `Vec<u8>`, delegates to `store()`, drops the blob body from the result.
+- `get_streaming(blob_id) -> Result<Option<(BlobMetadata, BlobBodyStream)>, StorageError>` — Default: calls `get()`, splits `StoredBlob` into metadata + single-chunk stream.
+
+**Content length:** `store_streaming` accepts an optional content length hint. Backends MAY use this for pre-allocation or capacity checks. Backends MUST NOT trust it for security decisions — the actual streamed length governs.
+
+**blob_id computation:** For `store_streaming`, the caller provides the `blob_id` (SHA-256 of the complete blob content). The relay computes this incrementally via streaming SHA-256 as it receives the blob over the wire, before calling `store_streaming`. The storage layer does not re-hash.
+
+**Native overrides:** Backends where streaming is materially beneficial (S3, future PostgreSQL large objects) override the defaults. The `S3BlobStore` streams directly to/from S3 using the AWS SDK's `ByteStream` without buffering the full blob.
+
 ## 17.8 Platform-Specific Key Custody
 
 Key custody is NOT part of this spec — it is the existing `KeyCustody` trait (ADR-006). Referenced here for completeness of the persistence picture:
@@ -483,14 +503,14 @@ The conformance suite tests: store/retrieve roundtrip, missing key returns None,
 
 ### Custom BlobStore Adapters
 
-Implement the 5 async methods of the `BlobStore` trait. Run the `blob_store_conformance!()` macro.
+Implement the 5 required async methods of the `BlobStorage` trait (`store`, `get`, `query`, `delete`, `purge_expired`). The 2 streaming methods (`store_streaming`, `get_streaming`) have default implementations that delegate to the `Vec<u8>` methods — override them only if your backend benefits from avoiding full materialization (see §17.7.1). Run the `blob_store_conformance!()` macro.
 
 ```rust
 #[cfg(test)]
 blob_store_conformance!(|| MyCustomBlobStore::new(clock.clone()));
 ```
 
-The conformance suite tests: store/retrieve roundtrip, missing blob returns None, TTL expiry, list by routing_id in stored_at order, list with since filter, delete removes blob, store returns SHA-256 blob_id, and concurrent store + expire safety.
+The conformance suite generates 19 tests: store/retrieve roundtrip, missing blob returns None, TTL expiry, query by routing_id in stored_at order, query with since filter, query with limit, delete removes blob, store returns SHA-256 blob_id, concurrent store + purge safety, purge removes only expired blobs, query for unknown routing_id returns empty, streaming store roundtrip, streaming get roundtrip, full streaming roundtrip, streaming empty body, content_length hint is advisory, streaming get for nonexistent blob, streaming-stored blob findable via query, and streaming get for expired blob.
 
 ## 17.12 Third-Party Adapter Candidates
 

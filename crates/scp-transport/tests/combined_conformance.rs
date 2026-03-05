@@ -20,7 +20,7 @@ fn make_combined_storage() -> CombinedNodeStorage {
     // Leak the TempDir so it outlives the test — the directory must remain
     // on disk while the SQLite connection is open.
     let _ = Box::leak(Box::new(dir));
-    CombinedNodeStorage::new(&dir_path, &key).expect("CombinedNodeStorage::new should succeed")
+    CombinedNodeStorage::open(&dir_path, &key).expect("CombinedNodeStorage::open should succeed")
 }
 
 fn make_combined_blob_store() -> (CombinedNodeStorage, Arc<AtomicU64>) {
@@ -34,8 +34,8 @@ fn make_combined_blob_store() -> (CombinedNodeStorage, Arc<AtomicU64>) {
         let c = clock.clone();
         Arc::new(move || Ok(c.load(Ordering::Relaxed)))
     };
-    let store = CombinedNodeStorage::with_clock(&dir_path, &key, clock_fn)
-        .expect("CombinedNodeStorage::with_clock should succeed");
+    let store = CombinedNodeStorage::open_with_clock(&dir_path, &key, clock_fn)
+        .expect("CombinedNodeStorage::open_with_clock should succeed");
     (store, clock)
 }
 
