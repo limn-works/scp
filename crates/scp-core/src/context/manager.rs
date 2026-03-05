@@ -1930,17 +1930,18 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        // Crypto: add to MLS group (no lock held).
-        self.crypto
-            .add_member(&context_id_bytes, did)
-            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-
         let snapshot = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
             require_active(&ctx.handle)?;
+
+            // Crypto: add to MLS group under lock to prevent partial-failure
+            // window (phantom MLS member if state mutation fails).
+            self.crypto
+                .add_member(&context_id_bytes, did)
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
             // Add to role state.
             ctx.role_state.members.insert(did.to_string());
@@ -1974,29 +1975,22 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        // Pre-check membership while holding the lock briefly.
-        {
-            let contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
-            require_active(&ctx.handle)?;
-            if !ctx.membership.contains(did) {
-                return Err(ContextError::MemberNotFound(did.to_string()));
-            }
-        }
-
-        // Crypto first: remove from MLS group before mutating state.
-        // Matches execute_add_member's pattern (crypto → state).
-        self.crypto
-            .remove_member(&context_id_bytes, did)
-            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-
         let snapshot = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            if !ctx.membership.contains(did) {
+                return Err(ContextError::MemberNotFound(did.to_string()));
+            }
+
+            // Crypto: remove from MLS group under lock to prevent TOCTOU
+            // race (concurrent remove of same DID).
+            self.crypto
+                .remove_member(&context_id_bytes, did)
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
             ctx.membership.remove_member(did);
             ctx.role_state.members.remove(did.as_ref());
