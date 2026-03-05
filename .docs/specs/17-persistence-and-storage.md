@@ -106,6 +106,9 @@ tofu/{did}
 key_package/{relay_url}/{index}
 relay_score/{relay_url}
 
+tls/certificate_chain
+tls/private_key
+
 mls/{context_id}/...
 ```
 
@@ -229,6 +232,11 @@ impl<S: Storage> ProtocolStore<S> {
     pub async fn store_adapter_credentials(&self, did: &DID, adapter_id: &str, credentials: &[u8]) -> Result<(), StoreError>;
     pub async fn load_adapter_credentials(&self, did: &DID, adapter_id: &str) -> Result<Option<Vec<u8>>, StoreError>;
     pub async fn list_adapter_credentials(&self, did: &DID) -> Result<Vec<String>, StoreError>;
+
+    // --- TLS certificates (§18.6.3) ---
+    pub async fn store_tls_certificate(&self, certificate_chain_pem: &str, private_key_pem: &str) -> Result<(), StoreError>;
+    pub async fn load_tls_certificate(&self) -> Result<Option<(String, Zeroizing<String>)>, StoreError>;
+    pub async fn delete_tls_certificate(&self) -> Result<(), StoreError>;
 }
 ```
 
@@ -243,6 +251,7 @@ scp-core/src/store/
     event_log.rs    # Event log persistence, tree nodes, roots
     identity.rs     # Identity documents, private state, TOFU, DID cache
     nonce.rs        # UCAN nonce tracking, pruning
+    tls.rs          # TLS certificate chain + private key (§18.6.3)
     tools.rs        # Tool registration, sessions
     transport.rs    # Relay scores, key packages
     economy.rs      # Economic policy, payment receipts, spending UCANs, adapter credentials

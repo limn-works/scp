@@ -14,6 +14,7 @@
 //! See spec sections 17.3 and 17.4.
 
 use scp_platform::traits::Storage;
+use zeroize::Zeroizing;
 
 use super::{ProtocolStore, StoreError};
 
@@ -58,8 +59,9 @@ impl<S: Storage> ProtocolStore<S> {
 
     /// Loads a TLS certificate chain and private key.
     ///
-    /// Returns `None` if no certificate is stored. Returns the certificate
-    /// chain PEM and private key PEM as a tuple.
+    /// Returns `None` if no certificate is stored. The private key is
+    /// returned as `Zeroizing<String>` so callers cannot accidentally
+    /// hold an unprotected copy.
     ///
     /// # Errors
     ///
@@ -67,11 +69,11 @@ impl<S: Storage> ProtocolStore<S> {
     /// Returns [`StoreError::Storage`] if the underlying storage read fails.
     pub async fn load_tls_certificate(
         &self,
-    ) -> Result<Option<(String, String)>, StoreError> {
+    ) -> Result<Option<(String, Zeroizing<String>)>, StoreError> {
         let cert: Option<String> = self.load_value(CERT_CHAIN_KEY).await?;
         let key: Option<String> = self.load_value(PRIVATE_KEY_KEY).await?;
         match (cert, key) {
-            (Some(c), Some(k)) => Ok(Some((c, k))),
+            (Some(c), Some(k)) => Ok(Some((c, Zeroizing::new(k)))),
             _ => Ok(None),
         }
     }
@@ -116,10 +118,9 @@ mod tests {
             .await
             .unwrap();
 
-        let (loaded_cert, loaded_key) =
-            store.load_tls_certificate().await.unwrap().unwrap();
+        let (loaded_cert, loaded_key) = store.load_tls_certificate().await.unwrap().unwrap();
         assert_eq!(loaded_cert, cert_pem);
-        assert_eq!(loaded_key, key_pem);
+        assert_eq!(&*loaded_key, key_pem);
     }
 
     #[tokio::test]
@@ -132,10 +133,7 @@ mod tests {
     #[tokio::test]
     async fn delete_tls_certificate_removes_both_entries() {
         let store = make_store();
-        store
-            .store_tls_certificate("cert", "key")
-            .await
-            .unwrap();
+        store.store_tls_certificate("cert", "key").await.unwrap();
 
         store.delete_tls_certificate().await.unwrap();
 

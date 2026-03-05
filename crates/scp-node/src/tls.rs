@@ -349,7 +349,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
     }
 
     /// Load a TLS certificate from the protocol store, converting to
-    /// [`CertificateData`] with a `Zeroizing` private key.
+    /// [`CertificateData`].
     async fn load_tls_cert(&self) -> Result<Option<CertificateData>, TlsError> {
         match self
             .storage
@@ -359,7 +359,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
         {
             Some((certificate_chain_pem, private_key_pem)) => Ok(Some(CertificateData {
                 certificate_chain_pem,
-                private_key_pem: Zeroizing::new(private_key_pem),
+                private_key_pem,
             })),
             None => Ok(None),
         }
@@ -949,7 +949,7 @@ mod tests {
         // Load via domain method.
         let (cert, key) = store.load_tls_certificate().await.unwrap().unwrap();
         assert_eq!(cert, original.certificate_chain_pem);
-        assert_eq!(&*original.private_key_pem, &key);
+        assert_eq!(key, original.private_key_pem);
     }
 
     #[tokio::test]
