@@ -2568,7 +2568,7 @@ pub enum GovernanceAction {
     /// Initiate governance-triggered member reset (ADR-029).
     ResetMember { did: DID, reason: String },
     /// Resolve a governance conflict (see section 7).
-    ResolveConflict { conflicting_proposal_id: ProposalId, resolution: ConflictResolution },
+    ResolveConflict { proposal_a: ProposalId, proposal_b: ProposalId, resolution: ConflictResolution },
     /// Promote a context from ephemeral to persistent (§5.10).
     /// Requires unanimous consent from ALL current members regardless of
     /// governance model — protocol-level override enforced by ContextManager.
