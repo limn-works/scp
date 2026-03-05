@@ -459,6 +459,49 @@ impl<S: Storage> ApplicationNode<S> {
         let mut registry = self.state.projected_contexts.write().await;
         registry.remove(&routing_id);
     }
+
+    /// Propagates rotated broadcast keys to the projection registry after a
+    /// governance ban.
+    ///
+    /// After [`ContextManager::execute_governance_action`] returns
+    /// [`GovernanceActionResult::SubscriberBanned`], call this method with
+    /// the `context_id` and the [`GovernanceBanResult`] to ensure the
+    /// projection endpoint can decrypt content encrypted under the new
+    /// post-rotation keys.
+    ///
+    /// For each rotated author, inserts the new-epoch key into the
+    /// [`ProjectedContext`] key registry. If the context is not projected
+    /// (not registered via [`enable_broadcast_projection`]), this is a no-op.
+    ///
+    /// When the ban's [`RevocationScope`] is `Full`, old-epoch keys are
+    /// purged from the projection registry so historical content encrypted
+    /// under pre-ban keys is no longer served. `FutureOnly` retains old
+    /// keys (historical content remains accessible).
+    pub async fn propagate_ban_keys(
+        &self,
+        context_id: &str,
+        ban_result: &scp_core::context::broadcast::GovernanceBanResult,
+    ) {
+        use scp_core::context::governance::RevocationScope;
+
+        let routing_id = projection::compute_routing_id(context_id);
+        let mut registry = self.state.projected_contexts.write().await;
+        if let Some(projected) = registry.get_mut(&routing_id) {
+            // Insert new post-rotation keys.
+            for rotation in &ban_result.rotated_authors {
+                projected.insert_key(rotation.new_key.clone());
+            }
+
+            // Full scope: purge old-epoch keys so historical content is no
+            // longer decryptable via projection.
+            if ban_result.scope == RevocationScope::Full
+                && let Some(min_new_epoch) =
+                    ban_result.rotated_authors.iter().map(|r| r.new_epoch).min()
+            {
+                projected.purge_keys_before(min_new_epoch);
+            }
+        }
+    }
 }
 
 /// Returns a new [`ApplicationNodeBuilder`].

@@ -196,15 +196,23 @@ pub struct GovernanceBanResult {
     pub banned_did: String,
     /// Per-author key rotations triggered by the ban.
     pub rotated_authors: Vec<AuthorKeyRotation>,
+    /// The revocation scope that was applied.
+    pub scope: crate::context::governance::RevocationScope,
 }
 
 /// Record of an author's key rotation during a governance ban.
+///
+/// Includes the new [`BroadcastKey`] so callers can propagate it to
+/// downstream consumers (e.g., projection endpoints via
+/// [`ProjectedContext::insert_key`]).
 #[derive(Debug, Clone)]
 pub struct AuthorKeyRotation {
     /// The author whose key was rotated.
     pub author_did: String,
     /// The new epoch after rotation.
     pub new_epoch: u64,
+    /// The new broadcast key for this author at `new_epoch`.
+    pub new_key: BroadcastKey,
 }
 
 // ---------------------------------------------------------------------------
@@ -646,6 +654,7 @@ impl BroadcastContext {
     pub fn governance_ban_subscriber(
         &mut self,
         did: &str,
+        scope: crate::context::governance::RevocationScope,
     ) -> Result<GovernanceBanResult, ContextError> {
         if !self.subscribers.contains_key(did) {
             return Err(ContextError::MemberNotFound(format!(
@@ -676,15 +685,23 @@ impl BroadcastContext {
             author.epoch = new_epoch;
             author.broadcast_key = generate_sender_key();
 
+            let new_key = BroadcastKey::from_parts(
+                author.broadcast_key.clone(),
+                new_epoch,
+                author_did.clone(),
+            );
+
             rotated_authors.push(AuthorKeyRotation {
                 author_did: author_did.clone(),
                 new_epoch,
+                new_key,
             });
         }
 
         Ok(GovernanceBanResult {
             banned_did: did.to_owned(),
             rotated_authors,
+            scope,
         })
     }
 
@@ -1073,6 +1090,7 @@ where
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::context::governance::RevocationScope;
     use crate::crypto::sender_keys::{
         SenderKey, decrypt_sender_layer, encrypt_sender_layer, open_broadcast,
     };
@@ -3028,7 +3046,9 @@ mod tests {
         assert_eq!(ctx.get_author("did:example:bob").unwrap().epoch, 0);
         assert_eq!(ctx.get_author("did:example:carol").unwrap().epoch, 0);
 
-        let result = ctx.governance_ban_subscriber("did:example:sub1").unwrap();
+        let result = ctx
+            .governance_ban_subscriber("did:example:sub1", RevocationScope::FutureOnly)
+            .unwrap();
 
         // Banned DID is correct.
         assert_eq!(result.banned_did, "did:example:sub1");
@@ -3059,7 +3079,8 @@ mod tests {
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
 
-        let result = ctx.governance_ban_subscriber("did:example:ghost");
+        let result =
+            ctx.governance_ban_subscriber("did:example:ghost", RevocationScope::FutureOnly);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -3076,7 +3097,8 @@ mod tests {
         subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
 
         // Ban.
-        ctx.governance_ban_subscriber("did:example:sub1").unwrap();
+        ctx.governance_ban_subscriber("did:example:sub1", RevocationScope::FutureOnly)
+            .unwrap();
         assert!(ctx.is_blocked("did:example:alice", "did:example:sub1"));
         assert!(ctx.is_blocked("did:example:bob", "did:example:sub1"));
         assert!(!ctx.is_subscriber("did:example:sub1"));
@@ -3114,7 +3136,8 @@ mod tests {
         ));
 
         // Ban sub1.
-        ctx.governance_ban_subscriber("did:example:sub1").unwrap();
+        ctx.governance_ban_subscriber("did:example:sub1", RevocationScope::FutureOnly)
+            .unwrap();
 
         // After ban: sub1 is denied from ALL authors.
         assert!(matches!(
@@ -3152,7 +3175,8 @@ mod tests {
         subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
 
         // Ban, unban, re-subscribe.
-        ctx.governance_ban_subscriber("did:example:sub1").unwrap();
+        ctx.governance_ban_subscriber("did:example:sub1", RevocationScope::FutureOnly)
+            .unwrap();
         ctx.governance_unban_subscriber("did:example:sub1");
         subscribe_open(&mut ctx, "did:example:sub1", None, 2000).unwrap();
 
@@ -3170,7 +3194,9 @@ mod tests {
         subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
         assert!(ctx.is_subscriber("did:example:sub1"));
 
-        let result = ctx.governance_ban_subscriber("did:example:sub1").unwrap();
+        let result = ctx
+            .governance_ban_subscriber("did:example:sub1", RevocationScope::FutureOnly)
+            .unwrap();
 
         assert_eq!(result.banned_did, "did:example:sub1");
         assert!(result.rotated_authors.is_empty());

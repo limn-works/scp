@@ -182,6 +182,17 @@ impl ProjectedContext {
         self.keys.insert(epoch, broadcast_key);
     }
 
+    /// Removes all keys with epoch strictly less than `epoch`.
+    ///
+    /// Used after a `Full`-scope governance ban to ensure historical content
+    /// encrypted under pre-ban keys is no longer decryptable by the
+    /// projection endpoint. Messages referencing purged epochs will return
+    /// 500 (decryption failure) rather than serving content that a banned
+    /// subscriber may have previously accessed.
+    pub fn purge_keys_before(&mut self, epoch: u64) {
+        self.keys.retain(|&e, _| e >= epoch);
+    }
+
     /// Returns the broadcast key for the given epoch, if present.
     #[must_use]
     pub fn key_for_epoch(&self, epoch: u64) -> Option<&BroadcastKey> {

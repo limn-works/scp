@@ -1603,7 +1603,7 @@ impl ContextManager {
         &self,
         context_id: &str,
         did: &DID,
-        _scope: RevocationScope,
+        scope: RevocationScope,
         proposal_id: ProposalId,
     ) -> Result<GovernanceBanResult, ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
@@ -1635,7 +1635,7 @@ impl ContextManager {
                 .as_mut()
                 .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
 
-            let result = bc.governance_ban_subscriber(&did.0)?;
+            let result = bc.governance_ban_subscriber(&did.0, scope)?;
 
             // Take snapshot for persistence before dropping lock.
             let snapshot = bc.to_snapshot();
