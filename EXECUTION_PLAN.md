@@ -153,6 +153,8 @@ Every row maps a network capability to the issues/stories that must close for it
 | Capability | Status | Blocking issues | PRD stories |
 |---|---|---|---|
 | Python SDK | ⚠️ ~85% types, 0% E2E | #356, #328, #332 | — |
+| FFI: governance/broadcast/membership/persistence ops | ❌ 23 methods missing | #369 (depends #356) | — |
+| FFI: bridge/sync/discovery/provenance modules | ❌ Zero exposure | #370 (depends #356) | — |
 | WASM bridge | ❌ Critical stubs | #306 | — |
 | UniFFI bridge (Swift/Kotlin) | ❌ No-ops | #307 | — |
 | NAPI bridge (TypeScript) | ❌ No-ops | #307 | — |
@@ -339,8 +341,8 @@ PHASE 10: #291,#301,#303,#343,#344
 
 | Category | Count |
 |----------|-------|
-| GitHub issues | 67 |
+| GitHub issues | 69 |
 | PRD stories | 22 |
 | Auto-closed by root cause | 3 |
-| **Total work items** | **86** |
-| **Net after auto-close** | **83** |
+| **Total work items** | **88** |
+| **Net after auto-close** | **85** |
