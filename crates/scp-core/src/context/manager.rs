@@ -65,8 +65,13 @@ pub enum GovernanceActionResult {
         did: DID,
     },
     /// A governance action was executed successfully with no action-specific
-    /// result payload. Used for actions where the state change is
-    /// self-describing (e.g., ceiling modification, TTL extension).
+    /// result payload. Maps to: `ChangeRole`, `ModifyCeiling`, `CloseContext`,
+    /// `ExtendTtl`, `ChangeMemoryScope`, `AddMember`, `RemoveMember`,
+    /// `RegisterTool`, `DeregisterTool`, `ModifyThreshold`, `AddSigner`,
+    /// `RemoveSigner`, `EstablishToolInterface`, `ResetMember`,
+    /// `ResolveConflict`, `PromoteContext`, `RotateContentKeys`,
+    /// `RevokeWriteAccess`, `RestoreWriteAccess`, `ModifyPruningPolicy`,
+    /// `ReconfigureGovernance`.
     Executed,
 }
 
@@ -2759,9 +2764,21 @@ impl ContextManager {
         &self,
         context_id: &str,
         changes: &[super::governance::GovernanceReconfigAction],
-        _justification: &super::governance::DeadlockJustification,
+        justification: &super::governance::DeadlockJustification,
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
+        if changes.is_empty() {
+            return Err(ContextError::PermissionDenied(
+                "reconfigure_governance requires at least one change".to_owned(),
+            ));
+        }
+        if justification.unavailable_dids.is_empty() && justification.missed_windows.is_empty() {
+            return Err(ContextError::PermissionDenied(
+                "deadlock justification must provide evidence (unavailable_dids or missed_windows)"
+                    .to_owned(),
+            ));
+        }
+
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
