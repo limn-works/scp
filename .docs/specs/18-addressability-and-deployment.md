@@ -299,19 +299,20 @@ An `ApplicationNode` composes:
 ```rust
 // scp-node crate
 
-pub struct ApplicationNode { /* ... */ }
+pub struct ApplicationNode<S: Storage> { /* ... */ }
 
-impl ApplicationNode {
-    pub fn builder() -> ApplicationNodeBuilder;
+/// Convenience free function: `scp_node::builder()`.
+pub fn builder() -> ApplicationNodeBuilder;
 
+impl<S: Storage> ApplicationNode<S> {
     /// The relay handle — for direct relay operations.
     pub fn relay(&self) -> &RelayHandle;
 
     /// The identity handle — for DID operations, context creation, messaging.
     pub fn identity(&self) -> &IdentityHandle;
 
-    /// The storage handle — for direct ProtocolStore access.
-    pub fn storage(&self) -> &ProtocolStore;
+    /// The storage handle — for direct ProtocolStore access (§17.4).
+    pub fn storage(&self) -> &ProtocolStore<S>;
 
     /// Returns an axum Router serving GET /.well-known/scp.
     /// Dynamically generated from node state (DID, relay URL, registered contexts).
@@ -324,32 +325,43 @@ impl ApplicationNode {
     /// - Application-provided routes
     /// - .well-known/scp route
     /// - /scp/v1 WebSocket upgrade route
-    pub async fn serve(self, app_router: axum::Router) -> Result<(), NodeError>;
+    /// The shutdown future resolves when the server should begin graceful
+    /// shutdown (e.g., signal handler, test teardown). In-flight connections
+    /// drain naturally.
+    pub async fn serve(
+        self,
+        app_router: axum::Router,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), NodeError>;
 }
 
-pub struct ApplicationNodeBuilder {
-    domain: Option<String>,
-    identity: Option<Identity>,
-    storage: Option<SqliteStorage>,
-    bind_addr: Option<SocketAddr>,
-    acme_email: Option<String>,
-}
+/// Type-state builder — generic over key custody (K), DID method (D),
+/// storage backend (S), domain state, and identity state. The type system
+/// enforces that `.build()` is only callable when both domain mode and
+/// identity have been configured.
+pub struct ApplicationNodeBuilder<K, D, S, Dom, Id> { /* ... */ }
 
 impl ApplicationNodeBuilder {
-    pub fn domain(mut self, domain: &str) -> Self;
-    pub fn identity(mut self, identity: Identity) -> Self;
-    pub fn generate_identity(mut self) -> Self;
-    pub fn storage(mut self, storage: SqliteStorage) -> Self;
-    pub fn bind_addr(mut self, addr: SocketAddr) -> Self;
-    pub fn acme_email(mut self, email: &str) -> Self;
+    pub fn new() -> Self;
+}
 
-    /// Build the ApplicationNode:
+impl<...> ApplicationNodeBuilder<K, D, S, Dom, Id> {
+    pub fn domain(self, domain: &str) -> ApplicationNodeBuilder<..., HasDomain, ...>;
+    pub fn no_domain(self) -> ApplicationNodeBuilder<..., HasNoDomain, ...>;
+    pub fn generate_identity(self, ...) -> ApplicationNodeBuilder<..., HasIdentity>;
+    pub fn explicit_identity(self, ...) -> ApplicationNodeBuilder<..., HasIdentity>;
+    pub fn storage<S2: Storage>(self, storage: S2) -> ApplicationNodeBuilder<..., S2, ...>;
+    pub fn bind_addr(self, addr: SocketAddr) -> Self;
+    pub fn acme_email(self, email: &str) -> Self;
+    pub fn projection_rate_limit(self, rate: u32) -> Self;
+
+    /// Build the ApplicationNode (available when domain + identity are set):
     /// 1. Initialize storage (create if needed)
     /// 2. Load or generate identity
     /// 3. Start relay server
     /// 4. Publish DID document with SCPRelay entry
-    /// 5. Provision TLS certificate via ACME (if not cached)
-    pub async fn build(self) -> Result<ApplicationNode, NodeError>;
+    /// 5. Provision TLS certificate via ACME (domain mode) or probe NAT (no-domain mode)
+    pub async fn build(self) -> Result<ApplicationNode<S>, NodeError>;
 }
 ```
 
