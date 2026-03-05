@@ -684,6 +684,15 @@ Caching headers:
 
 Conditional GET: if the client sends `If-None-Match: "<blob_id>"`, the server returns `304 Not Modified` with no body.
 
+**Error responses:**
+
+- **400 Bad Request** — invalid hex in `routing_id` or `blob_id` path segment.
+- **404 Not Found** — unknown routing ID (no projected context registered) or unknown blob ID (not in storage or routing ID mismatch).
+- **410 Gone** — the message's key epoch has been purged from the projection registry after a `Full`-scope governance ban (§5.14.8). The content is permanently unavailable through projection. Clients should not retry. Body: `{"error": "content revoked", "code": "GONE"}`.
+- **500 Internal Server Error** — decryption failure (corrupt envelope or AEAD open failure).
+
+The feed endpoint (§18.11.3) silently omits messages whose epoch keys have been purged — they simply disappear from the feed rather than producing errors. This is consistent with the feed's role as a "latest content" view: revoked historical content is no longer latest.
+
 ### 18.11.5 Decryption Architecture
 
 A `ProjectedContext` registry maps `routing_id → BroadcastKey` (per epoch):
@@ -697,6 +706,14 @@ A `ProjectedContext` registry maps `routing_id → BroadcastKey` (per epoch):
 The `BlobStorage` instance is shared between the relay server and the projection handlers via `Arc<dyn BlobStorage>`. This requires `RelayServer::new` to accept `Arc<B>` so the same storage instance can be passed to both the relay and the `NodeState` (see ADR-035 for the architectural change).
 
 Keys are retained per epoch for the blob TTL window. When a key epoch advances, the previous epoch's key remains available to decrypt blobs published under the old epoch until those blobs expire.
+
+**Governance-ban key purge.** When a governance-level subscriber ban (§5.14.8) triggers key rotation via `RevokeReadAccess`, the projection registry must be updated to reflect the new key epoch(s). The SDK method `propagate_ban_keys()` (§18.11.8) handles this:
+
+1. For each rotated author, the new post-rotation key is inserted into the `ProjectedContext` key registry.
+2. If the ban's `RevocationScope` is `Full`, all pre-ban epoch keys are **purged** from the registry via `retain_only_epochs()`. This ensures historical content encrypted under pre-ban keys is no longer decryptable by the projection endpoint — messages referencing purged epochs return 410 Gone (§18.11.4) on per-message requests and are silently omitted from feed responses (§18.11.3).
+3. If the ban's `RevocationScope` is `FutureOnly`, old-epoch keys are retained. Historical content remains accessible; only future content (under the new key) is inaccessible to the banned subscriber.
+
+This differs from normal key rotation (where old keys are retained for the TTL window): a `Full`-scope governance ban is an explicit revocation of historical access, so old keys are immediately purged rather than retained.
 
 ### 18.11.6 Security Properties
 
@@ -727,4 +744,5 @@ This allows URI consumers to choose between the native SCP path (relay + broadca
 
 - `ApplicationNode::enable_broadcast_projection(context_id, broadcast_key, admission, projection_policy) -> Result<(), NodeError>` — activates HTTP projection for the specified broadcast context. `admission: BroadcastAdmission` determines baseline authentication (§5.14.4). `projection_policy: Option<ProjectionPolicy>` provides per-author overrides (§18.11.2.1). Registers the context, key, admission mode, and policy in the `ProjectedContext` registry. Returns `NodeError::InvalidConfig` if the projected context limit (1024) has been reached or if the projection policy violates ceiling constraints (e.g., `Public` rule on a gated context).
 - `ApplicationNode::disable_broadcast_projection(context_id)` — deactivates HTTP projection for the specified context. Removes it from the registry. Existing CDN caches may continue serving stale content per their cache headers.
+- `ApplicationNode::propagate_ban_keys(context_id, ban_result)` — updates the projection key registry after a governance-level subscriber ban. Inserts post-rotation keys for each rotated author. For `Full`-scope bans, purges all pre-ban epoch keys so historical content is no longer served (§18.11.5). No-op if the context is not projected. Must be called after `execute_governance_action` returns `GovernanceActionResult::SubscriberBanned`.
 - `ApplicationNode::broadcast_projection_router() -> axum::Router` — returns the projection router for composition. Served on the public HTTPS port alongside `.well-known/scp` and `/scp/v1`.
