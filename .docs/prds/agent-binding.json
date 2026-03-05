@@ -1196,7 +1196,7 @@
       "files": [
         "crates/scp-core/src/crypto/mls/group.rs"
       ],
-      "description": "Update key continuity fingerprint computation per ADR-039 acceptance criterion 12 and Key Continuity section. The fingerprint must include all three verification methods: identity_key, active_key, agent_key. Agent key absence uses domain-derived sentinel SHA-256(\"SCP-ABSENT-AGENT-KEY\") to avoid Ed25519 identity point collision. Formula: fingerprint = SHA256(\"SCP-KEY-CONTINUITY-V1:\" || len(did_a) || did_a || len(did_b) || did_b || a_identity || a_active || a_agent || b_identity || b_active || b_agent) with 4-byte big-endian length prefixes on DIDs. Add negative tests: (1) fingerprint changes when agent key is added, (2) fingerprint changes when agent key is rotated, (3) fingerprint changes when agent key is removed, (4) fingerprint with no agent key uses 32 zero bytes, (5) DID document with multiple #agent VMs is rejected.",
+      "description": "Update key continuity fingerprint computation per ADR-039 acceptance criterion 12 and Key Continuity section. The fingerprint must include all three verification methods: identity_key, active_key, agent_key. Agent key absence uses domain-derived sentinel SHA-256(\"SCP-ABSENT-AGENT-KEY\") to avoid Ed25519 identity point collision. Formula: fingerprint = SHA256(\"SCP-KEY-CONTINUITY-V1:\" || len(did_a) || did_a || len(did_b) || did_b || a_identity || a_active || a_agent || b_identity || b_active || b_agent) with 4-byte big-endian length prefixes on DIDs. Add negative tests: (1) fingerprint changes when agent key is added, (2) fingerprint changes when agent key is rotated, (3) fingerprint changes when agent key is removed, (4) fingerprint with no agent key uses domain-derived sentinel, (5) DID document with multiple #agent VMs is rejected.",
       "acceptanceCriteria": [
         "Key continuity fingerprint includes all three VMs: identity_key, active_key, agent_key",
         "Agent key absence uses domain-derived sentinel SHA-256(\"SCP-ABSENT-AGENT-KEY\") in fingerprint computation (not zero bytes, to avoid Ed25519 identity point collision)",
@@ -1215,7 +1215,7 @@
         "Add test: fingerprint changes on agent key add",
         "Add test: fingerprint changes on agent key rotate",
         "Add test: fingerprint changes on agent key remove",
-        "Add test: no agent key uses 32 zero bytes",
+        "Add test: no agent key uses domain-derived sentinel",
         "Add test: asymmetric agent key presence",
         "Add negative test: multiple #agent VMs rejected"
       ],
