@@ -319,12 +319,17 @@ pub struct SizeBasedPolicy {
 ///
 /// Structural events (governance, membership) are retained longer than
 /// operational events (messages, tool invocations).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Multipliers are expressed in basis points where 10000 = 1.0x multiplier.
+/// E.g. 30000 = 3.0x.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventTypeRetention {
-    /// Multiplier for structural event retention. Default: 3.0x.
-    pub structural_retention_multiplier: f64,
-    /// Multiplier for operational event retention. Default: 1.0x.
-    pub operational_retention_multiplier: f64,
+    /// Basis points where 10000 = 1.0x multiplier. E.g. 30000 = 3.0x.
+    /// Default: 30000 (3.0x).
+    pub structural_retention_multiplier: u32,
+    /// Basis points where 10000 = 1.0x multiplier. E.g. 30000 = 3.0x.
+    /// Default: 10000 (1.0x).
+    pub operational_retention_multiplier: u32,
 }
 
 /// Checkpoint creation schedule (ADR-030 §3).
@@ -343,7 +348,7 @@ pub struct CheckpointSchedule {
 ///
 /// Set at context creation or modified via governance. Included in
 /// publicly visible metadata (§5.7).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PruningPolicy {
     /// Time-based pruning. `None` = no time-based pruning.
     pub time_based: Option<TimeBasedPolicy>,
@@ -363,8 +368,8 @@ impl Default for PruningPolicy {
             time_based: None,
             size_based: None,
             event_type_retention: EventTypeRetention {
-                structural_retention_multiplier: 3.0,
-                operational_retention_multiplier: 1.0,
+                structural_retention_multiplier: 30_000,
+                operational_retention_multiplier: 10_000,
             },
             checkpoint_schedule: CheckpointSchedule {
                 event_interval: 10_000,
@@ -473,7 +478,7 @@ pub enum GovernanceAction {
     /// the context's governance model. See spec section 5.14.8.
     BlockAuthor {
         /// The DID of the author to block.
-        author_did: DID,
+        did: DID,
         /// Optional reason for the block.
         reason: Option<String>,
     },
@@ -1405,7 +1410,7 @@ mod tests {
             },
             GovernanceAction::TransferAdmin { new_admin: bob() },
             GovernanceAction::BlockAuthor {
-                author_did: bob(),
+                did: bob(),
                 reason: Some("spam".to_owned()),
             },
         ];

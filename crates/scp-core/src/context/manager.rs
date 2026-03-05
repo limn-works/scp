@@ -109,7 +109,7 @@ pub struct ContextSnapshot {
     pub registered_tools: Vec<ToolRegistration>,
     /// Members whose write access has been governance-revoked (ADR-031).
     #[serde(default)]
-    pub write_revoked_members: HashSet<String>,
+    pub write_revoked_members: HashSet<DID>,
     /// Established cross-context tool interfaces (§6.2).
     #[serde(default)]
     pub tool_interfaces: Vec<ToolInterface>,
@@ -244,7 +244,7 @@ struct PerContextState {
     /// Dynamically registered tools (beyond initial `ContextParams.tools`).
     registered_tools: Vec<ToolRegistration>,
     /// Members whose write access has been governance-revoked (ADR-031).
-    write_revoked_members: HashSet<String>,
+    write_revoked_members: HashSet<DID>,
     /// Established cross-context tool interfaces (§6.2).
     tool_interfaces: Vec<ToolInterface>,
     /// Governance threshold signers (for `ThresholdApproval` model).
@@ -1051,7 +1051,7 @@ impl ContextManager {
             require_active(&ctx.handle)?;
 
             // Governance-level write revocation check (§9.17, ADR-038).
-            if ctx.write_revoked_members.contains(sender_did.as_ref()) {
+            if ctx.write_revoked_members.contains(sender_did) {
                 return Err(ContextError::PermissionDenied(format!(
                     "write access has been revoked for {sender_did}"
                 )));
@@ -1373,7 +1373,7 @@ impl ContextManager {
             require_active(&ctx.handle)?;
 
             // Governance-level write revocation check (§9.17, ADR-038).
-            if ctx.write_revoked_members.contains(author_did.as_ref()) {
+            if ctx.write_revoked_members.contains(author_did) {
                 return Err(ContextError::PermissionDenied(format!(
                     "write access has been revoked for {author_did}"
                 )));
@@ -1569,9 +1569,9 @@ impl ContextManager {
     ) -> Result<GovernanceActionResult, ContextError> {
         let pid = proposal.proposal_id;
         match &proposal.action {
-            GovernanceAction::BlockAuthor { author_did, .. } => {
+            GovernanceAction::BlockAuthor { did, .. } => {
                 let r = self
-                    .block_broadcast_author_internal(context_id, author_did)
+                    .block_broadcast_author_internal(context_id, did)
                     .await?;
                 Ok(GovernanceActionResult::AuthorBlocked(r))
             }
@@ -2290,22 +2290,21 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        // Validate retention multipliers are finite and positive (NaN/Infinity
-        // would bypass the retention floor checks below).
-        let structural_mul = new_policy
+        // Validate retention multipliers are non-zero.
+        let structural_mul_bp = new_policy
             .event_type_retention
             .structural_retention_multiplier;
-        if !structural_mul.is_finite() || structural_mul <= 0.0 {
+        if structural_mul_bp == 0 {
             return Err(ContextError::PermissionDenied(
-                "structural_retention_multiplier must be a finite positive number".to_owned(),
+                "structural_retention_multiplier must be > 0".to_owned(),
             ));
         }
-        let operational_mul = new_policy
+        let operational_mul_bp = new_policy
             .event_type_retention
             .operational_retention_multiplier;
-        if !operational_mul.is_finite() || operational_mul <= 0.0 {
+        if operational_mul_bp == 0 {
             return Err(ContextError::PermissionDenied(
-                "operational_retention_multiplier must be a finite positive number".to_owned(),
+                "operational_retention_multiplier must be > 0".to_owned(),
             ));
         }
 
@@ -2318,25 +2317,12 @@ impl ContextManager {
             ));
         }
         // ADR-030: structural event retention floor is 90 days (7,776,000 seconds).
-        // Check: retention_secs * structural_retention_multiplier >= 7_776_000.
-        // Rearranged to avoid u64→f64 precision loss: multiply the floor constant
-        // by 1000 and the multiplier by 1000 to stay in integer space.
+        // effective = retention_secs * multiplier_bp / 10000
         if let Some(ref tb) = new_policy.time_based {
-            let multiplier = new_policy
-                .event_type_retention
-                .structural_retention_multiplier;
-            // Scale multiplier to integer (3 decimal places of precision).
-            // Clamp to valid u32 range — multiplier is always non-negative
-            // and well under u32::MAX in practice (typically 1.0–10.0).
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let multiplier_scaled = (multiplier * 1000.0)
-                .round()
-                .clamp(0.0, f64::from(u32::MAX)) as u32;
-            // effective = retention_secs * multiplier_scaled / 1000
             let effective = tb
                 .retention_secs
-                .saturating_mul(u64::from(multiplier_scaled))
-                / 1000;
+                .saturating_mul(u64::from(structural_mul_bp))
+                / 10_000;
             if effective < 7_776_000 {
                 return Err(ContextError::PermissionDenied(
                     "effective structural event retention must be >= 7,776,000 seconds (90 days)"
@@ -2669,7 +2655,7 @@ impl ContextManager {
             }
             // Mark member as write-revoked. The member remains present but
             // their messages will be rejected by the send path.
-            ctx.write_revoked_members.insert(did.to_string());
+            ctx.write_revoked_members.insert(did.clone());
 
             // Broadcast mode: also destroy the author's broadcast key so
             // key requests return Deny (§5.14.8 "Author removal").
@@ -2713,7 +2699,7 @@ impl ContextManager {
                     "MemberBan capability not in ceiling".to_owned(),
                 ));
             }
-            ctx.write_revoked_members.remove(did.as_ref());
+            ctx.write_revoked_members.remove(did);
             Self::snapshot_context(ctx)
         };
 
@@ -4784,7 +4770,7 @@ mod tests {
         };
 
         let action = GovernanceAction::BlockAuthor {
-            author_did: target_did.clone(),
+            did: target_did.clone(),
             reason: Some("governance test".to_owned()),
         };
 
@@ -4955,7 +4941,7 @@ mod tests {
             context_id: ctx_id.clone(),
             proposer_did: "did:key:alice".into(),
             action: super::GovernanceAction::BlockAuthor {
-                author_did: "did:key:bob".into(),
+                did: "did:key:bob".into(),
                 reason: None,
             },
             status: ProposalStatus::Pending,

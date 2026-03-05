@@ -489,7 +489,7 @@ fn behavioral_validation_works_after_pruning() {
     let config = PruningConfig {
         retain_last_n_checkpoints: None,
         retention_secs: None,
-        structural_retention_multiplier: 1.0,
+        structural_retention_multiplier: 10_000,
     };
 
     let (truncated, result) =
