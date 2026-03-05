@@ -1566,19 +1566,18 @@ impl ContextManager {
         match &proposal.action {
             GovernanceAction::BlockAuthor { author_did, .. } => {
                 let r = self
-                    .block_broadcast_author_internal(context_id, author_did, pid)
+                    .block_broadcast_author_internal(context_id, author_did)
                     .await?;
                 Ok(GovernanceActionResult::AuthorBlocked(r))
             }
             GovernanceAction::RevokeReadAccess { did, scope } => {
                 let r = self
-                    .revoke_read_access_internal(context_id, did, *scope, pid)
+                    .revoke_read_access_internal(context_id, did, *scope)
                     .await?;
                 Ok(GovernanceActionResult::SubscriberBanned(r))
             }
             GovernanceAction::RestoreReadAccess { did } => {
-                self.restore_read_access_internal(context_id, did, pid)
-                    .await?;
+                self.restore_read_access_internal(context_id, did).await?;
                 Ok(GovernanceActionResult::SubscriberUnbanned { did: did.clone() })
             }
             GovernanceAction::PromoteContext => {
@@ -1728,7 +1727,6 @@ impl ContextManager {
         &self,
         context_id: &str,
         author_did: &DID,
-        _proposal_id: ProposalId,
     ) -> Result<AuthorBlockResult, ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -1799,7 +1797,6 @@ impl ContextManager {
         context_id: &str,
         did: &DID,
         scope: RevocationScope,
-        _proposal_id: ProposalId,
     ) -> Result<GovernanceBanResult, ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -1872,7 +1869,6 @@ impl ContextManager {
         &self,
         context_id: &str,
         did: &DID,
-        _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
