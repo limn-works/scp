@@ -381,6 +381,14 @@ impl ContextHandle {
         &self.params
     }
 
+    /// Transitions the memory scope to `Full` during context promotion
+    /// (§5.10). This is the only spec-authorized mutation of `ContextParams`
+    /// after creation — promotion changes the opt-in contract from ephemeral
+    /// to persistent.
+    pub fn promote_memory_scope(&mut self) {
+        self.params.memory_scope = params::MemoryScope::Full;
+    }
+
     /// Returns the context's current lifecycle state.
     ///
     /// Acquires a read lock on the interior state.

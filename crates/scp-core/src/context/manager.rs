@@ -2644,9 +2644,13 @@ impl ContextManager {
                 )));
             }
 
-            // Promote: cancel TTL timer (effectively persistent).
+            // Promote: cancel TTL timer and transition memory scope (§5.10).
+            // "On promotion: TTL is removed, memory scope transitions from
+            // ephemeral to full, existing event log and key material are
+            // preserved."
             ctx.ttl_timer.cancel();
             ctx.ttl_timer.deadline_unix_secs = None;
+            ctx.handle.promote_memory_scope();
 
             Self::snapshot_context(ctx)
         };
