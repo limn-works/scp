@@ -784,9 +784,12 @@ pub async fn serve_tls(
             // Wrap in hyper's IO adapter.
             let io = TokioIo::new(tls_stream);
 
-            // Build a hyper service from the tower/axum router.
-            let hyper_service = hyper::service::service_fn(move |request: Request<Incoming>| {
-                tower_service.clone().call(request)
+            // Build a hyper service from the tower/axum router, injecting
+            // ConnectInfo so rate limiting middleware can extract the client IP.
+            let hyper_service = hyper::service::service_fn(move |mut req: Request<Incoming>| {
+                req.extensions_mut()
+                    .insert(axum::extract::ConnectInfo(peer_addr));
+                tower_service.clone().call(req)
             });
 
             // Serve with HTTP/2 auto-detection and WebSocket upgrade support.

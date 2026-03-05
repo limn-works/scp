@@ -299,19 +299,20 @@ An `ApplicationNode` composes:
 ```rust
 // scp-node crate
 
-pub struct ApplicationNode { /* ... */ }
+pub struct ApplicationNode<S: Storage> { /* ... */ }
 
-impl ApplicationNode {
-    pub fn builder() -> ApplicationNodeBuilder;
+/// Convenience free function: `scp_node::builder()`.
+pub fn builder() -> ApplicationNodeBuilder;
 
+impl<S: Storage> ApplicationNode<S> {
     /// The relay handle — for direct relay operations.
     pub fn relay(&self) -> &RelayHandle;
 
     /// The identity handle — for DID operations, context creation, messaging.
     pub fn identity(&self) -> &IdentityHandle;
 
-    /// The storage handle — for direct ProtocolStore access.
-    pub fn storage(&self) -> &ProtocolStore;
+    /// The storage handle — for direct ProtocolStore access (§17.4).
+    pub fn storage(&self) -> &ProtocolStore<S>;
 
     /// Returns an axum Router serving GET /.well-known/scp.
     /// Dynamically generated from node state (DID, relay URL, registered contexts).
@@ -324,32 +325,43 @@ impl ApplicationNode {
     /// - Application-provided routes
     /// - .well-known/scp route
     /// - /scp/v1 WebSocket upgrade route
-    pub async fn serve(self, app_router: axum::Router) -> Result<(), NodeError>;
+    /// The shutdown future resolves when the server should begin graceful
+    /// shutdown (e.g., signal handler, test teardown). In-flight connections
+    /// drain naturally.
+    pub async fn serve(
+        self,
+        app_router: axum::Router,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), NodeError>;
 }
 
-pub struct ApplicationNodeBuilder {
-    domain: Option<String>,
-    identity: Option<Identity>,
-    storage: Option<SqliteStorage>,
-    bind_addr: Option<SocketAddr>,
-    acme_email: Option<String>,
-}
+/// Type-state builder — generic over key custody (K), DID method (D),
+/// storage backend (S), domain state, and identity state. The type system
+/// enforces that `.build()` is only callable when both domain mode and
+/// identity have been configured.
+pub struct ApplicationNodeBuilder<K, D, S, Dom, Id> { /* ... */ }
 
 impl ApplicationNodeBuilder {
-    pub fn domain(mut self, domain: &str) -> Self;
-    pub fn identity(mut self, identity: Identity) -> Self;
-    pub fn generate_identity(mut self) -> Self;
-    pub fn storage(mut self, storage: SqliteStorage) -> Self;
-    pub fn bind_addr(mut self, addr: SocketAddr) -> Self;
-    pub fn acme_email(mut self, email: &str) -> Self;
+    pub fn new() -> Self;
+}
 
-    /// Build the ApplicationNode:
+impl<...> ApplicationNodeBuilder<K, D, S, Dom, Id> {
+    pub fn domain(self, domain: &str) -> ApplicationNodeBuilder<..., HasDomain, ...>;
+    pub fn no_domain(self) -> ApplicationNodeBuilder<..., HasNoDomain, ...>;
+    pub fn generate_identity(self, ...) -> ApplicationNodeBuilder<..., HasIdentity>;
+    pub fn explicit_identity(self, ...) -> ApplicationNodeBuilder<..., HasIdentity>;
+    pub fn storage<S2: Storage>(self, storage: S2) -> ApplicationNodeBuilder<..., S2, ...>;
+    pub fn bind_addr(self, addr: SocketAddr) -> Self;
+    pub fn acme_email(self, email: &str) -> Self;
+    pub fn projection_rate_limit(self, rate: u32) -> Self;
+
+    /// Build the ApplicationNode (available when domain + identity are set):
     /// 1. Initialize storage (create if needed)
     /// 2. Load or generate identity
     /// 3. Start relay server
     /// 4. Publish DID document with SCPRelay entry
-    /// 5. Provision TLS certificate via ACME (if not cached)
-    pub async fn build(self) -> Result<ApplicationNode, NodeError>;
+    /// 5. Provision TLS certificate via ACME (domain mode) or probe NAT (no-domain mode)
+    pub async fn build(self) -> Result<ApplicationNode<S>, NodeError>;
 }
 ```
 
@@ -527,6 +539,7 @@ Request bodies are limited to **64 KiB**. Requests exceeding this limit are reje
 - **Broadcast context limit.** A maximum of 1024 broadcast contexts may be registered per node. This prevents unbounded memory growth from registration floods via the dev API or SDK.
 - **Production default: disabled.** The dev API is opt-in via `local_api()`. Deployments that do not call this method have zero additional attack surface.
 - **Separate port** from the public HTTPS listener. Reverse proxy configurations that forward to the public port never accidentally expose the dev API.
+- **No rate limiting required.** The dev API's localhost binding + bearer token authentication provide sufficient protection. Per-IP rate limiting is applied only to public projection endpoints (§18.11.6).
 
 ## 18.11 HTTP Broadcast Projection
 
@@ -645,6 +658,7 @@ Keys are retained per epoch for the blob TTL window. When a key epoch advances, 
 - **Public endpoint.** Broadcast content was intended for broad distribution (§5.14 design). The projection makes already-public content accessible via HTTP without requiring SCP client software.
 - **No authentication on projection endpoints.** The content is public by design. Operators wanting access control can place a reverse proxy with authentication in front of the projection endpoints.
 - **`routing_id` is not new disclosure.** The `routing_id = SHA-256(context_id)` is already visible to relays (§5.14.6). Using it in URL paths reveals nothing beyond what relays already observe.
+- **Per-IP rate limiting.** Projection endpoints apply a per-IP token-bucket rate limiter (default 60 req/s, configurable via `SCP_NODE_PROJECTION_RATE_LIMIT`). Requests exceeding the limit receive HTTP 429 Too Many Requests. This prevents abuse of the public, unauthenticated endpoints that perform crypto decryption and blob reads per request. When deployed behind a reverse proxy or CDN, all requests arrive from the proxy's IP — operators in this topology should rely on proxy-layer rate limiting or configure `X-Forwarded-For` / `X-Real-IP` extraction with a trusted-proxy allowlist.
 
 ### 18.11.7 `scp://` URI Integration
 

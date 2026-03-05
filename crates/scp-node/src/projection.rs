@@ -670,13 +670,54 @@ pub async fn message_handler(
 ///
 /// See spec sections 18.11.3 and 18.11.4.
 pub fn broadcast_projection_router(state: Arc<NodeState>) -> Router {
+    let limiter = state.projection_rate_limiter.clone();
     Router::new()
         .route("/scp/broadcast/{routing_id}/feed", get(feed_handler))
         .route(
             "/scp/broadcast/{routing_id}/messages/{blob_id}",
             get(message_handler),
         )
+        .layer(axum::middleware::from_fn(move |req, next| {
+            projection_rate_limit_middleware(req, next, limiter.clone())
+        }))
         .with_state(state)
+}
+
+/// Middleware that enforces per-IP rate limiting on projection endpoints.
+///
+/// Extracts the client IP from [`axum::extract::ConnectInfo<SocketAddr>`]
+/// (injected by `axum::serve` for plain HTTP, or manually for TLS connections
+/// in [`crate::tls::serve_tls`]). Falls back to `0.0.0.0` if unavailable.
+///
+/// Returns HTTP 429 Too Many Requests when the per-IP token bucket is exhausted.
+/// See spec section 18.11.6.
+async fn projection_rate_limit_middleware(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+    limiter: scp_transport::relay::rate_limit::PublishRateLimiter,
+) -> axum::response::Response {
+    let ip = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map_or_else(
+            || {
+                tracing::warn!(
+                    "ConnectInfo missing from request extensions; \
+                     projection rate limiting falls back to shared 0.0.0.0 bucket \
+                     (per-IP isolation lost)"
+                );
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+            },
+            |ci| ci.0.ip(),
+        );
+    if !limiter.check(ip).await {
+        return (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded",
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 // ---------------------------------------------------------------------------
@@ -871,6 +912,16 @@ mod tests {
         projected: HashMap<[u8; 32], ProjectedContext>,
         storage: InMemoryBlobStorage,
     ) -> Arc<NodeState> {
+        test_state_with_rate(projected, storage, 1000)
+    }
+
+    /// Creates a test `NodeState` with the given projected contexts,
+    /// blob storage, and projection rate limit.
+    fn test_state_with_rate(
+        projected: HashMap<[u8; 32], ProjectedContext>,
+        storage: InMemoryBlobStorage,
+        rate_limit: u32,
+    ) -> Arc<NodeState> {
         Arc::new(NodeState {
             did: "did:dht:test".to_owned(),
             relay_url: "wss://localhost/scp/v1".to_owned(),
@@ -886,6 +937,9 @@ mod tests {
             http_bind_addr: SocketAddr::from(([0, 0, 0, 0], 8443)),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             cors_origins: None,
+            projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
+                rate_limit,
+            ),
             tls_config: None,
             cert_resolver: None,
         })
@@ -1856,5 +1910,63 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "unknown blob_id");
+    }
+
+    // -----------------------------------------------------------------------
+    // Rate limiting tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn rate_limit_returns_429_when_exceeded() {
+        // Set rate to 2 req/s so the third request is rate-limited.
+        let state = test_state_with_rate(HashMap::new(), InMemoryBlobStorage::new(), 2);
+        let routing_hex = hex_encode(&[0xAA; 32]);
+        let uri = format!("/scp/broadcast/{routing_hex}/feed");
+
+        // First two requests should succeed (404 for unknown routing, but not 429).
+        for i in 0..2 {
+            let router = broadcast_projection_router(Arc::clone(&state));
+            let req = Request::builder().uri(&uri).body(Body::empty()).unwrap();
+            let resp = router.oneshot(req).await.unwrap();
+            assert_ne!(
+                resp.status(),
+                HttpStatus::TOO_MANY_REQUESTS,
+                "request {i} should not be rate-limited"
+            );
+        }
+
+        // Third request should be rate-limited (429).
+        let router = broadcast_projection_router(Arc::clone(&state));
+        let req = Request::builder().uri(&uri).body(Body::empty()).unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            HttpStatus::TOO_MANY_REQUESTS,
+            "third request should be rate-limited"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_allows_different_ips() {
+        // Verify the limiter uses per-IP buckets via the PublishRateLimiter API directly.
+        let limiter = scp_transport::relay::rate_limit::PublishRateLimiter::new(1);
+        let ip_a: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let ip_b: std::net::IpAddr = "10.0.0.2".parse().unwrap();
+
+        // First request from each IP should be allowed.
+        assert!(limiter.check(ip_a).await, "ip_a first request should pass");
+        assert!(limiter.check(ip_b).await, "ip_b first request should pass");
+
+        // Second request from ip_a should be rate-limited.
+        assert!(
+            !limiter.check(ip_a).await,
+            "ip_a second request should be rate-limited"
+        );
+
+        // Second request from ip_b should also be rate-limited (separate bucket, same rate).
+        assert!(
+            !limiter.check(ip_b).await,
+            "ip_b second request should be rate-limited"
+        );
     }
 }

@@ -26,6 +26,7 @@ use zeroize::Zeroizing;
 use scp_platform::traits::Storage;
 use scp_transport::native::server::RelayConfig as TransportRelayConfig;
 use scp_transport::native::storage::BlobStorageBackend;
+use scp_transport::relay::rate_limit::PublishRateLimiter;
 
 use crate::tls;
 
@@ -120,6 +121,15 @@ pub struct NodeState {
     ///
     /// See issue #231.
     pub(crate) cors_origins: Option<Vec<String>>,
+    /// Per-IP token-bucket rate limiter for broadcast projection endpoints.
+    ///
+    /// Limits the request rate from each source IP to prevent abuse of the
+    /// public, unauthenticated projection endpoints that perform crypto
+    /// decryption and blob reads per request. Returns HTTP 429 when exceeded.
+    ///
+    /// Configurable via `SCP_NODE_PROJECTION_RATE_LIMIT` (default 60 req/s).
+    /// See spec section 18.11.6.
+    pub(crate) projection_rate_limiter: PublishRateLimiter,
     /// TLS configuration for the public HTTPS listener.
     ///
     /// When `Some`, [`ApplicationNode::serve`] terminates TLS using
@@ -510,6 +520,11 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
         app_router: Router,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<(), NodeError> {
+        spawn_projection_rate_limit_cleanup(
+            self.state.projection_rate_limiter.clone(),
+            self.state.shutdown_token.clone(),
+        );
+
         let cors = build_cors_layer(&self.state.cors_origins);
 
         // Apply CORS to public endpoints only. The WebSocket relay endpoint
@@ -676,6 +691,29 @@ fn spawn_dev_api(
 }
 
 // ---------------------------------------------------------------------------
+// Projection rate limiter cleanup (extracted for clippy::too_many_lines)
+// ---------------------------------------------------------------------------
+
+/// Spawns the background cleanup loop for the projection rate limiter.
+///
+/// Evicts stale per-IP token buckets every 60 seconds (buckets idle for more
+/// than 300 seconds). Runs until `shutdown_token` is cancelled.
+fn spawn_projection_rate_limit_cleanup(
+    limiter: PublishRateLimiter,
+    shutdown_token: CancellationToken,
+) {
+    tokio::spawn(async move {
+        limiter
+            .cleanup_loop(
+                Duration::from_secs(60),
+                Duration::from_secs(300),
+                shutdown_token,
+            )
+            .await;
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -712,6 +750,9 @@ mod tests {
             http_bind_addr: SocketAddr::from(([0, 0, 0, 0], 8443)),
             shutdown_token: CancellationToken::new(),
             cors_origins,
+            projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
+                1000,
+            ),
             tls_config: None,
             cert_resolver: None,
         })
