@@ -1581,6 +1581,11 @@ impl ContextManager {
                     .await?;
                 Ok(GovernanceActionResult::SubscriberUnbanned { did: did.clone() })
             }
+            GovernanceAction::PromoteContext => {
+                self.execute_promote_context(context_id, &proposal.approvals, pid)
+                    .await?;
+                Ok(GovernanceActionResult::Executed)
+            }
             _ => {
                 self.dispatch_context_governance_action(context_id, &proposal.action, pid)
                     .await?;
@@ -1663,7 +1668,11 @@ impl ContextManager {
                 self.execute_resolve_conflict(context_id, conflicting_proposal_id, resolution, pid)
                     .await
             }
-            GovernanceAction::PromoteContext => self.execute_promote_context(context_id, pid).await,
+            // PromoteContext is handled in dispatch_governance_action (needs
+            // proposal.approvals for unanimity check).
+            GovernanceAction::PromoteContext => unreachable!(
+                "PromoteContext is dispatched directly by dispatch_governance_action"
+            ),
             GovernanceAction::RevokeWriteAccess { did, scope } => {
                 self.execute_revoke_write_access(context_id, did, *scope, pid)
                     .await
@@ -2597,6 +2606,7 @@ impl ContextManager {
     async fn execute_promote_context(
         &self,
         context_id: &str,
+        approvals: &[super::governance::SignedVote],
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
@@ -2615,6 +2625,26 @@ impl ContextManager {
                 return Err(ContextError::PermissionDenied(
                     "context promotion_policy is not Promotable".to_owned(),
                 ));
+            }
+
+            // Unanimity check: promotion requires consent from ALL current
+            // members (§5.10) because promotion changes the opt-in contract
+            // (ephemeral → persistent). This is a protocol-level override
+            // that applies regardless of governance model.
+            let member_dids: std::collections::HashSet<&str> = ctx
+                .membership
+                .member_dids()
+                .map(|d| &**d)
+                .collect();
+            let approval_dids: std::collections::HashSet<&str> =
+                approvals.iter().map(|v| &*v.voter_did).collect();
+            let missing: Vec<&str> = member_dids.difference(&approval_dids).copied().collect();
+            if !missing.is_empty() {
+                return Err(ContextError::PermissionDenied(format!(
+                    "promotion requires unanimous consent — {} of {} members have not approved",
+                    missing.len(),
+                    member_dids.len()
+                )));
             }
 
             // Promote: cancel TTL timer (effectively persistent).
