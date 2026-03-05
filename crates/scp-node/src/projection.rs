@@ -171,6 +171,12 @@ impl ProjectedContext {
     ///
     /// If pruning becomes necessary, add a `prune_before(epoch)` method
     /// keyed to the relay's `max_blob_ttl`.
+    ///
+    /// **Important:** After a governance ban (`RevokeReadAccess` /
+    /// `governance_ban_subscriber`), all author keys are rotated in the
+    /// `ContextManager`. The caller MUST propagate the new-epoch keys to
+    /// the projection registry via this method; otherwise the projection
+    /// endpoint cannot decrypt content encrypted under the new keys.
     pub fn insert_key(&mut self, broadcast_key: BroadcastKey) {
         let epoch = broadcast_key.epoch();
         self.keys.insert(epoch, broadcast_key);
@@ -261,15 +267,21 @@ fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
 /// Validates a bearer token as a UCAN with `messages:read` capability for the
 /// given context.
 ///
-/// Performs structural validation: parses the JWT, verifies the UCAN header
-/// fields (algorithm, version), and checks that at least one attenuation
-/// grants `messages:read` for the specified context (or a wildcard context).
+/// Performs structural validation plus temporal checks: parses the JWT,
+/// verifies the UCAN header fields (algorithm, version), checks token
+/// expiry (`exp`) and not-before (`nbf`), and confirms that at least one
+/// attenuation grants `messages:read` for the specified context (or a
+/// wildcard context).
 ///
-/// This is a simplified validation suitable for projection endpoints where
-/// the full 11-step UCAN validation pipeline (DID resolution, signature
-/// verification, delegation chain, revocation check) from
-/// [`scp_core::context::broadcast::validate_messages_read_ucan`] is not
-/// available because the node does not hold the full `BroadcastContext` state.
+/// **Note:** This is a simplified validation suitable for projection
+/// endpoints. It does NOT perform the full 11-step UCAN validation pipeline
+/// (DID resolution, Ed25519 signature verification, delegation chain
+/// traversal, revocation check) from
+/// [`scp_core::context::broadcast::validate_messages_read_ucan`], because
+/// the projection layer does not hold DID documents or the full
+/// `BroadcastContext` state. The primary access-control boundary is key
+/// distribution (subscribers must obtain broadcast keys via the gated key
+/// request flow); this check is a secondary defense-in-depth gate.
 ///
 /// Returns `Ok(())` on success, or an error response on failure.
 fn validate_projection_ucan(
@@ -280,6 +292,36 @@ fn validate_projection_ucan(
         tracing::debug!(error = %e, "UCAN parse failed for projection auth");
         Box::new(ApiError::unauthorized_with("invalid UCAN token").into_response())
     })?;
+
+    // Temporal checks: reject expired or not-yet-valid tokens.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    if ucan.payload.exp <= now {
+        tracing::debug!(
+            exp = ucan.payload.exp,
+            now = now,
+            "UCAN expired for projection auth"
+        );
+        return Err(Box::new(
+            ApiError::unauthorized_with("UCAN token expired").into_response(),
+        ));
+    }
+
+    if let Some(nbf) = ucan.payload.nbf
+        && nbf > now
+    {
+        tracing::debug!(
+            nbf = nbf,
+            now = now,
+            "UCAN not yet valid for projection auth"
+        );
+        return Err(Box::new(
+            ApiError::unauthorized_with("UCAN token not yet valid").into_response(),
+        ));
+    }
 
     // Build the required capability URI for this context.
     let required = CapabilityUri::new(context_id, "messages", "read");
@@ -841,6 +883,21 @@ pub async fn message_handler(
         }
     };
 
+    // Per-author override: the envelope exposes `author_did` without
+    // requiring decryption (it's in the MessagePack header, not the
+    // ciphertext). Check per-author auth BEFORE decrypting — authenticate
+    // before processing is a fundamental security principle.
+    let effective_rule = effective_projection_rule(
+        admission,
+        projection_policy.as_ref(),
+        Some(&envelope.author_did),
+    );
+    if effective_rule != default_rule
+        && let Err(resp) = check_projection_auth(&headers, &context_id, effective_rule)
+    {
+        return *resp;
+    }
+
     // Find the matching broadcast key for this epoch.
     let Some(key) = keys.get(&envelope.key_epoch) else {
         tracing::error!(
@@ -864,23 +921,6 @@ pub async fn message_handler(
             return ApiError::internal_error("decryption failure").into_response();
         }
     };
-
-    // Per-author override: now that we know the author DID, check if a
-    // per-author override applies. If the default rule was Public but the
-    // per-author override is Gated (or vice versa), enforce the override.
-    let effective_rule = effective_projection_rule(
-        admission,
-        projection_policy.as_ref(),
-        Some(&envelope.author_did),
-    );
-    // If the effective rule is stricter than the default (e.g., default is
-    // Public but override is Gated), enforce auth now. The earlier pre-auth
-    // check only applied the default rule.
-    if effective_rule != default_rule
-        && let Err(resp) = check_projection_auth(&headers, &context_id, effective_rule)
-    {
-        return *resp;
-    }
 
     let message = FeedMessage {
         id: hex_encode(&stored.blob_id),
@@ -2621,6 +2661,87 @@ mod tests {
     #[test]
     fn validate_policy_accepts_none_on_gated() {
         assert!(validate_projection_policy(BroadcastAdmission::Gated, None).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-GG-008: UCAN temporal validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_ucan_rejects_expired_token() {
+        // Build a UCAN with exp in the past.
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use scp_core::crypto::ucan::{Attenuation, UcanHeader, UcanPayload};
+
+        let header = UcanHeader {
+            alg: "EdDSA".to_owned(),
+            typ: "JWT".to_owned(),
+            ucv: "0.10.0".to_owned(),
+            kid: None,
+        };
+        let payload = UcanPayload {
+            iss: "did:dht:test".to_owned(),
+            aud: "did:dht:test".to_owned(),
+            exp: 1, // expired (1970-01-01T00:00:01)
+            nbf: None,
+            nnc: "nonce".to_owned(),
+            att: vec![Attenuation {
+                with: "scp:ctx:test_ctx/messages:read".to_owned(),
+                can: "read".to_owned(),
+            }],
+            prf: vec![],
+            fct: None,
+        };
+
+        let h = serde_json::to_vec(&header).unwrap();
+        let p = serde_json::to_vec(&payload).unwrap();
+        let token = format!(
+            "{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(&h),
+            URL_SAFE_NO_PAD.encode(&p),
+            URL_SAFE_NO_PAD.encode(vec![0u8; 64]),
+        );
+
+        let result = validate_projection_ucan(&token, "test_ctx");
+        assert!(result.is_err(), "expired UCAN should be rejected");
+    }
+
+    #[test]
+    fn validate_ucan_rejects_not_yet_valid_token() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use scp_core::crypto::ucan::{Attenuation, UcanHeader, UcanPayload};
+
+        let header = UcanHeader {
+            alg: "EdDSA".to_owned(),
+            typ: "JWT".to_owned(),
+            ucv: "0.10.0".to_owned(),
+            kid: None,
+        };
+        let payload = UcanPayload {
+            iss: "did:dht:test".to_owned(),
+            aud: "did:dht:test".to_owned(),
+            exp: u64::MAX,
+            nbf: Some(u64::MAX - 1), // not valid until far future
+            nnc: "nonce".to_owned(),
+            att: vec![Attenuation {
+                with: "scp:ctx:test_ctx/messages:read".to_owned(),
+                can: "read".to_owned(),
+            }],
+            prf: vec![],
+            fct: None,
+        };
+
+        let h = serde_json::to_vec(&header).unwrap();
+        let p = serde_json::to_vec(&payload).unwrap();
+        let token = format!(
+            "{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(&h),
+            URL_SAFE_NO_PAD.encode(&p),
+            URL_SAFE_NO_PAD.encode(vec![0u8; 64]),
+        );
+
+        let result = validate_projection_ucan(&token, "test_ctx");
+        assert!(result.is_err(), "not-yet-valid UCAN should be rejected");
     }
 
     // -----------------------------------------------------------------------

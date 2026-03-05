@@ -244,7 +244,7 @@ pub enum FieldVisibility {
 /// This policy governs operational fields only. By default, all operational
 /// fields are [`FieldVisibility::PreJoin`] -- visible to anyone with the
 /// `context_id`, supporting informed consent before joining.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataVisibilityPolicy {
     /// Visibility of the context's member count.
     pub member_count: FieldVisibility,
@@ -262,21 +262,6 @@ pub struct MetadataVisibilityPolicy {
     pub tool_interface_count: FieldVisibility,
     /// Visibility of child context summary information.
     pub child_context_info: FieldVisibility,
-}
-
-impl Default for MetadataVisibilityPolicy {
-    fn default() -> Self {
-        Self {
-            member_count: FieldVisibility::PreJoin,
-            context_age: FieldVisibility::PreJoin,
-            creator_identity: FieldVisibility::PreJoin,
-            name: FieldVisibility::PreJoin,
-            description: FieldVisibility::PreJoin,
-            economic_policy: FieldVisibility::PreJoin,
-            tool_interface_count: FieldVisibility::PreJoin,
-            child_context_info: FieldVisibility::PreJoin,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
