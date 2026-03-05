@@ -328,6 +328,9 @@ pub struct ContextManager {
     contexts: Mutex<HashMap<String, PerContextState>>,
 }
 
+// Nursery lint — false-positives on async functions holding tokio::sync::MutexGuard
+// across block boundaries. The lock-snapshot-persist pattern is intentional.
+#[allow(clippy::significant_drop_tightening)]
 impl ContextManager {
     /// Creates a new `ContextManager` with the given providers.
     ///
@@ -504,8 +507,6 @@ impl ContextManager {
     ///
     /// Returns [`ContextError::PersistenceFailed`] if no persisted state
     /// exists. Returns [`ContextError::MembershipFailed`] if the context
-    /// is already registered.
-    #[allow(clippy::significant_drop_tightening)]
     pub async fn restore_context(
         &self,
         context_id: &str,
@@ -814,8 +815,6 @@ impl ContextManager {
     /// Returns [`ContextError`] if:
     /// - The context is not in `Active` state.
     /// - The key package is invalid.
-    /// - Any crypto or event log operation fails.
-    #[allow(clippy::significant_drop_tightening)]
     pub async fn join_context(
         &self,
         handle: &ContextHandle,
@@ -902,8 +901,6 @@ impl ContextManager {
     /// - The context is not in `Active` state.
     /// - The caller is neither the member being removed nor holds `MemberRemove`.
     /// - The member is not found.
-    /// - Any crypto or event log operation fails.
-    #[allow(clippy::significant_drop_tightening)]
     pub async fn leave_context(
         &self,
         handle: &ContextHandle,
@@ -1029,8 +1026,6 @@ impl ContextManager {
     /// Returns [`ContextError`] if:
     /// - The context is not in `Active` state.
     /// - The sender lacks `messages:write` capability.
-    /// - Any crypto, transport, or event log operation fails.
-    #[allow(clippy::significant_drop_tightening)]
     pub async fn send_message(
         &self,
         handle: &ContextHandle,
@@ -1207,8 +1202,6 @@ impl ContextManager {
     /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
     ///   context or the subscriber is already registered.
     /// - [`ContextError::PermissionDenied`] if the context is gated and no
-    ///   UCAN is provided, or the UCAN fails validation.
-    #[allow(clippy::significant_drop_tightening)]
     pub async fn subscribe_broadcast<D, N, R, P, S>(
         &self,
         context_id: &str,
@@ -1286,8 +1279,6 @@ impl ContextManager {
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
     ///   context.
-    /// - [`ContextError::MemberNotFound`] if the subscriber is not registered.
-    #[allow(clippy::significant_drop_tightening)]
     pub async fn unsubscribe_broadcast(
         &self,
         context_id: &str,
@@ -1360,8 +1351,6 @@ impl ContextManager {
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::MembershipFailed`] if the context is not broadcast.
     /// - [`ContextError::PermissionDenied`] if the sender is not an author.
-    /// - [`ContextError::CryptoFailed`] if encryption fails.
-    #[allow(clippy::significant_drop_tightening)]
     pub async fn publish_broadcast(
         &self,
         context_id: &str,
@@ -1432,8 +1421,6 @@ impl ContextManager {
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::MembershipFailed`] if the context is not broadcast.
     /// - [`ContextError::MemberNotFound`] if the author is not registered.
-    /// - [`ContextError::CryptoFailed`] if key rotation fails.
-    #[allow(clippy::significant_drop_tightening)]
     pub async fn block_broadcast_subscriber(
         &self,
         context_id: &str,
@@ -1499,8 +1486,6 @@ impl ContextManager {
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
     ///   context (for `BlockAuthor`, `RevokeReadAccess`, `RestoreReadAccess`).
-    /// - [`ContextError::MemberNotFound`] if the target DID is not registered.
-    #[allow(clippy::significant_drop_tightening)]
     pub async fn execute_governance_action(
         &self,
         context_id: &str,
@@ -1522,27 +1507,42 @@ impl ContextManager {
             )));
         }
 
-        // Gate: reject replayed proposals (defense-in-depth).
+        // Atomically check replay AND mark as executed before dispatch.
+        // This prevents TOCTOU races where concurrent callers both pass the
+        // replay check before either records the proposal as executed.
         {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(context_id)
-                && ctx.executed_proposals.contains(&proposal.proposal_id)
-            {
-                return Err(ContextError::PermissionDenied(
-                    "governance proposal has already been executed".into(),
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                if ctx.executed_proposals.contains(&proposal.proposal_id) {
+                    return Err(ContextError::PermissionDenied(
+                        "governance proposal has already been executed".into(),
+                    ));
+                }
+                ctx.executed_proposals.insert(proposal.proposal_id);
+            } else {
+                return Err(ContextError::MembershipFailed(
+                    "context not registered".into(),
                 ));
             }
         }
 
-        let result = self
-            .dispatch_governance_action(context_id, proposal)
-            .await?;
+        let result = match self.dispatch_governance_action(context_id, proposal).await {
+            Ok(r) => r,
+            Err(e) => {
+                // Roll back the executed marker on dispatch failure so the
+                // proposal can be retried (e.g. after a transient crypto error).
+                let mut contexts = self.contexts.lock().await;
+                if let Some(ctx) = contexts.get_mut(context_id) {
+                    ctx.executed_proposals.remove(&proposal.proposal_id);
+                }
+                return Err(e);
+            }
+        };
 
-        // Record the proposal as executed (post-dispatch, covers all 25 variants).
+        // Persist the executed-proposals set (the insert happened above).
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
-                ctx.executed_proposals.insert(proposal.proposal_id);
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(context_id) {
                 let snapshot = Self::snapshot_context(ctx);
                 drop(contexts);
                 self.persist_context_snapshot(context_id, &snapshot);
@@ -1721,8 +1721,6 @@ impl ContextManager {
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
     ///   context.
-    /// - [`ContextError::MemberNotFound`] if the author DID is not registered.
-    #[allow(clippy::significant_drop_tightening)]
     async fn block_broadcast_author_internal(
         &self,
         context_id: &str,
@@ -1790,8 +1788,6 @@ impl ContextManager {
     /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
     ///   context.
     /// - [`ContextError::MemberNotFound`] if the subscriber DID is not
-    ///   registered.
-    #[allow(clippy::significant_drop_tightening)]
     async fn revoke_read_access_internal(
         &self,
         context_id: &str,
@@ -1863,8 +1859,6 @@ impl ContextManager {
     /// - [`ContextError::PermissionDenied`] if the ceiling lacks `MemberBan`.
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
-    ///   context.
-    #[allow(clippy::significant_drop_tightening)]
     async fn restore_read_access_internal(
         &self,
         context_id: &str,
@@ -1922,7 +1916,6 @@ impl ContextManager {
     // `execute_governance_action` after proposal approval.
     // -----------------------------------------------------------------------
 
-    #[allow(clippy::significant_drop_tightening)]
     async fn execute_add_member(
         &self,
         context_id: &str,
@@ -1968,7 +1961,6 @@ impl ContextManager {
         Ok(())
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     async fn execute_remove_member(
         &self,
         context_id: &str,
@@ -2019,7 +2011,6 @@ impl ContextManager {
         Ok(())
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     async fn execute_change_role(
         &self,
         context_id: &str,
@@ -2061,7 +2052,6 @@ impl ContextManager {
         Ok(())
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     async fn execute_register_tool(
         &self,
         context_id: &str,
@@ -2087,7 +2077,6 @@ impl ContextManager {
         Ok(())
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     async fn execute_remove_tool(
         &self,
         context_id: &str,
@@ -2113,7 +2102,6 @@ impl ContextManager {
         Ok(())
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     async fn execute_modify_ceiling(
         &self,
         context_id: &str,
@@ -2150,7 +2138,6 @@ impl ContextManager {
         Ok(())
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     async fn execute_close_context(
         &self,
         context_id: &str,
@@ -2186,7 +2173,6 @@ impl ContextManager {
         Ok(())
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     async fn execute_extend_ttl(
         &self,
         context_id: &str,
@@ -2216,7 +2202,6 @@ impl ContextManager {
         Ok(())
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     async fn execute_transfer_admin(
         &self,
         context_id: &str,
@@ -2269,7 +2254,6 @@ impl ContextManager {
         Ok(())
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     async fn execute_create_child_context(
         &self,
         context_id: &str,
@@ -2293,7 +2277,6 @@ impl ContextManager {
         Ok(())
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     async fn execute_modify_pruning_policy(
         &self,
         context_id: &str,
@@ -2301,6 +2284,26 @@ impl ContextManager {
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
+
+        // Validate retention multipliers are finite and positive (NaN/Infinity
+        // would bypass the retention floor checks below).
+        let structural_mul = new_policy
+            .event_type_retention
+            .structural_retention_multiplier;
+        if !structural_mul.is_finite() || structural_mul <= 0.0 {
+            return Err(ContextError::PermissionDenied(
+                "structural_retention_multiplier must be a finite positive number".to_owned(),
+            ));
+        }
+        let operational_mul = new_policy
+            .event_type_retention
+            .operational_retention_multiplier;
+        if !operational_mul.is_finite() || operational_mul <= 0.0 {
+            return Err(ContextError::PermissionDenied(
+                "operational_retention_multiplier must be a finite positive number".to_owned(),
+            ));
+        }
+
         // Validate protocol minimum: 30 days for time-based retention (ADR-030).
         if let Some(ref tb) = new_policy.time_based
             && tb.retention_secs < 2_592_000
@@ -2354,7 +2357,6 @@ impl ContextManager {
         Ok(())
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     async fn execute_add_signer(
         &self,
         context_id: &str,
@@ -2388,7 +2390,6 @@ impl ContextManager {
         Ok(())
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     async fn execute_remove_signer(
         &self,
         context_id: &str,
@@ -2430,7 +2431,6 @@ impl ContextManager {
         Ok(())
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     async fn execute_modify_threshold(
         &self,
         context_id: &str,
@@ -2462,7 +2462,6 @@ impl ContextManager {
         Ok(())
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     async fn execute_establish_tool_interface(
         &self,
         context_id: &str,
@@ -2488,7 +2487,6 @@ impl ContextManager {
         Ok(())
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     async fn execute_reset_member(
         &self,
         context_id: &str,
@@ -2522,7 +2520,6 @@ impl ContextManager {
         Ok(())
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     async fn execute_resolve_conflict(
         &self,
         context_id: &str,
@@ -2541,13 +2538,13 @@ impl ContextManager {
             require_active(&ctx.handle)?;
 
             // Mark the conflicting proposal(s) as executed (invalidated) so
-            // they cannot be replayed. For AcceptProposal the winner is
-            // accepted and the loser invalidated; for InvalidateBoth, both
-            // are invalidated.
+            // they cannot be replayed. For AcceptProposal the loser is
+            // invalidated; the winner is left unexecuted so it can proceed
+            // through normal `execute_governance_action`. For InvalidateBoth,
+            // both are invalidated.
             match resolution {
                 super::governance::ConflictResolution::AcceptProposal { winner_id } => {
-                    // Invalidate the loser. The winner proceeds through normal
-                    // execution; mark it as executed to prevent double-execution.
+                    // Validate that winner_id is one of the two proposals.
                     let loser = if *winner_id == *proposal_a {
                         proposal_b
                     } else if *winner_id == *proposal_b {
@@ -2557,8 +2554,9 @@ impl ContextManager {
                             "winner_id {winner_id:?} is not one of the conflicting proposals"
                         )));
                     };
+                    // Only invalidate the loser — the winner remains eligible
+                    // for normal execution.
                     ctx.executed_proposals.insert(*loser);
-                    ctx.executed_proposals.insert(*winner_id);
                 }
                 super::governance::ConflictResolution::InvalidateBoth => {
                     ctx.executed_proposals.insert(*proposal_a);
@@ -2575,7 +2573,6 @@ impl ContextManager {
         Ok(())
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     async fn execute_promote_context(
         &self,
         context_id: &str,
@@ -2634,7 +2631,6 @@ impl ContextManager {
         Ok(())
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     async fn execute_revoke_write_access(
         &self,
         context_id: &str,
@@ -2692,7 +2688,6 @@ impl ContextManager {
         Ok(())
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     async fn execute_restore_write_access(
         &self,
         context_id: &str,
@@ -2723,7 +2718,6 @@ impl ContextManager {
         Ok(())
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     async fn execute_rotate_content_keys(
         &self,
         context_id: &str,
@@ -2761,7 +2755,6 @@ impl ContextManager {
         Ok(())
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     async fn execute_reconfigure_governance(
         &self,
         context_id: &str,
@@ -2778,37 +2771,56 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
             require_active(&ctx.handle)?;
 
-            // Apply each reconfiguration action in order (ADR-031 §10).
-            for change in changes {
-                match change {
-                    super::governance::GovernanceReconfigAction::RemoveInactiveSigner { did } => {
-                        ctx.threshold_signers.retain(|s| s != did);
-                    }
-                    super::governance::GovernanceReconfigAction::ReduceThreshold {
-                        new_threshold,
-                    } => {
-                        let signer_count =
-                            u32::try_from(ctx.threshold_signers.len()).unwrap_or(u32::MAX);
-                        if *new_threshold == 0 || *new_threshold > signer_count {
-                            return Err(ContextError::PermissionDenied(format!(
-                                "reconfigured threshold must be 1..={signer_count}, got {new_threshold}"
-                            )));
-                        }
-                        ctx.threshold_value = *new_threshold;
-                    }
-                }
-            }
+            // Save state for rollback — the loop below mutates ctx in-place,
+            // and any mid-loop or post-loop error must restore the original
+            // state to prevent in-memory corruption.
+            let original_signers = ctx.threshold_signers.clone();
+            let original_threshold = ctx.threshold_value;
 
-            // Post-loop invariant: threshold must still be satisfiable after
-            // all removals and reductions (ADR-031 §10).
-            if ctx.threshold_value > 0 {
-                let remaining = u32::try_from(ctx.threshold_signers.len()).unwrap_or(u32::MAX);
-                if ctx.threshold_value > remaining {
-                    return Err(ContextError::PermissionDenied(format!(
-                        "reconfiguration left {remaining} signers < threshold {}",
-                        ctx.threshold_value,
-                    )));
+            // Apply each reconfiguration action in order (ADR-031 §10).
+            let reconfigure_result: Result<(), ContextError> = (|| {
+                for change in changes {
+                    match change {
+                        super::governance::GovernanceReconfigAction::RemoveInactiveSigner {
+                            did,
+                        } => {
+                            ctx.threshold_signers.retain(|s| s != did);
+                        }
+                        super::governance::GovernanceReconfigAction::ReduceThreshold {
+                            new_threshold,
+                        } => {
+                            let signer_count =
+                                u32::try_from(ctx.threshold_signers.len()).unwrap_or(u32::MAX);
+                            if *new_threshold == 0 || *new_threshold > signer_count {
+                                return Err(ContextError::PermissionDenied(format!(
+                                    "reconfigured threshold must be 1..={signer_count}, got {new_threshold}"
+                                )));
+                            }
+                            ctx.threshold_value = *new_threshold;
+                        }
+                    }
                 }
+
+                // Post-loop invariant: threshold must still be satisfiable after
+                // all removals and reductions (ADR-031 §10).
+                if ctx.threshold_value > 0 {
+                    let remaining = u32::try_from(ctx.threshold_signers.len()).unwrap_or(u32::MAX);
+                    if ctx.threshold_value > remaining {
+                        return Err(ContextError::PermissionDenied(format!(
+                            "reconfiguration left {remaining} signers < threshold {}",
+                            ctx.threshold_value,
+                        )));
+                    }
+                }
+
+                Ok(())
+            })();
+
+            if let Err(e) = reconfigure_result {
+                // Rollback: restore original state before returning error.
+                ctx.threshold_signers = original_signers;
+                ctx.threshold_value = original_threshold;
+                return Err(e);
             }
 
             Self::snapshot_context(ctx)
@@ -2841,8 +2853,6 @@ impl ContextManager {
     /// registered as a locally controlled DID.
     ///
     /// Returns [`ContextError::MembershipFailed`] if the context is not
-    /// registered or not a broadcast context.
-    #[allow(clippy::significant_drop_tightening)]
     pub async fn handle_broadcast_key_request(
         &self,
         context_id: &str,
@@ -2923,8 +2933,6 @@ impl ContextManager {
     ///
     /// Returns [`ContextError::ContextNotActive`] if the context is not
     /// `Active`. Returns [`ContextError::PermissionDenied`] if the
-    /// initiator lacks the `ContextClose` capability.
-    #[allow(clippy::significant_drop_tightening)]
     pub async fn close_context(
         &self,
         handle: &ContextHandle,
@@ -3018,8 +3026,6 @@ impl ContextManager {
     /// # Errors
     ///
     /// Returns [`ContextError::ContextNotActive`] if the context is not
-    /// `Active`.
-    #[allow(clippy::significant_drop_tightening)]
     pub async fn handle_ttl_expiry(&self, handle: &ContextHandle) -> Result<(), ContextError> {
         let context_id = handle.context_id().to_owned();
 
@@ -3059,8 +3065,6 @@ impl ContextManager {
     ///
     /// Returns [`ContextError::MembershipFailed`] if the context is not
     /// registered. Returns [`ContextError::MemberNotFound`] if the member
-    /// is not in the context.
-    #[allow(clippy::significant_drop_tightening)]
     pub async fn propose_ttl_extension(
         &self,
         context_id: &str,
@@ -3140,8 +3144,6 @@ impl ContextManager {
     /// - Logs a `ContextExpired` event to the event log.
     ///
     /// This matches the behavior of [`TtlTimer::spawn`] and ensures key
-    /// material is properly destroyed on TTL expiry (SCP-169).
-    #[allow(clippy::significant_drop_tightening)]
     async fn spawn_ttl_timer(
         &self,
         context_id: &str,

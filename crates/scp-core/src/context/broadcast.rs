@@ -730,11 +730,17 @@ impl BroadcastContext {
     ///
     /// Returns [`ContextError::CryptoFailed`] if any author's epoch overflows.
     pub fn rotate_all_author_keys(&mut self) -> Result<(), ContextError> {
-        for author in self.authors.values_mut() {
-            let new_epoch = author.epoch.checked_add(1).ok_or_else(|| {
+        // Pre-validate: ensure ALL authors can increment their epoch before
+        // mutating any state. This prevents partial rotation where some
+        // authors get new keys but the operation fails mid-loop.
+        for author in self.authors.values() {
+            author.epoch.checked_add(1).ok_or_else(|| {
                 ContextError::CryptoFailed("broadcast key epoch overflow".to_owned())
             })?;
-            author.epoch = new_epoch;
+        }
+        // All epochs validated — safe to mutate.
+        for author in self.authors.values_mut() {
+            author.epoch += 1;
             author.broadcast_key = generate_sender_key();
         }
         Ok(())
