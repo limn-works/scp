@@ -1196,21 +1196,21 @@
       "files": [
         "crates/scp-core/src/crypto/mls/group.rs"
       ],
-      "description": "Update key continuity fingerprint computation per ADR-039 acceptance criterion 12 and Key Continuity section. The fingerprint must include all three verification methods: identity_key, active_key, agent_key. Agent key absence uses 32 zero bytes as placeholder. Formula: fingerprint = SHA256(sort(alice_did, bob_did) || alice_identity_key || alice_active_key || alice_agent_key || bob_identity_key || bob_active_key || bob_agent_key). Add negative tests: (1) fingerprint changes when agent key is added, (2) fingerprint changes when agent key is rotated, (3) fingerprint changes when agent key is removed, (4) fingerprint with no agent key uses 32 zero bytes, (5) DID document with multiple #agent VMs is rejected.",
+      "description": "Update key continuity fingerprint computation per ADR-039 acceptance criterion 12 and Key Continuity section. The fingerprint must include all three verification methods: identity_key, active_key, agent_key. Agent key absence uses domain-derived sentinel SHA-256(\"SCP-ABSENT-AGENT-KEY\") to avoid Ed25519 identity point collision. Formula: fingerprint = SHA256(\"SCP-KEY-CONTINUITY-V1:\" || len(did_a) || did_a || len(did_b) || did_b || a_identity || a_active || a_agent || b_identity || b_active || b_agent) with 4-byte big-endian length prefixes on DIDs. Add negative tests: (1) fingerprint changes when agent key is added, (2) fingerprint changes when agent key is rotated, (3) fingerprint changes when agent key is removed, (4) fingerprint with no agent key uses 32 zero bytes, (5) DID document with multiple #agent VMs is rejected.",
       "acceptanceCriteria": [
         "Key continuity fingerprint includes all three VMs: identity_key, active_key, agent_key",
-        "Agent key absence uses 32 zero bytes in fingerprint computation",
-        "Fingerprint formula: SHA256(sort(did_a, did_b) || a_identity || a_active || a_agent || b_identity || b_active || b_agent)",
+        "Agent key absence uses domain-derived sentinel SHA-256(\"SCP-ABSENT-AGENT-KEY\") in fingerprint computation (not zero bytes, to avoid Ed25519 identity point collision)",
+        "Fingerprint formula: SHA256(\"SCP-KEY-CONTINUITY-V1:\" || len(did_a) || did_a || len(did_b) || did_b || a_identity || a_active || a_agent || b_identity || b_active || b_agent) with 4-byte big-endian length prefixes on DID strings",
         "Fingerprint changes when agent key is added to a DID",
         "Fingerprint changes when agent key is rotated",
         "Fingerprint changes when agent key is removed",
-        "Fingerprint with no agent key on either side produces deterministic result (zero bytes)",
+        "Fingerprint with no agent key on either side produces deterministic result (domain-derived sentinel)",
         "Fingerprint with agent key on one side but not other produces correct asymmetric result",
         "Tests verify fingerprint computation with various agent key states",
         "Tests verify DID document with multiple #agent VMs is rejected (validation from SCP-AB-008)"
       ],
       "actionItems": [
-        "Update fingerprint computation to include agent key (or 32 zero bytes if absent)",
+        "Update fingerprint computation to include agent key (or domain-derived sentinel if absent)",
         "Update fingerprint formula to match ADR-039 specification",
         "Add test: fingerprint changes on agent key add",
         "Add test: fingerprint changes on agent key rotate",

@@ -874,7 +874,7 @@ impl Identity {
                         .await
                         .map_err(ScpError::from)?;
 
-                    let handle = Arc::new(Identity {
+                    let handle = Arc::new(Self {
                         did,
                         custody_type,
                         core_id: Some(updated_identity),
@@ -961,7 +961,7 @@ impl Identity {
                         .await
                         .map_err(ScpError::from)?;
 
-                    let handle = Arc::new(Identity {
+                    let handle = Arc::new(Self {
                         did,
                         custody_type,
                         core_id: Some(updated_identity),
@@ -1046,7 +1046,7 @@ impl Identity {
                         .await
                         .map_err(ScpError::from)?;
 
-                    let handle = Arc::new(Identity {
+                    let handle = Arc::new(Self {
                         did,
                         custody_type,
                         core_id: Some(updated_identity),

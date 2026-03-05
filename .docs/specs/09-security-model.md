@@ -660,10 +660,12 @@ Equivalent to Signal's "safety numbers." Allows two parties to verify they have 
 **Fingerprint format:**
 
 ```
-fingerprint = SHA256(sort(alice_did, bob_did) || alice_identity_key || alice_active_key || alice_agent_key || bob_identity_key || bob_active_key || bob_agent_key)
+fingerprint = SHA256("SCP-KEY-CONTINUITY-V1:" || len(did_a) || did_a || len(did_b) || did_b || a_identity_key || a_active_key || a_agent_key || b_identity_key || b_active_key || b_agent_key)
 ```
 
-All three verification methods (`#0`, `#active`, `#agent`) from each party's DID document are included to detect substitution of any single key (ADR-039). If a DID has no `#agent` verification method (no agent bound), 32 zero bytes are used as a placeholder to maintain a fixed-length input. Keys are concatenated in the order shown (identity, active, agent) within each DID's block; the two DID blocks are ordered by lexicographic sort of the DID strings.
+Where `did_a, did_b` are the two DID strings ordered by lexicographic sort, `len()` is a 4-byte big-endian length prefix (prevents concatenation ambiguity when DID strings have variable length), and keys are raw 32-byte Ed25519 public keys concatenated in the order shown (identity, active, agent) within each DID's block.
+
+All three verification methods (`#0`, `#active`, `#agent`) from each party's DID document are included to detect substitution of any single key (ADR-039). If a DID has no `#agent` verification method (no agent bound), a domain-derived sentinel `SHA-256("SCP-ABSENT-AGENT-KEY")` (truncated to 32 bytes) is used instead. This avoids collision with the Ed25519 identity point (all zeros) and provides domain separation from legitimate key values. The `"SCP-KEY-CONTINUITY-V1:"` domain separator prevents cross-protocol signature confusion.
 
 Displayed as:
 - A 12-word mnemonic (BIP-39 word list, first 128 bits of the hash)

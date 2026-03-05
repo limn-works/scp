@@ -3435,8 +3435,7 @@ mod tests {
         // the default and the kid_keys paths.
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
-            kid_keys: [((issuer_did.clone(), "#active".to_owned()), pk_bytes)]
-                .into_iter()
+            kid_keys: std::iter::once(((issuer_did.clone(), "#active".to_owned()), pk_bytes))
                 .collect(),
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
@@ -3502,8 +3501,7 @@ mod tests {
         // Register the agent key under the kid_keys resolver.
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_active)).collect(),
-            kid_keys: [((issuer_did.clone(), "#agent".to_owned()), pk_agent)]
-                .into_iter()
+            kid_keys: std::iter::once(((issuer_did.clone(), "#agent".to_owned()), pk_agent))
                 .collect(),
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
@@ -3568,11 +3566,10 @@ mod tests {
         // Register both keys. The #agent key is different from #active.
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_active)).collect(),
-            kid_keys: [(
+            kid_keys: std::iter::once((
                 (issuer_did.clone(), "#agent".to_owned()),
                 pk_agent, // Different from the key that actually signed
-            )]
-            .into_iter()
+            ))
             .collect(),
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
@@ -3637,13 +3634,13 @@ mod tests {
         // Tamper: change fct.scp_key_scope to "#agent" while keeping
         // kid="#active".
         let mut tampered_payload = base_token.payload.clone();
-        if let Some(ref mut fct) = tampered_payload.fct {
-            if let Some(obj) = fct.as_object_mut() {
-                obj.insert(
-                    "scp_key_scope".to_owned(),
-                    serde_json::Value::String("#agent".to_owned()),
-                );
-            }
+        if let Some(ref mut fct) = tampered_payload.fct
+            && let Some(obj) = fct.as_object_mut()
+        {
+            obj.insert(
+                "scp_key_scope".to_owned(),
+                serde_json::Value::String("#agent".to_owned()),
+            );
         }
 
         // Re-encode and re-sign the tampered payload.
@@ -3671,8 +3668,7 @@ mod tests {
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
-            kid_keys: [((issuer_did.clone(), "#active".to_owned()), pk_bytes)]
-                .into_iter()
+            kid_keys: std::iter::once(((issuer_did.clone(), "#active".to_owned()), pk_bytes))
                 .collect(),
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
@@ -3790,11 +3786,10 @@ mod tests {
         // The resolver maps #agent to the REAL agent key (different from #active).
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_active)).collect(),
-            kid_keys: [(
+            kid_keys: std::iter::once((
                 (issuer_did.clone(), "#agent".to_owned()),
                 pk_real_agent, // Different from the key that actually signed
-            )]
-            .into_iter()
+            ))
             .collect(),
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
@@ -3989,14 +3984,13 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(UcanError::CircularDelegation(_))
-                    | Err(UcanError::SelfDelegationWithoutKeyScope)
+                Err(UcanError::CircularDelegation(_) | UcanError::SelfDelegationWithoutKeyScope,)
             ),
             "parent with iss==aud and no key_scope must be rejected: {result:?}"
         );
     }
 
-    /// Also verify validate_key_scope directly catches the self-delegation case,
+    /// Also verify `validate_key_scope` directly catches the self-delegation case,
     /// independent of chain machinery.
     #[test]
     fn validate_key_scope_rejects_self_delegation_without_scope() {
