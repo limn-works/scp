@@ -504,7 +504,7 @@ Success responses return the resource directly. Error responses use:
 }
 ```
 
-Standard HTTP status codes: `200` (success), `201` (created), `204` (deleted), `400` (bad request), `401` (unauthorized), `403` (forbidden — DNS rebinding), `404` (not found), `500` (internal error).
+Standard HTTP status codes: `200` (success), `201` (created), `204` (deleted), `400` (bad request), `401` (unauthorized), `403` (forbidden — DNS rebinding), `404` (not found), `409` (conflict — duplicate resource), `500` (internal error).
 
 Request bodies are limited to **64 KiB**. Requests exceeding this limit are rejected before handler dispatch.
 
