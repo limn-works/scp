@@ -25,17 +25,17 @@
 use ed25519_dalek::Signer;
 
 use scp_core::crypto::mls::credential::ScpCredential;
-use scp_core::crypto::ucan::mint::{mint_ucan, MintParams};
+use scp_core::crypto::ucan::mint::{MintParams, mint_ucan};
 use scp_core::envelope::inner::{
-    create_inner_envelope, verify_inner_signature, InnerEnvelopeParams, Provenance,
+    InnerEnvelopeParams, Provenance, create_inner_envelope, verify_inner_signature,
 };
 use scp_core::trust::{
-    classify_action, enforce_category_a, ActionCategory, CounterAttestation,
-    CustodyViolationType, ScpCustodyViolationAttestation,
+    ActionCategory, CounterAttestation, CustodyViolationType, ScpCustodyViolationAttestation,
+    classify_action, enforce_category_a,
 };
 use scp_identity::attestation::{KeyCustodyModel, Platform, ScpKeyCustodyAttestation};
 use scp_identity::document::DidDocument;
-use scp_identity::{SigningKeyId, DID};
+use scp_identity::{DID, SigningKeyId};
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
 
@@ -162,7 +162,10 @@ async fn test_agent_binding_full_flow() {
 
     // For the UCAN test we use the InMemoryKeyCustody signer.
     // The issuer == audience (self-delegation) with key_scope = "#agent".
-    let capabilities = vec!["messages:write".to_owned(), "tool_invoke:assistant".to_owned()];
+    let capabilities = vec![
+        "messages:write".to_owned(),
+        "tool_invoke:assistant".to_owned(),
+    ];
 
     let ucan_token = mint_ucan(
         &MintParams {
@@ -193,8 +196,8 @@ async fn test_agent_binding_full_flow() {
 
     // Decode the header and verify kid is set.
     let header_json: serde_json::Value = {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let header_bytes = URL_SAFE_NO_PAD
             .decode(jwt_segments[0])
             .expect("base64url decode header");
@@ -208,8 +211,8 @@ async fn test_agent_binding_full_flow() {
 
     // Decode the payload and verify scp_key_scope fact.
     let payload_json: serde_json::Value = {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let payload_bytes = URL_SAFE_NO_PAD
             .decode(jwt_segments[1])
             .expect("base64url decode payload");
@@ -251,8 +254,7 @@ async fn test_agent_binding_full_flow() {
 
     // Verify MessagePack round-trip preserves signing_key_id.
     let serialized = credential.to_bytes().expect("serialize credential");
-    let deserialized =
-        ScpCredential::from_bytes(&serialized).expect("deserialize credential");
+    let deserialized = ScpCredential::from_bytes(&serialized).expect("deserialize credential");
     assert_eq!(
         deserialized.signing_key_id,
         SigningKeyId::Agent,
@@ -281,7 +283,7 @@ async fn test_agent_binding_full_flow() {
         generation: 0,
         sequence: 42,
         timestamp: 1_700_000_000_000,
-        payload: payload,
+        payload,
         provenance: Some(Provenance {
             source: "agent-assistant".to_owned(),
             upstream_hash: None,
@@ -302,7 +304,10 @@ async fn test_agent_binding_full_flow() {
     // Verify signature using the agent's public key.
     let sig_valid = verify_inner_signature(&envelope, agent_pubkey.as_bytes())
         .expect("signature verification must not error");
-    assert!(sig_valid, "inner envelope signature must verify with agent public key");
+    assert!(
+        sig_valid,
+        "inner envelope signature must verify with agent public key"
+    );
 
     // Verify signature fails with wrong key (active key).
     let active_pubkey = custody
@@ -381,7 +386,10 @@ async fn test_agent_binding_full_flow() {
         violation_reference: "sha256:abc123def456".to_owned(),
         explanation: "Agent key was compromised; key has been rotated.".to_owned(),
         timestamp: 1_700_001_000,
-        signature: active_sk.sign(b"counter-attestation-payload").to_bytes().to_vec(),
+        signature: active_sk
+            .sign(b"counter-attestation-payload")
+            .to_bytes()
+            .to_vec(),
     };
 
     assert!(
@@ -623,10 +631,8 @@ fn test_signing_key_id_serialization() {
     assert_eq!(agent_json, "\"#agent\"");
 
     // Round-trip.
-    let active_rt: SigningKeyId =
-        serde_json::from_str(&active_json).expect("deserialize Active");
-    let agent_rt: SigningKeyId =
-        serde_json::from_str(&agent_json).expect("deserialize Agent");
+    let active_rt: SigningKeyId = serde_json::from_str(&active_json).expect("deserialize Active");
+    let agent_rt: SigningKeyId = serde_json::from_str(&agent_json).expect("deserialize Agent");
     assert_eq!(active_rt, SigningKeyId::Active);
     assert_eq!(agent_rt, SigningKeyId::Agent);
 

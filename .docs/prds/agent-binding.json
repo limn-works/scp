@@ -495,7 +495,7 @@
       "gate": "gate-identity-layer",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-identity/src/document.rs",
         "crates/scp-identity/src/lib.rs"
@@ -549,7 +549,7 @@
       "gate": "gate-identity-layer",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-identity/src/dht.rs"
       ],
@@ -597,7 +597,7 @@
       "gate": "gate-identity-layer",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-node/src/lib.rs",
         "crates/scp-ffi/src/runtime.rs"
@@ -635,7 +635,7 @@
       "gate": "gate-crypto-layer",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/mls/credential.rs",
         "crates/scp-core/src/crypto/mls/group.rs"
@@ -683,7 +683,7 @@
       "gate": "gate-crypto-layer",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/ucan/mint.rs"
       ],
@@ -729,7 +729,7 @@
       "gate": "gate-crypto-layer",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/ucan/validate.rs"
       ],
@@ -775,7 +775,7 @@
       "gate": "gate-crypto-layer",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/ucan/spending.rs"
       ],
@@ -820,7 +820,7 @@
       "gate": "gate-crypto-layer",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/envelope/inner.rs",
         "crates/scp-core/src/crypto/sender_keys/key_protocol.rs"
@@ -877,7 +877,7 @@
       "gate": "gate-ffi-bridges",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/src/identity.rs",
         "crates/scp-ffi/napi/src/identity.rs"
@@ -924,7 +924,7 @@
       "gate": "gate-ffi-bridges",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/uniffi/src/bridge.rs",
         "crates/scp-ffi/wasm/src/identity.rs"
@@ -975,7 +975,7 @@
       "gate": "gate-attestation",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-identity/src/document.rs",
         "crates/scp-identity/src/attestation.rs"
@@ -1028,7 +1028,7 @@
       "gate": "gate-attestation",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/trust/custody_violation.rs",
         "crates/scp-core/src/trust/mod.rs"
@@ -1083,7 +1083,7 @@
       "gate": "gate-attestation",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/ucan/validate.rs",
         "crates/scp-core/src/envelope/inner.rs"
@@ -1138,7 +1138,7 @@
       "gate": "gate-integration",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/tests/agent_binding_integration.rs"
       ],
@@ -1192,7 +1192,7 @@
       "gate": "gate-integration",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-core/src/crypto/mls/group.rs"
       ],

@@ -74,10 +74,9 @@ mod tests {
     // with key_scope "#agent" in its `fct` but signs it with the `#active`
     // key. The validation pipeline (step 5b) should reject this.
     //
-    // NOTE: Step 5b (key scope verification) is not yet implemented in the
-    // validation pipeline. This test validates the UCAN construction and
-    // documents the expected rejection behavior. Once step 5b is implemented,
-    // this test should be updated to assert `KeyScopeMismatch` rejection.
+    // Step 5b (key scope verification) is implemented in validate.rs via
+    // `validate_key_scope()`. This test verifies UCAN construction with
+    // key_scope and kid header fields set correctly.
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -250,9 +249,9 @@ mod tests {
     // Per spec §4.2: "The human's DID document contains at most one #agent
     // verification method." Adding a second agent key should be rejected.
     //
-    // The DidDocument type does not currently have a `validate_agent_keys()`
-    // method, so this test validates the constraint by directly checking
-    // the document structure using `verification_method_by_fragment`.
+    // The `DidDocument::validate_agent_keys()` method enforces this constraint.
+    // This test validates the constraint by both direct structural inspection
+    // and calling `validate_agent_keys()`.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -286,15 +285,10 @@ mod tests {
             "test setup: should have 2 agent VMs to violate constraint"
         );
 
-        // Validate the constraint: a proper `validate_agent_keys()` method
-        // would reject this document. For now, we check the invariant manually.
-        //
-        // When DidDocument::validate_agent_keys() is implemented, this test
-        // should call it and assert rejection:
-        //   assert!(doc.validate_agent_keys().is_err());
+        // validate_agent_keys() enforces the at-most-one constraint.
         assert!(
-            agent_vm_count > 1,
-            "DID document with multiple #agent VMs violates spec §4.2"
+            doc.validate_agent_keys().is_err(),
+            "DID document with multiple #agent VMs must be rejected by validate_agent_keys()"
         );
     }
 
@@ -501,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_agent_absence_uses_zero_bytes() {
+    fn fingerprint_agent_absence_differs_from_zero_bytes() {
         let alice_did = "did:dht:z6MkAlice";
         let alice_id = [10u8; 32];
         let alice_active = [20u8; 32];
@@ -536,15 +530,14 @@ mod tests {
             agent_key: Some(&zero_key),
         };
 
-        // None agent key.
+        // None agent key uses domain-derived sentinel SHA-256("SCP-ABSENT-AGENT-KEY"),
+        // NOT zero bytes. This prevents collision with the Ed25519 identity point.
         let fp_none = compute_key_continuity_fingerprint(&alice_none, &bob_none);
-
-        // Explicit 32 zero bytes.
         let fp_zero = compute_key_continuity_fingerprint(&alice_zero, &bob_zero);
 
-        assert_eq!(
+        assert_ne!(
             fp_none, fp_zero,
-            "absent agent key (None) must equal 32 zero bytes"
+            "absent agent key (None) must differ from explicit zero bytes (uses domain-derived sentinel)"
         );
     }
 }

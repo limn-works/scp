@@ -5,17 +5,29 @@
 //!
 //! The fingerprint includes all three verification methods (`#0`, `#active`,
 //! `#agent`) from each party's DID document. If a DID has no `#agent`
-//! verification method, 32 zero bytes are used as a placeholder to maintain
-//! a fixed-length input (ADR-039).
+//! verification method, a domain-derived sentinel (`SHA-256("SCP-ABSENT-AGENT-KEY")`)
+//! is used as a placeholder to maintain a fixed-length input and avoid
+//! collision with the Ed25519 identity point (ADR-039).
 //!
 //! See spec section 9.11 for the full specification.
 
 use sha2::{Digest, Sha256};
 
-/// 32 zero bytes used as a placeholder when a DID has no `#agent` verification
-/// method. Ensures fixed-length fingerprint input regardless of agent binding
-/// state (spec section 9.11, ADR-039).
-const ABSENT_AGENT_KEY: [u8; 32] = [0u8; 32];
+/// Domain-derived sentinel for absent `#agent` keys. Uses `SHA-256("SCP-ABSENT-AGENT-KEY")`
+/// instead of zero bytes to avoid collision with the Ed25519 identity point
+/// and to be self-documenting. Ensures fixed-length fingerprint input
+/// regardless of agent binding state (spec section 9.11, ADR-039).
+///
+/// Precomputed: `SHA-256("SCP-ABSENT-AGENT-KEY")`.
+const ABSENT_AGENT_KEY: [u8; 32] = {
+    // SHA-256("SCP-ABSENT-AGENT-KEY") precomputed at compile time.
+    // Verified in test `absent_agent_key_sentinel_is_correct`.
+    [
+        0x57, 0xb4, 0xf5, 0xf2, 0xd1, 0x61, 0x53, 0xbc, 0x6c, 0xa4, 0xef, 0x97, 0x19, 0x86, 0x8e,
+        0x59, 0x53, 0xa4, 0xc5, 0xeb, 0x52, 0x7a, 0x66, 0xe7, 0x01, 0xb8, 0x44, 0xfa, 0x89, 0x2c,
+        0xea, 0x58,
+    ]
+};
 
 /// One party's key material for the key continuity fingerprint computation.
 ///
@@ -30,7 +42,8 @@ pub struct KeyContinuityParty<'a> {
     /// The party's `#active` Active Signing Key (32-byte Ed25519 public key).
     pub active_key: &'a [u8; 32],
     /// The party's `#agent` Agent Signing Key, or `None` if no agent is bound.
-    /// Absence uses 32 zero bytes in the fingerprint computation (ADR-039).
+    /// Absence uses `SHA-256("SCP-ABSENT-AGENT-KEY")` sentinel in the fingerprint
+    /// computation (ADR-039).
     pub agent_key: Option<&'a [u8; 32]>,
 }
 
@@ -45,7 +58,7 @@ pub struct KeyContinuityParty<'a> {
 /// ```
 ///
 /// Where the DID blocks are ordered by lexicographic sort of the DID strings,
-/// and agent key absence uses 32 zero bytes.
+/// and agent key absence uses a domain-derived sentinel.
 ///
 /// # Returns
 ///
@@ -64,8 +77,19 @@ pub fn compute_key_continuity_fingerprint(
     };
 
     let mut hasher = Sha256::new();
-    hasher.update(first.did.as_bytes());
-    hasher.update(second.did.as_bytes());
+
+    // Domain separator prevents cross-protocol signature confusion.
+    hasher.update(b"SCP-KEY-CONTINUITY-V1:");
+
+    // Length-prefix variable-length DID strings (prevents concatenation ambiguity).
+    let len_prefix = |h: &mut Sha256, data: &[u8]| {
+        h.update((data.len() as u32).to_be_bytes());
+        h.update(data);
+    };
+    len_prefix(&mut hasher, first.did.as_bytes());
+    len_prefix(&mut hasher, second.did.as_bytes());
+
+    // Fixed-length 32-byte keys (no length prefix needed).
     hasher.update(first.identity_key);
     hasher.update(first.active_key);
     hasher.update(first.agent_key.unwrap_or(&ABSENT_AGENT_KEY));
@@ -197,7 +221,48 @@ mod tests {
     }
 
     #[test]
-    fn agent_key_absence_uses_32_zero_bytes() {
+    fn absent_agent_key_sentinel_is_correct() {
+        // Verify the precomputed ABSENT_AGENT_KEY matches SHA-256("SCP-ABSENT-AGENT-KEY").
+        let expected = Sha256::digest(b"SCP-ABSENT-AGENT-KEY");
+        assert_eq!(
+            ABSENT_AGENT_KEY,
+            <[u8; 32]>::from(expected),
+            "ABSENT_AGENT_KEY must equal SHA-256(\"SCP-ABSENT-AGENT-KEY\")"
+        );
+    }
+
+    #[test]
+    fn agent_key_absence_uses_domain_derived_sentinel() {
+        let alice_id = [1u8; 32];
+        let alice_active = [2u8; 32];
+        let bob_id = [3u8; 32];
+        let bob_active = [4u8; 32];
+
+        let alice_none = party("did:dht:z6MkAlice", &alice_id, &alice_active, None);
+        let alice_sentinel = party(
+            "did:dht:z6MkAlice",
+            &alice_id,
+            &alice_active,
+            Some(&ABSENT_AGENT_KEY),
+        );
+        let bob_none = party("did:dht:z6MkBob", &bob_id, &bob_active, None);
+        let bob_sentinel = party(
+            "did:dht:z6MkBob",
+            &bob_id,
+            &bob_active,
+            Some(&ABSENT_AGENT_KEY),
+        );
+
+        let fp_none = compute_key_continuity_fingerprint(&alice_none, &bob_none);
+        let fp_sentinel = compute_key_continuity_fingerprint(&alice_sentinel, &bob_sentinel);
+        assert_eq!(
+            fp_none, fp_sentinel,
+            "None agent key must produce the same fingerprint as the sentinel value"
+        );
+    }
+
+    #[test]
+    fn agent_key_absence_differs_from_zero_bytes() {
         let alice_id = [1u8; 32];
         let alice_active = [2u8; 32];
         let bob_id = [3u8; 32];
@@ -216,9 +281,9 @@ mod tests {
 
         let fp_none = compute_key_continuity_fingerprint(&alice_none, &bob_none);
         let fp_zero = compute_key_continuity_fingerprint(&alice_zero, &bob_zero);
-        assert_eq!(
+        assert_ne!(
             fp_none, fp_zero,
-            "None agent key must produce the same fingerprint as 32 zero bytes"
+            "None agent key (sentinel) must differ from explicit zero bytes"
         );
     }
 

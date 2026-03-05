@@ -902,16 +902,23 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
     py.allow_threads(|| {
         rt.block_on(async {
             // Extract what we need from the registry entry.
-            let (custody, old_identity_key, old_active_key, pre_rotation_commitment, old_doc) =
-                crate::runtime::with_identity(&old_did, |entry| {
-                    Ok((
-                        Arc::clone(&entry.custody),
-                        entry.identity.identity_key,
-                        entry.identity.active_signing_key,
-                        entry.identity.pre_rotation_commitment,
-                        entry.document.clone(),
-                    ))
-                })?;
+            let (
+                custody,
+                old_identity_key,
+                old_active_key,
+                old_agent_key,
+                pre_rotation_commitment,
+                old_doc,
+            ) = crate::runtime::with_identity(&old_did, |entry| {
+                Ok((
+                    Arc::clone(&entry.custody),
+                    entry.identity.identity_key,
+                    entry.identity.active_signing_key,
+                    entry.identity.agent_signing_key,
+                    entry.identity.pre_rotation_commitment,
+                    entry.document.clone(),
+                ))
+            })?;
 
             // We need a pre-rotation key handle. Generate one for the
             // migration — in a full implementation, the pre-rotation key
@@ -933,7 +940,7 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
             let old_identity = ScpIdentity {
                 identity_key: old_identity_key,
                 active_signing_key: old_active_key,
-                agent_signing_key: None,
+                agent_signing_key: old_agent_key,
                 pre_rotation_commitment,
                 did: old_did.clone(),
             };
@@ -951,6 +958,7 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
                 .map_err(ScpPyError::from)?;
 
             let new_did = new_identity.did.clone();
+            let has_agent = new_document.has_agent_key();
 
             // Remove old identity and register the new one.
             crate::runtime::remove_identity(&old_did);
@@ -962,13 +970,10 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
                     document: new_document,
                 },
             );
-
             Ok(PyIdentity {
                 did: new_did,
                 custody: custody_str,
-                // Migration creates a new DID — agent key is not carried
-                // over (agent_signing_key: None in the old_identity above).
-                has_agent_key: false,
+                has_agent_key: has_agent,
             })
         })
     })
