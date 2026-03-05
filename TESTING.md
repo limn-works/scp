@@ -23,7 +23,7 @@ Source: `.docs/specs/21-documentation.md` section 21.7.
 
 All tools are managed by [mise](https://mise.jdx.dev/). See `.mise.toml` for versions.
 
-**Python linkage (required for Rust tests).** The `scp-ffi-uniffi` crate links against `libpython`. Every Rust test command needs the Python library directory on the dynamic linker path.
+**Python linkage (required for Rust tests).** The `scp-ffi` crate (PyO3 bridge) links against `libpython`. Every Rust test command that includes this crate — including `--workspace` — needs the Python library directory on the dynamic linker path.
 
 macOS:
 
