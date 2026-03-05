@@ -1075,7 +1075,10 @@ mod tests {
             Self {
                 signing_key,
                 issuer_did,
-                did_resolver: InMemoryDidResolver { keys },
+                did_resolver: InMemoryDidResolver {
+                    keys,
+                    kid_keys: std::collections::HashMap::new(),
+                },
                 nonce_tracker: InMemoryNonceTracker::new(),
                 revocation_checker: InMemoryRevocationChecker::new(),
                 proof_resolver: InMemoryProofResolver::new(),

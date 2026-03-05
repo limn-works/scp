@@ -165,7 +165,12 @@ mod tests {
 
     #[allow(clippy::unwrap_used)]
     fn test_credential(name: &str) -> ScpCredential {
-        ScpCredential::new(format!("did:dht:z6Mk{name}"), None).unwrap()
+        ScpCredential::new(
+            format!("did:dht:z6Mk{name}"),
+            None,
+            scp_identity::SigningKeyId::Active,
+        )
+        .unwrap()
     }
 
     /// Helper: set up Alice and Bob in a shared group at epoch 1.

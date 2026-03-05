@@ -570,7 +570,7 @@ mod tests {
 
     /// Verifies that `identity_create("in_memory")` is rejected when the
     /// `allow_in_memory_custody` feature is NOT enabled, returning
-    /// `ScpError::Identity` with code `SCP-IDN-1008`.
+    /// `ScpError::Identity` with code `SCP-IDENT-1008`.
     ///
     /// See GitHub issue #88 — acceptance criterion 2.
     #[test]
@@ -581,8 +581,8 @@ mod tests {
         match result {
             Err(ScpError::Identity { code, .. }) => {
                 assert_eq!(
-                    code, "SCP-IDN-1008",
-                    "expected SCP-IDN-1008 error code when in_memory custody is disabled"
+                    code, "SCP-IDENT-1008",
+                    "expected SCP-IDENT-1008 error code when in_memory custody is disabled"
                 );
             }
             Ok(_) => {
@@ -591,7 +591,7 @@ mod tests {
                 );
             }
             Err(other) => {
-                panic!("expected ScpError::Identity with SCP-IDN-1008, got: {other:?}");
+                panic!("expected ScpError::Identity with SCP-IDENT-1008, got: {other:?}");
             }
         }
     }

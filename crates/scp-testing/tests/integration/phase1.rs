@@ -213,7 +213,12 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
     // ---------------------------------------------------------------
     // Step 3: Alice creates an MLS group (ADR-001)
     // ---------------------------------------------------------------
-    let alice_cred = ScpCredential::new(alice_id.did.clone(), None).unwrap();
+    let alice_cred = ScpCredential::new(
+        alice_id.did.clone(),
+        None,
+        scp_identity::SigningKeyId::Active,
+    )
+    .unwrap();
     let mut alice_group = create_group(&alice_cred).unwrap();
 
     // ---------------------------------------------------------------
@@ -229,6 +234,7 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
         ctx_id,
         &alice_id.did,
         1,
+        scp_identity::SigningKeyId::Active,
     )
     .await
     .unwrap();
@@ -242,7 +248,8 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
     // ---------------------------------------------------------------
     // Step 5: Bob publishes key packages (ADR-001)
     // ---------------------------------------------------------------
-    let bob_cred = ScpCredential::new(bob_id.did.clone(), None).unwrap();
+    let bob_cred =
+        ScpCredential::new(bob_id.did.clone(), None, scp_identity::SigningKeyId::Active).unwrap();
     let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(&bob_cred).unwrap();
 
     // ---------------------------------------------------------------
@@ -335,6 +342,7 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
             timestamp: 1_700_000_000,
             payload: original_msg,
             provenance: None,
+            signing_key_id: scp_core::identity::SigningKeyId::Active,
         },
         &alice_mls_custody,
         &dummy_handle,

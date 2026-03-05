@@ -1199,11 +1199,11 @@ New validation step 5b (after existing audience check): if `fct.scp_key_scope` e
 
 ### Key Continuity
 
-Fingerprint computation (§9.11) updated to include all three verification methods:
+Fingerprint computation (§9.11) updated to include all three verification methods with domain separation and length-prefixed DIDs:
 ```
-fingerprint = SHA256(sort(alice_did, bob_did) || alice_identity_key || alice_active_key || alice_agent_key || bob_identity_key || bob_active_key || bob_agent_key)
+fingerprint = SHA256("SCP-KEY-CONTINUITY-V1:" || len(did_a) || did_a || len(did_b) || did_b || a_identity_key || a_active_key || a_agent_key || b_identity_key || b_active_key || b_agent_key)
 ```
-Agent key absence uses 32 zero bytes.
+Where `len()` is a 4-byte big-endian length prefix preventing concatenation ambiguity. The `"SCP-KEY-CONTINUITY-V1:"` domain separator prevents cross-protocol signature confusion. Agent key absence uses a domain-derived sentinel `SHA-256("SCP-ABSENT-AGENT-KEY")` instead of zero bytes to avoid collision with the Ed25519 identity point.
 
 ### Governance
 

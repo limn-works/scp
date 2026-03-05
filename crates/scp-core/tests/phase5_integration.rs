@@ -570,12 +570,21 @@ fn media_session_lifecycle_with_ceiling_check_and_signaling() {
 #[test]
 fn media_session_mls_key_derivation() {
     // -- Step 1: Create an MLS group with Alice --
-    let alice_cred =
-        ScpCredential::new("did:dht:z6MkAlice".to_owned(), None).expect("alice credential");
+    let alice_cred = ScpCredential::new(
+        "did:dht:z6MkAlice".to_owned(),
+        None,
+        scp_identity::SigningKeyId::Active,
+    )
+    .expect("alice credential");
     let mut alice_group = create_group(&alice_cred).expect("create group");
 
     // -- Step 2: Add Bob to the group --
-    let bob_cred = ScpCredential::new("did:dht:z6MkBob".to_owned(), None).expect("bob credential");
+    let bob_cred = ScpCredential::new(
+        "did:dht:z6MkBob".to_owned(),
+        None,
+        scp_identity::SigningKeyId::Active,
+    )
+    .expect("bob credential");
     let (bob_kp_bundle, bob_signer, bob_provider) =
         generate_key_package(&bob_cred).expect("bob key package");
     let bob_kp = bob_kp_bundle.key_package().clone().into();
@@ -989,10 +998,20 @@ fn cross_adr_event_log_records_bridge_and_media_events() {
 fn media_session_keys_derived_from_mls_group_state() {
     // Media + MLS: verify media session key material is correctly derived
     // from MLS export secrets, and both group members get the same keys.
-    let alice_cred = ScpCredential::new("did:dht:z6MkAlice".to_owned(), None).expect("alice cred");
+    let alice_cred = ScpCredential::new(
+        "did:dht:z6MkAlice".to_owned(),
+        None,
+        scp_identity::SigningKeyId::Active,
+    )
+    .expect("alice cred");
     let mut alice_group = create_group(&alice_cred).expect("alice group");
 
-    let bob_cred = ScpCredential::new("did:dht:z6MkBob".to_owned(), None).expect("bob cred");
+    let bob_cred = ScpCredential::new(
+        "did:dht:z6MkBob".to_owned(),
+        None,
+        scp_identity::SigningKeyId::Active,
+    )
+    .expect("bob cred");
     let (bob_kp_bundle, bob_signer, bob_provider) =
         generate_key_package(&bob_cred).expect("bob kp");
     let bob_kp = bob_kp_bundle.key_package().clone().into();

@@ -36,11 +36,12 @@ pub use broadcast::{
 };
 pub use encrypt::{decrypt_sender_layer, encrypt_sender_layer};
 pub use key_protocol::{
-    BlockNotification, NonceDedup, RotateForBlockResult, SenderKeyEpochAdvance, SenderKeyRequest,
-    SenderKeyRequestResult, SenderKeyResponse, expand_block_list, handle_sender_key_request,
-    open_sender_key_response, publish_sender_key_epoch_advance, request_sender_key,
-    rotate_sender_key_for_block, send_block_notification, validate_block_notification_freshness,
-    verify_block_notification, verify_epoch_advance, verify_sender_key_request,
+    BlockNotification, NonceDedup, RotateForBlockParams, RotateForBlockResult,
+    SenderKeyEpochAdvance, SenderKeyRequest, SenderKeyRequestResult, SenderKeyResponse,
+    expand_block_list, handle_sender_key_request, open_sender_key_response,
+    publish_sender_key_epoch_advance, request_sender_key, rotate_sender_key_for_block,
+    send_block_notification, validate_block_notification_freshness, verify_block_notification,
+    verify_epoch_advance, verify_sender_key_request,
 };
 
 // ---------------------------------------------------------------------------
@@ -195,6 +196,14 @@ pub enum SenderKeyError {
         /// The DID that was rejected.
         did: String,
     },
+
+    /// An agent key (`#agent`) attempted a Category A action (DID document
+    /// modification) via the sender key protocol. The action was rejected
+    /// and a custody violation attestation was generated.
+    ///
+    /// See ADR-039 and SCP-AB-020.
+    #[error("Category A violation: {0}")]
+    CategoryAViolation(String),
 }
 
 // ---------------------------------------------------------------------------

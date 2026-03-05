@@ -1,23 +1,41 @@
 //! DID Document construction, serialization, and verification method management.
 //!
 //! Implements the W3C DID Document JSON-LD format for `did:dht` identities.
-//! The document contains verification methods (Identity Key `#0`, Active Signing
-//! Key `#active`), authentication and assertion method references, and service
-//! entries (`PreRotationCommitment`, `SCPRelay`).
+//! The document contains up to three verification methods following the
+//! shared-DID identity model (ADR-039):
 //!
-//! # Key Rotation Support (SCP-008)
+//! - `#0` — Identity Key (Ed25519, hardware-backed, never rotates, derives DID)
+//! - `#active` — Human Signing Key (Ed25519, rotatable via Layer 1 rotation)
+//! - `#agent` — Agent Signing Key (Ed25519, optional, rotatable independently)
+//!
+//! Authentication and assertion method references include `#active` always,
+//! and `#agent` when present. Service entries include `PreRotationCommitment`
+//! and optionally `SCPRelay`.
+//!
+//! # Key Rotation Support (SCP-008, ADR-039)
 //!
 //! The document supports key rotation through:
-//! - [`DidDocument::retire_active_key`] — Retires the current active key and adds
-//!   a new one (Layer 1 rotation).
+//! - [`DidDocument::retire_active_key`] — Retires the current `#active` key and
+//!   adds a new one (Layer 1 rotation).
+//! - [`DidDocument::add_agent_key`] — Adds an `#agent` verification method.
+//! - [`DidDocument::remove_agent_key`] — Removes the `#agent` verification method.
+//! - [`DidDocument::rotate_agent_key`] — Rotates `#agent`, retaining bounded
+//!   retired keys (`#retired-agent-{sequence}`).
 //! - [`DidDocument::set_also_known_as`] — Sets the `alsoKnownAs` field for
 //!   identity migration (Layer 2 rotation).
 //! - [`DidRotationEvent`], [`MigrationProof`], [`PreRotationProof`] — Structs for
 //!   distributing and verifying identity migrations.
 //!
-//! See ADR-003 in `.docs/adrs/phase-1.md`.
+//! # Validation
+//!
+//! [`DidDocument::validate_agent_keys`] enforces the structural constraint:
+//! at most one `#agent` verification method per document. Verifiers call this
+//! on any resolved document.
+//!
+//! See ADR-003 and ADR-039 in `.docs/adrs/phase-1.md`.
 
 use super::IdentityError;
+use super::attestation::ScpKeyCustodyAttestation;
 use serde::{Deserialize, Serialize};
 
 /// Custom serde module for `[u8; 64]` fields.
@@ -50,16 +68,20 @@ mod serde_signature_64 {
 /// A W3C DID Document for an SCP identity.
 ///
 /// Contains verification methods, authentication references, assertion method
-/// references, and services as specified by ADR-003. The document is
-/// JSON-serializable via `serde_json`.
+/// references, and services as specified by ADR-003 and ADR-039. The document
+/// is JSON-serializable via `serde_json`.
 ///
-/// # Structure
+/// # Structure (ADR-039 Three-VM Model)
 ///
-/// - Verification method `#0`: the Identity Key (Ed25519). Used only for DID
-///   document updates and pre-rotation commitments.
-/// - Verification method `#active`: the Active Signing Key (Ed25519). Used for
+/// - Verification method `#0`: the Identity Key (Ed25519). Hardware-backed.
+///   Used only for DID document updates and pre-rotation commitments.
+/// - Verification method `#active`: the Human Signing Key (Ed25519). Used for
 ///   MLS credentials, inner envelope signatures, and UCAN issuance.
-/// - `authentication` and `assertionMethod` reference `#active`.
+/// - Verification method `#agent` (optional): the Agent Signing Key (Ed25519).
+///   Software-held key for autonomous agent operations. Added only when agent
+///   delegation is needed.
+/// - `authentication` and `assertionMethod` reference `#active`, and `#agent`
+///   when present.
 /// - `PreRotationCommitment` service publishes the SHA-256 commitment of the
 ///   next identity key's public key.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -154,8 +176,18 @@ const SCP_RELAY_SCHEME: &str = "wss://";
 /// The required path suffix for `SCPRelay` entries.
 const SCP_RELAY_PATH: &str = "/scp/v1";
 
+/// Maximum number of retired agent keys to retain in a DID document.
+///
+/// When rotating the `#agent` key, older retired keys beyond this limit are
+/// pruned to bound document size. Per ADR-039, this is set to 2.
+const MAX_RETIRED_AGENT_KEYS: usize = 2;
+
 impl DidDocument {
     /// Constructs a new DID Document for an SCP identity.
+    ///
+    /// Creates a document with the `#0` (Identity Key) and `#active` (Human
+    /// Signing Key) verification methods. If `agent_public_key` is provided,
+    /// a third `#agent` verification method is added per ADR-039.
     ///
     /// # Arguments
     ///
@@ -171,6 +203,37 @@ impl DidDocument {
         active_public_key: &[u8],
         pre_rotation_commitment: &[u8; 32],
     ) -> Self {
+        Self::new_with_agent_key(
+            did,
+            identity_public_key,
+            active_public_key,
+            pre_rotation_commitment,
+            None,
+        )
+    }
+
+    /// Constructs a new DID Document with an optional agent key.
+    ///
+    /// When `agent_public_key` is `Some`, adds an `#agent` verification method
+    /// and includes it in the `authentication` and `assertionMethod` arrays.
+    ///
+    /// # Arguments
+    ///
+    /// * `did` - The DID string (e.g., `did:dht:z...`).
+    /// * `identity_public_key` - The raw 32-byte Ed25519 Identity Key public key.
+    /// * `active_public_key` - The raw 32-byte Ed25519 Active Signing Key public key.
+    /// * `pre_rotation_commitment` - The 32-byte SHA-256 commitment of the
+    ///   pre-rotation key's public key.
+    /// * `agent_public_key` - Optional raw 32-byte Ed25519 Agent Signing Key
+    ///   public key. See ADR-039.
+    #[must_use]
+    pub fn new_with_agent_key(
+        did: &str,
+        identity_public_key: &[u8],
+        active_public_key: &[u8],
+        pre_rotation_commitment: &[u8; 32],
+        agent_public_key: Option<&[u8]>,
+    ) -> Self {
         let identity_vm = VerificationMethod {
             id: format!("{did}#0"),
             method_type: ED25519_VERIFICATION_KEY_TYPE.to_owned(),
@@ -185,6 +248,22 @@ impl DidDocument {
             public_key_multibase: multibase_encode(active_public_key),
         };
 
+        let mut verification_methods = vec![identity_vm, active_vm];
+        let mut authentication = vec![format!("{did}#active")];
+        let mut assertion_method = vec![format!("{did}#active")];
+
+        if let Some(agent_key) = agent_public_key {
+            let agent_vm = VerificationMethod {
+                id: format!("{did}#agent"),
+                method_type: ED25519_VERIFICATION_KEY_TYPE.to_owned(),
+                controller: did.to_owned(),
+                public_key_multibase: multibase_encode(agent_key),
+            };
+            verification_methods.push(agent_vm);
+            authentication.push(format!("{did}#agent"));
+            assertion_method.push(format!("{did}#agent"));
+        }
+
         let pre_rotation_service = Service {
             id: format!("{did}#pre-rotation"),
             service_type: "PreRotationCommitment".to_owned(),
@@ -194,9 +273,9 @@ impl DidDocument {
         Self {
             context: vec![DID_CONTEXT.to_owned(), ED25519_CONTEXT.to_owned()],
             id: did.to_owned(),
-            verification_method: vec![identity_vm, active_vm],
-            authentication: vec![format!("{did}#active")],
-            assertion_method: vec![format!("{did}#active")],
+            verification_method: verification_methods,
+            authentication,
+            assertion_method,
             also_known_as: Vec::new(),
             service: vec![pre_rotation_service],
         }
@@ -336,6 +415,54 @@ impl DidDocument {
         Ok(())
     }
 
+    /// Returns the key custody attestation from this DID document, if present.
+    ///
+    /// Searches the service entries for one with type `ScpKeyCustodyAttestation`
+    /// and parses the attestation data from its endpoint. Returns `None` if no
+    /// custody attestation service entry exists.
+    ///
+    /// Absence of attestation is a valid state — it signals that the DID owner
+    /// has not declared their key custody model (ADR-039 Layer 4).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::DocumentDeserializationError`] if a custody
+    /// attestation service entry exists but contains invalid data.
+    pub fn custody_attestation(&self) -> Result<Option<ScpKeyCustodyAttestation>, IdentityError> {
+        let entry = self
+            .service
+            .iter()
+            .find(|s| s.service_type == "ScpKeyCustodyAttestation");
+
+        entry.map_or(Ok(None), |service| {
+            ScpKeyCustodyAttestation::from_service_entry(service).map(Some)
+        })
+    }
+
+    /// Sets or replaces the key custody attestation in this DID document.
+    ///
+    /// Adds a service entry with type `ScpKeyCustodyAttestation` containing the
+    /// attestation data. If an existing custody attestation entry exists, it is
+    /// replaced. Other service entries are preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::DocumentSerializationError`] if the attestation
+    /// cannot be serialized (should not happen for well-formed data).
+    pub fn set_custody_attestation(
+        &mut self,
+        attestation: &ScpKeyCustodyAttestation,
+    ) -> Result<(), IdentityError> {
+        // Remove any existing custody attestation entry.
+        self.service
+            .retain(|s| s.service_type != "ScpKeyCustodyAttestation");
+
+        // Add the new entry.
+        let service = attestation.to_service_entry(&self.id)?;
+        self.service.push(service);
+        Ok(())
+    }
+
     /// Retires the current active signing key and installs a new one.
     ///
     /// This is used during Layer 1 key rotation (`rotate_active_key`).
@@ -370,8 +497,13 @@ impl DidDocument {
         self.verification_method.push(new_active_vm);
 
         // Update authentication and assertionMethod to reference the new #active key.
+        // Preserve the #agent reference if present (ADR-039).
         self.authentication = vec![format!("{did}#active")];
         self.assertion_method = vec![format!("{did}#active")];
+        if self.has_agent_key() {
+            self.authentication.push(format!("{did}#agent"));
+            self.assertion_method.push(format!("{did}#agent"));
+        }
     }
 
     /// Sets the `alsoKnownAs` field to point to a new DID.
@@ -380,6 +512,219 @@ impl DidDocument {
     /// from the old DID to the new DID.
     pub fn set_also_known_as(&mut self, new_did: &str) {
         self.also_known_as = vec![new_did.to_owned()];
+    }
+
+    // --- Agent key management (ADR-039) ---
+
+    /// Returns `true` if this document contains an `#agent` verification method.
+    #[must_use]
+    pub fn has_agent_key(&self) -> bool {
+        self.verification_method
+            .iter()
+            .any(|vm| vm.id.ends_with("#agent"))
+    }
+
+    /// Returns the `#agent` verification method, if present.
+    #[must_use]
+    pub fn agent_verification_method(&self) -> Option<&VerificationMethod> {
+        self.verification_method_by_fragment("agent")
+    }
+
+    /// Adds an `#agent` verification method to this document.
+    ///
+    /// The agent key is added to `authentication` and `assertionMethod`
+    /// relationship arrays. Fails if an `#agent` VM already exists.
+    ///
+    /// Only `#0` (Identity Key) can authorize this operation — enforcement is
+    /// at the signing/verification layer, not in this method.
+    ///
+    /// See ADR-039 acceptance criterion 4.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::AgentKeyAlreadyExists`] if an `#agent` VM
+    /// is already present.
+    pub fn add_agent_key(&mut self, public_key: &[u8]) -> Result<(), IdentityError> {
+        if self.has_agent_key() {
+            return Err(IdentityError::AgentKeyAlreadyExists);
+        }
+
+        let did = &self.id;
+        let agent_vm = VerificationMethod {
+            id: format!("{did}#agent"),
+            method_type: ED25519_VERIFICATION_KEY_TYPE.to_owned(),
+            controller: did.to_owned(),
+            public_key_multibase: multibase_encode(public_key),
+        };
+
+        self.verification_method.push(agent_vm);
+        self.authentication.push(format!("{did}#agent"));
+        self.assertion_method.push(format!("{did}#agent"));
+
+        Ok(())
+    }
+
+    /// Removes the `#agent` verification method from this document.
+    ///
+    /// Also removes `#agent` from `authentication` and `assertionMethod`
+    /// arrays. Fails if no `#agent` VM exists. Does NOT remove retired agent
+    /// keys (`#retired-agent-*`).
+    ///
+    /// Only `#0` (Identity Key) can authorize this operation — enforcement is
+    /// at the signing/verification layer, not in this method.
+    ///
+    /// See ADR-039 acceptance criterion 4.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::AgentKeyNotFound`] if no `#agent` VM exists.
+    pub fn remove_agent_key(&mut self) -> Result<(), IdentityError> {
+        if !self.has_agent_key() {
+            return Err(IdentityError::AgentKeyNotFound);
+        }
+
+        self.verification_method
+            .retain(|vm| !vm.id.ends_with("#agent"));
+        self.authentication
+            .retain(|ref_id| !ref_id.ends_with("#agent"));
+        self.assertion_method
+            .retain(|ref_id| !ref_id.ends_with("#agent"));
+
+        Ok(())
+    }
+
+    /// Rotates the `#agent` verification method, retaining the old key as a
+    /// retired key.
+    ///
+    /// The old `#agent` key is renamed to `#retired-agent-{sequence}`. At most
+    /// 2 retired agent keys are retained; older ones are pruned (bounded
+    /// retention). The new key becomes `#agent`.
+    ///
+    /// Only `#0` (Identity Key) can authorize this operation — enforcement is
+    /// at the signing/verification layer, not in this method.
+    ///
+    /// See ADR-039 acceptance criterion 4.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_public_key` - The raw 32-byte Ed25519 public key for the new
+    ///   agent signing key.
+    /// * `sequence` - The rotation sequence number, used to name the retired
+    ///   key fragment (e.g., `#retired-agent-1`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::AgentKeyNotFound`] if no `#agent` VM exists.
+    pub fn rotate_agent_key(
+        &mut self,
+        new_public_key: &[u8],
+        sequence: u64,
+    ) -> Result<(), IdentityError> {
+        if !self.has_agent_key() {
+            return Err(IdentityError::AgentKeyNotFound);
+        }
+
+        let did = &self.id;
+
+        // Rename current #agent to #retired-agent-{sequence}.
+        for vm in &mut self.verification_method {
+            if vm.id.ends_with("#agent") {
+                vm.id = format!("{did}#retired-agent-{sequence}");
+            }
+        }
+
+        // Add the new #agent verification method.
+        let new_agent_vm = VerificationMethod {
+            id: format!("{did}#agent"),
+            method_type: ED25519_VERIFICATION_KEY_TYPE.to_owned(),
+            controller: did.to_owned(),
+            public_key_multibase: multibase_encode(new_public_key),
+        };
+        self.verification_method.push(new_agent_vm);
+
+        // Prune retired agent keys to at most MAX_RETIRED_AGENT_KEYS.
+        self.prune_retired_agent_keys();
+
+        // authentication and assertionMethod already reference #agent by
+        // fragment, so no update needed — the new VM takes over the reference.
+
+        Ok(())
+    }
+
+    /// Validates that this document has at most one `#agent` verification method.
+    ///
+    /// Verifiers MUST call this on any resolved DID document per ADR-039
+    /// structural constraint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::MultipleAgentKeys`] if more than one `#agent`
+    /// VM is found.
+    pub fn validate_agent_keys(&self) -> Result<(), IdentityError> {
+        let agent_count = self
+            .verification_method
+            .iter()
+            .filter(|vm| vm.id.ends_with("#agent"))
+            .count();
+
+        if agent_count > 1 {
+            return Err(IdentityError::MultipleAgentKeys { count: agent_count });
+        }
+
+        Ok(())
+    }
+
+    /// Returns the number of retired agent keys (`#retired-agent-*`) in this
+    /// document.
+    #[must_use]
+    pub fn retired_agent_key_count(&self) -> usize {
+        self.verification_method
+            .iter()
+            .filter(|vm| {
+                // Match #retired-agent-{N} but not #retired-{N} (which are
+                // retired active keys from retire_active_key).
+                let Some(fragment) = vm.id.rsplit_once('#').map(|(_, f)| f) else {
+                    return false;
+                };
+                fragment.starts_with("retired-agent-")
+            })
+            .count()
+    }
+
+    /// Prunes retired agent keys to at most [`MAX_RETIRED_AGENT_KEYS`],
+    /// keeping the most recent (highest sequence number).
+    fn prune_retired_agent_keys(&mut self) {
+        // Collect (index, sequence) pairs for retired agent keys.
+        let mut retired: Vec<(usize, u64)> = self
+            .verification_method
+            .iter()
+            .enumerate()
+            .filter_map(|(i, vm)| {
+                let fragment = vm.id.rsplit_once('#').map(|(_, f)| f)?;
+                let seq_str = fragment.strip_prefix("retired-agent-")?;
+                let seq: u64 = seq_str.parse().ok()?;
+                Some((i, seq))
+            })
+            .collect();
+
+        if retired.len() <= MAX_RETIRED_AGENT_KEYS {
+            return;
+        }
+
+        // Sort by sequence descending — keep the highest.
+        retired.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Indices to remove (the ones beyond the retention limit).
+        let mut remove_indices: Vec<usize> = retired[MAX_RETIRED_AGENT_KEYS..]
+            .iter()
+            .map(|(i, _)| *i)
+            .collect();
+
+        // Sort descending so removal doesn't shift earlier indices.
+        remove_indices.sort_unstable_by(|a, b| b.cmp(a));
+        for idx in remove_indices {
+            self.verification_method.remove(idx);
+        }
     }
 }
 
@@ -843,5 +1188,542 @@ mod tests {
         let json = serde_json::to_string(&proof).unwrap();
         let parsed: MigrationProof = serde_json::from_str(&json).unwrap();
         assert_eq!(proof, parsed);
+    }
+
+    // --- Agent key tests (ADR-039, SCP-AB-008) ---
+
+    #[test]
+    fn document_with_agent_key_has_three_vms() {
+        let did = "did:dht:zAgentDoc";
+        let identity_pk = [1u8; 32];
+        let active_pk = [2u8; 32];
+        let agent_pk = [3u8; 32];
+        let commitment = [4u8; 32];
+
+        let doc = DidDocument::new_with_agent_key(
+            did,
+            &identity_pk,
+            &active_pk,
+            &commitment,
+            Some(&agent_pk),
+        );
+
+        // 3 verification methods: #0, #active, #agent
+        assert_eq!(doc.verification_method.len(), 3);
+
+        let vm0 = doc.verification_method_by_fragment("0").unwrap();
+        assert_eq!(vm0.id, format!("{did}#0"));
+
+        let vm_active = doc.verification_method_by_fragment("active").unwrap();
+        assert_eq!(vm_active.id, format!("{did}#active"));
+
+        let vm_agent = doc.verification_method_by_fragment("agent").unwrap();
+        assert_eq!(vm_agent.id, format!("{did}#agent"));
+        assert_eq!(vm_agent.controller, did);
+        assert!(vm_agent.public_key_multibase.starts_with('z'));
+
+        // #active and #agent in authentication and assertionMethod
+        assert_eq!(doc.authentication.len(), 2);
+        assert!(doc.authentication.contains(&format!("{did}#active")));
+        assert!(doc.authentication.contains(&format!("{did}#agent")));
+
+        assert_eq!(doc.assertion_method.len(), 2);
+        assert!(doc.assertion_method.contains(&format!("{did}#active")));
+        assert!(doc.assertion_method.contains(&format!("{did}#agent")));
+
+        // has_agent_key and agent_verification_method
+        assert!(doc.has_agent_key());
+        assert!(doc.agent_verification_method().is_some());
+
+        // validation passes
+        doc.validate_agent_keys().unwrap();
+    }
+
+    #[test]
+    fn document_without_agent_key_has_two_vms() {
+        let did = "did:dht:zNoAgent";
+        let identity_pk = [1u8; 32];
+        let active_pk = [2u8; 32];
+        let commitment = [3u8; 32];
+
+        // Using new() (backward compat)
+        let doc = DidDocument::new(did, &identity_pk, &active_pk, &commitment);
+
+        assert_eq!(doc.verification_method.len(), 2);
+        assert_eq!(doc.authentication.len(), 1);
+        assert_eq!(doc.assertion_method.len(), 1);
+        assert!(!doc.has_agent_key());
+        assert!(doc.agent_verification_method().is_none());
+        doc.validate_agent_keys().unwrap();
+
+        // Also test new_with_agent_key with None
+        let doc2 =
+            DidDocument::new_with_agent_key(did, &identity_pk, &active_pk, &commitment, None);
+        assert_eq!(doc, doc2);
+    }
+
+    #[test]
+    fn add_agent_key_to_existing_document() {
+        let did = "did:dht:zAddAgent";
+        let identity_pk = [1u8; 32];
+        let active_pk = [2u8; 32];
+        let commitment = [3u8; 32];
+        let agent_pk = [4u8; 32];
+
+        let mut doc = DidDocument::new(did, &identity_pk, &active_pk, &commitment);
+        assert!(!doc.has_agent_key());
+
+        doc.add_agent_key(&agent_pk).unwrap();
+
+        assert!(doc.has_agent_key());
+        assert_eq!(doc.verification_method.len(), 3);
+        assert_eq!(doc.authentication.len(), 2);
+        assert_eq!(doc.assertion_method.len(), 2);
+
+        let vm_agent = doc.verification_method_by_fragment("agent").unwrap();
+        assert_eq!(vm_agent.id, format!("{did}#agent"));
+        assert_eq!(vm_agent.method_type, "Ed25519VerificationKey2020");
+
+        doc.validate_agent_keys().unwrap();
+    }
+
+    #[test]
+    fn add_agent_key_fails_when_already_exists() {
+        let did = "did:dht:zDuplicateAgent";
+        let identity_pk = [1u8; 32];
+        let active_pk = [2u8; 32];
+        let commitment = [3u8; 32];
+        let agent_pk = [4u8; 32];
+
+        let mut doc = DidDocument::new(did, &identity_pk, &active_pk, &commitment);
+        doc.add_agent_key(&agent_pk).unwrap();
+
+        let result = doc.add_agent_key(&[5u8; 32]);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("already exists"),
+            "error should mention already exists, got: {err}"
+        );
+    }
+
+    #[test]
+    fn remove_agent_key() {
+        let did = "did:dht:zRemoveAgent";
+        let identity_pk = [1u8; 32];
+        let active_pk = [2u8; 32];
+        let agent_pk = [3u8; 32];
+        let commitment = [4u8; 32];
+
+        let mut doc = DidDocument::new_with_agent_key(
+            did,
+            &identity_pk,
+            &active_pk,
+            &commitment,
+            Some(&agent_pk),
+        );
+        assert!(doc.has_agent_key());
+
+        doc.remove_agent_key().unwrap();
+
+        assert!(!doc.has_agent_key());
+        assert_eq!(doc.verification_method.len(), 2);
+        assert_eq!(doc.authentication.len(), 1);
+        assert_eq!(doc.assertion_method.len(), 1);
+        assert!(!doc.authentication.iter().any(|r| r.ends_with("#agent")));
+        assert!(!doc.assertion_method.iter().any(|r| r.ends_with("#agent")));
+    }
+
+    #[test]
+    fn remove_agent_key_fails_when_none_exists() {
+        let did = "did:dht:zNoAgentRemove";
+        let identity_pk = [1u8; 32];
+        let active_pk = [2u8; 32];
+        let commitment = [3u8; 32];
+
+        let mut doc = DidDocument::new(did, &identity_pk, &active_pk, &commitment);
+
+        let result = doc.remove_agent_key();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("no agent key"),
+            "error should mention no agent key, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rotate_agent_key_retires_old_key() {
+        let did = "did:dht:zRotateAgent";
+        let identity_pk = [1u8; 32];
+        let active_pk = [2u8; 32];
+        let original_agent_pk = [3u8; 32];
+        let new_agent_pk = [4u8; 32];
+        let commitment = [5u8; 32];
+
+        let mut doc = DidDocument::new_with_agent_key(
+            did,
+            &identity_pk,
+            &active_pk,
+            &commitment,
+            Some(&original_agent_pk),
+        );
+
+        doc.rotate_agent_key(&new_agent_pk, 1).unwrap();
+
+        // New #agent should exist
+        assert!(doc.has_agent_key());
+        let vm_agent = doc.verification_method_by_fragment("agent").unwrap();
+        assert_eq!(vm_agent.id, format!("{did}#agent"));
+
+        // Old key should be retired
+        let vm_retired = doc
+            .verification_method_by_fragment("retired-agent-1")
+            .unwrap();
+        assert_eq!(vm_retired.id, format!("{did}#retired-agent-1"));
+
+        // The new agent key should have a different public key than the retired one
+        assert_ne!(
+            vm_agent.public_key_multibase,
+            vm_retired.public_key_multibase
+        );
+
+        assert_eq!(doc.retired_agent_key_count(), 1);
+        doc.validate_agent_keys().unwrap();
+    }
+
+    #[test]
+    fn rotate_agent_key_bounded_retention() {
+        let did = "did:dht:zBoundedRetire";
+        let identity_pk = [1u8; 32];
+        let active_pk = [2u8; 32];
+        let commitment = [5u8; 32];
+
+        let mut doc = DidDocument::new_with_agent_key(
+            did,
+            &identity_pk,
+            &active_pk,
+            &commitment,
+            Some(&[10u8; 32]),
+        );
+
+        // Rotate 3 times: should retain at most 2 retired keys
+        doc.rotate_agent_key(&[11u8; 32], 1).unwrap();
+        assert_eq!(doc.retired_agent_key_count(), 1);
+
+        doc.rotate_agent_key(&[12u8; 32], 2).unwrap();
+        assert_eq!(doc.retired_agent_key_count(), 2);
+
+        doc.rotate_agent_key(&[13u8; 32], 3).unwrap();
+        // Should be pruned to 2 (the 2 most recent: sequences 2 and 3)
+        assert_eq!(doc.retired_agent_key_count(), 2);
+
+        // Verify the most recent retired keys are retained
+        assert!(
+            doc.verification_method_by_fragment("retired-agent-3")
+                .is_some()
+        );
+        assert!(
+            doc.verification_method_by_fragment("retired-agent-2")
+                .is_some()
+        );
+        // Oldest should be pruned
+        assert!(
+            doc.verification_method_by_fragment("retired-agent-1")
+                .is_none()
+        );
+
+        // One more rotation
+        doc.rotate_agent_key(&[14u8; 32], 4).unwrap();
+        assert_eq!(doc.retired_agent_key_count(), 2);
+        assert!(
+            doc.verification_method_by_fragment("retired-agent-4")
+                .is_some()
+        );
+        assert!(
+            doc.verification_method_by_fragment("retired-agent-3")
+                .is_some()
+        );
+        assert!(
+            doc.verification_method_by_fragment("retired-agent-2")
+                .is_none()
+        );
+
+        doc.validate_agent_keys().unwrap();
+    }
+
+    #[test]
+    fn rotate_agent_key_fails_when_none_exists() {
+        let did = "did:dht:zNoAgentRotate";
+        let identity_pk = [1u8; 32];
+        let active_pk = [2u8; 32];
+        let commitment = [3u8; 32];
+
+        let mut doc = DidDocument::new(did, &identity_pk, &active_pk, &commitment);
+
+        let result = doc.rotate_agent_key(&[4u8; 32], 1);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("no agent key"),
+            "error should mention no agent key, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_multiple_agent_vms() {
+        let did = "did:dht:zMultiAgent";
+        let identity_pk = [1u8; 32];
+        let active_pk = [2u8; 32];
+        let commitment = [3u8; 32];
+
+        let mut doc = DidDocument::new(did, &identity_pk, &active_pk, &commitment);
+
+        // Manually inject two #agent VMs (bypassing add_agent_key guard)
+        doc.verification_method.push(VerificationMethod {
+            id: format!("{did}#agent"),
+            method_type: "Ed25519VerificationKey2020".to_owned(),
+            controller: did.to_owned(),
+            public_key_multibase: "zAAA".to_owned(),
+        });
+        doc.verification_method.push(VerificationMethod {
+            id: format!("{did}#agent"),
+            method_type: "Ed25519VerificationKey2020".to_owned(),
+            controller: did.to_owned(),
+            public_key_multibase: "zBBB".to_owned(),
+        });
+
+        let result = doc.validate_agent_keys();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("2 #agent"),
+            "error should mention 2 #agent VMs, got: {err}"
+        );
+    }
+
+    #[test]
+    fn agent_key_json_roundtrip_with_agent() {
+        let did = "did:dht:zRoundtripAgent";
+        let identity_pk = [10u8; 32];
+        let active_pk = [20u8; 32];
+        let agent_pk = [30u8; 32];
+        let commitment = [40u8; 32];
+
+        let doc = DidDocument::new_with_agent_key(
+            did,
+            &identity_pk,
+            &active_pk,
+            &commitment,
+            Some(&agent_pk),
+        );
+
+        let json = doc.to_json().unwrap();
+        let parsed = DidDocument::from_json(&json).unwrap();
+        assert_eq!(doc, parsed);
+
+        // Verify the agent VM survived roundtrip
+        assert!(parsed.has_agent_key());
+        assert_eq!(parsed.verification_method.len(), 3);
+        assert_eq!(parsed.authentication.len(), 2);
+        assert_eq!(parsed.assertion_method.len(), 2);
+        parsed.validate_agent_keys().unwrap();
+    }
+
+    #[test]
+    fn agent_key_json_roundtrip_without_agent() {
+        let did = "did:dht:zRoundtripNoAgent";
+        let identity_pk = [10u8; 32];
+        let active_pk = [20u8; 32];
+        let commitment = [30u8; 32];
+
+        let doc = DidDocument::new(did, &identity_pk, &active_pk, &commitment);
+
+        let json = doc.to_json().unwrap();
+        let parsed = DidDocument::from_json(&json).unwrap();
+        assert_eq!(doc, parsed);
+
+        assert!(!parsed.has_agent_key());
+        assert_eq!(parsed.verification_method.len(), 2);
+        parsed.validate_agent_keys().unwrap();
+    }
+
+    #[test]
+    fn agent_key_roundtrip_after_rotation() {
+        let did = "did:dht:zRoundtripRotate";
+        let identity_pk = [1u8; 32];
+        let active_pk = [2u8; 32];
+        let commitment = [5u8; 32];
+
+        let mut doc = DidDocument::new_with_agent_key(
+            did,
+            &identity_pk,
+            &active_pk,
+            &commitment,
+            Some(&[3u8; 32]),
+        );
+        doc.rotate_agent_key(&[4u8; 32], 1).unwrap();
+
+        let json = doc.to_json().unwrap();
+        let parsed = DidDocument::from_json(&json).unwrap();
+        assert_eq!(doc, parsed);
+
+        assert!(parsed.has_agent_key());
+        assert_eq!(parsed.retired_agent_key_count(), 1);
+        parsed.validate_agent_keys().unwrap();
+    }
+
+    #[test]
+    fn add_remove_add_agent_key_cycle() {
+        let did = "did:dht:zCycleAgent";
+        let identity_pk = [1u8; 32];
+        let active_pk = [2u8; 32];
+        let commitment = [3u8; 32];
+
+        let mut doc = DidDocument::new(did, &identity_pk, &active_pk, &commitment);
+
+        // Add
+        doc.add_agent_key(&[4u8; 32]).unwrap();
+        assert!(doc.has_agent_key());
+
+        // Remove
+        doc.remove_agent_key().unwrap();
+        assert!(!doc.has_agent_key());
+
+        // Add again with different key
+        doc.add_agent_key(&[5u8; 32]).unwrap();
+        assert!(doc.has_agent_key());
+
+        let vm_agent = doc.verification_method_by_fragment("agent").unwrap();
+        assert_eq!(vm_agent.id, format!("{did}#agent"));
+        doc.validate_agent_keys().unwrap();
+    }
+
+    // --- Custody attestation DID document integration tests (SCP-AB-018) ---
+
+    #[test]
+    fn did_document_without_attestation_returns_none() {
+        let did = "did:dht:zNoAttestation";
+        let doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        let attestation = doc.custody_attestation().unwrap();
+        assert!(
+            attestation.is_none(),
+            "document without attestation should return None"
+        );
+    }
+
+    #[test]
+    fn did_document_set_and_get_custody_attestation() {
+        use crate::attestation::{KeyCustodyModel, Platform, ScpKeyCustodyAttestation};
+
+        let did = "did:dht:zWithAttestation";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        let attestation = ScpKeyCustodyAttestation {
+            active_key_custody: KeyCustodyModel::HardwareBiometric,
+            agent_key_custody: Some(KeyCustodyModel::Software),
+            platform: Platform::Ios,
+            platform_attestation: None,
+            created_at: 1_700_000_000,
+        };
+
+        doc.set_custody_attestation(&attestation).unwrap();
+
+        let retrieved = doc.custody_attestation().unwrap().unwrap();
+        assert_eq!(retrieved, attestation);
+    }
+
+    #[test]
+    fn did_document_set_custody_attestation_replaces_existing() {
+        use crate::attestation::{KeyCustodyModel, Platform, ScpKeyCustodyAttestation};
+
+        let did = "did:dht:zReplaceAttestation";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        let first = ScpKeyCustodyAttestation {
+            active_key_custody: KeyCustodyModel::Software,
+            agent_key_custody: None,
+            platform: Platform::Desktop,
+            platform_attestation: None,
+            created_at: 1_700_000_000,
+        };
+        doc.set_custody_attestation(&first).unwrap();
+
+        let second = ScpKeyCustodyAttestation {
+            active_key_custody: KeyCustodyModel::HardwareBiometric,
+            agent_key_custody: Some(KeyCustodyModel::HardwarePin),
+            platform: Platform::Ios,
+            platform_attestation: None,
+            created_at: 1_700_000_001,
+        };
+        doc.set_custody_attestation(&second).unwrap();
+
+        let attestation_count = doc
+            .service
+            .iter()
+            .filter(|s| s.service_type == "ScpKeyCustodyAttestation")
+            .count();
+        assert_eq!(
+            attestation_count, 1,
+            "should have exactly one custody attestation entry"
+        );
+
+        let retrieved = doc.custody_attestation().unwrap().unwrap();
+        assert_eq!(retrieved, second);
+    }
+
+    #[test]
+    fn did_document_custody_attestation_preserves_other_services() {
+        use crate::attestation::{KeyCustodyModel, Platform, ScpKeyCustodyAttestation};
+
+        let did = "did:dht:zPreserveServices";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        doc.add_relay_service("wss://relay.example.com/scp/v1")
+            .unwrap();
+
+        let attestation = ScpKeyCustodyAttestation {
+            active_key_custody: KeyCustodyModel::HardwareBiometric,
+            agent_key_custody: None,
+            platform: Platform::Ios,
+            platform_attestation: None,
+            created_at: 1_700_000_000,
+        };
+        doc.set_custody_attestation(&attestation).unwrap();
+
+        // Should have: PreRotationCommitment + SCPRelay + ScpKeyCustodyAttestation.
+        assert_eq!(doc.service.len(), 3);
+        assert!(doc.pre_rotation_service().is_some());
+        assert_eq!(doc.relay_service_urls().len(), 1);
+        assert!(doc.custody_attestation().unwrap().is_some());
+    }
+
+    #[test]
+    fn did_document_custody_attestation_survives_json_roundtrip() {
+        use crate::attestation::{
+            AttestationPlatform, KeyCustodyModel, Platform, PlatformAttestation,
+            ScpKeyCustodyAttestation,
+        };
+
+        let did = "did:dht:zJsonRoundtrip";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        let attestation = ScpKeyCustodyAttestation {
+            active_key_custody: KeyCustodyModel::HardwareBiometric,
+            agent_key_custody: Some(KeyCustodyModel::Software),
+            platform: Platform::Ios,
+            platform_attestation: Some(PlatformAttestation {
+                platform: AttestationPlatform::AppleAppAttest,
+                proof: vec![0xCA, 0xFE, 0xBA, 0xBE],
+            }),
+            created_at: 1_700_000_000,
+        };
+        doc.set_custody_attestation(&attestation).unwrap();
+
+        let json = doc.to_json().unwrap();
+        let parsed = DidDocument::from_json(&json).unwrap();
+
+        let retrieved = parsed.custody_attestation().unwrap().unwrap();
+        assert_eq!(retrieved, attestation);
     }
 }
