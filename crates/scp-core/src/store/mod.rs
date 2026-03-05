@@ -23,6 +23,7 @@ pub mod economy;
 pub mod event_log;
 pub mod identity;
 pub mod nonce;
+pub mod tls;
 pub mod tools;
 pub mod transport;
 pub mod ucan;
