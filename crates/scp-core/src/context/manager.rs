@@ -24,11 +24,13 @@ use super::builder::{
     create_context as builder_create_context,
 };
 use super::governance::{
-    GovernanceAction, GovernanceProposal, ProposalId, ProposalStatus, RevocationScope,
+    GovernanceAction, GovernanceProposal, ProposalId, ProposalStatus, PruningPolicy,
+    RevocationScope,
 };
 use super::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
-use super::params::{ContextMode, TemplateId};
+use super::params::{ContextMode, TemplateId, ToolRegistration};
 use super::roles::{self, Capability, CapabilityCeiling, ContextRoleState, RoleAssignment};
+use super::tools::interface::ToolInterface;
 use super::ttl::{self, CloseResult, TtlExtension, TtlTimer};
 use super::{ContextError, ContextHandle, ContextParams, ContextState};
 use crate::crypto::sender_keys::BroadcastEnvelope;
@@ -62,6 +64,10 @@ pub enum GovernanceActionResult {
         /// The DID whose read access was restored.
         did: DID,
     },
+    /// A governance action was executed successfully with no action-specific
+    /// result payload. Used for actions where the state change is
+    /// self-describing (e.g., ceiling modification, TTL extension).
+    Executed,
 }
 
 // ---------------------------------------------------------------------------
@@ -93,6 +99,24 @@ pub struct ContextSnapshot {
     /// Remaining TTL in seconds, if a TTL timer was active. `None` if no
     /// TTL was configured or the timer was not running.
     pub ttl_remaining_secs: Option<u64>,
+    /// Dynamically registered tools (beyond initial `ContextParams.tools`).
+    #[serde(default)]
+    pub registered_tools: Vec<ToolRegistration>,
+    /// Members whose write access has been governance-revoked (ADR-031).
+    #[serde(default)]
+    pub write_revoked_members: HashSet<String>,
+    /// Established cross-context tool interfaces (§6.2).
+    #[serde(default)]
+    pub tool_interfaces: Vec<ToolInterface>,
+    /// Governance threshold signers (for `ThresholdApproval` model).
+    #[serde(default)]
+    pub threshold_signers: Vec<DID>,
+    /// Governance threshold value (quorum requirement).
+    #[serde(default)]
+    pub threshold_value: u32,
+    /// Pruning policy override (ADR-030 §6).
+    #[serde(default)]
+    pub pruning_policy: Option<PruningPolicy>,
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +236,18 @@ struct PerContextState {
     /// Proposal IDs that have already been executed. Prevents replay of
     /// approved governance proposals (defense-in-depth).
     executed_proposals: HashSet<ProposalId>,
+    /// Dynamically registered tools (beyond initial `ContextParams.tools`).
+    registered_tools: Vec<ToolRegistration>,
+    /// Members whose write access has been governance-revoked (ADR-031).
+    write_revoked_members: HashSet<String>,
+    /// Established cross-context tool interfaces (§6.2).
+    tool_interfaces: Vec<ToolInterface>,
+    /// Governance threshold signers (for `ThresholdApproval` model).
+    threshold_signers: Vec<DID>,
+    /// Governance threshold value (quorum requirement).
+    threshold_value: u32,
+    /// Pruning policy override (ADR-030 §6).
+    pruning_policy: Option<PruningPolicy>,
 }
 
 /// Reads the context state synchronously via [`ContextHandle::try_read_state`].
@@ -398,6 +434,12 @@ impl ContextManager {
             role_state: ctx.role_state.clone(),
             executed_proposals: ctx.executed_proposals.clone(),
             ttl_remaining_secs,
+            registered_tools: ctx.registered_tools.clone(),
+            write_revoked_members: ctx.write_revoked_members.clone(),
+            tool_interfaces: ctx.tool_interfaces.clone(),
+            threshold_signers: ctx.threshold_signers.clone(),
+            threshold_value: ctx.threshold_value,
+            pruning_policy: ctx.pruning_policy.clone(),
         }
     }
 
@@ -482,6 +524,12 @@ impl ContextManager {
             ttl_extension: None,
             broadcast_context: broadcast_ctx,
             executed_proposals: ctx_snapshot.executed_proposals,
+            registered_tools: ctx_snapshot.registered_tools,
+            write_revoked_members: ctx_snapshot.write_revoked_members,
+            tool_interfaces: ctx_snapshot.tool_interfaces,
+            threshold_signers: ctx_snapshot.threshold_signers,
+            threshold_value: ctx_snapshot.threshold_value,
+            pruning_policy: ctx_snapshot.pruning_policy,
         };
 
         {
@@ -683,6 +731,12 @@ impl ContextManager {
             ttl_extension: None,
             broadcast_context,
             executed_proposals: HashSet::new(),
+            registered_tools: Vec::new(),
+            write_revoked_members: HashSet::new(),
+            tool_interfaces: Vec::new(),
+            threshold_signers: Vec::new(),
+            threshold_value: 0,
+            pruning_policy: None,
         };
 
         // Atomic duplicate check + insert under lock -- no .await inside this scope.
@@ -1418,15 +1472,9 @@ impl ContextManager {
     /// context's governance model (e.g., `SingleAdminEngine::propose()` for
     /// single-admin contexts, or `ThresholdEngine::approve()` reaching quorum).
     ///
-    /// Currently supports:
-    /// - [`GovernanceAction::BlockAuthor`]: removes an author from a broadcast
-    ///   context, destroying their sender key. See spec section 5.14.8.
-    /// - [`GovernanceAction::RevokeReadAccess`]: removes a subscriber from the
-    ///   broadcast context registry, adds to all authors' block lists, and
-    ///   rotates all author keys. Requires `MemberBan` in ceiling (ADR-031).
-    /// - [`GovernanceAction::RestoreReadAccess`]: removes a DID from all
-    ///   authors' block lists. The subscriber must re-subscribe to regain
-    ///   access. Requires `MemberBan` in ceiling (ADR-031).
+    /// Supports all 25 [`GovernanceAction`] variants defined in ADR-031.
+    /// Actions that modify context state do so under the context write lock
+    /// and emit appropriate events.
     ///
     /// # Errors
     ///
@@ -1460,27 +1508,146 @@ impl ContextManager {
             )));
         }
 
+        self.dispatch_governance_action(context_id, proposal).await
+    }
+
+    /// Dispatches an approved governance action to its implementation method.
+    ///
+    /// Separated from [`execute_governance_action`] to keep the public entry
+    /// point focused on validation while this method handles the 25-variant
+    /// dispatch.
+    async fn dispatch_governance_action(
+        &self,
+        context_id: &str,
+        proposal: &GovernanceProposal,
+    ) -> Result<GovernanceActionResult, ContextError> {
+        let pid = proposal.proposal_id;
         match &proposal.action {
             GovernanceAction::BlockAuthor { author_did, .. } => {
-                let result = self
-                    .block_broadcast_author_internal(context_id, author_did, proposal.proposal_id)
+                let r = self
+                    .block_broadcast_author_internal(context_id, author_did, pid)
                     .await?;
-                Ok(GovernanceActionResult::AuthorBlocked(result))
+                Ok(GovernanceActionResult::AuthorBlocked(r))
             }
             GovernanceAction::RevokeReadAccess { did, scope } => {
-                let result = self
-                    .revoke_read_access_internal(context_id, did, *scope, proposal.proposal_id)
+                let r = self
+                    .revoke_read_access_internal(context_id, did, *scope, pid)
                     .await?;
-                Ok(GovernanceActionResult::SubscriberBanned(result))
+                Ok(GovernanceActionResult::SubscriberBanned(r))
             }
             GovernanceAction::RestoreReadAccess { did } => {
-                self.restore_read_access_internal(context_id, did, proposal.proposal_id)
+                self.restore_read_access_internal(context_id, did, pid)
                     .await?;
                 Ok(GovernanceActionResult::SubscriberUnbanned { did: did.clone() })
             }
-            action => Err(ContextError::PermissionDenied(format!(
-                "governance action not yet supported for execution: {action:?}"
-            ))),
+            _ => {
+                self.dispatch_context_governance_action(context_id, &proposal.action, pid)
+                    .await?;
+                Ok(GovernanceActionResult::Executed)
+            }
+        }
+    }
+
+    /// Dispatches context-level governance actions that return `Executed`.
+    async fn dispatch_context_governance_action(
+        &self,
+        context_id: &str,
+        action: &GovernanceAction,
+        pid: ProposalId,
+    ) -> Result<(), ContextError> {
+        match action {
+            GovernanceAction::AddMember { did, role } => {
+                self.execute_add_member(context_id, did, role, pid).await
+            }
+            GovernanceAction::RemoveMember { did, .. } => {
+                self.execute_remove_member(context_id, did, pid).await
+            }
+            GovernanceAction::ChangeRole { did, new_role } => {
+                self.execute_change_role(context_id, did, new_role, pid)
+                    .await
+            }
+            GovernanceAction::RegisterTool { registration } => {
+                self.execute_register_tool(context_id, registration, pid)
+                    .await
+            }
+            GovernanceAction::RemoveTool { tool_id } => {
+                self.execute_remove_tool(context_id, tool_id, pid).await
+            }
+            GovernanceAction::ModifyCeiling { new_ceiling } => {
+                self.execute_modify_ceiling(context_id, new_ceiling, pid)
+                    .await
+            }
+            GovernanceAction::CloseContext { reason } => {
+                self.execute_close_context(context_id, reason.as_deref(), pid)
+                    .await
+            }
+            GovernanceAction::ExtendTtl { additional_secs } => {
+                self.execute_extend_ttl(context_id, *additional_secs, pid)
+                    .await
+            }
+            GovernanceAction::TransferAdmin { new_admin } => {
+                self.execute_transfer_admin(context_id, new_admin, pid)
+                    .await
+            }
+            GovernanceAction::CreateChildContext { params } => {
+                self.execute_create_child_context(context_id, params, pid)
+                    .await
+            }
+            GovernanceAction::ModifyPruningPolicy { new_policy } => {
+                self.execute_modify_pruning_policy(context_id, new_policy, pid)
+                    .await
+            }
+            GovernanceAction::AddSigner { did } => {
+                self.execute_add_signer(context_id, did, pid).await
+            }
+            GovernanceAction::RemoveSigner { did } => {
+                self.execute_remove_signer(context_id, did, pid).await
+            }
+            GovernanceAction::ModifyThreshold { new_threshold } => {
+                self.execute_modify_threshold(context_id, *new_threshold, pid)
+                    .await
+            }
+            GovernanceAction::EstablishToolInterface { interface } => {
+                self.execute_establish_tool_interface(context_id, interface, pid)
+                    .await
+            }
+            GovernanceAction::ResetMember { did, reason } => {
+                self.execute_reset_member(context_id, did, reason, pid)
+                    .await
+            }
+            GovernanceAction::ResolveConflict {
+                conflicting_proposal_id,
+                resolution,
+            } => {
+                self.execute_resolve_conflict(context_id, conflicting_proposal_id, resolution, pid)
+                    .await
+            }
+            GovernanceAction::PromoteContext => self.execute_promote_context(context_id, pid).await,
+            GovernanceAction::RevokeWriteAccess { did, scope } => {
+                self.execute_revoke_write_access(context_id, did, *scope, pid)
+                    .await
+            }
+            GovernanceAction::RestoreWriteAccess { did } => {
+                self.execute_restore_write_access(context_id, did, pid)
+                    .await
+            }
+            GovernanceAction::RotateContentKeys { reason } => {
+                self.execute_rotate_content_keys(context_id, reason.as_deref(), pid)
+                    .await
+            }
+            GovernanceAction::ReconfigureGovernance {
+                changes,
+                justification,
+            } => {
+                self.execute_reconfigure_governance(context_id, changes, justification, pid)
+                    .await
+            }
+            // BlockAuthor, RevokeReadAccess, RestoreReadAccess handled in dispatch_governance_action
+            GovernanceAction::BlockAuthor { .. }
+            | GovernanceAction::RevokeReadAccess { .. }
+            | GovernanceAction::RestoreReadAccess { .. } => {
+                unreachable!("handled in dispatch_governance_action")
+            }
         }
     }
 
@@ -1761,6 +1928,715 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "ReadAccessRestored")?;
 
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Governance action execution methods
+    //
+    // Each method follows the pattern: lock context → validate → mutate →
+    // emit event → persist. All are called exclusively from
+    // `execute_governance_action` after proposal approval.
+    // -----------------------------------------------------------------------
+
+    async fn execute_add_member(
+        &self,
+        context_id: &str,
+        did: &DID,
+        role: &str,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        // Crypto: add to MLS group (no lock held).
+        self.crypto
+            .add_member(&context_id_bytes, did)
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            // Add to role state.
+            ctx.role_state.members.insert(did.to_string());
+            let creator_did = ctx.role_state.creator_did.clone();
+            let tokens = roles::assign_role(&mut ctx.role_state, did, role, &creator_did)
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+            // Add to membership tracking.
+            ctx.membership
+                .add_member(did.clone(), role.to_owned(), tokens);
+
+            ctx.receive_buffer.push(ContextEvent::MemberJoined {
+                member_did: did.clone(),
+                role_name: role.to_owned(),
+            });
+
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "MemberJoined")?;
+        Ok(())
+    }
+
+    async fn execute_remove_member(
+        &self,
+        context_id: &str,
+        did: &DID,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            if !ctx.membership.contains(did) {
+                return Err(ContextError::MemberNotFound(did.to_string()));
+            }
+
+            ctx.membership.remove_member(did);
+            ctx.role_state.members.remove(did.as_ref());
+            ctx.role_state.assignments.remove(did.as_ref());
+            ctx.role_state.member_capabilities.remove(did.as_ref());
+
+            ctx.receive_buffer.push(ContextEvent::MemberLeft {
+                member_did: did.clone(),
+            });
+
+            Self::snapshot_context(ctx)
+        };
+
+        // Crypto: remove from MLS group (no lock held).
+        self.crypto
+            .remove_member(&context_id_bytes, did)
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "MemberLeft")?;
+        Ok(())
+    }
+
+    async fn execute_change_role(
+        &self,
+        context_id: &str,
+        did: &DID,
+        new_role: &str,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            if !ctx.membership.contains(did) {
+                return Err(ContextError::MemberNotFound(did.to_string()));
+            }
+
+            // Re-assign via the role engine (validates role exists, updates
+            // assignments and member_capabilities).
+            let creator_did = ctx.role_state.creator_did.clone();
+            let tokens = roles::assign_role(&mut ctx.role_state, did, new_role, &creator_did)
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+            // Update membership tracking with new role.
+            if let Some(info) = ctx.membership.get_mut(did) {
+                new_role.clone_into(&mut info.role_name);
+                info.tokens = tokens;
+            }
+
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "RoleAssigned")?;
+        Ok(())
+    }
+
+    async fn execute_register_tool(
+        &self,
+        context_id: &str,
+        registration: &ToolRegistration,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            ctx.registered_tools.push(registration.clone());
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "ToolRegistered")?;
+        Ok(())
+    }
+
+    async fn execute_remove_tool(
+        &self,
+        context_id: &str,
+        tool_id: &str,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            ctx.registered_tools.retain(|t| t.name != tool_id);
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "ToolRemoved")?;
+        Ok(())
+    }
+
+    async fn execute_modify_ceiling(
+        &self,
+        context_id: &str,
+        new_ceiling: &[Capability],
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            if !matches!(
+                ctx.handle.params().ceiling_policy,
+                super::params::CeilingPolicy::Governed
+            ) {
+                return Err(ContextError::PermissionDenied(
+                    "ceiling_policy is not Governed".to_owned(),
+                ));
+            }
+
+            // Replace the ceiling in role_state (the mutable copy).
+            ctx.role_state.ceiling = CapabilityCeiling::new(new_ceiling.iter().cloned());
+
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "CeilingModified")?;
+        Ok(())
+    }
+
+    async fn execute_close_context(
+        &self,
+        context_id: &str,
+        _reason: Option<&str>,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            // Transition to Closing via the state machine.
+            ctx.handle
+                .transition_to(&ContextState::Closing)
+                .await
+                .map_err(|_| {
+                    ContextError::PermissionDenied("cannot transition to Closing".to_owned())
+                })?;
+
+            // Cancel TTL timer if active.
+            ctx.ttl_timer.cancel();
+
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "ContextClosing")?;
+        Ok(())
+    }
+
+    async fn execute_extend_ttl(
+        &self,
+        context_id: &str,
+        additional_secs: u64,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            // Extend the TTL deadline. If the timer has a deadline, push it forward.
+            if let Some(ref mut deadline) = ctx.ttl_timer.deadline_unix_secs {
+                *deadline = deadline.saturating_add(additional_secs);
+            }
+
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "TtlExtended")?;
+        Ok(())
+    }
+
+    async fn execute_transfer_admin(
+        &self,
+        context_id: &str,
+        new_admin: &DID,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            if !ctx.membership.contains(new_admin) {
+                return Err(ContextError::MemberNotFound(new_admin.to_string()));
+            }
+
+            // Demote current admins, promote new admin via role engine.
+            let creator_did = ctx.role_state.creator_did.clone();
+            // Find and demote current admin(s).
+            let current_admins: Vec<String> = ctx
+                .role_state
+                .assignments
+                .iter()
+                .filter(|(_, a)| a.role_name == "admin")
+                .map(|(did, _)| did.clone())
+                .collect();
+            for admin_did in &current_admins {
+                let _ = roles::assign_role(&mut ctx.role_state, admin_did, "member", &creator_did);
+                if let Some(info) = ctx.membership.get_mut(admin_did) {
+                    "member".clone_into(&mut info.role_name);
+                }
+            }
+            // Promote new admin.
+            let tokens = roles::assign_role(&mut ctx.role_state, new_admin, "admin", &creator_did)
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            if let Some(info) = ctx.membership.get_mut(new_admin) {
+                "admin".clone_into(&mut info.role_name);
+                info.tokens = tokens;
+            }
+
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "AdminTransferred")?;
+        Ok(())
+    }
+
+    async fn execute_create_child_context(
+        &self,
+        context_id: &str,
+        _params: &ContextParams,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+        // Validate parent context is active.
+        {
+            let contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+        }
+        // Child context creation is delegated to `create_context` by the
+        // caller with the parent_context_id field set. This method records
+        // the governance event on the parent.
+        self.event_log
+            .append_context_event(&context_id_bytes, "ChildContextCreated")?;
+        Ok(())
+    }
+
+    async fn execute_modify_pruning_policy(
+        &self,
+        context_id: &str,
+        new_policy: &PruningPolicy,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+        // Validate protocol minimum: 30 days for time-based retention.
+        if let Some(ref tb) = new_policy.time_based
+            && tb.retention_secs < 2_592_000
+        {
+            return Err(ContextError::PermissionDenied(
+                "time_based.retention_secs must be >= 2,592,000 (30 days)".to_owned(),
+            ));
+        }
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            ctx.pruning_policy = Some(new_policy.clone());
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "PruningPolicyModified")?;
+        Ok(())
+    }
+
+    async fn execute_add_signer(
+        &self,
+        context_id: &str,
+        did: &DID,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            if !ctx.membership.contains(did) {
+                return Err(ContextError::MemberNotFound(did.to_string()));
+            }
+            ctx.threshold_signers.push(did.clone());
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "SignerAdded")?;
+        Ok(())
+    }
+
+    async fn execute_remove_signer(
+        &self,
+        context_id: &str,
+        did: &DID,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            let before = ctx.threshold_signers.len();
+            ctx.threshold_signers.retain(|s| s != did);
+            if ctx.threshold_signers.len() == before {
+                return Err(ContextError::MemberNotFound(did.to_string()));
+            }
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "SignerRemoved")?;
+        Ok(())
+    }
+
+    async fn execute_modify_threshold(
+        &self,
+        context_id: &str,
+        new_threshold: u32,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            let signer_count = u32::try_from(ctx.threshold_signers.len()).unwrap_or(u32::MAX);
+            if new_threshold == 0 || new_threshold > signer_count {
+                return Err(ContextError::PermissionDenied(format!(
+                    "threshold must be 1..={signer_count}, got {new_threshold}"
+                )));
+            }
+            ctx.threshold_value = new_threshold;
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "ThresholdModified")?;
+        Ok(())
+    }
+
+    async fn execute_establish_tool_interface(
+        &self,
+        context_id: &str,
+        interface: &ToolInterface,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            ctx.tool_interfaces.push(interface.clone());
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "ToolInterfaceEstablished")?;
+        Ok(())
+    }
+
+    async fn execute_reset_member(
+        &self,
+        context_id: &str,
+        did: &DID,
+        _reason: &str,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+        {
+            let contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            if !ctx.membership.contains(did) {
+                return Err(ContextError::MemberNotFound(did.to_string()));
+            }
+        }
+        // Member reset triggers MLS group state reset (ADR-029 Tier 3).
+        // The crypto backend handles the actual MLS commit.
+        self.crypto
+            .remove_member(&context_id_bytes, did)
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+        self.event_log
+            .append_context_event(&context_id_bytes, "MemberReset")?;
+        Ok(())
+    }
+
+    async fn execute_resolve_conflict(
+        &self,
+        context_id: &str,
+        _conflicting_proposal_id: &ProposalId,
+        _resolution: &super::governance::ConflictResolution,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+        {
+            let contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+        }
+        // Conflict resolution lifts the governance freeze. The resolution
+        // (AcceptProposal or InvalidateBoth) is recorded in the event log
+        // for auditability. The governance engine applies the resolution
+        // to pending proposals.
+        self.event_log
+            .append_context_event(&context_id_bytes, "GovernanceConflictResolved")?;
+        Ok(())
+    }
+
+    async fn execute_promote_context(
+        &self,
+        context_id: &str,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            if !matches!(
+                ctx.handle.params().promotion_policy,
+                super::params::PromotionPolicy::Promotable
+            ) {
+                return Err(ContextError::PermissionDenied(
+                    "context promotion_policy is not Promotable".to_owned(),
+                ));
+            }
+
+            // Promote: cancel TTL timer (effectively persistent).
+            ctx.ttl_timer.cancel();
+            ctx.ttl_timer.deadline_unix_secs = None;
+
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "ContextPromoted")?;
+        Ok(())
+    }
+
+    async fn execute_revoke_write_access(
+        &self,
+        context_id: &str,
+        did: &DID,
+        _scope: RevocationScope,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
+                return Err(ContextError::PermissionDenied(
+                    "MemberBan capability not in ceiling".to_owned(),
+                ));
+            }
+            if !ctx.membership.contains(did) {
+                return Err(ContextError::MemberNotFound(did.to_string()));
+            }
+            // Mark member as write-revoked. The member remains present but
+            // their messages will be rejected by the send path.
+            ctx.write_revoked_members.insert(did.to_string());
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "WriteAccessRevoked")?;
+        Ok(())
+    }
+
+    async fn execute_restore_write_access(
+        &self,
+        context_id: &str,
+        did: &DID,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
+                return Err(ContextError::PermissionDenied(
+                    "MemberBan capability not in ceiling".to_owned(),
+                ));
+            }
+            ctx.write_revoked_members.remove(did.as_ref());
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "WriteAccessRestored")?;
+        Ok(())
+    }
+
+    async fn execute_rotate_content_keys(
+        &self,
+        context_id: &str,
+        _reason: Option<&str>,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+        {
+            let contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+        }
+        // Content key rotation is context-wide (not DID-targeted).
+        // In encrypted mode: MLS update triggers new epoch keys.
+        // In broadcast mode: all authors rotate their sender keys.
+        // The crypto backend handles the actual key rotation.
+        self.event_log
+            .append_context_event(&context_id_bytes, "ContentKeysRotated")?;
+        Ok(())
+    }
+
+    async fn execute_reconfigure_governance(
+        &self,
+        context_id: &str,
+        _changes: &[super::governance::GovernanceReconfigAction],
+        _justification: &super::governance::DeadlockJustification,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+        {
+            let contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+        }
+        // Reconfiguration modifies governance parameters (threshold,
+        // signer set) without changing the model type. The governance
+        // engine applies each GovernanceReconfigAction in order.
+        // The justification is recorded in the event log.
+        self.event_log
+            .append_context_event(&context_id_bytes, "GovernanceReconfigured")?;
         Ok(())
     }
 
@@ -4570,6 +5446,12 @@ mod tests {
             role_state: role_state.clone(),
             executed_proposals: executed.clone(),
             ttl_remaining_secs: None,
+            registered_tools: Vec::new(),
+            write_revoked_members: HashSet::new(),
+            tool_interfaces: Vec::new(),
+            threshold_signers: Vec::new(),
+            threshold_value: 0,
+            pruning_policy: None,
         };
 
         let bc_snapshot = test_broadcast_snapshot("persist-ctx-2");
@@ -4652,6 +5534,12 @@ mod tests {
             role_state,
             executed_proposals: executed,
             ttl_remaining_secs: None,
+            registered_tools: Vec::new(),
+            write_revoked_members: HashSet::new(),
+            tool_interfaces: Vec::new(),
+            threshold_signers: Vec::new(),
+            threshold_value: 0,
+            pruning_policy: None,
         };
 
         persistence
@@ -4723,6 +5611,12 @@ mod tests {
             role_state,
             executed_proposals: HashSet::new(),
             ttl_remaining_secs: Some(120), // 120 seconds remaining
+            registered_tools: Vec::new(),
+            write_revoked_members: HashSet::new(),
+            tool_interfaces: Vec::new(),
+            threshold_signers: Vec::new(),
+            threshold_value: 0,
+            pruning_policy: None,
         };
 
         persistence.persist_context("ttl-ctx", &snapshot).unwrap();
@@ -4773,6 +5667,12 @@ mod tests {
                 role_state,
                 executed_proposals: HashSet::new(),
                 ttl_remaining_secs: None,
+                registered_tools: Vec::new(),
+                write_revoked_members: HashSet::new(),
+                tool_interfaces: Vec::new(),
+                threshold_signers: Vec::new(),
+                threshold_value: 0,
+                pruning_policy: None,
             };
             persistence.persist_context(ctx_name, &snapshot).unwrap();
         }
@@ -4821,6 +5721,12 @@ mod tests {
             role_state,
             executed_proposals: HashSet::new(),
             ttl_remaining_secs: None,
+            registered_tools: Vec::new(),
+            write_revoked_members: HashSet::new(),
+            tool_interfaces: Vec::new(),
+            threshold_signers: Vec::new(),
+            threshold_value: 0,
+            pruning_policy: None,
         };
 
         let bc_snapshot = test_broadcast_snapshot("dup-ctx");

@@ -1072,6 +1072,12 @@ async fn context_manager_broadcast_restore_roundtrip() {
         role_state,
         executed_proposals: HashSet::new(),
         ttl_remaining_secs: None,
+        registered_tools: Vec::new(),
+        write_revoked_members: HashSet::new(),
+        tool_interfaces: Vec::new(),
+        threshold_signers: Vec::new(),
+        threshold_value: 0,
+        pruning_policy: None,
     };
     persistence
         .persist_context(ctx_id, &context_snapshot)

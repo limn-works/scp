@@ -284,12 +284,19 @@ pub fn actions_conflict(
             },
         ) => did_a == did_b && role_a != role_b,
 
-        // Two ceiling modifications with different sets.
-        (GovernanceAction::ModifyCeiling { .. }, GovernanceAction::ModifyCeiling { .. }) => {
-            // Any two concurrent ceiling modifications conflict — the sets
-            // may or may not differ, but concurrent modification is unsafe.
-            true
-        }
+        // Any two concurrent modifications to the same global context property
+        // conflict — the values may or may not differ, but concurrent
+        // modification is unsafe.
+        (GovernanceAction::ModifyCeiling { .. }, GovernanceAction::ModifyCeiling { .. })
+        | (GovernanceAction::ModifyThreshold { .. }, GovernanceAction::ModifyThreshold { .. })
+        | (
+            GovernanceAction::ModifyPruningPolicy { .. },
+            GovernanceAction::ModifyPruningPolicy { .. },
+        )
+        | (
+            GovernanceAction::ReconfigureGovernance { .. },
+            GovernanceAction::ReconfigureGovernance { .. },
+        ) => true,
 
         // Remove + role change for the same DID.
         (
@@ -315,15 +322,19 @@ pub fn actions_conflict(
             GovernanceAction::RemoveMember { did: did_b, .. },
         ) => did_a == b_proposer && did_b == a_proposer,
 
-        // Two RevokeReadAccess actions targeting the same DID conflict
-        // (scope may differ, but concurrent revocation is unsafe).
+        // Two concurrent revocations of the same type targeting the same DID
+        // conflict (scope may differ, but concurrent revocation is unsafe — ADR-031 §7).
         (
             GovernanceAction::RevokeReadAccess { did: did_a, .. },
             GovernanceAction::RevokeReadAccess { did: did_b, .. },
+        )
+        | (
+            GovernanceAction::RevokeWriteAccess { did: did_a, .. },
+            GovernanceAction::RevokeWriteAccess { did: did_b, .. },
         ) => did_a == did_b,
 
-        // RevokeReadAccess and RestoreReadAccess for the same DID conflict
-        // (contradictory intent on the same member's access state).
+        // Revoke and Restore for the same DID conflict (contradictory intent
+        // on the same member's access state).
         (
             GovernanceAction::RevokeReadAccess {
                 did: revoke_did, ..
@@ -335,7 +346,29 @@ pub fn actions_conflict(
             GovernanceAction::RevokeReadAccess {
                 did: revoke_did, ..
             },
+        )
+        | (
+            GovernanceAction::RevokeWriteAccess {
+                did: revoke_did, ..
+            },
+            GovernanceAction::RestoreWriteAccess { did: restore_did },
+        )
+        | (
+            GovernanceAction::RestoreWriteAccess { did: restore_did },
+            GovernanceAction::RevokeWriteAccess {
+                did: revoke_did, ..
+            },
         ) => revoke_did == restore_did,
+
+        // AddSigner and RemoveSigner for the same DID conflict.
+        (
+            GovernanceAction::AddSigner { did: add_did },
+            GovernanceAction::RemoveSigner { did: remove_did },
+        )
+        | (
+            GovernanceAction::RemoveSigner { did: remove_did },
+            GovernanceAction::AddSigner { did: add_did },
+        ) => add_did == remove_did,
 
         // All other action pairs are non-conflicting.
         _ => false,

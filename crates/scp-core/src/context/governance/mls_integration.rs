@@ -85,9 +85,13 @@ pub enum MlsImpact {
 #[must_use]
 pub const fn classify_action(action: &GovernanceAction) -> MlsImpact {
     match action {
+        // Membership changes trigger MLS Commit (epoch advance).
         GovernanceAction::AddMember { .. }
         | GovernanceAction::RemoveMember { .. }
-        | GovernanceAction::RevokeReadAccess { .. } => MlsImpact::MembershipChange,
+        | GovernanceAction::RevokeReadAccess { .. }
+        | GovernanceAction::ResetMember { .. } => MlsImpact::MembershipChange,
+        // All other actions are governance-level state changes that do not
+        // affect MLS group membership (ADR-031 §8).
         GovernanceAction::ChangeRole { .. }
         | GovernanceAction::RegisterTool { .. }
         | GovernanceAction::RemoveTool { .. }
@@ -97,7 +101,18 @@ pub const fn classify_action(action: &GovernanceAction) -> MlsImpact {
         | GovernanceAction::TransferAdmin { .. }
         | GovernanceAction::CreateChildContext { .. }
         | GovernanceAction::BlockAuthor { .. }
-        | GovernanceAction::RestoreReadAccess { .. } => MlsImpact::NoMlsChange,
+        | GovernanceAction::RestoreReadAccess { .. }
+        | GovernanceAction::ModifyPruningPolicy { .. }
+        | GovernanceAction::AddSigner { .. }
+        | GovernanceAction::RemoveSigner { .. }
+        | GovernanceAction::ModifyThreshold { .. }
+        | GovernanceAction::EstablishToolInterface { .. }
+        | GovernanceAction::ResolveConflict { .. }
+        | GovernanceAction::PromoteContext
+        | GovernanceAction::RevokeWriteAccess { .. }
+        | GovernanceAction::RestoreWriteAccess { .. }
+        | GovernanceAction::RotateContentKeys { .. }
+        | GovernanceAction::ReconfigureGovernance { .. } => MlsImpact::NoMlsChange,
     }
 }
 
