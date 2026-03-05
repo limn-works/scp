@@ -22,16 +22,20 @@ An agent with no prior context should be able to visit the SCP repository, under
 - SDK examples: Python, TypeScript, Swift, and Kotlin each have 4 runnable examples (basic messaging, tool invocation, MCP integration, multi-agent)
 - Getting started guide: `GETTING-STARTED.md` at repo root
 - Testing guide: `TESTING.md` at repo root
+- Contributing guide: `CONTRIBUTING.md` at repo root
+- FFI crate READMEs: `crates/scp-ffi/README.md`, `napi/README.md`, `wasm/README.md`, `uniffi/README.md`
+- SDK quickstart guide: `docs/guides/sdk-quickstart.md`
+- Storage backend guide: `docs/guides/storage-backends.md`
+- Relay operator guide: `docs/guides/relay-operations.md`
+- Conformance testing guide: `docs/guides/conformance-testing.md`
 
 ### Gaps
+
+| Category | Current | Target | Priority |
+|---|---|---|---|
 | Inline doc coverage | Struct fields, enum variants, constants under-documented | Field/variant-level `///` docs on public items | P1 |
 | Generated API reference | None | Hosted rustdoc, typedoc, pdoc, DocC | P1 |
-| Crate/FFI README files | None | README per crate and FFI bridge | P1 |
-| Storage backend guide | None | `docs/guides/storage-backends.md` | P2 |
-| Relay operator guide | None | `docs/guides/relay-operations.md` | P2 |
-| Conformance testing guide | None | `docs/guides/conformance-testing.md` | P2 |
 | Integration guides | None | "Add SCP to existing app" | P2 |
-| SDK quickstart guide | None | Unified `docs/guides/sdk-quickstart.md` | P2 |
 | Compliance documentation | None | Wire format reference, test vectors, conformance suite | P2 |
 
 ## 21.3 Documentation Architecture
@@ -40,17 +44,17 @@ An agent with no prior context should be able to visit the SCP repository, under
 README.md                        # What SCP is, capabilities, architecture, license
 LICENSING.md                     # License structure and FAQ
 GETTING-STARTED.md               ✓ exists
-CONTRIBUTING.md                  # Branch naming, commits, testing, PR process, CLA
+CONTRIBUTING.md                  ✓ exists
 TESTING.md                       ✓ exists
 
 docs/                            # Published documentation (agent-facing)
 ├── guides/
 │   ├── architecture.md          ✓ exists
-│   ├── sdk-quickstart.md
+│   ├── sdk-quickstart.md        ✓ exists
 │   ├── transport-adapters.md    ✓ exists
-│   ├── storage-backends.md
-│   ├── relay-operations.md
-│   └── conformance-testing.md
+│   ├── storage-backends.md      ✓ exists
+│   ├── relay-operations.md      ✓ exists
+│   └── conformance-testing.md   ✓ exists
 ├── examples/
 │   ├── python/
 │   ├── typescript/
