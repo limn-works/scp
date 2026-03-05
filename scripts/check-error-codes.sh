@@ -52,9 +52,14 @@ check_code() {
         SCP-ATTEST)   [[ $num -ge 9000 && $num -le 9999 ]] || { echo "VIOLATION: $file:$line_num: $code — ATTEST range is 9000-9999"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
         SCP-MCP)      [[ $num -ge 10000 && $num -le 10999 ]] || { echo "VIOLATION: $file:$line_num: $code — MCP range is 10000-10999"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
         SCP-UNKNOWN)  ;; # Sentinel for unmapped bridge errors — allowed
+        SCP-TEST)     ;; # Test sentinel — allowed
         *)
-            echo "VIOLATION: $file:$line_num: $code — non-canonical prefix '$prefix'"
-            VIOLATIONS=$((VIOLATIONS + 1))
+            # PRD story IDs (e.g. SCP-AB-016, SCP-PERSIST-062) use numbers
+            # < 1000. Error codes start at 1000+. Skip story references.
+            if [[ $num -ge 1000 ]]; then
+                echo "VIOLATION: $file:$line_num: $code — non-canonical prefix '$prefix'"
+                VIOLATIONS=$((VIOLATIONS + 1))
+            fi
             ;;
     esac
 }

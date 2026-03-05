@@ -51,6 +51,15 @@ jobs:
             kotlin:
               - 'bindings/kotlin/**'
 
+  # ── Error codes ───────────────────────────────────────────────────
+  error-codes:
+    needs: check-draft
+    name: Error code conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/check-error-codes.sh
+
   # ── Rust ────────────────────────────────────────────────────────────
   rust-fmt:
     needs: changes

@@ -278,9 +278,9 @@ pub async fn ucan_validate(
 ///
 /// # Errors
 ///
-/// - Rejects with `SCP-PERM-4004` if the context does not have key custody
+/// - Rejects with `SCP-PERM-3023` if the context does not have key custody
 ///   (created from an `identity_load` handle without key material).
-/// - Rejects with `SCP-PERM-4004` if signing or token construction fails.
+/// - Rejects with `SCP-PERM-3023` if signing or token construction fails.
 ///
 /// See RED-102 for the `KeyCustody` wiring story.
 #[napi]
@@ -296,7 +296,7 @@ pub async fn ucan_mint(
             message: "UCAN minting requires key custody — create the context with an \
                       in_memory identity (identity_create(\"in_memory\"))"
                 .to_owned(),
-            code: "SCP-PERM-4004".to_owned(),
+            code: "SCP-PERM-3023".to_owned(),
         })
     })?;
     let signing_key = handle.signing_key.ok_or_else(|| {
@@ -304,7 +304,7 @@ pub async fn ucan_mint(
             message: "UCAN minting requires a signing key — the context creator identity \
                       must have an active signing key"
                 .to_owned(),
-            code: "SCP-PERM-4004".to_owned(),
+            code: "SCP-PERM-3023".to_owned(),
         })
     })?;
 
@@ -331,7 +331,7 @@ pub async fn ucan_mint(
     let token = mint_ucan(&params, &custody.0).await.map_err(|e| {
         napi::Error::from(ScpNapiError::Permission {
             message: format!("UCAN minting failed: {e}"),
-            code: "SCP-PERM-4004".to_owned(),
+            code: "SCP-PERM-3023".to_owned(),
         })
     })?;
 

@@ -5334,7 +5334,7 @@ public func eventLogVerify(handle: ContextHandle, claimJson: String)async throws
  * - `"software"` — always accepted; requires a wired `KeyCustodyProvider`.
  * - `"in_memory"` — **only** accepted when the `allow_in_memory_custody`
  * feature is enabled at compile time. Returns `ScpError::Identity` with
- * code `SCP-IDN-1008` otherwise. Stores key material in unprotected heap
+ * code `SCP-IDENT-1008` otherwise. Stores key material in unprotected heap
  * memory; suitable for testing and development but NOT for production use
  * on mobile devices.
  *
@@ -5345,7 +5345,7 @@ public func eventLogVerify(handle: ContextHandle, claimJson: String)async throws
  * # Errors
  *
  * Returns `ScpError::Identity` if key generation or DID creation fails.
- * Returns `ScpError::Identity` with code `SCP-IDN-1008` if `"in_memory"` is
+ * Returns `ScpError::Identity` with code `SCP-IDENT-1008` if `"in_memory"` is
  * requested but the `allow_in_memory_custody` feature is not enabled.
  * Returns `ScpError::Validation` if the custody string is not recognized.
  *
