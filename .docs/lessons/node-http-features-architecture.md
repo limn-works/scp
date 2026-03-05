@@ -4,7 +4,7 @@ Patterns and decisions from the scp-node HTTP features implementation: local dev
 
 ## NodeState Generic Over BlobStorage
 
-`NodeState<B: BlobStorage>` uses a static generic parameter, not a trait object (`Arc<dyn BlobStorage>`). The reason: `BlobStorage` has async methods returning `impl Future` which makes it not dyn-compatible. The generic propagates through all handler functions: `health_handler::<B>`, `feed_handler::<B>`, etc.
+`NodeState<B: BlobStorage>` uses a static generic parameter, not a trait object (`Arc<dyn BlobStorage>`). While the trait now uses `#[async_trait]` (which boxes futures, enabling dyn-compatibility), the generic approach is retained for zero-cost dispatch via `BlobStorageBackend` enum. The generic propagates through all handler functions: `health_handler::<B>`, `feed_handler::<B>`, etc.
 
 When composing axum routers from generic handlers, the type parameter must be threaded through every route registration: `get(handler::<B>)`. This is mechanical but must be consistent -- missing a turbofish causes a type inference failure.
 

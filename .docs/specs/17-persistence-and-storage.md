@@ -23,7 +23,7 @@ The `Storage` trait (defined in `scp-platform`) is deliberately thin — six asy
 ```
 Relay Server (blob routing, TTL enforcement, subscription registry)
         |
-BlobStore trait (store/get/list/delete/expire with routing_id + TTL)
+BlobStorage trait (store/get/query/delete/purge_expired with routing_id + TTL)
         |
 Backend adapter (SQLite, redb, PostgreSQL, S3-compatible, in-memory)
 ```
@@ -503,14 +503,14 @@ The conformance suite tests: store/retrieve roundtrip, missing key returns None,
 
 ### Custom BlobStore Adapters
 
-Implement the 5 async methods of the `BlobStore` trait. Run the `blob_store_conformance!()` macro.
+Implement the 5 required async methods of the `BlobStorage` trait (`store`, `get`, `query`, `delete`, `purge_expired`). The 2 streaming methods (`store_streaming`, `get_streaming`) have default implementations that delegate to the `Vec<u8>` methods — override them only if your backend benefits from avoiding full materialization (see §17.7.1). Run the `blob_store_conformance!()` macro.
 
 ```rust
 #[cfg(test)]
 blob_store_conformance!(|| MyCustomBlobStore::new(clock.clone()));
 ```
 
-The conformance suite tests: store/retrieve roundtrip, missing blob returns None, TTL expiry, list by routing_id in stored_at order, list with since filter, delete removes blob, store returns SHA-256 blob_id, and concurrent store + expire safety.
+The conformance suite generates 19 tests: store/retrieve roundtrip, missing blob returns None, TTL expiry, query by routing_id in stored_at order, query with since filter, query with limit, delete removes blob, store returns SHA-256 blob_id, concurrent store + purge safety, purge removes only expired blobs, query for unknown routing_id returns empty, streaming store roundtrip, streaming get roundtrip, full streaming roundtrip, streaming empty body, content_length hint is advisory, streaming get for nonexistent blob, streaming-stored blob findable via query, and streaming get for expired blob.
 
 ## 17.12 Third-Party Adapter Candidates
 
