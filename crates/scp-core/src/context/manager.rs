@@ -1486,7 +1486,7 @@ impl ContextManager {
     /// context's governance model (e.g., `SingleAdminEngine::propose()` for
     /// single-admin contexts, or `ThresholdEngine::approve()` reaching quorum).
     ///
-    /// Supports all 25 [`GovernanceAction`] variants defined in ADR-031.
+    /// Supports all 25 [`GovernanceAction`] variants (24 from ADR-031 + legacy `BlockAuthor`).
     /// Actions that modify context state do so under the context write lock
     /// and emit appropriate events.
     ///
@@ -1555,7 +1555,7 @@ impl ContextManager {
     /// Dispatches an approved governance action to its implementation method.
     ///
     /// Separated from [`execute_governance_action`] to keep the public entry
-    /// point focused on validation while this method handles the 25-variant
+    /// point focused on validation while this method handles the 25-action
     /// dispatch.
     async fn dispatch_governance_action(
         &self,
@@ -2340,13 +2340,35 @@ impl ContextManager {
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
-        // Validate protocol minimum: 30 days for time-based retention.
+        // Validate protocol minimum: 30 days for time-based retention (ADR-030).
         if let Some(ref tb) = new_policy.time_based
             && tb.retention_secs < 2_592_000
         {
             return Err(ContextError::PermissionDenied(
                 "time_based.retention_secs must be >= 2,592,000 (30 days)".to_owned(),
             ));
+        }
+        // ADR-030: structural event retention floor is 90 days (7,776,000 seconds).
+        // Check: retention_secs * structural_retention_multiplier >= 7_776_000.
+        // Rearranged to avoid u64→f64 precision loss: multiply the floor constant
+        // by 1000 and the multiplier by 1000 to stay in integer space.
+        if let Some(ref tb) = new_policy.time_based {
+            let multiplier = new_policy
+                .event_type_retention
+                .structural_retention_multiplier;
+            // Scale multiplier to integer (3 decimal places of precision).
+            let multiplier_scaled = (multiplier * 1000.0).round() as u32;
+            // effective = retention_secs * multiplier_scaled / 1000
+            let effective = tb
+                .retention_secs
+                .saturating_mul(u64::from(multiplier_scaled))
+                / 1000;
+            if effective < 7_776_000 {
+                return Err(ContextError::PermissionDenied(
+                    "effective structural event retention must be >= 7,776,000 seconds (90 days)"
+                        .to_owned(),
+                ));
+            }
         }
 
         let snapshot = {
@@ -2418,6 +2440,18 @@ impl ContextManager {
             ctx.threshold_signers.retain(|s| s != did);
             if ctx.threshold_signers.len() == before {
                 return Err(ContextError::MemberNotFound(did.to_string()));
+            }
+            // ADR-031: if removing would make threshold > signers.len(), reject.
+            if ctx.threshold_value > 0 {
+                let remaining = u32::try_from(ctx.threshold_signers.len()).unwrap_or(u32::MAX);
+                if ctx.threshold_value > remaining {
+                    // Undo the removal before returning.
+                    ctx.threshold_signers.push(did.clone());
+                    return Err(ContextError::PermissionDenied(format!(
+                        "removing signer would leave {remaining} signers < threshold {}",
+                        ctx.threshold_value
+                    )));
+                }
             }
             Self::snapshot_context(ctx)
         };
@@ -2503,35 +2537,58 @@ impl ContextManager {
                 return Err(ContextError::MemberNotFound(did.to_string()));
             }
         }
-        // Member reset triggers MLS group state reset (ADR-029 Tier 3).
-        // The crypto backend handles the actual MLS commit.
+        // Member reset = leave + immediately re-join (ADR-029 §Tier 3).
+        // Step 1: Remove from MLS group (destroys stale leaf node).
         self.crypto
             .remove_member(&context_id_bytes, did)
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+        // Step 2: Re-add to MLS group with fresh key material.
+        self.crypto
+            .add_member(&context_id_bytes, did)
             .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
         self.event_log
             .append_context_event(&context_id_bytes, "MemberReset")?;
         Ok(())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn execute_resolve_conflict(
         &self,
         context_id: &str,
-        _conflicting_proposal_id: &ProposalId,
-        _resolution: &super::governance::ConflictResolution,
+        conflicting_proposal_id: &ProposalId,
+        resolution: &super::governance::ConflictResolution,
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
-        {
-            let contexts = self.contexts.lock().await;
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
             let ctx = contexts
-                .get(context_id)
+                .get_mut(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
             require_active(&ctx.handle)?;
-        }
-        // Conflict resolution lifts the governance freeze. The resolution
-        // (AcceptProposal or InvalidateBoth) is recorded in the event log
-        // for auditability. The governance engine applies the resolution
-        // to pending proposals.
+
+            // Mark the conflicting proposal(s) as executed (invalidated) so
+            // they cannot be replayed. For AcceptProposal the loser is
+            // invalidated; for InvalidateBoth, both are.
+            match resolution {
+                super::governance::ConflictResolution::AcceptProposal { winner_id } => {
+                    // Invalidate the conflicting proposal (the loser).
+                    ctx.executed_proposals.insert(*conflicting_proposal_id);
+                    // The winner is accepted — it proceeds through normal execution.
+                    // Mark it as executed to prevent double-execution.
+                    ctx.executed_proposals.insert(*winner_id);
+                }
+                super::governance::ConflictResolution::InvalidateBoth => {
+                    // Both proposals are invalidated.
+                    ctx.executed_proposals.insert(*conflicting_proposal_id);
+                }
+            }
+
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
         self.event_log
             .append_context_event(&context_id_bytes, "GovernanceConflictResolved")?;
         Ok(())
@@ -2577,10 +2634,16 @@ impl ContextManager {
         &self,
         context_id: &str,
         did: &DID,
-        _scope: RevocationScope,
+        scope: RevocationScope,
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
+        // Both Full and FutureOnly block future writes via write_revoked_members.
+        // Full additionally suppresses historical content via access key
+        // destruction (ADR-038 §3) — delegated to the access key layer when
+        // it processes the WriteAccessRevoked event. The scope is recorded in
+        // the event for downstream differentiation.
+        let _ = scope;
 
         let snapshot = {
             let mut contexts = self.contexts.lock().await;
@@ -2639,6 +2702,7 @@ impl ContextManager {
         Ok(())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn execute_rotate_content_keys(
         &self,
         context_id: &str,
@@ -2646,41 +2710,78 @@ impl ContextManager {
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
-        {
-            let contexts = self.contexts.lock().await;
+
+        // Broadcast mode: rotate all authors' sender keys under lock.
+        let bc_snapshot = {
+            let mut contexts = self.contexts.lock().await;
             let ctx = contexts
-                .get(context_id)
+                .get_mut(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
             require_active(&ctx.handle)?;
+
+            if let Some(ref mut bc) = ctx.broadcast_context {
+                // Rotate every author's broadcast key (epoch advance + new key).
+                bc.rotate_all_author_keys()?;
+                Some(bc.to_snapshot())
+            } else {
+                // Encrypted mode: the MLS backend handles key rotation via
+                // update proposals. No direct crypto call needed — the event
+                // signals the MLS layer to issue an Update + Commit.
+                None
+            }
+        };
+
+        if let Some(ref snapshot) = bc_snapshot {
+            self.persist_broadcast_snapshot(context_id, snapshot);
         }
-        // Content key rotation is context-wide (not DID-targeted).
-        // In encrypted mode: MLS update triggers new epoch keys.
-        // In broadcast mode: all authors rotate their sender keys.
-        // The crypto backend handles the actual key rotation.
+
         self.event_log
             .append_context_event(&context_id_bytes, "ContentKeysRotated")?;
         Ok(())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn execute_reconfigure_governance(
         &self,
         context_id: &str,
-        _changes: &[super::governance::GovernanceReconfigAction],
+        changes: &[super::governance::GovernanceReconfigAction],
         _justification: &super::governance::DeadlockJustification,
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
-        {
-            let contexts = self.contexts.lock().await;
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
             let ctx = contexts
-                .get(context_id)
+                .get_mut(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
             require_active(&ctx.handle)?;
-        }
-        // Reconfiguration modifies governance parameters (threshold,
-        // signer set) without changing the model type. The governance
-        // engine applies each GovernanceReconfigAction in order.
-        // The justification is recorded in the event log.
+
+            // Apply each reconfiguration action in order (ADR-031 §10).
+            for change in changes {
+                match change {
+                    super::governance::GovernanceReconfigAction::RemoveInactiveSigner { did } => {
+                        ctx.threshold_signers.retain(|s| s != did);
+                    }
+                    super::governance::GovernanceReconfigAction::ReduceThreshold {
+                        new_threshold,
+                    } => {
+                        let signer_count =
+                            u32::try_from(ctx.threshold_signers.len()).unwrap_or(u32::MAX);
+                        if *new_threshold == 0 || *new_threshold > signer_count {
+                            return Err(ContextError::PermissionDenied(format!(
+                                "reconfigured threshold must be 1..={signer_count}, got {new_threshold}"
+                            )));
+                        }
+                        ctx.threshold_value = *new_threshold;
+                    }
+                }
+            }
+
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
         self.event_log
             .append_context_event(&context_id_bytes, "GovernanceReconfigured")?;
         Ok(())

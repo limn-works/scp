@@ -720,6 +720,26 @@ impl BroadcastContext {
         }
     }
 
+    /// Rotates all authors' broadcast keys (governance-triggered, §9.17).
+    ///
+    /// Advances every author's epoch and generates a new sender key. Used by
+    /// `RotateContentKeys` governance action for context-wide key hygiene.
+    /// Does not modify block lists or subscriber registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if any author's epoch overflows.
+    pub fn rotate_all_author_keys(&mut self) -> Result<(), ContextError> {
+        for author in self.authors.values_mut() {
+            let new_epoch = author.epoch.checked_add(1).ok_or_else(|| {
+                ContextError::CryptoFailed("broadcast key epoch overflow".to_owned())
+            })?;
+            author.epoch = new_epoch;
+            author.broadcast_key = generate_sender_key();
+        }
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Capability checks (spec section 5.14.9)
     // -----------------------------------------------------------------------
