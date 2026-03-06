@@ -33,9 +33,9 @@ Every capability above must work through at least one SDK binding (Python).
 
 ---
 
-## Issue + PRD Story Inventory
+## Issue + PRD Story + Spec Audit Inventory
 
-### GitHub Issues: 67 open
+### GitHub Issues: 70 open
 
 | Tier | Count | Issues |
 |------|-------|--------|
@@ -45,192 +45,250 @@ Every capability above must work through at least one SDK binding (Python).
 | LOW | 19 | #291, #301, #303, #304, #315, #316, #317, #318, #322, #323, #325, #329, #330, #331, #334, #336, #337, #341, #348 |
 | POLISH | 15 | #342, #343, #344, #352, #353, #354, #355, #357, #360, #362, #363, #364, #365, #366, #367 |
 
-### PRD Stories: 22 across 3 files
+### PRD Stories: 52 unfinished across 6 files
 
-| PRD | Stories | Gate |
-|-----|---------|------|
-| capability-registry.json | SCP-ACR-001–007 | URI parser, challenge unification, DID capabilities, admission |
-| bridge-cooperative.json | SCP-BCH-001–009 | Auth, endpoints, webhook, credential lifecycle |
-| participation-admission.json | SCP-BA-001–006 | Types, context integration, blind verification, FFI, production |
+| PRD | Pending | In-Progress | Done | Gate | Blocked By |
+|-----|---------|-------------|------|------|------------|
+| content-access.json | 10 (SCP-CAC-001–010) | 0 | 0 | Block list, access keys, CEK wrapping, state destruction | #309, #356, Phase 0 S-A (canonical serialization for key wrapping AAD) |
+| governance-integration.json | 8 (SCP-267–274) | 0 | 0 | GovernanceEngine wiring, proposal lifecycle, conflict detection, cosignatures | #356 (ContextManager), #320 (actions) |
+| capability-registry.json | 7 (SCP-ACR-001–007) | 0 | 0 | URI parser, challenge unification, DID capabilities, admission | — (independent) |
+| bridge-cooperative.json | 9 (SCP-BCH-001–009) | 0 | 0 | Auth, endpoints, webhook, credential lifecycle | **Phase 0 S-D** (bridge MLS model) |
+| participation-admission.json | 6 (SCP-BA-001–006) | 0 | 0 | Types, context integration, blind verification, FFI, production | Phase 0 S-A (canonical serialization for profiles) |
+| main.json | 9 | 3 | 173 | Kotlin SDK, FFI wiring, signaling | #356 (FFI), #306/#307 (bridges) |
 
-### What's NOT tracked (gaps found during audit)
+#### main.json unfinished stories detail
 
-None identified. All capabilities required for a functioning network are covered by existing issues or PRD stories. See capability map below.
+| ID | Title | Status | Blocked By |
+|---|---|---|---|
+| SCP-038 | PyO3 identity bridge functions | in-progress | — |
+| SCP-092 | Signaling message construction and routing | in-progress | #290 |
+| SCP-116 | Kotlin Flow/Channel streaming layer | pending | — |
+| SCP-117 | Android lifecycle-aware SCP resource management | pending | — |
+| SCP-118 | Jetpack Compose state holders for SCP | pending | SCP-116 |
+| SCP-120 | Kotlin SDK cross-platform conformance tests | pending | SCP-116, SCP-117 |
+| SCP-214 | Wire KeyCustodyProvider callbacks across all FFI bridges | pending | #356 |
+| SCP-215 | Error code range audit and normalization | pending | — |
+| SCP-218 | Wire WASM bridge to scp-core for tools, UCAN, event log | pending | #306 |
+| SCP-220 | Wire UniFFI bridge to scp-core for UCAN and event log | pending | #307 |
+| SCP-221 | Wire Swift SDK wrapper functions to UniFFI bridge | pending | #307 |
+| SCP-227 | Broadcast subscriber registration, blocking, integration | in-progress | — |
+
+### Spec Audit Findings: 48 NEW untracked (VERIFIED-DEDUPED-REPORT.md)
+
+| Severity | New | Partially Tracked | Tracked |
+|----------|-----|-------------------|---------|
+| CRITICAL | 11 | 13 | 1 |
+| HIGH | 37 | ~93 | ~15 |
+
+**The 11 NEW CRITICALs and 37 NEW HIGHs are spec-level gaps — they require spec changes before correct implementation is possible.** Many existing issues will produce incorrect implementations if the underlying spec gap isn't resolved first.
 
 ---
 
-## Capability Map: Functioning Network
+## Blocking Sequences: Spec Audit → Implementation
 
-Every row maps a network capability to the issues/stories that must close for it to work.
+These spec findings **block** existing implementation work. Implementing the code without resolving the spec gap will produce non-interoperable or insecure results.
 
-### Tier 1: Network Can Exist (nodes start, find each other, create identities)
+### HARD BLOCKS (implement this spec fix BEFORE touching the code issue)
 
-| Capability | Status | Blocking issues | PRD stories |
-|---|---|---|---|
-| Node starts and serves traffic | ✅ Works | — | — |
-| Relay starts and serves traffic | ⚠️ In-memory only | #342 (persistent blob storage) | — |
-| DID creation | ✅ Works | — | — |
-| DID resolution (production DHT) | ❌ InMemory only | #310 (production DhtClient) | — |
-| DID sequence persistence | ❌ Starts at 0 | #327 (sequence counter) | — |
-| DID resolution systems connected | ❌ Disconnected | #311 (3 systems) | — |
-| Device attestation wired | ❌ Not wired | #362 (DeviceAttestation) | — |
-| Node uses production providers | ❌ All InMemory | #302 (scp-node InMemory), #300 (providers) | — |
-| TLS provisioning | ❌ ACME broken | #305 (3 defects) | — |
+| Spec Finding | Blocks | Why |
+|---|---|---|
+| **CRYPTO-01** (canonical serialization) | #338 (envelope pipeline), #346 (sender key wire), #351 (InnerEnvelope) | Two implementations can't verify each other's signatures without length prefixes. Implementing the pipeline now locks in the wrong format. |
+| **CRYPTO-04** (sender key nonce) | #346 (sender key wire format) | #346 fixes 4 deviations but nonce generation isn't one of them. Without specifying nonce, the fix is incomplete and GCM nonce reuse is possible. |
+| **CRYPTO-03** (HPKE not RFC 9180) | #312 (HPKE domain separator), #346 | #312 fixes the domain string but the underlying construction is still informal. Must decide: adopt RFC 9180 modes or fully specify the bespoke construction. |
+| **ADR-016-C3** (UCAN nonce format) | #313 (dedup TTL), #319 (UCAN at tool boundary), #326 (UniFFI UCAN) | Minted tokens will fail validation. Fix the spec contradiction first, then implement nonce handling consistently. |
+| **12.6-001/002** (bridge MLS model) | ALL SCP-BCH-* stories | Can't implement bridge HTTP endpoints until the fundamental question is answered: does the bridge join the MLS group? |
+| **ADR-029-C3** (ResetRequest anti-replay) | #324 (MLS epoch conflict) | The sync protocol's reset mechanism is exploitable via replay. Must add nonce/freshness before wiring sync. |
+| **5.13.2** (relay eligibility for encrypted) | #333 (MLS integration) | Context nesting validation can't work if the relay can't see membership. Resolve mechanism before implementing MLS group ops. |
 
-### Tier 2: Contexts Work (create, join, leave, close with encryption)
+### SOFT BLOCKS (should fix spec, but code can proceed with a TODO)
 
-| Capability | Status | Blocking issues | PRD stories |
-|---|---|---|---|
-| FFI → ContextManager wiring | ❌ ROOT CAUSE | #356 | — |
-| Context create via FFI | ❌ Parallel state | #356 | — |
-| Context join via FFI | ❌ No-op | #356 | — |
-| Context leave via FFI | ❌ No-op | #356 | — |
-| MLS group management | ❌ Trait stubs | #333 | — |
-| MLS LeafNode extension | ❌ Not impl | #314 | — |
-| MLS epoch/grace window | ❌ Conflict | #324 | — |
-| Production crypto provider | ❌ None | #300 | — |
-| Production transport provider | ❌ None | #300 | — |
-| Production event log provider | ❌ None | #300 | — |
-| Context persistence via FFI | ❌ Unused | #329 | — |
-
-### Tier 3: Messages Flow (send, receive, encrypt, decrypt)
-
-| Capability | Status | Blocking issues | PRD stories |
-|---|---|---|---|
-| Message send via FFI | ❌ Discarded | #328 (depends #356) | — |
-| Message receive via FFI | ❌ No producer | #332 (depends #356) | — |
-| Envelope pipeline (Inner→Outer) | ❌ Not wired | #338 (depends #356) | — |
-| Wire format field names | ❌ Breaks interop | #345 | — |
-| Sender key wire format | ❌ 4 deviations | #346 | — |
-| Deserialization size limits | ❌ OOM DoS | #347 | — |
-| InnerEnvelope deny_unknown_fields | ❌ Confused deputy | #351 | — |
-| Signaling message type | ❌ Not bound | #290 | — |
-| Timestamp validation | ❌ Not wired | #321 | — |
-| HPKE domain separator | ❌ Mismatch | #312 | — |
-| Dedup cache TTL | ⚠️ 1hr not 24hr | #313 | — |
-| Envelope provenance fields | ❌ Incomplete | #330 | — |
-| ProtocolStore named msgpack | ⚠️ Positional | #348 | — |
-
-### Tier 4: Security Enforcement (UCAN, governance, trust)
-
-| Capability | Status | Blocking issues | PRD stories |
-|---|---|---|---|
-| UCAN at tool invocation | ❌ Bypass | #319 | — |
-| UCAN signing (UniFFI) | ❌ Ephemeral keys | #326 | — |
-| UCAN in broadcast roles | ❌ Unsigned | #299 | — |
-| Ceiling enforcement | ❌ Not checked | #339 | — |
-| Promotion policy enforcement | ❌ Not checked | #340 | — |
-| All 24 governance actions | ⚠️ 12/24 | #320 | — |
-| min_participation basis points | ❌ f64 not u32 | #349 | — |
-| RoleDefinition/ToolRegistration stubs | ❌ Name-only | #350 | — |
-| Content access control (ADR-038) | ❌ Zero impl | #309 | — |
-| SDK state destruction (blocking) | ❌ Not impl | #317 | — |
-| Platform key custody | ❌ Not impl | #323 | — |
-| Trust engine wired to callers | ❌ No callers | #318 | — |
-| TOFU key tracking | ❌ Not impl | #325 | — |
-| Compromise recovery orchestrator | ❌ Not impl | #316 | — |
-| Vote signature verification | ❌ Not verified | #357 | — |
-| Governance collection bounds | ❌ Unbounded | #360 | — |
-
-### Tier 5: Advanced Features (broadcast, sync, bridge, discovery)
-
-| Capability | Status | Blocking issues | PRD stories |
-|---|---|---|---|
-| Broadcast sender key transport | ❌ No path | #335 | — |
-| BroadcastEnvelope spec fields | ❌ 3/9 | #352 | — |
-| Block subscriber scoping | ❌ Context-wide | #353 | — |
-| Conflict detection gaps | ⚠️ 2 cases | #354 | — |
-| Projection UCAN caching | ⚠️ Re-parses | #355 | — |
-| Context discovery (remote) | ❌ Local only | #336 | — |
-| Ephemeral context mode | ❌ Not impl | #337 | — |
-| Economic governance | ❌ Not impl | #334 | — |
-| Context state export/import | ❌ Not impl | #363 | — |
-| Cross-context tool interfaces | ❌ Not exposed | #322 | — |
-| BIP-39 mnemonics | ❌ Not impl | #315 | — |
-
-### Tier 6: SDK Bindings (FFI exposure)
-
-| Capability | Status | Blocking issues | PRD stories |
-|---|---|---|---|
-| Python SDK | ⚠️ ~85% types, 0% E2E | #356, #328, #332 | — |
-| FFI: governance/broadcast/membership/persistence ops | ❌ 23 methods missing | #369 (depends #356) | — |
-| FFI: bridge/sync/discovery/provenance modules | ❌ Zero exposure | #370 (depends #356) | — |
-| WASM bridge | ❌ Critical stubs | #306 | — |
-| UniFFI bridge (Swift/Kotlin) | ❌ No-ops | #307 | — |
-| NAPI bridge (TypeScript) | ❌ No-ops | #307 | — |
-| TypeScript SDK runtime | ❌ Types only | #341 | — |
-| Swift Trust/MCP modules | ❌ No exports | #331 | — |
-| Go/Java/C# bindings | ❌ README only | #304 | — |
-| Reference agent | ❌ Not impl | #364 | — |
-
-### Tier 7: New Features (from open questions resolution)
-
-| Capability | Status | Blocking issues | PRD stories |
-|---|---|---|---|
-| Capability URI namespace | ❌ Not impl | — | SCP-ACR-001–007 |
-| Bridge cooperative HTTP binding | ❌ Not impl | — | SCP-BCH-001–007 |
-| Bridge credential lifecycle | ❌ Not impl | — | SCP-BCH-008–009 |
-| Participation admission (blind) | ❌ Not impl | — | SCP-BA-001–006 |
-| Summary dispute resolution | ❌ Not impl | #365 | — |
-| Pseudonym fanout jitter | ❌ Not impl | #366 | — |
-| Tool integrity verification | ❌ Not impl | #367 | — |
-
-### Documentation / Polish
-
-| Capability | Status | Blocking issues | PRD stories |
-|---|---|---|---|
-| Stub policy compliance | ⚠️ 4 violations | #291 | — |
-| Dev API real metrics | ❌ Hardcoded 0s | #301 | — |
-| Event log full query | ❌ Summary only | #303 | — |
-| Artifact health fixes | ⚠️ 11 findings | #344 | — |
-| Tier 2 transport adapters | ❌ 0/12 | #343 | — |
+| Spec Finding | Affects | Risk if deferred |
+|---|---|---|
+| CRYPTO-12 (attestation canonicalization) | SCP-BA-001–006 (participation admission) | Participation profiles won't be verifiable cross-implementation. Can implement with a canonical format and backfill spec. |
+| CRYPTO-14 (ParticipationProfile signing key) | SCP-BA-001–006 | Same — implement with a chosen KDF and document it. |
+| CRYPTO-18 (broadcast key nonce) | #352 (BroadcastEnvelope fields) | Missing nonce field in struct. Can add it and document, then update spec. |
+| 03-IDENTITY-1/2 (private state encryption) | #329 (ProtocolStore persistence) | Identity private state is a future feature. Does not block core network. |
+| 8.4/9.1 (app sandboxing) | SCP-ACR-* (capability registry) | Capability declarations work without runtime sandboxing. Security risk, not interop risk. |
+| 15-001 (GDPR vs Merkle) | #303 (event log) | Tombstoning can be added later. Does not block core event log implementation. |
 
 ---
 
-## Execution Phases
+## Conflict Identification
 
-### Phase 1: Surgical Fixes (max parallelism, no dependencies)
+### Spec Findings That Conflict With Each Other
+
+| Finding A | Finding B | Conflict |
+|---|---|---|
+| 9.10.3/9.10.6 (bucket size) | — | Internal spec contradiction. Must pick one scheme. Factor-of-4 matches implementation. |
+| H-18 (chain depth hard vs configurable) | — | 3-way spec contradiction. Must pick: hard limit in SS9, or configurable in SS24. |
+| H-13 (TTL "all parties" vs "all members") | — | Spec self-contradiction. "All members" is correct for governance; "all parties" is ambiguous. |
+| H-07 (KeyPackage signing key) | — | SS9 line 287 vs 332. Active Signing Key (#active) is correct per RFC 9420. |
+
+### Spec Findings That Conflict With Existing Issues
+
+| Spec Finding | Existing Issue | Conflict |
+|---|---|---|
+| CRYPTO-01 (length prefixes) | #346 (sender key wire format) | #346 fixes 4 deviations in sender key wire format. CRYPTO-01 says the signature preimage itself needs length prefixes. Both touch `key_protocol.rs` — the CRYPTO-01 fix must come first or be bundled with #346. |
+| CRYPTO-03 (HPKE not RFC 9180) | #312 (domain separator mismatch) | #312 fixes the info string. CRYPTO-03 says the entire construction is wrong. Fixing only the string while leaving the bespoke ECDH+HKDF is insufficient. Must resolve together. |
+| ADR-016-C3 (nonce format) | #313 (dedup TTL) | #313 changes TTL from 1hr to 24hr. ADR-016-C3 says the nonce format itself is contradictory (UUID v4 vs timestamp-hex). The TTL fix is pointless if the format is wrong. |
+| 12.6-001 (bridge MLS) | #370 (bridge zero FFI) | #370 tracks missing FFI exposure for bridge module. But the bridge module itself can't work for encrypted contexts until the MLS membership model is decided. |
+| ADR-029-C3 (ResetRequest replay) | #324 (MLS epochs conflict) | #324 addresses the epoch/grace window mismatch. ADR-029-C3 says the ResetRequest message itself is vulnerable. Both are sync protocol issues that should be resolved together. |
+
+### Code File Conflicts (Same Files Touched by Multiple Items)
+
+| File | Issues + Findings | Sequence |
+|------|-------------------|----------|
+| `key_protocol.rs` | CRYPTO-01, CRYPTO-03, CRYPTO-04, #312, #346, #314, #347 | Spec fixes → #312+#346 → #314 → #347 |
+| `envelope/inner.rs` | CRYPTO-01, #351, #290, #347, #321, #338 | CRYPTO-01 → #351+#290 → #321 → #347 → #338 |
+| `context/manager.rs` | #350, #357, #360, #320, #339, #340, #356 | P1→P2→P3→P5 |
+| `governance/mod.rs` | #349, #320 | P2 |
+| `ucan/validation.rs` | ADR-016-C3, #313, #319, #326 | ADR-016-C3 → #313 → #319+#326 |
+| `context/broadcast.rs` | CRYPTO-18, #353, #352, #335 | CRYPTO-18 → #352+#353 → #335 |
+| `sync/` | ADR-029-C3, #324 | ADR-029-C3 → #324 |
+| `bridge/` | 12.6-001/002, #370, SCP-BCH-* | 12.6-001/002 → #370 → SCP-BCH-* |
+
+---
+
+## Parallelization Map
+
+### What Can Run In Parallel RIGHT NOW (no dependencies)
+
+```
+SPEC TRACK (all parallel — spec-only changes, no code conflicts):
+
+  S-A: Canonical serialization spec          S-B: UCAN nonce format fix
+       (CRYPTO-01, CRYPTO-12, CRYPTO-13)          (ADR-016-C3)
+       Define CanonicalHash trait pattern          Pick {unix_millis}-{hex16}
+       Add length prefixes to all formulas         Update ADR-016 mint_ucan
+
+  S-C: Versioning spec (§13)                 S-D: Bridge MLS model decision
+       (H-28–H-32, 13-002)                       (12.6-001, 12.6-002, 12-SECURITY)
+       Define version field, negotiation,          Decide: bridge joins MLS group?
+       forward compat, degraded mode               Add threat model for bridge operators
+
+  S-E: Identity private state spec           S-F: Sender key crypto spec
+       (03-IDENTITY-1, 03-IDENTITY-2)             (CRYPTO-03, CRYPTO-04)
+       Specify encryption algo, multi-device       Specify RFC 9180 mode + nonce gen
+       Specify social/device recovery              Specify wire format with nonce field
+
+  S-G: Sync protocol anti-replay             S-H: Context nesting eligibility
+       (ADR-029-C3)                                (5.13.2)
+       Add nonce to ResetRequest                   Specify mechanism for relay to verify
+       Add freshness binding                       parent membership in encrypted contexts
+```
+
+### What Can Run In Parallel With Spec Track (existing code issues, no spec dependencies)
+
+```
+CODE TRACK (Phase 1 — same as before):
+
+  C-A: #345,#313  C-B: #348  C-C: #354,#355,#291,#350  C-D: #301
+  C-E: #353       C-F: #349→#357→#360→#320 (governance serial chain)
+```
+
+### What CANNOT Start Until Spec Decisions Land
+
+| Code Work | Waiting On Spec |
+|---|---|
+| #346 (sender key wire format) | S-A (canonical serialization) + S-F (HPKE/nonce) |
+| #312 (HPKE domain separator) | S-F (RFC 9180 mode decision) |
+| #351, #290 (envelope types) | S-A (length prefix pattern) |
+| #338 (envelope pipeline) | S-A + #356 (both) |
+| #313 (dedup TTL) | S-B (nonce format) |
+| #319, #326 (UCAN security) | S-B (nonce format) |
+| SCP-BCH-* (bridge cooperative) | S-D (bridge MLS model) |
+| #324 (MLS epoch conflict) | S-G (ResetRequest anti-replay) |
+| SCP-BA-* (participation admission) | S-A (canonical serialization for profiles) |
+| #352 (BroadcastEnvelope fields) | S-F (broadcast key nonce) |
+
+---
+
+## Revised Execution Phases
+
+### Phase 0: Spec Fixes (NEW — max parallelism, spec-only)
+
+8 parallel lanes. All are spec/ADR document changes. No code changes. No inter-lane dependencies. Target: resolve all hard-block spec gaps before implementation proceeds.
+
+**Lane S-A** — Canonical Serialization Pattern
+- Define `CanonicalHash` construction: 4-byte BE length prefix on all variable-length fields + domain separator prefix
+- Update: SS9 §9.5 (line 214, 216), SS7 §7.4.1, §7.3.2.1, ADR-002 criterion 2
+- Template: migration proof at SS9 line ~350
+
+**Lane S-B** — UCAN Nonce Format Resolution
+- Pick `{unix_millis}-{hex16}` (matches validation step 9 and implementation)
+- Update: ADR-016 mint_ucan criterion 3 (remove "UUID v4 or 32 random bytes")
+
+**Lane S-C** — Protocol Versioning (§13)
+- Define version number, wire format field, negotiation mechanism, forward compat rules, degraded mode
+- Update: SS13 (currently 10 lines → needs full spec section)
+- Add version field to InnerEnvelope and BroadcastEnvelope structs
+
+**Lane S-D** — Bridge MLS Membership Model
+- Decide architectural question: bridge as MLS group member (degrades E2E) or alternative access model
+- Add bridge operator threat model to SS9 §9.2
+- Update: SS12 §12.6, §12.10.5, §12.10.7
+
+**Lane S-E** — Identity Private State
+- Specify encryption: X25519 key derived from Ed25519 Identity Key via RFC 7748, AES-256-GCM
+- Specify multi-device: key sharing via HPKE to device-specific X25519 keys
+- Specify social/device recovery: quorum threshold, wire format, failure semantics
+- Update: SS3 §3.3, §3.7
+
+**Lane S-F** — Sender Key & Broadcast Crypto
+- Specify RFC 9180 HPKE Base mode with explicit suite ID, info string, AAD
+- Specify nonce: random 12-byte per encryption, included in wire format
+- Add nonce field to BroadcastEnvelope struct
+- Update: SS9 §9.16.1, §9.16.2, SS5 §5.14.5, ADR-007
+
+**Lane S-G** — Sync Protocol Anti-Replay
+- Add nonce + timestamp + challenge-response freshness to ResetRequest
+- Update: ADR-029 §4, SS23 §23.5.2
+
+**Lane S-H** — Context Nesting Eligibility
+- Specify mechanism for relay to verify parent membership for encrypted contexts
+- Options: membership attestation, governance-signed eligibility proof, or remove relay-level validation for encrypted nesting
+- Update: SS5 §5.13.2
+
+### Phase 1: Surgical Code Fixes (max parallelism, no dependencies)
 
 7 parallel lanes. All branch from `main`. No inter-lane dependencies.
+**Requires:** Phase 0 lanes S-A, S-B, S-F merged (for lanes B, C that touch affected files).
 
 **Lane A** — `fix/wire-format-transport` (#345, #313)
 - scp-transport: serde rename annotations + TTL fix
-- Files: `protocol.rs`, `config.rs`
+- **Requires S-B merged** (nonce format affects TTL/dedup)
 
 **Lane B** — `fix/sender-key-wire-format` (#312, #346)
-- scp-core: HPKE domain separator + 4 wire format fixes
-- Files: `key_protocol.rs` (same file — must share branch)
+- scp-core: HPKE domain separator + 4 wire format fixes + length prefixes + nonce field
+- **Requires S-A + S-F merged** (canonical serialization + HPKE mode)
 
 **Lane C** — `fix/envelope-types` (#351, #290)
-- scp-core: deny_unknown_fields + signaling message binding
-- Files: `inner.rs`
+- scp-core: deny_unknown_fields + signaling message binding + length prefixes in signature
+- **Requires S-A merged** (canonical serialization pattern)
 
 **Lane D** — `fix/store-serialization` (#348)
 - scp-core: positional → named MessagePack
-- Files: `store/mod.rs`
 
 **Lane E** — `fix/broadcast-bugs` (#353, #352)
-- scp-core: block_subscriber scope + BroadcastEnvelope fields
-- Files: `broadcast.rs`, `sender_keys/broadcast.rs`
+- scp-core: block_subscriber scope + BroadcastEnvelope fields + nonce field
+- **Requires S-F merged** (broadcast key nonce)
 
 **Lane F** — `fix/misc-standalone` (#354, #355, #291, #350)
 - 4 separate crates/files, no conflicts
-- Files: `conflict_resolution.rs`, `projection.rs`, 4 stub locations, `params.rs`
 
 **Lane G** — `fix/node-dev-api` (#301)
 - scp-node: wire real metrics
-- Files: `dev_api.rs`
 
 ### Phase 2: Governance Cleanup (serial — same files)
 
-**Branch:** `fix/governance-types` from `main` post-Phase-1
+**Branch:** `fix/governance-types` from `main` post-Phase 1
 - #349 → #357 → #360 (all touch `manager.rs` or `governance/mod.rs`)
 - Then: `feat/governance-actions` (#320) — 12 missing variants
 
 ### Phase 3: Security Hardening (parallel, needs Phase 1 merged)
 
 **Lane A** — `fix/deser-limits` (#347) — needs #345, #346 merged (same files)
-**Lane B** — `fix/ucan-security` (#299, #319, #326)
+**Lane B** — `fix/ucan-security` (#299, #319, #326) — needs S-B merged
 **Lane C** — `fix/governance-enforcement` (#339, #340) — needs Phase 2 merged
 **Lane D** — `fix/timestamp-validation` (#321) — needs Phase 1 Lane C merged
 
@@ -244,34 +302,81 @@ Every row maps a network capability to the issues/stories that must close for it
 **Step 1:** `feat/production-providers` (#300)
 **Step 2:** `refactor/ffi-context-manager` (#356) — depends on #300
   - Closes: #328, #332, #329
-**Step 3:** `feat/envelope-pipeline` (#338) — depends on #356
+**Step 3:** `feat/envelope-pipeline` (#338) — depends on #356 + S-A
 
-### Phase 6: MLS & Encryption (depends on Phase 5)
+### Phase 6: MLS, Encryption & Content Access (depends on Phase 5)
 
-#333 → #324 → #314 → #309 → #317
+**Step 1:** #333 (MLS integration) — **requires S-H merged**
+**Step 2:** #324 (MLS epoch conflict) — **requires S-G merged**
+**Step 3:** #314 (MLS LeafNode extension)
+**Step 4:** #309 (ADR-038 content access control) — unlocks SCP-CAC-*
+**Step 5:** #317 (SDK-mandated state destruction)
 
-### Phase 7: Feature Completions (parallel, depends on Phase 5)
+Then content access PRD (serial — same subsystem, depends on #309):
+SCP-CAC-001 → SCP-CAC-002 → SCP-CAC-003 → SCP-CAC-004 → SCP-CAC-005 → SCP-CAC-006 → SCP-CAC-007 → SCP-CAC-008 → SCP-CAC-009 → SCP-CAC-010
 
-**Lane A:** #335 (broadcast transport)
+### Phase 7: Governance Integration (depends on Phase 2 + Phase 5)
+
+Governance PRD (serial — each builds on prior, all touch `manager.rs`):
+SCP-267 → SCP-268 → SCP-269 → SCP-270 → SCP-271 → SCP-272 → SCP-273 → SCP-274
+
+- SCP-267–268 need #356 (ContextManager wiring)
+- SCP-269–270 need #320 (all 24 governance actions)
+- SCP-272 needs #354 (conflict detection)
+- SCP-273 needs #330 (provenance/checkpoint fields)
+
+### Phase 8: Feature Completions (parallel, depends on Phase 5)
+
+**Lane A:** #335 (broadcast transport), SCP-227 (subscriber registration — in-progress)
 **Lane B:** #336, #337, #334 (context features)
 **Lane C:** #318, #330 (trust/provenance wiring)
 **Lane D:** #316, #323 (identity features)
 **Lane E:** #302, #305, #342 (node/relay production)
 
-### Phase 8: SDK Bindings (depends on Phase 5)
+### Phase 9: SDK Bindings (depends on Phase 5)
 
-**Lane A:** #306, #341 (WASM + TypeScript)
-**Lane B:** #307, #331, #322 (UniFFI + NAPI + cross-context tools)
-**Lane C:** #304 (Go/Java/C#)
+**Lane A:** #306, SCP-218 (WASM bridge wiring) → #341 (TypeScript SDK)
+**Lane B:** #307, SCP-220, SCP-221 (UniFFI bridge + Swift wiring) → #331 (Swift Trust/MCP)
+**Lane C:** SCP-214 (KeyCustodyProvider callbacks across all FFI bridges) — needs #356
+**Lane D:** #322 (cross-context tool interfaces)
+**Lane E:** SCP-215 (error code range audit — independent)
+**Lane F:** #304 (Go/Java/C#)
+**Lane G:** SCP-116 → SCP-117 → SCP-118 → SCP-120 (Kotlin SDK completion)
 
-### Phase 9: New Features (from open questions — independent)
+### Phase 10: New Features (partially blocked by spec)
 
-**Lane A:** SCP-ACR-001–007 (capability registry)
-**Lane B:** SCP-BCH-001–009 (bridge cooperative + credentials)
-**Lane C:** SCP-BA-001–006 (participation admission)
+**Lane A:** SCP-ACR-001–007 (capability registry) — independent, can start now
+**Lane B:** SCP-BCH-001–009 (bridge cooperative + credentials) — **BLOCKED by S-D** (bridge MLS model)
+**Lane C:** SCP-BA-001–006 (participation admission) — **soft-blocked by S-A** (canonical serialization for profiles)
 **Lane D:** #362, #363, #364, #365, #366, #367
+**Lane E:** SCP-038 (PyO3 identity bridge — in-progress), SCP-092 (signaling — in-progress, needs #290)
 
-### Phase 10: Polish
+### Phase 11: Spec Audit NEW HIGHs (parallel with Phase 8+)
+
+Spec-only fixes for the 37 NEW HIGH findings. Grouped by topic:
+
+**Lane H-A** — Identity spec gaps (H-01 through H-06)
+- Key custody migration, private state event log, routing_id, earned capacity, KeyPackage signing key, Merkle hash chain
+
+**Lane H-B** — Context spec gaps (H-07 through H-12)
+- Creation failure states, metadata signing, multi-parent matching, group_context extension, TOCTOU, context migration
+
+**Lane H-C** — Trust spec gaps (H-13 through H-18)
+- Chain depth contradiction, self-service auth, proof-of-absence, attestation independence, revocation format, counterparties privacy
+
+**Lane H-D** — Security spec gaps (H-19 through H-26)
+- Equivocation response, chunking, AccessKeyRequest timing, push registration, multi-device sync, media keys, QUIC 0-RTT, UCAN CID
+
+**Lane H-E** — Versioning spec gaps (H-28 through H-32)
+- Already covered by Phase 0 Lane S-C
+
+**Lane H-F** — Bridge spec gaps (H-27, H-33)
+- Bridge metadata in SS5.7, reverse bridge flow
+
+**Lane H-G** — Sync/provenance spec gaps (H-34 through H-37)
+- Counterparties privacy, EpochGraceStore crash recovery, checkpoint verification, event log reconciliation trust
+
+### Phase 12: Polish
 
 #291, #301, #303, #343, #344
 
@@ -280,50 +385,78 @@ Every row maps a network capability to the issues/stories that must close for it
 ## Dependency Graph
 
 ```
-PHASE 1 (parallel, 7 lanes) ─────────────────────────────────────────
-  A: #345,#313  B: #312,#346  C: #351,#290  D: #348
-  E: #353,#352  F: #354,#355,#291,#350  G: #301
+PHASE 0 — SPEC FIXES (all parallel, spec-only) ────────────────────
+  S-A: Canonical serialization   S-B: UCAN nonce format
+  S-C: Versioning (§13)          S-D: Bridge MLS model
+  S-E: Identity private state    S-F: Sender key crypto
+  S-G: Sync anti-replay          S-H: Context nesting eligibility
 
-PHASE 2 (serial) ────────────────────────────────────────────────────
+                    ↓ S-A,S-B,S-F must merge before P1 lanes that touch affected code
+                    ↓ S-D must merge before SCP-BCH-*
+                    ↓ S-G must merge before #324
+                    ↓ S-H should merge before #333
+
+PHASE 1 (parallel, 7 lanes — gated on relevant P0 lanes) ─────────
+  A: #345,#313 [needs S-B]     B: #312,#346 [needs S-A,S-F]
+  C: #351,#290 [needs S-A]     D: #348
+  E: #353,#352 [needs S-F]     F: #354,#355,#291,#350     G: #301
+
+PHASE 2 (serial) ──────────────────────────────────────────────────
   #349 → #357 → #360 → #320
 
-PHASE 3 (parallel, needs P1) ────────────────────────────────────────
-  A: #347  B: #299,#319,#326  C: #339,#340  D: #321
+PHASE 3 (parallel, needs P1) ──────────────────────────────────────
+  A: #347  B: #299,#319,#326 [needs S-B]  C: #339,#340  D: #321
 
-PHASE 4 (parallel with P2/P3) ──────────────────────────────────────
+PHASE 4 (parallel with P2/P3) ────────────────────────────────────
   A: #327→#310→#311  B: #315,#325
 
-═══════════ CRITICAL PATH ═══════════════════════════════════════════
-PHASE 5: #300 → #356 → #338 (closes #328,#332,#329)
-PHASE 6: #333 → #324 → #314 → #309 → #317
-═════════════════════════════════════════════════════════════════════
+═══════════ CRITICAL PATH ═════════════════════════════════════════
+PHASE 5: #300 → #356 → #338 [needs S-A] (closes #328,#332,#329)
+PHASE 6: #333 [needs S-H] → #324 [needs S-G] → #314 → #309 → #317
+         then SCP-CAC-001→010 (serial, needs #309)
+═══════════════════════════════════════════════════════════════════
 
-PHASE 7 (parallel, needs P5) ───────────────────────────────────────
-  A: #335  B: #336,#337,#334  C: #318,#330  D: #316,#323  E: #302,#305,#342
+PHASE 7 (needs P2+P5) ────────────────────────────────────────────
+  SCP-267→268 [needs #356] →269→270 [needs #320] →271→272→273→274
 
-PHASE 8 (parallel, needs P5) ───────────────────────────────────────
-  A: #306,#341  B: #307,#331,#322  C: #304
+PHASE 8 (parallel, needs P5) ─────────────────────────────────────
+  A: #335,SCP-227  B: #336,#337,#334  C: #318,#330
+  D: #316,#323     E: #302,#305,#342
 
-PHASE 9 (independent) ─────────────────────────────────────────────
-  A: SCP-ACR-*  B: SCP-BCH-*  C: SCP-BA-*  D: #362-367
+PHASE 9 — SDK BINDINGS (parallel, needs P5) ──────────────────────
+  A: #306,SCP-218→#341       B: #307,SCP-220,SCP-221→#331
+  C: SCP-214 [needs #356]    D: #322    E: SCP-215
+  F: #304                    G: SCP-116→117→118→120
 
-PHASE 10: #291,#301,#303,#343,#344
+PHASE 10 — NEW FEATURES (partially blocked by spec) ──────────────
+  A: SCP-ACR-*               B: SCP-BCH-* [BLOCKED by S-D]
+  C: SCP-BA-* [soft S-A]     D: #362-367
+  E: SCP-038,SCP-092
+
+PHASE 11 — SPEC AUDIT HIGHs (parallel with P8+) ─────────────────
+  H-A: Identity  H-B: Context  H-C: Trust  H-D: Security
+  H-E: (in S-C)  H-F: Bridge   H-G: Sync/provenance
+
+PHASE 12: #291,#301,#303,#343,#344
 ```
 
 ---
 
 ## Merge Conflict Hot Spots
 
-| File | Issues | Sequence |
-|------|--------|----------|
-| `context/manager.rs` | #350,#357,#360,#320,#339,#340,#356 | P1→P2→P3→P5 |
-| `key_protocol.rs` | #312,#346,#314,#347 | P1→P3→P6 |
-| `envelope/inner.rs` | #351,#290,#347,#321 | P1→P3 |
-| `governance/mod.rs` | #349,#320 | P2 |
-| `protocol.rs` | #345,#347 | P1→P3 |
-| `context/broadcast.rs` | #353,#352,#335 | P1→P7 |
-| `scp-ffi/src/context.rs` | #356,#336 | P5→P7 |
-| `scp-ffi/src/runtime.rs` | #356,#339 | P5→P3 |
+| File | Issues + Findings | Sequence |
+|------|-------------------|----------|
+| `key_protocol.rs` | CRYPTO-01, CRYPTO-03, CRYPTO-04, #312, #346, #314, #347 | S-A+S-F → #312+#346 → #314 → #347 |
+| `envelope/inner.rs` | CRYPTO-01, #351, #290, #347, #321, #338 | S-A → #351+#290 → #321 → #347 → #338 |
+| `context/manager.rs` | #350, #357, #360, #320, #339, #340, #356 | P1→P2→P3→P5 |
+| `governance/mod.rs` | #349, #320 | P2 |
+| `ucan/validation.rs` | ADR-016-C3, #313, #319, #326 | S-B → #313 → #319+#326 |
+| `context/broadcast.rs` | CRYPTO-18, #353, #352, #335 | S-F → #352+#353 → #335 |
+| `protocol.rs` | #345, #347 | P1→P3 |
+| `sync/` | ADR-029-C3, #324 | S-G → #324 |
+| `bridge/` | 12.6-001/002, #370, SCP-BCH-* | S-D → #370 → SCP-BCH-* |
+| `scp-ffi/src/context.rs` | #356, #336 | P5→P7 |
+| `scp-ffi/src/runtime.rs` | #356, #339 | P5→P3 |
 
 ---
 
@@ -341,8 +474,55 @@ PHASE 10: #291,#301,#303,#343,#344
 
 | Category | Count |
 |----------|-------|
-| GitHub issues | 69 |
-| PRD stories | 22 |
-| Auto-closed by root cause | 3 |
-| **Total work items** | **88** |
-| **Net after auto-close** | **85** |
+| GitHub issues | 70 |
+| PRD stories (unfinished) | 52 (across 6 PRDs) |
+| PRD stories (done) | 272 |
+| Spec audit: NEW CRITICALs | 11 |
+| Spec audit: NEW HIGHs | 37 |
+| Spec audit: PARTIALLY TRACKED (need issue expansion) | ~106 |
+| Auto-closed by root cause (#356) | 3 |
+| **Total open work items** | **167** |
+| **Net after auto-close** | **164** |
+
+### PRD Breakdown
+
+| PRD | Done | Unfinished | Blocked By |
+|-----|------|------------|------------|
+| main.json | 173 | 12 | #356, #290, #306, #307 |
+| content-access.json | 0 | 10 | #309 (Phase 6), #356 |
+| governance-integration.json | 0 | 8 | #356, #320 (Phase 2) |
+| capability-registry.json | 0 | 7 | — (independent) |
+| bridge-cooperative.json | 0 | 9 | **Phase 0 S-D** (bridge MLS model) |
+| participation-admission.json | 0 | 6 | Phase 0 S-A (soft) |
+| agent-binding.json | 22 | 0 | — |
+| http-features.json | 8 | 0 | — |
+| persistence.json | 36 | 0 | — |
+| reachability.json | 16 | 0 | — |
+| transport-expansion.json | 17 | 0 | — |
+
+---
+
+## Critical Path Timeline
+
+```
+         WEEK 1              WEEK 2              WEEK 3              WEEK 4
+    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+    │  PHASE 0    │    │  PHASE 1    │    │  PHASE 5    │    │  PHASE 6    │
+    │  Spec fixes │───→│  Code fixes │───→│  #300→#356  │───→│  MLS chain  │
+    │  (8 lanes)  │    │  (7 lanes)  │    │  →#338      │    │  #333→#317  │
+    └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
+         │                   │
+         │              ┌────┴────┐
+         │              │ PHASE 2 │ (governance)
+         │              │ PHASE 3 │ (security)
+         │              │ PHASE 4 │ (identity)
+         │              └─────────┘
+         │
+    ┌────┴────┐
+    │ PHASE 9 │ (new features — SCP-ACR, SCP-BA, etc.)
+    │ can run │ (SCP-BCH blocked until S-D resolves)
+    │ in ||   │
+    └─────────┘
+```
+
+Phase 0 is the new gate. Without it, Phases 1 and 6 produce implementations that lock in wrong formats.
