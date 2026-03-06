@@ -397,7 +397,7 @@ mod tests {
         // the store (i.e. is a true borrow, not a clone).
         let mut store = SenderKeyStore::new();
         let key = generate_sender_key();
-        let expected_ptr = key.as_bytes() as *const [u8; 32];
+        let expected_ptr = std::ptr::from_ref::<[u8; 32]>(key.as_bytes());
 
         store.set("ctx-1", "did:example:alice", key);
 
@@ -408,8 +408,10 @@ mod tests {
         // not to a freshly-allocated clone. Because `set` moves the key in,
         // the address will differ from `expected_ptr`, but calling get()
         // twice must return the same address — proving it borrows, not clones.
-        let ptr1 = retrieved.unwrap().as_bytes() as *const [u8; 32];
-        let ptr2 = store.get("ctx-1", "did:example:alice").unwrap().as_bytes() as *const [u8; 32];
+        let ptr1 = std::ptr::from_ref::<[u8; 32]>(retrieved.unwrap().as_bytes());
+        let ptr2 = std::ptr::from_ref::<[u8; 32]>(
+            store.get("ctx-1", "did:example:alice").unwrap().as_bytes(),
+        );
         assert_eq!(
             ptr1, ptr2,
             "consecutive get() calls must return the same pointer (borrow, not clone)"
