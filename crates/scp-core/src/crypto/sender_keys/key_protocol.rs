@@ -1434,7 +1434,7 @@ mod tests {
         let legacy = LegacyAdvance {
             sender_did: advance.sender_did.clone(),
             epoch: advance.epoch,
-            signature: advance.signature.clone(),
+            signature: advance.signature.to_vec(),
         };
         let legacy_bytes = rmp_serde::to_vec_named(&legacy).unwrap();
         let deserialized: SenderKeyEpochAdvance =
@@ -2445,10 +2445,10 @@ mod tests {
             requester_did: "did:dht:bob".to_owned(),
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
-            wrapping_pubkey: vec![0u8; 32],
+            wrapping_pubkey: [0u8; 32],
             nonce: [0u8; REQUEST_NONCE_SIZE],
             timestamp: now,
-            signature: vec![0u8; 64],
+            signature: [0u8; 64],
         };
         assert!(
             validate_sender_key_request_freshness(&request, now).is_ok(),
@@ -2463,10 +2463,10 @@ mod tests {
             requester_did: "did:dht:bob".to_owned(),
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
-            wrapping_pubkey: vec![0u8; 32],
+            wrapping_pubkey: [0u8; 32],
             nonce: [0u8; REQUEST_NONCE_SIZE],
             timestamp: now,
-            signature: vec![0u8; 64],
+            signature: [0u8; 64],
         };
         // Simulate receiving far in the future.
         let far_future = now + REQUEST_FRESHNESS_SECS + 1;
@@ -2484,11 +2484,11 @@ mod tests {
             requester_did: "did:dht:bob".to_owned(),
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
-            wrapping_pubkey: vec![0u8; 32],
+            wrapping_pubkey: [0u8; 32],
             nonce: [0u8; REQUEST_NONCE_SIZE],
             // Timestamp far ahead of "now".
             timestamp: now + REQUEST_FRESHNESS_SECS + 10_000,
-            signature: vec![0u8; 64],
+            signature: [0u8; 64],
         };
         let result = validate_sender_key_request_freshness(&request, now);
         assert!(
@@ -2788,21 +2788,17 @@ mod tests {
         // exactly 64 bytes (#347).
         #[derive(serde::Serialize)]
         struct FakeAdvance {
-            context_id: String,
             sender_did: String,
-            new_epoch: u64,
-            timestamp: u64,
-            signing_key_id: SigningKeyId,
+            epoch: u64,
+            signer_key_ref: SigningKeyId,
             #[serde(with = "serde_bytes")]
             signature: Vec<u8>,
         }
 
         let fake = FakeAdvance {
-            context_id: "ctx-1".to_owned(),
             sender_did: "did:dht:alice".to_owned(),
-            new_epoch: 1,
-            timestamp: 1_000_000,
-            signing_key_id: SigningKeyId::Active,
+            epoch: 1,
+            signer_key_ref: SigningKeyId::Active,
             signature: vec![0u8; 65],
         };
 
