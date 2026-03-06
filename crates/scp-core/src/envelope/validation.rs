@@ -242,7 +242,7 @@ mod tests {
     use scp_platform::traits::{KeyCustody, KeyType};
 
     use super::*;
-    use crate::envelope::inner::{InnerEnvelopeParams, create_inner_envelope};
+    use crate::envelope::inner::{InnerEnvelopeParams, MessageType, create_inner_envelope};
     use crate::identity::SigningKeyId;
 
     /// Helper: creates a signed inner envelope with the given timestamp and
@@ -260,6 +260,7 @@ mod tests {
                 generation: 0,
                 sequence,
                 timestamp,
+                message_type: MessageType::Content,
                 payload: b"test payload",
                 provenance: None,
                 signing_key_id: SigningKeyId::Active,
@@ -290,6 +291,7 @@ mod tests {
                 generation: 0,
                 sequence,
                 timestamp,
+                message_type: MessageType::Content,
                 payload: b"test payload",
                 provenance: None,
                 signing_key_id: SigningKeyId::Active,
