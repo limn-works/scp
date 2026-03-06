@@ -867,10 +867,19 @@ Each author holds an AES-256-GCM broadcast key with a monotonic epoch counter. T
 1. Author generates initial broadcast key (epoch 0) on role grant.
 2. Normal operation: encrypt content with current key.
 3. On block: increment epoch, generate new key, publish `KeyEpochAdvance` notification.
-4. Subscriber requests new key → author checks block list → responds with HPKE-encrypted key or ignores.
+4. Subscriber requests new key → author checks block list → responds with HPKE-sealed key or ignores.
 5. On unblock: author can redistribute key to previously blocked DID on their next request.
 
 **Key derivation:** New keys on rotation are freshly generated random 32-byte AES-256 keys (not HKDF-derived from a master secret). This provides key independence — compromise of one epoch's key reveals nothing about other epochs.
+
+**HPKE parameters for broadcast key distribution.** Broadcast key distribution uses HPKE Base mode (RFC 9180) with the same suite as sender key distribution (§9.16.2): DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. The `info` and `aad` parameters use a distinct domain separator:
+
+```
+info = "scp-broadcast-key-v1" || context_id || author_did || epoch_bytes
+aad  = context_id || author_did || epoch_bytes
+```
+
+Where `context_id` and `author_did` are UTF-8 bytes and `epoch_bytes` is the 8-byte big-endian encoding of the broadcast key epoch. The `"scp-broadcast-key-v1"` domain separator is distinct from `"scp-sender-key-v1"` (encrypted contexts) and `"scp-access-key-v1"` (content access keys), preventing cross-protocol key confusion. The three domain separators ensure that an HPKE ciphertext produced in one protocol cannot be replayed in another — different `info` values produce different HPKE key schedules.
 
 ### 5.14.3 Subscriber Registration
 
@@ -920,25 +929,36 @@ pub struct BroadcastEnvelope {
     pub sequence: u64,
     pub key_epoch: u64,
     pub timestamp: u64,
+    pub nonce: [u8; 12],         // AES-256-GCM nonce (random 12 bytes per message)
     pub content_hash: [u8; 32],  // SHA-256 of plaintext content
-    pub content: Vec<u8>,        // AES-256-GCM encrypted with author broadcast key
+    pub content: Vec<u8>,        // AES-256-GCM ciphertext + auth tag (no embedded nonce)
     pub provenance: Option<DataProvenance>,
     pub signature: Ed25519Signature,
 }
 ```
 
+**Nonce generation.** The `nonce` field is a random 12-byte value generated via `OsRng` (CSPRNG) per message. Each invocation of `seal_broadcast` generates a fresh nonce. The nonce is a top-level field (not embedded in `content`) so that it participates in the signature and is authenticated independently of AEAD verification. Random nonces are safe because: (1) each broadcast key encrypts at most 2^32 messages before rotation (key epoch advance on block events), well below the 2^48 birthday bound for AES-256-GCM with 96-bit random nonces; (2) no state synchronization is required between sender and receiver; (3) the construction matches the sender key layer (§9.16.1) and the WrappedContent nonce (§9.17.3).
+
+**AES-256-GCM additional authenticated data (AAD).** Content encryption in broadcast envelopes MUST bind the cleartext metadata fields as AAD:
+
+```
+aad = context_id || sender_did || key_epoch_bytes || sequence_bytes
+```
+
+Where `context_id` and `sender_did` are UTF-8 bytes (4-byte BE length prefix + bytes), `key_epoch_bytes` is 8-byte big-endian, and `sequence_bytes` is 8-byte big-endian. This prevents attribution forgery, epoch substitution, and message reordering by context members who possess the broadcast key. Tampering with any cleartext metadata field causes AEAD tag verification to fail on decryption.
+
 **Signature formula:**
 ```
 Ed25519_sign(active_signing_key_or_agent_signing_key, SHA-256(
-    context_id || sender_did || sequence || key_epoch || timestamp || content_hash || provenance_hash
+    context_id || sender_did || sequence || key_epoch || timestamp || nonce || content_hash || provenance_hash
 ))
 ```
 
-Where `provenance_hash = SHA256(serialize(provenance))` if present, or `SHA256(0x00)` if absent (same sentinel as InnerEnvelope, ADR-002).
+Where `nonce` is the raw 12 bytes (fixed-size, no length prefix) and `provenance_hash = SHA256(serialize(provenance))` if present, or `SHA256(0x00)` if absent (same sentinel as InnerEnvelope, ADR-002). The nonce is included in the signed hash to prevent nonce substitution attacks — without it, an attacker who possesses the broadcast key could replace the nonce and re-encrypt different content under the same signature.
 
-**Send path:** validate UCAN (`messagesWrite`) → assign sequence number → hash plaintext → hash provenance → sign → AES-256-GCM encrypt with author broadcast key → serialize → wrap in OuterEnvelope → relay PUBLISH.
+**Send path:** validate UCAN (`messagesWrite`) → assign sequence number → generate random 12-byte nonce → hash plaintext → hash provenance → sign (including nonce in hash) → AES-256-GCM encrypt with author broadcast key using nonce and AAD → serialize → wrap in OuterEnvelope → relay PUBLISH.
 
-**Receive path:** transport receive → dedup by blob hash → deserialize → verify signature against author's Active Signing Key or Agent Signing Key from sender's DID document → decrypt with cached author broadcast key for this epoch → verify `content_hash == SHA-256(decrypted_content)` → verify author UCAN → replay check (sequence number) → deliver to application layer.
+**Receive path:** transport receive → dedup by blob hash → deserialize → verify signature against author's Active Signing Key or Agent Signing Key from sender's DID document → decrypt with cached author broadcast key for this epoch using envelope nonce and reconstructed AAD → verify `content_hash == SHA-256(decrypted_content)` → verify author UCAN → replay check (sequence number) → deliver to application layer.
 
 ### 5.14.6 Routing
 
