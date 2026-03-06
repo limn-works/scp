@@ -397,5 +397,3 @@ The four CRITICAL findings are:
 4. No provenance record integrity protection (07, Section 7.7)
 
 These four gaps mean that the core security primitives of both files -- cross-context data flow, authorization, verifiable logs, and data provenance -- are not deterministically implementable from the spec alone.
-
-Now let me save these findings to memory.

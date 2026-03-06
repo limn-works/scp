@@ -234,7 +234,7 @@ The most serious category of findings involves underspecified constructions wher
 ### [CRYPTO-32] UCAN CID Computation Not Specified in Protocol Spec
 - **Construction**: UCAN revocation CID computation
 - **Location**: 09-security-model.md, line 218 (section 9.5)
-- **What's missing**: The spec says revocation uses "token CIDs" in the `RevocationList` but does not define how a CID is computed from a UCAN token. My memory records show the implementation uses `SHA-256(JSON(payload))` with a non-standard "bafyrei" prefix. This is not a valid CID v1 per the IPFS/IPLD specification (which requires multicodec + multihash encoding). The spec should define the exact CID computation to prevent the UniFFI bridge bug I documented (PR #127: UniFFI revokes by raw `token_id` instead of computed CID, making mobile revocations no-ops).
+- **What's missing**: The spec says revocation uses "token CIDs" in the `RevocationList` but does not define how a CID is computed from a UCAN token. The implementation uses `SHA-256(JSON(payload))` with a non-standard "bafyrei" prefix. This is not a valid CID v1 per the IPFS/IPLD specification (which requires multicodec + multihash encoding). The spec should define the exact CID computation to prevent a known UniFFI bridge bug (PR #127: UniFFI revokes by raw `token_id` instead of computed CID, making mobile revocations no-ops).
 - **Security impact**: Without a specified CID computation, implementations will use different methods to identify tokens for revocation. This is a known bug in production (PR #127). UCAN revocations from mobile/desktop clients silently fail.
 - **Severity**: HIGH
 
@@ -313,7 +313,7 @@ The most serious category of findings involves underspecified constructions wher
 | Broadcast Keys (AES-256) | Random 32 bytes | Local key store | On block/rotation | On author removal | NOT SPECIFIED |
 | X25519 Wrapping Key | Software keygen | KeyCustody | On identity rotation | On rotation | NOT SPECIFIED |
 
-**Randomness sources**: The spec does not explicitly mandate CSPRNG for key generation. The implementation uses `OsRng` (per my memory), which is correct. The spec should mandate this.
+**Randomness sources**: The spec does not explicitly mandate CSPRNG for key generation. The implementation uses `OsRng`, which is correct. The spec should mandate this.
 
 ---
 
@@ -370,5 +370,3 @@ Specify: "A UCAN token CID is computed as `SHA-256(canonical_json(payload))` whe
 - `.docs/specs/03-identity.md` -- Identity, key custody, DID resolution
 - `.docs/specs/07-trust-validation-and-capabilities.md` -- UCAN, attestations, participation profiles
 - `.docs/specs/05-contexts.md` -- Broadcast context specifics (lines 801-935)
-
-Now let me update my memory with these findings.

@@ -558,9 +558,6 @@
 
 ---
 
-I will now save these findings to memory for future reference.
-Here is the complete audit.
-
 ---
 
 # SCP Specification Audit: Unspecified Details in Sections 8, 9, and 10
