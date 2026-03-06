@@ -38,6 +38,7 @@ pub mod nesting;
 pub mod params;
 pub mod policy;
 pub mod promotion;
+pub mod providers;
 pub mod roles;
 pub mod standing;
 pub mod state_machine;

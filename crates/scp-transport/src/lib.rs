@@ -41,6 +41,7 @@ pub mod nat;
 pub mod native;
 pub mod pool;
 pub mod profile;
+pub mod provider;
 #[cfg(feature = "quic")]
 pub mod quic;
 pub mod relay;
@@ -67,5 +68,6 @@ pub use nat::{
 };
 pub use pool::{ConnectionPool, PoolKey, TransportType};
 pub use profile::{CoverTrafficTier, TransportProfile};
+pub use provider::RelayTransportProvider;
 pub use scoring::SuppressionWarning;
 pub use traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};
