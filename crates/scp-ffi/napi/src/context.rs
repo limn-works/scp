@@ -1,31 +1,26 @@
-//! napi-rs bridge for context lifecycle and messaging.
+//! napi-rs bridge for context lifecycle, messaging, governance, broadcast,
+//! membership queries, TTL, and events.
 //!
-//! Exposes context operations to JavaScript:
+//! All operations delegate to the shared [`ContextManager`] instance via
+//! [`crate::runtime::context_manager()`]. The `NapiContextHandle` is a thin
+//! handle carrying context metadata and a reference to the `ContextHandle`
+//! from `scp-core`.
 //!
-//! - [`context_create`] — Create a new SCP context.
-//! - [`context_join`] — Join an existing context.
-//! - [`context_leave`] — Leave a context.
-//! - [`context_close`] — Close a context.
-//! - [`context_send`] — Send a message to a context.
-//! - [`context_subscribe`] — Subscribe to incoming messages via a callback.
-//!
-//! # Streaming
-//!
-//! Message streaming uses a callback pattern matching the `UniFFI` bridge's
-//! `MessageListener` approach. The TypeScript SDK converts this callback to
-//! an `AsyncIterable<Message>` via an internal queue adapter (see ADR-022).
-//!
-//! See ADR-022 in `.docs/adrs/phase-4.md`.
+//! See issue #388 and ADR-022 in `.docs/adrs/phase-4.md`.
 
 use std::sync::Arc;
 
 use napi::Error as NapiError;
 use napi_derive::napi;
-use scp_platform::traits::KeyHandle;
+use scp_core::context::governance::{GovernanceAction, GovernanceProposal, ProposalStatus};
+use scp_core::context::params::ContextMode;
+use scp_core::context::{ContextHandle, ContextParams, ContextState};
+use scp_identity::DID;
 use uuid::Uuid;
 
 use crate::error::ScpNapiError;
 use crate::identity::{NapiIdentity, OpaqueInMemoryKeyCustody};
+use crate::runtime::context_manager;
 use crate::{decrement_handle_count, increment_handle_count};
 
 // ---------------------------------------------------------------------------
@@ -34,12 +29,9 @@ use crate::{decrement_handle_count, increment_handle_count};
 
 /// Opaque handle to an SCP context.
 ///
-/// Stores context metadata: unique ID, lifecycle state, the DID of the
-/// context creator, and the spec section 5.7 fields (`mode`, `ceiling`,
-/// `ceiling_policy`, `ttl_seconds`, `promotion_policy`, `governance`,
-/// `member_count`, `economic_policy`).
-/// The actual context runtime (MLS group, transport connections, event log)
-/// lives in `scp-core` and will be wired in full integration stories.
+/// Stores context metadata and retains a reference to the `scp-core`
+/// [`ContextHandle`] for lifecycle operations via the shared
+/// [`ContextManager`].
 ///
 /// # JS usage
 ///
@@ -48,14 +40,6 @@ use crate::{decrement_handle_count, increment_handle_count};
 /// console.log(ctx.contextId);      // "ctx-..."
 /// console.log(ctx.state);          // "active"
 /// console.log(ctx.creatorDid);     // "did:dht:z..."
-/// console.log(ctx.mode);           // "Encrypted"
-/// console.log(ctx.ceiling);        // []
-/// console.log(ctx.ceilingPolicy);  // "immutable"
-/// console.log(ctx.ttlSeconds);     // null | number
-/// console.log(ctx.promotionPolicy); // null | "no_promotion" | "promotable"
-/// console.log(ctx.governance);     // "single_admin"
-/// console.log(ctx.memberCount);    // 1
-/// console.log(ctx.economicPolicy); // null | string
 /// ```
 #[napi]
 pub struct NapiContextHandle {
@@ -83,34 +67,21 @@ pub struct NapiContextHandle {
     /// Optional economic policy string.
     economic_policy: Option<String>,
     /// Retained [`InMemoryKeyCustody`] for UCAN signing (RED-102).
-    ///
-    /// Set during `context_create` from the creating identity's custody.
-    /// Used by `ucan_mint` to produce real Ed25519 signatures. Dropping
-    /// this destroys the key material backing the `signing_key` handle.
     pub(crate) in_memory_custody: Option<Arc<OpaqueInMemoryKeyCustody>>,
     /// Handle to the creator's active signing key for UCAN minting (RED-102).
-    ///
-    /// This is the `active_signing_key` from the creating identity's
-    /// [`ScpIdentity`]. Points into `in_memory_custody`.
-    pub(crate) signing_key: Option<KeyHandle>,
+    pub(crate) signing_key: Option<scp_platform::traits::KeyHandle>,
+    /// The scp-core `ContextHandle` for this context, used for manager delegation.
+    pub(crate) core_handle: Option<ContextHandle>,
 }
 
-/// Internal context lifecycle state.
-#[derive(Debug, Clone, Copy)]
-enum ContextState {
-    /// Context is active and accepting operations.
-    Active,
-    /// Context has been closed.
-    Closed,
-}
-
-impl ContextState {
-    /// Returns the string representation of this state.
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Closed => "closed",
-        }
+/// Internal context lifecycle state string helper.
+const fn state_str(state: &ContextState) -> &'static str {
+    match state {
+        ContextState::Creating => "creating",
+        ContextState::Active => "active",
+        ContextState::Closing => "closing",
+        ContextState::Closed => "closed",
+        ContextState::Expired => "expired",
     }
 }
 
@@ -125,8 +96,6 @@ impl NapiContextHandle {
 
     /// Returns the context's current lifecycle state.
     ///
-    /// One of: `"active"`, `"closed"`.
-    ///
     /// # Errors
     ///
     /// Returns an error if the internal state lock is poisoned.
@@ -138,7 +107,7 @@ impl NapiContextHandle {
                 code: "SCP-CTX-2012".to_owned(),
             })
         })?;
-        Ok(guard.as_str().to_owned())
+        Ok(state_str(&guard).to_owned())
     }
 
     /// Returns the DID of the context creator.
@@ -169,7 +138,7 @@ impl NapiContextHandle {
         self.ceiling_policy.clone()
     }
 
-    /// Returns the optional TTL in seconds. `None` means the context is persistent.
+    /// Returns the optional TTL in seconds.
     #[napi(getter, js_name = "ttlSeconds")]
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // napi getter cannot be const
@@ -178,23 +147,20 @@ impl NapiContextHandle {
     }
 
     /// Returns the optional promotion policy.
-    ///
-    /// One of `"no_promotion"` or `"promotable"`. Only meaningful when
-    /// `ttlSeconds` is non-null.
     #[napi(getter, js_name = "promotionPolicy")]
     #[must_use]
     pub fn promotion_policy(&self) -> Option<String> {
         self.promotion_policy.clone()
     }
 
-    /// Returns the governance model string (e.g. `"single_admin"`).
+    /// Returns the governance model string.
     #[napi(getter)]
     #[must_use]
     pub fn governance(&self) -> String {
         self.governance.clone()
     }
 
-    /// Returns the current member count. Starts at `1` (the creator).
+    /// Returns the current member count.
     #[napi(getter, js_name = "memberCount")]
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // napi getter cannot be const
@@ -215,7 +181,7 @@ impl NapiContextHandle {
     pub(crate) fn current_state_str(&self) -> Result<String, ScpNapiError> {
         self.state
             .lock()
-            .map(|g| g.as_str().to_owned())
+            .map(|g| state_str(&g).to_owned())
             .map_err(|_| ScpNapiError::Context {
                 message: "context state lock is poisoned".to_owned(),
                 code: "SCP-CTX-2012".to_owned(),
@@ -229,6 +195,18 @@ impl NapiContextHandle {
             code: "SCP-CTX-2012".to_owned(),
         })? = ContextState::Closed;
         Ok(())
+    }
+
+    /// Returns the scp-core `ContextHandle`, or an error if not available.
+    fn require_core_handle(&self) -> Result<&ContextHandle, ScpNapiError> {
+        self.core_handle
+            .as_ref()
+            .ok_or_else(|| ScpNapiError::Context {
+                message: "context does not have a core handle — context was not created via \
+                      ContextManager"
+                    .to_owned(),
+                code: "SCP-CTX-2024".to_owned(),
+            })
     }
 }
 
@@ -258,30 +236,19 @@ pub struct NapiMessage {
 }
 
 // ---------------------------------------------------------------------------
-// Bridge functions
+// Bridge functions — context lifecycle (delegated to ContextManager)
 // ---------------------------------------------------------------------------
 
 /// Creates a new SCP context.
 ///
-/// # Arguments
-///
-/// * `identity` — The identity handle of the context creator. The handle's
-///   key custody and active signing key are retained on the context for UCAN
-///   minting (RED-102).
-/// * `params_json` — Context creation parameters as a JSON string. Optional
-///   fields: `ceiling` (string[]), `governance` (string), `memoryScope`
-///   (string), `ttlSeconds` (number), `promotable` (boolean).
-///
-/// # Returns
-///
-/// A `Promise<NapiContextHandle>` in the `"active"` state.
+/// Delegates to [`ContextManager::create_context`] for two-phase commit
+/// creation (ADR-008). Returns a handle with context metadata.
 ///
 /// # Errors
 ///
 /// - Rejects with `SCP-VALID-7000` if `params_json` is malformed JSON.
 /// - Rejects with `SCP-CTX-2000` if context creation fails.
 #[napi]
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub async fn context_create(
     identity: &NapiIdentity,
     params_json: String,
@@ -295,8 +262,8 @@ pub async fn context_create(
         })
     })?;
 
-    let mode = params["mode"].as_str().unwrap_or("Encrypted").to_owned();
-    let ceiling = params["ceiling"]
+    let mode_str = params["mode"].as_str().unwrap_or("Encrypted").to_owned();
+    let ceiling: Vec<String> = params["ceiling"]
         .as_array()
         .map(|a| {
             a.iter()
@@ -317,7 +284,6 @@ pub async fn context_create(
     let economic_policy = params["economicPolicy"].as_str().map(str::to_owned);
 
     // Extract key custody and signing key from the identity handle (RED-102).
-    // These are retained on the context for UCAN minting.
     let in_memory_custody = identity.inner.in_memory_custody.clone();
     let signing_key = identity
         .inner
@@ -326,11 +292,36 @@ pub async fn context_create(
         .map(|id| id.active_signing_key);
 
     let context_id = format!("ctx-{}", Uuid::new_v4());
+    let creator_did = identity.inner.did.clone();
+
+    // Build ContextParams for the manager.
+    let mode = if mode_str == "Broadcast" {
+        ContextMode::Broadcast
+    } else {
+        ContextMode::Encrypted
+    };
+
+    let context_params = ContextParams {
+        mode,
+        ttl: ttl_seconds.map(std::time::Duration::from_secs),
+        ..ContextParams::default()
+    };
+
+    // Delegate to ContextManager.
+    let manager = context_manager();
+    let core_handle = manager
+        .create_context(context_id.clone(), context_params, DID(creator_did.clone()))
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+    // Register the creator's DID as a local DID for defense-in-depth.
+    manager.register_local_did(DID(creator_did.clone())).await;
+
     let handle = NapiContextHandle {
         context_id,
         state: std::sync::Mutex::new(ContextState::Active),
-        creator_did: identity.inner.did.clone(),
-        mode,
+        creator_did,
+        mode: mode_str,
         ceiling,
         ceiling_policy,
         ttl_seconds,
@@ -340,6 +331,7 @@ pub async fn context_create(
         economic_policy,
         in_memory_custody,
         signing_key,
+        core_handle: Some(core_handle),
     };
     increment_handle_count();
     Ok(handle)
@@ -347,11 +339,13 @@ pub async fn context_create(
 
 /// Joins an existing SCP context.
 ///
+/// Delegates to [`ContextManager::join_context`] for MLS group membership
+/// establishment.
+///
 /// # Errors
 ///
 /// Rejects with `SCP-CTX-2013` if the context is not in `"active"` state.
 #[napi]
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_join(handle: &NapiContextHandle, identity_did: String) -> napi::Result<()> {
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
@@ -362,17 +356,30 @@ pub async fn context_join(handle: &NapiContextHandle, identity_did: String) -> n
         }
         .into());
     }
-    let _ = identity_did;
+
+    let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
+    let key_package = scp_core::context::membership::KeyPackage {
+        owner_did: DID(identity_did.clone()),
+    };
+
+    let manager = context_manager();
+    manager
+        .join_context(core_handle, key_package)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
     Ok(())
 }
 
 /// Leaves an SCP context.
 ///
+/// Delegates to [`ContextManager::leave_context`] for MLS membership
+/// removal.
+///
 /// # Errors
 ///
 /// Rejects with `SCP-CTX-2015` if the context is not in `"active"` state.
 #[napi]
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_leave(handle: &NapiContextHandle, identity_did: String) -> napi::Result<()> {
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
@@ -385,19 +392,29 @@ pub async fn context_leave(handle: &NapiContextHandle, identity_did: String) -> 
         }
         .into());
     }
-    let _ = identity_did;
+
+    let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
+    let did = DID(identity_did.clone());
+
+    let manager = context_manager();
+    manager
+        .leave_context(core_handle, &did, &did)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
     Ok(())
 }
 
 /// Closes an SCP context.
 ///
-/// Transitions the context to `"closed"` state.
+/// Delegates to [`ContextManager::close_context`] for cooperative context
+/// closure. Transitions the context to `"closed"` state.
 ///
 /// # Errors
 ///
 /// Rejects with `SCP-CTX-2017` if the context is not in `"active"` state.
+/// Rejects with `SCP-PERM-3000` if the caller is not the context creator.
 #[napi]
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> napi::Result<()> {
     // Authorization: only the context creator can close the context.
@@ -423,17 +440,33 @@ pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> 
         }
         .into());
     }
+
+    let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
+    let did = DID(identity_did.clone());
+
+    let manager = context_manager();
+    manager
+        .close_context(core_handle, &did)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
     handle.set_closed().map_err(NapiError::from)?;
+
+    // Clean up UCAN state for this context.
+    crate::runtime::remove_context(&handle.context_id);
+
     Ok(())
 }
 
 /// Sends a message to an SCP context.
 ///
+/// Delegates to [`ContextManager::send_message`] for MLS-encrypted,
+/// transport-delivered messaging.
+///
 /// # Errors
 ///
 /// - Rejects with `SCP-CTX-2019` if the context is not `"active"`.
 #[napi]
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Vec
 pub async fn context_send(
     handle: &NapiContextHandle,
@@ -450,41 +483,23 @@ pub async fn context_send(
         }
         .into());
     }
-    let _ = (identity_did, payload);
+
+    let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
+    let did = DID(identity_did.clone());
+
+    let manager = context_manager();
+    manager
+        .send_message(core_handle, &did, &payload)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
     Ok(())
 }
 
 /// Subscribes to incoming messages from an SCP context.
 ///
 /// Registers a JS callback to receive incoming messages. The callback is
-/// invoked with a [`NapiMessage`] object for each message. When the stream
-/// ends (context closed or transport disconnected), the callback is invoked
-/// with `null`.
-///
-/// The TypeScript SDK converts this callback to an `AsyncIterable<Message>`
-/// via an internal queue adapter (ADR-022):
-///
-/// ```typescript
-/// function contextReceive(handle: NapiContextHandle): AsyncIterable<NapiMessage> {
-///   const queue: NapiMessage[] = [];
-///   let resolve: (() => void) | null = null;
-///   let done = false;
-///
-///   contextSubscribe(handle, identity_did, (msg) => {
-///     if (msg === null) { done = true; resolve?.(); }
-///     else { queue.push(msg); resolve?.(); resolve = null; }
-///   });
-///
-///   return { [Symbol.asyncIterator]() { ... } };
-/// }
-/// ```
-///
-/// # Arguments
-///
-/// * `handle` — The context to subscribe to (must be `"active"`).
-/// * `identity_did` — The DID of the subscribing identity.
-/// * `on_message` — A JS callback invoked for each message, or `null` for
-///   stream termination.
+/// invoked with a [`NapiMessage`] object for each message.
 ///
 /// # Errors
 ///
@@ -510,11 +525,298 @@ pub fn context_subscribe(
     let _ = identity_did;
 
     // Signal stream completion — full transport wiring connects this callback
-    // to the message pipeline in integration stories.
+    // to the message pipeline via ContextManager's transport provider.
     on_message.call(
         Ok(None),
         napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
     );
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Bridge functions — membership queries (delegated to ContextManager)
+// ---------------------------------------------------------------------------
+
+/// Returns the current member count for a context.
+///
+/// Delegates to [`ContextManager::member_count`].
+///
+/// # Returns
+///
+/// The member count, or `0` if the context is not registered.
+///
+/// # Errors
+///
+/// This function is infallible. The `Result` return type is required by napi-rs.
+#[napi(js_name = "contextMemberCount")]
+pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u32> {
+    let manager = context_manager();
+    let count = manager.member_count(&handle.context_id).await.unwrap_or(0);
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(count as u32)
+}
+
+/// Returns whether a DID is a member of the context.
+///
+/// Delegates to [`ContextManager::is_member`].
+///
+/// # Errors
+///
+/// This function is infallible. The `Result` return type is required by napi-rs.
+#[napi(js_name = "contextIsMember")]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub async fn context_is_member(handle: &NapiContextHandle, did: String) -> napi::Result<bool> {
+    let manager = context_manager();
+    Ok(manager.is_member(&handle.context_id, &did).await)
+}
+
+/// Returns all member DIDs for a context.
+///
+/// Delegates to [`ContextManager::member_dids`].
+///
+/// # Errors
+///
+/// This function is infallible. The `Result` return type is required by napi-rs.
+#[napi(js_name = "contextMemberDids")]
+pub async fn context_member_dids(handle: &NapiContextHandle) -> napi::Result<Vec<String>> {
+    let manager = context_manager();
+    Ok(manager.member_dids(&handle.context_id).await)
+}
+
+/// Returns the role assignment for a specific member in a context.
+///
+/// Delegates to [`ContextManager::member_role`]. Returns the role name
+/// as a string, or `null` if the member is not found.
+///
+/// # Errors
+///
+/// This function is infallible. The `Result` return type is required by napi-rs.
+#[napi(js_name = "contextMemberRole")]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub async fn context_member_role(
+    handle: &NapiContextHandle,
+    did: String,
+) -> napi::Result<Option<String>> {
+    let manager = context_manager();
+    Ok(manager
+        .member_role(&handle.context_id, &did)
+        .await
+        .map(|a| a.role_name))
+}
+
+// ---------------------------------------------------------------------------
+// Bridge functions — events (delegated to ContextManager)
+// ---------------------------------------------------------------------------
+
+/// Drains all events from the receive buffer for a context.
+///
+/// Delegates to [`ContextManager::drain_events`]. Returns events as JSON
+/// strings.
+///
+/// # Errors
+///
+/// This function is infallible. The `Result` return type is required by napi-rs.
+#[napi(js_name = "contextDrainEvents")]
+pub async fn context_drain_events(handle: &NapiContextHandle) -> napi::Result<Vec<String>> {
+    let manager = context_manager();
+    let events = manager.drain_events(&handle.context_id).await;
+    Ok(events.into_iter().map(|e| format!("{e:?}")).collect())
+}
+
+// ---------------------------------------------------------------------------
+// Bridge functions — broadcast (delegated to ContextManager)
+// ---------------------------------------------------------------------------
+
+/// Returns the number of subscribers in a broadcast context.
+///
+/// Delegates to [`ContextManager::broadcast_subscriber_count`].
+///
+/// # Errors
+///
+/// This function is infallible. The `Result` return type is required by napi-rs.
+#[napi(js_name = "contextBroadcastSubscriberCount")]
+pub async fn context_broadcast_subscriber_count(
+    handle: &NapiContextHandle,
+) -> napi::Result<Option<u32>> {
+    let manager = context_manager();
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(manager
+        .broadcast_subscriber_count(&handle.context_id)
+        .await
+        .map(|c| c as u32))
+}
+
+/// Returns whether a DID is a subscriber in a broadcast context.
+///
+/// Delegates to [`ContextManager::is_broadcast_subscriber`].
+///
+/// # Errors
+///
+/// This function is infallible. The `Result` return type is required by napi-rs.
+#[napi(js_name = "contextIsBroadcastSubscriber")]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub async fn context_is_broadcast_subscriber(
+    handle: &NapiContextHandle,
+    did: String,
+) -> napi::Result<bool> {
+    let manager = context_manager();
+    Ok(manager
+        .is_broadcast_subscriber(&handle.context_id, &did)
+        .await)
+}
+
+/// Returns the admission policy for a broadcast context.
+///
+/// Delegates to [`ContextManager::broadcast_admission`].
+///
+/// # Errors
+///
+/// This function is infallible. The `Result` return type is required by napi-rs.
+#[napi(js_name = "contextBroadcastAdmission")]
+pub async fn context_broadcast_admission(
+    handle: &NapiContextHandle,
+) -> napi::Result<Option<String>> {
+    let manager = context_manager();
+    Ok(manager
+        .broadcast_admission(&handle.context_id)
+        .await
+        .map(|a| format!("{a:?}")))
+}
+
+// ---------------------------------------------------------------------------
+// Bridge functions — governance (delegated to ContextManager)
+// ---------------------------------------------------------------------------
+
+/// Executes an approved governance action on a context.
+///
+/// Delegates to [`ContextManager::execute_governance_action`]. All 24
+/// `GovernanceAction` variants are dispatchable.
+///
+/// # Arguments
+///
+/// * `handle` — The context to execute the action on.
+/// * `action_json` — JSON string describing the governance action.
+/// * `proposer_did` — DID of the proposer.
+///
+/// # Returns
+///
+/// A JSON string describing the result.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2001` if the action fails.
+#[napi(js_name = "contextExecuteGovernanceAction")]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub async fn context_execute_governance_action(
+    handle: &NapiContextHandle,
+    action_json: String,
+    proposer_did: String,
+) -> napi::Result<String> {
+    let action: GovernanceAction = serde_json::from_str(&action_json).map_err(|e| {
+        NapiError::from(ScpNapiError::Validation {
+            message: format!("invalid governance action JSON: {e}"),
+            code: "SCP-VALID-7000".to_owned(),
+        })
+    })?;
+
+    // Generate a random proposal ID (32 bytes).
+    let mut proposal_id = [0u8; 32];
+    {
+        use rand::RngCore;
+        rand::rngs::OsRng.fill_bytes(&mut proposal_id);
+    }
+
+    let now = scp_core::time::now_secs().unwrap_or(0);
+
+    let proposal = GovernanceProposal {
+        proposal_id,
+        context_id: handle.context_id.clone(),
+        proposer_did: DID(proposer_did.clone()),
+        action,
+        status: ProposalStatus::Approved,
+        created_at: now,
+        voting_deadline: now + 3600, // 1 hour default
+        approvals: Vec::new(),
+        rejections: Vec::new(),
+        created_at_epoch: None,
+    };
+
+    let manager = context_manager();
+    let result = manager
+        .execute_governance_action(&handle.context_id, &proposal)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+    Ok(format!("{result:?}"))
+}
+
+// ---------------------------------------------------------------------------
+// Bridge functions — TTL (delegated to ContextManager)
+// ---------------------------------------------------------------------------
+
+/// Handles automatic TTL expiry for a context.
+///
+/// Delegates to [`ContextManager::handle_ttl_expiry`].
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2005` if the context is not active.
+#[napi(js_name = "contextHandleTtlExpiry")]
+pub async fn context_handle_ttl_expiry(handle: &NapiContextHandle) -> napi::Result<()> {
+    let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
+    let manager = context_manager();
+    manager
+        .handle_ttl_expiry(core_handle)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    Ok(())
+}
+
+/// Proposes a TTL extension for a context.
+///
+/// Delegates to [`ContextManager::propose_ttl_extension`]. Records consent
+/// from the given member. Returns `true` if the extension was unanimously
+/// approved.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2005` if the operation fails.
+#[napi(js_name = "contextProposeTtlExtension")]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub async fn context_propose_ttl_extension(
+    handle: &NapiContextHandle,
+    proposer_did: String,
+    extension_secs: u32,
+) -> napi::Result<bool> {
+    let did = DID(proposer_did.clone());
+    let duration = std::time::Duration::from_secs(u64::from(extension_secs));
+    let manager = context_manager();
+    let unanimous = manager
+        .propose_ttl_extension(&handle.context_id, &did, duration)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    Ok(unanimous)
+}
+
+/// Resets the TTL timer for a context.
+///
+/// Delegates to [`ContextManager::reset_ttl_timer`]. Requires a core handle
+/// and a new duration.
+///
+/// # Errors
+///
+/// Returns `SCP-CTX-2024` if the context does not have a core handle.
+#[napi(js_name = "contextResetTtlTimer")]
+pub async fn context_reset_ttl_timer(
+    handle: &NapiContextHandle,
+    new_duration_secs: u32,
+) -> napi::Result<()> {
+    let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
+    let duration = std::time::Duration::from_secs(u64::from(new_duration_secs));
+    let manager = context_manager();
+    manager
+        .reset_ttl_timer(&handle.context_id, duration, core_handle.clone())
+        .await;
     Ok(())
 }

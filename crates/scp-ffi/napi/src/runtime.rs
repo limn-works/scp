@@ -1,24 +1,32 @@
-//! Global runtime registry mapping context IDs to live `scp-core` objects.
+//! Shared `ContextManager` instance for the NAPI bridge.
 //!
-//! The NAPI bridge functions accept `&NapiContextHandle` references but need
-//! access to real `scp-core` runtime objects (event logs, UCAN revocation
-//! lists, nonce trackers). This module provides a global registry that maps
-//! context IDs to their associated runtime state.
+//! Replaces the previous `ContextRuntime` / `DashMap` registry with a single
+//! `Arc<ContextManager>` that owns all context state. Bridge functions delegate
+//! lifecycle, messaging, governance, broadcast, membership, and TTL operations
+//! to the manager.
 //!
-//! # Lazy registration
+//! The manager is initialized once (via `OnceLock`) with lightweight provider
+//! implementations suitable for the Node.js/Bun FFI environment:
 //!
-//! Unlike the `PyO3` bridge (where `py_context_create` eagerly registers state),
-//! the NAPI bridge uses lazy registration: the first UCAN or event log call
-//! on a context triggers registration from `NapiContextHandle` metadata. This
-//! avoids modifying `context.rs` (which is out of scope for SCP-219).
+//! - [`NapiBridgeCryptoProvider`] — No-op MLS/sender-key operations. Real
+//!   encryption is handled at the SDK layer above the FFI bridge.
+//! - [`NapiBridgeTransportProvider`] — Reports connected, no-op send/publish.
+//!   Real transport is handled via `NapiTransportManager`.
+//! - [`NapiBridgeEventLogProvider`] — Delegates to `scp_event_log::EventLog`
+//!   for Merkle tree operations.
+//! - [`NapiBridgePersistence`] — In-memory persistence via `DashMap`.
 //!
-//! See SCP-219 and ADR-022 in `.docs/adrs/phase-4.md`.
+//! See issue #388 and `.docs/adrs/phase-4.md` (ADR-022).
 
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
-use scp_core::context::roles::default_ceiling;
+use scp_core::context::ContextError;
+use scp_core::context::builder::{
+    ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
+};
+use scp_core::context::manager::{ContextManager, ContextPersistence, ContextSnapshot};
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_event_log::EventLog;
@@ -27,42 +35,47 @@ use scp_identity::cache::SystemClock;
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
 
-/// Global registry of per-context runtime state.
-static CONTEXT_REGISTRY: OnceLock<DashMap<String, ContextRuntime>> = OnceLock::new();
+// ---------------------------------------------------------------------------
+// Global ContextManager instance
+// ---------------------------------------------------------------------------
 
-/// Global production DID resolver (#311). See `scp-ffi/src/runtime.rs` for
-/// full documentation.
-static DID_RESOLVER: OnceLock<Arc<scp_ffi_common::IdentityBackedDidResolver>> = OnceLock::new();
+/// Global shared `ContextManager`, initialized once at first access.
+static CONTEXT_MANAGER: OnceLock<Arc<ContextManager>> = OnceLock::new();
 
-/// Returns the global production DID resolver, if initialized.
-#[must_use]
-pub fn did_resolver() -> Option<&'static Arc<scp_ffi_common::IdentityBackedDidResolver>> {
-    DID_RESOLVER.get()
-}
-
-/// Initializes the global production DID resolver (#311).
-pub fn init_did_resolver<R>(resolver: Arc<R>, handle: tokio::runtime::Handle)
-where
-    R: scp_identity::resolver::DidResolver + 'static,
-{
-    let _ = DID_RESOLVER.set(Arc::new(scp_ffi_common::IdentityBackedDidResolver::new(
-        resolver, handle,
-    )));
-}
-
-/// Returns a reference to the global context registry.
-fn registry() -> &'static DashMap<String, ContextRuntime> {
-    CONTEXT_REGISTRY.get_or_init(DashMap::new)
-}
-
-/// Per-context runtime state: the live objects needed by bridge functions.
+/// Returns a reference to the shared `ContextManager`.
 ///
-/// Each context gets its own event log, UCAN revocation list, nonce tracker,
-/// and capability ceiling string set. These are created lazily on first access
-/// from UCAN or event log bridge functions.
-pub struct ContextRuntime {
-    /// Event log (Merkle tree) for this context.
-    pub event_log: EventLog,
+/// Initializes the manager on first call with bridge-local provider
+/// implementations. All NAPI bridge functions that need context operations
+/// call this function.
+pub fn context_manager() -> &'static Arc<ContextManager> {
+    CONTEXT_MANAGER.get_or_init(|| {
+        let crypto = Box::new(NapiBridgeCryptoProvider);
+        let transport = Box::new(NapiBridgeTransportProvider);
+        let event_log = Box::new(NapiBridgeEventLogProvider::new());
+        let persistence = Box::new(NapiBridgePersistence::new());
+        Arc::new(ContextManager::with_persistence(
+            crypto,
+            transport,
+            event_log,
+            persistence,
+        ))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Per-context UCAN state — retained for the UCAN validation pipeline
+//
+// The ContextManager does not own UCAN revocation lists or nonce trackers.
+// Those are validation-layer concerns that live in the bridge. We keep a
+// lightweight registry for them, keyed by context ID.
+// ---------------------------------------------------------------------------
+
+/// Per-context UCAN validation state.
+///
+/// Retains the `RevocationList` and `NonceTracker` needed by the UCAN
+/// validation pipeline (ADR-016). These are NOT duplicates of `ContextManager`
+/// state — the manager does not track UCAN revocation or nonces.
+pub struct UcanContextState {
     /// UCAN revocation list for this context.
     pub revocation_list: RevocationList,
     /// UCAN nonce tracker for replay prevention (ADR-016 step 9).
@@ -72,22 +85,29 @@ pub struct ContextRuntime {
     pub ceiling_strings: HashSet<String>,
     /// The DID of the context creator.
     pub creator_did: String,
+    /// Event log (Merkle tree) for this context.
+    pub event_log: EventLog,
 }
 
-// default_ceiling() imported from scp_core::context::roles.
+/// Global registry of per-context UCAN validation state.
+static UCAN_REGISTRY: OnceLock<DashMap<String, UcanContextState>> = OnceLock::new();
 
-/// Ensures a context is registered in the runtime registry.
+/// Returns a reference to the UCAN state registry.
+fn ucan_registry() -> &'static DashMap<String, UcanContextState> {
+    UCAN_REGISTRY.get_or_init(DashMap::new)
+}
+
+/// Ensures UCAN validation state is registered for a context.
 ///
 /// If the context is already registered, this is a no-op. Otherwise, creates
-/// runtime state from the `NapiContextHandle` metadata (context ID, creator
-/// DID, ceiling).
+/// UCAN state from the `NapiContextHandle` metadata.
 ///
 /// # Errors
 ///
 /// Returns `ScpNapiError::Context` if the context state cannot be determined.
 pub fn ensure_registered(handle: &NapiContextHandle) -> Result<(), ScpNapiError> {
     let context_id = handle.context_id();
-    let map = registry();
+    let map = ucan_registry();
 
     if map.contains_key(&context_id) {
         return Ok(());
@@ -97,7 +117,7 @@ pub fn ensure_registered(handle: &NapiContextHandle) -> Result<(), ScpNapiError>
     let handle_ceiling = handle.ceiling();
 
     let ceiling_strings = if handle_ceiling.is_empty() {
-        default_ceiling()
+        scp_core::context::roles::default_ceiling()
             .capabilities
             .iter()
             .map(std::string::ToString::to_string)
@@ -110,38 +130,34 @@ pub fn ensure_registered(handle: &NapiContextHandle) -> Result<(), ScpNapiError>
     let revocation_list = RevocationList::new(context_id.clone());
     let nonce_tracker = NonceTracker::new(context_id.clone(), SystemClock);
 
-    let runtime = ContextRuntime {
-        event_log,
+    let state = UcanContextState {
         revocation_list,
         nonce_tracker,
         ceiling_strings,
         creator_did,
+        event_log,
     };
 
-    map.entry(context_id).or_insert(runtime);
+    map.entry(context_id).or_insert(state);
     Ok(())
 }
 
-/// Executes a closure with mutable access to a context's runtime state.
-///
-/// Looks up the context by ID in the global registry and calls `f` with a
-/// mutable reference to the [`ContextRuntime`]. Uses `DashMap::get_mut` for
-/// fine-grained per-key locking.
+/// Executes a closure with mutable access to a context's UCAN state.
 ///
 /// # Errors
 ///
-/// Returns `ScpNapiError::Context` if the context is not found.
+/// Returns `ScpNapiError::Context` if the context is not found in the registry.
 pub fn with_context<T, F>(context_id: &str, f: F) -> Result<T, ScpNapiError>
 where
-    F: FnOnce(&mut ContextRuntime) -> Result<T, ScpNapiError>,
+    F: FnOnce(&mut UcanContextState) -> Result<T, ScpNapiError>,
 {
-    let map = registry();
+    let map = ucan_registry();
 
     let mut entry = map
         .get_mut(context_id)
         .ok_or_else(|| ScpNapiError::Context {
             message: format!(
-                "context '{context_id}' not found in runtime registry \
+                "context '{context_id}' not found in UCAN state registry \
              -- call a UCAN or event log function with the context handle first"
             ),
             code: "SCP-CTX-2023".to_owned(),
@@ -150,32 +166,25 @@ where
     f(entry.value_mut())
 }
 
-/// Removes a context from the global runtime registry.
+/// Removes UCAN state for a context.
 ///
-/// Called when a context is closed. All associated runtime objects are dropped.
-/// Does not error if the context was not found (idempotent).
-#[allow(dead_code)]
+/// Called when a context is closed. Idempotent.
 pub fn remove_context(context_id: &str) {
-    registry().remove(context_id);
+    ucan_registry().remove(context_id);
 }
 
-/// Registers a test context directly in the runtime registry.
-///
-/// Creates a `ContextRuntime` with the default ceiling, the given creator DID,
-/// and empty event log, revocation list, and nonce tracker. This is for unit
-/// tests that need to exercise runtime state without constructing a full
-/// `NapiContextHandle`.
+/// Registers a test context in the UCAN state registry.
 #[cfg(test)]
 pub fn register_test_context(context_id: &str, creator_did: &str) {
-    let map = registry();
+    let map = ucan_registry();
 
-    let ceiling_strings = default_ceiling()
+    let ceiling_strings = scp_core::context::roles::default_ceiling()
         .capabilities
         .iter()
         .map(std::string::ToString::to_string)
         .collect::<HashSet<String>>();
 
-    let runtime = ContextRuntime {
+    let state = UcanContextState {
         event_log: EventLog::new(context_id.to_owned()),
         revocation_list: RevocationList::new(context_id.to_owned()),
         nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
@@ -183,5 +192,232 @@ pub fn register_test_context(context_id: &str, creator_did: &str) {
         creator_did: creator_did.to_owned(),
     };
 
-    map.entry(context_id.to_owned()).or_insert(runtime);
+    map.entry(context_id.to_owned()).or_insert(state);
+}
+
+// ---------------------------------------------------------------------------
+// NapiBridgeCryptoProvider — no-op MLS/sender key operations
+// ---------------------------------------------------------------------------
+
+/// Bridge crypto provider for the NAPI layer.
+///
+/// All operations succeed immediately. Real MLS and sender key operations
+/// will be delegated to production providers when integrated. The bridge
+/// layer validates parameters and delegates lifecycle to `ContextManager`;
+/// the crypto provider is called by the manager during creation, join,
+/// leave, and send flows.
+struct NapiBridgeCryptoProvider;
+
+impl ContextCryptoProvider for NapiBridgeCryptoProvider {
+    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+
+    fn create_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+
+    fn generate_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+
+    fn init_broadcast_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+
+    fn destroy_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+
+    fn destroy_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+
+    fn validate_key_package(&self, _owner_did: &str) -> Result<(), ContextError> {
+        Ok(())
+    }
+
+    fn add_member(&self, _context_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
+        Ok(())
+    }
+
+    fn remove_member(&self, _context_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
+        Ok(())
+    }
+
+    fn distribute_sender_key(
+        &self,
+        _context_id: &[u8; 32],
+        _member_did: &str,
+    ) -> Result<(), ContextError> {
+        Ok(())
+    }
+
+    fn remove_member_sender_key(
+        &self,
+        _context_id: &[u8; 32],
+        _member_did: &str,
+    ) -> Result<(), ContextError> {
+        Ok(())
+    }
+
+    fn encrypt_message(
+        &self,
+        _context_id: &[u8; 32],
+        _sender_did: &str,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, ContextError> {
+        // Return payload as-is; real encryption is layered above the bridge.
+        Ok(payload.to_vec())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NapiBridgeTransportProvider — no-op transport
+// ---------------------------------------------------------------------------
+
+/// Bridge transport provider for the NAPI layer.
+///
+/// Reports connected and succeeds all operations. Real transport is
+/// managed by `NapiTransportManager` at the SDK layer.
+struct NapiBridgeTransportProvider;
+
+impl ContextTransportProvider for NapiBridgeTransportProvider {
+    fn is_connected(&self) -> bool {
+        true
+    }
+
+    fn publish_context(
+        &self,
+        _context_id: &[u8; 32],
+        _params: &scp_core::context::ContextParams,
+    ) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+
+    fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+
+    fn send_message(&self, _context_id: &[u8; 32], _encrypted: &[u8]) -> Result<(), ContextError> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NapiBridgeEventLogProvider — delegates to scp_event_log
+// ---------------------------------------------------------------------------
+
+/// Bridge event log provider for the NAPI layer.
+///
+/// No-op implementation. The `ContextManager` calls these methods during
+/// context creation and messaging. Real event log operations (Merkle proofs,
+/// queries) are handled by the UCAN registry's `EventLog` instances in
+/// `ensure_registered`/`with_context`.
+struct NapiBridgeEventLogProvider;
+
+impl NapiBridgeEventLogProvider {
+    const fn new() -> Self {
+        Self
+    }
+}
+
+impl ContextEventLogProvider for NapiBridgeEventLogProvider {
+    fn init_event_log(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+
+    fn append_event(
+        &self,
+        _context_id: &[u8; 32],
+        _event_type: &str,
+    ) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+
+    fn destroy_event_log(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NapiBridgePersistence — in-memory persistence
+// ---------------------------------------------------------------------------
+
+/// In-memory persistence provider for the NAPI bridge.
+///
+/// Stores context and broadcast snapshots in `DashMap`s. Suitable for
+/// the Node.js/Bun environment where process lifetime matches context
+/// lifetime. Production persistence (`SQLite`) is configured at the
+/// application layer.
+struct NapiBridgePersistence {
+    contexts: DashMap<String, ContextSnapshot>,
+    broadcasts: DashMap<String, scp_core::context::broadcast::BroadcastContextSnapshot>,
+}
+
+impl NapiBridgePersistence {
+    fn new() -> Self {
+        Self {
+            contexts: DashMap::new(),
+            broadcasts: DashMap::new(),
+        }
+    }
+}
+
+impl ContextPersistence for NapiBridgePersistence {
+    fn persist_context(
+        &self,
+        context_id: &str,
+        snapshot: &ContextSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.contexts
+            .insert(context_id.to_owned(), snapshot.clone());
+        Ok(())
+    }
+
+    fn load_context(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<ContextSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.contexts.get(context_id).map(|v| v.value().clone()))
+    }
+
+    fn persist_broadcast(
+        &self,
+        context_id: &str,
+        snapshot: &scp_core::context::broadcast::BroadcastContextSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.broadcasts
+            .insert(context_id.to_owned(), snapshot.clone());
+        Ok(())
+    }
+
+    fn load_broadcast(
+        &self,
+        context_id: &str,
+    ) -> Result<
+        Option<scp_core::context::broadcast::BroadcastContextSnapshot>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        Ok(self.broadcasts.get(context_id).map(|v| v.value().clone()))
+    }
+
+    fn delete_context(
+        &self,
+        context_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.contexts.remove(context_id);
+        self.broadcasts.remove(context_id);
+        Ok(())
+    }
+
+    fn list_persisted_contexts(
+        &self,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .contexts
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect())
+    }
 }

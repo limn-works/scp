@@ -3,58 +3,54 @@
 ## Overview
 
 This crate is the `@scp/sdk-napi` native addon (`.node` file). It exposes scp-core APIs to
-Node.js/Bun via napi-rs `#[napi]` types and functions. Unlike the PyO3 bridge (`crates/scp-ffi`),
-this bridge has no global runtime registry — all context state lives in the `NapiContextHandle`
-struct itself.
+Node.js/Bun via napi-rs `#[napi]` types and functions.
 
 ## Architecture
 
-### No Runtime Registry
+### Shared ContextManager (issue #388)
 
-The PyO3 bridge uses a global `DashMap<String, ContextRuntime>` keyed by context ID. The NAPI
-bridge does NOT have an equivalent. All state needed by bridge functions is stored directly on
-the opaque handle structs:
+All context lifecycle, messaging, governance, broadcast, membership, and TTL operations
+delegate to a shared `Arc<ContextManager>` initialized once via `OnceLock` in `runtime.rs`.
 
-- `NapiContextHandle` — carries `context_id`, `creator_did`, `mode`, `ceiling`, etc.
-- `NapiUcanToken` — carries `data: NapiUcanTokenData` and `encoded: String`
-- `NapiIdentity` — carries `did`, `custody_type`
-- `NapiTransportManager` — carries transport state
+The `ContextManager` is constructed with bridge-local provider implementations:
+- `NapiBridgeCryptoProvider` — no-op MLS/sender-key operations
+- `NapiBridgeTransportProvider` — reports connected, no-op send
+- `NapiBridgeEventLogProvider` — no-op event log
+- `NapiBridgePersistence` — in-memory `DashMap`-backed persistence
 
-Functions that need context data receive the handle as `&NapiContextHandle` and read from it
-directly. There is no `with_context` lookup by ID.
+### UCAN State Registry
+
+A separate `DashMap<String, UcanContextState>` in `runtime.rs` stores per-context UCAN
+validation state (revocation lists, nonce trackers, capability ceilings, event logs for
+Merkle proofs). This is NOT a duplicate of `ContextManager` state — the manager does not
+track UCAN revocation or nonces.
+
+Functions: `ensure_registered`, `with_context`, `remove_context`.
 
 ### Module Structure
 
 | Module | Functions |
 |--------|-----------|
-| `identity.rs` | `identity_create`, `identity_load`, `identity_resolve` |
-| `context.rs` | `context_create`, `context_join`, `context_leave`, `context_close`, `context_send`, `context_subscribe` |
+| `identity.rs` | `identity_create`, `identity_create_with_agent_key`, `identity_load`, `identity_resolve` |
+| `context.rs` | `context_create`, `context_join`, `context_leave`, `context_close`, `context_send`, `context_subscribe`, `context_member_count`, `context_is_member`, `context_member_dids`, `context_member_role`, `context_drain_events`, `context_broadcast_subscriber_count`, `context_is_broadcast_subscriber`, `context_broadcast_admission`, `context_execute_governance_action`, `context_handle_ttl_expiry`, `context_propose_ttl_extension`, `context_reset_ttl_timer` |
 | `tools.rs` | `tool_register`, `tool_invoke`, `tool_verify` |
 | `ucan.rs` | `ucan_validate`, `ucan_mint`, `ucan_revoke` |
 | `event_log.rs` | `event_log_query`, `event_log_verify` |
 | `transport.rs` | `transport_connect`, `transport_disconnect`, `transport_status` |
+| `runtime.rs` | `context_manager()`, `ensure_registered`, `with_context`, `remove_context` |
 
 ### Build
 
-- `crate-type = ["cdylib"]` only (unlike PyO3 which has rlib for test linkage)
-- Tests run via `cargo test -p scp-ffi-napi` (no Python linkage required, unlike scp-ffi)
+- `crate-type = ["cdylib"]` only
+- Tests run via `cargo test -p scp-ffi-napi` (no Python linkage required)
 - `cargo check -p scp-ffi-napi` validates without building the full cdylib
 
 ## Key Differences From the PyO3 Bridge
 
 ### NapiUcanToken Has `encoded` Field; PyUcanToken Does Not
 
-`NapiUcanToken` carries a `pub(crate) encoded: String` field for future revocation/validation
-wiring. `PyUcanToken` in the PyO3 bridge has no such field — it only exposes metadata.
-
-When implementing `ucan_mint`, the `encoded` field MUST be set to a valid JWT-format string:
-`base64url(header_json).base64url(payload_json).base64url(sig_bytes)`. A placeholder 64-byte
-zero signature is acceptable until real Ed25519 signing is wired (SCP-214).
-
-An empty `encoded` field means:
-- `ucan_revoke` cannot compute the revocation CID (it needs to call `parse_ucan`)
-- `ucan_validate` cannot verify the token
-- The token is structurally non-round-trippable
+`NapiUcanToken` carries a `pub(crate) encoded: String` field for revocation/validation.
+`PyUcanToken` in the PyO3 bridge has no such field.
 
 ### JWT Construction Pattern (NAPI)
 
@@ -73,40 +69,26 @@ let sig_b64 = URL_SAFE_NO_PAD.encode([0u8; 64]);
 let encoded = format!("{header_b64}.{payload_b64}.{sig_b64}");
 ```
 
-This produces a string parseable by `scp_core::crypto::ucan::validate::parse_ucan`.
-
 ### Capability URI Scoping
 
 Capabilities passed as `"messages:write"` are scoped to `"scp:ctx:{context_id}/messages:write"`.
-Capabilities already starting with `"scp:ctx:"` are passed through unchanged. The `can` field
-of each `Attenuation` is derived from `rsplit_once(':')` on the scoped URI.
+Capabilities already starting with `"scp:ctx:"` are passed through unchanged.
 
 ### Nonce Generation
 
-The NAPI bridge uses `rand::rngs::OsRng.fill_bytes` directly (no wrapper). Format:
+The NAPI bridge uses `rand::rngs::OsRng.fill_bytes` directly. Format:
 `{unix_millis_timestamp}-{16_random_bytes_hex}` matching ADR-016 §7.2.
 
 ## Gotchas
 
+- Bridge functions in `context.rs` delegate to the shared `ContextManager` via
+  `crate::runtime::context_manager()`. The `NapiContextHandle` stores a `core_handle: Option<ContextHandle>`
+  for manager operations.
+- UCAN validation state (revocation lists, nonce trackers) lives in a separate `DashMap` registry,
+  NOT in the `ContextManager`. The `ensure_registered` / `with_context` pattern accesses this state.
+- `context_close` removes UCAN state via `remove_context` after closing through the manager.
+- The bridge event log provider is no-op. Real Merkle proofs use the UCAN registry's `EventLog`.
 - `NapiUcanToken.encoded` is `#[allow(dead_code)]` because `ucan_revoke` currently returns a stub
   error. When revocation is wired to the runtime, the bridge will parse the full JWT `token`
-  parameter to compute the revocation CID (matching the PyO3 bridge pattern).
-
-- Bridge functions returning `Err(...)` immediately without constructing the output type leave
-  `encoded` / other fields unset. Always construct the output struct before the feature is
-  "working" in any sense — stubs that silently produce empty fields are worse than stubs that
-  return errors, because they look like they work.
-
-- `ucan_validate` and `ucan_revoke` use the global `ContextRuntime` registry in `runtime.rs`.
-  The registry is lazily initialized on first call via `ensure_registered`. Both functions share
-  persistent `RevocationList` and `NonceTracker` state across calls for the same context.
-
-- Dependencies: add `base64 = { workspace = true }` and `rand = { workspace = true }` to
-  `Cargo.toml` when building JWT-format tokens. Both are workspace deps.
-
-## SCP-219 Status
-
-As of 2026-03-02:
-- `ucan_mint`: FIXED — constructs proper JWT-format `encoded` string with real Ed25519 signature
-- `ucan_validate`: FIXED — uses persistent `RevocationList` and `NonceTracker` from `runtime.rs` registry (closes #136)
-- `ucan_revoke`: FIXED — wired to persistent `RevocationList` in `runtime.rs` registry (closes #136)
+  parameter to compute the revocation CID.
+- Dependencies: `base64`, `rand`, `dashmap` in `Cargo.toml`.
