@@ -40,6 +40,19 @@ use crate::crypto::ucan::validate::{
 };
 use scp_identity::DID;
 
+// ---------------------------------------------------------------------------
+// Protocol-level collection size limits (§5.9)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of registered tools per context.
+const MAX_REGISTERED_TOOLS: usize = 256;
+
+/// Maximum number of cross-context tool interfaces per context.
+const MAX_TOOL_INTERFACES: usize = 256;
+
+/// Maximum number of governance threshold signers per context.
+const MAX_THRESHOLD_SIGNERS: usize = 64;
+
 // GovernanceActionResult
 // ---------------------------------------------------------------------------
 
@@ -2066,6 +2079,11 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
             require_active(&ctx.handle)?;
 
+            if ctx.registered_tools.len() >= MAX_REGISTERED_TOOLS {
+                return Err(ContextError::LimitExceeded(format!(
+                    "registered tool limit of {MAX_REGISTERED_TOOLS} exceeded"
+                )));
+            }
             ctx.registered_tools.push(registration.clone());
             Self::snapshot_context(ctx)
         };
@@ -2365,6 +2383,11 @@ impl ContextManager {
                     "DID is already a signer: {did}"
                 )));
             }
+            if ctx.threshold_signers.len() >= MAX_THRESHOLD_SIGNERS {
+                return Err(ContextError::LimitExceeded(format!(
+                    "threshold signer limit of {MAX_THRESHOLD_SIGNERS} exceeded"
+                )));
+            }
             ctx.threshold_signers.push(did.clone());
             Self::snapshot_context(ctx)
         };
@@ -2462,6 +2485,11 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
             require_active(&ctx.handle)?;
 
+            if ctx.tool_interfaces.len() >= MAX_TOOL_INTERFACES {
+                return Err(ContextError::LimitExceeded(format!(
+                    "tool interface limit of {MAX_TOOL_INTERFACES} exceeded"
+                )));
+            }
             ctx.tool_interfaces.push(interface.clone());
             Self::snapshot_context(ctx)
         };
@@ -2649,6 +2677,8 @@ impl ContextManager {
             }
             // Mark member as write-revoked. The member remains present but
             // their messages will be rejected by the send path.
+            // No artificial cap on write_revoked_members — naturally bounded
+            // by membership count (§5.9: cannot revoke write for non-members).
             ctx.write_revoked_members.insert(did.clone());
 
             // Broadcast mode: also destroy the author's broadcast key so
@@ -6148,6 +6178,131 @@ mod tests {
         assert!(
             matches!(err, ContextError::PermissionDenied(_)),
             "should be PermissionDenied (DID check), not MembershipFailed (context lookup): {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Collection bounds tests (#360, §5.9)
+    // -----------------------------------------------------------------------
+
+    /// #360: register exactly 256 tools (the limit), verify the 256th succeeds;
+    /// attempt to register a 257th, verify `LimitExceeded` is returned.
+    #[tokio::test]
+    async fn registered_tools_bounded_at_256() {
+        let (manager, _handle) = setup_active_context().await;
+        let pid: ProposalId = [0u8; 32];
+
+        // Register exactly MAX_REGISTERED_TOOLS tools.
+        for i in 0..super::MAX_REGISTERED_TOOLS {
+            let reg = ToolRegistration {
+                name: format!("tool-{i}"),
+            };
+            manager
+                .execute_register_tool("test-ctx", &reg, pid)
+                .await
+                .unwrap();
+        }
+
+        // The 257th must fail with LimitExceeded.
+        let overflow = ToolRegistration {
+            name: "tool-overflow".to_owned(),
+        };
+        let err = manager
+            .execute_register_tool("test-ctx", &overflow, pid)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ContextError::LimitExceeded(msg) if msg.contains("256")),
+            "expected LimitExceeded with limit value, got: {err}"
+        );
+    }
+
+    /// #360: establish exactly 256 tool interfaces (the limit), verify the 256th
+    /// succeeds; attempt to establish a 257th, verify `LimitExceeded` is returned.
+    #[tokio::test]
+    async fn tool_interfaces_bounded_at_256() {
+        let (manager, _handle) = setup_active_context().await;
+        let pid: ProposalId = [0u8; 32];
+
+        // Establish exactly MAX_TOOL_INTERFACES interfaces.
+        for i in 0..super::MAX_TOOL_INTERFACES {
+            let iface = ToolInterface {
+                source_context: "test-ctx".to_owned(),
+                target_context: format!("target-{i}"),
+                tool_id: format!("tool-{i}"),
+                rate_limit: None,
+                approved_by_source: true,
+                approved_by_target: true,
+            };
+            manager
+                .execute_establish_tool_interface("test-ctx", &iface, pid)
+                .await
+                .unwrap();
+        }
+
+        // The 257th must fail with LimitExceeded.
+        let overflow = ToolInterface {
+            source_context: "test-ctx".to_owned(),
+            target_context: "target-overflow".to_owned(),
+            tool_id: "tool-overflow".to_owned(),
+            rate_limit: None,
+            approved_by_source: true,
+            approved_by_target: true,
+        };
+        let err = manager
+            .execute_establish_tool_interface("test-ctx", &overflow, pid)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ContextError::LimitExceeded(msg) if msg.contains("256")),
+            "expected LimitExceeded with limit value, got: {err}"
+        );
+    }
+
+    /// #360: add exactly 64 signers (the limit), verify the 64th succeeds;
+    /// attempt to add a 65th, verify `LimitExceeded` is returned.
+    #[tokio::test]
+    async fn threshold_signers_bounded_at_64() {
+        let (manager, _handle) = setup_active_context().await;
+        let pid: ProposalId = [0u8; 32];
+
+        // First, add 64 members to the context so they pass the membership check.
+        // The creator ("did:key:creator") is already a member.
+        let mut dids: Vec<DID> = Vec::with_capacity(super::MAX_THRESHOLD_SIGNERS);
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("test-ctx").unwrap();
+            for i in 0..super::MAX_THRESHOLD_SIGNERS {
+                let did: DID = format!("did:key:signer-{i}").into();
+                ctx.membership
+                    .add_member(did.clone(), "member".to_owned(), vec![]);
+                dids.push(did);
+            }
+        }
+
+        // Add exactly MAX_THRESHOLD_SIGNERS signers.
+        for did in &dids {
+            manager
+                .execute_add_signer("test-ctx", did, pid)
+                .await
+                .unwrap();
+        }
+
+        // The 65th must fail with LimitExceeded.
+        let overflow_did: DID = "did:key:signer-overflow".into();
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("test-ctx").unwrap();
+            ctx.membership
+                .add_member(overflow_did.clone(), "member".to_owned(), vec![]);
+        }
+        let err = manager
+            .execute_add_signer("test-ctx", &overflow_did, pid)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ContextError::LimitExceeded(msg) if msg.contains("64")),
+            "expected LimitExceeded with limit value, got: {err}"
         );
     }
 }

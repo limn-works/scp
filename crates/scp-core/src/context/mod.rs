@@ -283,6 +283,11 @@ pub enum ContextError {
     #[error("invalid key package: {0}")]
     InvalidKeyPackage(String),
 
+    /// A governance action would exceed a protocol-level collection size limit
+    /// (§5.9). The message includes the limit value for debuggability.
+    #[error("limit exceeded: {0}")]
+    LimitExceeded(String),
+
     /// An invalid memory scope was requested for a broadcast context.
     ///
     /// Broadcast contexts only support `MemoryScope::Full` because they lack
