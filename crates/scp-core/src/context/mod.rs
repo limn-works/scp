@@ -150,7 +150,7 @@ pub use governance::{
 pub use broadcast::{
     AuthorBlockResult, AuthorState, AuthorStateSnapshot, BlockResult, BroadcastAdmission,
     BroadcastContext, BroadcastContextSnapshot, KeyRequestDecision, SubscriberRecord,
-    SubscriptionResult, UnsubscribeResult,
+    SubscriberRegistration, SubscriptionResult, UnsubscribeResult,
 };
 
 // Re-export TTL management types (SCP-021, SCP-066).

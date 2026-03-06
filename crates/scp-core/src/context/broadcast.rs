@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -42,6 +43,123 @@ pub enum BroadcastAdmission {
     Open,
     /// Subscription requires a valid `messagesRead` UCAN (gated-broadcast).
     Gated,
+}
+
+// ---------------------------------------------------------------------------
+// SubscriberRegistration (wire type — spec section 5.14.3)
+// ---------------------------------------------------------------------------
+
+/// Wire-type subscriber registration request for broadcast contexts.
+///
+/// This is the DID-signed registration message that a prospective subscriber
+/// publishes to the context's `routing_id` as a structured relay message
+/// (spec section 5.14.3). The author SDK processes the registration, verifies
+/// the signature, checks admission policy, and responds with broadcast key
+/// material via the pull-based key protocol.
+///
+/// The signature covers `context_id || subscriber_did || wrapping_pubkey || timestamp`
+/// using the subscriber's Active Signing Key (Ed25519).
+///
+/// See spec section 5.14.3 and issue #299.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriberRegistration {
+    /// The subscriber's DID (identity).
+    pub subscriber_did: DID,
+    /// X25519 public key for HPKE key wrapping. Authors use this to encrypt
+    /// broadcast key material for the subscriber.
+    #[serde(with = "serde_bytes")]
+    pub wrapping_pubkey: Vec<u8>,
+    /// Optional UCAN token. Required for gated broadcast contexts
+    /// (`gated-broadcast` template) — must grant `messagesRead`.
+    /// `None` for open broadcast contexts (`public-broadcast` template).
+    pub ucan: Option<UcanToken>,
+    /// Unix timestamp (seconds) of registration request.
+    pub timestamp: u64,
+    /// Ed25519 signature over `context_id || subscriber_did || wrapping_pubkey || timestamp`.
+    /// Verified against the subscriber's Active Signing Key resolved via
+    /// the `DidResolver`.
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+}
+
+impl SubscriberRegistration {
+    /// Builds the signing input for signature creation and verification.
+    ///
+    /// The signing input is the concatenation of:
+    /// `context_id || subscriber_did || wrapping_pubkey || timestamp`
+    ///
+    /// `timestamp` is encoded as 8 big-endian bytes for deterministic
+    /// serialization across platforms.
+    #[must_use]
+    pub fn signing_input(
+        context_id: &str,
+        subscriber_did: &DID,
+        wrapping_pubkey: &[u8],
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let mut input = Vec::new();
+        input.extend_from_slice(context_id.as_bytes());
+        input.extend_from_slice(subscriber_did.0.as_bytes());
+        input.extend_from_slice(wrapping_pubkey);
+        input.extend_from_slice(&timestamp.to_be_bytes());
+        input
+    }
+
+    /// Verifies the registration signature against the subscriber's Active
+    /// Signing Key, resolved via the provided `DidResolver`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::PermissionDenied`] if:
+    /// - The DID cannot be resolved to a public key.
+    /// - The public key bytes are invalid (not a valid Ed25519 point).
+    /// - The signature is invalid for the signing input.
+    pub fn verify_signature<D: DidResolver>(
+        &self,
+        context_id: &str,
+        did_resolver: &D,
+    ) -> Result<(), ContextError> {
+        // Resolve the subscriber's Ed25519 public key.
+        let pub_key_bytes = did_resolver
+            .resolve_public_key(&self.subscriber_did.0)
+            .map_err(|e| {
+                ContextError::PermissionDenied(format!(
+                    "cannot resolve public key for {}: {e}",
+                    self.subscriber_did.0
+                ))
+            })?;
+
+        let verifying_key = VerifyingKey::from_bytes(&pub_key_bytes).map_err(|e| {
+            ContextError::PermissionDenied(format!(
+                "invalid Ed25519 public key for {}: {e}",
+                self.subscriber_did.0
+            ))
+        })?;
+
+        let sig_bytes: [u8; 64] = self.signature.as_slice().try_into().map_err(|_| {
+            ContextError::PermissionDenied(format!(
+                "invalid signature length: expected 64, got {}",
+                self.signature.len()
+            ))
+        })?;
+
+        let signature = Signature::from_bytes(&sig_bytes);
+
+        let signing_input = Self::signing_input(
+            context_id,
+            &self.subscriber_did,
+            &self.wrapping_pubkey,
+            self.timestamp,
+        );
+
+        verifying_key
+            .verify(&signing_input, &signature)
+            .map_err(|e| {
+                ContextError::PermissionDenied(format!(
+                    "subscriber registration signature verification failed: {e}"
+                ))
+            })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +528,73 @@ impl BroadcastContext {
     // -----------------------------------------------------------------------
     // Subscriber registration (spec section 5.14.3)
     // -----------------------------------------------------------------------
+
+    /// Processes a [`SubscriberRegistration`] wire message.
+    ///
+    /// This is the entry point for the subscriber registration protocol
+    /// (spec section 5.14.3, issue #299). It:
+    ///
+    /// 1. Verifies the Ed25519 signature on the registration against the
+    ///    subscriber's Active Signing Key (resolved via `DidResolver`).
+    /// 2. Validates the wrapping public key length (32 bytes for X25519).
+    /// 3. Delegates to [`subscribe()`](Self::subscribe) for admission policy
+    ///    enforcement (open vs gated) and UCAN validation.
+    /// 4. Returns a [`SubscriptionResult`] containing author epochs and
+    ///    the `MemberJoined` event.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::PermissionDenied`] if signature verification fails.
+    /// - [`ContextError::PermissionDenied`] if wrapping key has invalid length.
+    /// - All errors from [`subscribe()`](Self::subscribe) (gated UCAN
+    ///   validation, duplicate subscriber, etc.).
+    pub fn register_subscriber<D, N, R, P, S>(
+        &mut self,
+        registration: &SubscriberRegistration,
+        validation_ctx: Option<&mut ValidationContext<'_, D, N, R, P, S>>,
+    ) -> Result<SubscriptionResult, ContextError>
+    where
+        D: DidResolver,
+        N: NonceTracker,
+        R: RevocationChecker,
+        P: ProofResolver,
+        S: BuildHasher,
+    {
+        // Step 1: Resolve the DID resolver from the validation context or
+        // require one for signature verification. For open contexts without
+        // a validation context, we need at minimum the DID resolver.
+        // Since DidResolver is available via the validation context, we
+        // require it for all registration paths (signature verification
+        // always needs DID resolution).
+        let did_resolver: &D = match &validation_ctx {
+            Some(ctx) => ctx.did_resolver,
+            None => {
+                return Err(ContextError::PermissionDenied(
+                    "subscriber registration requires a DID resolver for signature verification"
+                        .to_owned(),
+                ));
+            }
+        };
+
+        // Step 2: Verify the Ed25519 signature.
+        registration.verify_signature(&self.context_id, did_resolver)?;
+
+        // Step 3: Validate wrapping key length (X25519 = 32 bytes).
+        if registration.wrapping_pubkey.len() != 32 {
+            return Err(ContextError::PermissionDenied(format!(
+                "invalid wrapping public key length: expected 32, got {}",
+                registration.wrapping_pubkey.len()
+            )));
+        }
+
+        // Step 4: Delegate to subscribe() for admission policy and UCAN validation.
+        self.subscribe(
+            &registration.subscriber_did.0,
+            registration.ucan.as_ref(),
+            registration.timestamp,
+            validation_ctx,
+        )
+    }
 
     /// Registers a subscriber in the broadcast context.
     ///
@@ -3406,5 +3591,565 @@ mod tests {
                 .block_list
                 .is_empty()
         );
+    }
+
+    // =======================================================================
+    // SubscriberRegistration wire type and signature verification (#299)
+    // =======================================================================
+
+    /// Helper to create a signed `SubscriberRegistration` for testing.
+    fn make_signed_registration(
+        context_id: &str,
+        subscriber_did: &str,
+        signing_key: &ed25519_dalek::SigningKey,
+        wrapping_pubkey: [u8; 32],
+        timestamp: u64,
+        ucan: Option<UcanToken>,
+    ) -> SubscriberRegistration {
+        use ed25519_dalek::Signer;
+
+        let did = DID(subscriber_did.to_owned());
+        let signing_input =
+            SubscriberRegistration::signing_input(context_id, &did, &wrapping_pubkey, timestamp);
+        let signature = signing_key.sign(&signing_input);
+
+        SubscriberRegistration {
+            subscriber_did: did,
+            wrapping_pubkey: wrapping_pubkey.to_vec(),
+            ucan,
+            timestamp,
+            signature: signature.to_bytes().to_vec(),
+        }
+    }
+
+    /// Helper to create a subscriber keypair and register its DID in the
+    /// resolver. Returns (signing_key, DID string, wrapping_pubkey).
+    fn make_subscriber_identity(
+        seed: [u8; 32],
+        did_str: &str,
+        did_resolver: &mut InMemoryDidResolver,
+    ) -> (ed25519_dalek::SigningKey, [u8; 32]) {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let verifying_key = signing_key.verifying_key();
+        did_resolver
+            .keys
+            .insert(did_str.to_owned(), verifying_key.to_bytes());
+
+        // Generate a deterministic X25519 wrapping key for testing.
+        let wrapping_pubkey = [seed[0]; 32];
+
+        (signing_key, wrapping_pubkey)
+    }
+
+    // -----------------------------------------------------------------------
+    // AC: SubscriberRegistration struct (§5.14.3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn subscriber_registration_struct_has_required_fields() {
+        let reg = SubscriberRegistration {
+            subscriber_did: DID("did:example:test".to_owned()),
+            wrapping_pubkey: vec![0u8; 32],
+            ucan: None,
+            timestamp: 1_700_000_000,
+            signature: vec![0u8; 64],
+        };
+        assert_eq!(reg.subscriber_did.0, "did:example:test");
+        assert_eq!(reg.wrapping_pubkey.len(), 32);
+        assert!(reg.ucan.is_none());
+        assert_eq!(reg.timestamp, 1_700_000_000);
+        assert_eq!(reg.signature.len(), 64);
+    }
+
+    #[test]
+    fn subscriber_registration_signing_input_is_deterministic() {
+        let did = DID("did:example:sub".to_owned());
+        let pubkey = [42u8; 32];
+        let ts = 1_700_000_000u64;
+
+        let input1 = SubscriberRegistration::signing_input("ctx-1", &did, &pubkey, ts);
+        let input2 = SubscriberRegistration::signing_input("ctx-1", &did, &pubkey, ts);
+        assert_eq!(input1, input2, "signing input must be deterministic");
+
+        // Different context_id produces different input.
+        let input3 = SubscriberRegistration::signing_input("ctx-2", &did, &pubkey, ts);
+        assert_ne!(input1, input3);
+    }
+
+    // -----------------------------------------------------------------------
+    // AC: Signature verification on SubscriberRegistration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn subscriber_registration_valid_signature_passes() {
+        let mut setup = GatedTestSetup::new();
+        let sub_seed = [99u8; 32];
+        let sub_did = "did:example:subscriber";
+        let (sub_key, wrapping_pubkey) =
+            make_subscriber_identity(sub_seed, sub_did, &mut setup.did_resolver);
+
+        let reg = make_signed_registration(
+            "ctx-open-1",
+            sub_did,
+            &sub_key,
+            wrapping_pubkey,
+            1_700_000_000,
+            None,
+        );
+
+        let result = reg.verify_signature("ctx-open-1", &setup.did_resolver);
+        assert!(result.is_ok(), "valid signature must pass: {result:?}");
+    }
+
+    #[test]
+    fn subscriber_registration_tampered_timestamp_fails_signature() {
+        // AC: submit SubscriberRegistration with invalid signature
+        // (tampered timestamp) → rejected with signature verification error.
+        let mut setup = GatedTestSetup::new();
+        let sub_seed = [99u8; 32];
+        let sub_did = "did:example:subscriber";
+        let (sub_key, wrapping_pubkey) =
+            make_subscriber_identity(sub_seed, sub_did, &mut setup.did_resolver);
+
+        let mut reg = make_signed_registration(
+            "ctx-open-1",
+            sub_did,
+            &sub_key,
+            wrapping_pubkey,
+            1_700_000_000,
+            None,
+        );
+
+        // Tamper with the timestamp after signing.
+        reg.timestamp += 1;
+
+        let result = reg.verify_signature("ctx-open-1", &setup.did_resolver);
+        assert!(result.is_err(), "tampered timestamp must fail verification");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("signature verification failed"),
+            "error must indicate signature failure, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn subscriber_registration_wrong_context_fails_signature() {
+        let mut setup = GatedTestSetup::new();
+        let sub_seed = [99u8; 32];
+        let sub_did = "did:example:subscriber";
+        let (sub_key, wrapping_pubkey) =
+            make_subscriber_identity(sub_seed, sub_did, &mut setup.did_resolver);
+
+        // Sign for "ctx-1" but verify against "ctx-2".
+        let reg = make_signed_registration(
+            "ctx-1",
+            sub_did,
+            &sub_key,
+            wrapping_pubkey,
+            1_700_000_000,
+            None,
+        );
+
+        let result = reg.verify_signature("ctx-2", &setup.did_resolver);
+        assert!(
+            result.is_err(),
+            "wrong context must fail signature verification"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AC: Open broadcast register_subscriber path (#299)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn register_subscriber_open_broadcast_succeeds() {
+        // AC: open broadcast registration with ucan: None auto-registers.
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        let mut setup = GatedTestSetup::new();
+        let sub_did = "did:example:subscriber";
+        let (sub_key, wrapping_pubkey) =
+            make_subscriber_identity([99u8; 32], sub_did, &mut setup.did_resolver);
+
+        let reg = make_signed_registration(
+            "ctx-broadcast-1",
+            sub_did,
+            &sub_key,
+            wrapping_pubkey,
+            1_700_000_000,
+            None,
+        );
+
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: sub_did,
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        let result = ctx.register_subscriber(&reg, Some(&mut val_ctx)).unwrap();
+
+        assert!(ctx.is_subscriber(sub_did));
+        assert_eq!(result.author_epochs["did:example:alice"], 0);
+        assert_eq!(
+            result.event,
+            ContextEvent::MemberJoined {
+                member_did: DID(sub_did.to_owned()),
+                role_name: "subscriber".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn register_subscriber_rejects_invalid_signature() {
+        // AC: submit SubscriberRegistration with invalid signature
+        // (tampered timestamp) → rejected with signature verification error.
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        let mut setup = GatedTestSetup::new();
+        let sub_did = "did:example:subscriber";
+        let (sub_key, wrapping_pubkey) =
+            make_subscriber_identity([99u8; 32], sub_did, &mut setup.did_resolver);
+
+        let mut reg = make_signed_registration(
+            "ctx-broadcast-1",
+            sub_did,
+            &sub_key,
+            wrapping_pubkey,
+            1_700_000_000,
+            None,
+        );
+        // Tamper with timestamp after signing.
+        reg.timestamp += 1;
+
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: sub_did,
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("signature verification failed"),
+            "must indicate signature failure: {err_msg}"
+        );
+        assert!(!ctx.is_subscriber(sub_did));
+    }
+
+    #[test]
+    fn register_subscriber_rejects_invalid_wrapping_key_length() {
+        let mut ctx = make_open_ctx();
+
+        let mut setup = GatedTestSetup::new();
+        let sub_did = "did:example:subscriber";
+        let (sub_key, _) = make_subscriber_identity([99u8; 32], sub_did, &mut setup.did_resolver);
+
+        // Use a 16-byte wrapping key instead of 32.
+        let bad_pubkey = [0u8; 16];
+        let did = DID(sub_did.to_owned());
+        let signing_input = SubscriberRegistration::signing_input(
+            "ctx-broadcast-1",
+            &did,
+            &bad_pubkey,
+            1_700_000_000,
+        );
+        use ed25519_dalek::Signer;
+        let signature = sub_key.sign(&signing_input);
+
+        let reg = SubscriberRegistration {
+            subscriber_did: did,
+            wrapping_pubkey: bad_pubkey.to_vec(),
+            ucan: None,
+            timestamp: 1_700_000_000,
+            signature: signature.to_bytes().to_vec(),
+        };
+
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: sub_did,
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("invalid wrapping public key length"),
+            "must indicate wrapping key issue: {err_msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AC: Gated broadcast register_subscriber path (#299)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn register_subscriber_gated_without_ucan_rejected() {
+        // AC: submit SubscriberRegistration to gated broadcast with ucan: None
+        // → rejected with error specifying "messagesRead UCAN required for
+        // gated broadcast".
+        let mut ctx = make_gated_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        let mut setup = GatedTestSetup::new();
+        let sub_did = "did:example:subscriber";
+        let (sub_key, wrapping_pubkey) =
+            make_subscriber_identity([99u8; 32], sub_did, &mut setup.did_resolver);
+
+        let reg = make_signed_registration(
+            "ctx-gated-1",
+            sub_did,
+            &sub_key,
+            wrapping_pubkey,
+            1_700_000_000,
+            None, // No UCAN for gated context.
+        );
+
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: sub_did,
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("gated broadcast requires messagesRead UCAN")
+                || err_msg.contains("messagesRead UCAN required"),
+            "must specify messagesRead UCAN required, got: {err_msg}"
+        );
+        assert!(!ctx.is_subscriber(sub_did));
+    }
+
+    #[test]
+    fn register_subscriber_gated_with_valid_ucan_succeeds() {
+        // AC: gated broadcast with valid messagesRead UCAN passes full
+        // 11-step validation.
+        let mut ctx = make_gated_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        let mut setup = GatedTestSetup::new();
+        let sub_did = "did:example:subscriber";
+        let (sub_key, wrapping_pubkey) =
+            make_subscriber_identity([99u8; 32], sub_did, &mut setup.did_resolver);
+
+        let ucan = setup.make_ucan("ctx-gated-1", sub_did);
+
+        let reg = make_signed_registration(
+            "ctx-gated-1",
+            sub_did,
+            &sub_key,
+            wrapping_pubkey,
+            1_700_000_000,
+            Some(ucan),
+        );
+
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: sub_did,
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        let result = ctx.register_subscriber(&reg, Some(&mut val_ctx)).unwrap();
+
+        assert!(ctx.is_subscriber(sub_did));
+        assert_eq!(
+            result.event,
+            ContextEvent::MemberJoined {
+                member_did: DID(sub_did.to_owned()),
+                role_name: "subscriber".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn register_subscriber_gated_with_expired_ucan_rejected() {
+        // AC: submit SubscriberRegistration to gated broadcast with expired
+        // UCAN → rejected at validation step 4 (time bounds).
+        let mut ctx = make_gated_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        let mut setup = GatedTestSetup::new();
+        let sub_did = "did:example:subscriber";
+        let (sub_key, wrapping_pubkey) =
+            make_subscriber_identity([99u8; 32], sub_did, &mut setup.did_resolver);
+
+        // Create an expired UCAN — exp in the past.
+        let expired_ucan = {
+            use base64::Engine;
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            use ed25519_dalek::Signer as _;
+
+            let now_secs = crate::time::now_secs().expect("clock unavailable");
+            let now_millis = crate::time::now_millis().expect("clock unavailable");
+
+            let header = UcanHeader::new();
+            let payload = UcanPayload {
+                iss: setup.issuer_did.clone(),
+                aud: sub_did.to_owned(),
+                exp: now_secs.saturating_sub(3600), // Expired 1 hour ago.
+                nbf: Some(now_secs.saturating_sub(7200)),
+                nnc: format!("{now_millis}-expired11223344expired11223344"),
+                att: vec![Attenuation {
+                    with: format!("scp:ctx:ctx-gated-1/messages:read"),
+                    can: "read".to_owned(),
+                }],
+                prf: vec![],
+                fct: None,
+            };
+
+            let header_json = serde_json::to_vec(&header).unwrap();
+            let payload_json = serde_json::to_vec(&payload).unwrap();
+            let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
+            let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+            let signing_input_str = format!("{header_b64}.{payload_b64}");
+            let sig = setup.signing_key.sign(signing_input_str.as_bytes());
+            let sig_bytes = sig.to_bytes().to_vec();
+            let sig_b64 = URL_SAFE_NO_PAD.encode(&sig_bytes);
+            let encoded = format!("{header_b64}.{payload_b64}.{sig_b64}");
+
+            UcanToken {
+                header,
+                payload,
+                signature: sig_bytes,
+                encoded,
+            }
+        };
+
+        let reg = make_signed_registration(
+            "ctx-gated-1",
+            sub_did,
+            &sub_key,
+            wrapping_pubkey,
+            1_700_000_000,
+            Some(expired_ucan),
+        );
+
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: sub_did,
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
+        assert!(result.is_err(), "expired UCAN must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("UCAN validation failed"),
+            "error must indicate UCAN validation failure: {err_msg}"
+        );
+        assert!(!ctx.is_subscriber(sub_did));
+    }
+
+    // -----------------------------------------------------------------------
+    // AC: Round-trip test — mint messagesRead UCAN → validate (#299)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn roundtrip_open_broadcast_mint_validate_ucan() {
+        // AC: mint a messagesRead UCAN for a subscriber in open broadcast →
+        // validate it via validate_ucan() → passes all 11 steps.
+        let setup = GatedTestSetup::new();
+        let sub_did = "did:example:subscriber";
+        let context_id = "ctx-broadcast-roundtrip";
+
+        // Mint a valid messagesRead UCAN.
+        let ucan = make_signed_ucan(context_id, &setup.issuer_did, sub_did, &setup.signing_key);
+
+        // Validate it through the full 11-step pipeline.
+        let required_cap = CapabilityUri::new(context_id, "messages", "read");
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: sub_did,
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        let result = validate_ucan(&ucan, &required_cap, &mut val_ctx);
+        assert!(
+            result.is_ok(),
+            "round-trip minted UCAN must pass full validation: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AC: SubscriberRegistration serialization roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn subscriber_registration_serde_roundtrip() {
+        let reg = SubscriberRegistration {
+            subscriber_did: DID("did:example:test".to_owned()),
+            wrapping_pubkey: vec![42u8; 32],
+            ucan: None,
+            timestamp: 1_700_000_000,
+            signature: vec![0xAA; 64],
+        };
+
+        let json = serde_json::to_string(&reg).unwrap();
+        let decoded: SubscriberRegistration = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.subscriber_did, reg.subscriber_did);
+        assert_eq!(decoded.wrapping_pubkey, reg.wrapping_pubkey);
+        assert_eq!(decoded.timestamp, reg.timestamp);
+        assert_eq!(decoded.signature, reg.signature);
+        assert!(decoded.ucan.is_none());
+    }
+
+    #[test]
+    fn subscriber_registration_msgpack_roundtrip() {
+        let reg = SubscriberRegistration {
+            subscriber_did: DID("did:example:msgpack-test".to_owned()),
+            wrapping_pubkey: vec![77u8; 32],
+            ucan: None,
+            timestamp: 1_700_000_000,
+            signature: vec![0xBB; 64],
+        };
+
+        let bytes = rmp_serde::to_vec(&reg).unwrap();
+        let decoded: SubscriberRegistration = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.subscriber_did, reg.subscriber_did);
+        assert_eq!(decoded.wrapping_pubkey, reg.wrapping_pubkey);
+        assert_eq!(decoded.timestamp, reg.timestamp);
+        assert_eq!(decoded.signature, reg.signature);
     }
 }
