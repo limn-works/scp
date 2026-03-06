@@ -323,18 +323,19 @@ Additional review fixes (81185a1): deny_unknown_fields on 4 sender key wire type
 ### Phase 2: Governance Cleanup (serial — same files) — PARTIAL
 
 **Step 1:** #349 (f64→u32 basis points) — **COMPLETE** → fadf4ff
-- Remaining: #357 → #360 → #320
+**Step 2:** #357 (vote signature verification) — **COMPLETE** → eba59b9 + review fix fbf0577
+- Remaining: #360 → #320
 
 ### Phase 3: Security Hardening (parallel, needs Phase 1 merged) — PARTIAL
 
 **Lane A** — #347 (deser size limits) — **COMPLETE** → 155f2b3 + review fix 1bd9403
-**Lane B** — #319 — **COMPLETE** → e6b86a9 + review fix 04c2281. #299 — **NOT STARTED** (3 dispatch attempts failed). #326 done in prior iteration.
+**Lane B** — #319 — **COMPLETE** → e6b86a9 + review fix 04c2281. #299 — **COMPLETE** → ffd3272 + review fix fbf0577. #326 done in prior iteration.
 **Lane C** — #339, #340 — **BLOCKED** on Phase 2 completion (#357+)
 **Lane D** — #321 — **COMPLETE** (prior iteration) → b7b4e1e + review fix 3eacfb2
 
 ### Phase 4: Identity Infrastructure (parallel with Phases 2-3) — PARTIAL
 
-**Lane A** — #327 (BEP44 sequence persistence) — **COMPLETE** → cc5eff1. #310 (PkarrDhtClient) — **COMPLETE** → 59f18b2 + review fix 04c2281. Remaining: #311
+**Lane A** — #327 (BEP44 sequence persistence) — **COMPLETE** → cc5eff1. #310 (PkarrDhtClient) — **COMPLETE** → 59f18b2 + review fix 04c2281. #311 (DID resolver unification) — **COMPLETE** → 6b2885e + review fix fbf0577
 **Lane B** — #315 (BIP-39 mnemonic) — **COMPLETE** → 7e61bb3. #325 (TOFU + cert pinning) — **COMPLETE** → 225c862 + review fix 1bd9403
 
 ### Phase 5: Core Infrastructure (CRITICAL PATH)
