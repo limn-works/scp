@@ -104,7 +104,14 @@ Any one of the following triggers a group state reset:
 
 ### 23.5.2 Reset Protocol
 
-1. The reconnecting member publishes a `ResetRequest` via the relay (not MLS-encrypted -- the member may not be able to encrypt at the current epoch). The request is signed by the member's Active Signing Key or Agent Signing Key (`#active` or `#agent`) for authentication. Includes context_id, member_did, last_known_epoch, reset reason, and signature.
+1. The reconnecting member publishes a `ResetRequest` via the relay (not MLS-encrypted -- the member may not be able to encrypt at the current epoch). The request includes context_id, member_did, last_known_epoch, reset reason, a 16-byte random nonce (CSPRNG), and a timestamp (Unix seconds). The request is signed by the member's Active Signing Key or Agent Signing Key (`#active` or `#agent`) for authentication, using the canonical hash construction (section 9.5.1) with domain separator `"SCP-RESET-REQUEST-V1:"`. The signed preimage includes: `context_id || member_did || last_known_epoch || reason_tag || nonce || timestamp`.
+
+   **Anti-replay validation.** Because the ResetRequest is transmitted as plaintext (not MLS-encrypted), it is visible to relays and network observers. An attacker who captures a valid ResetRequest could replay it to force-remove and re-add the member repeatedly, disrupting their session at low cost. To prevent this, the relay (or any recipient processing the request) MUST validate all three of the following before forwarding or acting on the request:
+
+   - **(a) Signature validity.** Verify the Ed25519 signature against the member's DID document (`#active` or `#agent` verification method).
+   - **(b) Timestamp freshness.** Reject requests where `|relay_clock - timestamp| > 30 seconds` (matching the freshness window used for SenderKeyRequest in section 9.16.2 and AccessKeyRequest in section 9.17).
+   - **(c) Nonce uniqueness.** Maintain a deduplication cache of `(member_did, nonce)` pairs with a 60-second TTL. Reject any request whose nonce has been seen within the TTL window. The 60-second TTL is 2x the freshness window to prevent replay after nonce eviction at the window boundary. Cache capacity: bounded at 10,000 entries with oldest-first eviction.
+
 2. An online member with `MemberRemove` + `MemberInvite` capabilities (typically admin) processes the reset: (a) removes the offline member's stale leaf node via MLS `remove_member()`, (b) immediately re-adds the member using a fresh KeyPackage via MLS `add_member()`, (c) distributes the new Welcome message via relay.
 3. The reconnecting member processes the Welcome, joining the group at the current epoch. They request sender keys for all current members via the pull-based protocol (ADR-007).
 4. The reconnecting member's outbound queue is drained using the new epoch's key schedule.
@@ -197,6 +204,10 @@ To support offline member addition (a member can be added to a group even when t
 | `COMMIT_PROCESS_TIMEOUT` | 5 seconds | Per-Commit processing timeout |
 | `SENDER_KEY_TIMEOUT` | 60 seconds | Sender key re-acquisition timeout |
 | `RECONNECTION_DEDUP_WINDOW` | 30 seconds | Multi-device reconnection deduplication window |
+| `RESET_REQUEST_NONCE_SIZE` | 16 bytes | Random nonce size for ResetRequest anti-replay |
+| `RESET_REQUEST_FRESHNESS_WINDOW` | 30 seconds | Maximum age of a valid ResetRequest timestamp |
+| `RESET_NONCE_DEDUP_TTL` | 60 seconds | TTL for ResetRequest nonce deduplication cache entries |
+| `RESET_NONCE_DEDUP_CAPACITY` | 10,000 entries | Maximum entries in ResetRequest nonce dedup cache |
 
 ## 23.12 Error Model
 
@@ -213,6 +224,7 @@ Sync errors are categorized by the reconnection phase in which they occur:
 - **CommitProcessingFailed** -- A Commit in the catch-up sequence was corrupted or failed.
 - **GapTimeoutExpired** -- Gap timeout expired before a missing message arrived.
 - **ReconnectionTimeout** -- Overall 120-second reconnection timeout exceeded.
+- **ResetRequestRejected** -- ResetRequest failed anti-replay validation (invalid signature, stale timestamp, or replayed nonce).
 
 Per-context sync outcomes are reported to the application layer:
 
