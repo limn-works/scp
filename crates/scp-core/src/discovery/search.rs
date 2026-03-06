@@ -114,7 +114,7 @@ pub async fn unified_search<C: ContactCache, Q: ContextQuerier>(
             all_entries.push(DiscoveryResultEntry {
                 did: agent_entry.did.clone(),
                 capabilities: agent_entry.capabilities.clone(),
-                behavioral_summary: None,
+                participation_summary: None,
                 provenance: DataProvenance {
                     source_did: agent_entry.did,
                     source_context: Some(context_id.clone()),
@@ -407,7 +407,7 @@ mod tests {
         DiscoveryResultEntry {
             did: did.into(),
             capabilities: caps.iter().map(|c| (*c).to_owned()).collect(),
-            behavioral_summary: None,
+            participation_summary: None,
             provenance: DataProvenance {
                 source_did: did.into(),
                 source_context: source_context.map(ToOwned::to_owned),

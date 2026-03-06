@@ -110,7 +110,7 @@ Contexts MAY declare participation requirements for admission, enforced mechanic
 ```
 RequireParticipation {
     fact: ParticipationFact,          // which participation category
-    threshold: BehavioralThreshold, // comparison + value
+    threshold: ParticipationThreshold, // comparison + value
     max_age_secs: u64,             // record freshness requirement
     min_contexts: u32,             // from at least N independent contexts
 }
@@ -126,7 +126,7 @@ RequireParticipation {
 - `RoleProgressionCount` — Number of role transitions (`role_history.len()`).
 - `AttestationCount` — Number of attestation events (`attestation_history.len()`).
 
-**`BehavioralThreshold` operators:**
+**`ParticipationThreshold` operators:**
 
 - `GreaterThan(u64)` — Fact value must be strictly greater than the specified value.
 - `LessThan(u64)` — Fact value must be strictly less than the specified value.
@@ -426,7 +426,7 @@ Attestation {
   id:          unique identifier
   type:        identity_link | capability_delegation | tool_integrity |
                endorsement | role_assignment | agent_capability |
-               context_endorsement | behavioral_witness
+               context_endorsement | participation_witness
   issuer:      DID of the entity making the claim
   subject:     what the claim is about (DID, tool_id, context_id, etc.)
   claim:       structured content (type-specific)

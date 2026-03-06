@@ -483,13 +483,13 @@ pub(crate) fn canonical_attestation_bytes(attestation: &Attestation) -> Vec<u8> 
 ///
 /// Some attestation types require evidence:
 /// - `ToolIntegrity` requires evidence (hash of the tool).
-/// - `BehavioralWitness` requires evidence (log reference).
+/// - `ParticipationWitness` requires evidence (log reference).
 ///
 /// Other types accept optional evidence without strict requirements.
 fn validate_evidence(attestation: &Attestation) -> Result<(), TrustError> {
     let requires_evidence = matches!(
         attestation.attestation_type,
-        AttestationType::ToolIntegrity | AttestationType::BehavioralWitness
+        AttestationType::ToolIntegrity | AttestationType::ParticipationWitness
     );
 
     if requires_evidence && attestation.evidence.is_none() {

@@ -247,8 +247,8 @@ pub enum AttestationType {
     RoleAssignment,
     /// Endorses a context.
     ContextEndorsement,
-    /// Witnesses behavioral facts.
-    BehavioralWitness,
+    /// Witnesses participation facts.
+    ParticipationWitness,
 }
 
 /// Returns a stable numeric tag for each attestation type variant.
@@ -266,7 +266,7 @@ pub const fn attestation_type_tag(at: &AttestationType) -> u16 {
         AttestationType::Endorsement => 4,
         AttestationType::RoleAssignment => 5,
         AttestationType::ContextEndorsement => 6,
-        AttestationType::BehavioralWitness => 7,
+        AttestationType::ParticipationWitness => 7,
     }
 }
 
@@ -365,7 +365,7 @@ mod tests {
         AttestationType::Endorsement,
         AttestationType::RoleAssignment,
         AttestationType::ContextEndorsement,
-        AttestationType::BehavioralWitness,
+        AttestationType::ParticipationWitness,
     ];
 
     #[test]

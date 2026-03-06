@@ -142,7 +142,7 @@ pub struct DiscoveryResult {
 
 /// A single entry in a discovery result set.
 ///
-/// Contains the agent's DID, advertised capabilities, optional behavioral
+/// Contains the agent's DID, advertised capabilities, optional participation
 /// summary, provenance metadata, and a relevance score.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DiscoveryResultEntry {
@@ -150,8 +150,8 @@ pub struct DiscoveryResultEntry {
     pub did: DID,
     /// The agent's advertised capabilities.
     pub capabilities: Vec<String>,
-    /// Optional behavioral summary (agent-computed from event logs).
-    pub behavioral_summary: Option<serde_json::Value>,
+    /// Optional participation summary (agent-computed from event logs).
+    pub participation_summary: Option<serde_json::Value>,
     /// Provenance metadata for this entry.
     pub provenance: DataProvenance,
     /// Relevance score (0.0 to 1.0). Higher is more relevant.
@@ -258,7 +258,7 @@ mod tests {
         let entry = DiscoveryResultEntry {
             did: "did:dht:zTestDid".into(),
             capabilities: vec!["code_review".to_owned(), "testing".to_owned()],
-            behavioral_summary: Some(serde_json::json!({"participation": 42})),
+            participation_summary: Some(serde_json::json!({"participation": 42})),
             provenance: DataProvenance {
                 source_did: "did:dht:zSourceDid".into(),
                 source_context: Some("ctx-001".to_owned()),
