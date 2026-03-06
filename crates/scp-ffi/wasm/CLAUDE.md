@@ -14,57 +14,47 @@ All re-implementations must be algorithm-identical to scp-core. When scp-core ch
 
 | Module | Responsibility |
 |--------|---------------|
-| `runtime.rs` | WASM-local runtime registry: `WasmContextRuntime`, `ToolRegistry`, `WasmEventLog`, Merkle proof functions, schema validation, `with_context` |
-| `context.rs` | Context lifecycle: create, join, leave, close, send, subscribe |
-| `tools.rs` | Tool registration, invocation, verification |
-| `ucan.rs` | UCAN token management: validate, mint, revoke |
-| `event_log.rs` | Event log query, Merkle inclusion/absence proofs |
+| `manager.rs` | `WasmContextManager` — central coordinator for all context state. Mirrors `scp_core::context::manager::ContextManager` API surface. All bridge functions delegate here. |
+| `runtime.rs` | Pure algorithm implementations: `ToolRegistry`, `WasmEventLog`, Merkle proof functions, schema validation. No state management. |
+| `context.rs` | Context lifecycle bridge: create, join, leave, close, send, subscribe, membership queries, governance, broadcast, TTL, drain_events. All delegate to `manager.rs`. |
+| `tools.rs` | Tool registration, invocation, verification. Delegates to `manager.rs`. |
+| `ucan.rs` | UCAN token management: validate (full 11-step pipeline), mint, revoke. Validation algorithm is local; state ops (nonces, revocations) delegate to `manager.rs`. |
+| `event_log.rs` | Event log query, Merkle inclusion/absence proofs. Delegates to `manager.rs`. |
 | `identity.rs` | Identity create, load, resolve |
 | `transport.rs` | Transport connect/disconnect/status |
 | `custody.rs` | `JsKeyCustody` extern type (WebCrypto injection point) |
 | `storage.rs` | `JsStorage` extern type (OPFS/IndexedDB injection point) |
 | `error.rs` | `ScpWasmError` → `JsError` mapping with stable error codes |
 
-## Runtime Registry
+## WasmContextManager (manager.rs)
 
-WASM is single-threaded. The context registry uses `thread_local! { static CONTEXT_REGISTRY: RefCell<HashMap<String, WasmContextRuntime>> }` — no `Mutex` or `DashMap` needed. `with_context(id, closure)` is the access pattern, mirroring the PyO3 bridge's pattern.
+Central coordinator for all context state. Mirrors `ContextManager` from scp-core. Uses `thread_local! { RefCell<WasmContextManager> }` for the singleton (WASM is single-threaded). Access via `with_manager(|mgr| { ... })`.
 
-`WasmContextRuntime` fields:
-- `tool_registry: ToolRegistry` — tool registration/invocation
-- `event_log: WasmEventLog` — Merkle tree (append-only, RFC 6962)
-- `ceiling_strings: HashSet<String>` — capability ceiling for UCAN validation
-- `creator_did: String` — DID of the context creator
+The manager owns all per-context state (`PerContextState`): lifecycle state, members, roles, tool registry, event log (Merkle tree), UCAN nonce/revocation tracking, event buffer, broadcast state, governance replay protection, write-revoked members, and TTL.
 
-Note: UCAN revocation state lives in `WasmUcanState` (in `ucan.rs`), not on `WasmContextRuntime`. The `is_token_revoked` helper queries the per-context revocation set via `with_ucan_state`.
+All 24 `GovernanceAction` variants are dispatchable through `execute_governance_action`. Broadcast operations (subscribe, publish, unsubscribe, block) are direct methods. Membership queries (member_count, is_member, member_dids, member_role) mirror `ContextManager` exactly.
 
-## UCAN Validation — Known Gaps (SCP-218)
+## UCAN Validation — Full 11-Step Pipeline
 
-`validate_tool_ucan_wasm` (in `runtime.rs`) performs 7-step validation:
-1. JWT format check (3-part dot-split)
-2. Base64 decode + JSON parse of payload
-3. Expiry check (`exp` required field)
-4. Revocation check via `WasmUcanState.revoked_cids` using `compute_revocation_cid` (JSON payload hash)
-5. Audience DID validation (`aud` required field)
-6. Capability string match against `att` array (`tool_invoke:{name}` or wildcard)
-7. Capability ceiling compliance
-
-The function is decomposed into 6 focused helpers (`parse_and_decode_ucan_payload`, `check_ucan_expiry`, `check_ucan_revocation`, `check_ucan_audience`, `check_ucan_tool_capability`, `check_ucan_ceiling`) to stay under clippy's 100-line limit.
-
-**Not yet implemented** (deferred to key custody wiring):
-- Ed25519 signature verification — requires `JsKeyCustody` (WebCrypto) injection
-- Delegation chain traversal — requires proof token resolution
-- Root issuer verification
-- Attenuation enforcement
-- Nonce replay detection (infrastructure exists: add `nonce_tracker: HashSet<String>` to `WasmContextRuntime`)
-
-Do NOT claim "full validation" in docstrings until all steps are implemented. See `.docs/lessons/wasm-partial-ucan-validation.md`.
+`ucan_validate` performs the full 11-step UCAN validation pipeline from ADR-016:
+1. Parse JWT format (3 base64url segments)
+2. Ed25519 signature verification via `ed25519-dalek`
+3. Delegation chain verification (aud/iss linkage, recursive)
+4. Root issuer must be context creator
+5. Audience DID validation (with RED-105 trailing-slash protection)
+6. Capability match (fail-closed on unparseable URIs)
+7. Attenuation enforcement (child capabilities ⊆ parent)
+8. Capability ceiling check
+9. Nonce replay detection (delegated to `WasmContextManager`)
+10. Revocation check (delegated to `WasmContextManager`)
+11. Time bounds (exp, nbf, 24h max lifetime)
 
 ## UCAN Revocation — CID Consistency
 
-`ucan_revoke` and `validate_tool_ucan_wasm` MUST hash the same input to compute the revocation CID. **Both use `compute_revocation_cid` which hashes the JSON-serialized `UcanPayload` struct** (matching scp-core's `compute_revocation_cid` in `revoke.rs`). This means the CID is derived from the payload content, NOT from the full JWT string. Any deviation silently breaks revocation. See `.docs/lessons/wasm-cid-consistency.md`.
+`ucan_revoke` and `ucan_validate` MUST hash the same input to compute the revocation CID. **Both must call `compute_token_cid` on the full JWT string** — not a nonce-derived ID, not the payload struct. Any deviation silently breaks revocation. See `.docs/lessons/wasm-cid-consistency.md`.
 
-`ucan_revoke` parameter: full encoded JWT string — decoded to payload, then `compute_revocation_cid`.
-`validate_tool_ucan_wasm` revocation check: decodes payload bytes to `UcanPayloadForRevocation`, calls `compute_revocation_cid_from_payload`, checks against `WasmUcanState.revoked_cids`.
+`ucan_revoke` parameter: full encoded JWT string (same as PyO3 `py_ucan_revoke`).
+`ucan_validate` revocation check: `compute_token_cid(&token)` where `token` is the full JWT parameter.
 
 ## Capability Wildcard Matching
 
