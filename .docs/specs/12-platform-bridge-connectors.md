@@ -142,7 +142,7 @@ This creates two envelope types within a bridged encrypted context:
 - **MLS-encrypted envelopes** — from native members, using the MLS group key schedule. Bridge cannot decrypt these.
 - **Sender-key-encrypted envelopes** — from shadow identities, using per-shadow sender keys. All context members (native and bridge) can decrypt these.
 
-The envelope type discriminator (§9.5) distinguishes the two paths on the receive side. Both decryption paths already exist in the protocol — MLS for encrypted contexts, sender keys for broadcast contexts.
+The receiver distinguishes the two paths by envelope structure: MLS-encrypted envelopes contain an MLS ciphertext payload, while sender-key-encrypted envelopes contain a sender key ciphertext with the shadow's DID in the sender field. Both decryption paths already exist in the protocol — MLS for encrypted contexts, sender keys for broadcast contexts.
 
 Context metadata (§5.7) MUST include `bridge_operator_did` when a bridge is registered, so members can see that a bridge is present and evaluate trust accordingly.
 
@@ -150,7 +150,7 @@ Context metadata (§5.7) MUST include `bridge_operator_did` when a bridge is reg
 
 A malicious bridge operator can:
 
-1. **Fabricate shadow messages** — attribute content to platform users who did not produce it. Mitigated by `BridgeProvenance` (§12.4) which makes bridge attribution visible.
+1. **Fabricate shadow messages** — attribute content to platform users who did not produce it. Mitigated by `BridgeProvenance` (§12.5) which makes bridge attribution visible.
 2. **Selectively drop messages** — suppress platform-to-SCP or SCP-to-platform delivery. Detectable via the platform's own delivery confirmation mechanisms.
 3. **Correlate activity** — observe which platform users correspond to which shadow identities across contexts it operates in. Mitigated by separate bridge registrations per context (§12.6).
 4. **Inject false attestations** — claim platform identity verification that did not occur. Mitigated by attestation freshness checks (§7.4.4) and governance-level bridge revocation (§12.2).
@@ -206,7 +206,7 @@ This section specifies the concrete HTTP API that a cooperating external platfor
 ### 12.10.1 Design Principles
 
 - **Platform implements, bridge node consumes.** The platform exposes these endpoints. The bridge node calls them and also exposes a webhook receiver for platform-initiated events. The platform never calls SCP directly.
-- **Minimal surface area.** Six endpoints. No SCP-specific data structures leak into the platform's API — all SCP envelope construction, MLS encryption, and provenance marking happen on the bridge node.
+- **Minimal surface area.** Six endpoints. No SCP-specific data structures leak into the platform's API — all SCP envelope construction, sender key encryption (§12.6.1), and provenance marking happen on the bridge node.
 - **Authentication via DID-signed tokens.** The bridge operator's DID signs bearer tokens used for all requests. The platform validates signatures against the operator's published DID document.
 - **Idempotent where possible.** Shadow creation and deletion are idempotent to tolerate retries.
 - **JSON over HTTPS.** All requests and responses use `Content-Type: application/json`. TLS 1.3 required per §9.13.
@@ -355,7 +355,7 @@ Emit a message attributed to a shadow identity. The bridge node receives this, c
 }
 ```
 
-The `202 Accepted` status indicates the bridge node has accepted the message for processing. Envelope construction and MLS encryption happen asynchronously. The `bridge_provenance` field confirms the provenance chain that will be attached.
+The `202 Accepted` status indicates the bridge node has accepted the message for processing. Envelope construction and sender key encryption (§12.6.1) happen asynchronously. The `bridge_provenance` field confirms the provenance chain that will be attached.
 
 **Claimed shadows:** If the shadow has been claimed (bound to a DID), messages can still be emitted through this endpoint, but the provenance chain will reflect the claimed status (`shadow_status: "Claimed"`) and the trust level evaluation will place it at the `ClaimedBridged` tier (§12.5).
 
