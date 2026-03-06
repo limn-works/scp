@@ -88,28 +88,25 @@ Every capability above must work through at least one SDK binding (Python).
 
 These spec findings **block** existing implementation work. Implementing the code without resolving the spec gap will produce non-interoperable or insecure results.
 
-### HARD BLOCKS (implement this spec fix BEFORE touching the code issue)
+### HARD BLOCKS (spec fix BEFORE code)
 
-| Spec Finding | Blocks | Why |
+| Spec Finding | Blocks | Issue |
 |---|---|---|
-| **CRYPTO-01** (canonical serialization) | #338 (envelope pipeline), #346 (sender key wire), #351 (InnerEnvelope) | Two implementations can't verify each other's signatures without length prefixes. Implementing the pipeline now locks in the wrong format. |
-| **CRYPTO-04** (sender key nonce) | #346 (sender key wire format) | #346 fixes 4 deviations but nonce generation isn't one of them. Without specifying nonce, the fix is incomplete and GCM nonce reuse is possible. |
-| **CRYPTO-03** (HPKE not RFC 9180) | #312 (HPKE domain separator), #346 | #312 fixes the domain string but the underlying construction is still informal. Must decide: adopt RFC 9180 modes or fully specify the bespoke construction. |
-| **ADR-016-C3** (UCAN nonce format) | #313 (dedup TTL), #319 (UCAN at tool boundary), #326 (UniFFI UCAN) | Minted tokens will fail validation. Fix the spec contradiction first, then implement nonce handling consistently. |
-| **12.6-001/002** (bridge MLS model) | ALL SCP-BCH-* stories | Can't implement bridge HTTP endpoints until the fundamental question is answered: does the bridge join the MLS group? |
-| **ADR-029-C3** (ResetRequest anti-replay) | #324 (MLS epoch conflict) | The sync protocol's reset mechanism is exploitable via replay. Must add nonce/freshness before wiring sync. |
-| **5.13.2** (relay eligibility for encrypted) | #333 (MLS integration) | Context nesting validation can't work if the relay can't see membership. Resolve mechanism before implementing MLS group ops. |
+| **CRYPTO-04** (sender key nonce generation) | #346 (sender key wire format) | — |
+| **CRYPTO-03** (HPKE not RFC 9180) | #312 (HPKE domain separator), #346 | — |
+| **ADR-016-C3** (UCAN nonce format) | #313, #319, #326 | #380 |
+| **ADR-029-C3** (ResetRequest anti-replay) | #324 (MLS epoch conflict) | #381 |
+| **5.13.2** (relay eligibility for encrypted) | #333 (MLS integration) | #374 |
 
-### SOFT BLOCKS (should fix spec, but code can proceed with a TODO)
+### BLOCKS (spec fix BEFORE code)
 
-| Spec Finding | Affects | Risk if deferred |
+| Spec Finding | Blocks | Issue |
 |---|---|---|
-| CRYPTO-12 (attestation canonicalization) | SCP-BA-001–006 (participation admission) | Participation profiles won't be verifiable cross-implementation. Can implement with a canonical format and backfill spec. |
-| CRYPTO-14 (ParticipationProfile signing key) | SCP-BA-001–006 | Same — implement with a chosen KDF and document it. |
-| CRYPTO-18 (broadcast key nonce) | #352 (BroadcastEnvelope fields) | Missing nonce field in struct. Can add it and document, then update spec. |
-| 03-IDENTITY-1/2 (private state encryption) | #329 (ProtocolStore persistence) | Identity private state is a future feature. Does not block core network. |
-| 8.4/9.1 (app sandboxing) | SCP-ACR-* (capability registry) | Capability declarations work without runtime sandboxing. Security risk, not interop risk. |
-| 15-001 (GDPR vs Merkle) | #303 (event log) | Tombstoning can be added later. Does not block core event log implementation. |
+| CRYPTO-14 (ParticipationProfile signing key KDF) | SCP-BA-001–006 | — |
+| CRYPTO-18 (broadcast key nonce) | #352 (BroadcastEnvelope fields) | — |
+| 03-IDENTITY-1/2 (private state encryption) | #329 (ProtocolStore persistence) | #372 |
+| 8.4/9.1 (app sandboxing) | SCP-ACR-* (capability registry) | #376 |
+| 15-001 (GDPR erasure — §15 clarification) | — | #379 |
 
 ---
 
@@ -128,10 +125,8 @@ These spec findings **block** existing implementation work. Implementing the cod
 
 | Spec Finding | Existing Issue | Conflict |
 |---|---|---|
-| CRYPTO-01 (length prefixes) | #346 (sender key wire format) | #346 fixes 4 deviations in sender key wire format. CRYPTO-01 says the signature preimage itself needs length prefixes. Both touch `key_protocol.rs` — the CRYPTO-01 fix must come first or be bundled with #346. |
 | CRYPTO-03 (HPKE not RFC 9180) | #312 (domain separator mismatch) | #312 fixes the info string. CRYPTO-03 says the entire construction is wrong. Fixing only the string while leaving the bespoke ECDH+HKDF is insufficient. Must resolve together. |
 | ADR-016-C3 (nonce format) | #313 (dedup TTL) | #313 changes TTL from 1hr to 24hr. ADR-016-C3 says the nonce format itself is contradictory (UUID v4 vs timestamp-hex). The TTL fix is pointless if the format is wrong. |
-| 12.6-001 (bridge MLS) | #370 (bridge zero FFI) | #370 tracks missing FFI exposure for bridge module. But the bridge module itself can't work for encrypted contexts until the MLS membership model is decided. |
 | ADR-029-C3 (ResetRequest replay) | #324 (MLS epochs conflict) | #324 addresses the epoch/grace window mismatch. ADR-029-C3 says the ResetRequest message itself is vulnerable. Both are sync protocol issues that should be resolved together. |
 
 ### Existing GH Issues That Need Expanded Scope
@@ -256,79 +251,63 @@ These blocking relationships exist per the execution plan but are not declared i
 ```
 SPEC TRACK (all parallel — spec-only changes, no code conflicts):
 
-  S-A: Canonical serialization spec          S-B: UCAN nonce format fix
-       (CRYPTO-01, CRYPTO-12, CRYPTO-13)          (ADR-016-C3)
-       Define CanonicalHash trait pattern          Pick {unix_millis}-{hex16}
-       Add length prefixes to all formulas         Update ADR-016 mint_ucan
+  S-B: UCAN nonce format fix (#380)          S-C: Versioning spec (§13, #378)
+       Pick {unix_millis}-{hex16}                  Define version field, negotiation,
+       Update ADR-016 mint_ucan                    forward compat, degraded mode
 
-  S-C: Versioning spec (§13)                 S-D: Bridge MLS model decision
-       (H-28–H-32, 13-002)                       (12.6-001, 12.6-002, 12-SECURITY)
-       Define version field, negotiation,          Decide: bridge joins MLS group?
-       forward compat, degraded mode               Add threat model for bridge operators
+  S-E: Identity private state spec (#372)    S-F: Sender key crypto spec
+       Specify encryption algo, multi-device       (CRYPTO-03, CRYPTO-04)
+       Specify social/device recovery              Specify RFC 9180 mode + nonce gen
 
-  S-E: Identity private state spec           S-F: Sender key crypto spec
-       (03-IDENTITY-1, 03-IDENTITY-2)             (CRYPTO-03, CRYPTO-04)
-       Specify encryption algo, multi-device       Specify RFC 9180 mode + nonce gen
-       Specify social/device recovery              Specify wire format with nonce field
-
-  S-G: Sync protocol anti-replay             S-H: Context nesting eligibility
-       (ADR-029-C3)                                (5.13.2)
+  S-G: Sync anti-replay (#381)              S-H: Context nesting eligibility (#374)
        Add nonce to ResetRequest                   Specify mechanism for relay to verify
        Add freshness binding                       parent membership in encrypted contexts
+
+  S-I: §15 erasure clarification (#379)
+       3 sentences: ephemeral enforcement,
+       local deletion, Merkle leaf retention
 ```
 
-### What Can Run In Parallel With Spec Track (existing code issues, no spec dependencies)
+S-A (canonical serialization) and S-D (bridge MLS model) are DONE.
 
 ```
-CODE TRACK (Phase 1 — same as before):
+CODE TRACK (can start now — no remaining spec dependencies):
 
-  C-A: #345,#313  C-B: #348  C-C: #354,#355,#291,#350  C-D: #301
-  C-E: #353       C-F: #349→#357→#360→#320 (governance serial chain)
+  C-A: #345,#313 [needs S-B]     C-B: #348         C-C: #354,#355,#291,#350
+  C-D: #301                      C-E: #353          C-F: #349→#357→#360→#320
+  C-G: #351, #290 (envelope types — S-A done, unblocked)
 ```
 
-### What CANNOT Start Until Spec Decisions Land
+### What CANNOT Start Until Spec Fixes Land
 
 | Code Work | Waiting On Spec |
 |---|---|
-| #346 (sender key wire format) | S-A (canonical serialization) + S-F (HPKE/nonce) |
+| #346 (sender key wire format) | S-F (HPKE/nonce) |
 | #312 (HPKE domain separator) | S-F (RFC 9180 mode decision) |
-| #351, #290 (envelope types) | S-A (length prefix pattern) |
-| #338 (envelope pipeline) | S-A + #356 (both) |
 | #313 (dedup TTL) | S-B (nonce format) |
 | #319, #326 (UCAN security) | S-B (nonce format) |
-| SCP-BCH-* (bridge cooperative) | S-D (bridge MLS model) |
 | #324 (MLS epoch conflict) | S-G (ResetRequest anti-replay) |
-| SCP-BA-* (participation admission) | S-A (canonical serialization for profiles) |
+| SCP-BA-* (participation admission) | CRYPTO-14 (signing key KDF) |
 | #352 (BroadcastEnvelope fields) | S-F (broadcast key nonce) |
 
 ---
 
 ## Revised Execution Phases
 
-### Phase 0: Spec Fixes (NEW — max parallelism, spec-only)
+### Phase 0: Spec Fixes (6 remaining lanes, all parallel)
 
-8 parallel lanes. All are spec/ADR document changes. No code changes. No inter-lane dependencies. Target: resolve all hard-block spec gaps before implementation proceeds.
+S-A (canonical serialization) and S-D (bridge MLS model) are DONE.
 
-**Lane S-A** — Canonical Serialization Pattern
-- Define `CanonicalHash` construction: 4-byte BE length prefix on all variable-length fields + domain separator prefix
-- Update: SS9 §9.5 (line 214, 216), SS7 §7.4.1, §7.3.2.1, ADR-002 criterion 2
-- Template: migration proof at SS9 line ~350
-
-**Lane S-B** — UCAN Nonce Format Resolution
+**Lane S-B** — UCAN Nonce Format Resolution (#380)
 - Pick `{unix_millis}-{hex16}` (matches validation step 9 and implementation)
 - Update: ADR-016 mint_ucan criterion 3 (remove "UUID v4 or 32 random bytes")
 
-**Lane S-C** — Protocol Versioning (§13)
+**Lane S-C** — Protocol Versioning (§13) (#378)
 - Define version number, wire format field, negotiation mechanism, forward compat rules, degraded mode
 - Update: SS13 (currently 10 lines → needs full spec section)
 - Add version field to InnerEnvelope and BroadcastEnvelope structs
 
-**Lane S-D** — Bridge MLS Membership Model
-- Decide architectural question: bridge as MLS group member (degrades E2E) or alternative access model
-- Add bridge operator threat model to SS9 §9.2
-- Update: SS12 §12.6, §12.10.5, §12.10.7
-
-**Lane S-E** — Identity Private State
+**Lane S-E** — Identity Private State (#372)
 - Specify encryption: X25519 key derived from Ed25519 Identity Key via RFC 7748, AES-256-GCM
 - Specify multi-device: key sharing via HPKE to device-specific X25519 keys
 - Specify social/device recovery: quorum threshold, wire format, failure semantics
@@ -340,11 +319,11 @@ CODE TRACK (Phase 1 — same as before):
 - Add nonce field to BroadcastEnvelope struct
 - Update: SS9 §9.16.1, §9.16.2, SS5 §5.14.5, ADR-007
 
-**Lane S-G** — Sync Protocol Anti-Replay
+**Lane S-G** — Sync Protocol Anti-Replay (#381)
 - Add nonce + timestamp + challenge-response freshness to ResetRequest
 - Update: ADR-029 §4, SS23 §23.5.2
 
-**Lane S-H** — Context Nesting Eligibility
+**Lane S-H** — Context Nesting Eligibility (#374)
 - Specify mechanism for relay to verify parent membership for encrypted contexts
 - Options: membership attestation, governance-signed eligibility proof, or remove relay-level validation for encrypted nesting
 - Update: SS5 §5.13.2
@@ -570,47 +549,27 @@ PHASE 12: #291,#301,#303,#343,#344
 
 ---
 
-## Totals
+## PRD Breakdown
 
-| Category | Count |
-|----------|-------|
-| GitHub issues | 80 |
-| PRD stories (unfinished) | 52 (across 6 PRDs) |
-| PRD stories (done) | 272 |
-| Spec audit: NEW CRITICALs | 11 |
-| Spec audit: NEW HIGHs | 37 |
-| Spec audit: PARTIALLY TRACKED (need issue expansion) | ~106 |
-| Auto-closed by root cause (#356) | 3 |
-| GH issue provenance errors | 25 broken spec refs, 3 factual inaccuracies, 18 missing dep declarations |
-| **Total open work items** | **177** |
-| **Net after auto-close** | **174** |
-
-### PRD Breakdown
-
-| PRD | Done | Unfinished | Blocked By |
-|-----|------|------------|------------|
-| main.json | 173 | 12 | #356, #290, #306, #307 |
-| content-access.json | 0 | 10 | #309 (Phase 6), #356 |
-| governance-integration.json | 0 | 8 | #356, #320 (Phase 2) |
-| capability-registry.json | 0 | 7 | — (independent) |
-| bridge-cooperative.json | 0 | 9 | **Phase 0 S-D** (bridge MLS model) |
-| participation-admission.json | 0 | 6 | Phase 0 S-A (soft) |
-| agent-binding.json | 22 | 0 | — |
-| http-features.json | 8 | 0 | — |
-| persistence.json | 36 | 0 | — |
-| reachability.json | 16 | 0 | — |
-| transport-expansion.json | 17 | 0 | — |
+| PRD | Unfinished | Blocked By |
+|-----|------------|------------|
+| main.json | 12 | #356, #290, #306, #307 |
+| content-access.json | 10 | #309 (Phase 6), #356 |
+| governance-integration.json | 8 | #356, #320 (Phase 2) |
+| capability-registry.json | 7 | — (independent) |
+| bridge-cooperative.json | 9 + sender key stories TBD | — (S-D resolved) |
+| participation-admission.json | 6 | CRYPTO-14 (signing key KDF) |
 
 ---
 
 ## Critical Path Timeline
 
 ```
-         WEEK 1              WEEK 2              WEEK 3              WEEK 4
+         NOW                 NEXT                THEN                THEN
     ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
     │  PHASE 0    │    │  PHASE 1    │    │  PHASE 5    │    │  PHASE 6    │
-    │  Spec fixes │───→│  Code fixes │───→│  #300→#356  │───→│  MLS chain  │
-    │  (8 lanes)  │    │  (7 lanes)  │    │  →#338      │    │  #333→#317  │
+    │  6 spec     │───→│  Code fixes │───→│  #300→#356  │───→│  MLS chain  │
+    │  lanes left │    │  (8 lanes)  │    │  →#338      │    │  #333→#317  │
     └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
          │                   │
          │              ┌────┴────┐
