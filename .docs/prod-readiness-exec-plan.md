@@ -327,11 +327,11 @@ Additional review fixes (81185a1): deny_unknown_fields on 4 sender key wire type
 **Step 3:** #360 (governance collection bounds) — **COMPLETE** → fe86235 + review fix de6984a
 **Step 4:** #320 (GovernanceModel enum + proposal lifecycle) — **COMPLETE** → d535efa
 
-### Phase 3: Security Hardening (parallel, needs Phase 1 merged) — NEARLY COMPLETE
+### Phase 3: Security Hardening (parallel, needs Phase 1 merged) — COMPLETE
 
 **Lane A** — #347 (deser size limits) — **COMPLETE** → 155f2b3 + review fix 1bd9403
 **Lane B** — #319 — **COMPLETE** → e6b86a9 + review fix 04c2281. #299 — **COMPLETE** → ffd3272 + review fix fbf0577. #326 done in prior iteration.
-**Lane C** — #340 (promotion policy tests) — **COMPLETE** → c33675d. #339 (ceiling enforcement) — **PARTIAL** → 72deffe (governance action ceiling gates done; UCAN minting/delegation ceiling enforcement remaining)
+**Lane C** — #340 (promotion policy tests) — **COMPLETE** → c33675d. #339 (ceiling enforcement) — **COMPLETE** → 72deffe (governance actions) + 2c6d5c9 + 4a2d2e0 (UCAN minting/delegation + FFI wiring)
 **Lane D** — #321 — **COMPLETE** (prior iteration) → b7b4e1e + review fix 3eacfb2
 
 ### Phase 4: Identity Infrastructure (parallel with Phases 2-3) — COMPLETE
