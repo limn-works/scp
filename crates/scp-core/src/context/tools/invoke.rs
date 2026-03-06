@@ -1053,6 +1053,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
         let token = mint_ucan(&params, &custody).await.unwrap();
 

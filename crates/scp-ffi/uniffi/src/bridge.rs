@@ -2370,6 +2370,11 @@ async fn ucan_delegate_impl(
                 })
                 .collect();
 
+            // Get ceiling from the runtime registry for delegation-time enforcement (#339).
+            let ceiling_strings = crate::runtime::with_context(&handle.context_id, |rt| {
+                Ok(rt.ceiling_strings.clone())
+            })?;
+
             let params = scp_core::crypto::ucan::mint::DelegateParams {
                 parent_token: &parsed_parent,
                 delegator_did: &handle.creator_did,
@@ -2380,6 +2385,7 @@ async fn ucan_delegate_impl(
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: Some(ceiling_strings),
             };
 
             let token = scp_core::crypto::ucan::mint::delegate_ucan(&params, &custody.0)
