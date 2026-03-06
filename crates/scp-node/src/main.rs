@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use scp_identity::cache::SystemClock;
-use scp_identity::{DidCache, DidDht, InMemoryDhtClient};
+use scp_identity::{DidCache, DidDht, InMemoryDhtClient, InMemorySequenceStore, PkarrDhtClient};
 use scp_node::{ApplicationNodeBuilder, TlsProvider};
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 use scp_transport::native::server::{RelayConfig, RelayServer};
@@ -215,14 +215,83 @@ async fn run_full_node() {
         "starting scp-node in full mode"
     );
 
-    // Identity components (in-memory for now; production would use
-    // persistent storage and a real DHT client).
+    // Identity components.
+    //
+    // SCP_NODE_DHT_MODE controls the DHT client:
+    //   - "production" (default): PkarrDhtClient with Mainline DHT + optional
+    //     HTTP gateway fallback via SCP_NODE_DHT_GATEWAYS (comma-separated).
+    //   - "memory": InMemoryDhtClient for testing/development.
+    //
+    // Sequence persistence uses InMemorySequenceStore. A production deployment
+    // should replace this with a persistent SequenceStore backed by the
+    // Storage trait (see #327 for the pattern).
     let custody = Arc::new(InMemoryKeyCustody::new());
-    let dht_client = Arc::new(InMemoryDhtClient::new());
     let cache = Arc::new(DidCache::new());
-    let sign_fn = DidDht::<InMemoryDhtClient, SystemClock>::make_sign_fn(Arc::clone(&custody));
-    let did_method = Arc::new(DidDht::with_client_and_signer(dht_client, cache, sign_fn));
+    let sequence_store = Arc::new(InMemorySequenceStore::new());
 
+    let dht_mode = env::var("SCP_NODE_DHT_MODE").unwrap_or_else(|_| "production".into());
+
+    if dht_mode == "memory" {
+        tracing::warn!(
+            "using InMemoryDhtClient — DID documents will NOT be published to the network"
+        );
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let sign_fn = DidDht::<InMemoryDhtClient, SystemClock>::make_sign_fn(Arc::clone(&custody));
+        let did_method = Arc::new(DidDht::with_client_signer_and_store(
+            dht_client,
+            cache,
+            sign_fn,
+            sequence_store,
+        ));
+
+        run_full_node_with(domain, http_addr, custody, did_method).await;
+        return;
+    }
+
+    // Production: PkarrDhtClient with Mainline DHT.
+    let mut dht_builder = PkarrDhtClient::builder();
+
+    // Add HTTP gateway URLs from SCP_NODE_DHT_GATEWAYS (comma-separated).
+    if let Ok(gateways) = env::var("SCP_NODE_DHT_GATEWAYS") {
+        for gateway in gateways.split(',') {
+            let gateway = gateway.trim();
+            if !gateway.is_empty() {
+                tracing::info!(gateway = %gateway, "adding DHT HTTP gateway");
+                dht_builder = dht_builder.gateway_url(gateway);
+            }
+        }
+    }
+
+    let dht_client = match dht_builder.build() {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to create PkarrDhtClient");
+            std::process::exit(1);
+        }
+    };
+
+    let sign_fn = DidDht::<PkarrDhtClient, SystemClock>::make_sign_fn(Arc::clone(&custody));
+    let did_method = Arc::new(DidDht::with_client_signer_and_store(
+        dht_client,
+        cache,
+        sign_fn,
+        sequence_store,
+    ));
+
+    run_full_node_with(domain, http_addr, custody, did_method).await;
+}
+
+/// Shared implementation for `run_full_node`, parameterized over the DID method.
+///
+/// Builds and runs the `ApplicationNode` with the given identity components.
+/// The DID method type `D` is generic so both `DidDht<PkarrDhtClient>` (production)
+/// and `DidDht<InMemoryDhtClient>` (development) work without trait objects.
+async fn run_full_node_with<D: scp_identity::DidMethod + 'static>(
+    domain: String,
+    http_addr: SocketAddr,
+    custody: Arc<InMemoryKeyCustody>,
+    did_method: Arc<D>,
+) {
     // If SCP_NODE_TLS_SELF_SIGNED=1, use a self-signed certificate for
     // development/testing. In production, the builder uses ACME by default.
     let use_self_signed = env::var("SCP_NODE_TLS_SELF_SIGNED")

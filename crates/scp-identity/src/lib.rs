@@ -51,6 +51,8 @@ pub use dht::{
 };
 // SigningKeyId is defined in this module and exported directly.
 pub use dht_client::{DhtClient, InMemoryDhtClient};
+#[cfg(feature = "production-dht")]
+pub use dht_client::{PkarrDhtClient, PkarrDhtClientBuilder};
 pub use document::{DidDocument, DidRotationEvent, MigrationProof, PreRotationProof};
 pub use republish::RepublishManager;
 pub use resolution::{
