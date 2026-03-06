@@ -140,7 +140,7 @@
       "gate": "gate-gov-wiring",
       "priority": "P1",
       "severity": "critical",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-core/src/context/governance/mod.rs",
         "crates/scp-core/src/context/mod.rs",
@@ -207,7 +207,7 @@
       "gate": "gate-gov-wiring",
       "priority": "P1",
       "severity": "critical",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-core/src/context/manager.rs",
         "crates/scp-core/src/context/mod.rs"

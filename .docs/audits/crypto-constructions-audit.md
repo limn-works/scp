@@ -1,5 +1,3 @@
-I now have comprehensive coverage of all the cryptographic constructions across all three spec files. Let me compile the exhaustive audit.
-
 ---
 
 > **Line number shift notice:** References to `05-contexts.md` §5.14 (broadcast) are shifted +47 to +64 after PR #296 merged. All findings remain valid.
@@ -368,9 +366,9 @@ Specify: "A UCAN token CID is computed as `SHA-256(canonical_json(payload))` whe
 
 ## Relevant File Paths
 
-- `/Users/alec/Developer/limn/scp/.claude/worktrees/audit/prod-readiness/.docs/specs/09-security-model.md` -- Primary security and cryptographic specification
-- `/Users/alec/Developer/limn/scp/.claude/worktrees/audit/prod-readiness/.docs/specs/03-identity.md` -- Identity, key custody, DID resolution
-- `/Users/alec/Developer/limn/scp/.claude/worktrees/audit/prod-readiness/.docs/specs/07-trust-validation-and-capabilities.md` -- UCAN, attestations, participation profiles
-- `/Users/alec/Developer/limn/scp/.claude/worktrees/audit/prod-readiness/.docs/specs/05-contexts.md` -- Broadcast context specifics (lines 801-935)
+- `.docs/specs/09-security-model.md` -- Primary security and cryptographic specification
+- `.docs/specs/03-identity.md` -- Identity, key custody, DID resolution
+- `.docs/specs/07-trust-validation-and-capabilities.md` -- UCAN, attestations, participation profiles
+- `.docs/specs/05-contexts.md` -- Broadcast context specifics (lines 801-935)
 
 Now let me update my memory with these findings.

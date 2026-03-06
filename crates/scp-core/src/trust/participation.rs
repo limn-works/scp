@@ -302,7 +302,8 @@ mod tests {
         ];
 
         let record =
-            compute_participation_record(&events, "did:key:alice", "ctx-1", [1u8; 32], 2000).unwrap();
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [1u8; 32], 2000)
+                .unwrap();
 
         assert_eq!(record.subject_did, "did:key:alice");
         assert_eq!(record.context_id, "ctx-1");
@@ -346,7 +347,8 @@ mod tests {
         ];
 
         let record =
-            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000).unwrap();
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+                .unwrap();
 
         assert_eq!(record.tool_invocations.len(), 2);
         assert_eq!(record.tool_invocations.get("tool-search"), Some(&2));
@@ -373,7 +375,8 @@ mod tests {
         ];
 
         let record =
-            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000).unwrap();
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+                .unwrap();
 
         assert_eq!(record.governance_actions_by.len(), 2);
         assert_eq!(record.governance_actions_by[0].event_sequence, 0);
@@ -405,7 +408,8 @@ mod tests {
         ];
 
         let record =
-            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000).unwrap();
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+                .unwrap();
 
         // Only the first governance action targets alice.
         assert_eq!(record.governance_actions_against.len(), 1);
@@ -443,7 +447,8 @@ mod tests {
         ];
 
         let record =
-            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000).unwrap();
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+                .unwrap();
 
         assert_eq!(record.role_history.len(), 2);
         assert_eq!(record.role_history[0].timestamp, 1000);
@@ -460,7 +465,8 @@ mod tests {
         ];
 
         let record =
-            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000).unwrap();
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+                .unwrap();
 
         assert_eq!(record.context_creation_count, 2);
     }
@@ -473,7 +479,8 @@ mod tests {
         ];
 
         let record =
-            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000).unwrap();
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+                .unwrap();
 
         assert_eq!(record.attestation_history.len(), 1);
         assert_eq!(record.attestation_history[0].timestamp, 1000);
@@ -491,7 +498,8 @@ mod tests {
         )];
 
         let record =
-            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000).unwrap();
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+                .unwrap();
 
         assert_eq!(record.participation_count, 1);
         assert_eq!(record.participation_duration_seconds, 0);
@@ -505,7 +513,8 @@ mod tests {
         ];
 
         let record =
-            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000).unwrap();
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+                .unwrap();
 
         // Record is valid but all counts are zero.
         assert_eq!(record.participation_count, 0);
@@ -589,7 +598,8 @@ mod tests {
         ];
 
         let record =
-            compute_participation_record(&events, "did:key:alice", "ctx-1", [99u8; 32], 5000).unwrap();
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [99u8; 32], 5000)
+                .unwrap();
 
         assert_eq!(record.participation_count, 8); // All events except bob's
         assert_eq!(record.participation_duration_seconds, 9); // 1009 - 1000

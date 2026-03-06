@@ -176,22 +176,26 @@ pub struct ThresholdRequirement {
     pub mutual_endorsement_penalty: f64,
 }
 
-fn default_shared_context_penalty() -> f64 {
+const fn default_shared_context_penalty() -> f64 {
     0.1
 }
 
-fn default_shared_context_penalty_cap() -> f64 {
+const fn default_shared_context_penalty_cap() -> f64 {
     0.5
 }
 
-fn default_mutual_endorsement_penalty() -> f64 {
+const fn default_mutual_endorsement_penalty() -> f64 {
     0.2
 }
 
 impl ThresholdRequirement {
     /// Creates a new `ThresholdRequirement` with default penalty values.
     #[must_use]
-    pub fn new(required_count: u32, total_attestors: u32, independence_threshold: f64) -> Self {
+    pub const fn new(
+        required_count: u32,
+        total_attestors: u32,
+        independence_threshold: f64,
+    ) -> Self {
         Self {
             required_count,
             total_attestors,

@@ -1,5 +1,3 @@
-Good. Now let me produce the full audit report.
-
 ---
 
 # ADR Completeness and Specification Gap Audit

@@ -29,9 +29,9 @@ use super::attestation::{
     Attestation, AttestorInfo, DidPublicKeyResolver, FreshnessStatus, ThresholdRequirement,
     check_attestation_freshness, check_threshold_attestation, verify_attestation,
 };
-use super::participation::compute_participation_record;
 use super::challenge::ChallengeVerification;
 use super::consequence::ConsequenceRule;
+use super::participation::compute_participation_record;
 use super::{AttestationType, TrustError, TrustInput};
 
 // ---------------------------------------------------------------------------
@@ -339,7 +339,7 @@ where
     C: Clock,
 {
     // 1. Compute participation record from event log.
-    let participation_profile = compute_participation_record(
+    let participation_record = compute_participation_record(
         ctx.events,
         ctx.subject_did,
         ctx.context_id,
@@ -369,7 +369,7 @@ where
 
     Ok(TrustInput {
         verified_attestations,
-        participation_profile,
+        participation_record,
         challenge_results,
         consequence_structure,
         threshold_counts,
@@ -964,11 +964,11 @@ mod tests {
         let input = aggregate_trust_input(&ctx).unwrap();
 
         // Participation profile.
-        assert_eq!(input.participation_profile.subject_did, "did:key:alice");
-        assert_eq!(input.participation_profile.context_id, "ctx-1");
-        assert_eq!(input.participation_profile.participation_count, 3);
+        assert_eq!(input.participation_record.subject_did, "did:key:alice");
+        assert_eq!(input.participation_record.context_id, "ctx-1");
+        assert_eq!(input.participation_record.participation_count, 3);
         assert_eq!(
-            input.participation_profile.tool_invocations.get("my-tool"),
+            input.participation_record.tool_invocations.get("my-tool"),
             Some(&1)
         );
 
@@ -1135,7 +1135,7 @@ mod tests {
         assert!(input.challenge_results.is_empty());
         assert!(input.consequence_structure.is_empty());
         assert!(input.threshold_counts.is_empty());
-        assert_eq!(input.participation_profile.participation_count, 1);
+        assert_eq!(input.participation_record.participation_count, 1);
     }
 
     #[test]

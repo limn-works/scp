@@ -1,5 +1,3 @@
-Now I have everything I need. Let me write the comprehensive audit.
-
 ---
 
 # SCP Specification Audit: Unspecified Details in Sections 8, 9, and 10
@@ -964,6 +962,6 @@ Total findings: **1 CRITICAL, 16 HIGH, 18 MEDIUM, 5 LOW**.
 
 ## Key Files Referenced
 
-- `/Users/alec/Developer/limn/scp/.claude/worktrees/audit/prod-readiness/.docs/specs/08-products-and-apps-in-the-graph.md`
-- `/Users/alec/Developer/limn/scp/.claude/worktrees/audit/prod-readiness/.docs/specs/09-security-model.md`
-- `/Users/alec/Developer/limn/scp/.claude/worktrees/audit/prod-readiness/.docs/specs/10-infrastructure-and-self-hosting.md`
+- `.docs/specs/08-products-and-apps-in-the-graph.md`
+- `.docs/specs/09-security-model.md`
+- `.docs/specs/10-infrastructure-and-self-hosting.md`

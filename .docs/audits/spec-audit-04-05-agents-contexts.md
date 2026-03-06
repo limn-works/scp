@@ -1,5 +1,3 @@
-Now let me compile all findings. I have read every line of both files. Let me produce the complete report.
-
 ---
 
 > **Line number shift notice:** This audit was written against pre-PR #296 `05-contexts.md` (~960 lines). PR #296 added ~64 lines (memberBan capability, metadata visibility, projection auth, governance bans). Line references to `05-contexts.md` are shifted: lines 1-34 unchanged, 35-90 shift +1, 91-229 shift +35, 230-863 shift +47, 864+ shift +49 to +64. All findings remain valid.

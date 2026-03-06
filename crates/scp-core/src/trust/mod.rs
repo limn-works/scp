@@ -62,10 +62,10 @@
 
 pub mod aggregate;
 pub mod attestation;
-pub(crate) mod participation;
 pub mod challenge;
 pub mod consequence;
 pub mod custody_violation;
+pub(crate) mod participation;
 pub mod renewal;
 
 use std::collections::HashMap;
@@ -83,9 +83,6 @@ pub use attestation::{
 // ParticipationRecord and compute_participation_record are not part of
 // the public API. The module is pub(crate); the testing feature gate
 // re-exports compute_participation_record for integration tests.
-pub(crate) use participation::ParticipationRecord;
-#[cfg(feature = "testing")]
-pub use participation::compute_participation_record;
 pub use challenge::{
     ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,
     VerificationMethod, issue_challenge, verify_challenge_response,
@@ -98,6 +95,9 @@ pub use custody_violation::{
     ActionCategory, CounterAttestation, CustodyViolationError, CustodyViolationResult,
     CustodyViolationType, ScpCustodyViolationAttestation, classify_action, enforce_category_a,
 };
+pub use participation::ParticipationRecord;
+#[cfg(feature = "testing")]
+pub use participation::compute_participation_record;
 pub use renewal::{DefaultRenewalChecker, RenewalChecker, RenewalError, renew_attestation};
 
 // ---------------------------------------------------------------------------
@@ -333,7 +333,7 @@ pub struct TrustInput {
 
     /// Participation profile (Layer 2). Computed from the local view of the
     /// event log for the subject DID.
-    pub participation_profile: ParticipationRecord,
+    pub participation_record: ParticipationRecord,
 
     /// Challenge-response results (Layer 3). Each entry is a verified
     /// challenge-response pair with metadata distinguishing self-attested
