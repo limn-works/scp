@@ -35,7 +35,7 @@ Every capability above must work through at least one SDK binding (Python).
 
 ## Issue + PRD Story + Spec Audit Inventory
 
-### GitHub Issues: 70 open
+### GitHub Issues: 80 open
 
 | Tier | Count | Issues |
 |------|-------|--------|
@@ -163,6 +163,89 @@ These issues exist but don't cover spec gaps found by the audit. Expand acceptan
 | `context/broadcast.rs` | CRYPTO-18, #353, #352, #335 | CRYPTO-18 → #352+#353 → #335 |
 | `sync/` | ADR-029-C3, #324 | ADR-029-C3 → #324 |
 | `bridge/` | 12.6-001/002, #370, SCP-BCH-* | 12.6-001/002 → #370 → SCP-BCH-* |
+| `scp-ffi/src/context.rs` | #300, #328, #332, #336, #356, #369 | #300 → #356 → #328/#332/#336/#369 |
+| `scp-identity/src/dht.rs` | #310, #327, #362 | #327 → #310; #362 independent |
+
+---
+
+## GH Issue Provenance Audit
+
+### Broken Spec References (25 issues)
+
+Issues with wrong file names, section numbers, or ADR locations in their bodies. These don't affect the validity of the issue (the problem is real) but the references are misleading.
+
+**Wrong spec file names (13 issues):**
+
+| Issue | References | Actual File |
+|---|---|---|
+| #318 | `10-trust-model.md` | `10-infrastructure-and-self-hosting.md` |
+| #319 | `06-tools.md` | `06-cross-context-communication.md` |
+| #319 | `08-capabilities.md` | `08-products-and-apps-in-the-graph.md` |
+| #320 | `07-governance.md` | Does not exist; governance is in `05-contexts.md` §5.9 |
+| #321 | `09-timestamps.md` (implied) | `09-security-model.md` |
+| #325 | `09-security.md` (for TOFU) | `09-security-model.md` §9.11 (not §9.12) |
+| #333 | ADR-019 for MLS | ADR-019 is Data Provenance; MLS is ADR-001 in `phase-1.md` |
+| #334 | ADR-031 in `phase-5.md` | ADR-031 is in `phase-6.md` |
+| #337 | §5.7 for ephemeral | Should be §5.10/§5.11 |
+| #339 | `08-capabilities.md` | `08-products-and-apps-in-the-graph.md` |
+| #340 | `06-tools.md` | `06-cross-context-communication.md` |
+| #341 | `07-trust.md` | `07-trust-validation-and-capabilities.md` |
+| #342 | `10-transport.md` | `10-infrastructure-and-self-hosting.md` |
+
+**Wrong section numbers (9 issues):**
+
+| Issue | Claims | Actual |
+|---|---|---|
+| #299 | §5.8, §6.1 | §5.14.3 (subscriber registration), §6.2 |
+| #300 | §5.3, §6.1 | §5.2 (context creation), §6.2 |
+| #310 | §3.4 | §3.10 (DID resolution) |
+| #311 | §3.3 | §3.10.1 (parallel resolution) |
+| #313 | §9.9b | §9.8.2(b) (replay protection) |
+| #315 | §9.12 for mnemonic | §9.11 (key continuity fingerprints) |
+| #320 | ADR-031 in phase-5.md | phase-6.md line 2279 |
+| #321 | §9.9a, §9.9c | §9.8.2(c), §9.8.5 |
+| #325 | §9.12 for TOFU | §9.11 |
+
+**Factual inaccuracies (3 issues):**
+
+| Issue | Claim | Reality |
+|---|---|---|
+| #320 | Governance models: "Consensus, Delegated, Weighted, Tiered" | Actual: SingleAdmin, Threshold, Majority, Unanimity |
+| #320 | "No multi-party governance exists" | majority.rs, unanimity.rs, multisig.rs exist; PR #296 implemented all 24 variants |
+| #337 | Conflates ContextMode with memory_scope | These are separate concepts |
+| #340 | Mischaracterizes what "promotion" means | §5.10 defines promotion as ephemeral→persistent, not capability escalation |
+
+### Missing Dependency Declarations (18)
+
+These blocking relationships exist per the execution plan but are not declared in issue bodies.
+
+**Phase 2 serial chain:**
+- #349 → #357 → #360 → #320 (all touch `governance/mod.rs` or `manager.rs`)
+- #320 → #339, #320 → #340 (governance enforcement needs governance actions)
+
+**Phase 4 serial chain:**
+- #327 → #310 → #311 (DID sequence → production DHT → resolver unification)
+
+**Phase 6 MLS chain:**
+- #333 → #324 → #314 → #309 → #317
+
+**Cross-phase file conflicts:**
+- #345 → #347 (same file: `protocol.rs`)
+- #346 → #347 (same file: `key_protocol.rs`)
+- #306 → #341 (WASM bridge before TypeScript SDK)
+- #307 → #331 (UniFFI bridge before Swift Trust/MCP)
+- #356 → #336 (ContextManager before context discovery)
+- #371 → #290 (canonical serialization before signaling binding)
+
+**New spec audit issues:**
+- #372 → #316 (identity encryption spec before compromise recovery)
+- #373 → #333 (invitation bundle format before MLS integration)
+- #377 → #333 (bridge MLS model before MLS accounts for bridges)
+- #381 → #333 (reset anti-replay before MLS sync)
+
+### Hardest Bottleneck
+
+**#338 (envelope pipeline)** has 7 direct blocking predecessors: #300, #314, #328, #332, #333, #356, #371. It sits at the convergence point of the entire dependency graph.
 
 ---
 
@@ -491,15 +574,16 @@ PHASE 12: #291,#301,#303,#343,#344
 
 | Category | Count |
 |----------|-------|
-| GitHub issues | 70 |
+| GitHub issues | 80 |
 | PRD stories (unfinished) | 52 (across 6 PRDs) |
 | PRD stories (done) | 272 |
 | Spec audit: NEW CRITICALs | 11 |
 | Spec audit: NEW HIGHs | 37 |
 | Spec audit: PARTIALLY TRACKED (need issue expansion) | ~106 |
 | Auto-closed by root cause (#356) | 3 |
-| **Total open work items** | **167** |
-| **Net after auto-close** | **164** |
+| GH issue provenance errors | 25 broken spec refs, 3 factual inaccuracies, 18 missing dep declarations |
+| **Total open work items** | **177** |
+| **Net after auto-close** | **174** |
 
 ### PRD Breakdown
 
