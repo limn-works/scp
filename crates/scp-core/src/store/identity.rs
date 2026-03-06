@@ -76,6 +76,13 @@ fn tofu_key(did: &DID) -> Result<String, super::StoreError> {
     Ok(format!("tofu/{did_str}"))
 }
 
+/// Public-within-store accessor for the TOFU key builder.
+///
+/// Used by `store::tofu` to avoid duplicating the key convention.
+pub(super) fn tofu_key_for_store(did: &DID) -> Result<String, super::StoreError> {
+    tofu_key(did)
+}
+
 // ---------------------------------------------------------------------------
 // DID cache entry
 // ---------------------------------------------------------------------------

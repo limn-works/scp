@@ -29,6 +29,7 @@
 //! See ADR-004 in `.docs/adrs/phase-1.md` for the full specification.
 
 pub mod adapter;
+pub mod cert_pin;
 pub(crate) mod client;
 #[cfg(feature = "combined")]
 pub mod combined;
@@ -50,6 +51,7 @@ pub mod storage;
 
 // Re-export primary types for convenience.
 pub use adapter::NativeRelayAdapter;
+pub use cert_pin::{CertPinResult, CertificatePin};
 pub use error::{NativeProtocolError, code};
 pub use protocol::{
     ClientMessage, DEFAULT_QUERY_LIMIT, MAX_BLOB_SIZE, MAX_BLOB_TTL, MAX_QUERY_LIMIT,
