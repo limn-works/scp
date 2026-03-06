@@ -192,4 +192,26 @@ pub enum EnvelopeError {
         /// The highest previously seen sequence number from this sender.
         last_seen_sequence: u64,
     },
+
+    /// The envelope's timestamp is not monotonically non-decreasing for this
+    /// sender (§9.8.2(c)).
+    ///
+    /// The received timestamp is strictly less than the last seen timestamp
+    /// from the same sender in the same context. This catches time-shifted
+    /// replays where an attacker bumps the sequence number but uses an older
+    /// timestamp.
+    #[error(
+        "timestamp regression: sender={sender_did} in context={context_id}, \
+         received={received_timestamp}, last_seen={last_seen_timestamp}"
+    )]
+    TimestampRegression {
+        /// The sender's DID.
+        sender_did: String,
+        /// The context identifier.
+        context_id: String,
+        /// The received (regressed) timestamp.
+        received_timestamp: u64,
+        /// The highest previously seen timestamp from this sender.
+        last_seen_timestamp: u64,
+    },
 }

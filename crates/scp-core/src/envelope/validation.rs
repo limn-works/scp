@@ -125,20 +125,24 @@ impl TimestampValidator {
 /// Composite key for per-sender sequence tracking: `(context_id, sender_did)`.
 type SenderKey = (String, String);
 
-/// Tracks per-sender sequence numbers to detect replay attacks (§9.8.2,
-/// §9.8.5).
+/// Tracks per-sender sequence numbers and timestamps to detect replay attacks
+/// (§9.8.2, §9.8.5).
 ///
 /// Each sender in each context maintains a monotonically increasing SCP
-/// sequence number. Any envelope with a sequence number less than or equal to
-/// the last seen value from the same sender is a replay and is rejected.
+/// sequence number and monotonically non-decreasing timestamp. Any envelope
+/// with a sequence number ≤ the last seen value, or a timestamp strictly less
+/// than the last seen timestamp, from the same sender is rejected.
+///
+/// Per-sender timestamp monotonicity catches time-shifted replays where an
+/// attacker bumps the sequence number but uses an older timestamp (§9.8.2(c)).
 ///
 /// This tracker is separate from the MLS generation number check (which is
 /// handled by the MLS layer). It provides an additional SCP-level replay
 /// defense.
 #[derive(Debug, Clone, Default)]
 pub struct SequenceTracker {
-    /// Maps `(context_id, sender_did)` to the highest sequence number seen.
-    last_seen: HashMap<SenderKey, u64>,
+    /// Maps `(context_id, sender_did)` to `(highest_sequence, last_timestamp)`.
+    last_seen: HashMap<SenderKey, (u64, u64)>,
 }
 
 impl SequenceTracker {
@@ -148,29 +152,39 @@ impl SequenceTracker {
         Self::default()
     }
 
-    /// Validates the sequence number of an inner envelope and, if valid,
-    /// updates the tracker state.
+    /// Validates the sequence number and timestamp of an inner envelope and,
+    /// if valid, updates the tracker state.
     ///
     /// # Errors
     ///
     /// Returns [`EnvelopeError::SequenceRegression`] if the envelope's
-    /// `sequence` is less than or equal to the highest sequence number
-    /// previously seen from the same `(context_id, sender_did)`.
+    /// `sequence` is ≤ the highest previously seen from the same sender, or
+    /// [`EnvelopeError::TimestampRegression`] if the timestamp is strictly
+    /// less than the last seen timestamp (§9.8.2(c)).
     pub fn validate_and_advance(&mut self, envelope: &InnerEnvelope) -> Result<(), EnvelopeError> {
         let key = (envelope.context_id.clone(), envelope.sender_did.clone());
 
-        if let Some(&last) = self.last_seen.get(&key)
-            && envelope.sequence <= last
-        {
-            return Err(EnvelopeError::SequenceRegression {
-                sender_did: envelope.sender_did.clone(),
-                context_id: envelope.context_id.clone(),
-                received_sequence: envelope.sequence,
-                last_seen_sequence: last,
-            });
+        if let Some(&(last_seq, last_ts)) = self.last_seen.get(&key) {
+            if envelope.sequence <= last_seq {
+                return Err(EnvelopeError::SequenceRegression {
+                    sender_did: envelope.sender_did.clone(),
+                    context_id: envelope.context_id.clone(),
+                    received_sequence: envelope.sequence,
+                    last_seen_sequence: last_seq,
+                });
+            }
+            if envelope.timestamp < last_ts {
+                return Err(EnvelopeError::TimestampRegression {
+                    sender_did: envelope.sender_did.clone(),
+                    context_id: envelope.context_id.clone(),
+                    received_timestamp: envelope.timestamp,
+                    last_seen_timestamp: last_ts,
+                });
+            }
         }
 
-        self.last_seen.insert(key, envelope.sequence);
+        self.last_seen
+            .insert(key, (envelope.sequence, envelope.timestamp));
         Ok(())
     }
 
@@ -180,7 +194,7 @@ impl SequenceTracker {
     pub fn last_seen_sequence(&self, context_id: &str, sender_did: &str) -> Option<u64> {
         self.last_seen
             .get(&(context_id.to_owned(), sender_did.to_owned()))
-            .copied()
+            .map(|&(seq, _)| seq)
     }
 
     /// Resets the tracker state for a specific sender in a context.
@@ -713,5 +727,54 @@ mod tests {
             Some(1),
             "sequence should not advance when timestamp validation fails"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-sender timestamp monotonicity (§9.8.2(c))
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn timestamp_regression_rejected() {
+        let mut tracker = SequenceTracker::new();
+
+        // First envelope: seq=1, ts=1000
+        let env1 = make_envelope(1000, 1).await;
+        tracker.validate_and_advance(&env1).unwrap();
+
+        // Second envelope: seq=2 (valid), ts=500 (regression)
+        let env2 = make_envelope(500, 2).await;
+        let result = tracker.validate_and_advance(&env2);
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), EnvelopeError::TimestampRegression { .. }),
+            "timestamp regression should be rejected per §9.8.2(c)"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_timestamp_accepted() {
+        let mut tracker = SequenceTracker::new();
+
+        // Two envelopes with the same timestamp but increasing sequences.
+        let env1 = make_envelope(1000, 1).await;
+        tracker.validate_and_advance(&env1).unwrap();
+
+        let env2 = make_envelope(1000, 2).await;
+        tracker
+            .validate_and_advance(&env2)
+            .expect("same timestamp with higher sequence should be accepted");
+    }
+
+    #[tokio::test]
+    async fn increasing_timestamp_accepted() {
+        let mut tracker = SequenceTracker::new();
+
+        let env1 = make_envelope(1000, 1).await;
+        tracker.validate_and_advance(&env1).unwrap();
+
+        let env2 = make_envelope(2000, 2).await;
+        tracker
+            .validate_and_advance(&env2)
+            .expect("increasing timestamp with higher sequence should be accepted");
     }
 }

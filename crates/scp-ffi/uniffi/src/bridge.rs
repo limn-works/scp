@@ -2227,7 +2227,18 @@ async fn ucan_delegate_impl(
                     let cap_uri = if cap.starts_with("scp:ctx:") {
                         cap.clone()
                     } else {
-                        format!("scp:ctx:{}/{cap}", handle.context_id)
+                        // Resolve short names against parent token's capabilities.
+                        // The parent's `att` entries contain full URIs scoped to the
+                        // parent's context — find the first whose suffix matches.
+                        parsed_parent
+                            .payload
+                            .att
+                            .iter()
+                            .find(|a| a.with.ends_with(&format!("/{cap}")))
+                            .map(|a| a.with.clone())
+                            .unwrap_or_else(|| {
+                                format!("scp:ctx:{}/{cap}", handle.context_id)
+                            })
                     };
                     let action = cap_uri.rsplit_once('/').map_or_else(
                         || cap.clone(),
