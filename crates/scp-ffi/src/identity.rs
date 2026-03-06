@@ -36,13 +36,46 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use scp_identity::{DidCache, DidDht, DidDocument, DidMethod, InMemoryDhtClient, ScpIdentity};
+use scp_identity::{
+    DidCache, DidDht, DidDocument, DidMethod, DualLayerResolver, InMemoryDhtClient,
+    NoOpRelayQuerier, ScpIdentity,
+};
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, Storage};
 
 use crate::error::ScpPyError;
 use crate::runtime::IdentityEntry;
 use crate::validate;
+
+/// Ensures the global production DID resolver is initialized.
+///
+/// Creates a `DualLayerResolver` backed by `InMemoryDhtClient` and
+/// `NoOpRelayQuerier` (relay resolution will be upgraded when a production
+/// relay querier is available). The resolver is shared across all UCAN
+/// validation and attestation verification calls.
+///
+/// This is idempotent: subsequent calls are no-ops.
+///
+/// See #311 for the DID resolver unification design.
+fn ensure_did_resolver_initialized(handle: tokio::runtime::Handle) {
+    if crate::runtime::did_resolver().is_some() {
+        return;
+    }
+
+    let dht_client = Arc::new(InMemoryDhtClient::new());
+    let relay_querier = Arc::new(NoOpRelayQuerier);
+    let cache = Arc::new(DidCache::new());
+    let bootstrap_relays = Vec::new();
+
+    let resolver = Arc::new(DualLayerResolver::new(
+        relay_querier,
+        dht_client,
+        cache,
+        bootstrap_relays,
+    ));
+
+    crate::runtime::init_did_resolver(resolver, handle);
+}
 
 // ---------------------------------------------------------------------------
 // PyIdentity — opaque Python object for SCP identity
@@ -389,6 +422,9 @@ fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
     let (key_custody, custody_str) = parse_custody(custody)?;
     let rt = crate::runtime()?;
 
+    // Ensure the global DID resolver is initialized (idempotent). #311
+    ensure_did_resolver_initialized(rt.handle().clone());
+
     py.allow_threads(|| {
         rt.block_on(async {
             let did_method = DidDht::new();
@@ -453,6 +489,9 @@ fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
 fn py_identity_create_with_agent_key(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
     let (key_custody, custody_str) = parse_custody(custody)?;
     let rt = crate::runtime()?;
+
+    // Ensure the global DID resolver is initialized (idempotent). #311
+    ensure_did_resolver_initialized(rt.handle().clone());
 
     py.allow_threads(|| {
         rt.block_on(async {

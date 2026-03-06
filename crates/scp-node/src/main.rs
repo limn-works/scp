@@ -245,7 +245,16 @@ async fn run_full_node() {
         ));
 
         let seq_init_method = Arc::clone(&did_method);
-        let seq_init: Box<dyn FnOnce(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), scp_identity::IdentityError>> + Send>> + Send> = Box::new(move |did| {
+        let seq_init: Box<
+            dyn FnOnce(
+                    String,
+                ) -> std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<Output = Result<(), scp_identity::IdentityError>>
+                            + Send,
+                    >,
+                > + Send,
+        > = Box::new(move |did| {
             Box::pin(async move { seq_init_method.initialize_sequence(&did).await })
         });
         run_full_node_with(domain, http_addr, custody, seq_init, did_method).await;
@@ -283,7 +292,16 @@ async fn run_full_node() {
     ));
 
     let seq_init_method = Arc::clone(&did_method);
-    let seq_init: Box<dyn FnOnce(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), scp_identity::IdentityError>> + Send>> + Send> = Box::new(move |did| {
+    let seq_init: Box<
+        dyn FnOnce(
+                String,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<(), scp_identity::IdentityError>>
+                        + Send,
+                >,
+            > + Send,
+    > = Box::new(move |did| {
         Box::pin(async move { seq_init_method.initialize_sequence(&did).await })
     });
     run_full_node_with(domain, http_addr, custody, seq_init, did_method).await;
@@ -304,7 +322,16 @@ async fn run_full_node_with<D: scp_identity::DidMethod + 'static>(
     domain: String,
     http_addr: SocketAddr,
     custody: Arc<InMemoryKeyCustody>,
-    seq_init: Box<dyn FnOnce(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), scp_identity::IdentityError>> + Send>> + Send>,
+    seq_init: Box<
+        dyn FnOnce(
+                String,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<(), scp_identity::IdentityError>>
+                        + Send,
+                >,
+            > + Send,
+    >,
     did_method: Arc<D>,
 ) {
     // If SCP_NODE_TLS_SELF_SIGNED=1, use a self-signed certificate for

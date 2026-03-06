@@ -1309,6 +1309,20 @@ impl Drop for TransportManager {
 pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError> {
     let custody_method = parse_custody_method(&custody)?;
 
+    // Ensure the global DID resolver is initialized (idempotent). #311
+    if crate::runtime::did_resolver().is_none() {
+        let dht_client = std::sync::Arc::new(scp_identity::InMemoryDhtClient::new());
+        let relay_querier = std::sync::Arc::new(scp_identity::NoOpRelayQuerier);
+        let cache = std::sync::Arc::new(scp_identity::DidCache::new());
+        let resolver = std::sync::Arc::new(scp_identity::DualLayerResolver::new(
+            relay_querier,
+            dht_client,
+            cache,
+            Vec::new(),
+        ));
+        crate::runtime::init_did_resolver(resolver, runtime().handle().clone());
+    }
+
     runtime()
         .spawn(async move {
             match custody_method {
@@ -1857,15 +1871,18 @@ pub async fn tool_invoke(
             let context_id = handle.context_id.clone();
             let identity_did = identity.did.clone();
             crate::runtime::with_context(&context_id, |rt| {
-                let did_resolver = scp_ffi_common::BridgeDidResolver;
+                // Use production DID resolver when available (#311), fallback to string-only.
+                let production_resolver = crate::runtime::did_resolver();
+                let did_resolver = scp_ffi_common::DispatchDidResolver::new(
+                    production_resolver.map(std::convert::AsRef::as_ref),
+                );
                 let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
                     revocation_list: &rt.revocation_list,
                 };
                 let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
                     inner: &mut rt.nonce_tracker,
                 };
-                let proof_resolver =
-                    build_proof_resolver(proof_tokens.as_deref())?;
+                let proof_resolver = build_proof_resolver(proof_tokens.as_deref())?;
 
                 let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
                     did_resolver: &did_resolver,
@@ -2048,17 +2065,69 @@ pub async fn ucan_validate(
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let _ = (
-                handle,
-                token,
-                capability,
-                presenting_agent_did,
-                proof_tokens,
-            );
-            Err(ScpError::Permission {
-                message: "not yet connected to runtime — UCAN validation requires a live context"
-                    .to_owned(),
-                code: "SCP-PERM-3002".to_owned(),
+            // Step 1: Parse the UCAN token.
+            let parsed_token =
+                scp_core::crypto::ucan::validate::parse_ucan(&token).map_err(|e| {
+                    ScpError::Permission {
+                        message: format!("failed to parse UCAN token: {e}"),
+                        code: "SCP-PERM-3001".to_owned(),
+                    }
+                })?;
+
+            // Step 2: Parse the required capability URI.
+            let required_cap: scp_core::crypto::ucan::capability::CapabilityUri = capability
+                .parse()
+                .map_err(
+                    |e: scp_core::crypto::ucan::UcanError| ScpError::Permission {
+                        message: format!("invalid capability URI '{capability}': {e}"),
+                        code: "SCP-PERM-3001".to_owned(),
+                    },
+                )?;
+
+            // Step 3: Determine the presenting agent DID.
+            let agent_did = presenting_agent_did
+                .as_deref()
+                .unwrap_or(&parsed_token.payload.aud);
+
+            // Step 4: Build proof resolver from optional proof tokens.
+            let proof_resolver = build_proof_resolver(proof_tokens.as_deref())?;
+
+            // Step 5: Execute the full 11-step validation pipeline (#311).
+            let context_id = handle.context_id.clone();
+            crate::runtime::with_context(&context_id, |rt| {
+                // Use production DID resolver when available (#311), fallback to string-only.
+                let production_resolver = crate::runtime::did_resolver();
+                let did_resolver = scp_ffi_common::DispatchDidResolver::new(
+                    production_resolver.map(std::convert::AsRef::as_ref),
+                );
+                let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
+                    revocation_list: &rt.revocation_list,
+                };
+                let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
+                    inner: &mut rt.nonce_tracker,
+                };
+
+                let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
+                    did_resolver: &did_resolver,
+                    nonce_tracker: &mut nonce_adapter,
+                    revocation_checker: &revocation_checker,
+                    proof_resolver: &proof_resolver,
+                    ceiling: &rt.ceiling_strings,
+                    context_creator_did: &rt.creator_did,
+                    presenting_agent_did: agent_did,
+                    clock_skew_tolerance_secs:
+                        scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                };
+
+                scp_core::crypto::ucan::validate::validate_ucan(
+                    &parsed_token,
+                    &required_cap,
+                    &mut ctx,
+                )
+                .map_err(|e| ScpError::Permission {
+                    message: format!("UCAN validation failed: {e}"),
+                    code: "SCP-PERM-3001".to_owned(),
+                })
             })
         })
         .await

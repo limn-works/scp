@@ -46,7 +46,7 @@ use scp_core::crypto::ucan::validate::{
 };
 
 use crate::bridge_adapters::{
-    BridgeDidResolver, BridgeNonceTracker, BridgeProofResolver, BridgeRevocationChecker,
+    BridgeNonceTracker, BridgeProofResolver, BridgeRevocationChecker, DispatchDidResolver,
 };
 use crate::error::ScpPyError;
 use crate::validate;
@@ -182,8 +182,11 @@ pub fn py_ucan_validate(
     let proof_resolver = build_proof_resolver(proof_tokens.as_deref())?;
 
     // Execute the full 11-step validation pipeline within the context runtime.
+    // Use production DID resolver when available (#311), fallback to string-only.
     crate::runtime::with_context(context_id, |rt| {
-        let did_resolver = BridgeDidResolver;
+        let production_resolver = crate::runtime::did_resolver();
+        let did_resolver =
+            DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
         let revocation_checker = BridgeRevocationChecker {
             revocation_list: &rt.revocation_list,
         };
@@ -531,6 +534,7 @@ mod tests {
     use scp_core::crypto::ucan::validate::{
         DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
     };
+    use scp_ffi_common::BridgeDidResolver;
 
     // -----------------------------------------------------------------------
     // BridgeDidResolver

@@ -15,7 +15,7 @@
 //! See SCP-219 and ADR-022 in `.docs/adrs/phase-4.md`.
 
 use std::collections::HashSet;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use scp_core::context::roles::default_ceiling;
@@ -29,6 +29,26 @@ use crate::error::ScpNapiError;
 
 /// Global registry of per-context runtime state.
 static CONTEXT_REGISTRY: OnceLock<DashMap<String, ContextRuntime>> = OnceLock::new();
+
+/// Global production DID resolver (#311). See `scp-ffi/src/runtime.rs` for
+/// full documentation.
+static DID_RESOLVER: OnceLock<Arc<scp_ffi_common::IdentityBackedDidResolver>> = OnceLock::new();
+
+/// Returns the global production DID resolver, if initialized.
+#[must_use]
+pub fn did_resolver() -> Option<&'static Arc<scp_ffi_common::IdentityBackedDidResolver>> {
+    DID_RESOLVER.get()
+}
+
+/// Initializes the global production DID resolver (#311).
+pub fn init_did_resolver<R>(resolver: Arc<R>, handle: tokio::runtime::Handle)
+where
+    R: scp_identity::resolver::DidResolver + 'static,
+{
+    let _ = DID_RESOLVER.set(Arc::new(scp_ffi_common::IdentityBackedDidResolver::new(
+        resolver, handle,
+    )));
+}
 
 /// Returns a reference to the global context registry.
 fn registry() -> &'static DashMap<String, ContextRuntime> {

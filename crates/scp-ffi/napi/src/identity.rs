@@ -36,13 +36,40 @@ use std::sync::Arc;
 use napi::Error as NapiError;
 use napi_derive::napi;
 use scp_identity::{
-    DidCache, DidDht, DidDocument, DidMethod, IdentityError, InMemoryDhtClient, ScpIdentity,
+    DidCache, DidDht, DidDocument, DidMethod, DualLayerResolver, IdentityError, InMemoryDhtClient,
+    NoOpRelayQuerier, ScpIdentity,
 };
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::KeyCustody;
 
 use crate::error::{ScpNapiError, validate_custody_type};
 use crate::{decrement_handle_count, increment_handle_count};
+
+/// Ensures the global production DID resolver is initialized (idempotent). #311
+fn ensure_did_resolver_initialized() {
+    if crate::runtime::did_resolver().is_some() {
+        return;
+    }
+
+    let handle = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(_) => return, // No runtime available; skip initialization.
+    };
+
+    let dht_client = Arc::new(InMemoryDhtClient::new());
+    let relay_querier = Arc::new(NoOpRelayQuerier);
+    let cache = Arc::new(DidCache::new());
+    let bootstrap_relays = Vec::new();
+
+    let resolver = Arc::new(DualLayerResolver::new(
+        relay_querier,
+        dht_client,
+        cache,
+        bootstrap_relays,
+    ));
+
+    crate::runtime::init_did_resolver(resolver, handle);
+}
 
 // ---------------------------------------------------------------------------
 // OpaqueInMemoryKeyCustody — redacted Debug wrapper
@@ -507,6 +534,9 @@ pub struct NapiDIDDocument {
 #[napi]
 pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
     validate_custody_type(&custody).map_err(NapiError::from)?;
+
+    // Ensure the global DID resolver is initialized (idempotent). #311
+    ensure_did_resolver_initialized();
 
     match custody.as_str() {
         "in_memory" => {

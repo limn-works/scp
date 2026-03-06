@@ -299,6 +299,24 @@ impl HealingPublisher for NoOpHealer {
     }
 }
 
+/// A no-op relay querier that always returns `Ok(None)`.
+///
+/// Used when no production relay querier is available (e.g., before transport
+/// setup). The `DualLayerResolver` falls back to DHT-only resolution when the
+/// relay layer returns `None`.
+pub struct NoOpRelayQuerier;
+
+#[allow(clippy::manual_async_fn)]
+impl MultiRelayQuerier for NoOpRelayQuerier {
+    fn query(
+        &self,
+        _did: &str,
+        _relay_urls: &[String],
+    ) -> impl Future<Output = Result<Option<RelayRecord>, IdentityError>> + Send {
+        async { Ok(None) }
+    }
+}
+
 /// Production healing publisher that delegates to [`DhtClient`] and
 /// [`RelayPublisher`] for the respective stale layers (§3.10.7, SCP-245).
 ///
