@@ -81,6 +81,15 @@ fn key_package_prefix(relay_url: &str) -> String {
     format!("key_package/{url_hash}/")
 }
 
+/// Builds the storage key for a certificate pin.
+///
+/// Format: `cert_pin/{sha256_hex(url)}`
+/// See spec section 9.13.
+fn cert_pin_key(relay_url: &str) -> String {
+    let url_hash = hash_url(relay_url);
+    format!("cert_pin/{url_hash}")
+}
+
 // ---------------------------------------------------------------------------
 // ProtocolStore — transport methods
 // ---------------------------------------------------------------------------
@@ -200,6 +209,56 @@ impl<S: Storage> ProtocolStore<S> {
     /// Returns [`StoreError::Storage`] if the underlying storage delete fails.
     pub async fn delete_key_package(&self, relay_url: &str, index: u32) -> Result<(), StoreError> {
         let key = key_package_key(relay_url, index);
+        self.storage.delete(&key).await?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Certificate pin methods (spec §9.13)
+    // -----------------------------------------------------------------------
+
+    /// Stores a certificate pin for a relay URL.
+    ///
+    /// Serializes the pin data (fingerprint + timestamps) under
+    /// `cert_pin/{sha256_hex(url)}` wrapped in a `StoredValue` version
+    /// envelope.
+    ///
+    /// See spec section 9.13 (Transport Security Requirements).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
+    pub async fn store_cert_pin(&self, relay_url: &str, pin_data: &[u8]) -> Result<(), StoreError> {
+        let key = cert_pin_key(relay_url);
+        self.store_value(&key, &pin_data.to_vec()).await
+    }
+
+    /// Loads a certificate pin for a relay URL.
+    ///
+    /// Returns `None` if no pin exists for the given relay.
+    ///
+    /// See spec section 9.13.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage read fails.
+    pub async fn load_cert_pin(&self, relay_url: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let key = cert_pin_key(relay_url);
+        self.load_value(&key).await
+    }
+
+    /// Deletes a certificate pin for a relay URL.
+    ///
+    /// Used when a pin needs to be reset (e.g., after legitimate
+    /// certificate rotation).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Storage`] if the underlying storage delete fails.
+    pub async fn delete_cert_pin(&self, relay_url: &str) -> Result<(), StoreError> {
+        let key = cert_pin_key(relay_url);
         self.storage.delete(&key).await?;
         Ok(())
     }
@@ -378,5 +437,73 @@ mod tests {
     fn key_package_key_uses_10_digit_zero_padding() {
         let key = key_package_key("https://relay.example.com", 42);
         assert!(key.contains("/0000000042"));
+    }
+
+    // -------------------------------------------------------------------
+    // Certificate pins (spec §9.13)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn store_and_load_cert_pin_roundtrip() {
+        let store = make_store();
+        let pin_data = b"serialized-cert-pin-data".to_vec();
+
+        store
+            .store_cert_pin("wss://relay.example.com/scp/v1", &pin_data)
+            .await
+            .unwrap();
+        let loaded = store
+            .load_cert_pin("wss://relay.example.com/scp/v1")
+            .await
+            .unwrap();
+        assert_eq!(loaded, Some(pin_data));
+    }
+
+    #[tokio::test]
+    async fn load_cert_pin_returns_none_for_missing() {
+        let store = make_store();
+        let loaded = store
+            .load_cert_pin("wss://unknown.relay.com/scp/v1")
+            .await
+            .unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_cert_pin_removes_stored_data() {
+        let store = make_store();
+        let pin_data = b"pin-data".to_vec();
+
+        store
+            .store_cert_pin("wss://relay.example.com/scp/v1", &pin_data)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .load_cert_pin("wss://relay.example.com/scp/v1")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        store
+            .delete_cert_pin("wss://relay.example.com/scp/v1")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .load_cert_pin("wss://relay.example.com/scp/v1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cert_pin_key_uses_url_hash() {
+        let key = cert_pin_key("wss://relay.example.com/scp/v1");
+        assert!(key.starts_with("cert_pin/"));
+        let suffix = key.strip_prefix("cert_pin/").unwrap();
+        assert_eq!(suffix.len(), 64); // SHA-256 hex
     }
 }
