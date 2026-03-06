@@ -3568,7 +3568,7 @@
       "description": "Implement attestation types and verification logic. Common attestation envelope (\u00a77.4.1) enables generic verification logic and interoperable attestation exchange. Attestation freshness evaluates renewal interval \u2014 stale attestations (past renewal interval but not expired) are degraded, not revoked. Threshold attestation checks N-of-M requirements with independence scoring.",
       "acceptanceCriteria": [
         "Attestation struct defined with fields: id (String), attestation_type (AttestationType), issuer (DID), subject (DID), claim (serde_json::Value), evidence (Option<AttestationEvidence>), issued_at (u64), expires_at (Option<u64>), renewal_interval (Option<Duration>), revocation_status (RevocationStatus), signature (Ed25519Signature)",
-        "AttestationType enum with variants: IdentityLink, CapabilityDelegation, ToolIntegrity, AgentCapability, Endorsement, RoleAssignment, ContextEndorsement, BehavioralWitness",
+        "AttestationType enum with variants: IdentityLink, CapabilityDelegation, ToolIntegrity, AgentCapability, Endorsement, RoleAssignment, ContextEndorsement, ParticipationWitness",
         "ThresholdRequirement struct with fields: required_count (u32), total_attestors (u32), independence_threshold (f64)",
         "verify_attestation(attestation) -> Result<(), TrustError> verifies Ed25519 signature against issuer's public key (resolved via DID)",
         "verify_attestation validates evidence per attestation type",
@@ -3613,7 +3613,7 @@
         ],
         "rustTypes": {
           "Attestation": "pub struct Attestation { pub id: String, pub attestation_type: AttestationType, pub issuer: DID, pub subject: DID, pub claim: serde_json::Value, pub evidence: Option<AttestationEvidence>, pub issued_at: u64, pub expires_at: Option<u64>, pub renewal_interval: Option<Duration>, pub revocation_status: RevocationStatus, pub signature: Ed25519Signature }",
-          "AttestationType": "pub enum AttestationType { IdentityLink, CapabilityDelegation, ToolIntegrity, AgentCapability, Endorsement, RoleAssignment, ContextEndorsement, BehavioralWitness }",
+          "AttestationType": "pub enum AttestationType { IdentityLink, CapabilityDelegation, ToolIntegrity, AgentCapability, Endorsement, RoleAssignment, ContextEndorsement, ParticipationWitness }",
           "ThresholdRequirement": "pub struct ThresholdRequirement { pub required_count: u32, pub total_attestors: u32, pub independence_threshold: f64 }"
         }
       },

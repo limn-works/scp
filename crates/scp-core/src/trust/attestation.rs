@@ -532,6 +532,12 @@ fn compute_independence_score(
     shared_context_penalty_cap: f64,
     mutual_endorsement_penalty: f64,
 ) -> f64 {
+    // Clamp to non-negative: negative penalties would invert scoring,
+    // making colluding attestors appear more independent.
+    let shared_context_penalty = shared_context_penalty.max(0.0);
+    let shared_context_penalty_cap = shared_context_penalty_cap.max(0.0);
+    let mutual_endorsement_penalty = mutual_endorsement_penalty.max(0.0);
+
     if attestors.len() < 2 {
         return 1.0;
     }

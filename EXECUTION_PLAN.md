@@ -215,7 +215,7 @@ Issues with wrong file names, section numbers, or ADR locations in their bodies.
 | #337 | Conflates ContextMode with memory_scope | These are separate concepts |
 | #340 | Mischaracterizes what "promotion" means | §5.10 defines promotion as ephemeral→persistent, not capability escalation |
 
-### Missing Dependency Declarations (18)
+### Missing Dependency Declarations (19 — now added as GH comments)
 
 These blocking relationships exist per the execution plan but are not declared in issue bodies.
 
