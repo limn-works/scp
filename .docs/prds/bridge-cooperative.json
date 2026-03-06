@@ -77,7 +77,7 @@
         }
       ],
       "details": {},
-      "blocked_by_issues": [
+      "blockedByIssues": [
         377
       ]
     },

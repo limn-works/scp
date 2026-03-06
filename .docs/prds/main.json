@@ -5242,7 +5242,7 @@
           "ADR-005": "Signaling routed through SCP transport."
         }
       },
-      "blocked_by_issues": [
+      "blockedByIssues": [
         290
       ]
     },
@@ -9776,7 +9776,7 @@
         "sealEnvelopeNote": "seal_envelope (outer.rs:169) takes routing_id: &[u8] and InnerEnvelope as pre-computed inputs. It does not take KeyCustody directly, but both inputs require KeyCustody upstream: routing_id comes from derive_pseudonym, and InnerEnvelope comes from create_inner_envelope which signs with KeyCustody. The entire message send path is blocked without this wiring.",
         "inMemoryCodeBug": "InMemoryKeyCustody::derive_pseudonym at key_custody.rs:333 uses signing_key.to_bytes() (Ed25519 private/secret key bytes, 32 bytes) as the HMAC key. ADR-027 mandates verifying_key.to_bytes() (Ed25519 public key bytes, 32 bytes) for cross-platform determinism \u2014 hardware TEE keys (Android Keystore, Secure Enclave) cannot export private bytes. AndroidKeyCustody.kt correctly uses publicKey(keyHandle) at line 178. AppleKeyCustody.swift correctly uses publicKey(). InMemoryKeyCustody is the outlier. The golden vector test at key_custody.rs:626 will need updated expected values after the fix."
       },
-      "blocked_by_issues": [
+      "blockedByIssues": [
         356
       ]
     },
@@ -9980,7 +9980,7 @@
       ],
       "actionItems": [],
       "details": {},
-      "blocked_by_issues": [
+      "blockedByIssues": [
         306
       ]
     },
@@ -10048,7 +10048,7 @@
       ],
       "actionItems": [],
       "details": {},
-      "blocked_by_issues": [
+      "blockedByIssues": [
         307
       ]
     },

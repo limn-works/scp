@@ -137,6 +137,14 @@ def validate_prd(prd_path: Path, all_story_ids: set[str] | None = None) -> list[
                     f"story '{dep}'"
                 )
 
+        # --- Check 5b: blockedByIssues must be positive integers ---
+        for issue_num in story.get("blockedByIssues", []):
+            if not isinstance(issue_num, int) or issue_num <= 0:
+                errors.append(
+                    f"{prefix} blockedByIssues contains invalid "
+                    f"value '{issue_num}' (must be positive integer)"
+                )
+
         # --- Check 3 & 4: Source existence and section headings ---
         for source in story.get("sources", []):
             if isinstance(source, str):

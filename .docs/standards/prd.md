@@ -29,7 +29,7 @@ Include when relevant. Absence implies the default.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `tools` | array | `[]` | Capability categories: `browser`, `mobile`, `design` |
-| `blocked_by_issues` | array | `[]` | GitHub issue numbers that must be closed before this story can start |
+| `blockedByIssues` | array | `[]` | GitHub issue numbers that must be closed before this story can start |
 
 ## Gate Registration
 
@@ -93,7 +93,7 @@ Dependencies must be **forward-only**: a story depends on work that must exist b
 
 Every ID in `blockedBy` must reference an existing story — either in the same PRD or in another PRD file (for cross-PRD dependencies). CI rejects dangling references. CI also warns on stories that are `blockedBy` a `done` story — a completed dependency should not block pending work.
 
-Cross-PRD references enable orchestrator scheduling: a story is assignable when all `blockedBy` stories are `"done"` and all `blocked_by_issues` (GitHub issue numbers) are closed.
+Cross-PRD references enable orchestrator scheduling: a story is assignable when all `blockedBy` stories are `"done"` and all `blockedByIssues` (GitHub issue numbers) are closed.
 
 ## Story Scope
 
