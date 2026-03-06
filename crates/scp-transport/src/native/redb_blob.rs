@@ -416,4 +416,19 @@ impl BlobStorage for RedbBlobStore {
 
         Ok(count)
     }
+
+    async fn count(&self) -> Result<usize, StorageError> {
+        let db = self.db.lock().await;
+        let read_txn = db
+            .begin_read()
+            .map_err(|e| StorageError::Internal(format!("redb begin_read: {e}")))?;
+        let blobs_table = read_txn
+            .open_table(BLOBS_TABLE)
+            .map_err(|e| StorageError::Internal(format!("redb open blobs: {e}")))?;
+        let len = blobs_table
+            .len()
+            .map_err(|e| StorageError::Internal(format!("redb len: {e}")))?;
+        #[allow(clippy::cast_possible_truncation)]
+        Ok(len as usize)
+    }
 }

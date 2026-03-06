@@ -1289,6 +1289,17 @@ mod tests {
             ),
             tls_config: None,
             cert_resolver: None,
+            did_document: scp_identity::document::DidDocument {
+                context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+                id: "did:dht:test".to_owned(),
+                verification_method: vec![],
+                authentication: vec![],
+                assertion_method: vec![],
+                also_known_as: vec![],
+                service: vec![],
+            },
+            connection_tracker: scp_transport::relay::rate_limit::new_connection_tracker(),
+            subscription_registry: scp_transport::relay::subscription::new_registry(),
         })
     }
 

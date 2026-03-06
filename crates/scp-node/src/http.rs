@@ -23,10 +23,12 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use zeroize::Zeroizing;
 
+use scp_identity::document::DidDocument;
 use scp_platform::traits::Storage;
 use scp_transport::native::server::RelayConfig as TransportRelayConfig;
 use scp_transport::native::storage::BlobStorageBackend;
-use scp_transport::relay::rate_limit::PublishRateLimiter;
+use scp_transport::relay::rate_limit::{ConnectionTracker, PublishRateLimiter};
+use scp_transport::relay::subscription::SubscriptionRegistry;
 
 use crate::tls;
 
@@ -148,6 +150,22 @@ pub struct NodeState {
     ///
     /// See spec section 18.6.3 (auto-renewal).
     pub(crate) cert_resolver: Option<Arc<crate::tls::CertResolver>>,
+    /// The operator's DID document, populated at build time.
+    ///
+    /// Used by the dev API identity endpoint to return the full document
+    /// (spec section 18.10.3).
+    pub(crate) did_document: DidDocument,
+    /// Shared connection tracker from the relay server.
+    ///
+    /// Tracks active connections per IP address across all transports.
+    /// Used by the dev API health and relay status endpoints to report
+    /// real connection counts (spec section 18.10.3).
+    pub(crate) connection_tracker: ConnectionTracker,
+    /// Shared subscription registry from the relay server.
+    ///
+    /// Maps routing IDs to subscriber entries. Used by the dev API
+    /// context endpoint to report real subscriber counts (spec section 18.10.3).
+    pub(crate) subscription_registry: SubscriptionRegistry,
 }
 
 // ---------------------------------------------------------------------------
@@ -755,6 +773,17 @@ mod tests {
             ),
             tls_config: None,
             cert_resolver: None,
+            did_document: scp_identity::document::DidDocument {
+                context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+                id: "did:dht:cors_test".to_owned(),
+                verification_method: vec![],
+                authentication: vec![],
+                assertion_method: vec![],
+                also_known_as: vec![],
+                service: vec![],
+            },
+            connection_tracker: scp_transport::relay::rate_limit::new_connection_tracker(),
+            subscription_registry: scp_transport::relay::subscription::new_registry(),
         })
     }
 

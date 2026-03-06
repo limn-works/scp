@@ -685,6 +685,38 @@ impl BlobStorage for S3BlobStore {
         Ok(count)
     }
 
+    async fn count(&self) -> Result<usize, StorageError> {
+        let prefix = format!("{}/blobs/", self.prefix);
+        let mut total: usize = 0;
+        let mut continuation_token: Option<String> = None;
+
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&prefix);
+
+            if let Some(token) = &continuation_token {
+                request = request.continuation_token(token);
+            }
+
+            let output = request.send().await.map_err(|e| {
+                StorageError::Internal(format!("S3 list failed for count: {e}"))
+            })?;
+
+            total += output.contents().len();
+
+            if output.is_truncated() == Some(true) {
+                continuation_token = output.next_continuation_token().map(String::from);
+            } else {
+                break;
+            }
+        }
+
+        Ok(total)
+    }
+
     async fn store_streaming(
         &self,
         routing_id: [u8; 32],

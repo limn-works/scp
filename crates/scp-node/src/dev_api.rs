@@ -169,18 +169,14 @@ pub async fn security_headers_middleware(req: Request<Body>, next: Next) -> impl
 
 /// Response body for `GET /scp/dev/v1/health`.
 ///
-/// Reports basic health metrics for the running node. Fields that require
-/// runtime wiring (e.g., `relay_connections`) use placeholder values until
-/// SCP-245 connects real metrics.
+/// Reports basic health metrics for the running node.
 ///
 /// See spec section 18.10.3.
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthResponse {
     /// Seconds since the node was started.
     pub uptime_seconds: u64,
-    /// Number of active relay connections.
-    ///
-    /// Placeholder (always 0) until SCP-245 wires real connection tracking.
+    /// Total number of active relay connections across all IPs.
     pub relay_connections: u64,
     /// Storage subsystem status. Currently always `"ok"`.
     pub storage_status: String,
@@ -188,38 +184,30 @@ pub struct HealthResponse {
 
 /// Response body for `GET /scp/dev/v1/identity`.
 ///
-/// Returns the node operator's DID string and document. The `document` field
-/// currently returns the DID string as a placeholder until full
-/// [`DidDocument`](scp_core::identity::document::DidDocument) serialization
-/// is wired through `NodeState`.
+/// Returns the node operator's DID string and full DID document.
 ///
 /// See spec section 18.10.3.
 #[derive(Debug, Clone, Serialize)]
 pub struct IdentityResponse {
     /// The operator's DID string (e.g., `did:dht:...`).
     pub did: String,
-    /// The DID document. Currently returns the DID string as a placeholder
-    /// until the full document is available in `NodeState`.
-    pub document: String,
+    /// The operator's full DID document, serialized as a JSON object.
+    pub document: serde_json::Value,
 }
 
 /// Response body for `GET /scp/dev/v1/relay/status`.
 ///
-/// Reports relay server status. Fields that require runtime wiring use
-/// placeholder values until SCP-245 connects real metrics.
+/// Reports relay server status with real-time metrics from the
+/// connection tracker and blob storage backend.
 ///
 /// See spec section 18.10.3.
 #[derive(Debug, Clone, Serialize)]
 pub struct RelayStatusResponse {
     /// The address the relay server is bound to (e.g., `127.0.0.1:9000`).
     pub bound_addr: String,
-    /// Number of active WebSocket connections to the relay.
-    ///
-    /// Placeholder (always 0) until SCP-245 wires real connection tracking.
+    /// Total number of active connections across all IPs.
     pub active_connections: u64,
-    /// Number of blobs stored in the blob storage backend.
-    ///
-    /// Placeholder (always 0) until SCP-245 wires real blob counting.
+    /// Number of blobs currently stored in the blob storage backend.
     pub blob_count: u64,
 }
 
@@ -227,9 +215,7 @@ pub struct RelayStatusResponse {
 /// `GET /scp/dev/v1/contexts/{id}`).
 ///
 /// Represents a registered broadcast context with its metadata. The `mode`
-/// field is always `"broadcast"` in the current implementation. The
-/// `subscriber_count` field is a placeholder (always 0) until real
-/// subscriber tracking is wired.
+/// field is always `"broadcast"` in the current implementation.
 ///
 /// See spec section 18.10.3.
 #[derive(Debug, Clone, Serialize)]
@@ -240,21 +226,8 @@ pub struct ContextResponse {
     pub name: Option<String>,
     /// Context mode. Currently always `"broadcast"`.
     pub mode: String,
-    /// Number of active subscribers.
-    ///
-    /// Placeholder (always 0) until real subscriber tracking is wired.
+    /// Number of active subscribers for this context's routing ID.
     pub subscriber_count: u64,
-}
-
-impl From<&crate::http::BroadcastContext> for ContextResponse {
-    fn from(ctx: &crate::http::BroadcastContext) -> Self {
-        Self {
-            id: ctx.id.clone(),
-            name: ctx.name.clone(),
-            mode: "broadcast".to_owned(),
-            subscriber_count: 0,
-        }
-    }
 }
 
 /// Request body for `POST /scp/dev/v1/contexts`.
@@ -283,13 +256,16 @@ pub struct CreateContextRequest {
 /// See spec section 18.10.3.
 pub async fn health_handler(State(state): State<Arc<NodeState>>) -> impl IntoResponse {
     let uptime = state.start_time.elapsed().as_secs();
+    let relay_connections = {
+        let tracker = state.connection_tracker.read().await;
+        tracker.values().sum::<usize>() as u64
+    };
 
     (
         StatusCode::OK,
         Json(HealthResponse {
             uptime_seconds: uptime,
-            // TODO(SCP-245): wire real relay connection count
-            relay_connections: 0,
+            relay_connections,
             storage_status: "ok".to_owned(),
         }),
     )
@@ -298,17 +274,18 @@ pub async fn health_handler(State(state): State<Arc<NodeState>>) -> impl IntoRes
 /// Handler for `GET /scp/dev/v1/identity`.
 ///
 /// Returns an [`IdentityResponse`] with the node operator's DID string and
-/// document. The document field is a placeholder until full `DidDocument`
-/// serialization is available in `NodeState`.
+/// full DID document.
 ///
 /// See spec section 18.10.3.
 pub async fn identity_handler(State(state): State<Arc<NodeState>>) -> impl IntoResponse {
+    let document = serde_json::to_value(&state.did_document)
+        .unwrap_or_else(|_| serde_json::Value::String(state.did.clone()));
+
     (
         StatusCode::OK,
         Json(IdentityResponse {
             did: state.did.clone(),
-            // TODO: return full DidDocument once it is stored in NodeState
-            document: state.did.clone(),
+            document,
         }),
     )
 }
@@ -316,21 +293,45 @@ pub async fn identity_handler(State(state): State<Arc<NodeState>>) -> impl IntoR
 /// Handler for `GET /scp/dev/v1/relay/status`.
 ///
 /// Returns a [`RelayStatusResponse`] with the relay's bound address, active
-/// connection count, and blob count. Connection and blob counts are
-/// placeholders until SCP-245 wires real metrics.
+/// connection count from the shared connection tracker, and blob count
+/// from the blob storage backend.
 ///
 /// See spec section 18.10.3.
 pub async fn relay_status_handler(State(state): State<Arc<NodeState>>) -> impl IntoResponse {
+    use scp_transport::native::storage::BlobStorage as _;
+
+    let active_connections = {
+        let tracker = state.connection_tracker.read().await;
+        tracker.values().sum::<usize>() as u64
+    };
+    let blob_count = state.blob_storage.count().await.unwrap_or(0) as u64;
+
     (
         StatusCode::OK,
         Json(RelayStatusResponse {
             bound_addr: state.relay_addr.to_string(),
-            // TODO(SCP-245): wire real active connection count
-            active_connections: 0,
-            // TODO(SCP-245): wire real blob count from storage backend
-            blob_count: 0,
+            active_connections,
+            blob_count,
         }),
     )
+}
+
+/// Returns the subscriber count for a hex-encoded context/routing ID.
+///
+/// Parses the hex string into a `[u8; 32]` routing ID and looks up the
+/// number of subscriber entries in the subscription registry. Returns 0
+/// if the hex is invalid or the routing ID has no subscribers.
+async fn subscriber_count_for_context(state: &NodeState, hex_id: &str) -> u64 {
+    let Ok(bytes) = hex::decode(hex_id) else {
+        return 0;
+    };
+    let Ok(routing_id) = <[u8; 32]>::try_from(bytes) else {
+        return 0;
+    };
+    let registry = state.subscription_registry.read().await;
+    registry
+        .get(&routing_id)
+        .map_or(0, |entries| entries.len() as u64)
 }
 
 /// Handler for `GET /scp/dev/v1/contexts`.
@@ -341,13 +342,24 @@ pub async fn relay_status_handler(State(state): State<Arc<NodeState>>) -> impl I
 ///
 /// See spec section 18.10.3.
 pub async fn list_contexts_handler(State(state): State<Arc<NodeState>>) -> impl IntoResponse {
-    let responses: Vec<ContextResponse> = state
-        .broadcast_contexts
-        .read()
-        .await
-        .values()
-        .map(ContextResponse::from)
-        .collect();
+    let snapshot: Vec<(String, Option<String>)> = {
+        let contexts = state.broadcast_contexts.read().await;
+        contexts
+            .values()
+            .map(|ctx| (ctx.id.clone(), ctx.name.clone()))
+            .collect()
+    };
+
+    let mut responses = Vec::with_capacity(snapshot.len());
+    for (id, name) in snapshot {
+        let subscriber_count = subscriber_count_for_context(&state, &id).await;
+        responses.push(ContextResponse {
+            id,
+            name,
+            mode: "broadcast".to_owned(),
+            subscriber_count,
+        });
+    }
 
     (StatusCode::OK, Json(responses))
 }
@@ -364,11 +376,29 @@ pub async fn get_context_handler(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let id = id.to_ascii_lowercase();
-    let contexts = state.broadcast_contexts.read().await;
-    contexts.get(&id).map_or_else(
-        || ApiError::not_found(format!("context {id} not found")).into_response(),
-        |ctx| (StatusCode::OK, Json(ContextResponse::from(ctx))).into_response(),
-    )
+    let ctx_data = {
+        let contexts = state.broadcast_contexts.read().await;
+        contexts
+            .get(&id)
+            .map(|ctx| (ctx.id.clone(), ctx.name.clone()))
+    };
+
+    match ctx_data {
+        None => ApiError::not_found(format!("context {id} not found")).into_response(),
+        Some((ctx_id, ctx_name)) => {
+            let subscriber_count = subscriber_count_for_context(&state, &ctx_id).await;
+            (
+                StatusCode::OK,
+                Json(ContextResponse {
+                    id: ctx_id,
+                    name: ctx_name,
+                    mode: "broadcast".to_owned(),
+                    subscriber_count,
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Maximum allowed length for a context ID (hex-encoded, so 64 chars for 32 bytes).
@@ -447,7 +477,13 @@ pub async fn create_context_handler(
         id: id.clone(),
         name: body.name,
     };
-    let response = ContextResponse::from(&ctx);
+    // Newly created context starts with 0 subscribers.
+    let response = ContextResponse {
+        id: ctx.id.clone(),
+        name: ctx.name.clone(),
+        mode: "broadcast".to_owned(),
+        subscriber_count: 0,
+    };
     contexts.insert(id.clone(), ctx);
     drop(contexts);
 
@@ -590,6 +626,17 @@ mod tests {
             ),
             tls_config: None,
             cert_resolver: None,
+            did_document: scp_identity::document::DidDocument {
+                context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+                id: "did:dht:test123".to_owned(),
+                verification_method: vec![],
+                authentication: vec![],
+                assertion_method: vec![],
+                also_known_as: vec![],
+                service: vec![],
+            },
+            connection_tracker: scp_transport::relay::rate_limit::new_connection_tracker(),
+            subscription_registry: scp_transport::relay::subscription::new_registry(),
         })
     }
 

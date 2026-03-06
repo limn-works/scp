@@ -1678,6 +1678,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
                 .ok_or(NodeError::MissingField("blob_storage"))?,
         );
         let relay_server = RelayServer::new(relay_config.clone(), Arc::clone(&blob_storage));
+        let connection_tracker = relay_server.connection_tracker();
+        let subscription_registry = relay_server.subscriptions();
         let (shutdown_handle, bound_addr) = relay_server.start().await?;
         let dev_token = self.local_api_addr.map(generate_dev_token);
         let http_bind_addr = self.http_bind_addr.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
@@ -1708,6 +1710,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
                     self.projection_rate_limit
                         .unwrap_or(DEFAULT_PROJECTION_RATE_LIMIT),
                     cert_data,
+                    connection_tracker.clone(),
+                    subscription_registry.clone(),
                     #[cfg(feature = "http3")]
                     self.http3_config,
                 )
@@ -1743,6 +1747,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
                     self.projection_rate_limit
                         .unwrap_or(DEFAULT_PROJECTION_RATE_LIMIT),
                     self.network_detector,
+                    connection_tracker,
+                    subscription_registry,
                 )
                 .await
             }
@@ -1871,6 +1877,8 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     cors_origins: Option<Vec<String>>,
     projection_rate_limit: u32,
     cert_data: tls::CertificateData,
+    connection_tracker: scp_transport::relay::rate_limit::ConnectionTracker,
+    subscription_registry: scp_transport::relay::subscription::SubscriptionRegistry,
     #[cfg(feature = "http3")] http3_config: Option<scp_transport::http3::Http3Config>,
 ) -> Result<ApplicationNode<S>, NodeError> {
     let relay_url = format!("wss://{domain}/scp/v1");
@@ -1909,6 +1917,9 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         ),
         tls_config: Some(Arc::new(tls_server_config)),
         cert_resolver: Some(cert_resolver),
+        did_document: document.clone(),
+        connection_tracker,
+        subscription_registry,
     });
 
     Ok(ApplicationNode {
@@ -1950,6 +1961,8 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     cors_origins: Option<Vec<String>>,
     projection_rate_limit: u32,
     network_detector: Option<Arc<dyn NetworkChangeDetector>>,
+    connection_tracker: scp_transport::relay::rate_limit::ConnectionTracker,
+    subscription_registry: scp_transport::relay::subscription::SubscriptionRegistry,
 ) -> Result<ApplicationNode<S>, NodeError> {
     let tier = nat_strategy.select_tier(bound_addr.port()).await?;
 
@@ -2031,6 +2044,9 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         ),
         tls_config: None,
         cert_resolver: None,
+        did_document: document.clone(),
+        connection_tracker,
+        subscription_registry,
     });
 
     // Do NOT serve .well-known/scp — no domain to serve from (§10.12.8).
@@ -2104,6 +2120,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
                 .ok_or(NodeError::MissingField("blob_storage"))?,
         );
         let relay_server = RelayServer::new(relay_config.clone(), Arc::clone(&blob_storage));
+        let connection_tracker = relay_server.connection_tracker();
+        let subscription_registry = relay_server.subscriptions();
         let (shutdown_handle, bound_addr) = relay_server.start().await?;
 
         // 4. Generate dev API token if local_api was configured.
@@ -2136,6 +2154,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
             self.projection_rate_limit
                 .unwrap_or(DEFAULT_PROJECTION_RATE_LIMIT),
             self.network_detector,
+            connection_tracker,
+            subscription_registry,
         )
         .await
     }
