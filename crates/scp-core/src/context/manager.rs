@@ -25,7 +25,7 @@ use super::builder::{
 };
 use super::governance::{
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceEvent, GovernanceModelConfig,
-    GovernanceProposal, ProposalId, ProposalStatus, PruningPolicy, RevocationScope,
+    GovernanceProposal, KeyResolver, ProposalId, ProposalStatus, PruningPolicy, RevocationScope,
     SingleAdminEngine, majority::MajorityVoteEngine, multisig::ThresholdEngine,
     unanimity::UnanimityEngine,
 };
@@ -496,7 +496,7 @@ fn require_active(handle: &ContextHandle) -> Result<(), ContextError> {
 /// # Examples
 ///
 /// ```ignore
-/// let manager = ContextManager::new(crypto, transport, event_log);
+/// let manager = ContextManager::new(crypto, transport, event_log, key_resolver);
 /// let handle = manager.create_context("ctx-1".into(), params, "did:key:creator".into()).await?;
 /// assert_eq!(handle.state().await, ContextState::Active);
 /// ```
@@ -534,6 +534,10 @@ pub struct ContextManager {
     local_dids: RwLock<HashSet<DID>>,
     /// Per-context state, keyed by `context_id` string.
     contexts: Mutex<HashMap<String, PerContextState>>,
+    /// Resolver that maps a DID to its Ed25519 verifying key for governance
+    /// vote signature verification (spec §5.9, ADR-031). Passed through to
+    /// governance engines at creation and restoration time.
+    key_resolver: KeyResolver,
 }
 
 // Nursery lint — false-positives on async functions holding tokio::sync::MutexGuard
@@ -550,11 +554,13 @@ impl ContextManager {
     /// * `crypto` -- Provider for MLS and sender key operations.
     /// * `transport` -- Provider for relay connectivity and publication.
     /// * `event_log` -- Provider for event log initialisation and append.
+    /// * `key_resolver` -- Resolver for DID-to-Ed25519 key mapping (governance vote verification).
     #[must_use]
     pub fn new(
         crypto: Box<dyn ContextCryptoProvider>,
         transport: Box<dyn ContextTransportProvider>,
         event_log: Box<dyn ContextEventLogProvider>,
+        key_resolver: KeyResolver,
     ) -> Self {
         Self {
             crypto: Arc::from(crypto),
@@ -563,6 +569,7 @@ impl ContextManager {
             persistence: None,
             local_dids: RwLock::new(HashSet::new()),
             contexts: Mutex::new(HashMap::new()),
+            key_resolver,
         }
     }
 
@@ -579,12 +586,14 @@ impl ContextManager {
     /// * `transport` -- Provider for relay connectivity and publication.
     /// * `event_log` -- Provider for event log initialisation and append.
     /// * `persistence` -- Provider for context state persistence.
+    /// * `key_resolver` -- Resolver for DID-to-Ed25519 key mapping (governance vote verification).
     #[must_use]
     pub fn with_persistence(
         crypto: Box<dyn ContextCryptoProvider>,
         transport: Box<dyn ContextTransportProvider>,
         event_log: Box<dyn ContextEventLogProvider>,
         persistence: Box<dyn ContextPersistence>,
+        key_resolver: KeyResolver,
     ) -> Self {
         Self {
             crypto: Arc::from(crypto),
@@ -593,6 +602,7 @@ impl ContextManager {
             persistence: Some(Arc::from(persistence)),
             local_dids: RwLock::new(HashSet::new()),
             contexts: Mutex::new(HashMap::new()),
+            key_resolver,
         }
     }
 
@@ -726,7 +736,8 @@ impl ContextManager {
         let ttl_remaining = ctx_snapshot.ttl_remaining_secs;
 
         // Reconstruct the governance engine from the persisted snapshot.
-        let governance_engine = restore_governance_engine_from_snapshot(&ctx_snapshot)?;
+        let governance_engine =
+            restore_governance_engine_from_snapshot(&ctx_snapshot, self.key_resolver.clone())?;
 
         let per_context = PerContextState {
             handle: handle.clone(),
@@ -891,7 +902,8 @@ impl ContextManager {
         validate_governance_model(&params.governance)?;
 
         // Instantiate the governance engine based on GovernanceModel (ADR-031).
-        let governance_engine = create_governance_engine(&params.governance, &creator_did)?;
+        let governance_engine =
+            create_governance_engine(&params.governance, &creator_did, self.key_resolver.clone())?;
 
         // Phase 1+2: builder performs validation and creation (async, no lock held).
         let handle = builder_create_context(
@@ -3698,6 +3710,44 @@ mod tests {
     use crate::context::{ContextMode, ContextState};
 
     // -----------------------------------------------------------------------
+    // Key resolver helpers for tests
+    // -----------------------------------------------------------------------
+
+    /// No-op key resolver that always returns `None`. Suitable for tests
+    /// that don't exercise governance vote signature verification.
+    fn noop_key_resolver() -> KeyResolver {
+        Arc::new(|_| None)
+    }
+
+    /// Derives a deterministic Ed25519 seed from a DID string.
+    /// Used by both `mock_key_resolver` and `signing_key_for_did` to
+    /// ensure signing keys and resolved verifying keys match.
+    fn did_to_seed(did: &DID) -> [u8; 32] {
+        let mut s = [0u8; 32];
+        let bytes = did.as_ref().as_bytes();
+        for (i, b) in bytes.iter().enumerate() {
+            s[i % 32] ^= *b;
+        }
+        s
+    }
+
+    /// Mock key resolver that returns a deterministic verifying key derived
+    /// from the DID string. Suitable for governance proposal tests that
+    /// need actual key resolution for vote verification.
+    fn mock_key_resolver() -> KeyResolver {
+        Arc::new(|did| {
+            let seed = did_to_seed(did);
+            Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
+        })
+    }
+
+    /// Returns the signing key that corresponds to what `mock_key_resolver`
+    /// resolves for the given DID.
+    fn signing_key_for_did(did: &DID) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&did_to_seed(did))
+    }
+
+    // -----------------------------------------------------------------------
     // Reusable mock providers
     // -----------------------------------------------------------------------
 
@@ -3897,6 +3947,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         let params = ContextParams {
@@ -3926,6 +3977,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         let handle = manager
@@ -3944,6 +3996,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         let params = ContextParams {
@@ -3967,6 +4020,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::default()), // not connected
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         let result = manager
@@ -3989,6 +4043,7 @@ mod tests {
             Box::new(crypto),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         let result = manager
@@ -4008,6 +4063,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         let params = ContextParams {
@@ -4170,6 +4226,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         let params = ContextParams {
@@ -4454,6 +4511,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         ));
 
         let params = ContextParams {
@@ -4520,6 +4578,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         ));
 
         let params = ContextParams {
@@ -4579,6 +4638,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         // Register the author DID as locally controlled (#234).
@@ -5164,6 +5224,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         let params = ContextParams {
@@ -5301,6 +5362,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         // Register both author DIDs as locally controlled (#234).
@@ -5714,6 +5776,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         manager.register_local_did("did:key:alice".into()).await;
@@ -6138,6 +6201,7 @@ mod tests {
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
             Box::new(MockContextPersistence::default()),
+            noop_key_resolver(),
         );
 
         let params = ContextParams {
@@ -6204,6 +6268,7 @@ mod tests {
                 contexts: std::sync::Mutex::new(persistence.contexts.lock().unwrap().clone()),
                 broadcasts: std::sync::Mutex::new(persistence.broadcasts.lock().unwrap().clone()),
             }),
+            noop_key_resolver(),
         );
 
         // Restore the context.
@@ -6293,6 +6358,7 @@ mod tests {
                 contexts: std::sync::Mutex::new(persistence.contexts.lock().unwrap().clone()),
                 broadcasts: std::sync::Mutex::new(persistence.broadcasts.lock().unwrap().clone()),
             }),
+            noop_key_resolver(),
         );
 
         let handle = ContextHandle::new("replay-ctx".to_owned(), params);
@@ -6362,6 +6428,7 @@ mod tests {
                 contexts: std::sync::Mutex::new(persistence.contexts.lock().unwrap().clone()),
                 broadcasts: std::sync::Mutex::new(HashMap::new()),
             }),
+            noop_key_resolver(),
         );
 
         let handle = ContextHandle::new("ttl-ctx".to_owned(), params);
@@ -6419,6 +6486,7 @@ mod tests {
                 contexts: std::sync::Mutex::new(persistence.contexts.lock().unwrap().clone()),
                 broadcasts: std::sync::Mutex::new(HashMap::new()),
             }),
+            noop_key_resolver(),
         );
 
         let mut restored = manager.restore_all_contexts().await.unwrap();
@@ -6478,6 +6546,7 @@ mod tests {
                 contexts: std::sync::Mutex::new(persistence.contexts.lock().unwrap().clone()),
                 broadcasts: std::sync::Mutex::new(persistence.broadcasts.lock().unwrap().clone()),
             }),
+            noop_key_resolver(),
         );
 
         // First restore.
@@ -6509,6 +6578,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         let did: DID = "did:key:local1".into();
@@ -6688,6 +6758,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         // Neither the author DID nor the context exist.
@@ -6930,6 +7001,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         let params = ContextParams {
@@ -6957,6 +7029,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         let params = ContextParams {
@@ -6984,6 +7057,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         let params = ContextParams {
@@ -7013,6 +7087,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         let params = ContextParams {
@@ -7048,10 +7123,11 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            mock_key_resolver(),
         );
 
         let creator_did: DID = "did:dht:z6MkCreator".into();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let signing_key = signing_key_for_did(&creator_did);
 
         let handle = manager
             .create_context(
@@ -7066,9 +7142,7 @@ mod tests {
 
         // Propose RegisterTool — should auto-execute in SingleAdmin.
         let action = GovernanceAction::RegisterTool {
-            registration: super::super::params::ToolRegistration {
-                name: "test-tool".to_owned(),
-            },
+            registration: Box::new(test_tool_registration("test-tool")),
         };
 
         let (proposal, events) = manager
@@ -7116,13 +7190,14 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            mock_key_resolver(),
         );
 
         let alice: DID = "did:dht:z6MkAlice".into();
         let bob: DID = "did:dht:z6MkBob".into();
         let carol: DID = "did:dht:z6MkCarol".into();
-        let key_a = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-        let key_b = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+        let key_a = signing_key_for_did(&alice);
+        let key_b = signing_key_for_did(&bob);
 
         let params = ContextParams {
             governance: super::super::params::GovernanceModel::Threshold {
@@ -7140,9 +7215,7 @@ mod tests {
 
         // Alice proposes RegisterTool (her proposer vote counts as first approval).
         let action = GovernanceAction::RegisterTool {
-            registration: super::super::params::ToolRegistration {
-                name: "threshold-tool".to_owned(),
-            },
+            registration: Box::new(test_tool_registration("threshold-tool")),
         };
 
         let (proposal, _events) = manager
@@ -7187,13 +7260,14 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            mock_key_resolver(),
         );
 
         let alice: DID = "did:dht:z6MkAlice".into();
         let bob: DID = "did:dht:z6MkBob".into();
         let carol: DID = "did:dht:z6MkCarol".into();
-        let key_a = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-        let key_b = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+        let key_a = signing_key_for_did(&alice);
+        let key_b = signing_key_for_did(&bob);
 
         let params = ContextParams {
             governance: super::super::params::GovernanceModel::Majority {
@@ -7250,14 +7324,15 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            mock_key_resolver(),
         );
 
         let alice: DID = "did:dht:z6MkAlice".into();
         let bob: DID = "did:dht:z6MkBob".into();
         let carol: DID = "did:dht:z6MkCarol".into();
-        let key_a = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-        let key_b = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
-        let key_c = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+        let key_a = signing_key_for_did(&alice);
+        let key_b = signing_key_for_did(&bob);
+        let key_c = signing_key_for_did(&carol);
 
         let params = ContextParams {
             governance: super::super::params::GovernanceModel::Unanimity {
@@ -7336,13 +7411,14 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            mock_key_resolver(),
         );
 
         let alice: DID = "did:dht:z6MkAlice".into();
         let bob: DID = "did:dht:z6MkBob".into();
         let eve: DID = "did:dht:z6MkEve".into();
-        let key_a = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-        let key_e = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+        let key_a = signing_key_for_did(&alice);
+        let key_e = signing_key_for_did(&eve);
 
         let params = ContextParams {
             governance: super::super::params::GovernanceModel::Threshold {
@@ -7359,9 +7435,7 @@ mod tests {
 
         // Alice proposes.
         let action = GovernanceAction::RegisterTool {
-            registration: super::super::params::ToolRegistration {
-                name: "tool".to_owned(),
-            },
+            registration: Box::new(test_tool_registration("tool")),
         };
 
         let (proposal, _) = manager

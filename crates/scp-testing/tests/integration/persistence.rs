@@ -17,11 +17,13 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use scp_core::context::broadcast::{
     AuthorStateSnapshot, BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot,
     SubscriberRecord,
 };
+use scp_core::context::governance::KeyResolver;
 use scp_core::context::manager::{ContextManager, ContextPersistence, ContextSnapshot};
 use scp_core::context::{
     Capability, CapabilityCeiling, ContextHandle, ContextParams, ContextRoleState, ContextState,
@@ -1097,6 +1099,7 @@ async fn context_manager_broadcast_restore_roundtrip() {
         Box::new(MockTransport),
         Box::new(MockEventLog),
         Box::new(persistence),
+        Arc::new(|_: &DID| None) as KeyResolver,
     );
 
     // Create a context handle in Active state (simulating post-restart).
