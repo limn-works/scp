@@ -37,12 +37,13 @@ use crate::profile::TransportProfile;
 /// See ADR-012 acceptance criterion 3 for the rationale behind 10,000 entries.
 const DEFAULT_DEDUP_CACHE_SIZE: usize = 10_000;
 
-/// Default deduplication cache entry TTL.
+/// Default deduplication cache entry TTL (24 hours per spec §9.8.2(b)).
 ///
-/// Entries older than this duration are evicted even if the capacity has not
-/// been reached. This prevents stale entries from consuming memory in
-/// low-throughput scenarios.
-const DEFAULT_DEDUP_CACHE_TTL: Duration = Duration::from_secs(3600);
+/// The spec requires "10,000 envelopes or 24 hours, whichever is larger" for
+/// the deduplication sliding window. Entries older than this duration are
+/// evicted even if the capacity has not been reached. This prevents stale
+/// entries from consuming memory in low-throughput scenarios.
+const DEFAULT_DEDUP_CACHE_TTL: Duration = Duration::from_secs(86_400);
 
 /// Transport layer configuration.
 ///
@@ -62,7 +63,7 @@ const DEFAULT_DEDUP_CACHE_TTL: Duration = Duration::from_secs(3600);
 /// assert!(config.relay_urls.is_empty());
 /// assert!(config.bootstrap_domain.is_none());
 /// assert_eq!(config.dedup_cache_size, 10_000);
-/// assert_eq!(config.dedup_cache_ttl, Duration::from_secs(3600));
+/// assert_eq!(config.dedup_cache_ttl, Duration::from_secs(86_400));
 /// // Profile is platform-inferred by default.
 /// let _ = config.profile;
 /// ```
@@ -105,10 +106,10 @@ pub struct TransportConfig {
     /// Time-to-live for deduplication cache entries.
     ///
     /// Entries older than this duration are evicted even if the cache has not
-    /// reached capacity. Defaults to 1 hour. This prevents stale entries from
-    /// consuming memory in low-throughput scenarios and ensures that a slow
-    /// relay delivering a blob after the LRU entry was evicted does not bypass
-    /// deduplication.
+    /// reached capacity. Defaults to 24 hours per spec §9.8.2(b). This
+    /// prevents stale entries from consuming memory in low-throughput scenarios
+    /// and ensures that a slow relay delivering a blob after the LRU entry was
+    /// evicted does not bypass deduplication.
     pub dedup_cache_ttl: Duration,
 }
 
@@ -348,7 +349,7 @@ mod tests {
         assert!(config.relay_urls.is_empty());
         assert!(config.bootstrap_domain.is_none());
         assert_eq!(config.dedup_cache_size, 10_000);
-        assert_eq!(config.dedup_cache_ttl, Duration::from_secs(3600));
+        assert_eq!(config.dedup_cache_ttl, Duration::from_secs(86_400));
     }
 
     #[test]
