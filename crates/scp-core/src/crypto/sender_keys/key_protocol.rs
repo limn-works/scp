@@ -2283,6 +2283,7 @@ mod tests {
             "ctx-1",
             "did:dht:alice",
             "did:dht:dave",
+            SigningKeyId::Active,
         )
         .await
         .unwrap();

@@ -111,11 +111,7 @@ pub struct StoredValue<T> {
 ///
 /// Incremented when the serialized format of any domain type changes.
 /// Migration logic (spec section 17.10) uses this to detect stale data.
-///
-/// Version history:
-/// - v1: positional `MessagePack` (array format)
-/// - v2: named `MessagePack` (map format) for forward-compatible field evolution
-pub const CURRENT_STORE_VERSION: u16 = 2;
+pub const CURRENT_STORE_VERSION: u16 = 1;
 
 /// Current key-space schema version.
 ///
@@ -463,44 +459,12 @@ mod tests {
     #[test]
     fn stored_value_roundtrip_via_named_msgpack() {
         let original = StoredValue {
-            version: 2,
+            version: 1,
             data: "hello".to_owned(),
         };
         let bytes = rmp_serde::to_vec_named(&original).unwrap();
         let decoded: StoredValue<String> = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(decoded, original);
-    }
-
-    #[test]
-    fn named_msgpack_produces_map_not_array() {
-        let envelope = StoredValue {
-            version: CURRENT_STORE_VERSION,
-            data: "test",
-        };
-        let bytes = rmp_serde::to_vec_named(&envelope).unwrap();
-        // Named (map) format: first byte is a fixmap (0x82 = 2-element map).
-        // Positional (array) format would start with a fixarray (0x92).
-        assert_eq!(
-            bytes[0] & 0xF0,
-            0x80,
-            "expected MessagePack map marker, got {:#04x}",
-            bytes[0]
-        );
-    }
-
-    #[test]
-    fn deserialize_handles_legacy_positional_format() {
-        // Data written by the old positional serializer (v1) must still
-        // be readable by the current deserializer. rmp_serde::from_slice
-        // handles both array and map formats transparently.
-        let original = StoredValue {
-            version: 1u16,
-            data: "legacy".to_owned(),
-        };
-        let positional_bytes = rmp_serde::to_vec(&original).unwrap();
-        let decoded: StoredValue<String> = rmp_serde::from_slice(&positional_bytes).unwrap();
-        assert_eq!(decoded.version, 1);
-        assert_eq!(decoded.data, "legacy");
     }
 
     #[test]
@@ -520,23 +484,6 @@ mod tests {
             data: "future",
         };
         let bytes = rmp_serde::to_vec_named(&envelope).unwrap();
-        let result =
-            ProtocolStore::<scp_platform::testing::InMemoryStorage>::deserialize::<String>(&bytes);
-        assert!(matches!(
-            result,
-            Err(StoreError::IncompatibleVersion { .. })
-        ));
-    }
-
-    #[test]
-    fn deserialize_rejects_future_version_from_positional() {
-        // Future-version rejection must also work for positional format
-        // in case a newer version writes positional data (defensive).
-        let envelope = StoredValue {
-            version: CURRENT_STORE_VERSION + 1,
-            data: "future",
-        };
-        let bytes = rmp_serde::to_vec(&envelope).unwrap();
         let result =
             ProtocolStore::<scp_platform::testing::InMemoryStorage>::deserialize::<String>(&bytes);
         assert!(matches!(
