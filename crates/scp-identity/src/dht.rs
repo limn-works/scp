@@ -38,6 +38,86 @@ use super::{DidMethod, IdentityError, ScpIdentity};
 /// The `did:dht` DID method prefix.
 const DID_DHT_PREFIX: &str = "did:dht:";
 
+// ---------------------------------------------------------------------------
+// BEP44 Sequence Persistence (issue #327)
+// ---------------------------------------------------------------------------
+
+/// Persistence trait for BEP44 sequence numbers.
+///
+/// DID document publications to the Mainline DHT use BEP44 signed mutable
+/// items with a monotonically increasing sequence number. If the node restarts
+/// and begins from 0, previously-published documents with higher sequence
+/// numbers will be considered "newer" by DHT peers, enabling replay attacks.
+///
+/// Implementations persist the last-published sequence number so it can be
+/// recovered on restart. The identity crate defines this trait (rather than
+/// importing from `scp-core`) to preserve `scp-identity`'s self-contained
+/// design.
+///
+/// See issue #327 and BEP44 §Mutable Items.
+pub trait SequenceStore: Send + Sync {
+    /// Loads the last-persisted sequence number for the given DID.
+    ///
+    /// Returns `Ok(None)` if no sequence has been stored (first run).
+    fn load(
+        &self,
+        did: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, IdentityError>> + Send + '_>>;
+
+    /// Persists the sequence number for the given DID.
+    ///
+    /// Called after every successful DID document publication.
+    fn store(
+        &self,
+        did: &str,
+        seq: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), IdentityError>> + Send + '_>>;
+}
+
+/// In-memory [`SequenceStore`] for testing.
+///
+/// Stores sequence numbers in a `HashMap` behind a `tokio::sync::Mutex`.
+/// Not suitable for production (no persistence across restarts).
+#[derive(Debug, Default)]
+pub struct InMemorySequenceStore {
+    sequences: tokio::sync::Mutex<std::collections::HashMap<String, u64>>,
+}
+
+impl InMemorySequenceStore {
+    /// Creates a new empty in-memory sequence store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            sequences: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+impl SequenceStore for InMemorySequenceStore {
+    fn load(
+        &self,
+        did: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, IdentityError>> + Send + '_>> {
+        let did = did.to_owned();
+        Box::pin(async move {
+            let map = self.sequences.lock().await;
+            Ok(map.get(&did).copied())
+        })
+    }
+
+    fn store(
+        &self,
+        did: &str,
+        seq: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), IdentityError>> + Send + '_>> {
+        let did = did.to_owned();
+        Box::pin(async move {
+            self.sequences.lock().await.insert(did, seq);
+            Ok(())
+        })
+    }
+}
+
 /// Domain separator for migration proof hashes, preventing cross-protocol
 /// signature confusion. See issue #78.
 const DOMAIN_MIGRATION_V1: &[u8] = b"SCP-MIGRATION-V1:";
@@ -79,9 +159,15 @@ pub struct DidDht<D: DhtClient = InMemoryDhtClient, C: Clock = SystemClock> {
     sequence: AtomicU64,
     /// Optional signing function for BEP44 publish.
     sign_fn: Option<Arc<SignFn>>,
+    /// Optional persistence for BEP44 sequence numbers (issue #327).
+    ///
+    /// When present, the sequence number is persisted after every successful
+    /// DID document publication and loaded on startup via
+    /// [`initialize_sequence`](Self::initialize_sequence).
+    sequence_store: Option<Arc<dyn SequenceStore>>,
 }
 
-// Manual Debug impl because SignFn can't derive Debug.
+// Manual Debug impl because SignFn and dyn SequenceStore can't derive Debug.
 impl<D: DhtClient + std::fmt::Debug, C: Clock + std::fmt::Debug> std::fmt::Debug for DidDht<D, C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DidDht")
@@ -89,6 +175,10 @@ impl<D: DhtClient + std::fmt::Debug, C: Clock + std::fmt::Debug> std::fmt::Debug
             .field("cache", &self.cache)
             .field("sequence", &self.sequence)
             .field("sign_fn", &self.sign_fn.as_ref().map(|_| "<fn>"))
+            .field(
+                "sequence_store",
+                &self.sequence_store.as_ref().map(|_| "<store>"),
+            )
             .finish()
     }
 }
@@ -113,6 +203,7 @@ impl DidDht<InMemoryDhtClient, SystemClock> {
             cache: Arc::new(DidCache::new()),
             sequence: AtomicU64::new(0),
             sign_fn: None,
+            sequence_store: None,
         }
     }
 }
@@ -127,6 +218,7 @@ impl<D: DhtClient> DidDht<D, SystemClock> {
             cache: Arc::new(DidCache::new()),
             sequence: AtomicU64::new(0),
             sign_fn: None,
+            sequence_store: None,
         }
     }
 }
@@ -149,6 +241,29 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             cache,
             sequence: AtomicU64::new(0),
             sign_fn: Some(sign_fn),
+            sequence_store: None,
+        }
+    }
+
+    /// Creates a new `DidDht` instance with DHT client, cache, signing
+    /// function, and sequence persistence store (issue #327).
+    ///
+    /// After construction, call [`initialize_sequence`](Self::initialize_sequence)
+    /// to bootstrap the sequence number from the store and/or DHT before
+    /// publishing any documents.
+    #[must_use]
+    pub fn with_client_signer_and_store(
+        dht_client: Arc<D>,
+        cache: Arc<DidCache<C>>,
+        sign_fn: Arc<SignFn>,
+        sequence_store: Arc<dyn SequenceStore>,
+    ) -> Self {
+        Self {
+            dht_client,
+            cache,
+            sequence: AtomicU64::new(0),
+            sign_fn: Some(sign_fn),
+            sequence_store: Some(sequence_store),
         }
     }
 
@@ -191,6 +306,61 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     /// Sets the sequence number (e.g., when loading from persistent storage).
     pub fn set_sequence(&self, seq: u64) {
         self.sequence.store(seq, Ordering::Release);
+    }
+
+    /// Returns a reference to the sequence store, if configured.
+    #[must_use]
+    pub fn sequence_store(&self) -> Option<&Arc<dyn SequenceStore>> {
+        self.sequence_store.as_ref()
+    }
+
+    /// Bootstraps the BEP44 sequence number from persistent storage and/or
+    /// the DHT (issue #327).
+    ///
+    /// This method MUST be called after construction and before publishing
+    /// any DID documents. It ensures the node never publishes with a sequence
+    /// number less than or equal to a previously-published value, even after
+    /// restart.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Load the last-persisted sequence from the [`SequenceStore`] (if
+    ///    configured).
+    /// 2. Query the DHT for the current sequence of the DID's BEP44 record.
+    /// 3. Set the local sequence to `max(stored, remote)`. The next publish
+    ///    will increment this to `max(stored, remote) + 1`.
+    ///
+    /// If no store is configured and no DHT record exists, the sequence
+    /// remains at its current value (typically 0 for a new identity).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::DhtResolveFailed`] if the DHT query fails.
+    /// Store load errors are propagated as-is.
+    pub async fn initialize_sequence(&self, did: &str) -> Result<(), IdentityError> {
+        // Step 1: Load from persistent store.
+        let mut best_seq: u64 = if let Some(store) = &self.sequence_store
+            && let Some(stored_seq) = store.load(did).await?
+        {
+            stored_seq
+        } else {
+            0
+        };
+
+        // Step 2: Query DHT for the current remote sequence.
+        let public_key = extract_public_key(did)?;
+        if let Ok(Some(record)) = self.dht_client.resolve(&public_key).await {
+            best_seq = best_seq.max(record.seq);
+        }
+
+        // Step 3: Set to the maximum known sequence.
+        // The next publish_document call will fetch_add(1), producing
+        // max(stored, remote) + 1.
+        if best_seq > 0 {
+            self.sequence.store(best_seq, Ordering::Release);
+        }
+
+        Ok(())
     }
 
     /// Constructs the BEP44 signable payload for a value and sequence number.
@@ -269,6 +439,11 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         self.dht_client
             .publish(&public_key, &signature, value, seq)
             .await?;
+
+        // Persist the sequence number after successful publish (issue #327).
+        if let Some(store) = &self.sequence_store {
+            store.store(&identity.did, seq).await?;
+        }
 
         Ok(())
     }
@@ -3175,5 +3350,187 @@ mod tests {
             seq.load(Ordering::Acquire),
             (num_threads * increments_per_thread) as u64
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // BEP44 sequence persistence tests (issue #327)
+    // -----------------------------------------------------------------------
+
+    /// Helper to create a `DidDht` with a shared DHT client, custody, and
+    /// sequence store — simulating restart by creating a new `DidDht` that
+    /// shares the same store and DHT.
+    fn make_dht_with_store(
+        custody: &Arc<InMemoryKeyCustody>,
+        dht_client: Arc<InMemoryDhtClient>,
+        store: Arc<InMemorySequenceStore>,
+    ) -> DidDht<InMemoryDhtClient, Arc<TestClock>> {
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(clock));
+        let sign_fn =
+            DidDht::<InMemoryDhtClient, Arc<TestClock>>::make_sign_fn(Arc::clone(custody));
+        DidDht::with_client_signer_and_store(dht_client, cache, sign_fn, store)
+    }
+
+    #[tokio::test]
+    async fn publish_persists_sequence_to_store() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let store = Arc::new(InMemorySequenceStore::new());
+        let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+
+        // Publish increments and persists.
+        dht.publish_document(&identity, &document).await.unwrap();
+        assert_eq!(dht.current_sequence(), 1);
+
+        let stored = store.load(&identity.did).await.unwrap();
+        assert_eq!(stored, Some(1));
+
+        // Second publish persists 2.
+        dht.publish_document(&identity, &document).await.unwrap();
+        assert_eq!(dht.current_sequence(), 2);
+
+        let stored = store.load(&identity.did).await.unwrap();
+        assert_eq!(stored, Some(2));
+    }
+
+    #[tokio::test]
+    async fn initialize_sequence_from_store() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let store = Arc::new(InMemorySequenceStore::new());
+        let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+
+        // Publish 3 times to get sequence to 3.
+        for _ in 0..3 {
+            dht.publish_document(&identity, &document).await.unwrap();
+        }
+        assert_eq!(dht.current_sequence(), 3);
+        assert_eq!(store.load(&identity.did).await.unwrap(), Some(3));
+
+        // Simulate restart: create a new DidDht with same store and DHT.
+        let dht2 = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
+        assert_eq!(dht2.current_sequence(), 0); // Not yet initialized.
+
+        dht2.initialize_sequence(&identity.did).await.unwrap();
+        assert_eq!(dht2.current_sequence(), 3); // Loaded from store.
+
+        // Next publish must be > 3.
+        dht2.publish_document(&identity, &document).await.unwrap();
+        assert_eq!(dht2.current_sequence(), 4);
+        assert_eq!(store.load(&identity.did).await.unwrap(), Some(4));
+    }
+
+    #[tokio::test]
+    async fn initialize_sequence_from_dht_when_no_store() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let store = Arc::new(InMemorySequenceStore::new());
+
+        // First instance: publish with a store.
+        let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+        for _ in 0..5 {
+            dht.publish_document(&identity, &document).await.unwrap();
+        }
+        assert_eq!(dht.current_sequence(), 5);
+
+        // Second instance: fresh store (simulating lost storage), but same DHT.
+        let fresh_store = Arc::new(InMemorySequenceStore::new());
+        let dht2 = make_dht_with_store(&custody, Arc::clone(&dht_client), fresh_store);
+
+        dht2.initialize_sequence(&identity.did).await.unwrap();
+        // Should have recovered seq 5 from the DHT record.
+        assert_eq!(dht2.current_sequence(), 5);
+
+        // Next publish must be > 5.
+        dht2.publish_document(&identity, &document).await.unwrap();
+        assert_eq!(dht2.current_sequence(), 6);
+    }
+
+    #[tokio::test]
+    async fn initialize_sequence_uses_max_of_store_and_dht() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let store = Arc::new(InMemorySequenceStore::new());
+
+        // First instance: publish to get DHT seq to 3.
+        let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+        for _ in 0..3 {
+            dht.publish_document(&identity, &document).await.unwrap();
+        }
+
+        // Manually set the store to a higher value (simulating store ahead of DHT).
+        store.store(&identity.did, 10).await.unwrap();
+
+        let dht2 = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
+        dht2.initialize_sequence(&identity.did).await.unwrap();
+        // max(10, 3) = 10
+        assert_eq!(dht2.current_sequence(), 10);
+
+        // Next publish: 11.
+        dht2.publish_document(&identity, &document).await.unwrap();
+        assert_eq!(dht2.current_sequence(), 11);
+    }
+
+    #[tokio::test]
+    async fn publish_restart_publish_produces_higher_sequence() {
+        // This is the exact acceptance criterion test:
+        // "publish -> restart -> publish again -> second publication has higher sequence"
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let store = Arc::new(InMemorySequenceStore::new());
+
+        // First session: create and publish.
+        let dht1 = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
+        let (identity, document) = dht1.create(&*custody).await.unwrap();
+        dht1.publish_document(&identity, &document).await.unwrap();
+        let seq_before_restart = dht1.current_sequence();
+        assert_eq!(seq_before_restart, 1);
+
+        // Simulate restart: new DidDht, same store + DHT.
+        let dht2 = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
+        dht2.initialize_sequence(&identity.did).await.unwrap();
+
+        // Second session: publish again.
+        dht2.publish_document(&identity, &document).await.unwrap();
+        let seq_after_restart = dht2.current_sequence();
+
+        // The second publication MUST have a strictly higher sequence.
+        assert!(
+            seq_after_restart > seq_before_restart,
+            "sequence after restart ({seq_after_restart}) must be > sequence before restart ({seq_before_restart})"
+        );
+        assert_eq!(seq_after_restart, 2);
+    }
+
+    #[tokio::test]
+    async fn no_store_works_without_persistence() {
+        // Backward compatibility: DidDht without a store still works.
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+        dht.publish_document(&identity, &document).await.unwrap();
+        assert_eq!(dht.current_sequence(), 1);
+        dht.publish_document(&identity, &document).await.unwrap();
+        assert_eq!(dht.current_sequence(), 2);
+    }
+
+    #[tokio::test]
+    async fn initialize_sequence_no_store_no_dht_record() {
+        // New identity, no store, no DHT record: sequence stays at 0.
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let store = Arc::new(InMemorySequenceStore::new());
+        let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
+
+        let (identity, _document) = dht.create(&*custody).await.unwrap();
+        dht.initialize_sequence(&identity.did).await.unwrap();
+        assert_eq!(dht.current_sequence(), 0);
     }
 }
