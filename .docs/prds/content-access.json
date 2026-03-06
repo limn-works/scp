@@ -326,7 +326,7 @@
         "crates/scp-core/src/crypto/access_keys/lifecycle.rs",
         "crates/scp-core/src/context/manager.rs"
       ],
-      "description": "Implement Layer 2 (SDK-mandated state destruction) per \u00a79.16.7. When a block event is received and verified, the blocked party's SDK MUST destroy all locally cached material from the blocking party: cached sender keys (all epochs), cached plaintext (decrypted message content), and cached access keys.\n\nDestruction MUST occur before the SDK processes any subsequent messages \u2014 the block handler is synchronous with respect to message processing. This is a protocol requirement for compliant clients.\n\nAlso wire the complementary side: when the blocker's SDK processes a block it initiated, it deletes the target's access key from its local store (Layer 3 enforcement on the blocker's side).",
+      "description": "Implement Layer 2 (SDK-mandated state destruction) per \u00a79.16.7. When a block event is received and verified, the blocked party's SDK MUST destroy all locally cached material from the blocking party: cached sender keys (all epochs), cached plaintext (decrypted message content), and cached access keys.\n\nDestruction MUST occur before the SDK processes any subsequent messages \u2014 the block handler is synchronous with respect to message processing. This is a protocol requirement for compliant clients.\n\nAlso wire the complementary side: when the blocker's SDK processes a block it initiated, it deletes the target's access key from its local store (Layer 3 enforcement on the blocker's side).\n\nAdditionally, implement the ContentAccessState enum with four states: Full, ReadOnly, PresenceOnly, NonMember (\u00a79.16.4). State transitions are one-way (block) until explicit RestoreReadAccess/RestoreWriteAccess governance actions. Forward-only restoration: unblock grants future access, historical gap is permanent. RevokeReadAccess triggers plaintext + access key destruction. RevokeWriteAccess triggers sender key exclusion (Layer 1). Both trigger the appropriate ContentAccessState transition.",
       "acceptanceCriteria": [
         "On verified block notification, blocked party's SDK deletes all sender key epochs from the blocker",
         "On verified block notification, blocked party's SDK purges cached plaintext originating from the blocker",
@@ -337,7 +337,12 @@
         "Invalid block notification signature causes discard + anomaly log (no destruction)",
         "Tests verify sender key deletion on verified block notification",
         "Tests verify access key deletion on both sides (blocker and blocked)",
-        "Tests verify invalid signature causes discard without destruction"
+        "Tests verify invalid signature causes discard without destruction",
+        "ContentAccessState enum with Full, ReadOnly, PresenceOnly, NonMember variants",
+        "State transitions are one-way until explicit Restore governance action",
+        "Forward-only restoration: unblock grants future access, historical gap permanent",
+        "RevokeReadAccess triggers plaintext + access key destruction",
+        "RevokeWriteAccess triggers sender key exclusion"
       ],
       "actionItems": [
         "Add block notification handler in sender key module",
@@ -347,7 +352,10 @@
         "Wire block handler synchronously in message processing pipeline",
         "Wire blocker-side access key deletion on block initiation",
         "Add signature verification before destruction",
-        "Add unit tests for all destruction paths"
+        "Add unit tests for all destruction paths",
+        "Add ContentAccessState enum to context module",
+        "Wire state transitions on RevokeReadAccess and RevokeWriteAccess",
+        "Implement forward-only restoration semantics"
       ],
       "blockedBy": [
         "SCP-CAC-004"
