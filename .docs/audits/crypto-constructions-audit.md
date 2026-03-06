@@ -2,6 +2,8 @@ I now have comprehensive coverage of all the cryptographic constructions across 
 
 ---
 
+> **Line number shift notice:** References to `05-contexts.md` §5.14 (broadcast) are shifted +47 to +64 after PR #296 merged. All findings remain valid.
+
 # SCP Cryptographic Specification Audit
 
 ## Executive Summary
