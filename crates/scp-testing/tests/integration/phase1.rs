@@ -241,7 +241,7 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
 
     // Verify the epoch advance is valid.
     let advance: scp_core::crypto::sender_keys::SenderKeyEpochAdvance =
-        serde_json::from_slice(&advance_bytes).unwrap();
+        rmp_serde::from_slice(&advance_bytes).unwrap();
     let advance_ok = verify_epoch_advance(&advance, ctx_id, &alice_pubkey).unwrap();
     assert!(advance_ok, "epoch advance signature must verify");
 
@@ -282,7 +282,7 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
 
     // Alice handles the request (verifies signature, HPKE-encrypts the key).
     let sk_request: scp_core::crypto::sender_keys::SenderKeyRequest =
-        serde_json::from_slice(&req_result.request_message).unwrap();
+        rmp_serde::from_slice(&req_result.request_message).unwrap();
 
     let block_list: HashSet<String> = HashSet::new();
     let mut nonce_dedup = scp_core::crypto::sender_keys::NonceDedup::new();
@@ -305,7 +305,7 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
 
     // Bob decrypts the response to obtain Alice's sender key.
     let sk_response: scp_core::crypto::sender_keys::SenderKeyResponse =
-        serde_json::from_slice(&resp_bytes).unwrap();
+        rmp_serde::from_slice(&resp_bytes).unwrap();
     let received_sk =
         open_sender_key_response(&bob_custody, &req_result.wrapping_key_handle, &sk_response)
             .await
