@@ -6587,9 +6587,10 @@
         "Document lifecycle integration patterns for SDK consumers"
       ],
       "blockedBy": [
-        "SCP-115",
         "SCP-105",
         "SCP-106",
+        "SCP-115",
+        "SCP-116",
         "SCP-211"
       ],
       "sources": [
@@ -6608,10 +6609,7 @@
           "scaffold/kotlin.md",
           "ADR-026 (Swift SDK) as parallel reference"
         ]
-      },
-      "blocked_by": [
-        "SCP-116"
-      ]
+      }
     },
     {
       "id": "SCP-118",
@@ -6639,9 +6637,9 @@
         "Add Compose UI tests verifying recomposition on state changes"
       ],
       "blockedBy": [
+        "SCP-106",
         "SCP-116",
         "SCP-117",
-        "SCP-106",
         "SCP-211"
       ],
       "sources": [
@@ -6660,10 +6658,7 @@
           "scaffold/kotlin.md",
           "ADR-026 (Swift SDK) as parallel reference"
         ]
-      },
-      "blocked_by": [
-        "SCP-116"
-      ]
+      }
     },
     {
       "id": "SCP-119",
@@ -6741,9 +6736,11 @@
         "Add conformance tests to CI pipeline"
       ],
       "blockedBy": [
-        "SCP-115",
         "SCP-099",
         "SCP-106",
+        "SCP-115",
+        "SCP-116",
+        "SCP-117",
         "SCP-211"
       ],
       "sources": [
@@ -6760,11 +6757,7 @@
           "ADR-026 (Swift SDK) as parallel reference",
           "ADR-014 (Python SDK) as pattern"
         ]
-      },
-      "blocked_by": [
-        "SCP-116",
-        "SCP-117"
-      ]
+      }
     },
     {
       "id": "SCP-121",
@@ -10065,8 +10058,8 @@
       "gate": "gate-audit",
       "status": "pending",
       "blockedBy": [
-        "SCP-220",
-        "SCP-103"
+        "SCP-103",
+        "SCP-220"
       ],
       "files": [
         "bindings/swift/Sources/SCP/Mcp.swift",
@@ -10096,10 +10089,7 @@
         }
       ],
       "actionItems": [],
-      "details": {},
-      "blocked_by": [
-        "SCP-220"
-      ]
+      "details": {}
     },
     {
       "id": "SCP-222",

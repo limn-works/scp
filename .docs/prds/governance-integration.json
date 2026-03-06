@@ -135,10 +135,7 @@
           "section": "## 6. Governance"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-267"
-      ]
+      "details": {}
     },
     {
       "id": "SCP-269",
@@ -189,7 +186,8 @@
         "Add serialization round-trip tests for all new types"
       ],
       "blockedBy": [
-        "SCP-267"
+        "SCP-267",
+        "SCP-268"
       ],
       "sources": [
         {
@@ -206,9 +204,6 @@
         }
       ],
       "details": {},
-      "blocked_by": [
-        "SCP-268"
-      ],
       "blocked_by_issues": [
         320
       ]
@@ -278,10 +273,7 @@
           "section": "## 5.10 Context TTL (Time-to-Live)"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-269"
-      ]
+      "details": {}
     },
     {
       "id": "SCP-271",
@@ -332,7 +324,8 @@
       ],
       "blockedBy": [
         "SCP-268",
-        "SCP-269"
+        "SCP-269",
+        "SCP-270"
       ],
       "sources": [
         {
@@ -344,10 +337,7 @@
           "section": "## ADR-029: Offline/Sync Strategy"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-270"
-      ]
+      "details": {}
     },
     {
       "id": "SCP-272",
@@ -396,9 +386,6 @@
         }
       ],
       "details": {},
-      "blocked_by": [
-        "SCP-270"
-      ],
       "blocked_by_issues": [
         354
       ]
@@ -445,9 +432,6 @@
         }
       ],
       "details": {},
-      "blocked_by": [
-        "SCP-267"
-      ],
       "blocked_by_issues": [
         330
       ]
@@ -510,12 +494,7 @@
           "section": "## 5.9 Governance"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-271",
-        "SCP-272",
-        "SCP-273"
-      ]
+      "details": {}
     }
   ]
 }

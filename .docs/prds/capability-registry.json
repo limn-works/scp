@@ -143,10 +143,7 @@
           "section": "#### 7.3.4.3 Protocol Capability Registry"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-ACR-001"
-      ]
+      "details": {}
     },
     {
       "id": "SCP-ACR-003",
@@ -195,10 +192,7 @@
           "section": "### 7.3.4 Challenge-Response Verification"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-ACR-002"
-      ]
+      "details": {}
     },
     {
       "id": "SCP-ACR-004",
@@ -243,10 +237,7 @@
           "section": "#### 7.3.4.3 Protocol Capability Registry"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-ACR-003"
-      ]
+      "details": {}
     },
     {
       "id": "SCP-ACR-005",
@@ -290,10 +281,7 @@
           "section": "#### 7.3.4.1 Capability URI Namespace"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-ACR-001"
-      ]
+      "details": {}
     },
     {
       "id": "SCP-ACR-006",
@@ -332,10 +320,7 @@
           "section": "#### 7.3.4.1 Capability URI Namespace"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-ACR-005"
-      ]
+      "details": {}
     },
     {
       "id": "SCP-ACR-007",
@@ -383,11 +368,7 @@
           "section": "#### 7.3.4.4 Context Admission via Capability URIs"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-ACR-001",
-        "SCP-ACR-003"
-      ]
+      "details": {}
     }
   ]
 }

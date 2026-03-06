@@ -129,10 +129,7 @@
           "section": "### 7.3.2 Participation Records"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-BA-001"
-      ]
+      "details": {}
     },
     {
       "id": "SCP-BA-003",
@@ -188,10 +185,7 @@
           "section": "## ADR-017: Trust Engine (Four-Layer Evaluation)"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-BA-001"
-      ]
+      "details": {}
     },
     {
       "id": "SCP-BA-004",
@@ -237,11 +231,7 @@
           "section": "#### 7.3.2.1 Participation Admission Requirements"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-BA-002",
-        "SCP-BA-003"
-      ]
+      "details": {}
     },
     {
       "id": "SCP-BA-005",
@@ -299,10 +289,7 @@
           "section": "### 7.3.1 Verifiable Event Logs"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-BA-001"
-      ]
+      "details": {}
     },
     {
       "id": "SCP-BA-006",
@@ -342,10 +329,7 @@
           "section": "#### 7.3.2.1 Participation Admission Requirements"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-BA-001"
-      ]
+      "details": {}
     }
   ]
 }

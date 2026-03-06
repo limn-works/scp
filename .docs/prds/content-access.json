@@ -151,11 +151,7 @@
           "section": "### 9.16.7 SDK-Mandated State Destruction (Layer 2)"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-CAC-001",
-        "SCP-CAC-004"
-      ]
+      "details": {}
     },
     {
       "id": "SCP-CAC-003",
@@ -202,10 +198,7 @@
           "section": "## 3.6 Social Graph"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-CAC-002"
-      ]
+      "details": {}
     },
     {
       "id": "SCP-CAC-004",
@@ -319,10 +312,7 @@
           "section": "### 9.17.3 Wire Format"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-CAC-004"
-      ]
+      "details": {}
     },
     {
       "id": "SCP-CAC-006",
@@ -372,10 +362,7 @@
           "section": "### 9.16.3 Block Protocol"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-CAC-004"
-      ]
+      "details": {}
     },
     {
       "id": "SCP-CAC-007",
@@ -419,6 +406,7 @@
         "Add tests for each execution path"
       ],
       "blockedBy": [
+        "SCP-269",
         "SCP-CAC-005"
       ],
       "sources": [
@@ -439,11 +427,7 @@
           "section": "## 9.17 Content Access Key Layer"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-CAC-005",
-        "SCP-269"
-      ]
+      "details": {}
     },
     {
       "id": "SCP-CAC-008",
@@ -489,10 +473,7 @@
           "section": "### 5.14.10 Event Log"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-CAC-007"
-      ]
+      "details": {}
     },
     {
       "id": "SCP-CAC-009",
@@ -545,12 +526,7 @@
           "section": "## 9.17 Content Access Key Layer"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-CAC-003",
-        "SCP-CAC-006",
-        "SCP-CAC-008"
-      ]
+      "details": {}
     },
     {
       "id": "SCP-CAC-010",
@@ -602,10 +578,7 @@
           "section": "## ADR-038: Content Access Key Layer"
         }
       ],
-      "details": {},
-      "blocked_by": [
-        "SCP-CAC-007"
-      ]
+      "details": {}
     }
   ]
 }
