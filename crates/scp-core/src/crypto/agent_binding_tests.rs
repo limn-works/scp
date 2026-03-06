@@ -104,6 +104,7 @@ mod tests {
             })),
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None, // Deliberately not setting — tests key_scope mismatch
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -151,6 +152,7 @@ mod tests {
             facts: None, // No key_scope!
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         // mint_ucan rejects self-delegation without key_scope at mint time
@@ -202,6 +204,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody_agent).await.unwrap();

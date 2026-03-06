@@ -1167,6 +1167,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -1213,6 +1214,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let mut token = mint_ucan(&params, &custody).await.unwrap();
@@ -1285,6 +1287,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_creator,
         )
@@ -1308,6 +1311,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_delegator,
         )
@@ -1374,6 +1378,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_creator,
         )
@@ -1397,6 +1402,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_b,
         )
@@ -1455,6 +1461,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody,
         )
@@ -1511,6 +1518,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -1572,6 +1580,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_non_creator,
         )
@@ -1595,6 +1604,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_delegator,
         )
@@ -1659,6 +1669,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -1713,6 +1724,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -1764,6 +1776,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -1828,6 +1841,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_creator,
         )
@@ -1851,6 +1865,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_delegator,
         )
@@ -1914,6 +1929,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -1971,6 +1987,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -2036,6 +2053,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -2090,6 +2108,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -2147,6 +2166,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -2416,6 +2436,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let minted = mint_ucan(&params, &custody).await.unwrap();
@@ -2472,6 +2493,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -2530,6 +2552,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_creator,
         )
@@ -2559,6 +2582,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_delegator,
         )
@@ -2767,6 +2791,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             custody,
         )
@@ -2888,6 +2913,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_a,
         )
@@ -2909,6 +2935,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_b,
         )
@@ -3427,6 +3454,7 @@ mod tests {
             facts: None,
             key_scope: Some("#active".to_owned()),
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -3491,6 +3519,7 @@ mod tests {
             facts: None,
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -3559,6 +3588,7 @@ mod tests {
             facts: None,
             key_scope: Some("#agent".to_owned()), // Says #agent
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -3627,6 +3657,7 @@ mod tests {
             facts: None,
             key_scope: Some("#active".to_owned()),
             signing_key_id: None,
+            ceiling: None,
         };
 
         let base_token = mint_ucan(&base_params, &custody).await.unwrap();
@@ -3720,6 +3751,7 @@ mod tests {
             facts: None,
             key_scope: None, // No key scope: legacy token
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -3779,6 +3811,7 @@ mod tests {
             facts: None,
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -3952,6 +3985,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
         let child_token = mint_ucan(&child_params, &custody_creator).await.unwrap();
 
@@ -4104,6 +4138,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
         let child_token = mint_ucan(&child_params, &custody_delegator).await.unwrap();
 
@@ -4211,6 +4246,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
         let child_token = mint_ucan(&child_params, &custody_delegator).await.unwrap();
 

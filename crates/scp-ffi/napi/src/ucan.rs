@@ -314,6 +314,9 @@ pub async fn ucan_mint(
     let creator_did = handle.creator_did();
     let context_id = handle.context_id();
 
+    // Get ceiling from the context handle for mint-time enforcement (#339).
+    let ceiling_strings: std::collections::HashSet<String> = handle.ceiling().into_iter().collect();
+
     let params = MintParams {
         issuer_did: &creator_did,
         issuer_key: &signing_key,
@@ -326,6 +329,7 @@ pub async fn ucan_mint(
         facts: None,
         key_scope: None,
         signing_key_id: None,
+        ceiling: Some(ceiling_strings),
     };
 
     // Sign the token using the real InMemoryKeyCustody via scp-core.

@@ -264,6 +264,10 @@ pub fn py_ucan_mint(
     // Mint using real scp_core::mint_ucan with Ed25519 signing via
     // the retained KeyCustody. See SCP-214 criterion 7.
     let token = crate::runtime::with_identity(&creator_did, |entry| {
+        // Get the ceiling from the context runtime for mint-time enforcement (#339).
+        let ceiling_strings =
+            crate::runtime::with_context(&context_id_owned, |rt| Ok(rt.ceiling_strings.clone()))?;
+
         let params = MintParams {
             issuer_did: &creator_did,
             issuer_key: &entry.identity.active_signing_key,
@@ -276,6 +280,7 @@ pub fn py_ucan_mint(
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: Some(ceiling_strings),
         };
 
         let result = rt.block_on(async { mint_ucan(&params, entry.custody.as_ref()).await });
@@ -370,6 +375,10 @@ pub fn py_ucan_delegate(
 
     let rt = crate::runtime()?;
 
+    // Get the ceiling from the context runtime for delegation-time enforcement (#339).
+    let ceiling_strings =
+        crate::runtime::with_context(context_id, |rt| Ok(rt.ceiling_strings.clone()))?;
+
     let token = crate::runtime::with_identity(delegator_did, |entry| {
         let params = DelegateParams {
             parent_token: &parsed_parent,
@@ -381,6 +390,7 @@ pub fn py_ucan_delegate(
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: Some(ceiling_strings.clone()),
         };
 
         let result = rt.block_on(async { delegate_ucan(&params, entry.custody.as_ref()).await });

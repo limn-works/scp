@@ -2205,6 +2205,11 @@ async fn ucan_mint_impl(
                 code: "SCP-PERM-3004".to_owned(),
             })?;
 
+            // Get ceiling from the runtime registry for mint-time enforcement (#339).
+            let ceiling_strings = crate::runtime::with_context(&handle.context_id, |rt| {
+                Ok(rt.ceiling_strings.clone())
+            })?;
+
             let params = scp_core::crypto::ucan::mint::MintParams {
                 issuer_did: &handle.creator_did,
                 issuer_key: &signing_key,
@@ -2217,6 +2222,7 @@ async fn ucan_mint_impl(
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: Some(ceiling_strings),
             };
 
             let token = scp_core::crypto::ucan::mint::mint_ucan(&params, &custody.0)

@@ -180,6 +180,7 @@ async fn test_agent_binding_full_flow() {
             facts: None,
             key_scope: Some("#agent".to_owned()),
             signing_key_id: Some(SigningKeyId::Active),
+            ceiling: None,
         },
         &custody,
     )
