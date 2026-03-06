@@ -13,7 +13,13 @@ The protocol is designed compliance-first and privacy-first. These are core etho
 
 **GDPR and data portability:**
 
-- **Right to erasure.** A user can revoke their DID, revoke all attestations, and leave all contexts. Their identity private state is encrypted and under their control. Content they authored in contexts remains (attributed to a now-revoked DID) — the protocol does not retroactively delete content from other participants' contexts, as that would be modifying other people's state. Apps and context governance can implement content deletion policies; the protocol provides the identity revocation primitive.
+- **Right to erasure.** A user can revoke their DID, revoke all attestations, and leave all contexts. Their identity private state is encrypted and under their control. The protocol supports erasure at three levels:
+
+  1. **Ephemeral contexts (§5.10/§5.11)** are the protocol-level data minimization mechanism. Ciphertext is deleted on relays, encryption keys are destroyed, and all participants purge event data. This is protocol-enforced deletion — no data survives the context's TTL.
+  2. **Local deletion in any context.** Participants MAY purge stored event data at any time while retaining the Merkle leaf hash for chain integrity. The hash proves an event existed at a position; the content is gone. This satisfies GDPR Art.17 obligations for the deleting node's storage.
+  3. **The protocol does not propagate deletion requests to other participants.** Each node controls its own storage. This is inherent to decentralized systems — the same model as Signal, Matrix, and email. GDPR obligations apply per data controller, not across the network.
+
+  Content authored in contexts remains on other participants' nodes (attributed to a now-revoked DID). Apps and context governance can implement content deletion policies; the protocol provides the identity revocation primitive.
 - **Right to data portability.** Protocol state (membership, roles, attestations, participation records) is inherently portable — it's bound to the user's DID, not to any service provider. App state portability depends on the app (§8.3).
 - **Data minimization.** Protocol state is minimal by design (§10.3). The protocol collects and stores the minimum data needed for its function.
 
