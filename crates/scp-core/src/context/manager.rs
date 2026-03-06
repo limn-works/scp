@@ -4800,7 +4800,11 @@ mod tests {
         };
 
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-        let mut engine = SingleAdminEngine::new(admin_did.clone());
+        let vk = signing_key.verifying_key();
+        let resolver: std::sync::Arc<
+            dyn Fn(&scp_identity::DID) -> Option<ed25519_dalek::VerifyingKey> + Send + Sync,
+        > = std::sync::Arc::new(move |_| Some(vk));
+        let mut engine = SingleAdminEngine::new(admin_did.clone(), resolver);
         let gov_ctx = GovernanceContext {
             context_id: context_id.to_owned(),
             members: vec![
@@ -5308,7 +5312,11 @@ mod tests {
         use crate::context::governance::{GovernanceContext, GovernanceEngine, SingleAdminEngine};
 
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-        let mut engine = SingleAdminEngine::new(admin_did.clone());
+        let vk = signing_key.verifying_key();
+        let resolver: std::sync::Arc<
+            dyn Fn(&scp_identity::DID) -> Option<ed25519_dalek::VerifyingKey> + Send + Sync,
+        > = std::sync::Arc::new(move |_| Some(vk));
+        let mut engine = SingleAdminEngine::new(admin_did.clone(), resolver);
         let gov_ctx = GovernanceContext {
             context_id: context_id.to_owned(),
             members: vec![

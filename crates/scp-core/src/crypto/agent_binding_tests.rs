@@ -322,15 +322,38 @@ mod tests {
 
         let eligible_voters = vec![admin_did.clone(), voter_did.clone(), third_did.clone()];
 
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xAA; 32]);
+        let admin_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xBB; 32]);
+
+        // Resolver maps each DID to the signing key used by that participant.
+        let admin_vk = admin_signing_key.verifying_key();
+        let voter_vk = signing_key.verifying_key();
+        let third_vk = ed25519_dalek::SigningKey::from_bytes(&[0xCC; 32]).verifying_key();
+        let resolver: std::sync::Arc<
+            dyn Fn(&scp_identity::DID) -> Option<ed25519_dalek::VerifyingKey> + Send + Sync,
+        > = {
+            let admin_d = admin_did.clone();
+            let voter_d = voter_did.clone();
+            let third_d = third_did.clone();
+            std::sync::Arc::new(move |did: &scp_identity::DID| {
+                if *did == admin_d {
+                    Some(admin_vk)
+                } else if *did == voter_d {
+                    Some(voter_vk)
+                } else if *did == third_d {
+                    Some(third_vk)
+                } else {
+                    None
+                }
+            })
+        };
         let mut engine = MajorityVoteEngine::new(
             eligible_voters,
             300,  // voting_window_secs: 5 minutes
             5000, // min_participation_bps: 50%
+            resolver,
         )
         .unwrap();
-
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xAA; 32]);
-        let admin_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xBB; 32]);
 
         let ctx = GovernanceContext {
             context_id: "ctx-gov-test".to_owned(),

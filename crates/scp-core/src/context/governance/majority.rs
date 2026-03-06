@@ -30,8 +30,8 @@ use std::collections::HashMap;
 
 use super::{
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
-    GovernanceModelConfig, GovernanceProposal, ProposalId, ProposalStatus, RejectionReason,
-    VoteType, compute_proposal_id, sign_vote, verify_vote,
+    GovernanceModelConfig, GovernanceProposal, KeyResolver, ProposalId, ProposalStatus,
+    RejectionReason, VoteType, compute_proposal_id, sign_vote, verify_vote,
 };
 use scp_identity::DID;
 
@@ -54,7 +54,6 @@ use scp_identity::DID;
 /// - `min_participation_bps`: Minimum participation in basis points (1–10000),
 ///   where 10000 = 100%. Per ADR-031: u32 basis points so `GovernanceModelConfig`
 ///   derives `Eq`.
-#[derive(Debug)]
 pub struct MajorityVoteEngine {
     /// The set of DIDs eligible to vote on proposals.
     eligible_voter_dids: Vec<DID>,
@@ -64,6 +63,21 @@ pub struct MajorityVoteEngine {
     min_participation_bps: u32,
     /// Active and resolved proposals, keyed by proposal ID.
     proposals: HashMap<ProposalId, GovernanceProposal>,
+    /// Resolves voter DIDs to their Ed25519 verifying keys for signature
+    /// verification.
+    key_resolver: KeyResolver,
+}
+
+impl std::fmt::Debug for MajorityVoteEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MajorityVoteEngine")
+            .field("eligible_voter_dids", &self.eligible_voter_dids)
+            .field("voting_window_secs", &self.voting_window_secs)
+            .field("min_participation_bps", &self.min_participation_bps)
+            .field("proposals", &self.proposals)
+            .field("key_resolver", &"<fn>")
+            .finish()
+    }
 }
 
 impl MajorityVoteEngine {
@@ -85,6 +99,7 @@ impl MajorityVoteEngine {
         eligible_voters: Vec<DID>,
         voting_window_secs: u64,
         min_participation_bps: u32,
+        key_resolver: KeyResolver,
     ) -> Result<Self, GovernanceError> {
         if eligible_voters.is_empty() {
             return Err(GovernanceError::InvalidConfig(
@@ -107,6 +122,7 @@ impl MajorityVoteEngine {
             voting_window_secs,
             min_participation_bps,
             proposals: HashMap::new(),
+            key_resolver,
         })
     }
 
@@ -413,8 +429,17 @@ impl GovernanceEngine for MajorityVoteEngine {
             signing_key,
         )?;
 
-        // Defense-in-depth: verify the vote signature before accepting it.
-        verify_vote(proposal_id, &signed_vote, &signing_key.verifying_key())?;
+        // Verify the vote signature against the voter's DID-resolved key.
+        let resolved_key =
+            (self.key_resolver)(voter).ok_or_else(|| GovernanceError::UnknownVoter {
+                did: voter.to_string(),
+            })?;
+        verify_vote(proposal_id, &signed_vote, &resolved_key).map_err(|_| {
+            GovernanceError::InvalidSignature {
+                voter_did: voter.to_string(),
+                proposal_id: hex::encode(proposal_id),
+            }
+        })?;
 
         let proposal = self.proposals.get_mut(proposal_id).ok_or_else(|| {
             GovernanceError::ProposalNotFound {
@@ -496,8 +521,17 @@ impl GovernanceEngine for MajorityVoteEngine {
             signing_key,
         )?;
 
-        // Defense-in-depth: verify the vote signature before accepting it.
-        verify_vote(proposal_id, &signed_vote, &signing_key.verifying_key())?;
+        // Verify the vote signature against the voter's DID-resolved key.
+        let resolved_key =
+            (self.key_resolver)(voter).ok_or_else(|| GovernanceError::UnknownVoter {
+                did: voter.to_string(),
+            })?;
+        verify_vote(proposal_id, &signed_vote, &resolved_key).map_err(|_| {
+            GovernanceError::InvalidSignature {
+                voter_did: voter.to_string(),
+                proposal_id: hex::encode(proposal_id),
+            }
+        })?;
 
         let proposal = self.proposals.get_mut(proposal_id).ok_or_else(|| {
             GovernanceError::ProposalNotFound {
@@ -606,6 +640,33 @@ mod tests {
         ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
     }
 
+    /// Mock key resolver that maps test DIDs to their corresponding signing
+    /// key's verifying key.
+    fn mock_resolver() -> KeyResolver {
+        use std::sync::Arc;
+        Arc::new(|did: &DID| {
+            let did_str: &str = did.as_ref();
+            match did_str {
+                "did:dht:z6MkAlice" => {
+                    Some(ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]).verifying_key())
+                }
+                "did:dht:z6MkBob" => {
+                    Some(ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]).verifying_key())
+                }
+                "did:dht:z6MkCarol" => {
+                    Some(ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]).verifying_key())
+                }
+                "did:dht:z6MkDave" => {
+                    Some(ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]).verifying_key())
+                }
+                "did:dht:z6MkEve" => {
+                    Some(ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key())
+                }
+                _ => None,
+            }
+        })
+    }
+
     fn three_voters() -> Vec<DID> {
         vec![alice(), bob(), carol()]
     }
@@ -630,7 +691,7 @@ mod tests {
     const T0: u64 = 1_700_000_000;
 
     fn default_engine(voters: Vec<DID>) -> MajorityVoteEngine {
-        MajorityVoteEngine::new(voters, WINDOW, 5000).expect("valid config")
+        MajorityVoteEngine::new(voters, WINDOW, 5000, mock_resolver()).expect("valid config")
     }
 
     fn propose_add_member(
@@ -655,7 +716,7 @@ mod tests {
 
     #[test]
     fn new_valid_config() {
-        let engine = MajorityVoteEngine::new(three_voters(), WINDOW, 5000);
+        let engine = MajorityVoteEngine::new(three_voters(), WINDOW, 5000, mock_resolver());
         assert!(engine.is_ok());
         let engine = engine.unwrap();
         assert_eq!(engine.voting_window_secs(), WINDOW);
@@ -664,7 +725,7 @@ mod tests {
 
     #[test]
     fn new_rejects_empty_voters() {
-        let result = MajorityVoteEngine::new(vec![], WINDOW, 5000);
+        let result = MajorityVoteEngine::new(vec![], WINDOW, 5000, mock_resolver());
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -674,42 +735,42 @@ mod tests {
 
     #[test]
     fn new_rejects_voting_window_too_short() {
-        let result = MajorityVoteEngine::new(three_voters(), 299, 5000);
+        let result = MajorityVoteEngine::new(three_voters(), 299, 5000, mock_resolver());
         assert!(result.is_err());
     }
 
     #[test]
     fn new_rejects_voting_window_too_long() {
-        let result = MajorityVoteEngine::new(three_voters(), 604_801, 5000);
+        let result = MajorityVoteEngine::new(three_voters(), 604_801, 5000, mock_resolver());
         assert!(result.is_err());
     }
 
     #[test]
     fn new_accepts_boundary_voting_windows() {
-        assert!(MajorityVoteEngine::new(three_voters(), 300, 5000).is_ok());
-        assert!(MajorityVoteEngine::new(three_voters(), 604_800, 5000).is_ok());
+        assert!(MajorityVoteEngine::new(three_voters(), 300, 5000, mock_resolver()).is_ok());
+        assert!(MajorityVoteEngine::new(three_voters(), 604_800, 5000, mock_resolver()).is_ok());
     }
 
     #[test]
     fn new_rejects_zero_participation() {
-        let result = MajorityVoteEngine::new(three_voters(), WINDOW, 0);
+        let result = MajorityVoteEngine::new(three_voters(), WINDOW, 0, mock_resolver());
         assert!(result.is_err());
     }
 
     #[test]
     fn new_rejects_participation_above_10000() {
-        let result = MajorityVoteEngine::new(three_voters(), WINDOW, 10_001);
+        let result = MajorityVoteEngine::new(three_voters(), WINDOW, 10_001, mock_resolver());
         assert!(result.is_err());
     }
 
     #[test]
     fn new_accepts_participation_of_10000() {
-        assert!(MajorityVoteEngine::new(three_voters(), WINDOW, 10_000).is_ok());
+        assert!(MajorityVoteEngine::new(three_voters(), WINDOW, 10_000, mock_resolver()).is_ok());
     }
 
     #[test]
     fn new_accepts_small_participation() {
-        assert!(MajorityVoteEngine::new(three_voters(), WINDOW, 100).is_ok());
+        assert!(MajorityVoteEngine::new(three_voters(), WINDOW, 100, mock_resolver()).is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -1059,7 +1120,8 @@ mod tests {
     fn quorum_met_approves_at_deadline() {
         let voters = all_five();
         // min_participation_bps = 4000 (40%, i.e. 2 of 5 must vote).
-        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 4000).unwrap();
+        let mut engine =
+            MajorityVoteEngine::new(voters.clone(), WINDOW, 4000, mock_resolver()).unwrap();
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
 
@@ -1147,7 +1209,17 @@ mod tests {
         let voters: Vec<DID> = (0..10)
             .map(|i| DID::from(format!("did:dht:z6MkVoter{i}")))
             .collect();
-        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 5000).unwrap();
+        // Dynamic resolver for z6MkVoter{i} -> signing key [i + 10; 32]
+        let voter_resolver: KeyResolver = {
+            use std::sync::Arc;
+            Arc::new(|did: &DID| {
+                let s: &str = did.as_ref();
+                let idx: u8 = s.strip_prefix("did:dht:z6MkVoter")?.parse().ok()?;
+                Some(ed25519_dalek::SigningKey::from_bytes(&[idx + 10; 32]).verifying_key())
+            })
+        };
+        let mut engine =
+            MajorityVoteEngine::new(voters.clone(), WINDOW, 5000, voter_resolver).unwrap();
         let ctx = test_context(&voters, T0);
 
         let action = GovernanceAction::AddMember {
@@ -1180,7 +1252,17 @@ mod tests {
         let voters: Vec<DID> = (0..10)
             .map(|i| DID::from(format!("did:dht:z6MkVoter{i}")))
             .collect();
-        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 5000).unwrap();
+        // Dynamic resolver for z6MkVoter{i} -> signing key [i + 10; 32]
+        let voter_resolver: KeyResolver = {
+            use std::sync::Arc;
+            Arc::new(|did: &DID| {
+                let s: &str = did.as_ref();
+                let idx: u8 = s.strip_prefix("did:dht:z6MkVoter")?.parse().ok()?;
+                Some(ed25519_dalek::SigningKey::from_bytes(&[idx + 10; 32]).verifying_key())
+            })
+        };
+        let mut engine =
+            MajorityVoteEngine::new(voters.clone(), WINDOW, 5000, voter_resolver).unwrap();
         let ctx = test_context(&voters, T0);
 
         let action = GovernanceAction::AddMember {
@@ -1215,7 +1297,8 @@ mod tests {
     #[test]
     fn tie_goes_to_rejection_at_deadline() {
         let voters = vec![alice(), bob(), carol(), dave()]; // 4 voters
-        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 5000).unwrap();
+        let mut engine =
+            MajorityVoteEngine::new(voters.clone(), WINDOW, 5000, mock_resolver()).unwrap();
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
 
@@ -1253,7 +1336,8 @@ mod tests {
     fn abstentions_do_not_count_toward_majority() {
         // 5 voters, quorum 4000 bps (40%, 2 must vote), 2 approve, 3 abstain.
         let voters = all_five();
-        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 4000).unwrap();
+        let mut engine =
+            MajorityVoteEngine::new(voters.clone(), WINDOW, 4000, mock_resolver()).unwrap();
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
 
@@ -1276,7 +1360,8 @@ mod tests {
     fn single_vote_can_pass_with_low_quorum() {
         // 5 voters, quorum 2000 bps (20%, 1 must vote).
         let voters = all_five();
-        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 2000).unwrap();
+        let mut engine =
+            MajorityVoteEngine::new(voters.clone(), WINDOW, 2000, mock_resolver()).unwrap();
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
 
@@ -1678,7 +1763,8 @@ mod tests {
     #[test]
     fn single_voter_approves_immediately() {
         let voters = vec![alice()];
-        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 10_000).unwrap();
+        let mut engine =
+            MajorityVoteEngine::new(voters.clone(), WINDOW, 10_000, mock_resolver()).unwrap();
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
 
@@ -1692,7 +1778,8 @@ mod tests {
     #[test]
     fn single_voter_rejects_immediately() {
         let voters = vec![alice()];
-        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 10_000).unwrap();
+        let mut engine =
+            MajorityVoteEngine::new(voters.clone(), WINDOW, 10_000, mock_resolver()).unwrap();
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
 
@@ -1712,7 +1799,8 @@ mod tests {
     fn two_voters_need_both_to_approve_without_deadline() {
         // 2 voters: 1 approval is not > 2/2 = 1 (needs to be strictly greater).
         let voters = vec![alice(), bob()];
-        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 5000).unwrap();
+        let mut engine =
+            MajorityVoteEngine::new(voters.clone(), WINDOW, 5000, mock_resolver()).unwrap();
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
 
@@ -1732,7 +1820,8 @@ mod tests {
     #[test]
     fn two_voters_one_approve_one_abstain_passes_at_deadline_with_low_quorum() {
         let voters = vec![alice(), bob()];
-        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 5000).unwrap();
+        let mut engine =
+            MajorityVoteEngine::new(voters.clone(), WINDOW, 5000, mock_resolver()).unwrap();
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
 
@@ -1881,7 +1970,8 @@ mod tests {
         // min_participation_bps = 10000 (100%) with 5 voters. 2 approvals won't
         // trigger early resolution (need > 2.5), so we can test quorum at deadline.
         let voters = all_five();
-        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 10_000).unwrap();
+        let mut engine =
+            MajorityVoteEngine::new(voters.clone(), WINDOW, 10_000, mock_resolver()).unwrap();
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
 
@@ -1907,7 +1997,8 @@ mod tests {
     #[test]
     fn full_participation_all_approve() {
         let voters = three_voters();
-        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 10_000).unwrap();
+        let mut engine =
+            MajorityVoteEngine::new(voters.clone(), WINDOW, 10_000, mock_resolver()).unwrap();
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
 
@@ -2005,5 +2096,82 @@ mod tests {
             result.unwrap_err(),
             GovernanceError::VerificationFailed(_)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Vote signature verification via key_resolver (#357)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unknown_voter_did_rejected_by_resolver() {
+        // AC: construct a MajorityVoteEngine with a mock resolver, submit a
+        // vote for an unknown DID (resolver returns None), verify
+        // GovernanceError::UnknownVoter is returned.
+        //
+        // Dave is in the eligible voters but NOT in the resolver.
+        let resolver_without_dave: KeyResolver = {
+            use std::sync::Arc;
+            Arc::new(|did: &DID| {
+                let did_str: &str = did.as_ref();
+                match did_str {
+                    "did:dht:z6MkAlice" => {
+                        Some(ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]).verifying_key())
+                    }
+                    "did:dht:z6MkBob" => {
+                        Some(ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]).verifying_key())
+                    }
+                    "did:dht:z6MkCarol" => {
+                        Some(ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]).verifying_key())
+                    }
+                    _ => None,
+                }
+            })
+        };
+
+        let voters = vec![alice(), bob(), carol(), dave()];
+        let mut engine =
+            MajorityVoteEngine::new(voters.clone(), WINDOW, 5000, resolver_without_dave)
+                .expect("valid config");
+        let ctx = test_context(&voters, T0);
+
+        let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
+
+        // Alice approves (resolver knows Alice).
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx, &sk_alice())
+            .expect("alice approve ok");
+
+        // Dave tries to approve but resolver returns None for Dave.
+        let result = engine.approve(&proposal.proposal_id, &dave(), &ctx, &sk_dave());
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), GovernanceError::UnknownVoter { .. }),
+            "expected UnknownVoter error for unresolvable DID"
+        );
+    }
+
+    #[test]
+    fn forged_vote_rejected_by_resolver() {
+        // AC: submit a vote with a forged signature (wrong key).
+        let voters = three_voters();
+        let mut engine = default_engine(voters.clone());
+        let ctx = test_context(&voters, T0);
+        let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
+
+        // Alice approves with the correct key.
+        engine
+            .approve(&proposal.proposal_id, &alice(), &ctx, &sk_alice())
+            .expect("alice approve ok");
+
+        // Bob tries to approve with Carol's key (forgery).
+        let result = engine.approve(&proposal.proposal_id, &bob(), &ctx, &sk_carol());
+        assert!(result.is_err());
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                GovernanceError::InvalidSignature { .. }
+            ),
+            "expected InvalidSignature for forged vote"
+        );
     }
 }

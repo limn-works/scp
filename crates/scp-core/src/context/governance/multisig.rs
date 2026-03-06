@@ -25,8 +25,8 @@ use std::collections::HashMap;
 
 use super::{
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
-    GovernanceModelConfig, GovernanceProposal, ProposalId, ProposalStatus, RejectionReason,
-    VoteType, compute_proposal_id, sign_vote, verify_vote,
+    GovernanceModelConfig, GovernanceProposal, KeyResolver, ProposalId, ProposalStatus,
+    RejectionReason, VoteType, compute_proposal_id, sign_vote, verify_vote,
 };
 use scp_identity::DID;
 
@@ -39,7 +39,6 @@ use scp_identity::DID;
 /// A fixed set of designated signers; a proposal passes when at least
 /// `threshold` of them approve. Implements [`GovernanceEngine`] for use
 /// via `Box<dyn GovernanceEngine>`.
-#[derive(Debug)]
 pub struct ThresholdEngine {
     /// The set of DIDs authorized to vote.
     signers: Vec<DID>,
@@ -49,6 +48,21 @@ pub struct ThresholdEngine {
     voting_window_secs: u64,
     /// Active and resolved proposals, keyed by proposal ID.
     proposals: HashMap<ProposalId, GovernanceProposal>,
+    /// Resolves voter DIDs to their Ed25519 verifying keys for signature
+    /// verification.
+    key_resolver: KeyResolver,
+}
+
+impl std::fmt::Debug for ThresholdEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThresholdEngine")
+            .field("signers", &self.signers)
+            .field("threshold", &self.threshold)
+            .field("voting_window_secs", &self.voting_window_secs)
+            .field("proposals", &self.proposals)
+            .field("key_resolver", &"<fn>")
+            .finish()
+    }
 }
 
 impl ThresholdEngine {
@@ -64,6 +78,7 @@ impl ThresholdEngine {
         signers: Vec<DID>,
         threshold: u32,
         voting_window_secs: u64,
+        key_resolver: KeyResolver,
     ) -> Result<Self, GovernanceError> {
         if signers.is_empty() {
             return Err(GovernanceError::InvalidConfig(
@@ -89,6 +104,7 @@ impl ThresholdEngine {
             threshold,
             voting_window_secs,
             proposals: HashMap::new(),
+            key_resolver,
         })
     }
 
@@ -242,8 +258,17 @@ impl GovernanceEngine for ThresholdEngine {
             signing_key,
         )?;
 
-        // Defense-in-depth: verify the proposer's vote signature before accepting it.
-        verify_vote(&proposal_id, &proposer_vote, &signing_key.verifying_key())?;
+        // Verify the proposer's vote signature against their DID-resolved key.
+        let resolved_key =
+            (self.key_resolver)(proposer).ok_or_else(|| GovernanceError::UnknownVoter {
+                did: proposer.to_string(),
+            })?;
+        verify_vote(&proposal_id, &proposer_vote, &resolved_key).map_err(|_| {
+            GovernanceError::InvalidSignature {
+                voter_did: proposer.to_string(),
+                proposal_id: hex::encode(proposal_id),
+            }
+        })?;
 
         let proposal = GovernanceProposal {
             proposal_id,
@@ -344,8 +369,17 @@ impl GovernanceEngine for ThresholdEngine {
             signing_key,
         )?;
 
-        // Defense-in-depth: verify the vote signature before accepting it.
-        verify_vote(proposal_id, &vote, &signing_key.verifying_key())?;
+        // Verify the vote signature against the voter's DID-resolved key.
+        let resolved_key =
+            (self.key_resolver)(voter).ok_or_else(|| GovernanceError::UnknownVoter {
+                did: voter.to_string(),
+            })?;
+        verify_vote(proposal_id, &vote, &resolved_key).map_err(|_| {
+            GovernanceError::InvalidSignature {
+                voter_did: voter.to_string(),
+                proposal_id: hex::encode(proposal_id),
+            }
+        })?;
 
         // Key is guaranteed present because we just looked it up via `get()` above.
         if let Some(proposal_mut) = self.proposals.get_mut(proposal_id) {
@@ -414,8 +448,17 @@ impl GovernanceEngine for ThresholdEngine {
             signing_key,
         )?;
 
-        // Defense-in-depth: verify the vote signature before accepting it.
-        verify_vote(proposal_id, &vote, &signing_key.verifying_key())?;
+        // Verify the vote signature against the voter's DID-resolved key.
+        let resolved_key =
+            (self.key_resolver)(voter).ok_or_else(|| GovernanceError::UnknownVoter {
+                did: voter.to_string(),
+            })?;
+        verify_vote(proposal_id, &vote, &resolved_key).map_err(|_| {
+            GovernanceError::InvalidSignature {
+                voter_did: voter.to_string(),
+                proposal_id: hex::encode(proposal_id),
+            }
+        })?;
 
         // Key is guaranteed present because we just looked it up via `get()` above.
         if let Some(proposal_mut) = self.proposals.get_mut(proposal_id) {
@@ -549,6 +592,30 @@ mod tests {
         ed25519_dalek::SigningKey::from_bytes(&[3u8; 32])
     }
 
+    /// Mock key resolver that maps test DIDs to their corresponding signing
+    /// key's verifying key.
+    fn mock_resolver() -> KeyResolver {
+        use std::sync::Arc;
+        Arc::new(|did: &DID| {
+            let did_str: &str = did.as_ref();
+            match did_str {
+                "did:dht:z6MkAlice" => {
+                    Some(ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]).verifying_key())
+                }
+                "did:dht:z6MkBob" => {
+                    Some(ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]).verifying_key())
+                }
+                "did:dht:z6MkCarol" => {
+                    Some(ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]).verifying_key())
+                }
+                "did:dht:z6MkDave" => {
+                    Some(ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]).verifying_key())
+                }
+                _ => None,
+            }
+        })
+    }
+
     fn sk_dave() -> ed25519_dalek::SigningKey {
         ed25519_dalek::SigningKey::from_bytes(&[4u8; 32])
     }
@@ -585,7 +652,7 @@ mod tests {
 
     #[test]
     fn new_rejects_empty_signers() {
-        let result = ThresholdEngine::new(vec![], 1, 86_400);
+        let result = ThresholdEngine::new(vec![], 1, 86_400, mock_resolver());
         assert!(matches!(
             result.unwrap_err(),
             GovernanceError::InvalidConfig(_)
@@ -594,7 +661,7 @@ mod tests {
 
     #[test]
     fn new_rejects_zero_threshold() {
-        let result = ThresholdEngine::new(vec![alice()], 0, 86_400);
+        let result = ThresholdEngine::new(vec![alice()], 0, 86_400, mock_resolver());
         assert!(matches!(
             result.unwrap_err(),
             GovernanceError::InvalidConfig(_)
@@ -603,7 +670,7 @@ mod tests {
 
     #[test]
     fn new_rejects_threshold_exceeding_signers() {
-        let result = ThresholdEngine::new(vec![alice(), bob()], 3, 86_400);
+        let result = ThresholdEngine::new(vec![alice(), bob()], 3, 86_400, mock_resolver());
         assert!(matches!(
             result.unwrap_err(),
             GovernanceError::InvalidConfig(_)
@@ -612,7 +679,7 @@ mod tests {
 
     #[test]
     fn new_rejects_window_too_short() {
-        let result = ThresholdEngine::new(vec![alice()], 1, 299);
+        let result = ThresholdEngine::new(vec![alice()], 1, 299, mock_resolver());
         assert!(matches!(
             result.unwrap_err(),
             GovernanceError::InvalidConfig(_)
@@ -621,7 +688,7 @@ mod tests {
 
     #[test]
     fn new_rejects_window_too_long() {
-        let result = ThresholdEngine::new(vec![alice()], 1, 604_801);
+        let result = ThresholdEngine::new(vec![alice()], 1, 604_801, mock_resolver());
         assert!(matches!(
             result.unwrap_err(),
             GovernanceError::InvalidConfig(_)
@@ -631,7 +698,8 @@ mod tests {
     #[test]
     fn new_accepts_valid_config() {
         let engine =
-            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid config");
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid config");
         assert_eq!(engine.signers().len(), 3);
         assert_eq!(engine.threshold(), 2);
         assert_eq!(engine.voting_window_secs(), 86_400);
@@ -644,7 +712,8 @@ mod tests {
     #[test]
     fn propose_creates_pending_with_first_approval() {
         let mut engine =
-            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, events) = engine
@@ -667,7 +736,8 @@ mod tests {
     #[test]
     fn propose_1_of_n_auto_resolves() {
         let mut engine =
-            ThresholdEngine::new(vec![alice(), bob(), carol()], 1, 86_400).expect("valid");
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 1, 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, events) = engine
@@ -688,7 +758,8 @@ mod tests {
 
     #[test]
     fn propose_rejects_non_signer() {
-        let mut engine = ThresholdEngine::new(vec![alice(), bob()], 2, 86_400).expect("valid");
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob()], 2, 86_400, mock_resolver()).expect("valid");
         let ctx = test_context();
 
         let result = engine.propose(&dave(), default_action(), &ctx, &sk_dave());
@@ -705,7 +776,8 @@ mod tests {
     #[test]
     fn approve_reaches_threshold() {
         let mut engine =
-            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -729,7 +801,8 @@ mod tests {
 
     #[test]
     fn approve_rejects_non_signer() {
-        let mut engine = ThresholdEngine::new(vec![alice(), bob()], 2, 86_400).expect("valid");
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob()], 2, 86_400, mock_resolver()).expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -745,7 +818,8 @@ mod tests {
     #[test]
     fn approve_rejects_duplicate_vote() {
         let mut engine =
-            ThresholdEngine::new(vec![alice(), bob(), carol()], 3, 86_400).expect("valid");
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 3, 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -763,7 +837,8 @@ mod tests {
     fn reject_makes_approval_impossible() {
         // 2-of-3: if 2 reject, approval is impossible (rejections > 3 - 2 = 1).
         let mut engine =
-            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -796,7 +871,8 @@ mod tests {
     #[test]
     fn approve_rejected_after_deadline() {
         let mut engine =
-            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -817,7 +893,8 @@ mod tests {
     #[test]
     fn reject_rejected_after_deadline() {
         let mut engine =
-            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -838,7 +915,8 @@ mod tests {
     #[test]
     fn approve_accepted_just_before_deadline() {
         let mut engine =
-            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -860,7 +938,8 @@ mod tests {
     #[test]
     fn resolve_produces_expired_event() {
         let mut engine =
-            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -888,7 +967,8 @@ mod tests {
     #[test]
     fn resolve_no_events_when_still_pending() {
         let mut engine =
-            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -905,7 +985,8 @@ mod tests {
     #[test]
     fn resolve_returns_status_and_events_for_already_terminal() {
         let mut engine =
-            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -928,7 +1009,9 @@ mod tests {
 
     #[test]
     fn withdraw_vote_accessible_via_trait() {
-        let engine = ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+        let engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
         let mut boxed: Box<dyn GovernanceEngine> = Box::new(engine);
         let ctx = test_context();
 
@@ -947,7 +1030,9 @@ mod tests {
 
     #[test]
     fn resolve_accessible_via_trait() {
-        let engine = ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+        let engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
         let mut boxed: Box<dyn GovernanceEngine> = Box::new(engine);
         let ctx = test_context();
 
@@ -965,7 +1050,8 @@ mod tests {
     fn default_trait_impls_return_unsupported_for_single_admin() {
         use super::super::SingleAdminEngine;
 
-        let mut engine: Box<dyn GovernanceEngine> = Box::new(SingleAdminEngine::new(alice()));
+        let mut engine: Box<dyn GovernanceEngine> =
+            Box::new(SingleAdminEngine::new(alice(), mock_resolver()));
         let ctx = test_context();
 
         let action = GovernanceAction::CloseContext { reason: None };
@@ -994,7 +1080,8 @@ mod tests {
     #[test]
     fn withdraw_vote_allows_revote() {
         let mut engine =
-            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1020,7 +1107,8 @@ mod tests {
     #[test]
     fn withdraw_vote_rejects_non_voter() {
         let mut engine =
-            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1039,7 +1127,8 @@ mod tests {
     #[test]
     fn withdraw_vote_rejects_after_deadline() {
         let mut engine =
-            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1061,7 +1150,8 @@ mod tests {
 
     #[test]
     fn model_config_returns_threshold_variant() {
-        let engine = ThresholdEngine::new(vec![alice(), bob()], 2, 86_400).expect("valid");
+        let engine =
+            ThresholdEngine::new(vec![alice(), bob()], 2, 86_400, mock_resolver()).expect("valid");
         let config = engine.model_config();
         assert_eq!(
             config,
@@ -1075,7 +1165,9 @@ mod tests {
 
     #[test]
     fn eligible_voters_returns_signers() {
-        let engine = ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+        let engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
         let voters = engine.eligible_voters(&ctx);
         assert_eq!(voters, vec![alice(), bob(), carol()]);
@@ -1097,7 +1189,8 @@ mod tests {
 
     #[test]
     fn duplicate_proposal_rejected() {
-        let mut engine = ThresholdEngine::new(vec![alice(), bob()], 2, 86_400).expect("valid");
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob()], 2, 86_400, mock_resolver()).expect("valid");
         let ctx = test_context();
 
         let _ = engine
@@ -1116,7 +1209,8 @@ mod tests {
 
     #[test]
     fn approve_unknown_proposal() {
-        let mut engine = ThresholdEngine::new(vec![alice(), bob()], 2, 86_400).expect("valid");
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob()], 2, 86_400, mock_resolver()).expect("valid");
         let ctx = test_context();
         let fake_id = [0u8; 32];
 
@@ -1129,7 +1223,8 @@ mod tests {
 
     #[test]
     fn reject_unknown_proposal() {
-        let mut engine = ThresholdEngine::new(vec![alice(), bob()], 2, 86_400).expect("valid");
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob()], 2, 86_400, mock_resolver()).expect("valid");
         let ctx = test_context();
         let fake_id = [0u8; 32];
 
@@ -1147,7 +1242,8 @@ mod tests {
     #[test]
     fn full_lifecycle_2_of_3_approval() {
         let mut engine =
-            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         // 1. Alice proposes (counts as first approval).
@@ -1184,7 +1280,8 @@ mod tests {
     #[test]
     fn full_lifecycle_2_of_3_rejection() {
         let mut engine =
-            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1215,7 +1312,8 @@ mod tests {
     #[test]
     fn full_lifecycle_expiry() {
         let mut engine =
-            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1241,7 +1339,8 @@ mod tests {
         use crate::context::governance::verify_vote;
 
         let mut engine =
-            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1263,7 +1362,8 @@ mod tests {
         use crate::context::governance::verify_vote;
 
         let mut engine =
-            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1289,7 +1389,8 @@ mod tests {
         use crate::context::governance::verify_proposal_votes;
 
         let mut engine =
-            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400).expect("valid");
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1323,5 +1424,167 @@ mod tests {
             result.unwrap_err(),
             GovernanceError::VerificationFailed(_)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Vote signature verification via key_resolver (#357)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn valid_vote_signature_is_recorded() {
+        // AC: construct a ThresholdEngine with a mock resolver, submit a vote
+        // with a valid signature from a known key, verify it is recorded.
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
+        let ctx = test_context();
+
+        let (proposal, _) = engine
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
+            .expect("propose ok");
+        let pid = proposal.proposal_id;
+
+        // Bob's signing key matches the resolver's entry for Bob.
+        let (status, events) = engine
+            .approve(&pid, &bob(), &ctx, &sk_bob())
+            .expect("approve ok");
+
+        // Vote should be recorded and proposal approved (2-of-3).
+        assert_eq!(status, ProposalStatus::Approved);
+        assert!(!events.is_empty());
+
+        let p = engine.get_proposal(&pid).expect("found");
+        assert_eq!(p.approvals.len(), 2);
+        assert_eq!(p.approvals[1].voter_did, bob());
+    }
+
+    #[test]
+    fn forged_vote_signature_rejected() {
+        // AC: construct a ThresholdEngine with a mock resolver, submit a vote
+        // with a forged signature (wrong key), verify InvalidSignature returned
+        // and no vote is recorded.
+        //
+        // The resolver maps Bob to sk_bob's verifying key ([2u8;32]),
+        // but we sign with Carol's key ([3u8;32]) while claiming to be Bob.
+        // This simulates a forgery: correct DID, wrong signing key.
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
+        let ctx = test_context();
+
+        let (proposal, _) = engine
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
+            .expect("propose ok");
+        let pid = proposal.proposal_id;
+
+        // Sign Bob's vote with Carol's key (forgery).
+        let result = engine.approve(&pid, &bob(), &ctx, &sk_carol());
+        assert!(result.is_err(), "forged signature should be rejected");
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                GovernanceError::InvalidSignature { .. }
+            ),
+            "expected InvalidSignature error"
+        );
+
+        // No vote should have been recorded.
+        let p = engine.get_proposal(&pid).expect("found");
+        assert_eq!(p.approvals.len(), 1, "only proposer's vote should exist");
+        assert_eq!(p.approvals[0].voter_did, alice());
+    }
+
+    #[test]
+    fn unknown_voter_did_rejected() {
+        // AC (from MajorityVoteEngine, but testing ThresholdEngine too):
+        // submit a vote for an unknown DID (resolver returns None),
+        // verify UnknownVoter is returned.
+        //
+        // Dave is in the signer set but NOT in the resolver.
+        let resolver_without_dave: KeyResolver = {
+            use std::sync::Arc;
+            Arc::new(|did: &DID| {
+                let did_str: &str = did.as_ref();
+                match did_str {
+                    "did:dht:z6MkAlice" => {
+                        Some(ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]).verifying_key())
+                    }
+                    "did:dht:z6MkBob" => {
+                        Some(ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]).verifying_key())
+                    }
+                    "did:dht:z6MkCarol" => {
+                        Some(ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]).verifying_key())
+                    }
+                    _ => None,
+                }
+            })
+        };
+
+        let mut engine = ThresholdEngine::new(
+            vec![alice(), bob(), carol(), dave()],
+            2,
+            86_400,
+            resolver_without_dave,
+        )
+        .expect("valid");
+        let ctx = test_context();
+
+        let (proposal, _) = engine
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
+            .expect("propose ok");
+        let pid = proposal.proposal_id;
+
+        let result = engine.approve(&pid, &dave(), &ctx, &sk_dave());
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), GovernanceError::UnknownVoter { .. }),
+            "expected UnknownVoter error"
+        );
+    }
+
+    #[test]
+    fn e2e_valid_votes_reach_approved_forged_vote_does_not() {
+        // AC: end-to-end — create a proposal via ThresholdEngine, collect valid
+        // votes to reach quorum, verify proposal reaches Approved; repeat with
+        // one forged vote substituted, verify proposal does NOT reach Approved.
+
+        // Part 1: valid votes reach Approved.
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
+        let ctx = test_context();
+
+        let (proposal, _) = engine
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
+            .expect("propose ok");
+        let pid = proposal.proposal_id;
+
+        let (status, _) = engine
+            .approve(&pid, &bob(), &ctx, &sk_bob())
+            .expect("approve ok");
+        assert_eq!(
+            status,
+            ProposalStatus::Approved,
+            "valid votes should reach Approved"
+        );
+
+        // Part 2: forged vote prevents Approved.
+        let mut engine2 =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 86_400, mock_resolver())
+                .expect("valid");
+
+        let (proposal2, _) = engine2
+            .propose(&alice(), default_action(), &ctx, &sk_alice())
+            .expect("propose ok");
+        let pid2 = proposal2.proposal_id;
+
+        // Bob tries to vote with Carol's signing key (forgery).
+        let result = engine2.approve(&pid2, &bob(), &ctx, &sk_carol());
+        assert!(result.is_err(), "forged vote should fail");
+
+        // Proposal should still be Pending (only Alice's proposer vote exists).
+        let p = engine2.get_proposal(&pid2).expect("found");
+        assert_eq!(p.status, ProposalStatus::Pending);
+        assert_eq!(p.approvals.len(), 1, "only proposer's vote");
     }
 }

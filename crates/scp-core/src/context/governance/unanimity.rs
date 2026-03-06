@@ -29,8 +29,8 @@ use std::collections::HashMap;
 
 use super::{
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
-    GovernanceModelConfig, GovernanceProposal, ProposalId, ProposalStatus, RejectionReason,
-    VoteType, compute_proposal_id, sign_vote, verify_vote,
+    GovernanceModelConfig, GovernanceProposal, KeyResolver, ProposalId, ProposalStatus,
+    RejectionReason, VoteType, compute_proposal_id, sign_vote, verify_vote,
 };
 use scp_identity::DID;
 
@@ -43,7 +43,6 @@ use scp_identity::DID;
 /// A fixed set of required voters; a proposal passes only when **every** one
 /// of them approves. A single rejection vetoes the proposal immediately.
 /// Implements [`GovernanceEngine`] for use via `Box<dyn GovernanceEngine>`.
-#[derive(Debug)]
 pub struct UnanimityEngine {
     /// The set of DIDs required to vote (all must approve).
     voters: Vec<DID>,
@@ -51,6 +50,20 @@ pub struct UnanimityEngine {
     voting_window_secs: u64,
     /// Active and resolved proposals, keyed by proposal ID.
     proposals: HashMap<ProposalId, GovernanceProposal>,
+    /// Resolves voter DIDs to their Ed25519 verifying keys for signature
+    /// verification.
+    key_resolver: KeyResolver,
+}
+
+impl std::fmt::Debug for UnanimityEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnanimityEngine")
+            .field("voters", &self.voters)
+            .field("voting_window_secs", &self.voting_window_secs)
+            .field("proposals", &self.proposals)
+            .field("key_resolver", &"<fn>")
+            .finish()
+    }
 }
 
 impl UnanimityEngine {
@@ -61,7 +74,11 @@ impl UnanimityEngine {
     /// Returns [`GovernanceError::InvalidConfig`] if:
     /// - `voters` is empty.
     /// - `voting_window_secs` is outside `[300, 604_800]` (5 min to 7 days).
-    pub fn new(voters: Vec<DID>, voting_window_secs: u64) -> Result<Self, GovernanceError> {
+    pub fn new(
+        voters: Vec<DID>,
+        voting_window_secs: u64,
+        key_resolver: KeyResolver,
+    ) -> Result<Self, GovernanceError> {
         if voters.is_empty() {
             return Err(GovernanceError::InvalidConfig(
                 "voters must be non-empty".to_owned(),
@@ -77,6 +94,7 @@ impl UnanimityEngine {
             voters,
             voting_window_secs,
             proposals: HashMap::new(),
+            key_resolver,
         })
     }
 
@@ -223,8 +241,17 @@ impl GovernanceEngine for UnanimityEngine {
             signing_key,
         )?;
 
-        // Defense-in-depth: verify the proposer's vote signature before accepting it.
-        verify_vote(&proposal_id, &proposer_vote, &signing_key.verifying_key())?;
+        // Verify the proposer's vote signature against their DID-resolved key.
+        let resolved_key =
+            (self.key_resolver)(proposer).ok_or_else(|| GovernanceError::UnknownVoter {
+                did: proposer.to_string(),
+            })?;
+        verify_vote(&proposal_id, &proposer_vote, &resolved_key).map_err(|_| {
+            GovernanceError::InvalidSignature {
+                voter_did: proposer.to_string(),
+                proposal_id: hex::encode(proposal_id),
+            }
+        })?;
 
         let proposal = GovernanceProposal {
             proposal_id,
@@ -324,8 +351,17 @@ impl GovernanceEngine for UnanimityEngine {
             signing_key,
         )?;
 
-        // Defense-in-depth: verify the vote signature before accepting it.
-        verify_vote(proposal_id, &vote, &signing_key.verifying_key())?;
+        // Verify the vote signature against the voter's DID-resolved key.
+        let resolved_key =
+            (self.key_resolver)(voter).ok_or_else(|| GovernanceError::UnknownVoter {
+                did: voter.to_string(),
+            })?;
+        verify_vote(proposal_id, &vote, &resolved_key).map_err(|_| {
+            GovernanceError::InvalidSignature {
+                voter_did: voter.to_string(),
+                proposal_id: hex::encode(proposal_id),
+            }
+        })?;
 
         // Key is guaranteed present because we just looked it up via `get()` above.
         if let Some(proposal_mut) = self.proposals.get_mut(proposal_id) {
@@ -394,8 +430,17 @@ impl GovernanceEngine for UnanimityEngine {
             signing_key,
         )?;
 
-        // Defense-in-depth: verify the vote signature before accepting it.
-        verify_vote(proposal_id, &vote, &signing_key.verifying_key())?;
+        // Verify the vote signature against the voter's DID-resolved key.
+        let resolved_key =
+            (self.key_resolver)(voter).ok_or_else(|| GovernanceError::UnknownVoter {
+                did: voter.to_string(),
+            })?;
+        verify_vote(proposal_id, &vote, &resolved_key).map_err(|_| {
+            GovernanceError::InvalidSignature {
+                voter_did: voter.to_string(),
+                proposal_id: hex::encode(proposal_id),
+            }
+        })?;
 
         // Key is guaranteed present because we just looked it up via `get()` above.
         if let Some(proposal_mut) = self.proposals.get_mut(proposal_id) {
@@ -539,6 +584,33 @@ mod tests {
         ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
     }
 
+    /// Mock key resolver that maps test DIDs to their corresponding signing
+    /// key's verifying key.
+    fn mock_resolver() -> KeyResolver {
+        use std::sync::Arc;
+        Arc::new(|did: &DID| {
+            let did_str: &str = did.as_ref();
+            match did_str {
+                "did:dht:z6MkAlice" => {
+                    Some(ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]).verifying_key())
+                }
+                "did:dht:z6MkBob" => {
+                    Some(ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]).verifying_key())
+                }
+                "did:dht:z6MkCarol" => {
+                    Some(ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]).verifying_key())
+                }
+                "did:dht:z6MkDave" => {
+                    Some(ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]).verifying_key())
+                }
+                "did:dht:z6MkEve" => {
+                    Some(ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key())
+                }
+                _ => None,
+            }
+        })
+    }
+
     /// Create a test context at a given timestamp.
     fn test_context_at(now: u64) -> GovernanceContext {
         GovernanceContext {
@@ -571,7 +643,7 @@ mod tests {
 
     #[test]
     fn new_rejects_empty_voters() {
-        let result = UnanimityEngine::new(vec![], 86_400);
+        let result = UnanimityEngine::new(vec![], 86_400, mock_resolver());
         assert!(matches!(
             result.unwrap_err(),
             GovernanceError::InvalidConfig(_)
@@ -580,7 +652,7 @@ mod tests {
 
     #[test]
     fn new_rejects_window_too_short() {
-        let result = UnanimityEngine::new(vec![alice()], 299);
+        let result = UnanimityEngine::new(vec![alice()], 299, mock_resolver());
         assert!(matches!(
             result.unwrap_err(),
             GovernanceError::InvalidConfig(_)
@@ -589,7 +661,7 @@ mod tests {
 
     #[test]
     fn new_rejects_window_too_long() {
-        let result = UnanimityEngine::new(vec![alice()], 604_801);
+        let result = UnanimityEngine::new(vec![alice()], 604_801, mock_resolver());
         assert!(matches!(
             result.unwrap_err(),
             GovernanceError::InvalidConfig(_)
@@ -598,21 +670,23 @@ mod tests {
 
     #[test]
     fn new_accepts_valid_config() {
-        let engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid config");
+        let engine = UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+            .expect("valid config");
         assert_eq!(engine.voters().len(), 3);
         assert_eq!(engine.voting_window_secs(), 86_400);
     }
 
     #[test]
     fn new_accepts_minimum_window() {
-        let engine = UnanimityEngine::new(vec![alice()], 300).expect("valid config");
+        let engine =
+            UnanimityEngine::new(vec![alice()], 300, mock_resolver()).expect("valid config");
         assert_eq!(engine.voting_window_secs(), 300);
     }
 
     #[test]
     fn new_accepts_maximum_window() {
-        let engine = UnanimityEngine::new(vec![alice()], 604_800).expect("valid config");
+        let engine =
+            UnanimityEngine::new(vec![alice()], 604_800, mock_resolver()).expect("valid config");
         assert_eq!(engine.voting_window_secs(), 604_800);
     }
 
@@ -623,7 +697,8 @@ mod tests {
     #[test]
     fn propose_creates_pending_with_first_approval() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, events) = engine
@@ -645,7 +720,8 @@ mod tests {
 
     #[test]
     fn propose_single_voter_auto_resolves() {
-        let mut engine = UnanimityEngine::new(vec![alice()], 86_400).expect("valid");
+        let mut engine =
+            UnanimityEngine::new(vec![alice()], 86_400, mock_resolver()).expect("valid");
         let ctx = test_context();
 
         let (proposal, events) = engine
@@ -666,7 +742,8 @@ mod tests {
 
     #[test]
     fn propose_rejects_non_voter() {
-        let mut engine = UnanimityEngine::new(vec![alice(), bob()], 86_400).expect("valid");
+        let mut engine =
+            UnanimityEngine::new(vec![alice(), bob()], 86_400, mock_resolver()).expect("valid");
         let ctx = test_context();
 
         let result = engine.propose(&dave(), default_action(), &ctx, &sk_dave());
@@ -678,7 +755,8 @@ mod tests {
 
     #[test]
     fn propose_rejects_duplicate() {
-        let mut engine = UnanimityEngine::new(vec![alice(), bob()], 86_400).expect("valid");
+        let mut engine =
+            UnanimityEngine::new(vec![alice(), bob()], 86_400, mock_resolver()).expect("valid");
         let ctx = test_context();
 
         let _ = engine
@@ -698,7 +776,8 @@ mod tests {
     #[test]
     fn approve_all_voters_reaches_unanimity() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -728,7 +807,8 @@ mod tests {
 
     #[test]
     fn approve_rejects_non_voter() {
-        let mut engine = UnanimityEngine::new(vec![alice(), bob()], 86_400).expect("valid");
+        let mut engine =
+            UnanimityEngine::new(vec![alice(), bob()], 86_400, mock_resolver()).expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -744,7 +824,8 @@ mod tests {
     #[test]
     fn approve_rejects_duplicate_vote() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -757,7 +838,8 @@ mod tests {
 
     #[test]
     fn approve_rejects_on_resolved_proposal() {
-        let mut engine = UnanimityEngine::new(vec![alice()], 86_400).expect("valid");
+        let mut engine =
+            UnanimityEngine::new(vec![alice()], 86_400, mock_resolver()).expect("valid");
         let ctx = test_context();
 
         // Single voter -> auto-approved.
@@ -778,7 +860,8 @@ mod tests {
     #[test]
     fn reject_single_vote_vetoes_proposal() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -809,7 +892,8 @@ mod tests {
     #[test]
     fn reject_after_some_approvals_still_vetoes() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -835,7 +919,8 @@ mod tests {
 
     #[test]
     fn reject_rejects_non_voter() {
-        let mut engine = UnanimityEngine::new(vec![alice(), bob()], 86_400).expect("valid");
+        let mut engine =
+            UnanimityEngine::new(vec![alice(), bob()], 86_400, mock_resolver()).expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -851,7 +936,8 @@ mod tests {
     #[test]
     fn reject_rejects_duplicate_vote() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -865,7 +951,8 @@ mod tests {
     #[test]
     fn reject_on_resolved_proposal_fails() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -891,7 +978,8 @@ mod tests {
     #[test]
     fn approve_rejected_after_deadline() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -911,7 +999,8 @@ mod tests {
     #[test]
     fn reject_rejected_after_deadline() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -931,7 +1020,8 @@ mod tests {
     #[test]
     fn approve_accepted_just_before_deadline() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -953,7 +1043,8 @@ mod tests {
     #[test]
     fn resolve_expires_proposal_after_deadline() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -981,7 +1072,8 @@ mod tests {
     #[test]
     fn resolve_no_events_when_still_pending() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -998,7 +1090,8 @@ mod tests {
     #[test]
     fn resolve_returns_terminal_status_with_no_events_for_already_resolved() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1023,7 +1116,8 @@ mod tests {
     #[test]
     fn resolve_partial_votes_at_deadline_expires() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1043,7 +1137,8 @@ mod tests {
 
     #[test]
     fn resolve_unknown_proposal_returns_error() {
-        let mut engine = UnanimityEngine::new(vec![alice(), bob()], 86_400).expect("valid");
+        let mut engine =
+            UnanimityEngine::new(vec![alice(), bob()], 86_400, mock_resolver()).expect("valid");
         let ctx = test_context();
         let fake_id = [0u8; 32];
 
@@ -1061,7 +1156,8 @@ mod tests {
     #[test]
     fn withdraw_vote_allows_revote() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1092,7 +1188,8 @@ mod tests {
     #[test]
     fn withdraw_rejection_allows_revote_as_approval() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1120,7 +1217,8 @@ mod tests {
     #[test]
     fn withdraw_vote_rejects_non_voter() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1138,7 +1236,8 @@ mod tests {
 
     #[test]
     fn withdraw_vote_rejects_non_member() {
-        let mut engine = UnanimityEngine::new(vec![alice(), bob()], 86_400).expect("valid");
+        let mut engine =
+            UnanimityEngine::new(vec![alice(), bob()], 86_400, mock_resolver()).expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1154,7 +1253,8 @@ mod tests {
     #[test]
     fn withdraw_vote_rejects_after_deadline() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1173,7 +1273,8 @@ mod tests {
     #[test]
     fn withdraw_vote_rejects_on_resolved_proposal() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1204,7 +1305,8 @@ mod tests {
 
     #[test]
     fn withdraw_vote_accessible_via_trait() {
-        let engine = UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+        let engine = UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+            .expect("valid");
         let mut boxed: Box<dyn GovernanceEngine> = Box::new(engine);
         let ctx = test_context();
 
@@ -1223,7 +1325,8 @@ mod tests {
 
     #[test]
     fn resolve_accessible_via_trait() {
-        let engine = UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+        let engine = UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+            .expect("valid");
         let mut boxed: Box<dyn GovernanceEngine> = Box::new(engine);
         let ctx = test_context();
 
@@ -1243,7 +1346,8 @@ mod tests {
 
     #[test]
     fn model_config_returns_unanimity_variant() {
-        let engine = UnanimityEngine::new(vec![alice(), bob()], 172_800).expect("valid");
+        let engine =
+            UnanimityEngine::new(vec![alice(), bob()], 172_800, mock_resolver()).expect("valid");
         let config = engine.model_config();
         assert_eq!(
             config,
@@ -1255,7 +1359,8 @@ mod tests {
 
     #[test]
     fn eligible_voters_returns_voter_set() {
-        let engine = UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+        let engine = UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+            .expect("valid");
         let ctx = test_context();
         let voters = engine.eligible_voters(&ctx);
         assert_eq!(voters, vec![alice(), bob(), carol()]);
@@ -1267,7 +1372,8 @@ mod tests {
 
     #[test]
     fn approve_unknown_proposal() {
-        let mut engine = UnanimityEngine::new(vec![alice(), bob()], 86_400).expect("valid");
+        let mut engine =
+            UnanimityEngine::new(vec![alice(), bob()], 86_400, mock_resolver()).expect("valid");
         let ctx = test_context();
         let fake_id = [0u8; 32];
 
@@ -1280,7 +1386,8 @@ mod tests {
 
     #[test]
     fn reject_unknown_proposal() {
-        let mut engine = UnanimityEngine::new(vec![alice(), bob()], 86_400).expect("valid");
+        let mut engine =
+            UnanimityEngine::new(vec![alice(), bob()], 86_400, mock_resolver()).expect("valid");
         let ctx = test_context();
         let fake_id = [0u8; 32];
 
@@ -1293,7 +1400,8 @@ mod tests {
 
     #[test]
     fn withdraw_vote_unknown_proposal() {
-        let mut engine = UnanimityEngine::new(vec![alice(), bob()], 86_400).expect("valid");
+        let mut engine =
+            UnanimityEngine::new(vec![alice(), bob()], 86_400, mock_resolver()).expect("valid");
         let ctx = test_context();
         let fake_id = [0u8; 32];
 
@@ -1311,7 +1419,8 @@ mod tests {
     #[test]
     fn full_lifecycle_3_of_3_unanimous_approval() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         // 1. Alice proposes (counts as first approval).
@@ -1345,7 +1454,8 @@ mod tests {
     #[test]
     fn full_lifecycle_veto_by_single_rejection() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1379,7 +1489,8 @@ mod tests {
     #[test]
     fn full_lifecycle_expiry() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1399,7 +1510,8 @@ mod tests {
     #[test]
     fn full_lifecycle_withdraw_and_revote() {
         let mut engine =
-            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400).expect("valid");
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 86_400, mock_resolver())
+                .expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1431,7 +1543,7 @@ mod tests {
     #[test]
     fn five_voters_all_approve() {
         let voters = vec![alice(), bob(), carol(), dave(), eve()];
-        let mut engine = UnanimityEngine::new(voters, 86_400).expect("valid");
+        let mut engine = UnanimityEngine::new(voters, 86_400, mock_resolver()).expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1452,7 +1564,7 @@ mod tests {
     #[test]
     fn five_voters_one_rejects_after_three_approvals() {
         let voters = vec![alice(), bob(), carol(), dave(), eve()];
-        let mut engine = UnanimityEngine::new(voters, 86_400).expect("valid");
+        let mut engine = UnanimityEngine::new(voters, 86_400, mock_resolver()).expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1481,14 +1593,16 @@ mod tests {
 
     #[test]
     fn get_proposal_returns_none_for_missing() {
-        let engine = UnanimityEngine::new(vec![alice(), bob()], 86_400).expect("valid");
+        let engine =
+            UnanimityEngine::new(vec![alice(), bob()], 86_400, mock_resolver()).expect("valid");
         let fake_id = [0u8; 32];
         assert!(engine.get_proposal(&fake_id).is_none());
     }
 
     #[test]
     fn proposal_records_correct_epoch() {
-        let mut engine = UnanimityEngine::new(vec![alice(), bob()], 86_400).expect("valid");
+        let mut engine =
+            UnanimityEngine::new(vec![alice(), bob()], 86_400, mock_resolver()).expect("valid");
         let mut ctx = test_context();
         ctx.current_epoch = Some(42);
 
@@ -1500,7 +1614,8 @@ mod tests {
 
     #[test]
     fn proposal_events_contain_correct_voting_deadline() {
-        let mut engine = UnanimityEngine::new(vec![alice(), bob()], 3600).expect("valid");
+        let mut engine =
+            UnanimityEngine::new(vec![alice(), bob()], 3600, mock_resolver()).expect("valid");
         let ctx = test_context();
 
         let (_, events) = engine
@@ -1519,7 +1634,8 @@ mod tests {
 
     #[test]
     fn two_voters_both_must_approve() {
-        let mut engine = UnanimityEngine::new(vec![alice(), bob()], 86_400).expect("valid");
+        let mut engine =
+            UnanimityEngine::new(vec![alice(), bob()], 86_400, mock_resolver()).expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1544,7 +1660,7 @@ mod tests {
         use crate::context::governance::verify_vote;
 
         let voters = vec![alice(), bob(), carol()];
-        let mut engine = UnanimityEngine::new(voters, 86_400).expect("valid");
+        let mut engine = UnanimityEngine::new(voters, 86_400, mock_resolver()).expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1566,7 +1682,7 @@ mod tests {
         use crate::context::governance::verify_vote;
 
         let voters = vec![alice(), bob(), carol()];
-        let mut engine = UnanimityEngine::new(voters, 86_400).expect("valid");
+        let mut engine = UnanimityEngine::new(voters, 86_400, mock_resolver()).expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
@@ -1592,7 +1708,7 @@ mod tests {
         use crate::context::governance::verify_proposal_votes;
 
         let voters = vec![alice(), bob(), carol()];
-        let mut engine = UnanimityEngine::new(voters, 86_400).expect("valid");
+        let mut engine = UnanimityEngine::new(voters, 86_400, mock_resolver()).expect("valid");
         let ctx = test_context();
 
         let (proposal, _) = engine
