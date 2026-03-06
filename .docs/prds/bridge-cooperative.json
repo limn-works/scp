@@ -538,7 +538,7 @@
         "Native members can send SenderKeyRequest for a shadow's sender key by (context_id, shadow_did)",
         "Bridge handles SenderKeyRequest by retrieving the shadow's sender key from SenderKeyStore and wrapping it via HPKE",
         "HPKE wrapping uses the bridge operator's identity key as sender and the requesting member's identity key as recipient",
-        "HPKE domain separation label is \"scp-sender-key-hpke-v1\"",
+        "HPKE domain separation label is \"scp-sender-key-v1\" per §9.16.2",
         "SenderKeyResponse contains the HPKE-wrapped sender key and is routed to the requesting member",
         "Members joining a bridged context request sender keys for all active shadows",
         "SenderKeyRequest for a non-existent shadow returns an error (not a silent failure)",

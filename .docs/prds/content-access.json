@@ -279,11 +279,13 @@
         "member_id is first 8 bytes of SHA-256(member_did)",
         "unwrap_content with member not in wrapped_ceks returns CryptoError::NotRecipient",
         "unwrap_content with tampered ciphertext returns CryptoError::IntegrityFailure (AEAD tag mismatch)",
+        "AES-256-GCM AAD is context_id || sender_did || sequence_number — cross-context ciphertext relocation returns CryptoError::IntegrityFailure",
         "WrappedContent serializable via MessagePack (round-trip test passes)",
         "WrappedCek uses Vec<WrappedCek> (not HashMap) for deterministic serialization",
         "Tests verify wrap/unwrap round-trip for single and multiple recipients",
         "Tests verify integrity check failure on wrong access key",
-        "Tests verify AEAD tag verification catches content tampering"
+        "Tests verify AEAD tag verification catches content tampering",
+        "Tests verify AAD mismatch (wrong context_id) causes AES-GCM decryption failure"
       ],
       "actionItems": [
         "Implement ContentEncryptionKey struct with generate()",
@@ -335,14 +337,15 @@
         "On block initiation, blocker's SDK deletes the target's access key from local store",
         "Block notification signature is verified against blocker's Active Signing Key before destruction",
         "Invalid block notification signature causes discard + anomaly log (no destruction)",
-        "Tests verify sender key deletion on verified block notification",
-        "Tests verify access key deletion on both sides (blocker and blocked)",
-        "Tests verify invalid signature causes discard without destruction",
-        "ContentAccessState enum with Full, ReadOnly, PresenceOnly, NonMember variants",
-        "State transitions are one-way until explicit Restore governance action",
-        "Forward-only restoration: unblock grants future access, historical gap permanent",
-        "RevokeReadAccess triggers plaintext + access key destruction",
-        "RevokeWriteAccess triggers sender key exclusion"
+        "Tests verify sender key deletion on verified block notification (all epochs for blocker DID purged from ProtocolStore)",
+        "Tests verify access key deletion on both sides (blocker and blocked) via ProtocolStore get returning None",
+        "Tests verify invalid signature causes discard without destruction (sender keys and access keys unchanged)",
+        "ContentAccessState enum with Full, ReadOnly, PresenceOnly, NonMember variants; derives Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize",
+        "ContentAccessState transitions: Full -> ReadOnly (via RevokeWriteAccess), Full -> PresenceOnly (via RevokeReadAccess + RevokeWriteAccess), Full -> NonMember (via RemoveMember)",
+        "State transitions are one-way until explicit RestoreReadAccess/RestoreWriteAccess governance action",
+        "Forward-only restoration: unblock grants future access, historical gap permanent — test verifies messages encrypted during block period remain undecryptable after unblock",
+        "RevokeReadAccess triggers plaintext + access key destruction via Layer 2 handler",
+        "RevokeWriteAccess triggers sender key exclusion via Layer 1 rotation"
       ],
       "actionItems": [
         "Add block notification handler in sender key module",
@@ -503,8 +506,8 @@
         "Test creates a broadcast context with Author and Subscriber",
         "Broadcast test: governance RevokeWriteAccess removes Author. Subscribers cannot get Author's new key. RestoreWriteAccess restores Author, forward-only.",
         "Tier stacking test: both Alice (Tier 1) and governance (Tier 3) revoke Dave's access. Reversing only one does not restore access. Both must be reversed.",
-        "Layer verification: after Full revocation, target's access key is gone (Layer 3), cached material is destroyed (Layer 2), and key requests are denied (Layer 1)",
-        "Forward-only verification: after unblock/restore, historical messages remain inaccessible"
+        "Layer verification: after Full revocation, target's access key is gone from ProtocolStore (Layer 3), cached sender keys are purged (Layer 2), and SenderKeyRequest returns denial (Layer 1)",
+        "Forward-only verification: after unblock/restore, attempt to decrypt messages from block period returns CryptoError (key epochs permanently missed)"
       ],
       "actionItems": [
         "Create integration test file",

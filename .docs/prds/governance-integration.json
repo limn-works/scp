@@ -186,8 +186,7 @@
         "Add serialization round-trip tests for all new types"
       ],
       "blockedBy": [
-        "SCP-267",
-        "SCP-268"
+        "SCP-267"
       ],
       "sources": [
         {
@@ -221,14 +220,14 @@
       ],
       "description": "Extend `execute_governance_action()` to handle all 24 GovernanceAction variants. For each variant, implement the internal execution method. The catch-all arm that returns PermissionDenied('not yet supported') must be replaced with actual dispatch for every variant.\n\nWire auto-execution: when the GovernanceEngine returns Approved status (from propose for SingleAdmin, from approve/reject for multi-admin models), ContextManager automatically calls execute_governance_action(). This was moved from SCP-268 to this story because action dispatch lives here.\n\nRemove or restrict any standalone public methods that bypass governance. All governed actions MUST be exclusively available through GovernanceEngine — the engine cannot be circumvented. Specifically: close_context() for multi-admin models must route through governance (propose -> vote -> execute). SingleAdmin close_context() still works via auto-approve but goes through the engine.\n\nProtocol-level unanimity overrides (enforced by ContextManager, not the engine): ExtendTtl and PromoteContext always require unanimous consent from ALL current members regardless of governance model, per spec §5.10 and ADR-031 §4d.\n\nUCAN updates on signer changes per ADR-031 §6: AddSigner execution mints GovernanceVote + GovernancePropose UCANs for the new signer. RemoveSigner execution revokes governance UCANs and validates threshold <= remaining signers.len().\n\nGovernance actions that result in membership changes (AddMember, RemoveMember) trigger MLS operations per ADR-031 §8: AddMember triggers MLS add_member() Commit, RemoveMember triggers MLS remove_member() Commit. The sequence is: proposal approved -> ContextManager executes membership change -> MLS Commit advances epoch -> GovernanceActionExecuted event appended.",
       "acceptanceCriteria": [
-        "execute_governance_action() dispatches all 24 GovernanceAction variants (no catch-all 'not supported' arm)",
-        "GovernanceActionResult returned for each variant matches the enum defined in SCP-269",
+        "execute_governance_action() has 24 explicit match arms — one per GovernanceAction variant — with no catch-all or wildcard arm",
+        "Each match arm returns the corresponding GovernanceActionResult variant defined in SCP-269",
         "When GovernanceEngine returns Approved status from propose (SingleAdmin) or approve/reject (multi-admin), ContextManager automatically calls execute_governance_action()",
         "close_context() for multi-admin models routes through governance (propose -> vote -> execute)",
         "close_context() for SingleAdmin goes through the engine (auto-approve)",
         "ExtendTtl execution enforces unanimity override regardless of governance model per ADR-031 §4d and spec §5.10",
         "PromoteContext execution enforces unanimity override regardless of governance model per ADR-031 §4d and spec §5.10",
-        "No standalone public method on ContextManager directly executes a governance-gated operation without going through the engine",
+        "No standalone public method on ContextManager directly executes AddMember, RemoveMember, ChangeRole, CloseContext, ModifyCeiling, or any other governance-gated operation without routing through GovernanceEngine",
         "AddMember execution triggers MLS Add Commit (MlsImpact::RequiresMlsCommit per mls_integration.rs)",
         "RemoveMember execution triggers MLS Remove Commit (MlsImpact::RequiresMlsCommit)",
         "AddSigner execution mints GovernanceVote + GovernancePropose UCANs for the new signer per ADR-031 §6",
@@ -410,9 +409,11 @@
         "Cosignature collection uses a 1-hour default voting window",
         "If cosignature quorum not reached, checkpoint is valid with creator's signature alone and flagged as PartiallyAttested",
         "Checkpoint hash is distributed to eligible cosigners for verification",
-        "Tests verify cosignature quorum for each governance model",
-        "Tests verify PartiallyAttested flag when quorum not reached",
-        "Tests verify SingleAdmin cosignatures field is empty"
+        "Tests verify SingleAdmin checkpoint has empty cosignatures field",
+        "Tests verify Threshold(2-of-3) checkpoint requires 2 cosignatures to be FullyAttested",
+        "Tests verify Majority checkpoint requires >50% cosignatures to be FullyAttested",
+        "Tests verify Unanimity checkpoint requires all member cosignatures to be FullyAttested",
+        "Tests verify checkpoint with insufficient cosignatures after 1-hour window is flagged PartiallyAttested (not rejected)"
       ],
       "actionItems": [
         "Add governance model query to checkpoint creation flow",
@@ -455,9 +456,9 @@
         "Unanimity: propose -> all members approve -> action executes",
         "Rejected proposals do not execute actions",
         "Expired proposals do not execute actions",
-        "All 7 governance event types (GovernanceProposalCreated, GovernanceVoteCast, GovernanceVoteWithdrawn, GovernanceProposalResolved, GovernanceConflictDetected, GovernanceConflictResolved, GovernanceDeadlockRecovery) appear in the context event log when triggered",
-        "Attempting governance-gated operations through non-governance paths returns errors",
-        "Test exercises at least 7 different GovernanceAction variants (RemoveMember, ChangeRole, CloseContext, AddSigner, ExtendTtl, RevokeWriteAccess, RestoreReadAccess)",
+        "All 8 governance event types (GovernanceProposalCreated, GovernanceVoteCast, GovernanceVoteWithdrawn, GovernanceProposalResolved, GovernanceConflictDetected, GovernanceConflictResolved, GovernanceDeadlockRecovery, GovernanceActionExecuted) appear in the context event log when triggered",
+        "Attempting governance-gated operations through non-governance paths returns ContextError",
+        "Test exercises these 7 GovernanceAction variants: RemoveMember, ChangeRole, CloseContext, AddSigner, ExtendTtl, RevokeWriteAccess, RestoreReadAccess",
         "Test verifies ExtendTtl unanimity override in a Threshold context",
         "Test verifies PromoteContext unanimity override in a Majority context",
         "Test verifies conflict detection and resolution for competing ChangeRole proposals",

@@ -67,7 +67,7 @@
         "FromStr rejects 'scp:capability:name/v1/extra' with MalformedUri error (no deeper nesting)",
         "Display round-trips: parse then display produces the original string for all valid URIs",
         "CapabilityUri derives Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Debug",
-        "Tests verify at least one URI from each of the three authority types",
+        "Tests verify parsing for all three authority types: Protocol (scp:capability:prompt-injection-resistance/v1), DidScoped (did:dht:z6Mk123:capability:domain-expertise/v2), System (scp:system:relay-operation)",
         "Tests verify all error variants are reachable"
       ],
       "actionItems": [
@@ -212,7 +212,7 @@
         "issue_challenge rejects unknown scp:capability:* URIs (not in registry)",
         "verify_challenge_response succeeds for challenges using any of the 27 protocol capabilities",
         "For parameterized capabilities, issue_challenge validates that parameters match the registry's parameter_schema when present",
-        "Tests exercise issue_challenge with at least one capability from each of the 10 categories",
+        "Tests exercise issue_challenge with one capability from each of the 10 categories: prompt-injection-resistance (safety-security), schema-validation (schema-compliance), rate-limit-compliance (behavioral-compliance), latency-compliance (operational), spending-limit-enforcement (spending-commerce), mathematical-reasoning (reasoning-logic), code-generation (code), instruction-recall (recall-fidelity), demographic-bias-resistance (bias-fairness), source-attribution (factual-hallucination)",
         "Tests exercise issue_challenge with a DID-scoped custom capability",
         "Tests verify that issue_challenge rejects an unknown scp:capability:fake/v1"
       ],
@@ -299,7 +299,7 @@
         "CapabilityEntry can contain a mix of Protocol, DidScoped, and System capabilities",
         "Tests verify a DID document with system capabilities resolves correctly via resolve_capabilities",
         "Tests verify deduplication works across Protocol, DidScoped, and System variants",
-        "System capabilities are not confused with challenge capabilities in any code path"
+        "issue_challenge rejects CapabilityUri::System variants with ChallengeError::NotChallengeable (system capabilities are node role declarations, not challengeable)"
       ],
       "actionItems": [
         "Add tests for system capability parsing and resolution",
