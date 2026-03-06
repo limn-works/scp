@@ -475,8 +475,8 @@ mod tests {
 
     #[test]
     fn runtime_returns_same_instance_on_repeated_calls() {
-        let first = runtime() as *const _;
-        let second = runtime() as *const _;
+        let first = std::ptr::from_ref(runtime());
+        let second = std::ptr::from_ref(runtime());
         assert_eq!(first, second);
     }
 
