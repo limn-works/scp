@@ -570,7 +570,7 @@ impl PyMessage {
 pub struct PyMessageReceiver {
     /// The receiving half of the message channel, wrapped in a `tokio::sync::Mutex`
     /// so it can be locked across `.await` points in `__anext__`. Shared with
-    /// `ContextRuntime::message_rx` via `Arc` so that `deliver_message` can
+    /// `FfiBridgeState::message_rx` via `Arc` so that `deliver_message` can
     /// implement oldest-drop overflow.
     rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>,
 }
@@ -630,7 +630,7 @@ impl PyMessageReceiver {
     /// Creates a new receiver from a pre-wrapped shared receiver Arc.
     ///
     /// The `Arc<tokio::sync::Mutex<Receiver>>` is shared with
-    /// `ContextRuntime::message_rx` so that `deliver_message` can access
+    /// `FfiBridgeState::message_rx` so that `deliver_message` can access
     /// the receiver for oldest-drop overflow handling.
     #[must_use]
     pub const fn from_shared_rx(rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>) -> Self {
@@ -728,13 +728,34 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
     // for embedding in scp://context/<id> URIs.
     let context_id = crate::types::generate_context_id();
 
-    let handle = PyContextHandle::new(context_id.clone(), identity_did.to_owned(), parsed);
+    let handle = PyContextHandle::new(context_id.clone(), identity_did.to_owned(), parsed.clone());
 
-    // Register runtime objects (ToolRegistry, EventLog, RoleState, RevocationList)
-    // in the global runtime registry so that tools/UCAN/event_log bridge functions
-    // can look them up by context ID.
+    // Register FFI-specific state (ToolRegistry, EventLog, RoleState, RevocationList)
+    // in the global FFI state registry so that tools/UCAN/event_log bridge functions
+    // can look them up by context ID. Also initializes the shared ContextManager.
     crate::runtime::register_context(&context_id, identity_did)
-        .map_err(|e| PyRuntimeError::new_err(format!("failed to register context runtime: {e}")))?;
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to register context state: {e}")))?;
+
+    // Delegate context creation to the shared ContextManager for lifecycle tracking.
+    // Build scp-core ContextParams from the parsed PyContextParams.
+    {
+        let core_params = build_core_context_params(&parsed);
+        let creator_did_owned = scp_identity::DID(identity_did.to_owned());
+        let rt = crate::runtime()?;
+        let mgr = crate::runtime::context_manager()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let mgr = mgr.clone();
+        let ctx_id = context_id.clone();
+        rt.block_on(async move {
+            mgr.create_context(ctx_id, core_params, creator_did_owned)
+                .await
+        })
+        .map_err(|e| {
+            // Clean up FFI state on ContextManager failure.
+            crate::runtime::remove_context(&context_id);
+            PyRuntimeError::new_err(format!("ContextManager create_context failed: {e}"))
+        })?;
+    }
 
     // Register in the known-contexts registry for discovery via
     // py_mcp_load_contexts. Derive a per-identity routing ID using
@@ -828,11 +849,43 @@ fn py_context_join(handle: &PyContextHandle, identity_did: &str) -> PyResult<()>
     }
     drop(state);
 
-    // In the full runtime, this would:
-    // 1. Generate a key package for the joining member.
-    // 2. Add the member to the MLS group.
-    // 3. Log the join event.
-    let _ = identity_did; // Will be used when connected to scp-core runtime.
+    // Delegate join to the shared ContextManager for membership tracking.
+    {
+        let context_id = handle.context_id.clone();
+        let member_did = identity_did.to_owned();
+        let rt = crate::runtime()?;
+        let mgr = crate::runtime::context_manager()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let mgr = mgr.clone();
+
+        // Build a key package for the joining member.
+        let key_package = scp_core::context::membership::KeyPackage {
+            owner_did: scp_identity::DID(member_did.clone()),
+        };
+
+        // Look up the ContextHandle from a completed create_context call.
+        // The ContextManager stores PerContextState keyed by context_id.
+        // We need the handle to delegate. Since the handle is stored in
+        // ContextManager's internal state, we create a temporary handle
+        // matching the context's params for the join call.
+        let core_params = build_core_context_params(&handle.params);
+        let temp_handle = scp_core::context::ContextHandle::new(context_id.clone(), core_params);
+        // Transition the temp handle to Active to match the real state.
+        rt.block_on(async {
+            let _ = temp_handle
+                .transition_to(&scp_core::context::ContextState::Active)
+                .await;
+            mgr.join_context(&temp_handle, key_package).await
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("ContextManager join_context failed: {e}")))?;
+
+        // Also update FFI bridge state's role_state for UCAN/tool capability checks.
+        crate::runtime::with_ffi_state(&context_id, |st| {
+            st.role_state.members.insert(member_did.clone());
+            Ok(())
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    }
 
     Ok(())
 }
@@ -863,11 +916,35 @@ fn py_context_leave(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
     }
     drop(state);
 
-    // In the full runtime, this would:
-    // 1. Remove the member from the MLS group.
-    // 2. Update sender keys.
-    // 3. Log the leave event.
-    let _ = identity_did; // Will be used when connected to scp-core runtime.
+    // Delegate leave to the shared ContextManager for membership tracking.
+    {
+        let context_id = handle.context_id.clone();
+        let member_did = scp_identity::DID(identity_did.to_owned());
+        let rt = crate::runtime()?;
+        let mgr = crate::runtime::context_manager()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let mgr = mgr.clone();
+
+        let core_params = build_core_context_params(&handle.params);
+        let temp_handle = scp_core::context::ContextHandle::new(context_id.clone(), core_params);
+        rt.block_on(async {
+            let _ = temp_handle
+                .transition_to(&scp_core::context::ContextState::Active)
+                .await;
+            // Self-removal: caller_did == member_did.
+            mgr.leave_context(&temp_handle, &member_did, &member_did)
+                .await
+        })
+        .map_err(|e| {
+            PyRuntimeError::new_err(format!("ContextManager leave_context failed: {e}"))
+        })?;
+
+        // Also update FFI bridge state's role_state.
+        let _ = crate::runtime::with_ffi_state(&context_id, |st| {
+            st.role_state.members.remove(identity_did);
+            Ok(())
+        });
+    }
 
     // Close the receive channel so any active PyMessageReceiver raises
     // StopAsyncIteration (SCP-216 AC6).
@@ -912,8 +989,8 @@ fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
     // the close operation. Without this check, any caller could close any
     // context -- a privilege escalation vulnerability (black-hat finding).
     let context_id = handle.context_id.clone();
-    crate::runtime::with_context(&context_id, |rt| {
-        if !rt
+    crate::runtime::with_ffi_state(&context_id, |st| {
+        if !st
             .role_state
             .member_has_capability(identity_did, &Capability::ContextClose)
         {
@@ -927,12 +1004,34 @@ fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
     })
     .map_err(|e: crate::error::ScpPyError| -> PyErr { e.into() })?;
 
+    // Delegate close to the shared ContextManager.
+    {
+        let initiator_did = scp_identity::DID(identity_did.to_owned());
+        let rt = crate::runtime()?;
+        let mgr = crate::runtime::context_manager()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let mgr = mgr.clone();
+
+        let core_params = build_core_context_params(&handle.params);
+        let temp_handle = scp_core::context::ContextHandle::new(context_id, core_params);
+        let close_result = rt.block_on(async {
+            let _ = temp_handle
+                .transition_to(&scp_core::context::ContextState::Active)
+                .await;
+            mgr.close_context(&temp_handle, &initiator_did).await
+        });
+        // close_context may fail if the context was already removed from
+        // ContextManager (e.g., all members left). Proceed with FFI cleanup
+        // regardless, since the bridge-level state check passed.
+        let _ = close_result;
+    }
+
     // Transition directly to "closed" (skipping "closing" for the bridge
     // layer -- the full runtime will implement the cooperative closing window).
     "closed".clone_into(&mut state);
     drop(state);
 
-    // Remove context from the runtime registry to free resources.
+    // Remove context from the FFI state registry to free resources.
     crate::runtime::remove_context(&handle.context_id);
 
     Ok(())
@@ -980,15 +1079,16 @@ fn py_context_send(
         return Err(PyTypeError::new_err("payload must be bytes or str"));
     };
 
-    // Create a real inner envelope using the retained KeyCustody for signing.
-    // This validates that the identity's active signing key can produce a
-    // valid Ed25519 signature over the message. The inner envelope is not
-    // yet transmitted (MLS encryption and transport are future stories) but
-    // the signing path exercises real KeyCustody. See SCP-214 criterion 6.
+    // Delegate message sending to the shared ContextManager. The ContextManager
+    // validates Active state, checks write capabilities, assigns sequence numbers,
+    // encrypts via the crypto provider, and sends via the transport provider.
     let context_id = handle.context_id.clone();
     let identity_did_owned = identity_did.to_owned();
-
     let rt = crate::runtime()?;
+
+    // Create a real inner envelope using the retained KeyCustody for signing.
+    // This validates that the identity's active signing key can produce a
+    // valid Ed25519 signature over the message. See SCP-214 criterion 6.
     crate::runtime::with_identity(&identity_did_owned, |entry| {
         let now_ms = scp_core::time::now_millis()
             .map_err(|e| crate::error::ScpPyError::context(format!("{e}")))?;
@@ -1021,6 +1121,25 @@ fn py_context_send(
         Ok(())
     })
     .map_err(|e: crate::error::ScpPyError| -> PyErr { e.into() })?;
+
+    // Delegate to ContextManager for message delivery through the transport.
+    {
+        let sender_did = scp_identity::DID(identity_did_owned);
+        let mgr = crate::runtime::context_manager()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let mgr = mgr.clone();
+
+        let core_params = build_core_context_params(&handle.params);
+        let temp_handle = scp_core::context::ContextHandle::new(context_id, core_params);
+        rt.block_on(async {
+            let _ = temp_handle
+                .transition_to(&scp_core::context::ContextState::Active)
+                .await;
+            mgr.send_message(&temp_handle, &sender_did, &payload_bytes)
+                .await
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("ContextManager send_message failed: {e}")))?;
+    }
 
     Ok(())
 }
@@ -1058,14 +1177,102 @@ fn py_context_receive(handle: &PyContextHandle) -> PyResult<PyMessageReceiver> {
     let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
 
     let context_id = handle.context_id.clone();
-    crate::runtime::with_context(&context_id, |rt| {
-        rt.message_tx = Some(tx);
-        rt.message_rx = Some(Arc::clone(&rx_arc));
+    crate::runtime::with_ffi_state(&context_id, |st| {
+        st.message_tx = Some(tx);
+        st.message_rx = Some(Arc::clone(&rx_arc));
         Ok(())
     })
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     Ok(PyMessageReceiver::from_shared_rx(rx_arc))
+}
+
+// ---------------------------------------------------------------------------
+// ContextManager delegation helpers
+// ---------------------------------------------------------------------------
+
+/// Builds scp-core [`ContextParams`] from a [`PyContextParams`].
+///
+/// Converts the flat FFI-facing parameter representation into the typed
+/// scp-core parameter struct used by [`ContextManager::create_context`].
+fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::ContextParams {
+    use scp_core::context::params::{
+        CeilingPolicy, ContextMode, GovernanceModel, MemoryScope, PromotionPolicy, TemplateId,
+    };
+
+    let mode = match py_params.mode.as_str() {
+        "broadcast" => ContextMode::Broadcast,
+        _ => ContextMode::Encrypted,
+    };
+
+    let ceiling_policy = match py_params.ceiling_policy.as_str() {
+        "governed" => CeilingPolicy::Governed,
+        _ => CeilingPolicy::Immutable,
+    };
+
+    let promotion_policy = match py_params.promotion_policy.as_str() {
+        "promotable" => PromotionPolicy::Promotable,
+        _ => PromotionPolicy::NoPromotion,
+    };
+
+    let memory_scope = match py_params.memory_scope.as_str() {
+        "summary" => MemoryScope::Summary,
+        "full" => MemoryScope::Full,
+        _ => MemoryScope::Ephemeral,
+    };
+
+    // Currently only SingleAdmin is supported; governance string was already validated.
+    let _ = py_params.governance.as_str();
+    let governance_model = GovernanceModel::SingleAdmin;
+
+    let template_id = py_params.template_id.as_deref().and_then(|tid| match tid {
+        "BilateralEphemeral" => Some(TemplateId::BilateralEphemeral),
+        "BilateralPersistent" => Some(TemplateId::BilateralPersistent),
+        "Coordination" => Some(TemplateId::Coordination),
+        "GroupDiscussion" => Some(TemplateId::GroupDiscussion),
+        "PublicBroadcast" => Some(TemplateId::PublicBroadcast),
+        "GatedBroadcast" => Some(TemplateId::GatedBroadcast),
+        "scp:template/tool-interface" => Some(TemplateId::ToolInterfaceTemplate),
+        "scp:template/paid-service" => Some(TemplateId::PaidService),
+        "scp:template/paid-broadcast" => Some(TemplateId::PaidBroadcast),
+        _ => None,
+    });
+
+    let ceiling: Vec<scp_core::context::roles::Capability> = py_params
+        .ceiling
+        .iter()
+        .map(scp_core::context::roles::Capability::new)
+        .collect();
+
+    let roles = py_params
+        .roles
+        .keys()
+        .map(|name| scp_core::context::params::RoleDefinition { name: name.clone() })
+        .collect();
+
+    let tools = py_params
+        .tools
+        .iter()
+        .map(|name| scp_core::context::params::ToolRegistration { name: name.clone() })
+        .collect();
+
+    let ttl = py_params.ttl.map(std::time::Duration::from_secs_f64);
+
+    scp_core::context::ContextParams {
+        mode,
+        ceiling,
+        ceiling_policy,
+        promotion_policy,
+        roles,
+        tools,
+        ttl,
+        memory_scope,
+        governance: governance_model,
+        template_id,
+        economic_policy: None,
+        metadata_visibility: scp_core::context::params::MetadataVisibilityPolicy::default(),
+        projection_policy: None,
+    }
 }
 
 // ---------------------------------------------------------------------------

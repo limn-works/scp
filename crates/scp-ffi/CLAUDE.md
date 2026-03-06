@@ -8,17 +8,23 @@ This crate is the `_scp_core` Python extension module. It exposes scp-core/scp-m
 
 ### Runtime Registry (`runtime.rs`)
 
-**Context registry:** A global `OnceLock<DashMap<String, ContextRuntime>>` maps context IDs to live runtime state:
+**Architecture (post-#386 rewrite):** Context lifecycle is delegated to a shared `Arc<ContextManager>` stored in `OnceLock<Arc<ContextManager>>`. Per-context FFI-specific state lives in `FfiBridgeState` in a `OnceLock<DashMap<String, FfiBridgeState>>`.
+
+**ContextManager (shared):** Owns context lifecycle state — membership, roles, governance, broadcast, TTL. All `py_context_*` functions delegate to `ContextManager::create_context`, `join_context`, `leave_context`, `close_context`, `send_message`. Initialized via `init_context_manager()` with no-op providers at bridge layer.
+
+**FfiBridgeState (per-context, FFI-only):** Does NOT duplicate ContextManager state:
 - `ToolRegistry` — tool registration/invocation
 - `EventLog` — event recording, querying, Merkle proofs
 - `RevocationList` — UCAN token revocation tracking
-- `RoleState` — role assignments for capability checking
+- `RoleState` — role assignments for UCAN/tool capability checking (synced with ContextManager)
 - `NonceTracker<SystemClock>` — per-context UCAN nonce replay prevention (ADR-016 step 9)
 - `ceiling_strings: HashSet<String>` — capability ceiling as `{resource}:{action}` strings (ADR-016 step 8)
 - `creator_did` — the DID of the context creator
 - `tool_handlers: HashMap<String, ToolHandler>` — registered tool handler closures keyed by tool ID (SCP-212)
 - `message_tx: Option<mpsc::Sender<PyMessage>>` — sender half of the receive channel (SCP-216). Stored so transport can feed messages. Dropping closes the channel.
 - `message_rx: Option<Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>>` — shared receiver for oldest-drop overflow (SCP-216). Shared with `PyMessageReceiver`.
+
+**Backward-compatibility aliases:** `with_context` → `with_ffi_state`, `register_context` → `register_ffi_state` + `init_context_manager`, `remove_context` → `remove_ffi_state`. Existing modules (`tools.rs`, `ucan.rs`, `event_log.rs`, `mcp.rs`) use these aliases without modification.
 
 **Identity registry (SCP-214):** A global `OnceLock<DashMap<String, IdentityEntry>>` maps DID strings to retained identity state:
 - `ScpIdentity` — opaque key handles (`identity_key`, `active_signing_key`), pre-rotation commitment, DID string
@@ -27,9 +33,9 @@ This crate is the `_scp_core` Python extension module. It exposes scp-core/scp-m
 
 `py_identity_create` registers identity state. Bridge functions (`context.rs`, `ucan.rs`, `identity.rs`) look up state by DID via `with_identity` / `with_identity_mut`. `remove_identity` is called during DID migration.
 
-DashMap provides lock-free concurrent access with internal sharding — no global mutex contention under concurrent Python calls (important for PEP 703 free-threaded Python). The `with_context` function takes a closure receiving `&mut ContextRuntime` and returns `Result<T, ScpPyError>` with typed errors. The `with_identity` / `with_identity_mut` functions follow the same pattern for identity state.
+DashMap provides lock-free concurrent access with internal sharding — no global mutex contention under concurrent Python calls (important for PEP 703 free-threaded Python). The `with_context` function (alias for `with_ffi_state`) takes a closure receiving `&mut FfiBridgeState` and returns `Result<T, ScpPyError>` with typed errors. The `with_identity` / `with_identity_mut` functions follow the same pattern for identity state.
 
-`py_context_create` in `context.rs` registers runtime state. Other modules (`tools.rs`, `ucan.rs`, `event_log.rs`) look up state by context ID via `with_context`.
+`py_context_create` in `context.rs` registers FFI bridge state and delegates lifecycle to `ContextManager`. Other modules (`tools.rs`, `ucan.rs`, `event_log.rs`) look up FFI state by context ID via `with_context` (alias for `with_ffi_state`).
 
 Additional global registries in `runtime.rs`:
 - `KNOWN_CONTEXTS: OnceLock<DashMap<String, KnownContext>>` — context-to-relay mappings for discovery (SCP-213)
@@ -119,8 +125,8 @@ The MCP bridge delegates to real `scp-mcp` server/client implementations via two
 - `ToolRegistry::registrations()` returns an iterator, not a Vec. There is no `invoke()` method — tool invocation checks tool existence and returns a JSON status response.
 - `SseClientTransport` uses raw `TcpStream` — `https://` URLs are explicitly rejected (no TLS). Only `http://` is supported; add `rustls` dependency for HTTPS.
 - `FfiBridgeProvider::validate_capability` performs real capability checking via `has_tool_invoke_capability` against the context's role state (SCP-210). Defense-in-depth alongside the UCAN layer. `invoke_tool` validates input against the tool's JSON schema and dispatches to a registered handler if one exists (SCP-212). If no handler is registered, falls back to echo mode with `"status": "validated"`. Handler output is also validated against the tool's output schema (defense-in-depth).
-- **Tool handler registration (SCP-212)**: `py_register_tool_handler(context_id, tool_name, handler)` wraps a Python callable in a Rust closure and stores it in `ContextRuntime::tool_handlers`. The handler is called by `FfiBridgeProvider::invoke_tool` when the tool is invoked via MCP. The tool must be registered in the `ToolRegistry` first. `ContextProvider::invoke_tool` is sync, and Python handlers are GIL-bound (inherently sync), so no async boundary crossing is needed at the FFI layer. Python SDK wrapper: `scp_sdk.mcp.register_tool_handler(context, tool_name, handler)`.
-- **Receive channel lifecycle (SCP-216)**: `py_context_receive` creates a bounded channel (capacity 1000, `RECEIVE_BUFFER_CAPACITY`), stores the sender in `ContextRuntime::message_tx` and a shared receiver `Arc` in both `ContextRuntime::message_rx` and `PyMessageReceiver`. `__anext__` returns an `asyncio.Future` — it spawns the `recv()` on the tokio runtime and resolves the future via `call_soon_threadsafe` when a message arrives, so the asyncio event loop is never blocked (#138). Channel closes on `py_context_leave` (via `close_receive_channel`) or `py_context_close` (via `remove_context` dropping the runtime). `deliver_message` in `runtime.rs` feeds messages and handles oldest-drop overflow: on full buffer, acquires `try_lock` on the shared receiver (never `blocking_lock` which would panic inside tokio), pops exactly 1 oldest item, sends the new message, then best-effort sends a `BufferOverflow` warning. If `try_lock` fails (consumer holds the mutex), returns `Err` instead of silently dropping the message.
+- **Tool handler registration (SCP-212)**: `py_register_tool_handler(context_id, tool_name, handler)` wraps a Python callable in a Rust closure and stores it in `FfiBridgeState::tool_handlers`. The handler is called by `FfiBridgeProvider::invoke_tool` when the tool is invoked via MCP. The tool must be registered in the `ToolRegistry` first. `ContextProvider::invoke_tool` is sync, and Python handlers are GIL-bound (inherently sync), so no async boundary crossing is needed at the FFI layer. Python SDK wrapper: `scp_sdk.mcp.register_tool_handler(context, tool_name, handler)`.
+- **Receive channel lifecycle (SCP-216)**: `py_context_receive` creates a bounded channel (capacity 1000, `RECEIVE_BUFFER_CAPACITY`), stores the sender in `FfiBridgeState::message_tx` and a shared receiver `Arc` in both `FfiBridgeState::message_rx` and `PyMessageReceiver`. `__anext__` returns an `asyncio.Future` — it spawns the `recv()` on the tokio runtime and resolves the future via `call_soon_threadsafe` when a message arrives, so the asyncio event loop is never blocked (#138). Channel closes on `py_context_leave` (via `close_receive_channel`) or `py_context_close` (via `remove_context` dropping the runtime). `deliver_message` in `runtime.rs` feeds messages and handles oldest-drop overflow: on full buffer, acquires `try_lock` on the shared receiver (never `blocking_lock` which would panic inside tokio), pops exactly 1 oldest item, sends the new message, then best-effort sends a `BufferOverflow` warning. If `try_lock` fails (consumer holds the mutex), returns `Err` instead of silently dropping the message.
 - **Thread leak on tool handler timeout**: When `FfiBridgeProvider::invoke_tool` times out (via `recv_timeout`), the spawned `std::thread` continues running in the background until the handler returns naturally. Rust has no mechanism to forcibly cancel a thread. The leaked thread holds an `Arc<dyn Fn>` (handler closure) and the Python GIL (for Python handlers). No DashMap locks are held (two-phase design from #122). Cooperative cancellation was rejected as unreasonable API burden for handler authors. Mitigation path if needed: process-level isolation, not in-process cancellation. See PR #170 review discussion and the doc comment in `invoke_tool` in `mcp.rs`.
 - `parse_http_url` rejects control characters (CRLF injection defense). SSE `post_path` from server is also validated.
 - SSE response event loop is bounded to 1000 events. If the server streams non-matching events beyond this, the request fails.
