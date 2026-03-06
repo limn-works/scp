@@ -294,69 +294,31 @@ CODE TRACK (can start now — no remaining spec dependencies):
 
 ## Revised Execution Phases
 
-### Phase 0: Spec Fixes (6 remaining lanes, all parallel)
+### Phase 0: Spec Fixes — COMPLETE
 
-S-A (canonical serialization) and S-D (bridge MLS model) are DONE.
+All 8 spec lanes merged to `feat/achieve-production-readiness`:
+- S-A: Canonical serialization (pre-existing)
+- S-B: UCAN nonce format (#380) → aa92b92
+- S-C: Protocol versioning §13 (#378) → 23c4b32
+- S-D: Bridge MLS model (pre-existing)
+- S-E: Identity private state (#372) → f8bbc6e
+- S-F: Sender key & broadcast crypto → e6ecaa3
+- S-G: Sync anti-replay (#381) → 8c7ae18
+- S-H: Context nesting eligibility (#374) → 5c79ab7
+- S-I: §15 erasure (#379) → aeaf5f9
 
-**Lane S-B** — UCAN Nonce Format Resolution (#380)
-- Pick `{unix_millis}-{hex16}` (matches validation step 9 and implementation)
-- Update: ADR-016 mint_ucan criterion 3 (remove "UUID v4 or 32 random bytes")
+### Phase 1: Surgical Code Fixes — COMPLETE
 
-**Lane S-C** — Protocol Versioning (§13) (#378)
-- Define version number, wire format field, negotiation mechanism, forward compat rules, degraded mode
-- Update: SS13 (currently 10 lines → needs full spec section)
-- Add version field to InnerEnvelope and BroadcastEnvelope structs
+All 7 lanes merged to `feat/achieve-production-readiness`:
+- Lane A: #345 (af4192c), #313 (2444c9a)
+- Lane B: #312 (53ed083), #346 (7f341b8, 5fb0266)
+- Lane C: #351 (26e2222), #290 (5f88141)
+- Lane D: #348 (d174211, 34d05b2)
+- Lane E: #353, #352 (c78f1b6)
+- Lane F: #354 (38fe1cf), #355, #350 (dd392ae)
+- Lane G: #301 (cf3cc06)
 
-**Lane S-E** — Identity Private State (#372)
-- Specify encryption: X25519 key derived from Ed25519 Identity Key via RFC 7748, AES-256-GCM
-- Specify multi-device: key sharing via HPKE to device-specific X25519 keys
-- Specify social/device recovery: quorum threshold, wire format, failure semantics
-- Update: SS3 §3.3, §3.7
-
-**Lane S-F** — Sender Key & Broadcast Crypto
-- Specify RFC 9180 HPKE Base mode with explicit suite ID, info string, AAD
-- Specify nonce: random 12-byte per encryption, included in wire format
-- Add nonce field to BroadcastEnvelope struct
-- Update: SS9 §9.16.1, §9.16.2, SS5 §5.14.5, ADR-007
-
-**Lane S-G** — Sync Protocol Anti-Replay (#381)
-- Add nonce + timestamp + challenge-response freshness to ResetRequest
-- Update: ADR-029 §4, SS23 §23.5.2
-
-**Lane S-H** — Context Nesting Eligibility (#374)
-- Specify mechanism for relay to verify parent membership for encrypted contexts
-- Options: membership attestation, governance-signed eligibility proof, or remove relay-level validation for encrypted nesting
-- Update: SS5 §5.13.2
-
-### Phase 1: Surgical Code Fixes (max parallelism, no dependencies)
-
-7 parallel lanes. All branch from `main`. No inter-lane dependencies.
-**Requires:** Phase 0 lanes S-A, S-B, S-F merged (for lanes B, C that touch affected files).
-
-**Lane A** — `fix/wire-format-transport` (#345, #313)
-- scp-transport: serde rename annotations + TTL fix
-- **Requires S-B merged** (nonce format affects TTL/dedup)
-
-**Lane B** — `fix/sender-key-wire-format` (#312, #346)
-- scp-core: HPKE domain separator + 4 wire format fixes + length prefixes + nonce field
-- **Requires S-A + S-F merged** (canonical serialization + HPKE mode)
-
-**Lane C** — `fix/envelope-types` (#351, #290)
-- scp-core: deny_unknown_fields + signaling message binding + length prefixes in signature
-- **Requires S-A merged** (canonical serialization pattern)
-
-**Lane D** — `fix/store-serialization` (#348)
-- scp-core: positional → named MessagePack
-
-**Lane E** — `fix/broadcast-bugs` (#353, #352)
-- scp-core: block_subscriber scope + BroadcastEnvelope fields + nonce field
-- **Requires S-F merged** (broadcast key nonce)
-
-**Lane F** — `fix/misc-standalone` (#354, #355, #291, #350)
-- 4 separate crates/files, no conflicts
-
-**Lane G** — `fix/node-dev-api` (#301)
-- scp-node: wire real metrics
+Additional review fixes (81185a1): deny_unknown_fields on 4 sender key wire types, HandleRequestParams nonce/timestamp validation, saturating_add, conflict detection tests, actions_conflict docstring.
 
 ### Phase 2: Governance Cleanup (serial — same files)
 
