@@ -98,6 +98,7 @@ pub use bridge::{
     tool_verify,
     transport_connect,
     transport_status,
+    ucan_delegate,
     ucan_mint,
     ucan_revoke,
     ucan_validate,
@@ -461,6 +462,8 @@ pub trait DeviceAttestationProvider: Send + Sync {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[test]
@@ -748,4 +751,251 @@ mod tests {
     // NOTE: routing_id tests removed — SA-15 changed ContextHandle to accept
     // Identity (for KeyCustody signing), which removed the routing_id field.
     // Routing ID tests will be re-added when routing is wired through KeyCustody.
+
+    // -----------------------------------------------------------------------
+    // UCAN minting with persistent identity keys (#326)
+    // -----------------------------------------------------------------------
+
+    /// Verifies that `ucan_mint` produces a token whose `iss` matches the
+    /// identity's DID, confirming no ephemeral keys are used.
+    ///
+    /// Acceptance criterion: UCAN `iss` matches the caller's DID.
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn ucan_mint_issuer_matches_identity_did() {
+        let rt = runtime();
+
+        let identity = rt
+            .block_on(identity_create("in_memory".to_owned()))
+            .expect("identity_create failed");
+        let identity_did = identity.did();
+
+        let params = bridge::ContextParams {
+            ceiling: Vec::new(),
+            governance: bridge::GovernanceModel::SingleAdmin,
+            memory_scope: bridge::MemoryScope::Ephemeral,
+            ttl_seconds: 0,
+            promotable: false,
+        };
+        let handle = rt
+            .block_on(context_create(identity, params))
+            .expect("context_create failed");
+
+        let audience_did = "did:dht:z6MkTestAudience1234567890abcdef";
+        let token = rt
+            .block_on(ucan_mint(
+                handle,
+                audience_did.to_owned(),
+                vec!["messages:write".to_owned()],
+            ))
+            .expect("ucan_mint failed");
+
+        assert_eq!(
+            token.issuer(),
+            identity_did,
+            "UCAN iss must match the identity's DID — no ephemeral keys"
+        );
+        assert_eq!(
+            token.audience(),
+            audience_did,
+            "UCAN aud must match the provided member DID"
+        );
+    }
+
+    /// Verifies that a minted UCAN token has a valid Ed25519 signature that
+    /// can be verified against the identity's public key.
+    ///
+    /// Acceptance criterion: token is verifiable by resolving `iss` DID →
+    /// getting public key → checking Ed25519 signature.
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn ucan_mint_signature_verifiable_against_identity_key() {
+        use scp_platform::traits::KeyCustody;
+
+        let rt = runtime();
+
+        // Create identity and extract custody + signing key handle.
+        let identity = rt
+            .block_on(identity_create("in_memory".to_owned()))
+            .expect("identity_create failed");
+
+        // Get the public key from the identity's custody provider.
+        let signing_key = identity
+            .core_id
+            .as_ref()
+            .expect("core_id must be present")
+            .active_signing_key;
+        let custody = identity
+            .in_memory_custody
+            .as_ref()
+            .expect("in_memory_custody must be present");
+        let public_key = rt
+            .block_on(custody.0.public_key(&signing_key))
+            .expect("public_key retrieval failed");
+
+        let params = bridge::ContextParams {
+            ceiling: Vec::new(),
+            governance: bridge::GovernanceModel::SingleAdmin,
+            memory_scope: bridge::MemoryScope::Ephemeral,
+            ttl_seconds: 0,
+            promotable: false,
+        };
+        let handle = rt
+            .block_on(context_create(identity, params))
+            .expect("context_create failed");
+
+        let token = rt
+            .block_on(ucan_mint(
+                handle,
+                "did:dht:z6MkTestAudience1234567890abcdef".to_owned(),
+                vec!["messages:write".to_owned()],
+            ))
+            .expect("ucan_mint failed");
+
+        // Parse the encoded token and verify the signature.
+        let parsed = scp_core::crypto::ucan::validate::parse_ucan(&token.encoded)
+            .expect("parse_ucan failed");
+
+        let signing_input = parsed
+            .encoded
+            .rfind('.')
+            .map(|pos| &parsed.encoded[..pos])
+            .expect("encoded token must have signature segment");
+
+        scp_core::crypto::ed25519::verify_ed25519_signature_strict(
+            public_key.as_bytes(),
+            signing_input.as_bytes(),
+            &parsed.signature,
+        )
+        .expect("Ed25519 signature verification must succeed against identity's public key");
+    }
+
+    /// Verifies that `ucan_delegate` chains correctly from a previously
+    /// minted token: the delegated token references the parent via proof,
+    /// the issuer is the delegator (context creator), and the audience is
+    /// the delegatee.
+    ///
+    /// Uses two identities: identity A mints a parent token to identity B,
+    /// then identity B (using their own context handle) delegates to C.
+    /// This tests the full delegation chain without self-delegation.
+    ///
+    /// Acceptance criterion: `ucan_delegate` chains correctly from a
+    /// previously minted token.
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn ucan_delegate_chains_from_minted_token() {
+        let rt = runtime();
+
+        // Create identity A (minter) and identity B (delegator).
+        let identity_a = rt
+            .block_on(identity_create("in_memory".to_owned()))
+            .expect("identity_create failed for A");
+
+        let identity_b = rt
+            .block_on(identity_create("in_memory".to_owned()))
+            .expect("identity_create failed for B");
+        let did_b = identity_b.did();
+
+        let mk_params = || bridge::ContextParams {
+            ceiling: Vec::new(),
+            governance: bridge::GovernanceModel::SingleAdmin,
+            memory_scope: bridge::MemoryScope::Ephemeral,
+            ttl_seconds: 0,
+            promotable: false,
+        };
+
+        // A creates a context and mints a token addressed to B.
+        let handle_a = rt
+            .block_on(context_create(identity_a, mk_params()))
+            .expect("context_create failed for A");
+
+        let parent_token = rt
+            .block_on(ucan_mint(
+                Arc::clone(&handle_a),
+                did_b.clone(),
+                vec!["messages:write".to_owned()],
+            ))
+            .expect("ucan_mint failed for parent token");
+
+        // B creates their own context (to get key custody on their handle).
+        let handle_b = rt
+            .block_on(context_create(identity_b, mk_params()))
+            .expect("context_create failed for B");
+
+        // B delegates from the parent token to C.
+        // Use full capability URIs from the parent token to match the parent's
+        // context-scoped capabilities (attenuation check requires subset).
+        let parent_capabilities = parent_token.capabilities();
+        let delegatee_did = "did:dht:z6MkDelegatee1234567890abcdefg";
+        let delegated_token = rt
+            .block_on(ucan_delegate(
+                handle_b,
+                delegatee_did.to_owned(),
+                parent_token.encoded.clone(),
+                parent_capabilities,
+            ))
+            .expect("ucan_delegate failed");
+
+        // Verify the delegated token's properties.
+        assert_eq!(
+            delegated_token.issuer(),
+            did_b,
+            "delegated token issuer must be the delegator (identity B)"
+        );
+        assert_eq!(
+            delegated_token.audience(),
+            delegatee_did,
+            "delegated token audience must be the delegatee"
+        );
+
+        // Verify the proof chain links back to the parent.
+        let parsed_delegated =
+            scp_core::crypto::ucan::validate::parse_ucan(&delegated_token.encoded)
+                .expect("parse_ucan for delegated token failed");
+        assert!(
+            !parsed_delegated.payload.prf.is_empty(),
+            "delegated token must have non-empty proof chain linking to parent"
+        );
+    }
+
+    /// Verifies that no ephemeral key generation occurs in the UCAN mint
+    /// path — the signing key is the persistent identity key retained on
+    /// the context handle.
+    ///
+    /// Acceptance criterion: No ephemeral key generation in UCAN code paths.
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn ucan_mint_uses_persistent_key_not_ephemeral() {
+        let rt = runtime();
+
+        let identity = rt
+            .block_on(identity_create("in_memory".to_owned()))
+            .expect("identity_create failed");
+
+        // Extract the identity's signing key handle before creating context.
+        let signing_key_handle = identity
+            .core_id
+            .as_ref()
+            .expect("core_id must be present")
+            .active_signing_key;
+
+        let params = bridge::ContextParams {
+            ceiling: Vec::new(),
+            governance: bridge::GovernanceModel::SingleAdmin,
+            memory_scope: bridge::MemoryScope::Ephemeral,
+            ttl_seconds: 0,
+            promotable: false,
+        };
+        let handle = rt
+            .block_on(context_create(identity, params))
+            .expect("context_create failed");
+
+        // Verify the context handle uses the same signing key handle as the
+        // identity — confirming no ephemeral key was generated.
+        assert_eq!(
+            handle.signing_key,
+            Some(signing_key_handle),
+            "context handle must retain the identity's persistent signing key, not an ephemeral one"
+        );
+    }
 }
