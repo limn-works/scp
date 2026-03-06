@@ -9777,7 +9777,7 @@
       "gate": "gate-6",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         ".docs/standards/sdk-common.md",
         "crates/scp-ffi/src/mcp.rs",
