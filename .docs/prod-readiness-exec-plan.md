@@ -331,7 +331,7 @@ Additional review fixes (81185a1): deny_unknown_fields on 4 sender key wire type
 
 **Lane A** — #347 (deser size limits) — **COMPLETE** → 155f2b3 + review fix 1bd9403
 **Lane B** — #319 — **COMPLETE** → e6b86a9 + review fix 04c2281. #299 — **COMPLETE** → ffd3272 + review fix fbf0577. #326 done in prior iteration.
-**Lane C** — #339, #340 — unblocked (Phase 2 complete). Todo.
+**Lane C** — #340 (promotion policy tests) — **COMPLETE** → c33675d. #339 (ceiling enforcement) — **PARTIAL** → 72deffe (governance action ceiling gates done; UCAN minting/delegation ceiling enforcement remaining)
 **Lane D** — #321 — **COMPLETE** (prior iteration) → b7b4e1e + review fix 3eacfb2
 
 ### Phase 4: Identity Infrastructure (parallel with Phases 2-3) — COMPLETE
