@@ -122,6 +122,7 @@ pub struct SenderKeyRequest {
     /// Cryptographic nonce for replay protection (16 bytes, generated with
     /// `OsRng`). The responder echoes this in [`SenderKeyResponse::request_nonce`]
     /// and rejects duplicate nonces within [`NONCE_EXPIRY_SECS`].
+    #[serde(with = "serde_bytes")]
     pub nonce: [u8; REQUEST_NONCE_SIZE],
     /// Unix timestamp in seconds when the request was created.
     pub timestamp: u64,
@@ -153,6 +154,7 @@ pub struct SenderKeyResponse {
     pub ephemeral_pubkey: Vec<u8>,
     /// Echo of the request nonce from [`SenderKeyRequest::nonce`], binding
     /// this response to the originating request.
+    #[serde(with = "serde_bytes")]
     pub request_nonce: [u8; REQUEST_NONCE_SIZE],
 }
 
@@ -162,7 +164,8 @@ pub struct SenderKeyResponse {
 /// can automatically rotate Dave's sender key excluding Alice. The signature
 /// prevents forgery by other group members.
 ///
-/// Signature payload: `SHA-256(context_id || "block" || blocker_did || blocked_did || timestamp_BE)`.
+/// Signature payload (via canonical hash):
+/// `SHA-256("SCP-BLOCK-NOTIFICATION-V1:" || context_id || blocker_did || blocked_did || signing_key_id || timestamp_BE)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlockNotification {
@@ -173,9 +176,15 @@ pub struct BlockNotification {
     pub blocker: String,
     /// The DID of the member being blocked.
     pub blocked: String,
+    /// Identifies which DID verification method (`#active` or `#agent`)
+    /// produced the signature. Verifiers resolve the correct public key
+    /// from the blocker's DID document using this field (ADR-039).
+    #[serde(default)]
+    pub signing_key_id: SigningKeyId,
     /// Unix timestamp in milliseconds when the block was issued.
     pub timestamp: u64,
-    /// Ed25519 signature from the blocker's Active Signing Key.
+    /// Ed25519 signature from the blocker's Active Signing Key or Agent
+    /// Signing Key.
     #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
 }
@@ -717,7 +726,7 @@ pub async fn open_sender_key_response(
 /// transmission as an MLS application message.
 ///
 /// Signature payload:
-/// `SHA-256(context_id || "block" || blocker_did || blocked_did || timestamp_BE)`.
+/// `SHA-256(context_id || "block" || blocker_did || blocked_did || signing_key_id || timestamp_BE)`.
 ///
 /// # Errors
 ///
@@ -730,10 +739,17 @@ pub async fn send_block_notification(
     context_id: &str,
     blocker_did: &str,
     blocked_did: &str,
+    signing_key_id: SigningKeyId,
 ) -> Result<Vec<u8>, SenderKeyError> {
     let timestamp = current_timestamp_ms()?;
 
-    let hash = compute_block_notification_hash(context_id, blocker_did, blocked_did, timestamp);
+    let hash = compute_block_notification_hash(
+        context_id,
+        blocker_did,
+        blocked_did,
+        signing_key_id,
+        timestamp,
+    );
 
     let signature = key_custody
         .sign(signing_key, &hash)
@@ -744,6 +760,7 @@ pub async fn send_block_notification(
         notification_type: "block_notification".to_owned(),
         blocker: blocker_did.to_owned(),
         blocked: blocked_did.to_owned(),
+        signing_key_id,
         timestamp,
         signature: signature.into_bytes(),
     };
@@ -803,6 +820,7 @@ pub fn verify_block_notification(
         context_id,
         &notification.blocker,
         &notification.blocked,
+        notification.signing_key_id,
         notification.timestamp,
     );
     verify_ed25519_signature(blocker_public_key, &hash, &notification.signature)
@@ -1079,7 +1097,7 @@ fn compute_request_hash(
 
 /// Computes `SHA-256("SCP-BLOCK-NOTIFICATION-V1:" || len(context_id) || context_id
 ///   || len(blocker_did) || blocker_did || len(blocked_did) || blocked_did
-///   || timestamp_BE)`.
+///   || len(signing_key_id) || signing_key_id || timestamp_BE)`.
 ///
 /// Variable-length fields are prefixed with their length as a 4-byte
 /// big-endian u32 to prevent field-boundary ambiguity. The domain separator
@@ -1089,17 +1107,19 @@ fn compute_block_notification_hash(
     context_id: &str,
     blocker_did: &str,
     blocked_did: &str,
+    signing_key_id: SigningKeyId,
     timestamp: u64,
 ) -> Vec<u8> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
-    // Field order per §9.5.2: context_id, blocker_did, blocked_did, timestamp.
+    // Field order per ADR-007 §6: context_id, blocker_did, blocked_did, signing_key_id, timestamp.
     canonical_hash(
         "SCP-BLOCK-NOTIFICATION-V1:",
         &[
             CanonicalField::VarBytes(context_id.as_bytes()),
             CanonicalField::VarBytes(blocker_did.as_bytes()),
             CanonicalField::VarBytes(blocked_did.as_bytes()),
+            CanonicalField::VarBytes(signing_key_id.as_bytes()),
             CanonicalField::U64(timestamp),
         ],
     )
@@ -1814,6 +1834,7 @@ mod tests {
             "ctx-1",
             "did:dht:alice",
             "did:dht:dave",
+            SigningKeyId::Active,
         )
         .await
         .unwrap();
@@ -1822,6 +1843,7 @@ mod tests {
         assert_eq!(notification.notification_type, "block_notification");
         assert_eq!(notification.blocker, "did:dht:alice");
         assert_eq!(notification.blocked, "did:dht:dave");
+        assert_eq!(notification.signing_key_id, SigningKeyId::Active);
         assert!(notification.timestamp > 0);
 
         let valid = verify_block_notification(&notification, "ctx-1", pubkey.as_bytes()).unwrap();
@@ -1839,6 +1861,7 @@ mod tests {
             "ctx-1",
             "did:dht:alice",
             "did:dht:dave",
+            SigningKeyId::Active,
         )
         .await
         .unwrap();
@@ -1861,6 +1884,7 @@ mod tests {
             "ctx-1",
             "did:dht:alice",
             "did:dht:dave",
+            SigningKeyId::Active,
         )
         .await
         .unwrap();
@@ -2212,6 +2236,7 @@ mod tests {
             "ctx-1",
             "did:dht:alice",
             "did:dht:dave",
+            SigningKeyId::Active,
         )
         .await
         .unwrap();
@@ -2234,6 +2259,7 @@ mod tests {
             "ctx-1",
             "did:dht:alice",
             "did:dht:dave",
+            SigningKeyId::Active,
         )
         .await
         .unwrap();
@@ -2520,8 +2546,20 @@ mod tests {
 
     #[test]
     fn block_notification_hash_boundary_shift_produces_different_hash() {
-        let hash_a = compute_block_notification_hash("ctx-1", "did:key:AB", "did:key:CD", 100);
-        let hash_b = compute_block_notification_hash("ctx-1", "did:key:ABC", "did:key:D", 100);
+        let hash_a = compute_block_notification_hash(
+            "ctx-1",
+            "did:key:AB",
+            "did:key:CD",
+            SigningKeyId::Active,
+            100,
+        );
+        let hash_b = compute_block_notification_hash(
+            "ctx-1",
+            "did:key:ABC",
+            "did:key:D",
+            SigningKeyId::Active,
+            100,
+        );
         assert_ne!(
             hash_a, hash_b,
             "shifting bytes between blocker_did and blocked_did must produce different hashes"
