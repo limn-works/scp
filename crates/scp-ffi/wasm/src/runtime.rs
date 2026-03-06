@@ -781,8 +781,8 @@ fn check_ucan_expiry(payload: &serde_json::Value) -> Result<(), ScpWasmError> {
 ///
 /// Uses `compute_revocation_cid` (JSON payload hash) matching scp-core's format.
 fn check_ucan_revocation(context_id: &str, payload_bytes: &[u8]) -> Result<(), ScpWasmError> {
-    let ucan_payload: crate::ucan::UcanPayloadForRevocation =
-        serde_json::from_slice(payload_bytes).map_err(|e| ScpWasmError::Permission {
+    let ucan_payload: crate::ucan::UcanPayloadForRevocation = serde_json::from_slice(payload_bytes)
+        .map_err(|e| ScpWasmError::Permission {
             message: format!("UCAN payload deserialization failed for revocation check: {e}"),
             code: "SCP-PERM-3001".to_owned(),
         })?;
@@ -793,8 +793,7 @@ fn check_ucan_revocation(context_id: &str, payload_bytes: &[u8]) -> Result<(), S
                 code: "SCP-PERM-3001".to_owned(),
             }
         })?;
-    let is_revoked =
-        crate::ucan::is_token_revoked(context_id, &revocation_cid).unwrap_or(false);
+    let is_revoked = crate::ucan::is_token_revoked(context_id, &revocation_cid).unwrap_or(false);
     if is_revoked {
         return Err(ScpWasmError::Permission {
             message: "UCAN token has been revoked".to_owned(),
@@ -873,10 +872,7 @@ fn check_ucan_tool_capability(
 }
 
 /// Checks the tool invocation is within the context's capability ceiling (step 7).
-fn check_ucan_ceiling(
-    rt: &WasmContextRuntime,
-    tool_name: &str,
-) -> Result<(), ScpWasmError> {
+fn check_ucan_ceiling(rt: &WasmContextRuntime, tool_name: &str) -> Result<(), ScpWasmError> {
     if !rt.ceiling_strings.is_empty() {
         let capability_name = format!("tool_invoke:{tool_name}");
         let wildcard = "tool_invoke:*".to_owned();
@@ -890,4 +886,3 @@ fn check_ucan_ceiling(
     }
     Ok(())
 }
-

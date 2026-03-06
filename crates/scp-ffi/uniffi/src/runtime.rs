@@ -16,7 +16,7 @@
 //! 3. [`context_close`](super::bridge::context_close) calls [`remove_context`].
 
 use std::collections::HashSet;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use scp_core::context::roles::default_ceiling;
@@ -28,6 +28,26 @@ use scp_identity::cache::SystemClock;
 use crate::bridge::ScpError;
 
 static CONTEXT_REGISTRY: OnceLock<DashMap<String, ContextRuntime>> = OnceLock::new();
+
+/// Global production DID resolver (#311). See `scp-ffi/src/runtime.rs` for
+/// full documentation.
+static DID_RESOLVER: OnceLock<Arc<scp_ffi_common::IdentityBackedDidResolver>> = OnceLock::new();
+
+/// Returns the global production DID resolver, if initialized.
+#[must_use]
+pub fn did_resolver() -> Option<&'static Arc<scp_ffi_common::IdentityBackedDidResolver>> {
+    DID_RESOLVER.get()
+}
+
+/// Initializes the global production DID resolver (#311).
+pub fn init_did_resolver<R>(resolver: Arc<R>, handle: tokio::runtime::Handle)
+where
+    R: scp_identity::resolver::DidResolver + 'static,
+{
+    let _ = DID_RESOLVER.set(Arc::new(scp_ffi_common::IdentityBackedDidResolver::new(
+        resolver, handle,
+    )));
+}
 
 fn registry() -> &'static DashMap<String, ContextRuntime> {
     CONTEXT_REGISTRY.get_or_init(DashMap::new)

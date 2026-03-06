@@ -654,10 +654,9 @@ impl ContextProvider for FfiBridgeProvider {
         // See spec §6.2, §8, ADR-016, and issue #319.
         if let Some(ref token) = self.agent_ucan_token {
             // Build proof resolver from optional proof tokens (supports delegated UCANs).
-            let proof_resolver = crate::ucan::build_proof_resolver_from_tokens(
-                self.agent_proof_tokens.as_deref(),
-            )
-            .map_err(|e| format!("failed to build proof resolver: {e}"))?;
+            let proof_resolver =
+                crate::ucan::build_proof_resolver_from_tokens(self.agent_proof_tokens.as_deref())
+                    .map_err(|e| format!("failed to build proof resolver: {e}"))?;
 
             crate::runtime::with_context(context_id, |rt| {
                 let did_resolver = crate::bridge_adapters::BridgeDidResolver;

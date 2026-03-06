@@ -139,6 +139,46 @@ static RELAY_CONNECTION: OnceLock<RwLock<Option<Arc<NativeRelayAdapter>>>> = Onc
 /// registry pattern.
 static IDENTITY_REGISTRY: OnceLock<DashMap<String, IdentityEntry>> = OnceLock::new();
 
+/// Global production DID resolver that delegates to `scp_identity::resolver::DidResolver`
+/// for full DID document validation (BEP44 signature verification, self-certification,
+/// sequence number comparison, caching, healing).
+///
+/// Initialized by [`init_did_resolver`] when the identity layer is first set up.
+/// Used by UCAN validation and attestation verification when available; falls back
+/// to [`scp_ffi_common::BridgeDidResolver`] (string-only) when `None`.
+///
+/// See #311 for the unification design.
+static DID_RESOLVER: OnceLock<Arc<scp_ffi_common::IdentityBackedDidResolver>> = OnceLock::new();
+
+/// Returns the global production DID resolver, if initialized.
+#[must_use]
+pub fn did_resolver() -> Option<&'static Arc<scp_ffi_common::IdentityBackedDidResolver>> {
+    DID_RESOLVER.get()
+}
+
+/// Initializes the global production DID resolver.
+///
+/// Wraps any `scp_identity::resolver::DidResolver` implementation (typically
+/// `DualLayerResolver`) in an [`IdentityBackedDidResolver`] and stores it
+/// as the process-global resolver for UCAN validation and attestation
+/// verification.
+///
+/// Called once during identity system setup. Subsequent calls are no-ops
+/// (the resolver is initialized via `OnceLock`).
+///
+/// # Arguments
+///
+/// * `resolver` — The identity resolver to wrap. Must be `'static + Send + Sync`.
+/// * `handle` — Handle to the tokio runtime for async-sync bridging.
+pub fn init_did_resolver<R>(resolver: Arc<R>, handle: tokio::runtime::Handle)
+where
+    R: scp_identity::resolver::DidResolver + 'static,
+{
+    let _ = DID_RESOLVER.set(Arc::new(scp_ffi_common::IdentityBackedDidResolver::new(
+        resolver, handle,
+    )));
+}
+
 /// Returns a reference to the global context registry.
 fn registry() -> &'static DashMap<String, ContextRuntime> {
     CONTEXT_REGISTRY.get_or_init(DashMap::new)

@@ -4859,6 +4859,9 @@ dependencies = [
  "hex",
  "scp-core",
  "scp-identity",
+ "scp-platform",
+ "tokio",
+ "tracing",
  "z-base-32",
 ]
 

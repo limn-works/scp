@@ -156,12 +156,13 @@ pub async fn tool_invoke(
     crate::runtime::ensure_registered(handle)?;
 
     // Build proof resolver from optional proof tokens (supports delegated UCANs).
-    let proof_resolver =
-        crate::ucan::build_proof_resolver_from_tokens(proof_tokens.as_deref())
-            .map_err(|e| napi::Error::from(ScpNapiError::Permission {
+    let proof_resolver = crate::ucan::build_proof_resolver_from_tokens(proof_tokens.as_deref())
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Permission {
                 message: format!("failed to build proof resolver: {e}"),
                 code: "SCP-PERM-3001".to_owned(),
-            }))?;
+            })
+        })?;
 
     crate::runtime::with_context(&context_id, |rt| {
         let did_resolver = scp_ffi_common::BridgeDidResolver;

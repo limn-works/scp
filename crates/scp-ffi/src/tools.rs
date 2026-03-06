@@ -245,8 +245,7 @@ fn validate_tool_ucan(
     identity_did: &str,
     proof_tokens: &Option<Vec<String>>,
 ) -> PyResult<()> {
-    let proof_resolver =
-        crate::ucan::build_proof_resolver_from_tokens(proof_tokens.as_deref())?;
+    let proof_resolver = crate::ucan::build_proof_resolver_from_tokens(proof_tokens.as_deref())?;
 
     crate::runtime::with_context(context_id, |rt| {
         let did_resolver = crate::bridge_adapters::BridgeDidResolver;

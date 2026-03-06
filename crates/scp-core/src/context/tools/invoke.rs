@@ -1026,8 +1026,8 @@ mod tests {
     async fn validate_tool_invocation_ucan_rejects_non_tool_capability() {
         use crate::crypto::ucan::mint::{MintParams, mint_ucan};
         use crate::crypto::ucan::validate::{
-            InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
-            InMemoryRevocationChecker, ValidationContext, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+            DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryNonceTracker,
+            InMemoryProofResolver, InMemoryRevocationChecker, ValidationContext,
         };
         use scp_platform::testing::InMemoryKeyCustody;
         use scp_platform::traits::{KeyCustody, KeyType};

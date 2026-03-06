@@ -39,7 +39,7 @@ use scp_core::crypto::ucan::validate::{
 };
 
 use scp_ffi_common::{
-    BridgeDidResolver, BridgeNonceTracker, BridgeProofResolver, BridgeRevocationChecker,
+    BridgeNonceTracker, BridgeProofResolver, BridgeRevocationChecker, DispatchDidResolver,
 };
 
 use crate::context::NapiContextHandle;
@@ -228,7 +228,10 @@ pub async fn ucan_validate(
     // - Replayed nonces are detected across calls (persistent NonceTracker).
     crate::runtime::with_context(&context_id, |rt| {
         // Build validation context using persistent runtime state.
-        let did_resolver = BridgeDidResolver;
+        // Use production DID resolver when available (#311), fallback to string-only.
+        let production_resolver = crate::runtime::did_resolver();
+        let did_resolver =
+            DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
         let revocation_checker = BridgeRevocationChecker {
             revocation_list: &rt.revocation_list,
         };
@@ -458,6 +461,7 @@ mod tests {
     use scp_core::crypto::ucan::validate::{
         DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
     };
+    use scp_ffi_common::BridgeDidResolver;
 
     // -----------------------------------------------------------------------
     // BridgeDidResolver
