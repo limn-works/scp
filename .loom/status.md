@@ -7,43 +7,53 @@ None — full workspace test suite green. Clippy clean with CI features.
 None — all changes committed. Working tree clean.
 
 ## Fixed This Iteration
-- **Broken build from #320 merge**: `create_governance_engine` and `restore_governance_engine_from_snapshot` were changed to require `KeyResolver` parameter, but `ContextManager` was not updated. Fixed by wiring `KeyResolver` through the struct, constructors, and all ~30 test call sites. Commit d2c9fcf.
+- Broken build from cherry-pick: `MintParams` missing `ceiling` field at `invoke.rs:1044` and `DelegateParams` missing `ceiling` field at UniFFI `bridge.rs:2373`. Fixed in 4a2d2e0.
+- Broken build from cherry-pick: `ContextSnapshot` missing `governance_model_config` field in persistence test. Fixed in 0e2dd00.
 
 ## Tests Added / Updated
-- #340: 3 promotion policy enforcement tests (NoPromotion rejection, Promotable success with TTL/memory scope transition, immutability post-promotion). 77 total manager tests.
-- #339: 5 ceiling enforcement tests (RegisterTool rejected/succeeds, EstablishToolInterface rejected, CreateChildContext rejected, BlockAuthor rejected without MemberBan).
-- Updated `setup_active_context` and `setup_broadcast_context_two_authors` test helpers to include broader ceiling capabilities for compatibility with new enforcement checks.
-- Fixed `revoke_read_access_rejected_without_member_ban_ceiling` and `restore_read_access_rejected_without_member_ban_ceiling` to create their own contexts without MemberBan instead of using shared helper.
+- #339: 5 new ceiling enforcement tests for UCAN minting/delegation (mint rejection/success/no-ceiling, delegate rejection/success). `verify_attestation_ceiling_compliance` helper. `ceiling: None` added to ~70 existing construction sites.
+- #385: 31 new tests across 4 provider implementations:
+  - MlsCryptoProvider: 12 tests (group creation, sender keys, broadcast keys, encrypt/decrypt)
+  - RelayTransportProvider: 7 tests (connectivity, publish, delete, send)
+  - MerkleEventLogProvider: 8 tests (init, append, chain integrity, destroy)
+  - InMemoryPersistence: 5 tests (persist, load, delete, round-trip)
 
 ## Work Summary
 
-### This Iteration: Phase 2 build fix + Phase 3 Lane C (#339, #340)
+### This Iteration: Phase 3 completion + Phase 5 Step 1
 
 | Issue | Phase | Description | Result | Commit |
 |-------|-------|-------------|--------|--------|
-| Build fix | — | Wire KeyResolver through ContextManager (broken by #320 merge) | **COMPLETE** | d2c9fcf |
-| #340 | P3 Lane C | Promotion policy enforcement tests + doc comments | **COMPLETE** | c33675d |
-| #339 | P3 Lane C | Ceiling enforcement for governance actions | **PARTIAL** | 72deffe |
+| #339 | P3 Lane C | UCAN minting/delegation ceiling enforcement + FFI wiring | **COMPLETE** | 2c6d5c9 + 4a2d2e0 |
+| #385 | P5 Step 1 | Production provider implementations (ContextCrypto, Transport, EventLog, Persistence) | **COMPLETE** | cd90541 + 0e2dd00 |
 
-Execution plan update: e79ea63
+Execution plan updates: 7a82fb9 (Phase 3 COMPLETE), d051aaf (Phase 5 Step 1 COMPLETE)
 
-### #339 Partial Status
-**Done:** Ceiling enforcement for 4 governance actions in manager.rs (execute_register_tool, execute_establish_tool_interface, execute_create_child_context, block_broadcast_author_internal) + 5 boundary tests.
-**Remaining:** UCAN minting ceiling enforcement (mint.rs), UCAN delegation ceiling enforcement, FFI wiring (py_ucan_mint, NAPI, UniFFI). The subagent produced these changes but against the wrong base (main instead of feature branch), making them incompatible with the current API (f64→u32 #349, KeyResolver #357/#320).
+### Phase Status Summary
+- **Phases 0-4**: COMPLETE
+- **Phase 5 Step 1**: COMPLETE (#385 — production providers merged)
+- **Phase 5 Step 2**: NOT STARTED (#386-389 bridge rewrites — now unblocked)
+- **Phase 5 Step 3**: NOT STARTED (#390 E2E tests — blocked by #386)
+- **Phases 6-12**: NOT STARTED
 
 ### Issues Commented This Iteration
-#339, #340
+#339, #385
 
-### Cumulative Issues Commented (33)
-#290, #299, #301, #310, #311, #312, #313, #315, #319, #321, #325, #326, #327, #339, #340, #345, #346, #347, #348, #349, #350, #351, #352, #353, #354, #355, #357, #372, #374, #378, #379, #380, #381
+### Cumulative Issues Commented (35)
+#290, #299, #301, #310, #311, #312, #313, #315, #319, #321, #325, #326, #327, #339, #340, #345, #346, #347, #348, #349, #350, #351, #352, #353, #354, #355, #357, #372, #374, #378, #379, #380, #381, #385
+
+## Review Outcomes
+- **#339 review**: PASS — security reviewer found no actionable issues.
+- **#385 review**: PASS — security reviewer completed, no structured findings surfaced. Stored learnings in Vestige.
 
 ## Next Iteration — Continue Execution Plan
 
-**Phase 3 Lane C (finish #339):**
-- UCAN minting ceiling enforcement (mint.rs) — add ceiling parameter to `mint_ucan`, `delegate_ucan`
-- FFI wiring: pass ceiling from context to UCAN minting in py_ucan_mint, NAPI, UniFFI
+**Phase 5 Step 2 (CRITICAL — 4 parallel bridge rewrites):**
+- #386 — PyO3 bridge rewrite (reference bridge)
+- #387 — UniFFI bridge rewrite (Swift + Kotlin)
+- #388 — NAPI bridge rewrite (TypeScript)
+- #389 — WASM bridge rewrite
+- All 4 can run simultaneously now that #385 is done
+- Closes: #328, #332, #329, #335, #336, #338
 
-**Phase 3 is then COMPLETE.** Phase 4 already COMPLETE.
-
-**Phase 5 (CRITICAL PATH):** #385 → #386+#387+#388+#389 → #390
-- This is the next major phase — production provider implementations, then bridge rewrites
+**After bridge rewrites:** Phase 5 Step 3 (#390 E2E integration tests), then Phases 6-12.
