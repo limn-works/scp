@@ -110,7 +110,7 @@ static CONTEXT_MANAGER: OnceLock<Arc<ContextManager>> = OnceLock::new();
 /// initialized via [`init_context_manager`].
 pub fn context_manager() -> Result<&'static Arc<ContextManager>, ScpPyError> {
     CONTEXT_MANAGER.get().ok_or_else(|| {
-        ScpPyError::ContextError(
+        ScpPyError::context(
             "ContextManager not initialized — call py_context_create or \
              init_context_manager first"
                 .to_owned(),
@@ -133,6 +133,7 @@ pub fn init_context_manager() {
             Box::new(NoOpCryptoProvider),
             Box::new(NoOpTransportProvider),
             Box::new(NoOpEventLogProvider),
+            noop_key_resolver(),
         ))
     });
 }
@@ -147,7 +148,59 @@ pub fn init_context_manager_with(
     event_log: Box<dyn ContextEventLogProvider>,
 ) {
     let _ =
-        CONTEXT_MANAGER.get_or_init(|| Arc::new(ContextManager::new(crypto, transport, event_log)));
+        CONTEXT_MANAGER.get_or_init(|| Arc::new(ContextManager::new(crypto, transport, event_log, noop_key_resolver())));
+}
+
+// ---------------------------------------------------------------------------
+// DID resolver (global, production)
+// ---------------------------------------------------------------------------
+
+/// Global production DID resolver that delegates to `scp_identity::resolver::DidResolver`
+/// for full DID document validation (BEP44 signature verification, self-certification,
+/// sequence number comparison, caching, healing).
+///
+/// Initialized by [`init_did_resolver`] when the identity layer is first set up.
+/// Used by UCAN validation and attestation verification when available; falls back
+/// to [`scp_ffi_common::BridgeDidResolver`] (string-only) when `None`.
+///
+/// See #311 for the unification design.
+static DID_RESOLVER: OnceLock<Arc<scp_ffi_common::IdentityBackedDidResolver>> = OnceLock::new();
+
+/// Returns the global production DID resolver, if initialized.
+#[must_use]
+pub fn did_resolver() -> Option<&'static Arc<scp_ffi_common::IdentityBackedDidResolver>> {
+    DID_RESOLVER.get()
+}
+
+/// Initializes the global production DID resolver.
+///
+/// Wraps any `scp_identity::resolver::DidResolver` implementation (typically
+/// `DualLayerResolver`) in an [`IdentityBackedDidResolver`] and stores it
+/// as the process-global resolver for UCAN validation and attestation
+/// verification.
+///
+/// Called once during identity system setup. Subsequent calls are no-ops
+/// (the resolver is initialized via `OnceLock`).
+pub fn init_did_resolver<R>(resolver: Arc<R>, handle: tokio::runtime::Handle)
+where
+    R: scp_identity::resolver::DidResolver + 'static,
+{
+    let _ = DID_RESOLVER.set(Arc::new(scp_ffi_common::IdentityBackedDidResolver::new(
+        resolver, handle,
+    )));
+}
+
+// ---------------------------------------------------------------------------
+// Key resolver helper
+// ---------------------------------------------------------------------------
+
+/// Returns a no-op key resolver for bridge-layer `ContextManager` initialization.
+///
+/// Governance vote signature verification is not yet wired at the FFI layer —
+/// the no-op resolver returns `None` for all DIDs, which causes vote
+/// verification to be skipped (permissive mode).
+fn noop_key_resolver() -> scp_core::context::governance::KeyResolver {
+    Arc::new(|_: &scp_identity::DID| -> Option<ed25519_dalek::VerifyingKey> { None })
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +413,7 @@ pub fn register_ffi_state(context_id: &str, creator_did: &str) -> Result<(), Scp
 
     match map.entry(context_id.to_owned()) {
         Entry::Occupied(_) => {
-            return Err(ScpPyError::ContextError(format!(
+            return Err(ScpPyError::context(format!(
                 "context '{context_id}' FFI state is already registered"
             )));
         }
@@ -375,7 +428,7 @@ pub fn register_ffi_state(context_id: &str, creator_did: &str) -> Result<(), Scp
                 .collect::<HashSet<String>>();
             let role_state = ContextRoleState::new(context_id, creator_did, ceiling, vec![])
                 .map_err(|e| {
-                    ScpPyError::ContextError(format!("failed to create role state: {e}"))
+                    ScpPyError::context(format!("failed to create role state: {e}"))
                 })?;
             let revocation_list = RevocationList::new(context_id.to_owned());
             let nonce_tracker = NonceTracker::new(context_id.to_owned(), SystemClock);
@@ -417,7 +470,7 @@ where
     let map = ffi_state_registry();
 
     let mut entry = map.get_mut(context_id).ok_or_else(|| {
-        ScpPyError::ContextError(format!(
+        ScpPyError::context(format!(
             "context '{context_id}' not found in FFI state registry \
                  -- was it created with py_context_create?"
         ))
@@ -460,7 +513,7 @@ pub fn register_tool_handler(
     with_ffi_state(context_id, |st| {
         // Verify the tool exists in the registry before accepting a handler.
         if st.tool_registry.get(tool_id).is_none() {
-            return Err(ScpPyError::ContextError(format!(
+            return Err(ScpPyError::context(format!(
                 "tool '{tool_id}' not found in context '{context_id}' \
                  -- register the tool before adding a handler"
             )));
@@ -522,13 +575,13 @@ pub fn close_receive_channel(context_id: &str) -> Result<(), ScpPyError> {
 pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPyError> {
     let (tx, rx_arc) = with_ffi_state(context_id, |st| {
         let tx = st.message_tx.clone().ok_or_else(|| {
-            ScpPyError::ContextError(format!(
+            ScpPyError::context(format!(
                 "context '{context_id}' has no active receive channel \
                  -- call py_context_receive first"
             ))
         })?;
         let rx = st.message_rx.clone().ok_or_else(|| {
-            ScpPyError::ContextError("receive channel has no shared receiver reference".to_owned())
+            ScpPyError::context("receive channel has no shared receiver reference".to_owned())
         })?;
         Ok((tx, rx))
     })?;
@@ -547,7 +600,7 @@ pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPy
             drop(rx_guard);
 
             tx.try_send(message).map_err(|e| {
-                ScpPyError::ContextError(format!(
+                ScpPyError::context(format!(
                     "failed to deliver message to context '{context_id}' \
                      after overflow drop: {e}"
                 ))
@@ -564,7 +617,7 @@ pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPy
             let _ = tx.try_send(overflow_warning);
             Ok(())
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => Err(ScpPyError::ContextError(format!(
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(ScpPyError::context(format!(
             "receive channel for context '{context_id}' is closed"
         ))),
     }
@@ -708,7 +761,7 @@ where
     F: FnOnce(&IdentityEntry) -> Result<T, ScpPyError>,
 {
     let entry = identity_registry().get(did).ok_or_else(|| {
-        ScpPyError::IdentityError(format!(
+        ScpPyError::identity(format!(
             "identity '{did}' not found in registry \
              -- was it created with py_identity_create?"
         ))
@@ -727,7 +780,7 @@ where
     F: FnOnce(&mut IdentityEntry) -> Result<T, ScpPyError>,
 {
     let mut entry = identity_registry().get_mut(did).ok_or_else(|| {
-        ScpPyError::IdentityError(format!(
+        ScpPyError::identity(format!(
             "identity '{did}' not found in registry \
              -- was it created with py_identity_create?"
         ))
@@ -799,7 +852,7 @@ pub fn init_storage(storage_type: &str) -> Result<(), ScpPyError> {
             let _ = STORAGE_PROVIDER.set(Arc::new(InMemoryStorage::new()));
             Ok(())
         }
-        other => Err(ScpPyError::ValidationError(format!(
+        other => Err(ScpPyError::validation(format!(
             "unknown storage type: {other:?} — expected \"in_memory\""
         ))),
     }
@@ -813,7 +866,7 @@ pub fn init_storage(storage_type: &str) -> Result<(), ScpPyError> {
 /// via [`init_storage`].
 pub fn get_storage() -> Result<&'static Arc<InMemoryStorage>, ScpPyError> {
     STORAGE_PROVIDER.get().ok_or_else(|| {
-        ScpPyError::IdentityError(
+        ScpPyError::identity(
             "storage not initialized — call py_init_storage(\"in_memory\") first".to_owned(),
         )
     })
@@ -850,7 +903,7 @@ fn relay_state() -> &'static RwLock<Option<Arc<NativeRelayAdapter>>> {
 /// Returns `ScpPyError::TransportError` if the relay state lock is poisoned.
 pub fn set_relay_connection(adapter: Arc<NativeRelayAdapter>) -> Result<(), ScpPyError> {
     *relay_state().write().map_err(|_| {
-        ScpPyError::TransportError("relay connection state lock is poisoned".to_owned())
+        ScpPyError::transport("relay connection state lock is poisoned".to_owned())
     })? = Some(adapter);
     Ok(())
 }
@@ -866,7 +919,7 @@ pub fn set_relay_connection(adapter: Arc<NativeRelayAdapter>) -> Result<(), ScpP
 /// Returns `ScpPyError::TransportError` if the relay state lock is poisoned.
 pub fn get_relay_connection() -> Result<Option<Arc<NativeRelayAdapter>>, ScpPyError> {
     let guard = relay_state().read().map_err(|_| {
-        ScpPyError::TransportError("relay connection state lock is poisoned".to_owned())
+        ScpPyError::transport("relay connection state lock is poisoned".to_owned())
     })?;
     Ok(guard.clone())
 }
@@ -882,7 +935,7 @@ pub fn get_relay_connection() -> Result<Option<Arc<NativeRelayAdapter>>, ScpPyEr
 /// Returns `ScpPyError::TransportError` if the relay state lock is poisoned.
 pub fn clear_relay_connection() -> Result<(), ScpPyError> {
     *relay_state().write().map_err(|_| {
-        ScpPyError::TransportError("relay connection state lock is poisoned".to_owned())
+        ScpPyError::transport("relay connection state lock is poisoned".to_owned())
     })? = None;
     Ok(())
 }
@@ -965,7 +1018,7 @@ pub fn registry_stats() -> Result<RegistryStats, ScpPyError> {
     let relay_connected = relay_state()
         .read()
         .map_err(|_| {
-            ScpPyError::TransportError("relay connection state lock is poisoned".to_owned())
+            ScpPyError::transport("relay connection state lock is poisoned".to_owned())
         })?
         .is_some();
 

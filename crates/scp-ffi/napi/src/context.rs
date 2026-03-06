@@ -489,7 +489,7 @@ pub async fn context_send(
 
     let manager = context_manager();
     manager
-        .send_message(core_handle, &did, &payload)
+        .send_message(core_handle, &did, &payload, None)
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 

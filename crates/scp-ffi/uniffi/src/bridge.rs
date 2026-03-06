@@ -1784,7 +1784,7 @@ pub async fn context_send(
 
             let sender_did: scp_identity::DID = identity.did.clone().into();
             manager
-                .send_message(&core_handle, &sender_did, &payload)
+                .send_message(&core_handle, &sender_did, &payload, None)
                 .await
                 .map_err(ScpError::from)?;
 
@@ -2183,6 +2183,7 @@ async fn ucan_mint_impl(
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             };
 
             let token = scp_core::crypto::ucan::mint::mint_ucan(&params, &custody.0)
@@ -2501,7 +2502,7 @@ pub async fn broadcast_publish(
             let manager = crate::runtime::context_manager();
             let did: scp_identity::DID = author_did.into();
             manager
-                .publish_broadcast(&handle.context_id, &did, &payload)
+                .publish_broadcast(&handle.context_id, &did, &payload, &ed25519_dalek::SigningKey::from_bytes(&[0u8; 32]))
                 .await
                 .map_err(ScpError::from)?;
             Ok(())

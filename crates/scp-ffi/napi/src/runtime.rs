@@ -42,6 +42,30 @@ use crate::error::ScpNapiError;
 /// Global shared `ContextManager`, initialized once at first access.
 static CONTEXT_MANAGER: OnceLock<Arc<ContextManager>> = OnceLock::new();
 
+/// Global production DID resolver (#311).
+static DID_RESOLVER: OnceLock<Arc<scp_ffi_common::IdentityBackedDidResolver>> = OnceLock::new();
+
+/// Returns the global production DID resolver, if initialized.
+#[must_use]
+pub fn did_resolver() -> Option<&'static Arc<scp_ffi_common::IdentityBackedDidResolver>> {
+    DID_RESOLVER.get()
+}
+
+/// Initializes the global production DID resolver.
+pub fn init_did_resolver<R>(resolver: Arc<R>, handle: tokio::runtime::Handle)
+where
+    R: scp_identity::resolver::DidResolver + 'static,
+{
+    let _ = DID_RESOLVER.set(Arc::new(scp_ffi_common::IdentityBackedDidResolver::new(
+        resolver, handle,
+    )));
+}
+
+/// Returns a no-op key resolver for bridge-layer `ContextManager` initialization.
+fn noop_key_resolver() -> scp_core::context::governance::KeyResolver {
+    Arc::new(|_| None)
+}
+
 /// Returns a reference to the shared `ContextManager`.
 ///
 /// Initializes the manager on first call with bridge-local provider
@@ -58,6 +82,7 @@ pub fn context_manager() -> &'static Arc<ContextManager> {
             transport,
             event_log,
             persistence,
+            noop_key_resolver(),
         ))
     })
 }

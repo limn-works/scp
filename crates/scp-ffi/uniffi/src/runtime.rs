@@ -26,6 +26,11 @@ use scp_core::context::{ContextError, ContextParams};
 /// Global shared `ContextManager` instance.
 static CONTEXT_MANAGER: OnceLock<Arc<ContextManager>> = OnceLock::new();
 
+/// Returns a no-op key resolver for bridge-layer `ContextManager` initialization.
+fn noop_key_resolver() -> scp_core::context::governance::KeyResolver {
+    Arc::new(|_| None)
+}
+
 /// Returns (or lazily initializes) the shared `ContextManager`.
 ///
 /// The manager is created with stub provider implementations that delegate
@@ -42,6 +47,7 @@ pub fn context_manager() -> &'static Arc<ContextManager> {
             Box::new(FfiBridgeCrypto),
             Box::new(FfiBridgeTransport),
             Box::new(FfiBridgeEventLog),
+            noop_key_resolver(),
         ))
     })
 }

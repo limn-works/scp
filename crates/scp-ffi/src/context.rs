@@ -25,7 +25,7 @@
 //!
 //! See ADR-013 in `.docs/adrs/phase-3.md` for the full specification.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -1135,7 +1135,7 @@ fn py_context_send(
             let _ = temp_handle
                 .transition_to(&scp_core::context::ContextState::Active)
                 .await;
-            mgr.send_message(&temp_handle, &sender_did, &payload_bytes)
+            mgr.send_message(&temp_handle, &sender_did, &payload_bytes, None)
                 .await
         })
         .map_err(|e| PyRuntimeError::new_err(format!("ContextManager send_message failed: {e}")))?;
@@ -1247,13 +1247,28 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
     let roles = py_params
         .roles
         .keys()
-        .map(|name| scp_core::context::params::RoleDefinition { name: name.clone() })
+        .map(|name| scp_core::context::params::RoleDefinition {
+            name: name.clone(),
+            capabilities: HashSet::new(),
+        })
         .collect();
 
     let tools = py_params
         .tools
         .iter()
-        .map(|name| scp_core::context::params::ToolRegistration { name: name.clone() })
+        .map(|name| scp_core::context::params::ToolRegistration {
+            tool_id: name.clone(),
+            name: name.clone(),
+            description: String::new(),
+            schema: scp_core::context::tools::ToolSchema {
+                input_schema: serde_json::Value::Object(Default::default()),
+                output_schema: serde_json::Value::Object(Default::default()),
+            },
+            implementation_hash: [0u8; 32],
+            test_vectors: vec![],
+            operator_did: scp_identity::DID("did:key:placeholder".to_owned()),
+            economic_metadata: None,
+        })
         .collect();
 
     let ttl = py_params.ttl.map(std::time::Duration::from_secs_f64);
