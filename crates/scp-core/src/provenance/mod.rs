@@ -151,7 +151,7 @@ impl Ord for ProvenanceQuality {
 /// meaningless. See [`ProvenanceError::ChainDepthExceeded`].
 ///
 /// See ADR-019 acceptance criteria 1-6.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataProvenance {
     /// The context from which this data originated.
     pub source_context: ContextId,

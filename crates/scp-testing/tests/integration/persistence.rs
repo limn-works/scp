@@ -76,6 +76,7 @@ fn make_broadcast_snapshot(context_id: &str) -> BroadcastContextSnapshot {
             author_did: "did:dht:z6MkAuthor1".to_owned(),
             broadcast_key: generate_sender_key(),
             epoch: 3,
+            next_sequence: 1,
             block_list,
         },
     );

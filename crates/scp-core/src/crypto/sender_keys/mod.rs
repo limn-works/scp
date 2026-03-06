@@ -31,8 +31,9 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub use broadcast::{
-    BroadcastEnvelope, BroadcastKey, BroadcastKeyEpochAdvance, generate_broadcast_key,
-    open_broadcast, rotate_broadcast_key, seal_broadcast,
+    BroadcastEnvelope, BroadcastKey, BroadcastKeyEpochAdvance, BroadcastReplayDetector,
+    SealBroadcastParams, generate_broadcast_key, open_broadcast, open_broadcast_trusted,
+    rotate_broadcast_key, seal_broadcast,
 };
 pub use encrypt::{decrypt_sender_layer, encrypt_sender_layer};
 pub use key_protocol::{

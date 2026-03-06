@@ -17,7 +17,8 @@ use crate::context::ContextError;
 use crate::context::membership::ContextEvent;
 use crate::context::params::ContextMode;
 use crate::crypto::sender_keys::{
-    BroadcastEnvelope, BroadcastKey, SenderKey, generate_sender_key, seal_broadcast,
+    BroadcastEnvelope, BroadcastKey, SealBroadcastParams, SenderKey, generate_sender_key,
+    seal_broadcast,
 };
 use crate::crypto::ucan::UcanToken;
 use crate::crypto::ucan::capability::CapabilityUri;
@@ -70,8 +71,8 @@ pub struct SubscriberRecord {
 /// Per-author broadcast key state within a broadcast context.
 ///
 /// Each author maintains an independent broadcast key with its own epoch
-/// counter and block list. See spec section 5.14.2 for the key lifecycle
-/// and section 5.14.8 for blocking semantics.
+/// counter, sequence counter, and block list. See spec section 5.14.2 for
+/// the key lifecycle and section 5.14.8 for blocking semantics.
 #[derive(Debug)]
 pub struct AuthorState {
     /// The author's DID.
@@ -80,6 +81,10 @@ pub struct AuthorState {
     pub broadcast_key: SenderKey,
     /// The current key epoch (monotonically increasing).
     pub epoch: u64,
+    /// Next sequence number for this author's messages. Starts at 1 and
+    /// increments with each `publish()` call. Used for replay detection
+    /// on the consumer side (§5.14.5, issue #352).
+    pub next_sequence: u64,
     /// DIDs blocked by this author. Blocked subscribers receive no key
     /// material for epochs after the block.
     pub block_list: HashSet<String>,
@@ -87,13 +92,14 @@ pub struct AuthorState {
 
 impl AuthorState {
     /// Creates a new author state with a freshly generated broadcast key at
-    /// epoch 0.
+    /// epoch 0 and sequence starting at 1.
     #[must_use]
     pub fn new(author_did: String) -> Self {
         Self {
             author_did,
             broadcast_key: generate_sender_key(),
             epoch: 0,
+            next_sequence: 1,
             block_list: HashSet::new(),
         }
     }
@@ -521,10 +527,9 @@ impl BroadcastContext {
 
         author.block_list.insert(blocked_did.to_owned());
 
-        // Remove the blocked subscriber from the local subscriber roster so
-        // `can_read()` immediately reflects the block. Without this, the
-        // subscriber retains read permission until the next roster sync.
-        self.subscribers.remove(blocked_did);
+        // Per-author blocking does NOT remove from the context-wide subscriber
+        // roster. The subscriber retains read access to other authors' content.
+        // Only `governance_ban_subscriber()` removes from the roster (§5.14.8).
 
         let new_epoch = author
             .epoch
@@ -575,7 +580,7 @@ impl BroadcastContext {
 
         for &did in blocked_dids {
             author.block_list.insert(did.to_owned());
-            self.subscribers.remove(did);
+            // Per-author blocking does NOT remove from roster (§5.14.8).
         }
 
         let new_epoch = author
@@ -758,14 +763,48 @@ impl BroadcastContext {
         self.authors.contains_key(did)
     }
 
-    /// Checks whether a DID holds `messagesRead` (is a registered subscriber
-    /// or author).
+    /// Checks whether a subscriber DID can read a specific author's content.
     ///
-    /// Authors implicitly have read access. Subscribers have read access
-    /// through registration.
+    /// Returns `true` if the subscriber is registered AND not on the given
+    /// author's block list, OR if the subscriber is itself an author (authors
+    /// have implicit read access). Per-author blocking means a subscriber
+    /// blocked by author A can still read author B's content (§5.14.8).
     #[must_use]
-    pub fn can_read(&self, did: &str) -> bool {
-        self.subscribers.contains_key(did) || self.authors.contains_key(did)
+    pub fn can_read(&self, subscriber_did: &str, author_did: &str) -> bool {
+        // Authors have implicit read access.
+        if self.authors.contains_key(subscriber_did) {
+            return true;
+        }
+        // Must be a registered subscriber.
+        if !self.subscribers.contains_key(subscriber_did) {
+            return false;
+        }
+        // Must not be on this author's block list.
+        !self.is_blocked(author_did, subscriber_did)
+    }
+
+    /// Checks whether a DID can read from at least one author in the context.
+    ///
+    /// Convenience method for call sites without a specific author context.
+    /// Returns `true` if the DID is an author (implicit read) or is a
+    /// registered subscriber not blocked by ALL authors.
+    #[must_use]
+    pub fn can_read_any(&self, did: &str) -> bool {
+        // Authors always have read access.
+        if self.authors.contains_key(did) {
+            return true;
+        }
+        // Must be a registered subscriber.
+        if !self.subscribers.contains_key(did) {
+            return false;
+        }
+        // Can read if not blocked by at least one author (or no authors exist).
+        if self.authors.is_empty() {
+            return true;
+        }
+        self.authors
+            .keys()
+            .any(|author_did| !self.is_blocked(author_did, did))
     }
 
     // -----------------------------------------------------------------------
@@ -779,23 +818,35 @@ impl BroadcastContext {
     /// `can_write` check with [`seal_broadcast`] in a single operation so
     /// callers cannot accidentally bypass the authorization check.
     ///
+    /// Increments the author's `next_sequence` counter on each call. The
+    /// resulting `BroadcastEnvelope` includes all spec-defined fields
+    /// (§5.14.5, issue #352): `context_id`, `author_did`, `sequence`,
+    /// `timestamp`, `key_epoch`, `provenance`, `signature`, and
+    /// `encrypted_content`.
+    ///
     /// # Arguments
     ///
     /// * `author_did` -- The DID of the author publishing the message.
     /// * `payload` -- The plaintext content to encrypt.
+    /// * `timestamp` -- Unix timestamp in milliseconds.
+    /// * `signing_key` -- The author's Ed25519 signing key.
+    /// * `provenance` -- Optional provenance metadata (§7.7.1).
     ///
     /// # Errors
     ///
     /// - [`ContextError::PermissionDenied`] if `author_did` is not a
     ///   registered author (does not hold `messagesWrite`).
-    /// - [`ContextError::CryptoFailed`] if the AES-256-GCM seal operation
-    ///   fails.
+    /// - [`ContextError::CryptoFailed`] if the AES-256-GCM seal or signing
+    ///   operation fails.
     ///
     /// [`seal_broadcast`]: crate::crypto::sender_keys::seal_broadcast
     pub fn publish(
-        &self,
+        &mut self,
         author_did: &str,
         payload: &[u8],
+        timestamp: u64,
+        signing_key: &ed25519_dalek::SigningKey,
+        provenance: Option<crate::provenance::DataProvenance>,
     ) -> Result<BroadcastEnvelope, ContextError> {
         if !self.can_write(author_did) {
             return Err(ContextError::PermissionDenied(format!(
@@ -803,9 +854,14 @@ impl BroadcastContext {
             )));
         }
 
-        let author = self.authors.get(author_did).ok_or_else(|| {
+        let author = self.authors.get_mut(author_did).ok_or_else(|| {
             ContextError::MemberNotFound(format!("author not found: {author_did}"))
         })?;
+
+        let sequence = author.next_sequence;
+        author.next_sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| ContextError::CryptoFailed("broadcast sequence overflow".to_owned()))?;
 
         let broadcast_key = BroadcastKey::from_parts(
             author.broadcast_key.clone(),
@@ -813,7 +869,15 @@ impl BroadcastContext {
             author.author_did.clone(),
         );
 
-        seal_broadcast(&broadcast_key, payload)
+        let params = SealBroadcastParams {
+            context_id: &self.context_id,
+            sequence,
+            timestamp,
+            provenance,
+            signing_key,
+        };
+
+        seal_broadcast(&broadcast_key, payload, &params)
             .map_err(|e| ContextError::CryptoFailed(format!("seal_broadcast failed: {e}")))
     }
 
@@ -983,6 +1047,7 @@ impl BroadcastContext {
                         author_did: state.author_did.clone(),
                         broadcast_key: state.broadcast_key.clone(),
                         epoch: state.epoch,
+                        next_sequence: state.next_sequence,
                         block_list: state.block_list.clone(),
                     },
                 )
@@ -1014,6 +1079,7 @@ impl BroadcastContext {
                         author_did: snap.author_did,
                         broadcast_key: snap.broadcast_key,
                         epoch: snap.epoch,
+                        next_sequence: snap.next_sequence,
                         block_list: snap.block_list,
                     },
                 )
@@ -1071,6 +1137,8 @@ pub struct AuthorStateSnapshot {
     pub broadcast_key: SenderKey,
     /// The current key epoch (monotonically increasing).
     pub epoch: u64,
+    /// Next sequence number for this author's messages (§5.14.5).
+    pub next_sequence: u64,
     /// DIDs blocked by this author.
     pub block_list: HashSet<String>,
 }
@@ -1118,7 +1186,7 @@ mod tests {
     use super::*;
     use crate::context::governance::RevocationScope;
     use crate::crypto::sender_keys::{
-        SenderKey, decrypt_sender_layer, encrypt_sender_layer, open_broadcast,
+        SenderKey, decrypt_sender_layer, encrypt_sender_layer, open_broadcast_trusted,
     };
     use crate::crypto::ucan::validate::{
         DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryNonceTracker,
@@ -1150,6 +1218,21 @@ mod tests {
         // Deterministic key for reproducible tests.
         let seed = [42u8; 32];
         ed25519_dalek::SigningKey::from_bytes(&seed)
+    }
+
+    /// Signing key for broadcast publish tests (separate from UCAN keypair).
+    fn test_broadcast_signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[0xAA; 32])
+    }
+
+    /// Helper that calls `BroadcastContext::publish` with test defaults.
+    fn test_publish(
+        ctx: &mut BroadcastContext,
+        author_did: &str,
+        payload: &[u8],
+    ) -> Result<BroadcastEnvelope, ContextError> {
+        let sk = test_broadcast_signing_key();
+        ctx.publish(author_did, payload, 1_700_000_000_000, &sk, None)
     }
 
     /// Creates a properly signed UCAN token for testing gated subscription.
@@ -1637,10 +1720,10 @@ mod tests {
 
         // Subscriber is still registered and can read.
         assert_eq!(ctx.subscriber_count(), 1);
-        assert!(ctx.can_read("did:example:sub1"));
+        assert!(ctx.can_read_any("did:example:sub1"));
 
         // Publishing fails (no author).
-        let publish_result = ctx.publish("did:example:sole-author", b"after block");
+        let publish_result = test_publish(&mut ctx, "did:example:sole-author", b"after block");
         assert!(publish_result.is_err());
 
         // Key request for the blocked author returns Deny.
@@ -1657,12 +1740,12 @@ mod tests {
         subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
 
         // Alice can publish before block.
-        assert!(ctx.publish("did:example:alice", b"hello").is_ok());
+        assert!(test_publish(&mut ctx, "did:example:alice", b"hello").is_ok());
 
         ctx.block_author("did:example:alice").unwrap();
 
         // Alice cannot publish after block.
-        let result = ctx.publish("did:example:alice", b"hello again");
+        let result = test_publish(&mut ctx, "did:example:alice", b"hello again");
         assert!(result.is_err());
     }
 
@@ -1722,14 +1805,14 @@ mod tests {
 
         // Alice can still publish (unaffected).
         let alice_msg2 = b"Alice's second message";
-        let _alice_envelope = ctx.publish("did:example:alice", alice_msg2).unwrap();
+        let _alice_envelope = test_publish(&mut ctx, "did:example:alice", alice_msg2).unwrap();
 
         // Subscribers can still decrypt Alice's messages via key request.
         let alice_decision = ctx.handle_key_request("did:example:alice", "did:example:sub1");
         assert!(matches!(alice_decision, KeyRequestDecision::Grant { .. }));
 
         // Bob cannot publish (PermissionDenied).
-        let bob_result = ctx.publish("did:example:bob", b"Bob tries to publish");
+        let bob_result = test_publish(&mut ctx, "did:example:bob", b"Bob tries to publish");
         assert!(bob_result.is_err());
 
         // Key request for Bob returns Deny (author not found).
@@ -1758,14 +1841,22 @@ mod tests {
     }
 
     #[test]
-    fn can_read_for_subscribers_and_authors() {
+    fn can_read_per_author_for_subscribers_and_authors() {
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
         subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
 
-        assert!(ctx.can_read("did:example:alice"));
-        assert!(ctx.can_read("did:example:bob"));
-        assert!(!ctx.can_read("did:example:unknown"));
+        // Per-author can_read: bob can read alice's content.
+        assert!(ctx.can_read("did:example:bob", "did:example:alice"));
+        // Authors have implicit read access.
+        assert!(ctx.can_read("did:example:alice", "did:example:alice"));
+        // Unknown DID cannot read.
+        assert!(!ctx.can_read("did:example:unknown", "did:example:alice"));
+
+        // can_read_any convenience.
+        assert!(ctx.can_read_any("did:example:alice"));
+        assert!(ctx.can_read_any("did:example:bob"));
+        assert!(!ctx.can_read_any("did:example:unknown"));
     }
 
     // -----------------------------------------------------------------------
@@ -1787,7 +1878,7 @@ mod tests {
         let ciphertext = encrypt_sender_layer(&author.broadcast_key, plaintext).unwrap();
 
         for sub_did in &["did:example:sub1", "did:example:sub2", "did:example:sub3"] {
-            assert!(ctx.can_read(sub_did));
+            assert!(ctx.can_read(sub_did, "did:example:alice"));
             let decrypted = decrypt_sender_layer(&author.broadcast_key, &ciphertext).unwrap();
             assert_eq!(decrypted, plaintext);
         }
@@ -2098,27 +2189,62 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Block removes subscriber from roster (RED-108)
+    // Per-author blocking does NOT remove from roster (#353, §5.14.8)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn block_subscriber_removes_from_subscribers() {
+    fn block_subscriber_does_not_remove_from_roster() {
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
+        ctx.add_author("did:example:bob").unwrap();
         subscribe_open(&mut ctx, "did:example:dave", None, 1000).unwrap();
 
         assert!(ctx.is_subscriber("did:example:dave"));
-        assert!(ctx.can_read("did:example:dave"));
+        assert!(ctx.can_read("did:example:dave", "did:example:alice"));
+        assert!(ctx.can_read("did:example:dave", "did:example:bob"));
 
         ctx.block_subscriber("did:example:alice", "did:example:dave")
             .unwrap();
 
-        // After blocking, subscriber should be removed from the roster and
-        // can_read should return false (unless they are also an author).
-        assert!(!ctx.is_subscriber("did:example:dave"));
+        // Per-author blocking: subscriber stays in roster but loses access
+        // to the blocking author's content only (§5.14.8).
         assert!(
-            !ctx.can_read("did:example:dave"),
-            "blocked subscriber must lose read access (RED-108)"
+            ctx.is_subscriber("did:example:dave"),
+            "per-author block must NOT remove from roster (#353)"
+        );
+        assert!(
+            !ctx.can_read("did:example:dave", "did:example:alice"),
+            "blocked subscriber must lose read access to blocking author"
+        );
+        assert!(
+            ctx.can_read("did:example:dave", "did:example:bob"),
+            "blocked subscriber must retain read access to other authors (#353)"
+        );
+        assert!(
+            ctx.can_read_any("did:example:dave"),
+            "subscriber blocked by one author can still read from another"
+        );
+    }
+
+    #[test]
+    fn block_subscriber_all_authors_blocks_all_read() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        ctx.add_author("did:example:bob").unwrap();
+        subscribe_open(&mut ctx, "did:example:dave", None, 1000).unwrap();
+
+        ctx.block_subscriber("did:example:alice", "did:example:dave")
+            .unwrap();
+        ctx.block_subscriber("did:example:bob", "did:example:dave")
+            .unwrap();
+
+        // Blocked by ALL authors — can_read_any returns false.
+        assert!(ctx.is_subscriber("did:example:dave"));
+        assert!(!ctx.can_read("did:example:dave", "did:example:alice"));
+        assert!(!ctx.can_read("did:example:dave", "did:example:bob"));
+        assert!(
+            !ctx.can_read_any("did:example:dave"),
+            "subscriber blocked by all authors has no read access"
         );
     }
 
@@ -2145,15 +2271,20 @@ mod tests {
             )
             .unwrap();
 
-        // All three should be blocked.
+        // All three should be blocked by this author.
         assert!(ctx.is_blocked("did:example:alice", "did:example:dave"));
         assert!(ctx.is_blocked("did:example:alice", "did:example:dave-alt"));
         assert!(ctx.is_blocked("did:example:alice", "did:example:dave-bot"));
 
-        // All three should be removed from subscribers.
-        assert!(!ctx.is_subscriber("did:example:dave"));
-        assert!(!ctx.is_subscriber("did:example:dave-alt"));
-        assert!(!ctx.is_subscriber("did:example:dave-bot"));
+        // Per-author blocking does NOT remove from roster (#353).
+        assert!(ctx.is_subscriber("did:example:dave"));
+        assert!(ctx.is_subscriber("did:example:dave-alt"));
+        assert!(ctx.is_subscriber("did:example:dave-bot"));
+
+        // But they cannot read from the blocking author.
+        assert!(!ctx.can_read("did:example:dave", "did:example:alice"));
+        assert!(!ctx.can_read("did:example:dave-alt", "did:example:alice"));
+        assert!(!ctx.can_read("did:example:dave-bot", "did:example:alice"));
 
         // Single key rotation (epoch incremented once, not three times).
         assert_eq!(result.new_epoch, 1);
@@ -2315,10 +2446,10 @@ mod tests {
         ctx.add_author("did:example:alice").unwrap();
         subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
 
-        assert!(ctx.can_read("did:example:bob"));
+        assert!(ctx.can_read("did:example:bob", "did:example:alice"));
         ctx.unsubscribe("did:example:bob", false).unwrap();
         assert!(
-            !ctx.can_read("did:example:bob"),
+            !ctx.can_read("did:example:bob", "did:example:alice"),
             "unsubscribed member must lose read access"
         );
     }
@@ -2592,7 +2723,7 @@ mod tests {
 
         // Step 5: Verify no further access.
         assert!(!ctx.is_subscriber("did:example:bob"));
-        assert!(!ctx.can_read("did:example:bob"));
+        assert!(!ctx.can_read_any("did:example:bob"));
 
         // Step 6: Key request now denied.
         let denied = ctx.handle_key_request("did:example:alice", "did:example:bob");
@@ -2733,14 +2864,14 @@ mod tests {
         subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
 
         // Subscriber tries to publish -- must be rejected.
-        let result = ctx.publish("did:example:bob", b"unauthorized message");
+        let result = test_publish(&mut ctx, "did:example:bob", b"unauthorized message");
         assert!(
             matches!(&result, Err(ContextError::PermissionDenied(_))),
             "non-author must be rejected by publish: {result:?}"
         );
 
         // Completely unknown DID also rejected.
-        let result = ctx.publish("did:example:unknown", b"ghost message");
+        let result = test_publish(&mut ctx, "did:example:unknown", b"ghost message");
         assert!(
             matches!(&result, Err(ContextError::PermissionDenied(_))),
             "unknown DID must be rejected by publish: {result:?}"
@@ -2762,7 +2893,7 @@ mod tests {
         let plaintext = b"Hello from Alice via publish()!";
 
         // Author publishes through the capability-enforced path.
-        let envelope = ctx.publish("did:example:alice", plaintext).unwrap();
+        let envelope = test_publish(&mut ctx, "did:example:alice", plaintext).unwrap();
 
         // Verify envelope metadata.
         assert_eq!(envelope.author_did, "did:example:alice");
@@ -2780,8 +2911,11 @@ mod tests {
         );
 
         for sub_did in &["did:example:sub1", "did:example:sub2", "did:example:sub3"] {
-            assert!(ctx.can_read(sub_did), "{sub_did} must have read access");
-            let decrypted = open_broadcast(&subscriber_key, &envelope).unwrap();
+            assert!(
+                ctx.can_read(sub_did, "did:example:alice"),
+                "{sub_did} must have read access"
+            );
+            let decrypted = open_broadcast_trusted(&subscriber_key, &envelope).unwrap();
             assert_eq!(
                 decrypted, plaintext,
                 "{sub_did} must decrypt the correct plaintext"
@@ -2810,11 +2944,12 @@ mod tests {
 
         // Author publishes a message before the block.
         let pre_block_msg = b"message visible to everyone";
-        let pre_block_envelope = ctx.publish("did:example:alice", pre_block_msg).unwrap();
+        let pre_block_envelope =
+            test_publish(&mut ctx, "did:example:alice", pre_block_msg).unwrap();
 
         // Both subscribers can decrypt the pre-block message.
         assert_eq!(
-            open_broadcast(&pre_block_key, &pre_block_envelope).unwrap(),
+            open_broadcast_trusted(&pre_block_key, &pre_block_envelope).unwrap(),
             pre_block_msg,
         );
 
@@ -2826,7 +2961,8 @@ mod tests {
 
         // Author publishes a post-block message (with the new key).
         let post_block_msg = b"message only for sub1";
-        let post_block_envelope = ctx.publish("did:example:alice", post_block_msg).unwrap();
+        let post_block_envelope =
+            test_publish(&mut ctx, "did:example:alice", post_block_msg).unwrap();
         assert_eq!(post_block_envelope.key_epoch, 1);
 
         // sub1 (non-blocked) obtains the new key and can decrypt.
@@ -2836,12 +2972,12 @@ mod tests {
             post_block_author.epoch,
             post_block_author.author_did.clone(),
         );
-        let sub1_decrypted = open_broadcast(&post_block_key, &post_block_envelope).unwrap();
+        let sub1_decrypted = open_broadcast_trusted(&post_block_key, &post_block_envelope).unwrap();
         assert_eq!(sub1_decrypted, post_block_msg);
 
         // sub2 (blocked) only has the old key -- epoch mismatch means they
         // cannot even attempt decryption of the new envelope.
-        let sub2_result = open_broadcast(&pre_block_key, &post_block_envelope);
+        let sub2_result = open_broadcast_trusted(&pre_block_key, &post_block_envelope);
         assert!(
             sub2_result.is_err(),
             "blocked subscriber must not decrypt post-block messages"
@@ -2849,7 +2985,8 @@ mod tests {
 
         // Verify pre-block messages remain decryptable with the old key
         // (backwards compatibility: old content is not lost).
-        let pre_block_still_ok = open_broadcast(&pre_block_key, &pre_block_envelope).unwrap();
+        let pre_block_still_ok =
+            open_broadcast_trusted(&pre_block_key, &pre_block_envelope).unwrap();
         assert_eq!(pre_block_still_ok, pre_block_msg);
     }
 
@@ -3009,10 +3146,14 @@ mod tests {
             original_key_bytes
         );
 
-        // Blocked subscriber should not be in subscriber list.
-        assert!(!restored.is_subscriber("did:dht:z6MkSub1"));
-        // Unblocked subscriber should still be there.
+        // Per-author blocking does NOT remove from roster (#353, §5.14.8).
+        // Both subscribers remain registered.
+        assert!(restored.is_subscriber("did:dht:z6MkSub1"));
         assert!(restored.is_subscriber("did:dht:z6MkSub2"));
+
+        // But blocked subscriber cannot read this author's content.
+        assert!(!restored.can_read("did:dht:z6MkSub1", "did:dht:z6MkAuthor1"));
+        assert!(restored.can_read("did:dht:z6MkSub2", "did:dht:z6MkAuthor1"));
     }
 
     #[test]

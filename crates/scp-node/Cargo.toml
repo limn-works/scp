@@ -49,6 +49,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
 tower = { version = "0.5", features = ["util"] }
+ed25519-dalek = { workspace = true }
 http-body-util = "0.1"
 hyper = "1"
 rcgen = "0.14"

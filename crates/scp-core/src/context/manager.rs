@@ -1036,6 +1036,7 @@ impl ContextManager {
         handle: &ContextHandle,
         sender_did: &DID,
         payload: &[u8],
+        signing_key: Option<&ed25519_dalek::SigningKey>,
     ) -> Result<(), ContextError> {
         let context_id = handle.context_id().to_owned();
         let context_id_bytes = context_id_to_bytes(&context_id);
@@ -1057,9 +1058,16 @@ impl ContextManager {
                 )));
             }
 
-            if let Some(ref bc) = ctx.broadcast_context {
+            if let Some(ref mut bc) = ctx.broadcast_context {
                 // Broadcast path: capability check + seal under lock.
-                let envelope = bc.publish(sender_did, payload)?;
+                let sk = signing_key.ok_or_else(|| {
+                    ContextError::CryptoFailed(
+                        "signing key required for broadcast publish".to_owned(),
+                    )
+                })?;
+                let timestamp = crate::time::now_millis()
+                    .map_err(|e| ContextError::CryptoFailed(format!("clock error: {e}")))?;
+                let envelope = bc.publish(sender_did, payload, timestamp, sk, None)?;
 
                 // Assign per-sender monotonic sequence number.
                 let seq = ctx
@@ -1361,6 +1369,7 @@ impl ContextManager {
         context_id: &str,
         author_did: &DID,
         payload: &[u8],
+        signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<BroadcastEnvelope, ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -1381,10 +1390,12 @@ impl ContextManager {
 
             let bc = ctx
                 .broadcast_context
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
 
-            let envelope = bc.publish(author_did, payload)?;
+            let timestamp = crate::time::now_millis()
+                .map_err(|e| ContextError::CryptoFailed(format!("clock error: {e}")))?;
+            let envelope = bc.publish(author_did, payload, timestamp, signing_key, None)?;
 
             // Assign per-sender monotonic sequence number.
             let seq = ctx
@@ -3822,7 +3833,7 @@ mod tests {
         handle.transition_to(&ContextState::Closing).await.unwrap();
 
         let result = manager
-            .send_message(&handle, &"did:key:creator".into(), b"hello")
+            .send_message(&handle, &"did:key:creator".into(), b"hello", None)
             .await;
         assert!(result.is_err());
         assert!(matches!(
@@ -3838,7 +3849,7 @@ mod tests {
 
         // Try to send as a non-member -- should be denied.
         let result = manager
-            .send_message(&handle, &"did:key:nonexistent".into(), b"hello")
+            .send_message(&handle, &"did:key:nonexistent".into(), b"hello", None)
             .await;
         assert!(result.is_err());
 
@@ -3855,7 +3866,7 @@ mod tests {
         let (manager, handle) = setup_active_context().await;
 
         let result = manager
-            .send_message(&handle, &"did:key:creator".into(), b"hello world")
+            .send_message(&handle, &"did:key:creator".into(), b"hello world", None)
             .await;
         assert!(result.is_ok());
 
@@ -3885,7 +3896,7 @@ mod tests {
 
         for i in 1..=5u8 {
             manager
-                .send_message(&handle, &"did:key:creator".into(), &[i])
+                .send_message(&handle, &"did:key:creator".into(), &[i], None)
                 .await
                 .unwrap();
         }
@@ -4016,7 +4027,8 @@ mod tests {
             let mgr = std::sync::Arc::clone(&manager);
             let h = std::sync::Arc::clone(&handle);
             join_handles.push(tokio::spawn(async move {
-                mgr.send_message(&h, &"did:key:creator".into(), &[i]).await
+                mgr.send_message(&h, &"did:key:creator".into(), &[i], None)
+                    .await
             }));
         }
 
@@ -4301,14 +4313,26 @@ mod tests {
             .unwrap();
 
         // Author can publish (send_message routes to broadcast publish).
+        let author_signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
         let result = manager
-            .send_message(&handle, &"did:key:author1".into(), b"hello broadcast")
+            .send_message(
+                &handle,
+                &"did:key:author1".into(),
+                b"hello broadcast",
+                Some(&author_signing_key),
+            )
             .await;
         assert!(result.is_ok(), "author should be able to publish");
 
         // Non-author subscriber cannot publish.
+        let sub_signing_key = ed25519_dalek::SigningKey::from_bytes(&[43u8; 32]);
         let result = manager
-            .send_message(&handle, &"did:key:sub1".into(), b"unauthorized")
+            .send_message(
+                &handle,
+                &"did:key:sub1".into(),
+                b"unauthorized",
+                Some(&sub_signing_key),
+            )
             .await;
         assert!(result.is_err(), "subscriber should not be able to publish");
         assert!(matches!(
@@ -4329,6 +4353,8 @@ mod tests {
         use std::hash::RandomState;
 
         let (manager, _handle, ctx_id) = setup_broadcast_context().await;
+        let author_signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let author_verifying_key = author_signing_key.verifying_key();
 
         // Subscribe 3 subscribers.
         for name in &["sub1", "sub2", "sub3"] {
@@ -4355,7 +4381,12 @@ mod tests {
         // Author publishes a message.
         let plaintext = b"hello all subscribers!";
         let envelope = manager
-            .publish_broadcast(&ctx_id, &"did:key:author1".into(), plaintext)
+            .publish_broadcast(
+                &ctx_id,
+                &"did:key:author1".into(),
+                plaintext,
+                &author_signing_key,
+            )
             .await
             .unwrap();
 
@@ -4381,7 +4412,8 @@ mod tests {
                         epoch,
                         "did:key:author1".to_owned(),
                     );
-                    let decrypted = open_broadcast(&broadcast_key, &envelope).unwrap();
+                    let decrypted =
+                        open_broadcast(&broadcast_key, &envelope, &author_verifying_key).unwrap();
                     assert_eq!(decrypted, plaintext);
                 }
                 super::KeyRequestDecision::Deny { reason } => {
@@ -4414,6 +4446,8 @@ mod tests {
         use std::hash::RandomState;
 
         let (manager, _handle, ctx_id) = setup_broadcast_context().await;
+        let author_signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let author_verifying_key = author_signing_key.verifying_key();
 
         // Subscribe 2 subscribers.
         for name in &["good-sub", "bad-sub"] {
@@ -4438,7 +4472,12 @@ mod tests {
         // Author publishes first message (both can decrypt).
         let msg1 = b"pre-block message";
         let envelope1 = manager
-            .publish_broadcast(&ctx_id, &"did:key:author1".into(), msg1)
+            .publish_broadcast(
+                &ctx_id,
+                &"did:key:author1".into(),
+                msg1,
+                &author_signing_key,
+            )
             .await
             .unwrap();
 
@@ -4465,7 +4504,8 @@ mod tests {
             pre_block_epoch,
             "did:key:author1".to_owned(),
         );
-        let decrypted = open_broadcast(&pre_block_broadcast_key, &envelope1).unwrap();
+        let decrypted =
+            open_broadcast(&pre_block_broadcast_key, &envelope1, &author_verifying_key).unwrap();
         assert_eq!(decrypted, msg1);
 
         // Block bad-sub.
@@ -4481,7 +4521,12 @@ mod tests {
         // Author publishes post-block message.
         let msg2 = b"post-block secret";
         let envelope2 = manager
-            .publish_broadcast(&ctx_id, &"did:key:author1".into(), msg2)
+            .publish_broadcast(
+                &ctx_id,
+                &"did:key:author1".into(),
+                msg2,
+                &author_signing_key,
+            )
             .await
             .unwrap();
 
@@ -4501,7 +4546,8 @@ mod tests {
 
         // bad-sub tries to decrypt with the old key -- should fail because
         // the message was encrypted with the new (post-rotation) key.
-        let decrypt_attempt = open_broadcast(&pre_block_broadcast_key, &envelope2);
+        let decrypt_attempt =
+            open_broadcast(&pre_block_broadcast_key, &envelope2, &author_verifying_key);
         assert!(
             decrypt_attempt.is_err(),
             "blocked subscriber should not be able to decrypt post-block messages"
@@ -4526,7 +4572,8 @@ mod tests {
                     epoch,
                     "did:key:author1".to_owned(),
                 );
-                let decrypted = open_broadcast(&new_key, &envelope2).unwrap();
+                let decrypted =
+                    open_broadcast(&new_key, &envelope2, &author_verifying_key).unwrap();
                 assert_eq!(decrypted, msg2);
             }
             super::KeyRequestDecision::Deny { reason } => {
@@ -4565,8 +4612,9 @@ mod tests {
             .unwrap();
 
         // Subscriber tries to publish -- should fail.
+        let sub_signing_key = ed25519_dalek::SigningKey::from_bytes(&[43u8; 32]);
         let result = manager
-            .publish_broadcast(&ctx_id, &"did:key:sub1".into(), b"nope")
+            .publish_broadcast(&ctx_id, &"did:key:sub1".into(), b"nope", &sub_signing_key)
             .await;
         assert!(result.is_err());
         assert!(matches!(
@@ -4590,8 +4638,9 @@ mod tests {
         assert_eq!(manager.broadcast_subscriber_count(&ctx_id).await, Some(0));
 
         // Author should be able to publish.
+        let author_sk = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
         let result = manager
-            .publish_broadcast(&ctx_id, &"did:key:author1".into(), b"test")
+            .publish_broadcast(&ctx_id, &"did:key:author1".into(), b"test", &author_sk)
             .await;
         assert!(result.is_ok());
     }
@@ -4853,16 +4902,19 @@ mod tests {
                 .unwrap();
         }
 
+        let alice_sk = ed25519_dalek::SigningKey::from_bytes(&[0xAA; 32]);
+        let bob_sk = ed25519_dalek::SigningKey::from_bytes(&[0xBB; 32]);
+
         // Both authors can publish before blocking.
         assert!(
             manager
-                .publish_broadcast(&ctx_id, &"did:key:alice".into(), b"alice msg")
+                .publish_broadcast(&ctx_id, &"did:key:alice".into(), b"alice msg", &alice_sk)
                 .await
                 .is_ok()
         );
         assert!(
             manager
-                .publish_broadcast(&ctx_id, &"did:key:bob".into(), b"bob msg")
+                .publish_broadcast(&ctx_id, &"did:key:bob".into(), b"bob msg", &bob_sk)
                 .await
                 .is_ok()
         );
@@ -4882,7 +4934,12 @@ mod tests {
         // Alice can still publish (unaffected).
         assert!(
             manager
-                .publish_broadcast(&ctx_id, &"did:key:alice".into(), b"alice still ok")
+                .publish_broadcast(
+                    &ctx_id,
+                    &"did:key:alice".into(),
+                    b"alice still ok",
+                    &alice_sk
+                )
                 .await
                 .is_ok(),
             "unblocked author should still be able to publish"
@@ -4890,7 +4947,7 @@ mod tests {
 
         // Bob cannot publish (PermissionDenied).
         let bob_result = manager
-            .publish_broadcast(&ctx_id, &"did:key:bob".into(), b"bob tries")
+            .publish_broadcast(&ctx_id, &"did:key:bob".into(), b"bob tries", &bob_sk)
             .await;
         assert!(
             bob_result.is_err(),
@@ -4972,6 +5029,10 @@ mod tests {
         use std::hash::RandomState;
 
         let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
+        let alice_signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let alice_verifying_key = alice_signing_key.verifying_key();
+        let bob_signing_key = ed25519_dalek::SigningKey::from_bytes(&[43u8; 32]);
+        let bob_verifying_key = bob_signing_key.verifying_key();
 
         // Subscribe 2 subscribers.
         for name in &["sub1", "sub2"] {
@@ -4996,14 +5057,19 @@ mod tests {
         // Alice publishes — both subscribers can get key and decrypt.
         let alice_msg1 = b"Alice before block";
         let _alice_envelope1 = manager
-            .publish_broadcast(&ctx_id, &"did:key:alice".into(), alice_msg1)
+            .publish_broadcast(
+                &ctx_id,
+                &"did:key:alice".into(),
+                alice_msg1,
+                &alice_signing_key,
+            )
             .await
             .unwrap();
 
         // Bob publishes — both subscribers can get key and decrypt.
         let bob_msg1 = b"Bob before block";
         let bob_envelope1 = manager
-            .publish_broadcast(&ctx_id, &"did:key:bob".into(), bob_msg1)
+            .publish_broadcast(&ctx_id, &"did:key:bob".into(), bob_msg1, &bob_signing_key)
             .await
             .unwrap();
 
@@ -5026,7 +5092,8 @@ mod tests {
             bob_pre_epoch,
             "did:key:bob".to_owned(),
         );
-        let decrypted = open_broadcast(&bob_broadcast_key, &bob_envelope1).unwrap();
+        let decrypted =
+            open_broadcast(&bob_broadcast_key, &bob_envelope1, &bob_verifying_key).unwrap();
         assert_eq!(decrypted, bob_msg1);
 
         // Block Bob via governance (admin proposes, auto-approved).
@@ -5039,7 +5106,12 @@ mod tests {
 
         // Bob tries to publish — PermissionDenied.
         let bob_result = manager
-            .publish_broadcast(&ctx_id, &"did:key:bob".into(), b"bob after block")
+            .publish_broadcast(
+                &ctx_id,
+                &"did:key:bob".into(),
+                b"bob after block",
+                &bob_signing_key,
+            )
             .await;
         assert!(
             bob_result.is_err(),
@@ -5049,7 +5121,12 @@ mod tests {
         // Alice can still publish after Bob is blocked.
         let alice_msg2 = b"Alice after Bob blocked";
         let alice_envelope2 = manager
-            .publish_broadcast(&ctx_id, &"did:key:alice".into(), alice_msg2)
+            .publish_broadcast(
+                &ctx_id,
+                &"did:key:alice".into(),
+                alice_msg2,
+                &alice_signing_key,
+            )
             .await
             .unwrap();
 
@@ -5067,7 +5144,8 @@ mod tests {
                     epoch,
                     "did:key:alice".to_owned(),
                 );
-                let decrypted = open_broadcast(&alice_key, &alice_envelope2).unwrap();
+                let decrypted =
+                    open_broadcast(&alice_key, &alice_envelope2, &alice_verifying_key).unwrap();
                 assert_eq!(decrypted, alice_msg2);
             }
             super::KeyRequestDecision::Deny { reason } => {
@@ -5087,7 +5165,8 @@ mod tests {
 
         // Old messages from Bob are still decryptable with cached key
         // (forward access to historical content is preserved).
-        let old_decrypted = open_broadcast(&bob_broadcast_key, &bob_envelope1).unwrap();
+        let old_decrypted =
+            open_broadcast(&bob_broadcast_key, &bob_envelope1, &bob_verifying_key).unwrap();
         assert_eq!(old_decrypted, bob_msg1);
     }
 
@@ -5535,6 +5614,7 @@ mod tests {
                 author_did: "did:key:author1".to_owned(),
                 broadcast_key: generate_sender_key(),
                 epoch: 3,
+                next_sequence: 1,
                 block_list: HashSet::from(["did:key:blocked1".to_owned()]),
             },
         );
