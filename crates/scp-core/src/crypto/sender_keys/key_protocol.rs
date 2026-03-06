@@ -228,7 +228,8 @@ pub async fn publish_sender_key_epoch_advance(
         signature: signature.into_bytes(),
     };
 
-    serde_json::to_vec(&advance).map_err(|e| SenderKeyError::SerializationFailed(e.to_string()))
+    rmp_serde::to_vec_named(&advance)
+        .map_err(|e| SenderKeyError::SerializationFailed(e.to_string()))
 }
 
 /// Verifies the Ed25519 signature on a [`SenderKeyEpochAdvance`].
@@ -366,7 +367,7 @@ pub async fn request_sender_key(
         signature: signature.into_bytes(),
     };
 
-    let message = serde_json::to_vec(&request)
+    let message = rmp_serde::to_vec_named(&request)
         .map_err(|e| SenderKeyError::SerializationFailed(e.to_string()))?;
 
     Ok(SenderKeyRequestResult {
@@ -495,7 +496,7 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
         request_nonce: request.nonce,
     };
 
-    let message = serde_json::to_vec(&response)
+    let message = rmp_serde::to_vec_named(&response)
         .map_err(|e| SenderKeyError::SerializationFailed(e.to_string()))?;
 
     Ok(Some(message))
@@ -653,7 +654,7 @@ pub async fn send_block_notification(
         signature: signature.into_bytes(),
     };
 
-    serde_json::to_vec(&notification)
+    rmp_serde::to_vec_named(&notification)
         .map_err(|e| SenderKeyError::SerializationFailed(e.to_string()))
 }
 
@@ -676,6 +677,12 @@ pub const fn validate_block_notification_freshness(
     notification: &BlockNotification,
     now_ms: u64,
 ) -> Result<(), SenderKeyError> {
+    // Reject future timestamps: saturating_sub would return 0 for future
+    // timestamps, bypassing the staleness check. A far-future timestamp
+    // would make the notification valid indefinitely.
+    if notification.timestamp > now_ms + BLOCK_NOTIFICATION_FRESHNESS_MS {
+        return Err(SenderKeyError::StaleBlockNotification);
+    }
     let age_ms = now_ms.saturating_sub(notification.timestamp);
     if age_ms > BLOCK_NOTIFICATION_FRESHNESS_MS {
         return Err(SenderKeyError::StaleBlockNotification);
@@ -1086,7 +1093,7 @@ mod tests {
         .await
         .unwrap();
 
-        let advance: SenderKeyEpochAdvance = serde_json::from_slice(&message).unwrap();
+        let advance: SenderKeyEpochAdvance = rmp_serde::from_slice(&message).unwrap();
         assert_eq!(advance.sender_did, "did:dht:alice");
         assert_eq!(advance.epoch, 5);
         assert_eq!(advance.signer_key_ref, SigningKeyId::Active);
@@ -1111,7 +1118,7 @@ mod tests {
         .await
         .unwrap();
 
-        let advance: SenderKeyEpochAdvance = serde_json::from_slice(&message).unwrap();
+        let advance: SenderKeyEpochAdvance = rmp_serde::from_slice(&message).unwrap();
 
         // Verify with wrong context_id should fail.
         let valid = verify_epoch_advance(&advance, "ctx-WRONG", pubkey.as_bytes()).unwrap();
@@ -1135,7 +1142,7 @@ mod tests {
         .await
         .unwrap();
 
-        let advance: SenderKeyEpochAdvance = serde_json::from_slice(&message).unwrap();
+        let advance: SenderKeyEpochAdvance = rmp_serde::from_slice(&message).unwrap();
         let valid = verify_epoch_advance(&advance, "ctx-1", wrong_pubkey.as_bytes()).unwrap();
         assert!(!valid, "wrong public key should invalidate signature");
     }
@@ -1156,7 +1163,7 @@ mod tests {
         .await
         .unwrap();
 
-        let advance: SenderKeyEpochAdvance = serde_json::from_slice(&message).unwrap();
+        let advance: SenderKeyEpochAdvance = rmp_serde::from_slice(&message).unwrap();
         assert_eq!(advance.signer_key_ref, SigningKeyId::Agent);
 
         let valid = verify_epoch_advance(&advance, "ctx-1", pubkey.as_bytes()).unwrap();
@@ -1179,7 +1186,7 @@ mod tests {
         .await
         .unwrap();
 
-        let mut advance: SenderKeyEpochAdvance = serde_json::from_slice(&message).unwrap();
+        let mut advance: SenderKeyEpochAdvance = rmp_serde::from_slice(&message).unwrap();
         // Tamper: flip signer_key_ref from Active to Agent.
         advance.signer_key_ref = SigningKeyId::Agent;
 
@@ -1205,10 +1212,26 @@ mod tests {
         .await
         .unwrap();
 
-        // Simulate an old-format message by removing signer_key_ref.
-        let mut json_val: serde_json::Value = serde_json::from_slice(&message).unwrap();
-        json_val.as_object_mut().unwrap().remove("signer_key_ref");
-        let deserialized: SenderKeyEpochAdvance = serde_json::from_value(json_val).unwrap();
+        // Simulate an old-format message without signer_key_ref by
+        // constructing a minimal struct that omits the field.
+        // Simulate an old-format message without signer_key_ref by
+        // constructing a minimal struct that omits the field.
+        #[derive(Serialize)]
+        struct LegacyAdvance {
+            sender_did: String,
+            epoch: u64,
+            #[serde(with = "serde_bytes")]
+            signature: Vec<u8>,
+        }
+        let advance: SenderKeyEpochAdvance = rmp_serde::from_slice(&message).unwrap();
+        let legacy = LegacyAdvance {
+            sender_did: advance.sender_did.clone(),
+            epoch: advance.epoch,
+            signature: advance.signature.clone(),
+        };
+        let legacy_bytes = rmp_serde::to_vec_named(&legacy).unwrap();
+        let deserialized: SenderKeyEpochAdvance =
+            rmp_serde::from_slice(&legacy_bytes).unwrap();
 
         assert_eq!(
             deserialized.signer_key_ref,
@@ -1252,7 +1275,7 @@ mod tests {
         .unwrap();
 
         let request: SenderKeyRequest =
-            serde_json::from_slice(&request_result.request_message).unwrap();
+            rmp_serde::from_slice(&request_result.request_message).unwrap();
 
         // Alice handles the request (no membership gate — backward compat).
         let block_list = HashSet::new();
@@ -1272,7 +1295,7 @@ mod tests {
             response_bytes.is_some(),
             "non-blocked requester should get a response"
         );
-        let response: SenderKeyResponse = serde_json::from_slice(&response_bytes.unwrap()).unwrap();
+        let response: SenderKeyResponse = rmp_serde::from_slice(&response_bytes.unwrap()).unwrap();
 
         assert_eq!(response.sender_did, "did:dht:alice");
         assert_eq!(response.epoch, 1);
@@ -1299,7 +1322,7 @@ mod tests {
             .await
             .unwrap();
 
-        let request: SenderKeyRequest = serde_json::from_slice(&result.request_message).unwrap();
+        let request: SenderKeyRequest = rmp_serde::from_slice(&result.request_message).unwrap();
 
         let valid = verify_sender_key_request(&request, pubkey.as_bytes()).unwrap();
         assert!(valid, "request signature should be valid");
@@ -1316,7 +1339,7 @@ mod tests {
             .await
             .unwrap();
 
-        let request: SenderKeyRequest = serde_json::from_slice(&result.request_message).unwrap();
+        let request: SenderKeyRequest = rmp_serde::from_slice(&result.request_message).unwrap();
 
         let valid = verify_sender_key_request(&request, wrong_pubkey.as_bytes()).unwrap();
         assert!(!valid, "wrong signer should invalidate request signature");
@@ -1349,7 +1372,7 @@ mod tests {
         .unwrap();
 
         let request: SenderKeyRequest =
-            serde_json::from_slice(&request_result.request_message).unwrap();
+            rmp_serde::from_slice(&request_result.request_message).unwrap();
 
         // Alice has Bob on her block list.
         let mut block_list = HashSet::new();
@@ -1395,7 +1418,7 @@ mod tests {
         .unwrap();
 
         let request: SenderKeyRequest =
-            serde_json::from_slice(&request_result.request_message).unwrap();
+            rmp_serde::from_slice(&request_result.request_message).unwrap();
 
         // Block list has someone else, not Bob.
         let mut block_list = HashSet::new();
@@ -1446,7 +1469,7 @@ mod tests {
         .unwrap();
 
         let request: SenderKeyRequest =
-            serde_json::from_slice(&request_result.request_message).unwrap();
+            rmp_serde::from_slice(&request_result.request_message).unwrap();
 
         let block_list: HashSet<String> = HashSet::new();
 
@@ -1494,7 +1517,7 @@ mod tests {
         .unwrap();
 
         let request: SenderKeyRequest =
-            serde_json::from_slice(&request_result.request_message).unwrap();
+            rmp_serde::from_slice(&request_result.request_message).unwrap();
 
         let block_list: HashSet<String> = HashSet::new();
 
@@ -1600,7 +1623,7 @@ mod tests {
         .unwrap();
 
         let request: SenderKeyRequest =
-            serde_json::from_slice(&request_result.request_message).unwrap();
+            rmp_serde::from_slice(&request_result.request_message).unwrap();
 
         // Original block list only has Dave.
         let mut block_list = HashSet::new();
@@ -1652,7 +1675,7 @@ mod tests {
         .await
         .unwrap();
 
-        let notification: BlockNotification = serde_json::from_slice(&message).unwrap();
+        let notification: BlockNotification = rmp_serde::from_slice(&message).unwrap();
         assert_eq!(notification.notification_type, "block_notification");
         assert_eq!(notification.blocker, "did:dht:alice");
         assert_eq!(notification.blocked, "did:dht:dave");
@@ -1677,7 +1700,7 @@ mod tests {
         .await
         .unwrap();
 
-        let notification: BlockNotification = serde_json::from_slice(&message).unwrap();
+        let notification: BlockNotification = rmp_serde::from_slice(&message).unwrap();
         let valid =
             verify_block_notification(&notification, "ctx-WRONG", pubkey.as_bytes()).unwrap();
         assert!(!valid, "wrong context should invalidate block notification");
@@ -1699,7 +1722,7 @@ mod tests {
         .await
         .unwrap();
 
-        let notification: BlockNotification = serde_json::from_slice(&message).unwrap();
+        let notification: BlockNotification = rmp_serde::from_slice(&message).unwrap();
         let valid =
             verify_block_notification(&notification, "ctx-1", wrong_pubkey.as_bytes()).unwrap();
         assert!(!valid, "wrong key should invalidate block notification");
@@ -1740,7 +1763,7 @@ mod tests {
 
         // The epoch advance message should be valid.
         let advance: SenderKeyEpochAdvance =
-            serde_json::from_slice(&result.epoch_advance_message).unwrap();
+            rmp_serde::from_slice(&result.epoch_advance_message).unwrap();
         assert_eq!(advance.epoch, 4);
         assert_eq!(advance.sender_did, "did:dht:alice");
 
@@ -1842,7 +1865,7 @@ mod tests {
         .unwrap();
 
         let request: SenderKeyRequest =
-            serde_json::from_slice(&request_result.request_message).unwrap();
+            rmp_serde::from_slice(&request_result.request_message).unwrap();
 
         // Alice handles Dave's request with the updated block list.
         let response = handle_sender_key_request(
@@ -2045,7 +2068,7 @@ mod tests {
         .await
         .unwrap();
 
-        let notification: BlockNotification = serde_json::from_slice(&msg).unwrap();
+        let notification: BlockNotification = rmp_serde::from_slice(&msg).unwrap();
         let now_ms = current_timestamp_ms().unwrap();
         let result = validate_block_notification_freshness(&notification, now_ms);
         assert!(
@@ -2067,7 +2090,7 @@ mod tests {
         .await
         .unwrap();
 
-        let notification: BlockNotification = serde_json::from_slice(&msg).unwrap();
+        let notification: BlockNotification = rmp_serde::from_slice(&msg).unwrap();
         // Simulate the notification being received far in the future.
         let far_future_ms = notification.timestamp + BLOCK_NOTIFICATION_FRESHNESS_MS + 1_000;
         let result = validate_block_notification_freshness(&notification, far_future_ms);
@@ -2109,7 +2132,7 @@ mod tests {
         .await
         .unwrap();
 
-        let request: SenderKeyRequest = serde_json::from_slice(&result.request_message).unwrap();
+        let request: SenderKeyRequest = rmp_serde::from_slice(&result.request_message).unwrap();
         let original_nonce = request.nonce;
 
         let response_bytes = handle_sender_key_request(
@@ -2125,7 +2148,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        let response: SenderKeyResponse = serde_json::from_slice(&response_bytes).unwrap();
+        let response: SenderKeyResponse = rmp_serde::from_slice(&response_bytes).unwrap();
         assert_eq!(
             response.request_nonce, original_nonce,
             "response must echo the request nonce"
