@@ -52,7 +52,7 @@ Every capability above must work through at least one SDK binding (Python).
 | content-access.json | 10 (SCP-CAC-001–010) | 0 | 0 | Block list, access keys, CEK wrapping, state destruction | #309, #356, Phase 0 S-A (canonical serialization for key wrapping AAD) |
 | governance-integration.json | 8 (SCP-267–274) | 0 | 0 | GovernanceEngine wiring, proposal lifecycle, conflict detection, cosignatures | #356 (ContextManager), #320 (actions) |
 | capability-registry.json | 7 (SCP-ACR-001–007) | 0 | 0 | URI parser, challenge unification, DID capabilities, admission | — (independent) |
-| bridge-cooperative.json | 9 (SCP-BCH-001–009) | 0 | 0 | Auth, endpoints, webhook, credential lifecycle | **Phase 0 S-D** (bridge MLS model) |
+| bridge-cooperative.json | 13 (SCP-BCH-001–013) | 0 | 0 | Auth, endpoints, webhook, credential lifecycle, sender key encryption | **Phase 0 S-D** (bridge MLS model) |
 | participation-admission.json | 6 (SCP-BA-001–006) | 0 | 0 | Types, context integration, blind verification, FFI, production | Phase 0 S-A (canonical serialization for profiles) |
 | main.json | 9 | 3 | 173 | Kotlin SDK, FFI wiring, signaling | #356 (FFI), #306/#307 (bridges) |
 
@@ -67,7 +67,7 @@ Every capability above must work through at least one SDK binding (Python).
 | SCP-118 | Jetpack Compose state holders for SCP | pending | SCP-116 |
 | SCP-120 | Kotlin SDK cross-platform conformance tests | pending | SCP-116, SCP-117 |
 | SCP-214 | Wire KeyCustodyProvider callbacks across all FFI bridges | pending | #356 |
-| SCP-215 | Error code range audit and normalization | pending | — |
+| SCP-215 | Error code range audit and normalization | done | — |
 | SCP-218 | Wire WASM bridge to scp-core for tools, UCAN, event log | pending | #306 |
 | SCP-220 | Wire UniFFI bridge to scp-core for UCAN and event log | pending | #307 |
 | SCP-221 | Wire Swift SDK wrapper functions to UniFFI bridge | pending | #307 |
@@ -158,7 +158,7 @@ These issues exist but don't cover spec gaps found by the audit. Expand acceptan
 | `context/broadcast.rs` | CRYPTO-18, #353, #352, #335 | CRYPTO-18 → #352+#353 → #335 |
 | `sync/` | ADR-029-C3, #324 | ADR-029-C3 → #324 |
 | `bridge/` | 12.6-001/002, #370, SCP-BCH-* | 12.6-001/002 → #370 → SCP-BCH-* |
-| `scp-ffi/src/context.rs` | #300, #328, #332, #336, #356, #369 | #300 → #356 → #328/#332/#336/#369 |
+| `scp-ffi/src/context.rs` | #385, #386, #328, #332, #336, #369 | #385 → #386 → closes #328/#332/#336/#369 |
 | `scp-identity/src/dht.rs` | #310, #327, #362 | #327 → #310; #362 independent |
 
 ---
@@ -328,21 +328,33 @@ Additional review fixes (81185a1): deny_unknown_fields on 4 sender key wire type
 ### Phase 3: Security Hardening (parallel, needs Phase 1 merged) — PARTIAL
 
 **Lane A** — #347 (deser size limits) — **COMPLETE** → 155f2b3 + review fix 1bd9403
-**Lane B** — #299, #319 — **NOT STARTED** (both hit usage limits, need re-dispatch). #326 done in prior iteration.
+**Lane B** — #319 — **COMPLETE** → e6b86a9 + review fix 04c2281. #299 — **NOT STARTED** (3 dispatch attempts failed). #326 done in prior iteration.
 **Lane C** — #339, #340 — **BLOCKED** on Phase 2 completion (#357+)
 **Lane D** — #321 — **COMPLETE** (prior iteration) → b7b4e1e + review fix 3eacfb2
 
 ### Phase 4: Identity Infrastructure (parallel with Phases 2-3) — PARTIAL
 
-**Lane A** — #327 (BEP44 sequence persistence) — **COMPLETE** → cc5eff1. Remaining: #310 → #311
+**Lane A** — #327 (BEP44 sequence persistence) — **COMPLETE** → cc5eff1. #310 (PkarrDhtClient) — **COMPLETE** → 59f18b2 + review fix 04c2281. Remaining: #311
 **Lane B** — #315 (BIP-39 mnemonic) — **COMPLETE** → 7e61bb3. #325 (TOFU + cert pinning) — **COMPLETE** → 225c862 + review fix 1bd9403
 
-### Phase 5: Core Infrastructure (CRITICAL PATH — sequential)
+### Phase 5: Core Infrastructure (CRITICAL PATH)
 
-**Step 1:** `feat/production-providers` (#300)
-**Step 2:** `refactor/ffi-context-manager` (#356) — depends on #300
-  - Closes: #328, #332, #329
-**Step 3:** `feat/envelope-pipeline` (#338) — depends on #356 + S-A
+#356 has been decomposed into 6 sub-issues. #300 is absorbed into #385.
+
+**Step 1:** #385 — Production provider implementations (ContextCrypto, Transport, EventLog, Persistence)
+  - Absorbs #300 (no production providers)
+  - Pure scp-core/scp-transport, no FFI
+**Step 2 (parallel):** Bridge rewrites — all 4 can run simultaneously after #385:
+  - #386 — PyO3 bridge rewrite (reference bridge, most complete API)
+  - #387 — UniFFI bridge rewrite (Swift + Kotlin)
+  - #388 — NAPI bridge rewrite (TypeScript)
+  - #389 — WASM bridge rewrite
+  - Closes: #328, #332, #329, #335, #336, #338
+  - Partially advances: #306, #307, #369, #370 (context ops fixed; remaining stubs in Phase 9)
+**Step 3:** #390 — E2E integration tests (blocked by #386 at minimum)
+  - Message round-trip, governance, broadcast, persistence — all through FFI
+
+Blocking chain: `#385 → (#386 + #387 + #388 + #389 parallel) → #390`
 
 ### Phase 6: MLS, Encryption & Content Access (depends on Phase 5)
 
@@ -350,7 +362,7 @@ Additional review fixes (81185a1): deny_unknown_fields on 4 sender key wire type
 **Step 2:** #324 (MLS epoch conflict) — **requires S-G merged**
 **Step 3:** #314 (MLS LeafNode extension)
 **Step 4:** #309 (ADR-038 content access control) — unlocks SCP-CAC-*
-**Step 5:** #317 (SDK-mandated state destruction)
+**Step 5:** #317 (SDK-mandated state destruction) — **DONE** (closed)
 
 Then content access PRD (serial — same subsystem, depends on #309):
 SCP-CAC-001 → SCP-CAC-002 → SCP-CAC-003 → SCP-CAC-004 → SCP-CAC-005 → SCP-CAC-006 → SCP-CAC-007 → SCP-CAC-008 → SCP-CAC-009 → SCP-CAC-010
@@ -361,23 +373,23 @@ Governance PRD (serial — each builds on prior, all touch `manager.rs`):
 SCP-267 → SCP-268 → SCP-269 → SCP-270 → SCP-271 → SCP-272 → SCP-273 → SCP-274
 
 - SCP-267–268 need #356 (ContextManager wiring)
-- SCP-269–270 need #320 (all 24 governance actions)
+- SCP-269–270 need #320 (GovernanceModel enum expansion + proposal lifecycle — all 24 actions already dispatched per PR #296)
 - SCP-272 needs #354 (conflict detection)
 - SCP-273 needs #330 (provenance/checkpoint fields)
 
 ### Phase 8: Feature Completions (parallel, depends on Phase 5)
 
-**Lane A:** #335 (broadcast transport), SCP-227 (subscriber registration — in-progress)
-**Lane B:** #336, #337, #334 (context features)
+**Lane A:** SCP-227 (subscriber registration — in-progress). Note: #335 closed by Phase 5 bridge rewrites.
+**Lane B:** #337, #334 (context features). Note: #336 closed by Phase 5 bridge rewrites.
 **Lane C:** #318, #330 (trust/provenance wiring)
-**Lane D:** #316, #323 (identity features)
+**Lane D:** #316, #323 (identity features — decomposed: #391 file custody → #392+#393+#394 parallel)
 **Lane E:** #302, #305, #342 (node/relay production)
 
 ### Phase 9: SDK Bindings (depends on Phase 5)
 
 **Lane A:** #306, SCP-218 (WASM bridge wiring) → #341 (TypeScript SDK)
 **Lane B:** #307, SCP-220, SCP-221 (UniFFI bridge + Swift wiring) → #331 (Swift Trust/MCP)
-**Lane C:** SCP-214 (KeyCustodyProvider callbacks across all FFI bridges) — needs #356
+**Lane C:** SCP-214 (KeyCustodyProvider callbacks across all FFI bridges) — needs #386/#387/#388/#389 (bridge rewrites)
 **Lane D:** #322 (cross-context tool interfaces)
 **Lane E:** SCP-215 (error code range audit — independent)
 **Lane F:** #304 (Go/Java/C#)
@@ -386,10 +398,10 @@ SCP-267 → SCP-268 → SCP-269 → SCP-270 → SCP-271 → SCP-272 → SCP-273 
 ### Phase 10: New Features (partially blocked by spec)
 
 **Lane A:** SCP-ACR-001–007 (capability registry) — independent, can start now
-**Lane B:** SCP-BCH-001–009 (bridge cooperative + credentials) — **BLOCKED by S-D** (bridge MLS model)
+**Lane B:** SCP-BCH-001–013 (bridge cooperative + credentials + sender key encryption) — **BLOCKED by S-D** (bridge MLS model)
 **Lane C:** SCP-BA-001–006 (participation admission) — **soft-blocked by S-A** (canonical serialization for profiles)
 **Lane D:** #362, #363, #364, #365, #366, #367
-**Lane E:** SCP-038 (PyO3 identity bridge — in-progress), SCP-092 (signaling — in-progress, needs #290)
+**Lane E:** SCP-038 (PyO3 identity bridge — in-progress), SCP-092 (signaling — in-progress, #290 done)
 
 ### Phase 11: Spec Audit NEW HIGHs (parallel with Phase 8+)
 
@@ -422,6 +434,27 @@ Spec-only fixes for the 37 NEW HIGH findings. Grouped by topic:
 
 ---
 
+## Issue Audit Notes (2026-03-06)
+
+All ~50 open issues audited for AC quality, spec reference accuracy, and scope. Changes applied directly to GitHub issues.
+
+**Decomposed:**
+- #356 → #385, #386, #387, #388, #389, #390 (providers + 4 bridge rewrites + E2E tests)
+- #323 → #391, #392, #393, #394 (file custody, Apple, Android, restriction)
+- #309 → tracked as epic, PRD stories SCP-CAC-001–010 are the implementation units
+
+**Scope reduced (already partially/fully implemented):**
+- #320 — all 24 GovernanceAction variants already dispatched (PR #296). Real gap: GovernanceModel enum + proposal lifecycle API
+- #340 — enforcement already exists at `manager.rs:2609-2615`. Downgraded to LOW (needs tests only)
+- #339 — ceiling IS checked during UCAN validation (step 8, `validate.rs:549`). Gap: not checked during minting
+- #299 — `mint_role_tokens()` stub already fixed. Real gap: broadcast subscriber registration
+
+**Wrong spec references fixed (14 issues):** #310, #311, #318, #319, #320, #325, #330, #333, #334, #336, #337, #339, #340, #366
+
+**Overlap with bridge rewrites noted:** #306, #307, #328, #329, #332, #369, #370 — all reference #385/#386/#387/#388/#389 as blockers
+
+---
+
 ## Dependency Graph
 
 ```
@@ -451,7 +484,11 @@ PHASE 4 (parallel with P2/P3) ────────────────�
   A: #327→#310→#311  B: #315,#325
 
 ═══════════ CRITICAL PATH ═════════════════════════════════════════
-PHASE 5: #300 → #356 → #338 [needs S-A] (closes #328,#332,#329)
+PHASE 5: #385 (providers, absorbs #300)
+         → #386 + #387 + #388 + #389 (4 bridge rewrites, parallel)
+         → #390 (E2E integration tests)
+         Closes: #328,#332,#329,#335,#336,#338
+         Advances: #306,#307,#369,#370 (remaining stubs in P9)
 PHASE 6: #333 [needs S-H] → #324 [needs S-G] → #314 → #309 → #317
          then SCP-CAC-001→010 (serial, needs #309)
 ═══════════════════════════════════════════════════════════════════
@@ -518,7 +555,7 @@ PHASE 12: #291,#301,#303,#343,#344
 | content-access.json | 10 | #309 (Phase 6), #356 |
 | governance-integration.json | 8 | #356, #320 (Phase 2) |
 | capability-registry.json | 7 | — (independent) |
-| bridge-cooperative.json | 9 + sender key stories TBD | — (S-D resolved) |
+| bridge-cooperative.json | 13 (SCP-BCH-001–013) | — (S-D resolved) |
 | participation-admission.json | 6 | CRYPTO-14 (signing key KDF) |
 
 ---
