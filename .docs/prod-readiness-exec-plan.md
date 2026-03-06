@@ -348,11 +348,12 @@ Additional review fixes (81185a1): deny_unknown_fields on 4 sender key wire type
   - Pure scp-core/scp-transport, no FFI
   - MlsCryptoProvider, RelayTransportProvider, MerkleEventLogProvider, InMemoryPersistence + ProtocolStorePersistence
   - 31 new tests
-**Step 2 (parallel):** Bridge rewrites — all 4 can run simultaneously after #385:
-  - #386 — PyO3 bridge rewrite (reference bridge, most complete API)
-  - #387 — UniFFI bridge rewrite (Swift + Kotlin)
-  - #388 — NAPI bridge rewrite (TypeScript)
-  - #389 — WASM bridge rewrite
+**Step 2 (parallel):** Bridge rewrites — **COMPLETE**
+  - #386 — PyO3 bridge rewrite → 83c6630 (ContextRuntime → ContextManager + FfiBridgeState)
+  - #387 — UniFFI bridge rewrite → 7901cff (shared Arc<ContextManager>, no-op validation stubs)
+  - #388 — NAPI bridge rewrite → b733858 (UcanContextState retained separately, DashMap persistence)
+  - #389 — WASM bridge rewrite → 1ca2970 (WasmContextManager centralizing state)
+  - Integration fixes → 606cf0d (key_resolver, did_resolver, error variants, missing fields)
   - Closes: #328, #332, #329, #335, #336, #338
   - Partially advances: #306, #307, #369, #370 (context ops fixed; remaining stubs in Phase 9)
 **Step 3:** #390 — E2E integration tests (blocked by #386 at minimum)
