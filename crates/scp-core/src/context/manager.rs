@@ -2211,6 +2211,15 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
             require_active(&ctx.handle)?;
 
+            // Gate: ceiling must include MemberBan (§5.3, ADR-031, #339).
+            // Consistent with revoke_read_access_internal and
+            // restore_read_access_internal which already check this.
+            if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
+                return Err(ContextError::PermissionDenied(
+                    "context ceiling does not include member:ban capability".into(),
+                ));
+            }
+
             let bc = ctx
                 .broadcast_context
                 .as_mut()
@@ -2520,6 +2529,9 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Registers a tool in the context. Requires `ToolRegister` in the
+    /// context's ceiling (§5.3). Without this capability in the ceiling,
+    /// the context does not support tool registration.
     async fn execute_register_tool(
         &self,
         context_id: &str,
@@ -2534,6 +2546,13 @@ impl ContextManager {
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
             require_active(&ctx.handle)?;
+
+            // Gate: ceiling must include ToolRegister (§5.3, #339).
+            if !ctx.role_state.ceiling.contains(&Capability::ToolRegister) {
+                return Err(ContextError::PermissionDenied(
+                    "context ceiling does not include tool registration capability".into(),
+                ));
+            }
 
             if ctx.registered_tools.len() >= MAX_REGISTERED_TOOLS {
                 return Err(ContextError::LimitExceeded(format!(
@@ -2727,6 +2746,8 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Creates a child context from this parent. Requires `ChildContextCreate`
+    /// in the parent context's ceiling (§5.3, §5.13).
     async fn execute_create_child_context(
         &self,
         context_id: &str,
@@ -2734,13 +2755,24 @@ impl ContextManager {
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
-        // Validate parent context is active.
+        // Validate parent context is active and ceiling allows child creation.
         {
             let contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
             require_active(&ctx.handle)?;
+
+            // Gate: ceiling must include ChildContextCreate (§5.3, §5.13, #339).
+            if !ctx
+                .role_state
+                .ceiling
+                .contains(&Capability::ChildContextCreate)
+            {
+                return Err(ContextError::PermissionDenied(
+                    "context ceiling does not include child context creation capability".into(),
+                ));
+            }
         }
         // Child context creation is delegated to `create_context` by the
         // caller with the parent_context_id field set. This method records
@@ -2926,6 +2958,9 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Establishes a cross-context tool interface. Requires `ToolInterface`
+    /// in the context's ceiling (§5.3, §6.2). Without this capability in the
+    /// ceiling, the context does not support tool interface exposure.
     async fn execute_establish_tool_interface(
         &self,
         context_id: &str,
@@ -2940,6 +2975,13 @@ impl ContextManager {
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
             require_active(&ctx.handle)?;
+
+            // Gate: ceiling must include ToolInterface (§5.3, §6.2, #339).
+            if !ctx.role_state.ceiling.contains(&Capability::ToolInterface) {
+                return Err(ContextError::PermissionDenied(
+                    "context ceiling does not include tool interface capability".into(),
+                ));
+            }
 
             if ctx.tool_interfaces.len() >= MAX_TOOL_INTERFACES {
                 return Err(ContextError::LimitExceeded(format!(
@@ -3965,6 +4007,10 @@ mod tests {
                 crate::context::params::Capability::new("messages:read"),
                 crate::context::params::Capability::new("messages:write"),
                 crate::context::params::Capability::new("role:assign"),
+                Capability::ToolRegister,
+                Capability::ToolInterface,
+                Capability::ChildContextCreate,
+                Capability::MemberBan,
             ],
             ..ContextParams::default()
         };
@@ -5385,6 +5431,7 @@ mod tests {
                 crate::context::params::Capability::new("messages:read"),
                 crate::context::params::Capability::new("messages:write"),
                 crate::context::params::Capability::new("role:assign"),
+                Capability::MemberBan,
             ],
             ..ContextParams::default()
         };
@@ -5936,8 +5983,37 @@ mod tests {
     /// SCP-GG-006: `RevokeReadAccess` fails when ceiling lacks `MemberBan`.
     #[tokio::test]
     async fn revoke_read_access_rejected_without_member_ban_ceiling() {
-        // Use the standard two-author setup which does NOT have MemberBan.
-        let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
+        // Create a broadcast context WITHOUT MemberBan in ceiling.
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        manager.register_local_did("did:key:alice".into()).await;
+        manager.register_local_did("did:key:bob".into()).await;
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            ceiling: vec![
+                Capability::MessagesRead,
+                Capability::MessagesWrite,
+                Capability::RoleAssign,
+            ],
+            ..ContextParams::default()
+        };
+        let _handle = manager
+            .create_context("no-ban-ctx".into(), params, "did:key:alice".into())
+            .await
+            .unwrap();
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("no-ban-ctx").unwrap();
+            let bc = ctx.broadcast_context.as_mut().unwrap();
+            bc.add_author("did:key:bob").unwrap();
+            ctx.membership
+                .add_member("did:key:bob".into(), "author".into(), vec![]);
+        }
+        let ctx_id = "no-ban-ctx".to_owned();
 
         // Subscribe sub1.
         {
@@ -6051,7 +6127,27 @@ mod tests {
     /// SCP-GG-006: `RestoreReadAccess` also fails without `MemberBan` in ceiling.
     #[tokio::test]
     async fn restore_read_access_rejected_without_member_ban_ceiling() {
-        let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
+        // Create a broadcast context WITHOUT MemberBan in ceiling.
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        manager.register_local_did("did:key:alice".into()).await;
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            ceiling: vec![
+                Capability::MessagesRead,
+                Capability::MessagesWrite,
+            ],
+            ..ContextParams::default()
+        };
+        let _handle = manager
+            .create_context("no-ban-restore-ctx".into(), params, "did:key:alice".into())
+            .await
+            .unwrap();
+        let ctx_id = "no-ban-restore-ctx".to_owned();
 
         let action = super::GovernanceAction::RestoreReadAccess {
             did: "did:key:sub1".into(),
@@ -7139,10 +7235,19 @@ mod tests {
         let creator_did: DID = "did:dht:z6MkCreator".into();
         let signing_key = signing_key_for_did(&creator_did);
 
+        let params = ContextParams {
+            ceiling: vec![
+                Capability::MessagesRead,
+                Capability::MessagesWrite,
+                Capability::ToolRegister,
+            ],
+            ..ContextParams::default()
+        };
+
         let handle = manager
             .create_context(
                 "ctx-single-admin-lifecycle".into(),
-                ContextParams::default(),
+                params,
                 creator_did.clone(),
             )
             .await
@@ -7214,6 +7319,11 @@ mod tests {
                 threshold: 2,
                 signers: vec![alice.clone(), bob.clone(), carol.clone()],
             },
+            ceiling: vec![
+                Capability::MessagesRead,
+                Capability::MessagesWrite,
+                Capability::ToolRegister,
+            ],
             ..ContextParams::default()
         };
 
@@ -7710,6 +7820,244 @@ mod tests {
             ctx.handle.params().promotion_policy,
             PromotionPolicy::Promotable,
             "promotion_policy must remain Promotable after promotion — it is immutable"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Ceiling enforcement tests (#339, §5.3)
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a context with a specific ceiling for ceiling enforcement tests.
+    async fn setup_context_with_ceiling(
+        ceiling: Vec<Capability>,
+    ) -> (ContextManager, ContextHandle, String) {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let params = ContextParams {
+            ceiling,
+            ..ContextParams::default()
+        };
+
+        let handle = manager
+            .create_context("ceiling-test-ctx".into(), params, "did:key:creator".into())
+            .await
+            .unwrap();
+
+        let ctx_id = "ceiling-test-ctx".to_owned();
+        (manager, handle, ctx_id)
+    }
+
+    /// Helper: build a simple approved proposal for ceiling tests.
+    fn ceiling_test_proposal(
+        context_id: &str,
+        action: GovernanceAction,
+    ) -> super::GovernanceProposal {
+        use crate::context::governance::{SignedVote, VoteType};
+        super::GovernanceProposal {
+            proposal_id: [42u8; 32],
+            context_id: context_id.into(),
+            proposer_did: "did:key:creator".into(),
+            action,
+            status: ProposalStatus::Approved,
+            created_at: 1000,
+            voting_deadline: 2000,
+            approvals: vec![SignedVote {
+                voter_did: "did:key:creator".into(),
+                vote: VoteType::Approve,
+                timestamp: 1000,
+                signature: vec![0u8; 64],
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        }
+    }
+
+    /// #339: `RegisterTool` is rejected when `ToolRegister` is not in ceiling.
+    #[tokio::test]
+    async fn register_tool_rejected_without_ceiling_capability() {
+        use crate::context::tools::registry::{TestVector, ToolSchema};
+
+        let (manager, _handle, ctx_id) =
+            setup_context_with_ceiling(vec![Capability::MessagesRead, Capability::MessagesWrite])
+                .await;
+
+        let reg = super::super::params::ToolRegistration {
+            tool_id: "test".to_owned(),
+            name: "test".to_owned(),
+            description: "test".to_owned(),
+            schema: ToolSchema {
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: serde_json::json!({"type": "object"}),
+            },
+            implementation_hash: [0u8; 32],
+            test_vectors: vec![],
+            operator_did: "did:key:op".into(),
+            economic_metadata: None,
+        };
+
+        let proposal = ceiling_test_proposal(
+            &ctx_id,
+            GovernanceAction::RegisterTool {
+                registration: Box::new(reg),
+            },
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("tool registration")),
+            "expected PermissionDenied about tool registration, got: {err}"
+        );
+    }
+
+    /// #339: `RegisterTool` succeeds when `ToolRegister` is in ceiling.
+    #[tokio::test]
+    async fn register_tool_succeeds_with_ceiling_capability() {
+        use crate::context::tools::registry::{TestVector, ToolSchema};
+
+        let (manager, _handle, ctx_id) = setup_context_with_ceiling(vec![
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::ToolRegister,
+        ])
+        .await;
+
+        let reg = super::super::params::ToolRegistration {
+            tool_id: "test".to_owned(),
+            name: "test".to_owned(),
+            description: "test".to_owned(),
+            schema: ToolSchema {
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: serde_json::json!({"type": "object"}),
+            },
+            implementation_hash: [0u8; 32],
+            test_vectors: vec![],
+            operator_did: "did:key:op".into(),
+            economic_metadata: None,
+        };
+
+        let proposal = ceiling_test_proposal(
+            &ctx_id,
+            GovernanceAction::RegisterTool {
+                registration: Box::new(reg),
+            },
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_ok(), "RegisterTool should succeed: {result:?}");
+    }
+
+    /// #339: `EstablishToolInterface` is rejected when `ToolInterface` is not in ceiling.
+    #[tokio::test]
+    async fn establish_tool_interface_rejected_without_ceiling_capability() {
+        let (manager, _handle, ctx_id) =
+            setup_context_with_ceiling(vec![Capability::MessagesRead, Capability::MessagesWrite])
+                .await;
+
+        let proposal = ceiling_test_proposal(
+            &ctx_id,
+            GovernanceAction::EstablishToolInterface {
+                interface: ToolInterface {
+                    source_context: ctx_id.clone(),
+                    target_context: "other-ctx".into(),
+                    tool_id: "tool-a".into(),
+                    rate_limit: None,
+                    approved_by_source: true,
+                    approved_by_target: false,
+                },
+            },
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("tool interface")),
+            "expected PermissionDenied about tool interface, got: {err}"
+        );
+    }
+
+    /// #339: `CreateChildContext` is rejected when `ChildContextCreate` is not in ceiling.
+    #[tokio::test]
+    async fn create_child_context_rejected_without_ceiling_capability() {
+        let (manager, _handle, ctx_id) =
+            setup_context_with_ceiling(vec![Capability::MessagesRead, Capability::MessagesWrite])
+                .await;
+
+        let proposal = ceiling_test_proposal(
+            &ctx_id,
+            GovernanceAction::CreateChildContext {
+                params: Box::new(ContextParams::default()),
+            },
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("child context")),
+            "expected PermissionDenied about child context, got: {err}"
+        );
+    }
+
+    /// #339: `BlockAuthor` is rejected when `MemberBan` is not in ceiling.
+    #[tokio::test]
+    async fn block_author_rejected_without_member_ban_ceiling() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        manager.register_local_did("did:key:alice".into()).await;
+        manager.register_local_did("did:key:bob".into()).await;
+
+        // Ceiling WITHOUT MemberBan.
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            ceiling: vec![
+                Capability::MessagesRead,
+                Capability::MessagesWrite,
+                Capability::RoleAssign,
+            ],
+            ..ContextParams::default()
+        };
+
+        let _handle = manager
+            .create_context("bc-no-ban".into(), params, "did:key:alice".into())
+            .await
+            .unwrap();
+
+        // Add bob as author.
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("bc-no-ban").unwrap();
+            let bc = ctx.broadcast_context.as_mut().unwrap();
+            bc.add_author("did:key:bob").unwrap();
+            ctx.membership
+                .add_member("did:key:bob".into(), "author".into(), vec![]);
+        }
+
+        let proposal = approved_block_author_proposal(
+            &"did:key:alice".into(),
+            "bc-no-ban",
+            &"did:key:bob".into(),
+        );
+        let result = manager
+            .execute_governance_action("bc-no-ban", &proposal)
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("member:ban")),
+            "expected PermissionDenied about member:ban, got: {err}"
         );
     }
 }
