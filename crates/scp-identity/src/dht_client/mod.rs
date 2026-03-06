@@ -2,9 +2,15 @@
 //!
 //! Defines the [`DhtClient`] trait that abstracts Mainline DHT operations
 //! (BEP44 signed mutable items). This enables testing with [`InMemoryDhtClient`]
-//! while production code uses a real DHT client (e.g., pkarr).
+//! while production code uses a real DHT client.
 //!
-//! See ADR-003 in `.docs/adrs/phase-1.md` for the full design.
+//! # Production Implementations
+//!
+//! - [`PkarrDhtClient`] — Uses the `mainline` crate for direct Mainline DHT
+//!   BEP44 operations, with optional HTTP gateway fallback for resolution
+//!   behind restrictive firewalls. Enabled via the `production-dht` feature.
+//!
+//! See ADR-003 in `.docs/adrs/phase-1.md` and §3.10 (DID Resolution Layers).
 
 use std::collections::HashMap;
 
@@ -14,7 +20,7 @@ use super::IdentityError;
 
 /// Abstraction over BEP44 signed mutable item operations on a DHT.
 ///
-/// Production implementations wrap the `pkarr` crate for Mainline DHT access.
+/// Production implementations use the `mainline` crate for Mainline DHT access.
 /// The [`InMemoryDhtClient`] provides a `HashMap`-backed implementation for
 /// unit tests that require no network access.
 ///
@@ -166,6 +172,16 @@ impl DhtClient for InMemoryDhtClient {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// PkarrDhtClient — production Mainline DHT client (feature: production-dht)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "production-dht")]
+mod pkarr_client;
+
+#[cfg(feature = "production-dht")]
+pub use pkarr_client::{PkarrDhtClient, PkarrDhtClientBuilder};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
