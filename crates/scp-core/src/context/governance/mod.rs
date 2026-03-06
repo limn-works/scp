@@ -49,6 +49,7 @@ pub mod multisig;
 pub mod unanimity;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,21 @@ use super::roles::ToolId;
 use super::tools::interface::ToolInterface;
 use scp_event_log::{ContextId, Ed25519Signature};
 use scp_identity::DID;
+
+// ---------------------------------------------------------------------------
+// KeyResolver
+// ---------------------------------------------------------------------------
+
+/// Resolves a voter's DID to their Ed25519 verifying key.
+///
+/// Governance engines use this to verify vote signatures against the voter's
+/// actual public key (derived from their DID), rather than trusting the
+/// signing key provided by the caller. This prevents forged votes where an
+/// attacker supplies a valid DID but signs with a different key.
+///
+/// Returns `None` if the DID cannot be resolved (e.g., non-did:dht method
+/// with no fallback, or unknown DID).
+pub type KeyResolver = Arc<dyn Fn(&DID) -> Option<ed25519_dalek::VerifyingKey> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // ProposalId
@@ -710,6 +726,13 @@ pub struct GovernanceProposal {
     /// The governance action being proposed.
     pub action: GovernanceAction,
     /// Current lifecycle status.
+    ///
+    /// **Invariant:** When `status` is [`ProposalStatus::Approved`], all vote
+    /// signatures in [`approvals`](Self::approvals) have been cryptographically
+    /// verified against the voter's DID-resolved public key via the engine's
+    /// [`KeyResolver`]. Code that receives an `Approved` proposal can trust
+    /// that every approval vote is authentic — no further signature checks
+    /// are needed.
     pub status: ProposalStatus,
     /// Unix timestamp (seconds) when the proposal was created.
     pub created_at: u64,
@@ -858,6 +881,29 @@ pub enum GovernanceError {
     /// Vote signature verification failed.
     #[error("vote verification failed: {0}")]
     VerificationFailed(String),
+
+    /// A vote signature failed cryptographic verification against the voter's
+    /// DID-resolved public key.
+    ///
+    /// This means the signature was not produced by the key associated with
+    /// the claimed voter DID — the vote is forged or corrupted.
+    #[error("invalid vote signature: voter {voter_did} on proposal {proposal_id}")]
+    InvalidSignature {
+        /// The DID of the voter whose signature failed verification.
+        voter_did: String,
+        /// Hex-encoded proposal ID the vote was for.
+        proposal_id: String,
+    },
+
+    /// The voter's DID could not be resolved to a public key.
+    ///
+    /// The key resolver returned `None` for this DID, meaning the voter's
+    /// identity cannot be verified. The vote is rejected.
+    #[error("unknown voter: cannot resolve public key for DID {did}")]
+    UnknownVoter {
+        /// The unresolvable DID.
+        did: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1049,17 +1095,22 @@ pub struct SingleAdminEngine {
     admin_did: DID,
     /// Active and resolved proposals, keyed by proposal ID.
     proposals: HashMap<ProposalId, GovernanceProposal>,
+    /// Resolves voter DIDs to their Ed25519 verifying keys for signature
+    /// verification.
+    key_resolver: KeyResolver,
 }
 
 impl SingleAdminEngine {
     /// Creates a new single-admin governance engine.
     ///
-    /// The provided DID is the sole governance authority.
+    /// The provided DID is the sole governance authority. The `key_resolver`
+    /// maps DIDs to Ed25519 verifying keys for vote signature verification.
     #[must_use]
-    pub fn new(admin_did: DID) -> Self {
+    pub fn new(admin_did: DID, key_resolver: KeyResolver) -> Self {
         Self {
             admin_did,
             proposals: HashMap::new(),
+            key_resolver,
         }
     }
 
@@ -1113,8 +1164,17 @@ impl GovernanceEngine for SingleAdminEngine {
             signing_key,
         )?;
 
-        // Defense-in-depth: verify the admin's vote signature before accepting it.
-        verify_vote(&proposal_id, &admin_vote, &signing_key.verifying_key())?;
+        // Verify the admin's vote signature against their DID-resolved key.
+        let resolved_key =
+            (self.key_resolver)(proposer).ok_or_else(|| GovernanceError::UnknownVoter {
+                did: proposer.to_string(),
+            })?;
+        verify_vote(&proposal_id, &admin_vote, &resolved_key).map_err(|_| {
+            GovernanceError::InvalidSignature {
+                voter_did: proposer.to_string(),
+                proposal_id: hex::encode(proposal_id),
+            }
+        })?;
 
         // In single-admin mode, the proposal is immediately approved.
         let proposal = GovernanceProposal {
@@ -1251,6 +1311,26 @@ mod tests {
     /// [`test_signing_key`]) for multi-party test scenarios.
     fn test_signing_key_2() -> ed25519_dalek::SigningKey {
         ed25519_dalek::SigningKey::from_bytes(&[2u8; 32])
+    }
+
+    /// Mock key resolver that maps test DIDs to their corresponding signing
+    /// key's verifying key. Alice -> [1u8;32], Bob -> [2u8;32].
+    fn mock_resolver() -> KeyResolver {
+        Arc::new(|did: &DID| {
+            let did_str: &str = did.as_ref();
+            match did_str {
+                "did:dht:z6MkAlice" => {
+                    Some(ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]).verifying_key())
+                }
+                "did:dht:z6MkBob" => {
+                    Some(ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]).verifying_key())
+                }
+                "did:dht:z6MkCarol" => {
+                    Some(ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]).verifying_key())
+                }
+                _ => None,
+            }
+        })
     }
 
     fn test_context(admin: &DID) -> GovernanceContext {
@@ -1503,7 +1583,7 @@ mod tests {
     #[test]
     fn single_admin_propose_auto_approves() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::AddMember {
@@ -1548,7 +1628,7 @@ mod tests {
     #[test]
     fn single_admin_non_admin_cannot_propose() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::AddMember {
@@ -1568,7 +1648,7 @@ mod tests {
     #[test]
     fn single_admin_approve_is_noop_for_admin() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
@@ -1591,7 +1671,7 @@ mod tests {
     #[test]
     fn single_admin_reject_is_noop_for_admin() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
@@ -1613,7 +1693,7 @@ mod tests {
     #[test]
     fn single_admin_non_admin_cannot_approve() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
@@ -1636,7 +1716,7 @@ mod tests {
     #[test]
     fn single_admin_non_admin_cannot_reject() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
@@ -1659,7 +1739,7 @@ mod tests {
     #[test]
     fn single_admin_approve_unknown_proposal() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
         let fake_id = [0u8; 32];
 
@@ -1674,7 +1754,7 @@ mod tests {
     #[test]
     fn single_admin_reject_unknown_proposal() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
         let fake_id = [0u8; 32];
 
@@ -1693,7 +1773,7 @@ mod tests {
     #[test]
     fn single_admin_model_config() {
         let admin = alice();
-        let engine = SingleAdminEngine::new(admin.clone());
+        let engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
 
         let config = engine.model_config();
         assert_eq!(
@@ -1709,7 +1789,7 @@ mod tests {
     #[test]
     fn single_admin_eligible_voters() {
         let admin = alice();
-        let engine = SingleAdminEngine::new(admin.clone());
+        let engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let voters = engine.eligible_voters(&ctx);
@@ -1723,7 +1803,7 @@ mod tests {
     #[test]
     fn single_admin_get_proposal() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::AddMember {
@@ -1742,7 +1822,7 @@ mod tests {
     #[test]
     fn single_admin_get_proposal_not_found() {
         let admin = alice();
-        let engine = SingleAdminEngine::new(admin);
+        let engine = SingleAdminEngine::new(admin, mock_resolver());
         let fake_id = [0u8; 32];
         assert!(engine.get_proposal(&fake_id).is_none());
     }
@@ -1754,7 +1834,7 @@ mod tests {
     #[test]
     fn single_admin_transfer_admin() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         // Propose transfer.
@@ -1792,7 +1872,7 @@ mod tests {
     #[test]
     fn single_admin_distinct_proposal_ids() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
 
         let ctx1 = GovernanceContext {
             context_id: "ctx-1".to_owned(),
@@ -1831,7 +1911,7 @@ mod tests {
     #[test]
     fn single_admin_propose_all_action_variants() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let actions: Vec<GovernanceAction> = vec![
@@ -1903,7 +1983,7 @@ mod tests {
     fn governance_engine_is_object_safe() {
         fn assert_object_safe(_: &dyn GovernanceEngine) {}
         let admin = alice();
-        let engine = SingleAdminEngine::new(admin);
+        let engine = SingleAdminEngine::new(admin, mock_resolver());
         assert_object_safe(&engine);
     }
 
@@ -1924,7 +2004,7 @@ mod tests {
     #[test]
     fn proposal_lifecycle_state_machine_single_admin() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         // 1. Propose -> immediately Approved (state: Pending -> Approved).
@@ -2059,7 +2139,7 @@ mod tests {
     #[test]
     fn governance_events_are_serializable_for_merkle_log() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::ChangeRole {
@@ -2089,7 +2169,7 @@ mod tests {
     #[test]
     fn governance_proposal_serialization_roundtrip() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::AddMember {
@@ -2321,7 +2401,7 @@ mod tests {
         let sk = test_signing_key();
         let vk = sk.verifying_key();
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
@@ -2344,7 +2424,7 @@ mod tests {
         let sk = test_signing_key();
         let vk = sk.verifying_key();
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
@@ -2359,7 +2439,7 @@ mod tests {
     fn verify_proposal_votes_rejects_tampered_signature() {
         let sk = test_signing_key();
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
@@ -2383,7 +2463,7 @@ mod tests {
     fn verify_proposal_votes_rejects_unknown_voter_key() {
         let sk = test_signing_key();
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
@@ -2404,7 +2484,7 @@ mod tests {
         let sk = test_signing_key();
         let wrong_vk = test_signing_key_2().verifying_key();
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
@@ -2425,7 +2505,7 @@ mod tests {
         let sk = test_signing_key();
         let vk = sk.verifying_key();
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
