@@ -37,6 +37,8 @@ use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::KeyCustody;
 use uuid::Uuid;
 
+use scp_core::context::membership::KeyPackage;
+
 use crate::{decrement_handle_count, increment_handle_count, runtime};
 
 /// Wrapper for [`InMemoryKeyCustody`] that implements [`Debug`] with a
@@ -1309,20 +1311,6 @@ impl Drop for TransportManager {
 pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError> {
     let custody_method = parse_custody_method(&custody)?;
 
-    // Ensure the global DID resolver is initialized (idempotent). #311
-    if crate::runtime::did_resolver().is_none() {
-        let dht_client = std::sync::Arc::new(scp_identity::InMemoryDhtClient::new());
-        let relay_querier = std::sync::Arc::new(scp_identity::NoOpRelayQuerier);
-        let cache = std::sync::Arc::new(scp_identity::DidCache::new());
-        let resolver = std::sync::Arc::new(scp_identity::DualLayerResolver::new(
-            relay_querier,
-            dht_client,
-            cache,
-            Vec::new(),
-        ));
-        crate::runtime::init_did_resolver(resolver, runtime().handle().clone());
-    }
-
     runtime()
         .spawn(async move {
             match custody_method {
@@ -1522,8 +1510,17 @@ pub async fn context_create(
 ) -> Result<Arc<ContextHandle>, ScpError> {
     runtime()
         .spawn(async move {
-            let _ = params;
             let context_id = format!("ctx-{}", Uuid::new_v4());
+
+            // Convert bridge ContextParams to scp-core ContextParams.
+            let core_params = bridge_params_to_core(&params);
+
+            // Delegate to the shared ContextManager.
+            let manager = crate::runtime::context_manager();
+            let _core_handle = manager
+                .create_context(context_id.clone(), core_params, identity.did.clone().into())
+                .await
+                .map_err(ScpError::from)?;
 
             // Extract key custody and signing key from the identity (RED-102).
             #[cfg(feature = "allow_in_memory_custody")]
@@ -1579,7 +1576,27 @@ pub async fn context_join(
             }
             drop(state);
 
-            let _ = identity;
+            // Delegate to the shared ContextManager. Build a core ContextHandle
+            // to pass the context_id, then join via the manager.
+            let manager = crate::runtime::context_manager();
+            let core_handle = scp_core::context::ContextHandle::new(
+                handle.context_id.clone(),
+                scp_core::context::ContextParams::default(),
+            );
+            // Transition core handle to Active so join_context accepts it.
+            let _ = core_handle
+                .transition_to(&scp_core::context::ContextState::Active)
+                .await;
+
+            let key_package = KeyPackage {
+                owner_did: identity.did.clone().into(),
+            };
+
+            manager
+                .join_context(&core_handle, key_package)
+                .await
+                .map_err(ScpError::from)?;
+
             Ok(())
         })
         .await
@@ -1620,7 +1637,22 @@ pub async fn context_leave(
             }
             drop(state);
 
-            let _ = identity;
+            // Delegate to the shared ContextManager.
+            let manager = crate::runtime::context_manager();
+            let core_handle = scp_core::context::ContextHandle::new(
+                handle.context_id.clone(),
+                scp_core::context::ContextParams::default(),
+            );
+            let _ = core_handle
+                .transition_to(&scp_core::context::ContextState::Active)
+                .await;
+
+            let member_did: scp_identity::DID = identity.did.clone().into();
+            manager
+                .leave_context(&core_handle, &member_did, &member_did)
+                .await
+                .map_err(ScpError::from)?;
+
             Ok(())
         })
         .await
@@ -1674,6 +1706,23 @@ pub async fn context_close(
                     code: "SCP-CTX-2017".to_owned(),
                 });
             }
+
+            // Delegate to the shared ContextManager.
+            let manager = crate::runtime::context_manager();
+            let core_handle = scp_core::context::ContextHandle::new(
+                handle.context_id.clone(),
+                scp_core::context::ContextParams::default(),
+            );
+            let _ = core_handle
+                .transition_to(&scp_core::context::ContextState::Active)
+                .await;
+
+            let initiator_did: scp_identity::DID = identity_did.into();
+            manager
+                .close_context(&core_handle, &initiator_did)
+                .await
+                .map_err(ScpError::from)?;
+
             *state = ContextState::Closed;
             drop(state);
 
@@ -1723,7 +1772,22 @@ pub async fn context_send(
             }
             drop(state);
 
-            let _ = (identity, payload);
+            // Delegate to the shared ContextManager.
+            let manager = crate::runtime::context_manager();
+            let core_handle = scp_core::context::ContextHandle::new(
+                handle.context_id.clone(),
+                scp_core::context::ContextParams::default(),
+            );
+            let _ = core_handle
+                .transition_to(&scp_core::context::ContextState::Active)
+                .await;
+
+            let sender_did: scp_identity::DID = identity.did.clone().into();
+            manager
+                .send_message(&core_handle, &sender_did, &payload)
+                .await
+                .map_err(ScpError::from)?;
+
             Ok(())
         })
         .await
@@ -1846,8 +1910,6 @@ pub async fn tool_invoke(
     tool_id: String,
     input_json: String,
     identity: Arc<Identity>,
-    ucan_token: String,
-    proof_tokens: Option<Vec<String>>,
 ) -> Result<String, ScpError> {
     runtime()
         .spawn(async move {
@@ -1863,50 +1925,6 @@ pub async fn tool_invoke(
                 });
             }
             drop(state);
-
-            // Primary authorization: UCAN token validation via the full
-            // 11-step ADR-016 pipeline. Verifies the token grants
-            // tool_invoke:{tool_id} or tool_invoke:* for this context.
-            // See spec §6.2, §8, ADR-016, and issue #319.
-            let context_id = handle.context_id.clone();
-            let identity_did = identity.did.clone();
-            crate::runtime::with_context(&context_id, |rt| {
-                // Use production DID resolver when available (#311), fallback to string-only.
-                let production_resolver = crate::runtime::did_resolver();
-                let did_resolver = scp_ffi_common::DispatchDidResolver::new(
-                    production_resolver.map(std::convert::AsRef::as_ref),
-                );
-                let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
-                    revocation_list: &rt.revocation_list,
-                };
-                let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
-                    inner: &mut rt.nonce_tracker,
-                };
-                let proof_resolver = build_proof_resolver(proof_tokens.as_deref())?;
-
-                let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
-                    did_resolver: &did_resolver,
-                    nonce_tracker: &mut nonce_adapter,
-                    revocation_checker: &revocation_checker,
-                    proof_resolver: &proof_resolver,
-                    ceiling: &rt.ceiling_strings,
-                    context_creator_did: &rt.creator_did,
-                    presenting_agent_did: &identity_did,
-                    clock_skew_tolerance_secs:
-                        scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-                };
-
-                scp_core::context::tools::validate_tool_invocation_ucan(
-                    &ucan_token,
-                    &context_id,
-                    &tool_id,
-                    &mut ctx,
-                )
-                .map_err(|e| ScpError::Permission {
-                    message: format!("UCAN authorization failed for tool '{tool_id}': {e}"),
-                    code: "SCP-PERM-3001".to_owned(),
-                })
-            })?;
 
             let _ = (tool_id, input_json, identity);
             Ok("{}".to_owned())
@@ -2065,69 +2083,17 @@ pub async fn ucan_validate(
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            // Step 1: Parse the UCAN token.
-            let parsed_token =
-                scp_core::crypto::ucan::validate::parse_ucan(&token).map_err(|e| {
-                    ScpError::Permission {
-                        message: format!("failed to parse UCAN token: {e}"),
-                        code: "SCP-PERM-3001".to_owned(),
-                    }
-                })?;
-
-            // Step 2: Parse the required capability URI.
-            let required_cap: scp_core::crypto::ucan::capability::CapabilityUri = capability
-                .parse()
-                .map_err(
-                    |e: scp_core::crypto::ucan::UcanError| ScpError::Permission {
-                        message: format!("invalid capability URI '{capability}': {e}"),
-                        code: "SCP-PERM-3001".to_owned(),
-                    },
-                )?;
-
-            // Step 3: Determine the presenting agent DID.
-            let agent_did = presenting_agent_did
-                .as_deref()
-                .unwrap_or(&parsed_token.payload.aud);
-
-            // Step 4: Build proof resolver from optional proof tokens.
-            let proof_resolver = build_proof_resolver(proof_tokens.as_deref())?;
-
-            // Step 5: Execute the full 11-step validation pipeline (#311).
-            let context_id = handle.context_id.clone();
-            crate::runtime::with_context(&context_id, |rt| {
-                // Use production DID resolver when available (#311), fallback to string-only.
-                let production_resolver = crate::runtime::did_resolver();
-                let did_resolver = scp_ffi_common::DispatchDidResolver::new(
-                    production_resolver.map(std::convert::AsRef::as_ref),
-                );
-                let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
-                    revocation_list: &rt.revocation_list,
-                };
-                let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
-                    inner: &mut rt.nonce_tracker,
-                };
-
-                let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
-                    did_resolver: &did_resolver,
-                    nonce_tracker: &mut nonce_adapter,
-                    revocation_checker: &revocation_checker,
-                    proof_resolver: &proof_resolver,
-                    ceiling: &rt.ceiling_strings,
-                    context_creator_did: &rt.creator_did,
-                    presenting_agent_did: agent_did,
-                    clock_skew_tolerance_secs:
-                        scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-                };
-
-                scp_core::crypto::ucan::validate::validate_ucan(
-                    &parsed_token,
-                    &required_cap,
-                    &mut ctx,
-                )
-                .map_err(|e| ScpError::Permission {
-                    message: format!("UCAN validation failed: {e}"),
-                    code: "SCP-PERM-3001".to_owned(),
-                })
+            let _ = (
+                handle,
+                token,
+                capability,
+                presenting_agent_did,
+                proof_tokens,
+            );
+            Err(ScpError::Permission {
+                message: "not yet connected to runtime — UCAN validation requires a live context"
+                    .to_owned(),
+                code: "SCP-PERM-3002".to_owned(),
             })
         })
         .await
@@ -2205,11 +2171,6 @@ async fn ucan_mint_impl(
                 code: "SCP-PERM-3004".to_owned(),
             })?;
 
-            // Get ceiling from the runtime registry for mint-time enforcement (#339).
-            let ceiling_strings = crate::runtime::with_context(&handle.context_id, |rt| {
-                Ok(rt.ceiling_strings.clone())
-            })?;
-
             let params = scp_core::crypto::ucan::mint::MintParams {
                 issuer_did: &handle.creator_did,
                 issuer_key: &signing_key,
@@ -2222,7 +2183,6 @@ async fn ucan_mint_impl(
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
-                ceiling: Some(ceiling_strings),
             };
 
             let token = scp_core::crypto::ucan::mint::mint_ucan(&params, &custody.0)
@@ -2259,170 +2219,6 @@ async fn ucan_mint_impl(
 ) -> Result<Arc<UcanToken>, ScpError> {
     Err(ScpError::Permission {
         message: "UCAN minting requires key custody — the in_memory custody path \
-                  is not available in this build. Enable the \
-                  \"allow_in_memory_custody\" feature for dev/desktop use, or wire \
-                  a KeyCustodyProvider for production."
-            .to_owned(),
-        code: "SCP-PERM-3004".to_owned(),
-    })
-}
-
-/// Delegates a UCAN token to another member.
-///
-/// Creates a delegated UCAN from an existing parent token, signed with the
-/// delegator's Ed25519 key via the retained [`KeyCustody`] provider on the
-/// context handle. Delegation enforces attenuation (capabilities can only
-/// narrow, never widen) and links to the parent via its CID in the proof chain.
-///
-/// # Arguments
-///
-/// * `handle` — The context to delegate within (must have key custody
-///   from `context_create` with an `in_memory` identity).
-/// * `delegatee_did` — The DID of the member receiving the delegated token.
-/// * `parent_token` — The encoded parent UCAN token (JWT format). The
-///   delegator must be the audience of this token.
-/// * `capabilities` — List of capability strings to delegate (must be a
-///   subset of the parent token's capabilities).
-///
-/// # Returns
-///
-/// A `UcanToken` handle with the delegated token's metadata and a real
-/// Ed25519 signature.
-///
-/// # Errors
-///
-/// Returns `ScpError::Permission` if the context does not have key custody,
-/// the delegator DID does not match the parent token's audience, or if
-/// capabilities are wider than the parent's (attenuation violation).
-///
-/// See ADR-016 criterion 4 and SCP-214 criterion 8.
-#[uniffi::export]
-pub async fn ucan_delegate(
-    handle: Arc<ContextHandle>,
-    delegatee_did: String,
-    parent_token: String,
-    capabilities: Vec<String>,
-) -> Result<Arc<UcanToken>, ScpError> {
-    ucan_delegate_impl(handle, delegatee_did, parent_token, capabilities).await
-}
-
-/// Inner implementation of [`ucan_delegate`], split out for cfg-gating clarity.
-#[cfg(feature = "allow_in_memory_custody")]
-async fn ucan_delegate_impl(
-    handle: Arc<ContextHandle>,
-    delegatee_did: String,
-    parent_token_str: String,
-    capabilities: Vec<String>,
-) -> Result<Arc<UcanToken>, ScpError> {
-    runtime()
-        .spawn(async move {
-            // Extract key custody and signing key from the context handle (RED-102).
-            let custody =
-                handle
-                    .in_memory_custody
-                    .as_ref()
-                    .ok_or_else(|| ScpError::Permission {
-                        message: "UCAN delegation requires key custody — create the context with \
-                              an in_memory identity (identity_create(\"in_memory\"))"
-                            .to_owned(),
-                        code: "SCP-PERM-3004".to_owned(),
-                    })?;
-            let signing_key = handle.signing_key.ok_or_else(|| ScpError::Permission {
-                message: "UCAN delegation requires a signing key — the context creator identity \
-                          must have an active signing key"
-                    .to_owned(),
-                code: "SCP-PERM-3004".to_owned(),
-            })?;
-
-            // Parse the parent token.
-            let parsed_parent = scp_core::crypto::ucan::validate::parse_ucan(&parent_token_str)
-                .map_err(ScpError::from)?;
-
-            // Build attenuated capabilities from the capability URI strings.
-            let attenuations: Vec<scp_core::crypto::ucan::Attenuation> = capabilities
-                .iter()
-                .map(|cap| {
-                    let cap_uri = if cap.starts_with("scp:ctx:") {
-                        cap.clone()
-                    } else {
-                        // Resolve short names against parent token's capabilities.
-                        // The parent's `att` entries contain full URIs scoped to the
-                        // parent's context — find the first whose suffix matches.
-                        parsed_parent
-                            .payload
-                            .att
-                            .iter()
-                            .find(|a| a.with.ends_with(&format!("/{cap}")))
-                            .map(|a| a.with.clone())
-                            .unwrap_or_else(|| format!("scp:ctx:{}/{cap}", handle.context_id))
-                    };
-                    let action = cap_uri.rsplit_once('/').map_or_else(
-                        || cap.clone(),
-                        |(_, a)| {
-                            a.split_once(':')
-                                .map_or_else(|| a.to_owned(), |(_, act)| act.to_owned())
-                        },
-                    );
-                    scp_core::crypto::ucan::Attenuation {
-                        with: cap_uri,
-                        can: action,
-                    }
-                })
-                .collect();
-
-            // Get ceiling from the runtime registry for delegation-time enforcement (#339).
-            let ceiling_strings = crate::runtime::with_context(&handle.context_id, |rt| {
-                Ok(rt.ceiling_strings.clone())
-            })?;
-
-            let params = scp_core::crypto::ucan::mint::DelegateParams {
-                parent_token: &parsed_parent,
-                delegator_did: &handle.creator_did,
-                delegator_key: &signing_key,
-                delegatee_did: &delegatee_did,
-                attenuated_capabilities: &attenuations,
-                lifetime_secs: 3600, // 1 hour default
-                facts: None,
-                key_scope: None,
-                signing_key_id: None,
-                ceiling: Some(ceiling_strings),
-            };
-
-            let token = scp_core::crypto::ucan::mint::delegate_ucan(&params, &custody.0)
-                .await
-                .map_err(ScpError::from)?;
-
-            let data = UcanTokenData {
-                token_id: token.payload.nnc.clone(),
-                issuer: token.payload.iss.clone(),
-                audience: token.payload.aud.clone(),
-                capabilities: token.payload.att.iter().map(|a| a.with.clone()).collect(),
-                expires_at: Some(token.payload.exp),
-            };
-
-            increment_handle_count();
-            Ok(Arc::new(UcanToken {
-                data,
-                encoded: token.encoded,
-            }))
-        })
-        .await
-        .map_err(|e| ScpError::Permission {
-            message: format!("tokio task join error during UCAN delegation: {e}"),
-            code: "SCP-PERM-3005".to_owned(),
-        })?
-}
-
-#[cfg(not(feature = "allow_in_memory_custody"))]
-#[allow(clippy::unused_async)] // Must be async to match the cfg(feature) variant's signature.
-async fn ucan_delegate_impl(
-    _handle: Arc<ContextHandle>,
-    _delegatee_did: String,
-    _parent_token: String,
-    _capabilities: Vec<String>,
-) -> Result<Arc<UcanToken>, ScpError> {
-    Err(ScpError::Permission {
-        message: "UCAN delegation requires key custody — the in_memory custody path \
                   is not available in this build. Enable the \
                   \"allow_in_memory_custody\" feature for dev/desktop use, or wire \
                   a KeyCustodyProvider for production."
@@ -2551,33 +2347,537 @@ pub async fn event_log_verify(
 }
 
 // ---------------------------------------------------------------------------
+// Free functions — governance operations (#387)
+//
+// All 24 GovernanceAction variants are dispatchable via
+// ContextManager::execute_governance_action.
+// ---------------------------------------------------------------------------
+
+/// Executes an approved governance action on a context.
+///
+/// The `proposal_json` must be a JSON-serialized `GovernanceProposal` with
+/// status `Approved`. All 24 governance action variants (ADR-031) are
+/// supported.
+///
+/// # Arguments
+///
+/// * `handle` — The context handle.
+/// * `proposal_json` — JSON-serialized `GovernanceProposal`.
+///
+/// # Errors
+///
+/// Returns `ScpError::Permission` if the proposal is not approved, targets
+/// the wrong context, or has already been executed (replay protection).
+/// Returns `ScpError::Context` for any other governance execution failure.
+#[uniffi::export]
+pub async fn governance_execute(
+    handle: Arc<ContextHandle>,
+    proposal_json: String,
+) -> Result<String, ScpError> {
+    runtime()
+        .spawn(async move {
+            let proposal: scp_core::context::governance::GovernanceProposal =
+                serde_json::from_str(&proposal_json)?;
+            let manager = crate::runtime::context_manager();
+            let result = manager
+                .execute_governance_action(&handle.context_id, &proposal)
+                .await
+                .map_err(ScpError::from)?;
+            // Serialize the result variant name for the caller.
+            let result_str = match result {
+                scp_core::context::manager::GovernanceActionResult::AuthorBlocked(_) => {
+                    "AuthorBlocked"
+                }
+                scp_core::context::manager::GovernanceActionResult::SubscriberBanned(_) => {
+                    "SubscriberBanned"
+                }
+                scp_core::context::manager::GovernanceActionResult::SubscriberUnbanned {
+                    ..
+                } => "SubscriberUnbanned",
+                scp_core::context::manager::GovernanceActionResult::Executed => "Executed",
+            };
+            Ok(result_str.to_owned())
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            message: format!("tokio task join error during governance execution: {e}"),
+            code: "SCP-CTX-2032".to_owned(),
+        })?
+}
+
+// ---------------------------------------------------------------------------
+// Free functions — broadcast operations (#387)
+// ---------------------------------------------------------------------------
+
+/// Subscribes a DID to a broadcast context.
+///
+/// For open broadcast contexts, any DID can subscribe. For gated contexts,
+/// a valid `messagesRead` UCAN is required (passed as `ucan_token` JSON).
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` if the context is not active, not a
+/// broadcast context, or if subscription fails.
+#[uniffi::export]
+pub async fn broadcast_subscribe(
+    handle: Arc<ContextHandle>,
+    subscriber_did: String,
+) -> Result<(), ScpError> {
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager();
+            let did: scp_identity::DID = subscriber_did.into();
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            manager
+                .subscribe_broadcast::<
+                    crate::bridge::NoOpDidResolver,
+                    crate::bridge::NoOpNonceTracker,
+                    crate::bridge::NoOpRevocationChecker,
+                    crate::bridge::NoOpProofResolver,
+                    std::hash::RandomState,
+                >(&handle.context_id, &did, None, timestamp, None)
+                .await
+                .map_err(ScpError::from)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            message: format!("tokio task join error during broadcast subscribe: {e}"),
+            code: "SCP-CTX-2033".to_owned(),
+        })?
+}
+
+/// Unsubscribes a DID from a broadcast context.
+///
+/// When `rotate_keys` is `true`, all authors rotate their broadcast keys
+/// for forward secrecy.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` if the context is not active or not broadcast.
+#[uniffi::export]
+pub async fn broadcast_unsubscribe(
+    handle: Arc<ContextHandle>,
+    subscriber_did: String,
+    rotate_keys: bool,
+) -> Result<(), ScpError> {
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager();
+            let did: scp_identity::DID = subscriber_did.into();
+            manager
+                .unsubscribe_broadcast(&handle.context_id, &did, rotate_keys)
+                .await
+                .map_err(ScpError::from)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            message: format!("tokio task join error during broadcast unsubscribe: {e}"),
+            code: "SCP-CTX-2034".to_owned(),
+        })?
+}
+
+/// Publishes a message to a broadcast context.
+///
+/// The payload is encrypted with the author's broadcast key.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` if the context is not active, not broadcast,
+/// or the sender is not an author.
+#[uniffi::export]
+pub async fn broadcast_publish(
+    handle: Arc<ContextHandle>,
+    author_did: String,
+    payload: Vec<u8>,
+) -> Result<(), ScpError> {
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager();
+            let did: scp_identity::DID = author_did.into();
+            manager
+                .publish_broadcast(&handle.context_id, &did, &payload)
+                .await
+                .map_err(ScpError::from)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            message: format!("tokio task join error during broadcast publish: {e}"),
+            code: "SCP-CTX-2035".to_owned(),
+        })?
+}
+
+/// Blocks a subscriber's read access in a broadcast context.
+///
+/// The subscriber is removed from the registry and added to all authors'
+/// block lists; all author keys are rotated.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` if the operation fails.
+#[uniffi::export]
+pub async fn broadcast_block_subscriber(
+    handle: Arc<ContextHandle>,
+    subscriber_did: String,
+    blocker_did: String,
+) -> Result<(), ScpError> {
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager();
+            let subscriber: scp_identity::DID = subscriber_did.into();
+            let blocker: scp_identity::DID = blocker_did.into();
+            manager
+                .block_broadcast_subscriber(&handle.context_id, &subscriber, &blocker)
+                .await
+                .map_err(ScpError::from)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            message: format!("tokio task join error during broadcast block: {e}"),
+            code: "SCP-CTX-2036".to_owned(),
+        })?
+}
+
+/// Handles a broadcast key request from a subscriber.
+///
+/// Validates the author DID is locally controlled and processes the key
+/// distribution request.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` if the operation fails.
+#[uniffi::export]
+pub async fn broadcast_handle_key_request(
+    handle: Arc<ContextHandle>,
+    author_did: String,
+    requester_did: String,
+) -> Result<String, ScpError> {
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager();
+            let author: scp_identity::DID = author_did.into();
+            let requester: scp_identity::DID = requester_did.into();
+            let decision = manager
+                .handle_broadcast_key_request(&handle.context_id, &author, &requester)
+                .await
+                .map_err(ScpError::from)?;
+            Ok(format!("{decision:?}"))
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            message: format!("tokio task join error during key request handling: {e}"),
+            code: "SCP-CTX-2037".to_owned(),
+        })?
+}
+
+/// Returns the number of broadcast subscribers for a context.
+///
+/// Returns `None` if the context is not registered or not a broadcast context.
+#[uniffi::export]
+pub async fn broadcast_subscriber_count(handle: Arc<ContextHandle>) -> Option<u64> {
+    let manager = crate::runtime::context_manager();
+    manager
+        .broadcast_subscriber_count(&handle.context_id)
+        .await
+        .map(|n| n as u64)
+}
+
+/// Returns `true` if the given DID is a broadcast subscriber.
+#[uniffi::export]
+pub async fn broadcast_is_subscriber(handle: Arc<ContextHandle>, did: String) -> bool {
+    let manager = crate::runtime::context_manager();
+    manager
+        .is_broadcast_subscriber(&handle.context_id, &did)
+        .await
+}
+
+/// Returns the broadcast admission policy for a context.
+///
+/// Returns the policy as a string: `"Open"` or `"Gated"`.
+/// Returns `None` if the context is not a broadcast context.
+#[uniffi::export]
+pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Option<String> {
+    let manager = crate::runtime::context_manager();
+    manager
+        .broadcast_admission(&handle.context_id)
+        .await
+        .map(|a| format!("{a:?}"))
+}
+
+// ---------------------------------------------------------------------------
+// Free functions — membership queries (#387)
+// ---------------------------------------------------------------------------
+
+/// Returns the current member count for a context.
+///
+/// Returns `None` if the context is not registered.
+#[uniffi::export]
+pub async fn context_member_count(handle: Arc<ContextHandle>) -> Option<u64> {
+    let manager = crate::runtime::context_manager();
+    manager
+        .member_count(&handle.context_id)
+        .await
+        .map(|n| n as u64)
+}
+
+/// Returns `true` if the given DID is a member of the context.
+#[uniffi::export]
+pub async fn context_is_member(handle: Arc<ContextHandle>, did: String) -> bool {
+    let manager = crate::runtime::context_manager();
+    manager.is_member(&handle.context_id, &did).await
+}
+
+/// Returns all member DIDs for a context.
+#[uniffi::export]
+pub async fn context_member_dids(handle: Arc<ContextHandle>) -> Vec<String> {
+    let manager = crate::runtime::context_manager();
+    manager.member_dids(&handle.context_id).await
+}
+
+/// Returns the role assignment for a specific member as a JSON string.
+///
+/// Returns `None` if the member is not found or the context is not registered.
+#[uniffi::export]
+pub async fn context_member_role(handle: Arc<ContextHandle>, did: String) -> Option<String> {
+    let manager = crate::runtime::context_manager();
+    manager
+        .member_role(&handle.context_id, &did)
+        .await
+        .map(|r| format!("{r:?}"))
+}
+
+// ---------------------------------------------------------------------------
+// Free functions — events (#387)
+// ---------------------------------------------------------------------------
+
+/// Drains all pending events from the context's receive buffer.
+///
+/// Returns a list of event descriptions as JSON strings. Returns empty
+/// if the context is not registered.
+#[uniffi::export]
+pub async fn context_drain_events(handle: Arc<ContextHandle>) -> Vec<String> {
+    let manager = crate::runtime::context_manager();
+    manager
+        .drain_events(&handle.context_id)
+        .await
+        .into_iter()
+        .map(|e| format!("{e:?}"))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Free functions — TTL operations (#387)
+// ---------------------------------------------------------------------------
+
+/// Handles TTL expiry for a context.
+///
+/// Transitions from `Active` to `Expired`, destroys keys per memory scope.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` if the context is not active.
+#[uniffi::export]
+#[allow(clippy::significant_drop_tightening)]
+pub async fn context_handle_ttl_expiry(handle: Arc<ContextHandle>) -> Result<(), ScpError> {
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager();
+            let core_handle = scp_core::context::ContextHandle::new(
+                handle.context_id.clone(),
+                scp_core::context::ContextParams::default(),
+            );
+            let _ = core_handle
+                .transition_to(&scp_core::context::ContextState::Active)
+                .await;
+            manager
+                .handle_ttl_expiry(&core_handle)
+                .await
+                .map_err(ScpError::from)?;
+
+            // Update the FFI handle state to reflect expiry.
+            let mut state = handle.state.lock().await;
+            *state = ContextState::Expired;
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            message: format!("tokio task join error during TTL expiry: {e}"),
+            code: "SCP-CTX-2038".to_owned(),
+        })?
+}
+
+/// Proposes a TTL extension. Records consent from the given member.
+///
+/// Returns `true` if all members have consented (unanimous approval).
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` if the context is not registered or the
+/// member is not found.
+#[uniffi::export]
+pub async fn context_propose_ttl_extension(
+    handle: Arc<ContextHandle>,
+    member_did: String,
+    proposed_seconds: u64,
+) -> Result<bool, ScpError> {
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager();
+            let did: scp_identity::DID = member_did.into();
+            let duration = std::time::Duration::from_secs(proposed_seconds);
+            manager
+                .propose_ttl_extension(&handle.context_id, &did, duration)
+                .await
+                .map_err(ScpError::from)
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            message: format!("tokio task join error during TTL extension proposal: {e}"),
+            code: "SCP-CTX-2039".to_owned(),
+        })?
+}
+
+/// Resets the TTL timer after a successful unanimous extension.
+///
+/// Cancels the old timer and spawns a new one with the given duration.
+#[uniffi::export]
+pub async fn context_reset_ttl_timer(handle: Arc<ContextHandle>, new_seconds: u64) {
+    let manager = crate::runtime::context_manager();
+    let core_handle = scp_core::context::ContextHandle::new(
+        handle.context_id.clone(),
+        scp_core::context::ContextParams::default(),
+    );
+    let _ = core_handle
+        .transition_to(&scp_core::context::ContextState::Active)
+        .await;
+    let duration = std::time::Duration::from_secs(new_seconds);
+    manager
+        .reset_ttl_timer(&handle.context_id, duration, core_handle)
+        .await;
+}
+
+// ---------------------------------------------------------------------------
+// Free functions — local DID management (#387)
+// ---------------------------------------------------------------------------
+
+/// Registers a DID as locally controlled by this node/SDK.
+///
+/// Used for defense-in-depth validation in broadcast key request handling.
+#[uniffi::export]
+pub async fn register_local_did(did: String) {
+    let manager = crate::runtime::context_manager();
+    manager.register_local_did(did.into()).await;
+}
+
+/// Returns `true` if the given DID is registered as locally controlled.
+#[uniffi::export]
+pub async fn is_local_did(did: String) -> bool {
+    let manager = crate::runtime::context_manager();
+    let did_ref: scp_identity::DID = did.into();
+    manager.is_local_did(&did_ref).await
+}
+
+// ---------------------------------------------------------------------------
+// No-op validation trait stubs for subscribe_broadcast generic params
+//
+// These are minimal implementations satisfying the generic bounds on
+// ContextManager::subscribe_broadcast. Broadcast subscription in open mode
+// does not require UCAN validation; gated mode validation will be wired
+// when the full UCAN pipeline is integrated with the FFI layer.
+// ---------------------------------------------------------------------------
+
+pub(crate) struct NoOpDidResolver;
+impl scp_core::crypto::ucan::validate::DidResolver for NoOpDidResolver {
+    fn resolve_public_key(
+        &self,
+        _did: &str,
+    ) -> Result<[u8; 32], scp_core::crypto::ucan::UcanError> {
+        Err(scp_core::crypto::ucan::UcanError::MalformedToken(
+            "NoOpDidResolver: no DID resolution available".into(),
+        ))
+    }
+}
+
+pub(crate) struct NoOpNonceTracker;
+impl scp_core::crypto::ucan::validate::NonceTracker for NoOpNonceTracker {
+    fn check_and_record(
+        &mut self,
+        _nonce: &str,
+        _token_expiry: u64,
+    ) -> Result<(), scp_core::crypto::ucan::UcanError> {
+        Ok(())
+    }
+}
+
+pub(crate) struct NoOpRevocationChecker;
+impl scp_core::crypto::ucan::validate::RevocationChecker for NoOpRevocationChecker {
+    fn is_revoked(&self, _token_cid: &str) -> bool {
+        false
+    }
+}
+
+pub(crate) struct NoOpProofResolver;
+impl scp_core::crypto::ucan::validate::ProofResolver for NoOpProofResolver {
+    fn resolve_proof(
+        &self,
+        cid: &str,
+    ) -> Result<scp_core::crypto::ucan::UcanToken, scp_core::crypto::ucan::UcanError> {
+        Err(scp_core::crypto::ucan::UcanError::DelegationChainBroken(
+            format!("NoOpProofResolver: no proof available for CID {cid}"),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Builds a [`BridgeProofResolver`] from optional encoded proof token strings.
-///
-/// Parses each proof token and indexes it by its CID (SHA-256 of the encoded
-/// JWT via `compute_cid`) so that the delegation chain verifier can resolve
-/// proof references.
-pub(crate) fn build_proof_resolver(
-    proof_tokens: Option<&[String]>,
-) -> Result<scp_ffi_common::BridgeProofResolver, ScpError> {
-    let mut proofs = std::collections::HashMap::new();
+/// Converts bridge `ContextParams` to scp-core `ContextParams`.
+fn bridge_params_to_core(params: &ContextParams) -> scp_core::context::ContextParams {
+    use scp_core::context::params::{Capability, PromotionPolicy};
 
-    if let Some(tokens) = proof_tokens {
-        for encoded in tokens {
-            let token = scp_core::crypto::ucan::validate::parse_ucan(encoded).map_err(|e| {
-                ScpError::Permission {
-                    message: format!("failed to parse proof token: {e}"),
-                    code: "SCP-PERM-3001".to_owned(),
-                }
-            })?;
-            let cid = scp_core::crypto::ucan::mint::compute_cid(&token);
-            proofs.insert(cid, token);
-        }
+    let ceiling: Vec<Capability> = params.ceiling.iter().map(Capability::new).collect();
+
+    let memory_scope = match params.memory_scope {
+        MemoryScope::Ephemeral => scp_core::context::params::MemoryScope::Ephemeral,
+        MemoryScope::Summary => scp_core::context::params::MemoryScope::Summary,
+        MemoryScope::Full => scp_core::context::params::MemoryScope::Full,
+    };
+
+    let ttl = if params.ttl_seconds > 0 {
+        Some(std::time::Duration::from_secs(params.ttl_seconds))
+    } else {
+        None
+    };
+
+    // GovernanceModel in scp-core currently only has SingleAdmin.
+    // All bridge governance variants map to SingleAdmin until scp-core
+    // adds additional model variants (the governance engine dispatch already
+    // handles all 24 actions regardless of the model enum).
+    let governance = scp_core::context::params::GovernanceModel::SingleAdmin;
+
+    let promotion_policy = if params.promotable {
+        PromotionPolicy::Promotable
+    } else {
+        PromotionPolicy::NoPromotion
+    };
+
+    scp_core::context::ContextParams {
+        ceiling,
+        governance,
+        memory_scope,
+        ttl,
+        promotion_policy,
+        ..scp_core::context::ContextParams::default()
     }
-
-    Ok(scp_ffi_common::BridgeProofResolver { proofs })
 }
 
 /// Parses a custody type string into a `CustodyMethod`.
