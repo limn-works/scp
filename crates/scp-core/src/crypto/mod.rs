@@ -11,6 +11,7 @@
 //! - [`ucan`] — UCAN token types and capability enforcement (ADR-016).
 //! - [`canonical`] — Canonical hash construction for signed structures (§9.5.1).
 
+mod bip39_wordlist;
 pub mod canonical;
 pub mod ed25519;
 pub mod key_continuity;
