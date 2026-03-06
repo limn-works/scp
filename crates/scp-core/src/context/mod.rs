@@ -143,7 +143,7 @@ pub use governance::{
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
     GovernanceModelConfig, GovernanceProposal, ProposalId, ProposalStatus, RejectionReason,
     RevocationScope, SignedVote, SingleAdminEngine, VoteType, majority::MajorityVoteEngine,
-    sign_vote, verify_vote,
+    multisig::ThresholdEngine, sign_vote, unanimity::UnanimityEngine, verify_vote,
 };
 
 // Re-export broadcast context types (SCP-227, spec section 5.14, #101).
@@ -312,6 +312,17 @@ pub enum ContextError {
     /// during context or broadcast state persistence or restoration.
     #[error("persistence failed: {0}")]
     PersistenceFailed(String),
+
+    /// A governance operation failed (proposal, vote, engine error).
+    ///
+    /// Returned when the [`GovernanceEngine`] reports an error during
+    /// proposal creation, voting, or resolution.
+    #[error("governance failed: {0}")]
+    GovernanceFailed(String),
+
+    /// Context creation failed due to invalid parameters or internal error.
+    #[error("creation failed: {0}")]
+    CreationFailed(String),
 }
 
 // ---------------------------------------------------------------------------

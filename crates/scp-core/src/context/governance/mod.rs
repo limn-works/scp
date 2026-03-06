@@ -1076,6 +1076,12 @@ pub trait GovernanceEngine: Send + Sync {
 
     /// Look up a proposal by ID. Returns `None` if not found.
     fn get_proposal(&self, proposal_id: &ProposalId) -> Option<&GovernanceProposal>;
+
+    /// List all proposals tracked by this engine (pending and resolved).
+    ///
+    /// Returns cloned proposals. Engines only track proposals in memory;
+    /// for durable access, proposals should be queried from the event log.
+    fn list_proposals(&self) -> Vec<GovernanceProposal>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1275,6 +1281,10 @@ impl GovernanceEngine for SingleAdminEngine {
 
     fn get_proposal(&self, proposal_id: &ProposalId) -> Option<&GovernanceProposal> {
         self.proposals.get(proposal_id)
+    }
+
+    fn list_proposals(&self) -> Vec<GovernanceProposal> {
+        self.proposals.values().cloned().collect()
     }
 }
 

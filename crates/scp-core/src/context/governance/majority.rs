@@ -580,6 +580,10 @@ impl GovernanceEngine for MajorityVoteEngine {
     fn get_proposal(&self, proposal_id: &ProposalId) -> Option<&GovernanceProposal> {
         self.proposals.get(proposal_id)
     }
+
+    fn list_proposals(&self) -> Vec<GovernanceProposal> {
+        self.proposals.values().cloned().collect()
+    }
 }
 
 // ---------------------------------------------------------------------------

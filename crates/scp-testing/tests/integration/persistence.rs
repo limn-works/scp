@@ -1079,6 +1079,7 @@ async fn context_manager_broadcast_restore_roundtrip() {
         threshold_signers: Vec::new(),
         threshold_value: 0,
         pruning_policy: None,
+        governance_model_config: None,
     };
     persistence
         .persist_context(ctx_id, &context_snapshot)

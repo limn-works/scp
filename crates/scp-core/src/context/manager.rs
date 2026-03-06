@@ -24,10 +24,13 @@ use super::builder::{
     create_context as builder_create_context,
 };
 use super::governance::{
-    GovernanceAction, GovernanceProposal, ProposalId, ProposalStatus, PruningPolicy,
-    RevocationScope,
+    GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceEvent, GovernanceModelConfig,
+    GovernanceProposal, ProposalId, ProposalStatus, PruningPolicy, RevocationScope,
+    SingleAdminEngine, majority::MajorityVoteEngine, multisig::ThresholdEngine,
+    unanimity::UnanimityEngine,
 };
 use super::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
+use super::params::GovernanceModel;
 use super::params::{ContextMode, TemplateId, ToolRegistration};
 use super::roles::{self, Capability, CapabilityCeiling, ContextRoleState, RoleAssignment};
 use super::tools::interface::ToolInterface;
@@ -135,6 +138,13 @@ pub struct ContextSnapshot {
     /// Pruning policy override (ADR-030 §6).
     #[serde(default)]
     pub pruning_policy: Option<PruningPolicy>,
+    /// Governance model configuration for engine restoration (ADR-031).
+    ///
+    /// Persisted so the correct `GovernanceEngine` can be reconstructed on
+    /// restart. `None` for legacy snapshots (defaults to `SingleAdmin` with
+    /// the first admin DID from membership).
+    #[serde(default)]
+    pub governance_model_config: Option<GovernanceModelConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -266,6 +276,130 @@ struct PerContextState {
     threshold_value: u32,
     /// Pruning policy override (ADR-030 §6).
     pruning_policy: Option<PruningPolicy>,
+    /// The governance engine for this context (ADR-031, spec §5.9).
+    ///
+    /// Initialized at context creation based on `GovernanceModel` in
+    /// `ContextParams`. Handles proposal creation, voting, and quorum
+    /// evaluation. The engine is restored from `GovernanceModelConfig` on
+    /// restart.
+    governance_engine: Box<dyn GovernanceEngine>,
+}
+
+/// Creates a governance engine from a [`GovernanceModel`] selector and
+/// the context creator's DID.
+///
+/// This maps the creation-time `GovernanceModel` (which lives in
+/// `ContextParams`) to the runtime `GovernanceEngine` implementation.
+///
+/// # Errors
+///
+/// Returns [`ContextCreationError`] if the governance model parameters are
+/// invalid (e.g., threshold > signers, empty voter sets).
+fn create_governance_engine(
+    model: &GovernanceModel,
+    creator_did: &DID,
+    key_resolver: KeyResolver,
+) -> Result<Box<dyn GovernanceEngine>, ContextCreationError> {
+    match model {
+        GovernanceModel::SingleAdmin => {
+            Ok(Box::new(SingleAdminEngine::new(creator_did.clone(), key_resolver)))
+        }
+        GovernanceModel::Threshold { threshold, signers } => {
+            let engine = ThresholdEngine::new(signers.clone(), *threshold, 86_400, key_resolver)
+                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+            Ok(Box::new(engine))
+        }
+        GovernanceModel::Majority { eligible_voters } => {
+            let engine =
+                MajorityVoteEngine::new(eligible_voters.clone(), 86_400, 5000, key_resolver)
+                    .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+            Ok(Box::new(engine))
+        }
+        GovernanceModel::Unanimity { eligible_voters } => {
+            let engine = UnanimityEngine::new(eligible_voters.clone(), 172_800, key_resolver)
+                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+            Ok(Box::new(engine))
+        }
+    }
+}
+
+/// Reconstructs a governance engine from a persisted [`GovernanceModelConfig`]
+/// and the context's current member set.
+///
+/// For `SingleAdmin` and `Threshold`, the config is self-contained.
+/// For `Majority` and `Unanimity`, the eligible voter set comes from the
+/// `GovernanceModel` stored in `ContextParams` (part of the snapshot).
+///
+/// # Errors
+///
+/// Returns [`ContextError`] if the engine cannot be reconstructed.
+fn restore_governance_engine_from_snapshot(
+    snapshot: &ContextSnapshot,
+    key_resolver: KeyResolver,
+) -> Result<Box<dyn GovernanceEngine>, ContextError> {
+    // Determine the config to restore from. If the snapshot has an explicit
+    // config, use it. Otherwise, fall back to SingleAdmin with the first admin.
+    let config = snapshot.governance_model_config.clone().unwrap_or_else(|| {
+        // Legacy snapshot: no governance_model_config. Default to SingleAdmin
+        // with the first admin from the membership state.
+        let admin_did = snapshot
+            .membership
+            .members()
+            .find(|m| m.role_name == "admin")
+            .map_or_else(|| DID::from("did:dht:unknown"), |m| m.did.clone());
+        GovernanceModelConfig::SingleAdmin { admin_did }
+    });
+
+    match config {
+        GovernanceModelConfig::SingleAdmin { admin_did } => {
+            Ok(Box::new(SingleAdminEngine::new(admin_did, key_resolver)))
+        }
+        GovernanceModelConfig::Threshold {
+            signers,
+            threshold,
+            voting_window_secs,
+        } => {
+            let engine =
+                ThresholdEngine::new(signers, threshold, voting_window_secs, key_resolver)
+                    .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
+            Ok(Box::new(engine))
+        }
+        GovernanceModelConfig::Majority {
+            voting_window_secs,
+            min_participation_bps,
+        } => {
+            // Recover eligible_voters from ContextParams.governance.
+            let voters = match &snapshot.context_params.governance {
+                GovernanceModel::Majority { eligible_voters } => eligible_voters.clone(),
+                _ => {
+                    // Mismatch between config and params — should not happen.
+                    // Fall back to all members.
+                    snapshot
+                        .membership
+                        .members()
+                        .map(|m| m.did.clone())
+                        .collect()
+                }
+            };
+            let engine =
+                MajorityVoteEngine::new(voters, voting_window_secs, min_participation_bps, key_resolver)
+                    .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
+            Ok(Box::new(engine))
+        }
+        GovernanceModelConfig::Unanimity { voting_window_secs } => {
+            let voters = match &snapshot.context_params.governance {
+                GovernanceModel::Unanimity { eligible_voters } => eligible_voters.clone(),
+                _ => snapshot
+                    .membership
+                    .members()
+                    .map(|m| m.did.clone())
+                    .collect(),
+            };
+            let engine = UnanimityEngine::new(voters, voting_window_secs, key_resolver)
+                .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
+            Ok(Box::new(engine))
+        }
+    }
 }
 
 /// Reads the context state synchronously via [`ContextHandle::try_read_state`].
@@ -274,6 +408,62 @@ struct PerContextState {
 ///
 /// This is used inside `Mutex` lock scopes to avoid TOCTOU races: the state
 /// check and the subsequent mutation happen within the same lock acquisition,
+/// Validates governance model parameters at context creation time.
+///
+/// Rejects configurations that would make governance impossible:
+/// - `Threshold` with `threshold == 0` (trivial quorum).
+/// - `Threshold` with `threshold > signers.len()` (impossible quorum).
+/// - `Threshold` with empty signers.
+/// - `Majority` with empty `eligible_voters`.
+/// - `Unanimity` with empty `eligible_voters`.
+///
+/// # Errors
+///
+/// Returns [`ContextCreationError::CreationFailed`] with a descriptive message.
+fn validate_governance_model(model: &GovernanceModel) -> Result<(), ContextCreationError> {
+    match model {
+        GovernanceModel::SingleAdmin => Ok(()),
+        GovernanceModel::Threshold { threshold, signers } => {
+            if signers.is_empty() {
+                return Err(ContextCreationError::CreationFailed(
+                    "Threshold governance requires non-empty signers".into(),
+                ));
+            }
+            if *threshold == 0 {
+                return Err(ContextCreationError::CreationFailed(
+                    "Threshold governance requires threshold >= 1".into(),
+                ));
+            }
+            // signers.len() is bounded by realistic member counts (<< u32::MAX).
+            #[allow(clippy::cast_possible_truncation)]
+            if *threshold > signers.len() as u32 {
+                return Err(ContextCreationError::CreationFailed(format!(
+                    "Threshold {} exceeds number of signers {}",
+                    threshold,
+                    signers.len()
+                )));
+            }
+            Ok(())
+        }
+        GovernanceModel::Majority { eligible_voters } => {
+            if eligible_voters.is_empty() {
+                return Err(ContextCreationError::CreationFailed(
+                    "Majority governance requires non-empty eligible_voters".into(),
+                ));
+            }
+            Ok(())
+        }
+        GovernanceModel::Unanimity { eligible_voters } => {
+            if eligible_voters.is_empty() {
+                return Err(ContextCreationError::CreationFailed(
+                    "Unanimity governance requires non-empty eligible_voters".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
 /// guaranteeing that no concurrent `close_context` or `handle_ttl_expiry` can
 /// interleave between the check and the mutation.
 fn require_active(handle: &ContextHandle) -> Result<(), ContextError> {
@@ -461,6 +651,7 @@ impl ContextManager {
             threshold_signers: ctx.threshold_signers.clone(),
             threshold_value: ctx.threshold_value,
             pruning_policy: ctx.pruning_policy.clone(),
+            governance_model_config: Some(ctx.governance_engine.model_config()),
         }
     }
 
@@ -534,6 +725,9 @@ impl ContextManager {
 
         let ttl_remaining = ctx_snapshot.ttl_remaining_secs;
 
+        // Reconstruct the governance engine from the persisted snapshot.
+        let governance_engine = restore_governance_engine_from_snapshot(&ctx_snapshot)?;
+
         let per_context = PerContextState {
             handle: handle.clone(),
             membership: ctx_snapshot.membership,
@@ -549,6 +743,7 @@ impl ContextManager {
             threshold_signers: ctx_snapshot.threshold_signers,
             threshold_value: ctx_snapshot.threshold_value,
             pruning_policy: ctx_snapshot.pruning_policy,
+            governance_engine,
         };
 
         {
@@ -692,6 +887,12 @@ impl ContextManager {
         params: ContextParams,
         creator_did: DID,
     ) -> Result<ContextHandle, ContextCreationError> {
+        // Validate governance model parameters before proceeding.
+        validate_governance_model(&params.governance)?;
+
+        // Instantiate the governance engine based on GovernanceModel (ADR-031).
+        let governance_engine = create_governance_engine(&params.governance, &creator_did)?;
+
         // Phase 1+2: builder performs validation and creation (async, no lock held).
         let handle = builder_create_context(
             context_id.clone(),
@@ -756,6 +957,7 @@ impl ContextManager {
             threshold_signers: Vec::new(),
             threshold_value: 0,
             pruning_policy: None,
+            governance_engine,
         };
 
         // Atomic duplicate check + insert under lock -- no .await inside this scope.
@@ -1728,6 +1930,237 @@ impl ContextManager {
                 unreachable!("handled in dispatch_governance_action")
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Proposal lifecycle API (ADR-031, spec §5.9, #320)
+    // -----------------------------------------------------------------------
+
+    /// Builds a [`GovernanceContext`] snapshot for the governance engine from
+    /// the current per-context state.
+    fn build_governance_context(ctx: &PerContextState) -> GovernanceContext {
+        let members: Vec<(DID, String)> = ctx
+            .membership
+            .members()
+            .map(|m| (m.did.clone(), m.role_name.clone()))
+            .collect();
+        let admin_dids: Vec<DID> = ctx
+            .membership
+            .members()
+            .filter(|m| m.role_name == "admin")
+            .map(|m| m.did.clone())
+            .collect();
+        GovernanceContext {
+            context_id: ctx.handle.context_id().to_owned(),
+            members,
+            admin_dids,
+            current_epoch: None, // MLS epoch not tracked here; governance doesn't need it.
+            now: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        }
+    }
+
+    /// Proposes a governance action on a context.
+    ///
+    /// Creates a proposal through the context's governance engine. For
+    /// `SingleAdmin` contexts, the proposal is auto-approved and the
+    /// action is immediately executed. For multi-party governance models,
+    /// the proposal enters `Pending` status and waits for votes.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` -- The context to propose on.
+    /// * `action` -- The governance action to propose.
+    /// * `proposer_did` -- The DID of the proposer.
+    /// * `signing_key` -- Ed25519 key for signing the proposer's implicit vote.
+    ///
+    /// # Returns
+    ///
+    /// The created [`GovernanceProposal`] (which may already be `Approved` for
+    /// `SingleAdmin` contexts) and any [`GovernanceEvent`]s produced.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::GovernanceFailed`] if the proposer lacks authority or
+    ///   the action is invalid.
+    pub async fn propose_governance_action(
+        &self,
+        context_id: &str,
+        action: GovernanceAction,
+        proposer_did: &DID,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<(GovernanceProposal, Vec<GovernanceEvent>), ContextError> {
+        let (proposal, events, should_execute) = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+            require_active(&ctx.handle)?;
+
+            let gov_ctx = Self::build_governance_context(ctx);
+
+            let (proposal, events) = ctx
+                .governance_engine
+                .propose(proposer_did, action, &gov_ctx, signing_key)
+                .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
+
+            let should_execute = proposal.status == ProposalStatus::Approved;
+
+            (proposal, events, should_execute)
+        };
+        // Lock dropped.
+
+        // If the proposal was auto-approved (SingleAdmin), execute immediately.
+        if should_execute {
+            self.execute_governance_action(context_id, &proposal)
+                .await?;
+        }
+
+        // Persist context state after proposal creation.
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(context_id) {
+                let snapshot = Self::snapshot_context(ctx);
+                drop(contexts);
+                self.persist_context_snapshot(context_id, &snapshot);
+            }
+        }
+
+        Ok((proposal, events))
+    }
+
+    /// Casts a vote on a pending governance proposal.
+    ///
+    /// Submits an approval or rejection vote through the context's governance
+    /// engine. If the vote causes the proposal to reach quorum (approved) or
+    /// become impossible to approve (rejected), the proposal transitions to
+    /// its terminal state. When approved, the action is auto-executed.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` -- The context containing the proposal.
+    /// * `proposal_id` -- The ID of the proposal to vote on.
+    /// * `voter_did` -- The DID of the voter.
+    /// * `approve` -- `true` for approval, `false` for rejection.
+    /// * `signing_key` -- Ed25519 key for signing the vote.
+    ///
+    /// # Returns
+    ///
+    /// The updated [`ProposalStatus`] and any [`GovernanceEvent`]s produced.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::GovernanceFailed`] if the voter is not eligible,
+    ///   already voted, or the proposal is not pending.
+    pub async fn vote_on_proposal(
+        &self,
+        context_id: &str,
+        proposal_id: &ProposalId,
+        voter_did: &DID,
+        approve: bool,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), ContextError> {
+        let (status, events, proposal_for_execution) = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+            require_active(&ctx.handle)?;
+
+            let gov_ctx = Self::build_governance_context(ctx);
+
+            let (status, events) = if approve {
+                ctx.governance_engine
+                    .approve(proposal_id, voter_did, &gov_ctx, signing_key)
+                    .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?
+            } else {
+                ctx.governance_engine
+                    .reject(proposal_id, voter_did, &gov_ctx, signing_key)
+                    .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?
+            };
+
+            // If the proposal just became Approved, grab a clone for execution.
+            let proposal_for_execution = if status == ProposalStatus::Approved {
+                ctx.governance_engine.get_proposal(proposal_id).cloned()
+            } else {
+                None
+            };
+
+            (status, events, proposal_for_execution)
+        };
+        // Lock dropped.
+
+        // Auto-execute if the proposal was just approved.
+        if let Some(proposal) = proposal_for_execution {
+            self.execute_governance_action(context_id, &proposal)
+                .await?;
+        }
+
+        // Persist context state after vote.
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(context_id) {
+                let snapshot = Self::snapshot_context(ctx);
+                drop(contexts);
+                self.persist_context_snapshot(context_id, &snapshot);
+            }
+        }
+
+        Ok((status, events))
+    }
+
+    /// Retrieves a governance proposal by ID.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::GovernanceFailed`] if the proposal is not found.
+    pub async fn get_proposal(
+        &self,
+        context_id: &str,
+        proposal_id: &ProposalId,
+    ) -> Result<GovernanceProposal, ContextError> {
+        let contexts = self.contexts.lock().await;
+        let ctx = contexts
+            .get(context_id)
+            .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+        ctx.governance_engine
+            .get_proposal(proposal_id)
+            .cloned()
+            .ok_or_else(|| {
+                ContextError::GovernanceFailed(format!(
+                    "proposal not found: {}",
+                    hex::encode(proposal_id)
+                ))
+            })
+    }
+
+    /// Lists all governance proposals for a context.
+    ///
+    /// Returns both pending and resolved proposals tracked by the governance
+    /// engine. Note that engines only retain proposals in memory; for durable
+    /// access, proposals should be queried from the event log.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    pub async fn list_proposals(
+        &self,
+        context_id: &str,
+    ) -> Result<Vec<GovernanceProposal>, ContextError> {
+        let contexts = self.contexts.lock().await;
+        let ctx = contexts
+            .get(context_id)
+            .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+        Ok(ctx.governance_engine.list_proposals())
     }
 
     /// Internal implementation of author blocking. Only callable within the
@@ -5749,6 +6182,7 @@ mod tests {
             threshold_signers: Vec::new(),
             threshold_value: 0,
             pruning_policy: None,
+            governance_model_config: None,
         };
 
         let bc_snapshot = test_broadcast_snapshot("persist-ctx-2");
@@ -5837,6 +6271,7 @@ mod tests {
             threshold_signers: Vec::new(),
             threshold_value: 0,
             pruning_policy: None,
+            governance_model_config: None,
         };
 
         persistence
@@ -5914,6 +6349,7 @@ mod tests {
             threshold_signers: Vec::new(),
             threshold_value: 0,
             pruning_policy: None,
+            governance_model_config: None,
         };
 
         persistence.persist_context("ttl-ctx", &snapshot).unwrap();
@@ -5970,6 +6406,7 @@ mod tests {
                 threshold_signers: Vec::new(),
                 threshold_value: 0,
                 pruning_policy: None,
+                governance_model_config: None,
             };
             persistence.persist_context(ctx_name, &snapshot).unwrap();
         }
@@ -6024,6 +6461,7 @@ mod tests {
             threshold_signers: Vec::new(),
             threshold_value: 0,
             pruning_policy: None,
+            governance_model_config: None,
         };
 
         let bc_snapshot = test_broadcast_snapshot("dup-ctx");
@@ -6409,6 +6847,595 @@ mod tests {
         assert!(
             matches!(&err, ContextError::LimitExceeded(msg) if msg.contains("64")),
             "expected LimitExceeded with limit value, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // GovernanceModel enum expansion tests (#320)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn governance_model_serde_roundtrip_all_variants() {
+        use super::super::params::GovernanceModel;
+
+        let alice: DID = "did:dht:z6MkAlice".into();
+        let bob: DID = "did:dht:z6MkBob".into();
+        let carol: DID = "did:dht:z6MkCarol".into();
+
+        let models = vec![
+            GovernanceModel::SingleAdmin,
+            GovernanceModel::Threshold {
+                threshold: 2,
+                signers: vec![alice.clone(), bob.clone(), carol.clone()],
+            },
+            GovernanceModel::Majority {
+                eligible_voters: vec![alice.clone(), bob.clone(), carol.clone()],
+            },
+            GovernanceModel::Unanimity {
+                eligible_voters: vec![alice, bob, carol],
+            },
+        ];
+
+        for model in &models {
+            let json = serde_json::to_string(model).expect("serialize");
+            let deserialized: GovernanceModel = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(&deserialized, model, "serde roundtrip failed for {model:?}");
+        }
+    }
+
+    #[test]
+    fn governance_model_in_context_params_roundtrip() {
+        use super::super::params::GovernanceModel;
+
+        let params = ContextParams {
+            governance: GovernanceModel::Threshold {
+                threshold: 2,
+                signers: vec![
+                    "did:dht:z6MkAlice".into(),
+                    "did:dht:z6MkBob".into(),
+                    "did:dht:z6MkCarol".into(),
+                ],
+            },
+            ..ContextParams::default()
+        };
+
+        let json = serde_json::to_string(&params).expect("serialize");
+        let deserialized: ContextParams = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deserialized.governance, params.governance);
+    }
+
+    #[test]
+    fn public_metadata_exposes_all_governance_variants() {
+        use super::super::params::{GovernanceModel, RuntimeMetadata};
+
+        let params = ContextParams {
+            governance: GovernanceModel::Majority {
+                eligible_voters: vec!["did:dht:z6MkAlice".into(), "did:dht:z6MkBob".into()],
+            },
+            ..ContextParams::default()
+        };
+
+        let runtime = RuntimeMetadata::default();
+        let meta = params.public_metadata(&runtime);
+        assert_eq!(meta.governance, params.governance);
+    }
+
+    // -----------------------------------------------------------------------
+    // Context creation validation tests (#320)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn create_context_rejects_threshold_exceeding_signers() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+        );
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::Threshold {
+                threshold: 5,
+                signers: vec!["did:dht:z6MkAlice".into(), "did:dht:z6MkBob".into()],
+            },
+            ..ContextParams::default()
+        };
+
+        let result = manager
+            .create_context(
+                "ctx-bad-threshold".into(),
+                params,
+                "did:dht:z6MkAlice".into(),
+            )
+            .await;
+
+        assert!(result.is_err(), "should reject threshold > signers.len()");
+    }
+
+    #[tokio::test]
+    async fn create_context_rejects_threshold_zero() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+        );
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::Threshold {
+                threshold: 0,
+                signers: vec!["did:dht:z6MkAlice".into()],
+            },
+            ..ContextParams::default()
+        };
+
+        let result = manager
+            .create_context(
+                "ctx-zero-threshold".into(),
+                params,
+                "did:dht:z6MkAlice".into(),
+            )
+            .await;
+
+        assert!(result.is_err(), "should reject threshold == 0");
+    }
+
+    #[tokio::test]
+    async fn create_context_rejects_majority_empty_voters() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+        );
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::Majority {
+                eligible_voters: vec![],
+            },
+            ..ContextParams::default()
+        };
+
+        let result = manager
+            .create_context(
+                "ctx-empty-majority".into(),
+                params,
+                "did:dht:z6MkAlice".into(),
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "should reject Majority with empty eligible_voters"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_context_rejects_unanimity_empty_voters() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+        );
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::Unanimity {
+                eligible_voters: vec![],
+            },
+            ..ContextParams::default()
+        };
+
+        let result = manager
+            .create_context(
+                "ctx-empty-unanimity".into(),
+                params,
+                "did:dht:z6MkAlice".into(),
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "should reject Unanimity with empty eligible_voters"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Proposal lifecycle tests (#320)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn single_admin_propose_auto_executes() {
+        use super::super::governance::GovernanceAction;
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+        );
+
+        let creator_did: DID = "did:dht:z6MkCreator".into();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+
+        let handle = manager
+            .create_context(
+                "ctx-single-admin-lifecycle".into(),
+                ContextParams::default(),
+                creator_did.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(handle.state().await, ContextState::Active);
+
+        // Propose RegisterTool — should auto-execute in SingleAdmin.
+        let action = GovernanceAction::RegisterTool {
+            registration: super::super::params::ToolRegistration {
+                name: "test-tool".to_owned(),
+            },
+        };
+
+        let (proposal, events) = manager
+            .propose_governance_action(
+                "ctx-single-admin-lifecycle",
+                action,
+                &creator_did,
+                &signing_key,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                proposal.status,
+                super::super::governance::ProposalStatus::Approved
+            ),
+            "SingleAdmin proposal should be auto-approved"
+        );
+        assert!(
+            events.len() >= 2,
+            "should have ProposalCreated + VoteCast + ProposalResolved events"
+        );
+
+        // Verify the proposal is retrievable.
+        let retrieved = manager
+            .get_proposal("ctx-single-admin-lifecycle", &proposal.proposal_id)
+            .await
+            .unwrap();
+        assert_eq!(retrieved.proposal_id, proposal.proposal_id);
+
+        // Verify list_proposals returns it.
+        let proposals = manager
+            .list_proposals("ctx-single-admin-lifecycle")
+            .await
+            .unwrap();
+        assert_eq!(proposals.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn threshold_context_proposal_lifecycle() {
+        use super::super::governance::{GovernanceAction, ProposalStatus};
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+        );
+
+        let alice: DID = "did:dht:z6MkAlice".into();
+        let bob: DID = "did:dht:z6MkBob".into();
+        let carol: DID = "did:dht:z6MkCarol".into();
+        let key_a = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let key_b = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::Threshold {
+                threshold: 2,
+                signers: vec![alice.clone(), bob.clone(), carol.clone()],
+            },
+            ..ContextParams::default()
+        };
+
+        // Create context (alice is the creator/admin).
+        let _handle = manager
+            .create_context("ctx-threshold".into(), params, alice.clone())
+            .await
+            .unwrap();
+
+        // Alice proposes RegisterTool (her proposer vote counts as first approval).
+        let action = GovernanceAction::RegisterTool {
+            registration: super::super::params::ToolRegistration {
+                name: "threshold-tool".to_owned(),
+            },
+        };
+
+        let (proposal, _events) = manager
+            .propose_governance_action("ctx-threshold", action, &alice, &key_a)
+            .await
+            .unwrap();
+
+        // Proposal should be Pending (1 vote, need 2).
+        assert!(
+            matches!(proposal.status, ProposalStatus::Pending),
+            "threshold proposal should be pending after 1 vote, got {:?}",
+            proposal.status
+        );
+
+        // Bob votes approve — should reach threshold (2-of-3).
+        let (status, _events) = manager
+            .vote_on_proposal("ctx-threshold", &proposal.proposal_id, &bob, true, &key_b)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(status, ProposalStatus::Approved),
+            "threshold proposal should be approved after 2nd vote, got {status:?}"
+        );
+
+        // Verify the tool was registered (auto-execution).
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("ctx-threshold").unwrap();
+        assert!(
+            ctx.registered_tools
+                .iter()
+                .any(|t| t.name == "threshold-tool"),
+            "tool should have been registered after proposal approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn majority_context_proposal_lifecycle() {
+        use super::super::governance::{GovernanceAction, ProposalStatus};
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+        );
+
+        let alice: DID = "did:dht:z6MkAlice".into();
+        let bob: DID = "did:dht:z6MkBob".into();
+        let carol: DID = "did:dht:z6MkCarol".into();
+        let key_a = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let key_b = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::Majority {
+                eligible_voters: vec![alice.clone(), bob.clone(), carol.clone()],
+            },
+            ..ContextParams::default()
+        };
+
+        let _handle = manager
+            .create_context("ctx-majority".into(), params, alice.clone())
+            .await
+            .unwrap();
+
+        // Alice proposes CloseContext.
+        let action = GovernanceAction::CloseContext {
+            reason: Some("test close".to_owned()),
+        };
+
+        let (proposal, _) = manager
+            .propose_governance_action("ctx-majority", action, &alice, &key_a)
+            .await
+            .unwrap();
+
+        assert!(matches!(proposal.status, ProposalStatus::Pending));
+
+        // Alice approves her own proposal (proposer must vote separately
+        // in MajorityVoteEngine — propose() does not auto-approve).
+        let (status, _) = manager
+            .vote_on_proposal("ctx-majority", &proposal.proposal_id, &alice, true, &key_a)
+            .await
+            .unwrap();
+        assert!(
+            matches!(status, ProposalStatus::Pending),
+            "1/3 approvals should still be pending, got {status:?}"
+        );
+
+        // Bob approves — now 2/3 approve = >50% = approved.
+        let (status, _) = manager
+            .vote_on_proposal("ctx-majority", &proposal.proposal_id, &bob, true, &key_b)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(status, ProposalStatus::Approved),
+            "2/3 approvals should reach majority, got {status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unanimity_context_single_rejection_defeats_proposal() {
+        use super::super::governance::{GovernanceAction, ProposalStatus};
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+        );
+
+        let alice: DID = "did:dht:z6MkAlice".into();
+        let bob: DID = "did:dht:z6MkBob".into();
+        let carol: DID = "did:dht:z6MkCarol".into();
+        let key_a = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let key_b = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+        let key_c = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::Unanimity {
+                eligible_voters: vec![alice.clone(), bob.clone(), carol.clone()],
+            },
+            ..ContextParams::default()
+        };
+
+        // Add bob as member so we can test RemoveMember doesn't happen.
+        let _handle = manager
+            .create_context("ctx-unanimity".into(), params, alice.clone())
+            .await
+            .unwrap();
+
+        // Add bob to membership manually for the test.
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("ctx-unanimity").unwrap();
+            ctx.membership
+                .add_member(bob.clone(), "member".into(), vec![]);
+            ctx.membership
+                .add_member(carol.clone(), "member".into(), vec![]);
+        }
+
+        // Alice proposes RemoveMember(bob).
+        let action = GovernanceAction::RemoveMember {
+            did: bob.clone(),
+            reason: Some("test removal".to_owned()),
+        };
+
+        let (proposal, _) = manager
+            .propose_governance_action("ctx-unanimity", action, &alice, &key_a)
+            .await
+            .unwrap();
+
+        assert!(matches!(proposal.status, ProposalStatus::Pending));
+
+        // Bob approves.
+        let (status, _) = manager
+            .vote_on_proposal("ctx-unanimity", &proposal.proposal_id, &bob, true, &key_b)
+            .await
+            .unwrap();
+        assert!(matches!(status, ProposalStatus::Pending));
+
+        // Carol rejects — single rejection kills unanimity.
+        let (status, _) = manager
+            .vote_on_proposal(
+                "ctx-unanimity",
+                &proposal.proposal_id,
+                &carol,
+                false,
+                &key_c,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(status, ProposalStatus::Rejected { .. }),
+            "unanimity proposal should be rejected after single rejection, got {status:?}"
+        );
+
+        // Verify bob is still a member (proposal was rejected, not executed).
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("ctx-unanimity").unwrap();
+        assert!(
+            ctx.membership.get(bob.as_ref()).is_some(),
+            "Bob should still be a member after rejected proposal"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_eligible_voter_rejected() {
+        use super::super::governance::GovernanceAction;
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+        );
+
+        let alice: DID = "did:dht:z6MkAlice".into();
+        let bob: DID = "did:dht:z6MkBob".into();
+        let eve: DID = "did:dht:z6MkEve".into();
+        let key_a = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let key_e = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::Threshold {
+                threshold: 2,
+                signers: vec![alice.clone(), bob.clone()],
+            },
+            ..ContextParams::default()
+        };
+
+        let _handle = manager
+            .create_context("ctx-eligibility".into(), params, alice.clone())
+            .await
+            .unwrap();
+
+        // Alice proposes.
+        let action = GovernanceAction::RegisterTool {
+            registration: super::super::params::ToolRegistration {
+                name: "tool".to_owned(),
+            },
+        };
+
+        let (proposal, _) = manager
+            .propose_governance_action("ctx-eligibility", action, &alice, &key_a)
+            .await
+            .unwrap();
+
+        // Eve (not a signer) tries to vote — should be rejected.
+        let result = manager
+            .vote_on_proposal("ctx-eligibility", &proposal.proposal_id, &eve, true, &key_e)
+            .await;
+
+        assert!(result.is_err(), "non-eligible voter should be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ContextError::GovernanceFailed(_)),
+            "should be GovernanceFailed for non-eligible voter, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn governance_snapshot_serde_roundtrip() {
+        use crate::context::roles::{ContextRoleState, default_ceiling};
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::Threshold {
+                threshold: 2,
+                signers: vec![
+                    "did:dht:z6MkAlice".into(),
+                    "did:dht:z6MkBob".into(),
+                    "did:dht:z6MkCarol".into(),
+                ],
+            },
+            ..ContextParams::default()
+        };
+
+        let role_state =
+            ContextRoleState::new("ctx-snap", "did:dht:z6MkAlice", default_ceiling(), vec![])
+                .unwrap();
+
+        let snapshot = super::ContextSnapshot {
+            context_id: "ctx-snap".to_owned(),
+            state: ContextState::Active,
+            context_params: params,
+            membership: MembershipState::new(),
+            role_state,
+            executed_proposals: HashSet::new(),
+            ttl_remaining_secs: None,
+            registered_tools: Vec::new(),
+            write_revoked_members: HashSet::new(),
+            tool_interfaces: Vec::new(),
+            threshold_signers: Vec::new(),
+            threshold_value: 0,
+            pruning_policy: None,
+            governance_model_config: Some(
+                super::super::governance::GovernanceModelConfig::Threshold {
+                    signers: vec![
+                        "did:dht:z6MkAlice".into(),
+                        "did:dht:z6MkBob".into(),
+                        "did:dht:z6MkCarol".into(),
+                    ],
+                    threshold: 2,
+                    voting_window_secs: 86_400,
+                },
+            ),
+        };
+
+        let json = serde_json::to_string(&snapshot).expect("serialize");
+        let deserialized: super::ContextSnapshot =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deserialized.context_id, snapshot.context_id);
+        assert_eq!(
+            deserialized.governance_model_config,
+            snapshot.governance_model_config
         );
     }
 }
