@@ -316,11 +316,19 @@ pub fn actions_conflict(
             },
         ) => remove_did == change_did,
 
-        // Mutual removal: each proposer removes the other.
+        // Two concurrent removals of the same member conflict (ADR-031 §7:
+        // concurrent modifications to the same membership state).
+        // Also catches mutual removal (each proposer removes the other).
         (
             GovernanceAction::RemoveMember { did: did_a, .. },
             GovernanceAction::RemoveMember { did: did_b, .. },
-        ) => did_a == b_proposer && did_b == a_proposer,
+        ) => did_a == did_b || (did_a == b_proposer && did_b == a_proposer),
+
+        // Concurrent context-wide key rotations conflict (global property mutation).
+        (
+            GovernanceAction::RotateContentKeys { .. },
+            GovernanceAction::RotateContentKeys { .. },
+        ) => true,
 
         // Two concurrent revocations of the same type targeting the same DID
         // conflict (scope may differ, but concurrent revocation is unsafe — ADR-031 §7).
