@@ -134,6 +134,23 @@ These spec findings **block** existing implementation work. Implementing the cod
 | 12.6-001 (bridge MLS) | #370 (bridge zero FFI) | #370 tracks missing FFI exposure for bridge module. But the bridge module itself can't work for encrypted contexts until the MLS membership model is decided. |
 | ADR-029-C3 (ResetRequest replay) | #324 (MLS epochs conflict) | #324 addresses the epoch/grace window mismatch. ADR-029-C3 says the ResetRequest message itself is vulnerable. Both are sync protocol issues that should be resolved together. |
 
+### Existing GH Issues That Need Expanded Scope
+
+These issues exist but don't cover spec gaps found by the audit. Expand acceptance criteria.
+
+| GH Issue | Currently Covers | Should Also Cover |
+|---|---|---|
+| #352 | BroadcastEnvelope missing 5 of 9 fields | Domain separator, length prefixes, nonce field for broadcast key layer |
+| #346 | 4 wire format deviations | Non-compliance with RFC 9180 HPKE, SenderKeyRequest signature preimage |
+| #309 | ADR-038 zero implementation | Coordinated key deletion protocol, AAD binding specification |
+| #334 | Economic governance not implemented | Relay payment wire protocol, measurement windows, spending enforcement |
+| #303 | Event log summary only | Pruning/checkpoint specification |
+| #316 | Compromise recovery | Total key loss recovery (social/device recovery — different scenario) |
+| #319 | UCAN tool invocation bypass | Root issuer trust gap in multi-admin |
+| #366 | Pseudonym rotation | Pseudonym HMAC public key derivation concern |
+| #347 | No deser size limits | Relay storage quota per client |
+| #349 | f64 basis points | Systemic f64 usage across multiple ADRs (not just min_participation) |
+
 ### Code File Conflicts (Same Files Touched by Multiple Items)
 
 | File | Issues + Findings | Sequence |
