@@ -17,6 +17,9 @@
 
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use hex;
+
 /// Sentinel value for absent optional fields: `SHA-256(0x00)`.
 ///
 /// Pre-computed to avoid re-hashing on every call.
