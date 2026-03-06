@@ -2,12 +2,12 @@
 //!
 //! Implements the [`GovernanceEngine`] trait for majority-vote governance.
 //! A proposal passes when:
-//! 1. Quorum is met: `votes_cast / eligible_voters >= min_participation`.
+//! 1. Quorum is met: `votes_cast * 10_000 / eligible_voters >= min_participation_bps`.
 //! 2. Approvals exceed 50% of votes cast: `approvals > votes_cast / 2`.
 //!
 //! Abstentions (not voting) do not count toward or against the majority --
 //! only explicit approve/reject votes are tallied. The quorum threshold
-//! (`min_participation`) prevents low-turnout approvals.
+//! (`min_participation_bps`) prevents low-turnout approvals.
 //!
 //! # Early resolution
 //!
@@ -51,16 +51,17 @@ use scp_identity::DID;
 ///   creation (or updated externally by the `ContextManager` when membership
 ///   changes).
 /// - `voting_window_secs`: Duration in seconds for the voting window.
-/// - `min_participation`: Fraction (0.0, 1.0] of eligible voters that must
-///   cast a vote for the proposal to be valid.
+/// - `min_participation_bps`: Minimum participation in basis points (1–10000),
+///   where 10000 = 100%. Per ADR-031: u32 basis points so `GovernanceModelConfig`
+///   derives `Eq`.
 #[derive(Debug)]
 pub struct MajorityVoteEngine {
     /// The set of DIDs eligible to vote on proposals.
     eligible_voter_dids: Vec<DID>,
     /// Duration of the voting window in seconds.
     voting_window_secs: u64,
-    /// Minimum participation fraction (0.0, 1.0].
-    min_participation: f64,
+    /// Minimum participation in basis points (1–10000, where 10000 = 100%).
+    min_participation_bps: u32,
     /// Active and resolved proposals, keyed by proposal ID.
     proposals: HashMap<ProposalId, GovernanceProposal>,
 }
@@ -73,8 +74,8 @@ impl MajorityVoteEngine {
     /// - `eligible_voters`: DIDs eligible to vote. Must be non-empty.
     /// - `voting_window_secs`: Voting window duration in seconds.
     ///   Must be in `[300, 604_800]` (5 minutes to 7 days).
-    /// - `min_participation`: Minimum participation fraction.
-    ///   Must be in `(0.0, 1.0]`.
+    /// - `min_participation_bps`: Minimum participation in basis points.
+    ///   Must be in `(0, 10000]` (where 10000 = 100%).
     ///
     /// # Errors
     ///
@@ -83,7 +84,7 @@ impl MajorityVoteEngine {
     pub fn new(
         eligible_voters: Vec<DID>,
         voting_window_secs: u64,
-        min_participation: f64,
+        min_participation_bps: u32,
     ) -> Result<Self, GovernanceError> {
         if eligible_voters.is_empty() {
             return Err(GovernanceError::InvalidConfig(
@@ -95,24 +96,24 @@ impl MajorityVoteEngine {
                 "voting_window_secs must be in [300, 604800], got {voting_window_secs}"
             )));
         }
-        if min_participation <= 0.0 || min_participation > 1.0 {
+        if min_participation_bps == 0 || min_participation_bps > 10_000 {
             return Err(GovernanceError::InvalidConfig(format!(
-                "min_participation must be in (0.0, 1.0], got {min_participation}"
+                "min_participation_bps must be in (0, 10000], got {min_participation_bps}"
             )));
         }
 
         Ok(Self {
             eligible_voter_dids: eligible_voters,
             voting_window_secs,
-            min_participation,
+            min_participation_bps,
             proposals: HashMap::new(),
         })
     }
 
-    /// Returns the minimum participation fraction.
+    /// Returns the minimum participation threshold in basis points (1–10000).
     #[must_use]
-    pub const fn min_participation(&self) -> f64 {
-        self.min_participation
+    pub const fn min_participation_bps(&self) -> u32 {
+        self.min_participation_bps
     }
 
     /// Returns the voting window duration in seconds.
@@ -251,11 +252,10 @@ impl MajorityVoteEngine {
 
         // Deadline check.
         if context.now > proposal.voting_deadline {
-            // Check quorum. Precision loss is acceptable here -- voter counts
-            // will never approach 2^52 where f64 mantissa saturates.
-            #[allow(clippy::cast_precision_loss)]
-            let participation_fraction = participation as f64 / eligible as f64;
-            if participation_fraction < self.min_participation {
+            // Check quorum using integer basis-point arithmetic (ADR-031).
+            // participation * 10_000 / eligible gives participation in basis points.
+            let participation_bps = participation.saturating_mul(10_000) / eligible;
+            if participation_bps < self.min_participation_bps as usize {
                 let status = ProposalStatus::Rejected {
                     reason: RejectionReason::InsufficientParticipation,
                 };
@@ -535,7 +535,7 @@ impl GovernanceEngine for MajorityVoteEngine {
     fn model_config(&self) -> GovernanceModelConfig {
         GovernanceModelConfig::Majority {
             voting_window_secs: self.voting_window_secs,
-            min_participation: self.min_participation,
+            min_participation_bps: self.min_participation_bps,
         }
     }
 
@@ -630,7 +630,7 @@ mod tests {
     const T0: u64 = 1_700_000_000;
 
     fn default_engine(voters: Vec<DID>) -> MajorityVoteEngine {
-        MajorityVoteEngine::new(voters, WINDOW, 0.5).expect("valid config")
+        MajorityVoteEngine::new(voters, WINDOW, 5000).expect("valid config")
     }
 
     fn propose_add_member(
@@ -655,16 +655,16 @@ mod tests {
 
     #[test]
     fn new_valid_config() {
-        let engine = MajorityVoteEngine::new(three_voters(), WINDOW, 0.5);
+        let engine = MajorityVoteEngine::new(three_voters(), WINDOW, 5000);
         assert!(engine.is_ok());
         let engine = engine.unwrap();
         assert_eq!(engine.voting_window_secs(), WINDOW);
-        assert!((engine.min_participation() - 0.5).abs() < f64::EPSILON);
+        assert_eq!(engine.min_participation_bps(), 5000);
     }
 
     #[test]
     fn new_rejects_empty_voters() {
-        let result = MajorityVoteEngine::new(vec![], WINDOW, 0.5);
+        let result = MajorityVoteEngine::new(vec![], WINDOW, 5000);
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -674,48 +674,42 @@ mod tests {
 
     #[test]
     fn new_rejects_voting_window_too_short() {
-        let result = MajorityVoteEngine::new(three_voters(), 299, 0.5);
+        let result = MajorityVoteEngine::new(three_voters(), 299, 5000);
         assert!(result.is_err());
     }
 
     #[test]
     fn new_rejects_voting_window_too_long() {
-        let result = MajorityVoteEngine::new(three_voters(), 604_801, 0.5);
+        let result = MajorityVoteEngine::new(three_voters(), 604_801, 5000);
         assert!(result.is_err());
     }
 
     #[test]
     fn new_accepts_boundary_voting_windows() {
-        assert!(MajorityVoteEngine::new(three_voters(), 300, 0.5).is_ok());
-        assert!(MajorityVoteEngine::new(three_voters(), 604_800, 0.5).is_ok());
+        assert!(MajorityVoteEngine::new(three_voters(), 300, 5000).is_ok());
+        assert!(MajorityVoteEngine::new(three_voters(), 604_800, 5000).is_ok());
     }
 
     #[test]
     fn new_rejects_zero_participation() {
-        let result = MajorityVoteEngine::new(three_voters(), WINDOW, 0.0);
+        let result = MajorityVoteEngine::new(three_voters(), WINDOW, 0);
         assert!(result.is_err());
     }
 
     #[test]
-    fn new_rejects_negative_participation() {
-        let result = MajorityVoteEngine::new(three_voters(), WINDOW, -0.1);
+    fn new_rejects_participation_above_10000() {
+        let result = MajorityVoteEngine::new(three_voters(), WINDOW, 10_001);
         assert!(result.is_err());
     }
 
     #[test]
-    fn new_rejects_participation_above_one() {
-        let result = MajorityVoteEngine::new(three_voters(), WINDOW, 1.01);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn new_accepts_participation_of_one() {
-        assert!(MajorityVoteEngine::new(three_voters(), WINDOW, 1.0).is_ok());
+    fn new_accepts_participation_of_10000() {
+        assert!(MajorityVoteEngine::new(three_voters(), WINDOW, 10_000).is_ok());
     }
 
     #[test]
     fn new_accepts_small_participation() {
-        assert!(MajorityVoteEngine::new(three_voters(), WINDOW, 0.01).is_ok());
+        assert!(MajorityVoteEngine::new(three_voters(), WINDOW, 100).is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -1064,12 +1058,12 @@ mod tests {
     #[test]
     fn quorum_met_approves_at_deadline() {
         let voters = all_five();
-        // min_participation = 0.4 (2 of 5 must vote).
-        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 0.4).unwrap();
+        // min_participation_bps = 4000 (40%, i.e. 2 of 5 must vote).
+        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 4000).unwrap();
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
 
-        // 2 approvals, 0 rejections. Quorum: 2/5 = 0.4 >= 0.4.
+        // 2 approvals, 0 rejections. Quorum: 2*10000/5 = 4000 >= 4000.
         engine
             .approve(&proposal.proposal_id, &alice(), &ctx, &sk_alice())
             .unwrap();
@@ -1092,12 +1086,12 @@ mod tests {
     #[test]
     fn quorum_not_met_rejects_at_deadline() {
         let voters = all_five();
-        // min_participation = 0.5 (3 of 5 must vote).
+        // min_participation_bps = 5000 (50%, i.e. 3 of 5 must vote).
         let mut engine = default_engine(voters.clone());
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
 
-        // Only 2 votes cast (2/5 = 0.4 < 0.5).
+        // Only 2 votes cast (2*10000/5 = 4000 < 5000).
         engine
             .approve(&proposal.proposal_id, &alice(), &ctx, &sk_alice())
             .unwrap();
@@ -1124,7 +1118,7 @@ mod tests {
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
 
-        // 1 approve, 2 reject. Quorum met (3/5 = 0.6 >= 0.5).
+        // 1 approve, 2 reject. Quorum met (3*10000/5 = 6000 >= 5000).
         engine
             .approve(&proposal.proposal_id, &alice(), &ctx, &sk_alice())
             .unwrap();
@@ -1148,13 +1142,84 @@ mod tests {
     }
 
     #[test]
+    fn basis_points_quorum_met_5_of_10() {
+        // Acceptance criterion: 5 of 10 members voted with min_participation_bps=5000 -> quorum met.
+        let voters: Vec<DID> = (0..10)
+            .map(|i| DID::from(format!("did:dht:z6MkVoter{i}")))
+            .collect();
+        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 5000).unwrap();
+        let ctx = test_context(&voters, T0);
+
+        let action = GovernanceAction::AddMember {
+            did: DID::from("did:dht:z6MkNewbie"),
+            role: "member".to_owned(),
+        };
+        let sks: Vec<ed25519_dalek::SigningKey> = (0..10)
+            .map(|i| ed25519_dalek::SigningKey::from_bytes(&[i + 10; 32]))
+            .collect();
+        let (proposal, _) = engine.propose(&voters[0], action, &ctx, &sks[0]).unwrap();
+
+        // 5 approvals out of 10 eligible.
+        for i in 0..5 {
+            engine
+                .approve(&proposal.proposal_id, &voters[i], &ctx, &sks[i])
+                .unwrap();
+        }
+
+        // At deadline: 5*10000/10 = 5000 >= 5000 -> quorum met, 5 > 0 -> approved.
+        let ctx_deadline = test_context(&voters, T0 + WINDOW + 1);
+        let (status, _) = engine
+            .resolve(&proposal.proposal_id, &ctx_deadline)
+            .unwrap();
+        assert_eq!(status, ProposalStatus::Approved);
+    }
+
+    #[test]
+    fn basis_points_quorum_not_met_4_of_10() {
+        // Acceptance criterion: 4 of 10 members voted with min_participation_bps=5000 -> quorum NOT met.
+        let voters: Vec<DID> = (0..10)
+            .map(|i| DID::from(format!("did:dht:z6MkVoter{i}")))
+            .collect();
+        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 5000).unwrap();
+        let ctx = test_context(&voters, T0);
+
+        let action = GovernanceAction::AddMember {
+            did: DID::from("did:dht:z6MkNewbie"),
+            role: "member".to_owned(),
+        };
+        let sks: Vec<ed25519_dalek::SigningKey> = (0..10)
+            .map(|i| ed25519_dalek::SigningKey::from_bytes(&[i + 10; 32]))
+            .collect();
+        let (proposal, _) = engine.propose(&voters[0], action, &ctx, &sks[0]).unwrap();
+
+        // 4 approvals out of 10 eligible.
+        for i in 0..4 {
+            engine
+                .approve(&proposal.proposal_id, &voters[i], &ctx, &sks[i])
+                .unwrap();
+        }
+
+        // At deadline: 4*10000/10 = 4000 < 5000 -> quorum NOT met.
+        let ctx_deadline = test_context(&voters, T0 + WINDOW + 1);
+        let (status, _) = engine
+            .resolve(&proposal.proposal_id, &ctx_deadline)
+            .unwrap();
+        assert_eq!(
+            status,
+            ProposalStatus::Rejected {
+                reason: RejectionReason::InsufficientParticipation
+            }
+        );
+    }
+
+    #[test]
     fn tie_goes_to_rejection_at_deadline() {
         let voters = vec![alice(), bob(), carol(), dave()]; // 4 voters
-        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 0.5).unwrap();
+        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 5000).unwrap();
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
 
-        // 2 approvals, 2 rejections. Quorum met (4/4 = 1.0 >= 0.5).
+        // 2 approvals, 2 rejections. Quorum met (4*10000/4 = 10000 >= 5000).
         engine
             .approve(&proposal.proposal_id, &alice(), &ctx, &sk_alice())
             .unwrap();
@@ -1186,9 +1251,9 @@ mod tests {
 
     #[test]
     fn abstentions_do_not_count_toward_majority() {
-        // 5 voters, quorum 0.4 (2 must vote), 2 approve, 3 abstain.
+        // 5 voters, quorum 4000 bps (40%, 2 must vote), 2 approve, 3 abstain.
         let voters = all_five();
-        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 0.4).unwrap();
+        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 4000).unwrap();
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
 
@@ -1199,7 +1264,7 @@ mod tests {
             .approve(&proposal.proposal_id, &bob(), &ctx, &sk_bob())
             .unwrap();
 
-        // At deadline: 2 votes cast, quorum met (2/5=0.4>=0.4), 2 approvals > 0 rejections.
+        // At deadline: 2 votes cast, quorum met (2*10000/5=4000>=4000), 2 approvals > 0 rejections.
         let ctx_deadline = test_context(&voters, T0 + WINDOW + 1);
         let (status, _) = engine
             .resolve(&proposal.proposal_id, &ctx_deadline)
@@ -1209,9 +1274,9 @@ mod tests {
 
     #[test]
     fn single_vote_can_pass_with_low_quorum() {
-        // 5 voters, quorum 0.2 (1 must vote).
+        // 5 voters, quorum 2000 bps (20%, 1 must vote).
         let voters = all_five();
-        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 0.2).unwrap();
+        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 2000).unwrap();
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
 
@@ -1245,7 +1310,7 @@ mod tests {
         let (status, _) = engine
             .approve(&proposal.proposal_id, &bob(), &ctx_late, &sk_bob())
             .unwrap();
-        // 1 vote / 3 eligible = 0.33 < 0.5 quorum -> InsufficientParticipation.
+        // 1 vote / 3 eligible = 3333 bps < 5000 quorum -> InsufficientParticipation.
         assert_eq!(
             status,
             ProposalStatus::Rejected {
@@ -1272,7 +1337,7 @@ mod tests {
             .reject(&proposal.proposal_id, &carol(), &ctx, &sk_carol())
             .unwrap();
 
-        // Try to reject past deadline. 3 votes cast / 5 eligible = 0.6 >= 0.5 quorum.
+        // Try to reject past deadline. 3*10000/5 = 6000 >= 5000 quorum.
         // 2 approvals > 1 rejection -> Approved.
         let ctx_late = test_context(&voters, T0 + WINDOW + 1);
         let (status, _) = engine
@@ -1553,7 +1618,7 @@ mod tests {
             config,
             GovernanceModelConfig::Majority {
                 voting_window_secs: WINDOW,
-                min_participation: 0.5,
+                min_participation_bps: 5000,
             }
         );
     }
@@ -1613,7 +1678,7 @@ mod tests {
     #[test]
     fn single_voter_approves_immediately() {
         let voters = vec![alice()];
-        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 1.0).unwrap();
+        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 10_000).unwrap();
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
 
@@ -1627,7 +1692,7 @@ mod tests {
     #[test]
     fn single_voter_rejects_immediately() {
         let voters = vec![alice()];
-        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 1.0).unwrap();
+        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 10_000).unwrap();
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
 
@@ -1647,7 +1712,7 @@ mod tests {
     fn two_voters_need_both_to_approve_without_deadline() {
         // 2 voters: 1 approval is not > 2/2 = 1 (needs to be strictly greater).
         let voters = vec![alice(), bob()];
-        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 0.5).unwrap();
+        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 5000).unwrap();
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
 
@@ -1667,14 +1732,14 @@ mod tests {
     #[test]
     fn two_voters_one_approve_one_abstain_passes_at_deadline_with_low_quorum() {
         let voters = vec![alice(), bob()];
-        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 0.5).unwrap();
+        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 5000).unwrap();
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
 
         engine
             .approve(&proposal.proposal_id, &alice(), &ctx, &sk_alice())
             .unwrap();
-        // Bob abstains. At deadline: 1 vote cast, quorum 1/2 = 0.5 >= 0.5, 1 > 0.
+        // Bob abstains. At deadline: 1*10000/2 = 5000 >= 5000 quorum, 1 > 0.
         let ctx_deadline = test_context(&voters, T0 + WINDOW + 1);
         let (status, _) = engine
             .resolve(&proposal.proposal_id, &ctx_deadline)
@@ -1813,10 +1878,10 @@ mod tests {
 
     #[test]
     fn full_participation_quorum_not_met_rejects() {
-        // min_participation = 1.0 with 5 voters. 2 approvals won't trigger early
-        // resolution (need > 2.5), so we can test quorum at deadline.
+        // min_participation_bps = 10000 (100%) with 5 voters. 2 approvals won't
+        // trigger early resolution (need > 2.5), so we can test quorum at deadline.
         let voters = all_five();
-        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 1.0).unwrap();
+        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 10_000).unwrap();
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
 
@@ -1826,7 +1891,7 @@ mod tests {
         engine
             .approve(&proposal.proposal_id, &bob(), &ctx, &sk_bob())
             .unwrap();
-        // 2 of 5 voted, 3 abstain. Quorum: 2/5 = 0.4 < 1.0.
+        // 2 of 5 voted, 3 abstain. Quorum: 2*10000/5 = 4000 < 10000.
         let ctx_deadline = test_context(&voters, T0 + WINDOW + 1);
         let (status, _) = engine
             .resolve(&proposal.proposal_id, &ctx_deadline)
@@ -1842,7 +1907,7 @@ mod tests {
     #[test]
     fn full_participation_all_approve() {
         let voters = three_voters();
-        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 1.0).unwrap();
+        let mut engine = MajorityVoteEngine::new(voters.clone(), WINDOW, 10_000).unwrap();
         let ctx = test_context(&voters, T0);
         let proposal = propose_add_member(&mut engine, &alice(), &ctx, &sk_alice());
 
