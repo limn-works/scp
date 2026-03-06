@@ -1,0 +1,291 @@
+{
+  "project": "scp",
+  "description": "Participation admission requirements: contexts can declare verifiable participation criteria for admission, enforced mechanically. RequireParticipation type with ParticipationFact/ParticipationThreshold enums, ParticipationProfile as a full participation profile (all 7 fact categories) produced and hosted by source contexts on their relays. Agents CANNOT write, modify, or delete their own statements — contexts control the storage. Agent opts in by allowing contexts to publish statements. DID document ParticipationStatements service endpoint for verifier discovery. Admitting contexts fetch statements from the service endpoint, verify Ed25519 signatures from distinct context-specific signers, and evaluate against RequireParticipation admission thresholds. FFI exposure across Python/UniFFI/NAPI bridges.",
+  "gates": [
+    {
+      "id": "gate-participation-admission-types",
+      "name": "Participation Admission Types and Context Integration",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-BA-001",
+        "SCP-BA-002"
+      ]
+    },
+    {
+      "id": "gate-participation-admission-production",
+      "name": "Context-Hosted Statement Production and Discovery",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-BA-005",
+        "SCP-BA-006"
+      ]
+    },
+    {
+      "id": "gate-participation-admission-verification",
+      "name": "Participation Admission Verification and FFI",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-BA-003",
+        "SCP-BA-004"
+      ]
+    }
+  ],
+  "stories": [
+    {
+      "id": "SCP-BA-001",
+      "title": "Implement RequireParticipation, ParticipationFact, ParticipationThreshold, and ParticipationProfile types",
+      "gate": "gate-participation-admission-types",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/trust/participation.rs",
+        "crates/scp-core/src/trust/mod.rs"
+      ],
+      "description": "Add the RequireParticipation struct, its constituent enums (ParticipationFact, ParticipationThreshold), and the ParticipationProfile struct to the trust/participation module, as specified in §7.3.2.1. ParticipationFact has 7 variants: ParticipationDuration, GovernanceActionsAgainst, GovernanceActionsBy, ToolInvocationCount, ContextCreationCount, RoleProgressionCount, AttestationCount. ParticipationThreshold has 5 variants: GreaterThan(u64), LessThan(u64), AtLeast(u64), AtMost(u64), Equals(u64). RequireParticipation has 4 fields: fact (ParticipationFact), threshold (ParticipationThreshold), max_age_secs (u64), min_contexts (u32). ParticipationProfile is a full participation profile — one statement per member per context, mutated in place. It contains all 7 fact categories as individual u64 fields: participation_duration_secs, governance_actions_against, governance_actions_by, tool_invocation_count, context_creation_count, role_progression_count, attestation_count. Additional fields: subject_did (DID), updated_at (u64), event_log_root ([u8; 32]), signer_public_key ([u8; 32]), signature (Ed25519Signature as [u8; 64]). The statement intentionally omits context_id — this is the privacy guarantee. All types derive Serialize/Deserialize/Debug/Clone/PartialEq/Eq. Add methods on ParticipationFact to extract the corresponding value from a ParticipationProfile, on ParticipationThreshold to check satisfaction, and on ParticipationProfile to produce the signable bytes (all fields except signature, in deterministic order).",
+      "acceptanceCriteria": [
+        "ParticipationFact enum has exactly 7 variants: ParticipationDuration, GovernanceActionsAgainst, GovernanceActionsBy, ToolInvocationCount, ContextCreationCount, RoleProgressionCount, AttestationCount",
+        "ParticipationThreshold enum has exactly 5 variants: GreaterThan(u64), LessThan(u64), AtLeast(u64), AtMost(u64), Equals(u64)",
+        "RequireParticipation struct has fields: fact (ParticipationFact), threshold (ParticipationThreshold), max_age_secs (u64), min_contexts (u32)",
+        "ParticipationProfile struct has fields: subject_did (DID), participation_duration_secs (u64), governance_actions_against (u64), governance_actions_by (u64), tool_invocation_count (u64), context_creation_count (u64), role_progression_count (u64), attestation_count (u64), updated_at (u64), event_log_root ([u8; 32]), signer_public_key ([u8; 32]), signature ([u8; 64])",
+        "ParticipationProfile does NOT contain a context_id field",
+        "ParticipationProfile::signable_bytes(&self) -> Vec<u8> returns deterministic bytes covering all fields except signature",
+        "ParticipationFact::extract_value(&self, &ParticipationProfile) -> u64 returns the correct field value for each variant from the profile",
+        "ParticipationThreshold::is_satisfied(&self, u64) -> bool returns correct comparison result for each variant",
+        "All four types derive Serialize, Deserialize, Debug, Clone, PartialEq, Eq",
+        "Serde roundtrip tests pass for all enum variants and ParticipationProfile",
+        "Unit tests verify extract_value returns correct values for each ParticipationFact variant against a known ParticipationProfile",
+        "Unit tests verify is_satisfied returns correct boolean for each ParticipationThreshold variant with boundary values",
+        "Unit tests verify signable_bytes produces identical output for identical statements and different output when any field changes"
+      ],
+      "actionItems": [
+        "Define ParticipationFact enum with 7 variants in trust/participation.rs",
+        "Define ParticipationThreshold enum with 5 variants in trust/participation.rs",
+        "Define RequireParticipation struct with 4 fields in trust/participation.rs",
+        "Define ParticipationProfile struct with 12 fields (all 7 fact u64 fields, subject_did, updated_at, event_log_root, signer_public_key, signature — no context_id) in trust/participation.rs",
+        "Implement ParticipationProfile::signable_bytes producing deterministic byte representation of all fields except signature",
+        "Implement ParticipationFact::extract_value method mapping each variant to the corresponding ParticipationProfile field",
+        "Implement ParticipationThreshold::is_satisfied method with correct comparison logic for each variant",
+        "Re-export new types from trust/mod.rs",
+        "Add serde roundtrip tests for all types including ParticipationProfile",
+        "Add unit tests for extract_value, is_satisfied, and signable_bytes"
+      ],
+      "blockedBy": [],
+      "sources": [
+        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "#### 7.3.2.1 Participation Admission Requirements" },
+        { "file": ".docs/adrs/phase-4.md", "section": "## ADR-017: Trust Engine (Four-Layer Evaluation)" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-BA-002",
+      "title": "Integrate participation_requirements into ContextParams admission requirements",
+      "gate": "gate-participation-admission-types",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/params.rs",
+        "crates/scp-core/src/context/mod.rs"
+      ],
+      "description": "Add a participation_requirements field (Vec<RequireParticipation>) to ContextParams, with #[serde(default)] for backwards compatibility. This field sits alongside the existing capability ceiling and template fields as a context admission criterion. When present, admitting contexts fetch signed ParticipationProfiles from the joining agent's DID document ParticipationStatements service endpoint and verify all requirements are satisfied. The field uses the RequireParticipation type from SCP-BA-001. Default is empty vec (no participation requirements). Add serde roundtrip tests and verify the default ContextParams still deserializes from JSON without the new field.",
+      "acceptanceCriteria": [
+        "ContextParams has a participation_requirements: Vec<RequireParticipation> field",
+        "The field has #[serde(default)] so existing serialized ContextParams without this field still deserialize",
+        "ContextParams::default() returns participation_requirements as an empty Vec",
+        "Serde roundtrip test with non-empty participation_requirements preserves all RequireParticipation entries",
+        "Existing ContextParams tests continue to pass without modification",
+        "JSON without participation_requirements field deserializes to empty vec (backwards compatibility test)"
+      ],
+      "actionItems": [
+        "Add participation_requirements field to ContextParams struct with #[serde(default)]",
+        "Import RequireParticipation in params.rs",
+        "Update ContextParams::default() to include participation_requirements: Vec::new()",
+        "Add serde roundtrip test with non-empty participation_requirements",
+        "Add backwards compatibility test: JSON without participation_requirements field deserializes correctly"
+      ],
+      "blockedBy": ["SCP-BA-001"],
+      "sources": [
+        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "#### 7.3.2.1 Participation Admission Requirements" },
+        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "### 7.3.2 Participation Records" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-BA-003",
+      "title": "Implement verification of participation admission requirements from fetched statements",
+      "gate": "gate-participation-admission-verification",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/trust/participation.rs",
+        "crates/scp-core/src/trust/mod.rs"
+      ],
+      "description": "Implement the verification function that checks a set of ParticipationProfiles (fetched from a joining agent's DID document ParticipationStatements service endpoint) against a context's Vec<RequireParticipation> admission requirements, per §7.3.2.1 verification flow. The function takes the current timestamp, the requirements, and the fetched signed statements. For each requirement it verifies: (a) each statement's Ed25519 signature is valid over its signable_bytes using its signer_public_key, (b) signers are distinct (N different signer_public_key values proving N independent contexts), (c) the required fact value (extracted from the full profile via ParticipationFact::extract_value) meets the threshold (using ParticipationThreshold::is_satisfied from SCP-BA-001), (d) the statement's updated_at is within max_age_secs of current time, (e) statements span at least min_contexts distinct signers. Returns Ok(()) if all requirements are satisfied, or an error indicating which requirement failed and why.",
+      "acceptanceCriteria": [
+        "verify_participation_requirements(current_time: u64, requirements: &[RequireParticipation], statements: &[ParticipationProfile]) -> Result<(), ParticipationAdmissionError> is implemented",
+        "Returns Ok(()) when all requirements are satisfied by the provided statements",
+        "Each statement's Ed25519 signature is verified against its signer_public_key over signable_bytes",
+        "Returns ParticipationAdmissionError::InvalidSignature when a statement's signature does not verify",
+        "Returns ParticipationAdmissionError::ThresholdNotMet when a fact value extracted from the profile does not satisfy its threshold",
+        "Returns ParticipationAdmissionError::RecordTooStale when all statements for a requirement have updated_at older than max_age_secs from current_time",
+        "Returns ParticipationAdmissionError::InsufficientContexts when statements span fewer than min_contexts distinct signer_public_key values",
+        "Multiple requirements are checked independently — all must pass",
+        "Duplicate signer_public_key values across statements count as one context (not N)",
+        "ParticipationFact::extract_value extracts the correct field from the full ParticipationProfile profile for threshold comparison",
+        "Test: single requirement satisfied by single valid signed statement returns Ok",
+        "Test: multiple requirements all satisfied returns Ok",
+        "Test: invalid signature returns InvalidSignature",
+        "Test: threshold not met returns ThresholdNotMet",
+        "Test: stale statement returns RecordTooStale",
+        "Test: insufficient distinct signers returns InsufficientContexts",
+        "Test: two statements with same signer_public_key count as one context"
+      ],
+      "actionItems": [
+        "Define ParticipationAdmissionError enum with variants InvalidSignature, ThresholdNotMet, RecordTooStale, InsufficientContexts, each carrying diagnostic fields",
+        "Implement verify_participation_requirements function in trust/participation.rs",
+        "Implement Ed25519 signature verification for each statement using signer_public_key and signable_bytes",
+        "Implement freshness check (current_time - statement.updated_at <= max_age_secs)",
+        "Implement min_contexts check by collecting distinct signer_public_key values from qualifying statements",
+        "Use ParticipationFact::extract_value to get the relevant fact value from each full-profile statement for threshold comparison",
+        "Re-export ParticipationAdmissionError from trust/mod.rs",
+        "Add comprehensive unit tests covering all error paths and success paths including signature verification"
+      ],
+      "blockedBy": ["SCP-BA-001"],
+      "sources": [
+        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "#### 7.3.2.1 Participation Admission Requirements" },
+        { "file": ".docs/adrs/phase-4.md", "section": "## ADR-017: Trust Engine (Four-Layer Evaluation)" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-BA-004",
+      "title": "Expose participation admission types and verification through FFI bridges",
+      "gate": "gate-participation-admission-verification",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/python/src/trust.rs",
+        "bindings/python/src/context.rs",
+        "crates/scp-ffi/uniffi/src/trust.rs",
+        "crates/scp-ffi/napi/src/trust.rs"
+      ],
+      "description": "Expose RequireParticipation, ParticipationFact, ParticipationThreshold, ParticipationProfile (full profile with all 7 fact fields), ParticipationAdmissionError, and verify_participation_requirements through the Python (PyO3), UniFFI (Swift/Kotlin), and NAPI (TypeScript) FFI bridges. The Python bridge is the reference implementation — UniFFI and NAPI follow the same pattern. Each bridge exposes: (1) all types as constructible objects/enums, (2) the verification function as a callable, (3) ParticipationAdmissionError mapped to the bridge's error conventions. ContextParams exposure must include the new participation_requirements field. ParticipationProfile must be exposed for both construction (by source contexts producing profile statements) and consumption (by admitting contexts verifying them). The full-profile statement includes all 7 u64 fact fields (participation_duration_secs, governance_actions_against, governance_actions_by, tool_invocation_count, context_creation_count, role_progression_count, attestation_count) plus updated_at, event_log_root, signer_public_key, and signature.",
+      "acceptanceCriteria": [
+        "Python bridge: RequireParticipation, ParticipationFact, ParticipationThreshold, ParticipationProfile are importable from scp_sdk",
+        "Python bridge: ParticipationProfile exposes all 7 fact fields (participation_duration_secs, governance_actions_against, governance_actions_by, tool_invocation_count, context_creation_count, role_progression_count, attestation_count) plus updated_at, event_log_root, signer_public_key, signature",
+        "Python bridge: verify_participation_requirements is callable with ParticipationProfile inputs and returns None on success or raises an exception on failure",
+        "Python bridge: ParticipationAdmissionError variants are mapped to Python exception types",
+        "Python bridge: ContextParams includes participation_requirements field",
+        "UniFFI bridge: RequireParticipation, ParticipationFact, ParticipationThreshold, ParticipationProfile are exposed in the UDL/proc-macro interface",
+        "UniFFI bridge: verify_participation_requirements is callable from Swift and Kotlin",
+        "NAPI bridge: RequireParticipation, ParticipationFact, ParticipationThreshold, ParticipationProfile are exported as TypeScript types",
+        "NAPI bridge: verifyParticipationRequirements is callable and returns a result",
+        "All bridges: serde roundtrip through the FFI boundary preserves all fields including all 7 fact fields of ParticipationProfile"
+      ],
+      "actionItems": [
+        "Add RequireParticipation, ParticipationFact, ParticipationThreshold, ParticipationProfile (full profile) wrappers to Python bridge trust module",
+        "Add verify_participation_requirements binding to Python bridge accepting ParticipationProfile inputs",
+        "Update Python ContextParams wrapper to include participation_requirements",
+        "Add equivalent types and function to UniFFI bridge trust module",
+        "Add equivalent types and function to NAPI bridge trust module",
+        "Add tests in each bridge's test suite verifying construction and verification"
+      ],
+      "blockedBy": ["SCP-BA-002", "SCP-BA-003"],
+      "sources": [
+        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "#### 7.3.2.1 Participation Admission Requirements" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-BA-005",
+      "title": "Implement context-hosted ParticipationProfile production and storage",
+      "gate": "gate-participation-admission-production",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/trust/participation.rs",
+        "crates/scp-core/src/trust/mod.rs",
+        "crates/scp-core/src/context/mod.rs"
+      ],
+      "description": "Implement the protocol operation where a context produces and hosts a ParticipationProfile (full participation profile) for each opted-in member, per §7.3.2.1. Key properties: (1) Contexts produce statements — agents CANNOT write, modify, or delete them. (2) One statement per member per context, mutated in place (not appended). (3) Whenever underlying facts change (governance action, role transition, tool invocation milestone, etc.), the context re-computes all 7 fact values from the event log, updates updated_at, re-signs the statement, and replaces the prior version. (4) Statements are stored on the source context's relay — the context controls the storage. (5) Members must opt in before the context produces a statement for them. The context-specific signing key must be deterministically derived from the context's key material with domain separation ('scp-participation-statement-v1') so verifiers see a consistent signer for a given context but cannot correlate it to the context identity.",
+      "acceptanceCriteria": [
+        "produce_participation_profile(context_key_material, member_did, events, merkle_root) -> Result<ParticipationProfile, TrustError> is implemented",
+        "The function rejects requests for non-members with TrustError::NotAMember",
+        "The returned statement contains all 7 fact values computed from the event log via compute_participation_record",
+        "The returned statement's subject_did matches the requested member_did",
+        "The returned statement's event_log_root matches the provided merkle_root",
+        "The returned statement's updated_at is set to the current time at computation",
+        "The returned statement's signer_public_key is derived deterministically from context_key_material using domain separator 'scp-participation-statement-v1'",
+        "The returned statement's signature is a valid Ed25519 signature over signable_bytes using the derived key",
+        "Different context_key_material inputs produce different signer_public_key values (preventing cross-context correlation)",
+        "The returned statement does NOT contain a context_id",
+        "Calling produce_participation_profile again for the same member produces a new statement that replaces (not appends to) the prior one",
+        "An opt-in check prevents production for members who have not opted in (returns TrustError::NotOptedIn)",
+        "Test: valid opted-in member produces a correctly signed full-profile statement",
+        "Test: non-member request returns TrustError::NotAMember",
+        "Test: non-opted-in member request returns TrustError::NotOptedIn",
+        "Test: produced statement verifies with Ed25519 verify using the embedded signer_public_key",
+        "Test: two different contexts produce statements with different signer_public_key values for the same member",
+        "Test: re-producing a statement after a fact change yields updated values and a new signature"
+      ],
+      "actionItems": [
+        "Implement context-specific signing key derivation from context key material with domain separator 'scp-participation-statement-v1'",
+        "Implement produce_participation_profile function in trust/participation.rs",
+        "Verify member status and opt-in status before producing the statement",
+        "Compute all 7 fact values from event log using existing compute_participation_record",
+        "Populate all ParticipationProfile profile fields (no context_id)",
+        "Sign the statement's signable_bytes with the derived context-specific Ed25519 key",
+        "Re-export produce_participation_profile from trust/mod.rs",
+        "Add unit tests for key derivation determinism, signature validity, cross-context key distinctness, opt-in enforcement, member access control, and statement replacement semantics"
+      ],
+      "blockedBy": ["SCP-BA-001"],
+      "sources": [
+        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "#### 7.3.2.1 Participation Admission Requirements" },
+        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "### 7.3.1 Verifiable Event Logs" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-BA-006",
+      "title": "Register ParticipationStatements service endpoint in DID documents",
+      "gate": "gate-participation-admission-production",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/identity/did_document.rs",
+        "crates/scp-core/src/identity/mod.rs"
+      ],
+      "description": "Add support for a ParticipationStatements service endpoint in DID documents, per §7.3.2.1. The endpoint points to a relay or aggregation endpoint where the agent's participation fact statements can be fetched by admitting contexts. When an agent opts into participation statement publication from one or more contexts, their DID document is updated to include this service entry. The endpoint type is 'ParticipationStatements' and the serviceEndpoint value is the URL where statements are served. Admitting contexts resolve the joining agent's DID document, find this service entry, and fetch statements from it as part of the verification flow.",
+      "acceptanceCriteria": [
+        "DID document Service entries support a 'ParticipationStatements' type",
+        "A ParticipationStatements service entry can be added to and removed from a DID document",
+        "The service entry contains a serviceEndpoint URL pointing to the relay or aggregation endpoint",
+        "DID document serialization/deserialization roundtrips preserve the ParticipationStatements service entry",
+        "A utility function exists to extract the ParticipationStatements service endpoint URL from a resolved DID document",
+        "Test: DID document with ParticipationStatements service entry serializes and deserializes correctly",
+        "Test: extracting ParticipationStatements endpoint from a DID document without one returns None",
+        "Test: extracting ParticipationStatements endpoint from a DID document with one returns the correct URL"
+      ],
+      "actionItems": [
+        "Add ParticipationStatements variant to the service type enum (or constant) in did_document.rs",
+        "Implement helper method to add a ParticipationStatements service entry to a DID document",
+        "Implement helper method to extract the ParticipationStatements service endpoint URL from a DID document",
+        "Add serde roundtrip tests for DID documents containing ParticipationStatements service entries",
+        "Add unit tests for endpoint extraction (present and absent cases)"
+      ],
+      "blockedBy": ["SCP-BA-001"],
+      "sources": [
+        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "#### 7.3.2.1 Participation Admission Requirements" }
+      ],
+      "details": {}
+    }
+  ]
+}

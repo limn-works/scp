@@ -25,7 +25,7 @@
 //!
 //! Session metadata ([`SessionMetadata`]) captures participants, capabilities,
 //! start/end times for recording in the context event log (ADR-024 AC 8,
-//! ADR-017 behavioral records).
+//! ADR-017 participation records).
 //!
 //! See ADR-024 in `.docs/adrs/phase-5.md`.
 
@@ -125,7 +125,7 @@ impl std::fmt::Display for MediaSessionState {
 
 /// Session metadata for event log recording (ADR-024 AC 8).
 ///
-/// Captures everything needed for behavioral record derivation (ADR-017):
+/// Captures everything needed for participation record derivation (ADR-017):
 /// participants, capabilities used, start and end times.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionMetadata {

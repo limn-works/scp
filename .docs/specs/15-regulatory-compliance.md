@@ -14,7 +14,7 @@ The protocol is designed compliance-first and privacy-first. These are core etho
 **GDPR and data portability:**
 
 - **Right to erasure.** A user can revoke their DID, revoke all attestations, and leave all contexts. Their identity private state is encrypted and under their control. Content they authored in contexts remains (attributed to a now-revoked DID) — the protocol does not retroactively delete content from other participants' contexts, as that would be modifying other people's state. Apps and context governance can implement content deletion policies; the protocol provides the identity revocation primitive.
-- **Right to data portability.** Protocol state (membership, roles, attestations, behavioral records) is inherently portable — it's bound to the user's DID, not to any service provider. App state portability depends on the app (§8.3).
+- **Right to data portability.** Protocol state (membership, roles, attestations, participation records) is inherently portable — it's bound to the user's DID, not to any service provider. App state portability depends on the app (§8.3).
 - **Data minimization.** Protocol state is minimal by design (§10.3). The protocol collects and stores the minimum data needed for its function.
 
 **Content moderation (EU Digital Services Act, etc.):**

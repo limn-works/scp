@@ -1,13 +1,13 @@
-//! Behavioral record computation from event logs.
+//! Participation record computation from event logs.
 //!
-//! Behavioral records are computed locally from event logs -- not stored
+//! Participation records are computed locally from event logs -- not stored
 //! centrally. Any agent computes from accessible logs. Two agents may compute
 //! different records from different event log views; this is correct behavior,
 //! not a bug.
 //!
-//! `compute_behavioral_record` is pure computation -- no side effects, no
+//! `compute_participation_record` is pure computation -- no side effects, no
 //! storage. It takes a slice of events and a Merkle root (captured at
-//! computation time for verifiability) and produces a [`BehavioralRecord`].
+//! computation time for verifiability) and produces a [`ParticipationRecord`].
 //!
 //! See ADR-017 in `.docs/adrs/phase-4.md`.
 
@@ -21,7 +21,7 @@ use scp_identity::DID;
 use super::{AttestationReference, GovernanceActionSummary, RoleTransition, ToolId, TrustError};
 
 // ---------------------------------------------------------------------------
-// BehavioralRecord
+// ParticipationRecord
 // ---------------------------------------------------------------------------
 
 /// Verifiable facts computed from context event logs.
@@ -33,8 +33,8 @@ use super::{AttestationReference, GovernanceActionSummary, RoleTransition, ToolI
 ///
 /// See ADR-017 acceptance criterion 1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BehavioralRecord {
-    /// The DID whose behavior is summarized.
+pub struct ParticipationRecord {
+    /// The DID whose participation is summarized.
     pub subject_did: DID,
 
     /// The context this record was computed from.
@@ -73,13 +73,13 @@ pub struct BehavioralRecord {
 }
 
 // ---------------------------------------------------------------------------
-// compute_behavioral_record
+// compute_participation_record
 // ---------------------------------------------------------------------------
 
-/// Computes a behavioral record for a subject DID from a slice of events.
+/// Computes a participation record for a subject DID from a slice of events.
 ///
 /// This function is pure computation -- no side effects, no storage. It scans
-/// all events in the provided slice and extracts behavioral facts for the
+/// all events in the provided slice and extracts participation facts for the
 /// given `subject_did`.
 ///
 /// # Parameters
@@ -97,13 +97,13 @@ pub struct BehavioralRecord {
 /// Returns [`TrustError::EmptyEventLog`] if `events` is empty.
 ///
 /// See ADR-017 acceptance criterion 2.
-pub fn compute_behavioral_record(
+pub fn compute_participation_record(
     events: &[Event],
     subject_did: &str,
     context_id: &str,
     merkle_root: [u8; 32],
     computed_at: u64,
-) -> Result<BehavioralRecord, TrustError> {
+) -> Result<ParticipationRecord, TrustError> {
     if events.is_empty() {
         return Err(TrustError::EmptyEventLog);
     }
@@ -202,7 +202,7 @@ pub fn compute_behavioral_record(
         _ => 0,
     };
 
-    Ok(BehavioralRecord {
+    Ok(ParticipationRecord {
         subject_did: subject_did.into(),
         context_id: context_id.to_owned(),
         participation_count,
@@ -262,7 +262,7 @@ mod tests {
     use scp_event_log::EventPayload;
 
     /// Creates a test event with the given parameters. The signature and
-    /// `prev_hash` are set to dummy values since `compute_behavioral_record`
+    /// `prev_hash` are set to dummy values since `compute_participation_record`
     /// does not verify signatures.
     fn make_event(
         event_type: EventType,
@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn compute_returns_error_for_empty_events() {
-        let result = compute_behavioral_record(&[], "did:key:alice", "ctx-1", [0u8; 32], 100);
+        let result = compute_participation_record(&[], "did:key:alice", "ctx-1", [0u8; 32], 100);
         assert!(result.is_err());
         match result {
             Err(TrustError::EmptyEventLog) => {}
@@ -302,7 +302,8 @@ mod tests {
         ];
 
         let record =
-            compute_behavioral_record(&events, "did:key:alice", "ctx-1", [1u8; 32], 2000).unwrap();
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [1u8; 32], 2000)
+                .unwrap();
 
         assert_eq!(record.subject_did, "did:key:alice");
         assert_eq!(record.context_id, "ctx-1");
@@ -346,7 +347,8 @@ mod tests {
         ];
 
         let record =
-            compute_behavioral_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000).unwrap();
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+                .unwrap();
 
         assert_eq!(record.tool_invocations.len(), 2);
         assert_eq!(record.tool_invocations.get("tool-search"), Some(&2));
@@ -373,7 +375,8 @@ mod tests {
         ];
 
         let record =
-            compute_behavioral_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000).unwrap();
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+                .unwrap();
 
         assert_eq!(record.governance_actions_by.len(), 2);
         assert_eq!(record.governance_actions_by[0].event_sequence, 0);
@@ -405,7 +408,8 @@ mod tests {
         ];
 
         let record =
-            compute_behavioral_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000).unwrap();
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+                .unwrap();
 
         // Only the first governance action targets alice.
         assert_eq!(record.governance_actions_against.len(), 1);
@@ -443,7 +447,8 @@ mod tests {
         ];
 
         let record =
-            compute_behavioral_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000).unwrap();
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+                .unwrap();
 
         assert_eq!(record.role_history.len(), 2);
         assert_eq!(record.role_history[0].timestamp, 1000);
@@ -460,7 +465,8 @@ mod tests {
         ];
 
         let record =
-            compute_behavioral_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000).unwrap();
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+                .unwrap();
 
         assert_eq!(record.context_creation_count, 2);
     }
@@ -473,7 +479,8 @@ mod tests {
         ];
 
         let record =
-            compute_behavioral_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000).unwrap();
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+                .unwrap();
 
         assert_eq!(record.attestation_history.len(), 1);
         assert_eq!(record.attestation_history[0].timestamp, 1000);
@@ -491,7 +498,8 @@ mod tests {
         )];
 
         let record =
-            compute_behavioral_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000).unwrap();
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+                .unwrap();
 
         assert_eq!(record.participation_count, 1);
         assert_eq!(record.participation_duration_seconds, 0);
@@ -505,7 +513,8 @@ mod tests {
         ];
 
         let record =
-            compute_behavioral_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000).unwrap();
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+                .unwrap();
 
         // Record is valid but all counts are zero.
         assert_eq!(record.participation_count, 0);
@@ -530,7 +539,7 @@ mod tests {
 
         let merkle_root = [42u8; 32];
         let record =
-            compute_behavioral_record(&events, "did:key:alice", "ctx-1", merkle_root, 2000)
+            compute_participation_record(&events, "did:key:alice", "ctx-1", merkle_root, 2000)
                 .unwrap();
 
         assert_eq!(record.event_log_root, merkle_root);
@@ -589,7 +598,8 @@ mod tests {
         ];
 
         let record =
-            compute_behavioral_record(&events, "did:key:alice", "ctx-1", [99u8; 32], 5000).unwrap();
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [99u8; 32], 5000)
+                .unwrap();
 
         assert_eq!(record.participation_count, 8); // All events except bob's
         assert_eq!(record.participation_duration_seconds, 9); // 1009 - 1000

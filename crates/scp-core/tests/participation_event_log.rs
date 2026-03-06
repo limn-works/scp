@@ -8,21 +8,21 @@
     clippy::redundant_field_names,
     clippy::cast_possible_truncation
 )]
-//! Integration tests: behavioral validation with event log Merkle operations.
+//! Integration tests: participation validation with event log Merkle operations.
 //!
-//! These three tests verify that `compute_behavioral_record` (scp-core trust
+//! These three tests verify that `compute_participation_record` (scp-core trust
 //! module) integrates correctly with event log checkpointing and pruning
 //! (scp-event-log). They were originally in checkpoint.rs and pruning.rs
 //! within the event log module, removed during the scp-event-log extraction
 //! (PR #199) because they cross the crate boundary. Restored here as
 //! scp-core integration tests per the original extraction plan.
 //!
-//! Covers SCP-125 AC6: behavioral validation continues to work with
+//! Covers SCP-125 AC6: participation validation continues to work with
 //! checkpointed and pruned event logs.
 
 use sha2::{Digest, Sha256};
 
-use scp_core::trust::compute_behavioral_record;
+use scp_core::trust::compute_participation_record;
 use scp_event_log::checkpoint::ConsistencyCheckpoint;
 use scp_event_log::pruning::{PruningConfig, prune_before_checkpoint};
 use scp_event_log::test_helpers::{TestSigner, did_from_pubkey, sign_event, test_keypair};
@@ -140,22 +140,22 @@ fn make_checkpoint(
 }
 
 // ---------------------------------------------------------------------------
-// Test 1: behavioral validation with checkpointed log
+// Test 1: participation validation with checkpointed log
 // ---------------------------------------------------------------------------
 
-/// Exercises behavioral record computation against a checkpoint Merkle root
+/// Exercises participation record computation against a checkpoint Merkle root
 /// with 2 participants and 12 events covering `ContextCreated`, `MemberJoined`,
 /// `RoleAssigned`, `MessageSent`, `ToolInvoked`, `GovernanceAction`, `ToolVerified`.
 ///
 /// This is the core assertion of SCP-125 AC6.
 #[tokio::test]
-async fn behavioral_validation_works_with_checkpointed_log() {
+async fn participation_validation_works_with_checkpointed_log() {
     let (vk_alice, sk_alice) = test_keypair();
     let did_alice = did_from_pubkey(&vk_alice);
     let (vk_bob, sk_bob) = test_keypair();
     let did_bob = did_from_pubkey(&vk_bob);
 
-    let mut log = EventLog::new("ctx-behavioral-checkpoint".to_owned());
+    let mut log = EventLog::new("ctx-participation-checkpoint".to_owned());
     let mut prev_hash = GENESIS_PREV_HASH;
     let mut all_events = Vec::new();
 
@@ -357,17 +357,17 @@ async fn behavioral_validation_works_with_checkpointed_log() {
     assert_eq!(checkpoint.event_count, 12);
     assert_eq!(checkpoint.merkle_root, tree::root(&log));
 
-    // Compute behavioral record for Alice using the checkpoint's Merkle root.
-    // This is the core assertion of SCP-125 AC6: behavioral validation
+    // Compute participation record for Alice using the checkpoint's Merkle root.
+    // This is the core assertion of SCP-125 AC6: participation validation
     // continues to work with checkpointed logs.
-    let record = compute_behavioral_record(
+    let record = compute_participation_record(
         &all_events,
         &did_alice,
-        "ctx-behavioral-checkpoint",
+        "ctx-participation-checkpoint",
         checkpoint.merkle_root,
         2_000_000,
     )
-    .expect("behavioral record computation should succeed");
+    .expect("participation record computation should succeed");
 
     // Alice participated in events 0,1,3,4,6,7,9,10 = 8 events.
     assert_eq!(record.participation_count, 8);
@@ -389,15 +389,15 @@ async fn behavioral_validation_works_with_checkpointed_log() {
     // Merkle root matches checkpoint.
     assert_eq!(record.event_log_root, checkpoint.merkle_root);
 
-    // Also verify Bob's behavioral record against the same checkpoint.
-    let bob_record = compute_behavioral_record(
+    // Also verify Bob's participation record against the same checkpoint.
+    let bob_record = compute_participation_record(
         &all_events,
         &did_bob,
-        "ctx-behavioral-checkpoint",
+        "ctx-participation-checkpoint",
         checkpoint.merkle_root,
         2_000_000,
     )
-    .expect("Bob's behavioral record computation should succeed");
+    .expect("Bob's participation record computation should succeed");
 
     // Bob participated in events 2,5,8,11 = 4 events.
     assert_eq!(bob_record.participation_count, 4);
@@ -414,14 +414,14 @@ async fn behavioral_validation_works_with_checkpointed_log() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 2: behavioral validation after pruning
+// Test 2: participation validation after pruning
 // ---------------------------------------------------------------------------
 
-/// Tests that behavioral validation continues to work after event log
+/// Tests that participation validation continues to work after event log
 /// pruning. Builds a log with 20 events from two participants, prunes the
-/// first 10, and validates behavioral records against the tail log root.
+/// first 10, and validates participation records against the tail log root.
 #[test]
-fn behavioral_validation_works_after_pruning() {
+fn participation_validation_works_after_pruning() {
     let (verifying_key, signing_key) = test_keypair();
     let did = did_from_pubkey(&verifying_key);
     let (verifying_key2, signing_key2) = test_keypair();
@@ -498,18 +498,18 @@ fn behavioral_validation_works_after_pruning() {
 
     assert_eq!(result.events_pruned, 10);
 
-    // Behavioral validation should work with just the post-checkpoint events.
+    // Participation validation should work with just the post-checkpoint events.
     let post_checkpoint_events = &all_events[10..];
     let tail_root = tree::root(truncated.tail_log());
 
-    let record = compute_behavioral_record(
+    let record = compute_participation_record(
         post_checkpoint_events,
         &did,
         "ctx-behavior-test",
         tail_root,
         2_000_000,
     )
-    .expect("behavioral record computation should succeed");
+    .expect("participation record computation should succeed");
 
     // Subject participated in events 10, 12, 14, 16, 18 (even indices).
     assert_eq!(record.participation_count, 5);
@@ -517,20 +517,20 @@ fn behavioral_validation_works_after_pruning() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 3: behavioral validation with full (unpruned) event set
+// Test 3: participation validation with full (unpruned) event set
 // ---------------------------------------------------------------------------
 
-/// Tests behavioral validation with the full event set (no pruning).
+/// Tests participation validation with the full event set (no pruning).
 /// Ensures the basic integration path works without any truncation.
 #[test]
-fn behavioral_validation_with_full_event_set() {
+fn participation_validation_with_full_event_set() {
     let (log, events, _) = build_log_with_events(10, 1_000_000);
     let merkle_root = tree::root(&log);
 
     let actor_did = &events[0].actor_did;
     let record =
-        compute_behavioral_record(&events, actor_did, "ctx-prune-test", merkle_root, 2_000_000)
-            .expect("behavioral record computation should succeed");
+        compute_participation_record(&events, actor_did, "ctx-prune-test", merkle_root, 2_000_000)
+            .expect("participation record computation should succeed");
 
     assert_eq!(record.participation_count, 10);
 }

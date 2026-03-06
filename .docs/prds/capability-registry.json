@@ -1,0 +1,318 @@
+{
+  "project": "scp",
+  "description": "Agent Capability Registry: URI namespace for agent capabilities (ADR-041), unifying ChallengeType and CapabilityEntry under structured URIs. Three authorities: scp:capability:* (protocol-defined, reserved), did:*:capability:* (DID-scoped custom), scp:system:* (protocol feature flags). 27 challenge capabilities + 5 system capabilities. SDK validation rejects unknown protocol-scoped URIs. Context admission requirements reference capability URIs with verification levels.",
+  "gates": [
+    {
+      "id": "gate-uri-parser",
+      "name": "Capability URI Parser and Registry",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-ACR-001",
+        "SCP-ACR-002"
+      ]
+    },
+    {
+      "id": "gate-challenge-unification",
+      "name": "ChallengeType URI Unification",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-ACR-003",
+        "SCP-ACR-004"
+      ]
+    },
+    {
+      "id": "gate-did-capabilities",
+      "name": "DID Capability Entry Update",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-ACR-005",
+        "SCP-ACR-006"
+      ]
+    },
+    {
+      "id": "gate-admission",
+      "name": "Context Admission Capability Requirements",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-ACR-007"
+      ]
+    }
+  ],
+  "stories": [
+    {
+      "id": "SCP-ACR-001",
+      "title": "Implement CapabilityUri type with three-authority URI parser",
+      "gate": "gate-uri-parser",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/trust/capability_uri.rs",
+        "crates/scp-core/src/trust/mod.rs"
+      ],
+      "description": "Implement the CapabilityUri validated type that parses and validates agent capability URIs per ADR-041 and \u00a77.3.4.1. Three URI authorities: (1) scp:capability:{kebab-case}/v{N} for protocol-defined challenge capabilities, (2) did:{method}:{id}:capability:{kebab-case}/v{N} for DID-scoped custom capabilities, (3) scp:system:{kebab-case} for protocol feature flags. The parser enforces: kebab-case naming (lowercase ASCII + hyphens), positive integer version numbers, no deeper nesting. CapabilityUri implements Display (round-trips to the canonical URI string), FromStr, Serialize/Deserialize, PartialEq, Eq, Hash, Clone, Debug. Error variants: MalformedUri, InvalidKebabCase, InvalidVersion, UnknownAuthority.",
+      "acceptanceCriteria": [
+        "CapabilityUri enum has three variants: Protocol { name: String, version: u32 }, DidScoped { did: String, name: String, version: u32 }, System { name: String }",
+        "FromStr parses 'scp:capability:prompt-injection-resistance/v1' into Protocol { name: \"prompt-injection-resistance\", version: 1 }",
+        "FromStr parses 'did:dht:z6Mk123:capability:domain-expertise/v2' into DidScoped { did: \"did:dht:z6Mk123\", name: \"domain-expertise\", version: 2 }",
+        "FromStr parses 'scp:system:relay-operation' into System { name: \"relay-operation\" }",
+        "FromStr rejects 'scp:capability:UPPERCASE/v1' with InvalidKebabCase error",
+        "FromStr rejects 'scp:capability:name/v0' with InvalidVersion error (version must be >= 1)",
+        "FromStr rejects 'scp:capability:name' with MalformedUri error (missing version for capability URIs)",
+        "FromStr rejects 'scp:unknown:name' with UnknownAuthority error",
+        "FromStr rejects 'scp:capability:name/v1/extra' with MalformedUri error (no deeper nesting)",
+        "Display round-trips: parse then display produces the original string for all valid URIs",
+        "CapabilityUri derives Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Debug",
+        "Tests verify at least one URI from each of the three authority types",
+        "Tests verify all error variants are reachable"
+      ],
+      "actionItems": [
+        "Define CapabilityUri enum with Protocol, DidScoped, and System variants",
+        "Implement FromStr with kebab-case validation regex",
+        "Implement Display for canonical round-trip",
+        "Implement Serialize/Deserialize via the string representation",
+        "Define CapabilityUriError enum with MalformedUri, InvalidKebabCase, InvalidVersion, UnknownAuthority variants",
+        "Add unit tests for all valid and invalid URI forms",
+        "Re-export from trust/mod.rs"
+      ],
+      "blockedBy": [],
+      "sources": [
+        { "file": ".docs/adrs/phase-4.md", "section": "## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)" },
+        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "#### 7.3.4.1 Capability URI Namespace" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-ACR-002",
+      "title": "Implement protocol capability registry with 27 challenge + 5 system capabilities",
+      "gate": "gate-uri-parser",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/trust/capability_registry.rs",
+        "crates/scp-core/src/trust/mod.rs"
+      ],
+      "description": "Implement the protocol capability registry per ADR-041 and \u00a77.3.4.3. The registry is a compile-time constant map from CapabilityUri to RegistryEntry containing category, description, and optional parameter schema (serde_json::Value). The registry contains 27 challenge capabilities across 10 categories and 5 system capabilities. Provides lookup_protocol_capability(uri) -> Option<&RegistryEntry> and is_known_protocol_capability(uri) -> bool. The validate_capability_uri(uri) function rejects unknown scp:capability:* URIs while accepting all valid DID-scoped URIs. This is the SDK enforcement point described in \u00a77.3.4.2.",
+      "acceptanceCriteria": [
+        "RegistryEntry struct has fields: category (String), description (String), parameter_schema (Option<serde_json::Value>)",
+        "PROTOCOL_REGISTRY contains exactly 27 entries with CapabilityUri::Protocol variants",
+        "SYSTEM_REGISTRY contains exactly 5 entries with CapabilityUri::System variants",
+        "lookup_protocol_capability returns Some for 'scp:capability:prompt-injection-resistance/v1'",
+        "lookup_protocol_capability returns None for 'scp:capability:nonexistent/v1'",
+        "is_known_protocol_capability returns true for all 27 protocol capabilities",
+        "is_known_protocol_capability returns false for unknown protocol URIs",
+        "validate_capability_uri accepts all 27 protocol capabilities",
+        "validate_capability_uri accepts arbitrary DID-scoped capabilities without registry lookup",
+        "validate_capability_uri rejects unknown scp:capability:* URIs with UnknownProtocolCapability error",
+        "validate_capability_uri accepts all 5 system capabilities",
+        "Parameterized capabilities (latency-compliance, multilingual, mathematical-reasoning, code-generation, code-review) have non-None parameter_schema",
+        "Registry entries are grouped by category: safety-security (4), schema-compliance (3), behavioral-compliance (4), operational (3), spending-commerce (2), reasoning-logic (3), code (2), recall-fidelity (2), bias-fairness (2), factual-hallucination (3)",
+        "Tests verify round-trip: every registry entry's URI parses back to the same CapabilityUri"
+      ],
+      "actionItems": [
+        "Define RegistryEntry struct",
+        "Build PROTOCOL_REGISTRY as a static/const map (phf or lazy_static HashMap) with all 27 entries",
+        "Build SYSTEM_REGISTRY with all 5 entries",
+        "Implement lookup_protocol_capability and is_known_protocol_capability",
+        "Implement validate_capability_uri that enforces scp:capability:* reservation",
+        "Add parameter schemas for parameterized capabilities",
+        "Add unit tests verifying all 32 registry entries",
+        "Re-export from trust/mod.rs"
+      ],
+      "blockedBy": ["SCP-ACR-001"],
+      "sources": [
+        { "file": ".docs/adrs/phase-4.md", "section": "## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)" },
+        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "#### 7.3.4.3 Protocol Capability Registry" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-ACR-003",
+      "title": "Unify ChallengeType enum with CapabilityUri",
+      "gate": "gate-challenge-unification",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/trust/challenge.rs"
+      ],
+      "description": "Replace the existing ChallengeType enum's hardcoded variants and Custom(String) with CapabilityUri-based matching per ADR-041 acceptance criterion 3. The three existing variants map to protocol URIs: PromptInjectionResistance -> scp:capability:prompt-injection-resistance/v1, SchemaValidation -> scp:capability:schema-validation/v1, RateLimitCompliance -> scp:capability:rate-limit-compliance/v1. Custom(String) is replaced by a variant that holds a validated CapabilityUri (must be DID-scoped or a known protocol URI). Existing code that pattern-matches on ChallengeType must be updated. The challenge_type_tag function uses the URI string representation. ChallengeRequest and ChallengeResponse are unchanged except for the ChallengeType field type. Serialization must be backwards-compatible: old PromptInjectionResistance deserializes to the URI form.",
+      "acceptanceCriteria": [
+        "ChallengeType enum has a single variant: Uri(CapabilityUri)",
+        "ChallengeType::from_legacy(\"PromptInjectionResistance\") returns ChallengeType with scp:capability:prompt-injection-resistance/v1",
+        "ChallengeType::from_legacy(\"SchemaValidation\") returns ChallengeType with scp:capability:schema-validation/v1",
+        "ChallengeType::from_legacy(\"RateLimitCompliance\") returns ChallengeType with scp:capability:rate-limit-compliance/v1",
+        "challenge_type_tag returns the canonical URI string for all challenge types",
+        "ChallengeType serializes as the URI string",
+        "ChallengeType deserializes from both legacy variant names and URI strings (backwards-compatible)",
+        "ChallengeType rejects Custom strings that use the scp:capability:* prefix but are not in the protocol registry",
+        "All existing tests in challenge.rs pass after migration (updated to use URI-based types)",
+        "ChallengeType derives PartialEq, Eq, Hash, Clone, Debug, Serialize, Deserialize",
+        "canonical_challenge_request_bytes uses the URI string as the type tag"
+      ],
+      "actionItems": [
+        "Refactor ChallengeType enum to use CapabilityUri",
+        "Add from_legacy constructor for backwards compatibility",
+        "Implement custom Serialize/Deserialize for backwards-compatible wire format",
+        "Update challenge_type_tag to use Display on CapabilityUri",
+        "Update canonical_challenge_request_bytes to use URI string",
+        "Update all existing tests to use new URI-based ChallengeType",
+        "Add migration tests verifying backwards compatibility"
+      ],
+      "blockedBy": ["SCP-ACR-001", "SCP-ACR-002"],
+      "sources": [
+        { "file": ".docs/adrs/phase-4.md", "section": "## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)" },
+        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "### 7.3.4 Challenge-Response Verification" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-ACR-004",
+      "title": "Expand challenge support for all 27 protocol capabilities",
+      "gate": "gate-challenge-unification",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/trust/challenge.rs",
+        "crates/scp-core/src/trust/capability_registry.rs"
+      ],
+      "description": "After SCP-ACR-003 unifies ChallengeType with CapabilityUri, ensure the challenge-response protocol supports all 27 protocol-defined capabilities. The issue_challenge function must accept any valid CapabilityUri (protocol or DID-scoped). The verify_challenge_response function validates against the registry to confirm the challenge type is a known protocol capability or a valid DID-scoped URI. Parameterized capabilities (latency-compliance, multilingual, mathematical-reasoning, code-generation, code-review) must have their parameter schemas available for challenge parameter validation. This story does NOT implement concrete test vectors for each capability; it ensures the infrastructure supports all 27.",
+      "acceptanceCriteria": [
+        "issue_challenge accepts any of the 27 protocol capability URIs as the challenge_type",
+        "issue_challenge accepts DID-scoped capability URIs as the challenge_type",
+        "issue_challenge rejects unknown scp:capability:* URIs (not in registry)",
+        "verify_challenge_response succeeds for challenges using any of the 27 protocol capabilities",
+        "For parameterized capabilities, issue_challenge validates that parameters match the registry's parameter_schema when present",
+        "Tests exercise issue_challenge with at least one capability from each of the 10 categories",
+        "Tests exercise issue_challenge with a DID-scoped custom capability",
+        "Tests verify that issue_challenge rejects an unknown scp:capability:fake/v1"
+      ],
+      "actionItems": [
+        "Update issue_challenge to validate challenge_type against registry",
+        "Add parameter schema validation for parameterized capabilities",
+        "Update verify_challenge_response to accept URI-based challenge types",
+        "Add integration tests covering all 10 categories",
+        "Add test for DID-scoped custom capability challenge",
+        "Add negative test for unknown protocol capability rejection"
+      ],
+      "blockedBy": ["SCP-ACR-003"],
+      "sources": [
+        { "file": ".docs/adrs/phase-4.md", "section": "## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)" },
+        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "#### 7.3.4.3 Protocol Capability Registry" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-ACR-005",
+      "title": "Update CapabilityEntry to use CapabilityUri type",
+      "gate": "gate-did-capabilities",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/discovery/did_capabilities.rs"
+      ],
+      "description": "Update CapabilityEntry in did_capabilities.rs to use Vec<CapabilityUri> instead of Vec<String> for the capabilities field per ADR-041 acceptance criterion 4. The parse_capability_endpoint function must parse each comma-separated capability string as a CapabilityUri. The existing scp:capabilities: service endpoint prefix is retained for DID document encoding, but each individual capability string within the comma-separated list must be a valid CapabilityUri. Invalid URIs in a service endpoint produce DiscoveryError::InvalidCapabilities. The resolve_capabilities function returns validated CapabilityUri instances.",
+      "acceptanceCriteria": [
+        "CapabilityEntry.capabilities field type is Vec<CapabilityUri> (not Vec<String>)",
+        "parse_capability_endpoint('scp:capabilities:scp:capability:schema-validation/v1,scp:capability:rate-limit-compliance/v1') returns two valid CapabilityUri::Protocol entries",
+        "parse_capability_endpoint('scp:capabilities:did:dht:z6Mk123:capability:custom/v1') returns one valid CapabilityUri::DidScoped entry",
+        "parse_capability_endpoint('scp:capabilities:invalid!!') returns DiscoveryError::InvalidCapabilities",
+        "extract_capabilities deduplicates by CapabilityUri equality (not string equality)",
+        "resolve_capabilities returns CapabilityEntry with validated CapabilityUri instances",
+        "All existing tests updated and passing with new CapabilityUri type",
+        "Serialization of CapabilityEntry produces URI strings in the capabilities array"
+      ],
+      "actionItems": [
+        "Change CapabilityEntry.capabilities from Vec<String> to Vec<CapabilityUri>",
+        "Update parse_capability_endpoint to parse each capability as CapabilityUri",
+        "Update extract_capabilities deduplication to use CapabilityUri Hash/Eq",
+        "Update all tests to use valid CapabilityUri strings",
+        "Add test for mixed protocol and DID-scoped capabilities in one service endpoint",
+        "Add test for invalid URI rejection"
+      ],
+      "blockedBy": ["SCP-ACR-001"],
+      "sources": [
+        { "file": ".docs/adrs/phase-4.md", "section": "## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)" },
+        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "#### 7.3.4.1 Capability URI Namespace" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-ACR-006",
+      "title": "Add system capability declarations to DID document service entries",
+      "gate": "gate-did-capabilities",
+      "priority": "P1",
+      "severity": "moderate",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/discovery/did_capabilities.rs"
+      ],
+      "description": "Extend the DID document capability advertising to support system capabilities (scp:system:*). System capabilities use the same SCPCapabilities service endpoint format as challenge capabilities but with the scp:system: prefix. The parse_capability_endpoint function already handles this via the CapabilityUri parser (SCP-ACR-005), but this story ensures system capabilities are properly represented, documented, and tested. System capabilities describe node roles (relay-operation, bridge-operation, etc.) and are not subject to challenge-response verification. Contexts and peers can discover system capabilities via DID resolution.",
+      "acceptanceCriteria": [
+        "parse_capability_endpoint('scp:capabilities:scp:system:relay-operation,scp:system:bridge-operation') returns two valid CapabilityUri::System entries",
+        "CapabilityEntry can contain a mix of Protocol, DidScoped, and System capabilities",
+        "Tests verify a DID document with system capabilities resolves correctly via resolve_capabilities",
+        "Tests verify deduplication works across Protocol, DidScoped, and System variants",
+        "System capabilities are not confused with challenge capabilities in any code path"
+      ],
+      "actionItems": [
+        "Add tests for system capability parsing and resolution",
+        "Add tests for mixed capability types in a single service endpoint",
+        "Verify deduplication works correctly across all three CapabilityUri variants",
+        "Add doc comments explaining system capability semantics"
+      ],
+      "blockedBy": ["SCP-ACR-005"],
+      "sources": [
+        { "file": ".docs/adrs/phase-4.md", "section": "## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)" },
+        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "#### 7.3.4.1 Capability URI Namespace" }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-ACR-007",
+      "title": "Implement context admission capability requirements with verification levels",
+      "gate": "gate-admission",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/context/params.rs",
+        "crates/scp-core/src/trust/capability_uri.rs"
+      ],
+      "description": "Implement the context admission capability requirement system per ADR-041 acceptance criterion 6 and \u00a77.3.4.4. Add a CapabilityRequirement struct containing a CapabilityUri and a VerificationLevel (SelfAttested or ChallengeVerified). Add an optional required_capabilities: Vec<CapabilityRequirement> field to ContextParams (or the relevant admission configuration type). Implement check_capability_requirements(requirements, agent_capabilities, challenge_verifications) -> Result<(), AdmissionError> that validates a joining agent meets all requirements. SelfAttested requires the capability URI in the agent's CapabilityEntry. ChallengeVerified requires a valid ChallengeVerification record for that capability URI. This story does NOT wire the check into the join flow (that depends on the ContextManager integration); it implements the data types and check function.",
+      "acceptanceCriteria": [
+        "CapabilityRequirement struct has fields: capability (CapabilityUri), verification_level (VerificationLevel)",
+        "VerificationLevel enum has two variants: SelfAttested, ChallengeVerified",
+        "check_capability_requirements returns Ok(()) when all requirements are met",
+        "check_capability_requirements returns Err(MissingCapability { uri }) when a SelfAttested requirement is not in the agent's capabilities",
+        "check_capability_requirements returns Err(VerificationRequired { uri }) when a ChallengeVerified requirement has no matching ChallengeVerification record",
+        "check_capability_requirements accepts ChallengeVerified capabilities that also satisfy SelfAttested requirements (ChallengeVerified is strictly stronger)",
+        "CapabilityRequirement derives Debug, Clone, Serialize, Deserialize, PartialEq, Eq",
+        "Tests verify SelfAttested check against CapabilityEntry",
+        "Tests verify ChallengeVerified check against ChallengeVerification records",
+        "Tests verify mixed requirements (some SelfAttested, some ChallengeVerified)",
+        "Tests verify rejection when any single requirement is unmet"
+      ],
+      "actionItems": [
+        "Define CapabilityRequirement and VerificationLevel types",
+        "Implement check_capability_requirements function",
+        "Add AdmissionError variants for MissingCapability and VerificationRequired",
+        "Add unit tests for all acceptance criteria",
+        "Document the admission check flow in doc comments"
+      ],
+      "blockedBy": ["SCP-ACR-001", "SCP-ACR-003"],
+      "sources": [
+        { "file": ".docs/adrs/phase-4.md", "section": "## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)" },
+        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "#### 7.3.4.4 Context Admission via Capability URIs" }
+      ],
+      "details": {}
+    }
+  ]
+}

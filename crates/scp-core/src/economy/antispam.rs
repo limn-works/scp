@@ -11,9 +11,9 @@
 //! normal conversation rates incur negligible cost while spam rates become
 //! economically self-limiting.
 //!
-//! Economic escalation operates independently from behavioral consequence
+//! Economic escalation operates independently from participation consequence
 //! mechanisms (spec section 7.3.7): an agent might exhaust its spending UCAN
-//! before behavioral suspension triggers, or vice versa.
+//! before participation suspension triggers, or vice versa.
 //!
 //! Each DID is tracked independently as a Sybil deterrent — N identities
 //! cost N times as much.

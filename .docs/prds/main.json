@@ -1990,7 +1990,7 @@
         "crates/scp-core/event_log/mod.rs",
         "crates/scp-core/event_log/tree.rs"
       ],
-      "description": "Implement an append-only Merkle tree per context in scp-core/event_log/. The tree uses SHA-256 hashing following the Certificate Transparency (RFC 6962) structure: leaf nodes are SHA-256 hashes of events, and interior nodes are SHA-256 hashes of their children's concatenated hashes. This story implements the core data structures (EventLog, Event, EventType, EventPayload) and the append/root/event_count operations. The Merkle tree is the foundation for behavioral validation, behavioral records, the Relay Consistency Protocol, and equivocation detection.",
+      "description": "Implement an append-only Merkle tree per context in scp-core/event_log/. The tree uses SHA-256 hashing following the Certificate Transparency (RFC 6962) structure: leaf nodes are SHA-256 hashes of events, and interior nodes are SHA-256 hashes of their children's concatenated hashes. This story implements the core data structures (EventLog, Event, EventType, EventPayload) and the append/root/event_count operations. The Merkle tree is the foundation for participation validation, participation records, the Relay Consistency Protocol, and equivocation detection.",
       "acceptanceCriteria": [
         "`EventLog` struct with fields: leaves (Vec<[u8; 32]> \u2014 SHA-256 hashes of events), tree (Vec<Vec<[u8; 32]>> \u2014 interior node layers), context_id (ContextId)",
         "`Event` struct with fields: event_type (EventType), actor_did (DID), timestamp (u64), sequence (u64 \u2014 monotonic event sequence within this log), payload (EventPayload \u2014 type-specific data), prev_hash ([u8; 32] \u2014 hash of the previous event for hash chain), signature (Ed25519Signature)",
@@ -3504,29 +3504,29 @@
     },
     {
       "id": "SCP-061",
-      "title": "Implement trust engine module root and behavioral records",
+      "title": "Implement trust engine module root and participation records",
       "gate": "gate-4",
       "priority": "P1",
       "severity": "critical",
       "status": "done",
       "files": [
         "crates/scp-core/trust/mod.rs",
-        "crates/scp-core/trust/behavioral.rs"
+        "crates/scp-core/trust/participation.rs"
       ],
-      "description": "Implement `scp-core/trust/` module root with `TrustInput` struct and re-exports, plus `BehavioralRecord` and `compute_behavioral_record` in behavioral.rs. Behavioral records are computed locally from event logs (not stored centrally) \u2014 any agent computes from accessible logs. Two agents may compute different records from different event log views \u2014 this is correct behavior, not a bug. The trust engine provides validated inputs for agent-level evaluation \u2014 it does not produce trust 'scores.'",
+      "description": "Implement `scp-core/trust/` module root with `TrustInput` struct and re-exports, plus `ParticipationRecord` and `compute_participation_record` in participation.rs. Participation records are computed locally from event logs (not stored centrally) \u2014 any agent computes from accessible logs. Two agents may compute different records from different event log views \u2014 this is correct behavior, not a bug. The trust engine provides validated inputs for agent-level evaluation \u2014 it does not produce trust 'scores.'",
       "acceptanceCriteria": [
-        "TrustInput struct defined with fields: verified_attestations (Vec<Attestation>), behavioral_record (BehavioralRecord), challenge_results (Vec<(ChallengeRequest, ChallengeResponse)>), consequence_structure (Vec<ConsequenceRule>), threshold_counts (HashMap<AttestationType, (u32, u32)>)",
-        "BehavioralRecord struct defined with fields: subject_did (DID), context_id (ContextId), participation_count (u64), participation_duration_seconds (u64), tool_invocations (HashMap<ToolId, u64>), governance_actions_by (Vec<GovernanceActionSummary>), governance_actions_against (Vec<GovernanceActionSummary>), role_history (Vec<RoleTransition>), attestation_history (Vec<AttestationReference>), context_creation_count (u64), computed_at (u64), event_log_root ([u8; 32])",
-        "compute_behavioral_record(event_log, subject_did) -> Result<BehavioralRecord, TrustError> scans event log entries for the subject DID",
-        "compute_behavioral_record computes: participation count/duration, tool invocations by type/frequency, governance actions against/by identity, role progression, attestation history, context creation history",
-        "compute_behavioral_record captures the Merkle root at computation time for verifiability",
-        "compute_behavioral_record is pure computation \u2014 no side effects, no storage",
+        "TrustInput struct defined with fields: verified_attestations (Vec<Attestation>), participation_record (ParticipationRecord), challenge_results (Vec<(ChallengeRequest, ChallengeResponse)>), consequence_structure (Vec<ConsequenceRule>), threshold_counts (HashMap<AttestationType, (u32, u32)>)",
+        "ParticipationRecord struct defined with fields: subject_did (DID), context_id (ContextId), participation_count (u64), participation_duration_seconds (u64), tool_invocations (HashMap<ToolId, u64>), governance_actions_by (Vec<GovernanceActionSummary>), governance_actions_against (Vec<GovernanceActionSummary>), role_history (Vec<RoleTransition>), attestation_history (Vec<AttestationReference>), context_creation_count (u64), computed_at (u64), event_log_root ([u8; 32])",
+        "compute_participation_record(event_log, subject_did) -> Result<ParticipationRecord, TrustError> scans event log entries for the subject DID",
+        "compute_participation_record computes: participation count/duration, tool invocations by type/frequency, governance actions against/by identity, role progression, attestation history, context creation history",
+        "compute_participation_record captures the Merkle root at computation time for verifiability",
+        "compute_participation_record is pure computation \u2014 no side effects, no storage",
         "Module root re-exports all public types from submodules"
       ],
       "actionItems": [
         "Create crates/scp-core/trust/mod.rs with TrustInput struct, TrustError enum, and re-exports",
-        "Create crates/scp-core/trust/behavioral.rs with BehavioralRecord struct and supporting types (GovernanceActionSummary, RoleTransition, AttestationReference)",
-        "Implement compute_behavioral_record that scans event log for subject DID entries",
+        "Create crates/scp-core/trust/participation.rs with ParticipationRecord struct and supporting types (GovernanceActionSummary, RoleTransition, AttestationReference)",
+        "Implement compute_participation_record that scans event log for subject DID entries",
         "Implement participation count and duration computation from MemberJoined/MemberLeft events",
         "Implement tool invocation frequency computation from ToolInvoked events",
         "Implement governance action extraction (actions by and against subject)",
@@ -3534,7 +3534,7 @@
         "Implement attestation history extraction",
         "Implement context creation count from ContextCreated events",
         "Capture Merkle root from event log at computation time",
-        "Write unit tests for compute_behavioral_record with mock event logs"
+        "Write unit tests for compute_participation_record with mock event logs"
       ],
       "blockedBy": [
         "SCP-030",
@@ -3550,8 +3550,8 @@
         "module": "scp-core/trust/",
         "estimatedFunctions": "~5 public functions, ~4 internal helpers",
         "rustTypes": {
-          "TrustInput": "pub struct TrustInput { pub verified_attestations: Vec<Attestation>, pub behavioral_record: BehavioralRecord, pub challenge_results: Vec<(ChallengeRequest, ChallengeResponse)>, pub consequence_structure: Vec<ConsequenceRule>, pub threshold_counts: HashMap<AttestationType, (u32, u32)> }",
-          "BehavioralRecord": "pub struct BehavioralRecord { pub subject_did: DID, pub context_id: ContextId, pub participation_count: u64, pub participation_duration_seconds: u64, pub tool_invocations: HashMap<ToolId, u64>, pub governance_actions_by: Vec<GovernanceActionSummary>, pub governance_actions_against: Vec<GovernanceActionSummary>, pub role_history: Vec<RoleTransition>, pub attestation_history: Vec<AttestationReference>, pub context_creation_count: u64, pub computed_at: u64, pub event_log_root: [u8; 32] }"
+          "TrustInput": "pub struct TrustInput { pub verified_attestations: Vec<Attestation>, pub participation_record: ParticipationRecord, pub challenge_results: Vec<(ChallengeRequest, ChallengeResponse)>, pub consequence_structure: Vec<ConsequenceRule>, pub threshold_counts: HashMap<AttestationType, (u32, u32)> }",
+          "ParticipationRecord": "pub struct ParticipationRecord { pub subject_did: DID, pub context_id: ContextId, pub participation_count: u64, pub participation_duration_seconds: u64, pub tool_invocations: HashMap<ToolId, u64>, pub governance_actions_by: Vec<GovernanceActionSummary>, pub governance_actions_against: Vec<GovernanceActionSummary>, pub role_history: Vec<RoleTransition>, pub attestation_history: Vec<AttestationReference>, pub context_creation_count: u64, pub computed_at: u64, pub event_log_root: [u8; 32] }"
         }
       }
     },
@@ -3568,7 +3568,7 @@
       "description": "Implement attestation types and verification logic. Common attestation envelope (\u00a77.4.1) enables generic verification logic and interoperable attestation exchange. Attestation freshness evaluates renewal interval \u2014 stale attestations (past renewal interval but not expired) are degraded, not revoked. Threshold attestation checks N-of-M requirements with independence scoring.",
       "acceptanceCriteria": [
         "Attestation struct defined with fields: id (String), attestation_type (AttestationType), issuer (DID), subject (DID), claim (serde_json::Value), evidence (Option<AttestationEvidence>), issued_at (u64), expires_at (Option<u64>), renewal_interval (Option<Duration>), revocation_status (RevocationStatus), signature (Ed25519Signature)",
-        "AttestationType enum with variants: IdentityLink, CapabilityDelegation, ToolIntegrity, AgentCapability, Endorsement, RoleAssignment, ContextEndorsement, BehavioralWitness",
+        "AttestationType enum with variants: IdentityLink, CapabilityDelegation, ToolIntegrity, AgentCapability, Endorsement, RoleAssignment, ContextEndorsement, ParticipationWitness",
         "ThresholdRequirement struct with fields: required_count (u32), total_attestors (u32), independence_threshold (f64)",
         "verify_attestation(attestation) -> Result<(), TrustError> verifies Ed25519 signature against issuer's public key (resolved via DID)",
         "verify_attestation validates evidence per attestation type",
@@ -3613,7 +3613,7 @@
         ],
         "rustTypes": {
           "Attestation": "pub struct Attestation { pub id: String, pub attestation_type: AttestationType, pub issuer: DID, pub subject: DID, pub claim: serde_json::Value, pub evidence: Option<AttestationEvidence>, pub issued_at: u64, pub expires_at: Option<u64>, pub renewal_interval: Option<Duration>, pub revocation_status: RevocationStatus, pub signature: Ed25519Signature }",
-          "AttestationType": "pub enum AttestationType { IdentityLink, CapabilityDelegation, ToolIntegrity, AgentCapability, Endorsement, RoleAssignment, ContextEndorsement, BehavioralWitness }",
+          "AttestationType": "pub enum AttestationType { IdentityLink, CapabilityDelegation, ToolIntegrity, AgentCapability, Endorsement, RoleAssignment, ContextEndorsement, ParticipationWitness }",
           "ThresholdRequirement": "pub struct ThresholdRequirement { pub required_count: u32, pub total_attestors: u32, pub independence_threshold: f64 }"
         }
       },
@@ -3732,7 +3732,7 @@
       ],
       "description": "Implement aggregate_trust_input that combines all trust engine layers into a single TrustInput struct for agent-level evaluation. Includes ProtocolStore integration for caching verified attestations with TTL-based refresh, storing revocation list state per context, and persisting challenge results with timestamps.",
       "acceptanceCriteria": [
-        "aggregate_trust_input(context, subject_did) -> Result<TrustInput, TrustError> computes behavioral record from event log",
+        "aggregate_trust_input(context, subject_did) -> Result<TrustInput, TrustError> computes participation record from event log",
         "aggregate_trust_input collects and verifies attestations from cache",
         "aggregate_trust_input collects challenge results with timestamps",
         "aggregate_trust_input collects consequence structure from context params",
@@ -3744,7 +3744,7 @@
       ],
       "actionItems": [
         "Create crates/scp-core/trust/aggregate.rs with aggregate_trust_input function",
-        "Call compute_behavioral_record from behavioral.rs for the subject DID",
+        "Call compute_participation_record from participation.rs for the subject DID",
         "Collect attestations from ProtocolStore cache, verify each via verify_attestation",
         "Refresh stale attestations based on TTL",
         "Collect challenge results from ProtocolStore with timestamps",
@@ -4146,7 +4146,7 @@
         "CapabilityEntry struct defined with fields: did (DID), capabilities (Vec<String>), service_endpoints (Vec<String>), resolved_at (u64)",
         "DiscoveryQuery struct defined with fields: capability_filter (Option<Vec<String>>), keywords (Option<Vec<String>>), min_history (Option<Duration>)",
         "DiscoveryResult struct defined with fields: entries (Vec<DiscoveryResultEntry>), sources (Vec<ContextId>)",
-        "DiscoveryResultEntry struct defined with fields: did (DID), capabilities (Vec<String>), behavioral_summary (Option<serde_json::Value>), provenance (DataProvenance), relevance_score (f64)",
+        "DiscoveryResultEntry struct defined with fields: did (DID), capabilities (Vec<String>), participation_summary (Option<serde_json::Value>), provenance (DataProvenance), relevance_score (f64)",
         "RegistrationEntry struct defined with fields: did (DID), capabilities (Vec<String>), metadata (serde_json::Value), entry_id (String), registered_at (u64)",
         "DiscoveryBootstrap struct defined with fields: default_context_ids (Vec<ContextId>)",
         "resolve_capabilities(did) -> Result<CapabilityEntry, DiscoveryError> resolves DID via did:dht, extracts SCPCapabilities from service array, caches in local contact index",
@@ -4178,12 +4178,12 @@
           "CapabilityEntry": "pub struct CapabilityEntry { pub did: DID, pub capabilities: Vec<String>, pub service_endpoints: Vec<String>, pub resolved_at: u64 }",
           "DiscoveryQuery": "pub struct DiscoveryQuery { pub capability_filter: Option<Vec<String>>, pub keywords: Option<Vec<String>>, pub min_history: Option<Duration> }",
           "DiscoveryResult": "pub struct DiscoveryResult { pub entries: Vec<DiscoveryResultEntry>, pub sources: Vec<ContextId> }",
-          "DiscoveryResultEntry": "pub struct DiscoveryResultEntry { pub did: DID, pub capabilities: Vec<String>, pub behavioral_summary: Option<serde_json::Value>, pub provenance: DataProvenance, pub relevance_score: f64 }",
+          "DiscoveryResultEntry": "pub struct DiscoveryResultEntry { pub did: DID, pub capabilities: Vec<String>, pub participation_summary: Option<serde_json::Value>, pub provenance: DataProvenance, pub relevance_score: f64 }",
           "RegistrationEntry": "pub struct RegistrationEntry { pub did: DID, pub capabilities: Vec<String>, pub metadata: serde_json::Value, pub entry_id: String, pub registered_at: u64 }",
           "DiscoveryBootstrap": "pub struct DiscoveryBootstrap { pub default_context_ids: Vec<ContextId> }"
         },
         "standardToolSchemas": {
-          "agent_search": "agent_search(query) -> { results: [{ did, capabilities, behavioral_summary }] }",
+          "agent_search": "agent_search(query) -> { results: [{ did, capabilities, participation_summary }] }",
           "agent_register": "agent_register(did, capabilities, metadata) -> { registered, entry_id }",
           "agent_deregister": "agent_deregister(did) -> { removed }"
         }
@@ -5142,7 +5142,7 @@
       "files": [
         "crates/scp-media/src/session.rs"
       ],
-      "description": "Implement media session lifecycle in `scp-media/session.rs`. Session initiation, join, and end. Capability ceiling checks before session start.\n\nCapability ceiling check: media session initiation requires corresponding `media.*` capability in context ceiling. `check_media_capability(context, capability) -> Result<(), MediaError>`. Rejected if ceiling doesn't include the requested media type.\n\nSession teardown: member removal from context invalidates their media session keys via MLS epoch advance. Explicit `SessionEnd` message for graceful teardown. `end_media_session(session_id) -> Result<(), MediaError>`.\n\nNo media through SCP relays: media frames flow peer-to-peer or through WebRTC SFU using DTLS-SRTP with MLS-derived keys. SCP relays handle only signaling messages (small, infrequent).\n\nSession metadata in event log: participants, start time, end time, capabilities used recorded in context event log. Used for behavioral record derivation (ADR-017).",
+      "description": "Implement media session lifecycle in `scp-media/session.rs`. Session initiation, join, and end. Capability ceiling checks before session start.\n\nCapability ceiling check: media session initiation requires corresponding `media.*` capability in context ceiling. `check_media_capability(context, capability) -> Result<(), MediaError>`. Rejected if ceiling doesn't include the requested media type.\n\nSession teardown: member removal from context invalidates their media session keys via MLS epoch advance. Explicit `SessionEnd` message for graceful teardown. `end_media_session(session_id) -> Result<(), MediaError>`.\n\nNo media through SCP relays: media frames flow peer-to-peer or through WebRTC SFU using DTLS-SRTP with MLS-derived keys. SCP relays handle only signaling messages (small, infrequent).\n\nSession metadata in event log: participants, start time, end time, capabilities used recorded in context event log. Used for participation record derivation (ADR-017).",
       "acceptanceCriteria": [
         "Media session initiation requires corresponding `media.*` capability in context ceiling",
         "`check_media_capability(context, capability) -> Result<(), MediaError>` exists and works",
@@ -5153,7 +5153,7 @@
         "Media frames flow peer-to-peer or through WebRTC SFU \u2014 no media through SCP relays",
         "SCP relays handle only signaling messages (small, infrequent)",
         "Participants, start time, end time, capabilities used recorded in context event log",
-        "Session metadata used for behavioral record derivation (ADR-017)",
+        "Session metadata used for participation record derivation (ADR-017)",
         "`cargo test -p scp-media` passes all session lifecycle tests"
       ],
       "actionItems": [
@@ -6992,7 +6992,7 @@
         "Checkpoint format supports inclusion proofs for post-checkpoint events",
         "Consistency verification works across checkpoint boundaries",
         "Checkpoint creation does not block ongoing event log appends",
-        "Behavioral validation (\u00a77.3.1) continues to work with checkpointed logs",
+        "Participation validation (\u00a77.3.1) continues to work with checkpointed logs",
         "Tests verify checkpoint creation, proof generation, and consistency verification"
       ],
       "actionItems": [
@@ -7001,7 +7001,7 @@
         "Implement inclusion proof generation that works across checkpoint boundaries",
         "Implement consistency verification across checkpoints",
         "Ensure checkpoint creation is non-blocking for concurrent appends",
-        "Verify behavioral validation (\u00a77.3.1) works with checkpointed logs",
+        "Verify participation validation (\u00a77.3.1) works with checkpointed logs",
         "Add tests for checkpoint creation, proof verification, and cross-boundary consistency"
       ],
       "blockedBy": [
@@ -7022,7 +7022,7 @@
           "Protocol state footprint is deliberately minimal (\u00a710.3): membership, roles, tokens, tool registrations, governance, content hashes \u2014 NOT content itself",
           "Event logs are per-context Merkle trees with SHA-256 hash chain (ADR-011)",
           "Must support inclusion proofs and consistency verification",
-          "Behavioral validation (\u00a77.3.1) depends on verifiable event logs"
+          "Participation validation (\u00a77.3.1) depends on verifiable event logs"
         ],
         "references": [
           "ADR-011 \u2014 Event log design",
@@ -7050,7 +7050,7 @@
         "Proof compaction reduces storage while preserving verifiability of pruned entries",
         "Pruning is configurable: retain last N checkpoints, or retain checkpoints within time window",
         "Storage reclamation measurable after pruning",
-        "Behavioral validation (\u00a77.3.1) continues to work after pruning",
+        "Participation validation (\u00a77.3.1) continues to work after pruning",
         "Tests verify pruning, proof compaction, and storage reclamation"
       ],
       "actionItems": [
@@ -7058,7 +7058,7 @@
         "Implement proof compaction: compact Merkle proofs for pruned entries",
         "Implement configurable retention policy (checkpoint count, time window)",
         "Measure and verify storage reclamation after pruning",
-        "Verify behavioral validation continues to work post-pruning",
+        "Verify participation validation continues to work post-pruning",
         "Add tests for pruning, compaction, and storage metrics"
       ],
       "blockedBy": [
@@ -7081,7 +7081,7 @@
           "\u00a77.3.1 \u2014 Verifiable event logs"
         ]
       },
-      "result": "event_log/pruning.rs implements pruning with proof compaction. PruningConfig (retention by count/time). CompactProof for pruned events. Storage metrics. Behavioral validation works post-pruning. Comprehensive tests."
+      "result": "event_log/pruning.rs implements pruning with proof compaction. PruningConfig (retention by count/time). CompactProof for pruned events. Storage metrics. Participation validation works post-pruning. Comprehensive tests."
     },
     {
       "id": "SCP-127",
@@ -9039,7 +9039,7 @@
         "crates/scp-core/src/economy/antispam.rs",
         "crates/scp-core/src/economy/mod.rs"
       ],
-      "description": "Implement per-sender cost escalation via SenderVelocity metric (\u00a719.7) with sliding window tracking.\n\n\u00a719.7 Anti-Spam via Cost Escalation:\n\nStatic cost floor: Any non-zero cost eliminates economically irrational spam. $0.0001/message makes bulk spam a P&L decision.\n\nPer-sender escalation using SenderVelocity metric:\n```\nbase_cost: $0.001\nvariables:\n  - Step { metric: SenderVelocity, thresholds: [\n      (10/min,  +$0.001),     // elevated: $0.002/msg\n      (50/min,  +$0.01),      // high: $0.012/msg\n      (200/min, +$0.10),      // extreme: $0.112/msg\n    ]}\ncap: $1.00\n```\n\nNormal conversation (1-5 msg/min): negligible ($0.001). Spam rates (200+ msg/min): $0.112/msg = $1,344/hr. Self-limiting.\n\nComposes with consequence mechanisms (\u00a77.3.7): Economic tier (cost escalation) and behavioral tier (warning -> suspension -> ejection) operate independently. Agent might exhaust spending UCAN before behavioral consequences trigger, or vice versa.\n\nSybil deterrent: N identities = N x cost. Each identity needs its own spending UCAN, own adapter credentials, own payment capacity. Compounds with device attestation (\u00a79.3).\n\nDDoS inversion: DDoS against a priced relay is paying the operator to absorb the attack.",
+      "description": "Implement per-sender cost escalation via SenderVelocity metric (\u00a719.7) with sliding window tracking.\n\n\u00a719.7 Anti-Spam via Cost Escalation:\n\nStatic cost floor: Any non-zero cost eliminates economically irrational spam. $0.0001/message makes bulk spam a P&L decision.\n\nPer-sender escalation using SenderVelocity metric:\n```\nbase_cost: $0.001\nvariables:\n  - Step { metric: SenderVelocity, thresholds: [\n      (10/min,  +$0.001),     // elevated: $0.002/msg\n      (50/min,  +$0.01),      // high: $0.012/msg\n      (200/min, +$0.10),      // extreme: $0.112/msg\n    ]}\ncap: $1.00\n```\n\nNormal conversation (1-5 msg/min): negligible ($0.001). Spam rates (200+ msg/min): $0.112/msg = $1,344/hr. Self-limiting.\n\nComposes with consequence mechanisms (\u00a77.3.7): Economic tier (cost escalation) and participation tier (warning -> suspension -> ejection) operate independently. Agent might exhaust spending UCAN before participation consequences trigger, or vice versa.\n\nSybil deterrent: N identities = N x cost. Each identity needs its own spending UCAN, own adapter credentials, own payment capacity. Compounds with device attestation (\u00a79.3).\n\nDDoS inversion: DDoS against a priced relay is paying the operator to absorb the attack.",
       "acceptanceCriteria": [
         "SenderVelocityTracker struct defined \u2014 tracks message count per sender in a sliding time window",
         "Sliding window implementation: configurable window duration (e.g., 60 seconds), tracks timestamps of recent messages per sender DID",
@@ -9049,7 +9049,7 @@
         "SenderVelocity metric integrates with PricingFormula evaluation \u2014 evaluate_formula reads velocity from tracker",
         "Step-function escalation with SenderVelocity: cost increases at configured thresholds",
         "Example escalation: 10/min -> +$0.001, 50/min -> +$0.01, 200/min -> +$0.10 (thresholds cumulative)",
-        "Composition with consequence mechanisms (\u00a77.3.7): economic escalation operates independently from behavioral consequences",
+        "Composition with consequence mechanisms (\u00a77.3.7): economic escalation operates independently from participation consequences",
         "Sybil deterrent: each DID tracked independently \u2014 N identities = N x cost",
         "Per-sender tracking: velocity computed per-sender, not aggregate across all senders",
         "Thread-safe: SenderVelocityTracker safe to access from multiple threads",
@@ -9777,7 +9777,7 @@
       "gate": "gate-6",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         ".docs/standards/sdk-common.md",
         "crates/scp-ffi/src/mcp.rs",

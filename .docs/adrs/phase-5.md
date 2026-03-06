@@ -303,7 +303,7 @@ pub struct MediaKeyMaterial {
 
 8. **Session metadata in event log:**
    - Participants, start time, end time, capabilities used recorded in context event log.
-   - Used for behavioral record derivation (ADR-017).
+   - Used for participation record derivation (ADR-017).
 
 ### Scope
 

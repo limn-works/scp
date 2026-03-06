@@ -135,6 +135,15 @@
 - Healing: async best-effort republish to stale layer, panic-monitored
 - PRE-EXISTING: migration proof hash (dht.rs:607) has var-length concat ambiguity (old_did||new_did)
 
+### Spec-Level Crypto Audit (2026-03-05)
+- See [spec-audit-findings.md](spec-audit-findings.md) for full findings
+- 9 CRITICAL, 11 HIGH, 8 MEDIUM, 5 LOW findings across 09-security-model.md, 03-identity.md, 07-trust-validation-and-capabilities.md
+- Root pattern: migration proof (line 350) correctly uses length prefixes + domain sep, but 8+ other hash constructions don't
+- BroadcastEnvelope is the ONLY signature without a domain separator
+- "Ed25519_keygen(seed)" undefined = cross-platform breakage (confirmed by impl audit)
+- Sender key HPKE, nonce gen, wire format, routing_id (encrypted), participation signing key derivation all MISSING
+- Canonical serialization for signed structures (attestations, profiles, checkpoints) MISSING entirely
+
 ### Key Files
 - `crates/scp-core/src/event_log/tree.rs` -- Merkle tree, leaf/interior hashing
 - `crates/scp-core/src/event_log/proof.rs` -- inclusion/absence proofs

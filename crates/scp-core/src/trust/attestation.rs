@@ -162,6 +162,49 @@ pub struct ThresholdRequirement {
     /// Minimum independence score (0.0 to 1.0). Attestors with shared context
     /// memberships or mutual endorsements have reduced independence.
     pub independence_threshold: f64,
+    /// Independence penalty per shared context membership between a pair of
+    /// attestors. Default: 0.1. Capped at `shared_context_penalty_cap` total.
+    #[serde(default = "default_shared_context_penalty")]
+    pub shared_context_penalty: f64,
+    /// Maximum total penalty from shared context memberships for a single
+    /// pair. Default: 0.5.
+    #[serde(default = "default_shared_context_penalty_cap")]
+    pub shared_context_penalty_cap: f64,
+    /// Independence penalty per mutual endorsement direction (A endorsed B
+    /// = one direction, B endorsed A = another). Default: 0.2.
+    #[serde(default = "default_mutual_endorsement_penalty")]
+    pub mutual_endorsement_penalty: f64,
+}
+
+const fn default_shared_context_penalty() -> f64 {
+    0.1
+}
+
+const fn default_shared_context_penalty_cap() -> f64 {
+    0.5
+}
+
+const fn default_mutual_endorsement_penalty() -> f64 {
+    0.2
+}
+
+impl ThresholdRequirement {
+    /// Creates a new `ThresholdRequirement` with default penalty values.
+    #[must_use]
+    pub const fn new(
+        required_count: u32,
+        total_attestors: u32,
+        independence_threshold: f64,
+    ) -> Self {
+        Self {
+            required_count,
+            total_attestors,
+            independence_threshold,
+            shared_context_penalty: default_shared_context_penalty(),
+            shared_context_penalty_cap: default_shared_context_penalty_cap(),
+            mutual_endorsement_penalty: default_mutual_endorsement_penalty(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -377,7 +420,12 @@ pub fn check_threshold_attestation(
     let valid_count = u32::try_from(valid_attestors.len()).unwrap_or(u32::MAX);
 
     // Compute independence score among valid attestors.
-    let independence_score = compute_independence_score(&valid_attestors);
+    let independence_score = compute_independence_score(
+        &valid_attestors,
+        requirement.shared_context_penalty,
+        requirement.shared_context_penalty_cap,
+        requirement.mutual_endorsement_penalty,
+    );
 
     let count_met = valid_count >= requirement.required_count;
     let independence_met = independence_score >= requirement.independence_threshold;
@@ -435,13 +483,13 @@ pub(crate) fn canonical_attestation_bytes(attestation: &Attestation) -> Vec<u8> 
 ///
 /// Some attestation types require evidence:
 /// - `ToolIntegrity` requires evidence (hash of the tool).
-/// - `BehavioralWitness` requires evidence (log reference).
+/// - `ParticipationWitness` requires evidence (log reference).
 ///
 /// Other types accept optional evidence without strict requirements.
 fn validate_evidence(attestation: &Attestation) -> Result<(), TrustError> {
     let requires_evidence = matches!(
         attestation.attestation_type,
-        AttestationType::ToolIntegrity | AttestationType::BehavioralWitness
+        AttestationType::ToolIntegrity | AttestationType::ParticipationWitness
     );
 
     if requires_evidence && attestation.evidence.is_none() {
@@ -472,13 +520,24 @@ fn validate_evidence(attestation: &Attestation) -> Result<(), TrustError> {
 /// Returns 1.0 for a single attestor or empty set (no pairs to compare).
 /// For multiple attestors, averages the pairwise independence scores.
 ///
-/// Each pair starts at 1.0 independence. Penalties:
-/// - Each shared context membership: -0.1 (capped at 0.5 total from contexts).
-/// - Each mutual endorsement direction: -0.2 (A endorsed B = -0.2, B endorsed
-///   A = another -0.2).
+/// Each pair starts at 1.0 independence. Penalties are configurable via
+/// [`ThresholdRequirement`]:
+/// - `shared_context_penalty` per shared context (capped at `shared_context_penalty_cap`).
+/// - `mutual_endorsement_penalty` per endorsement direction.
 ///
 /// The pair independence is clamped to [0.0, 1.0].
-fn compute_independence_score(attestors: &[&AttestorInfo]) -> f64 {
+fn compute_independence_score(
+    attestors: &[&AttestorInfo],
+    shared_context_penalty: f64,
+    shared_context_penalty_cap: f64,
+    mutual_endorsement_penalty: f64,
+) -> f64 {
+    // Clamp to non-negative: negative penalties would invert scoring,
+    // making colluding attestors appear more independent.
+    let shared_context_penalty = shared_context_penalty.max(0.0);
+    let shared_context_penalty_cap = shared_context_penalty_cap.max(0.0);
+    let mutual_endorsement_penalty = mutual_endorsement_penalty.max(0.0);
+
     if attestors.len() < 2 {
         return 1.0;
     }
@@ -499,9 +558,9 @@ fn compute_independence_score(attestors: &[&AttestorInfo]) -> f64 {
                 .intersection(&b.context_memberships)
                 .count();
 
-            // Each shared context: -0.1, capped at 0.5 total penalty from contexts.
             #[allow(clippy::cast_precision_loss)]
-            let context_penalty = (shared_contexts as f64 * 0.1).min(0.5);
+            let context_penalty =
+                (shared_contexts as f64 * shared_context_penalty).min(shared_context_penalty_cap);
             pair_independence -= context_penalty;
 
             // Penalty for mutual endorsements.
@@ -509,10 +568,10 @@ fn compute_independence_score(attestors: &[&AttestorInfo]) -> f64 {
             let b_endorsed_a = b.endorsements.contains(&a.did);
 
             if a_endorsed_b {
-                pair_independence -= 0.2;
+                pair_independence -= mutual_endorsement_penalty;
             }
             if b_endorsed_a {
-                pair_independence -= 0.2;
+                pair_independence -= mutual_endorsement_penalty;
             }
 
             // Clamp to [0.0, 1.0].
@@ -1142,11 +1201,7 @@ mod tests {
             ),
         ];
 
-        let requirement = ThresholdRequirement {
-            required_count: 2,
-            total_attestors: 3,
-            independence_threshold: 0.5,
-        };
+        let requirement = ThresholdRequirement::new(2, 3, 0.5);
 
         let result = check_threshold_attestation(&att_type, &attestors, &requirement);
         assert!(result.met, "threshold should be met: {result:?}");
@@ -1168,11 +1223,7 @@ mod tests {
             Some(make_simple_attestation(att_type.clone(), "did:key:a")),
         )];
 
-        let requirement = ThresholdRequirement {
-            required_count: 3,
-            total_attestors: 5,
-            independence_threshold: 0.5,
-        };
+        let requirement = ThresholdRequirement::new(3, 5, 0.5);
 
         let result = check_threshold_attestation(&att_type, &attestors, &requirement);
         assert!(!result.met, "threshold should NOT be met: {result:?}");
@@ -1198,11 +1249,7 @@ mod tests {
             ),
         ];
 
-        let requirement = ThresholdRequirement {
-            required_count: 2,
-            total_attestors: 2,
-            independence_threshold: 0.5,
-        };
+        let requirement = ThresholdRequirement::new(2, 2, 0.5);
 
         let result = check_threshold_attestation(&att_type, &attestors, &requirement);
         assert!(
@@ -1234,11 +1281,7 @@ mod tests {
             make_attestor("did:key:b", &[], &[], None),
         ];
 
-        let requirement = ThresholdRequirement {
-            required_count: 1,
-            total_attestors: 2,
-            independence_threshold: 0.5,
-        };
+        let requirement = ThresholdRequirement::new(1, 2, 0.5);
 
         let result = check_threshold_attestation(&required_type, &attestors, &requirement);
         assert!(
@@ -1258,11 +1301,7 @@ mod tests {
             Some(make_simple_attestation(att_type.clone(), "did:key:a")),
         )];
 
-        let requirement = ThresholdRequirement {
-            required_count: 1,
-            total_attestors: 1,
-            independence_threshold: 0.5,
-        };
+        let requirement = ThresholdRequirement::new(1, 1, 0.5);
 
         let result = check_threshold_attestation(&att_type, &attestors, &requirement);
         assert!(
@@ -1294,11 +1333,7 @@ mod tests {
             ),
         ];
 
-        let requirement = ThresholdRequirement {
-            required_count: 2,
-            total_attestors: 2,
-            independence_threshold: 0.5,
-        };
+        let requirement = ThresholdRequirement::new(2, 2, 0.5);
 
         let result = check_threshold_attestation(&att_type, &attestors, &requirement);
         assert!(result.met, "0.7 independence >= 0.5 threshold: {result:?}");
@@ -1329,11 +1364,7 @@ mod tests {
             ),
         ];
 
-        let requirement = ThresholdRequirement {
-            required_count: 2,
-            total_attestors: 2,
-            independence_threshold: 0.5,
-        };
+        let requirement = ThresholdRequirement::new(2, 2, 0.5);
 
         let result = check_threshold_attestation(&att_type, &attestors, &requirement);
         // Mutual endorsements: A->B = -0.2, B->A = -0.2 => independence = 0.6.

@@ -462,7 +462,7 @@ cap: $1.00
 
 Normal conversation (1-5 msg/min): negligible ($0.001). Spam rates (200+ msg/min): $0.112/msg = $1,344/hr. Self-limiting.
 
-**Composes with consequence mechanisms** (§7.3.7): Economic tier (cost escalation) and behavioral tier (warning → suspension → ejection) operate independently. Agent might exhaust spending UCAN before behavioral consequences trigger, or vice versa.
+**Composes with consequence mechanisms** (§7.3.7): Economic tier (cost escalation) and participation tier (warning → suspension → ejection) operate independently. Agent might exhaust spending UCAN before participation consequences trigger, or vice versa.
 
 **Sybil deterrent:** N identities = N × cost. Each identity needs its own spending UCAN, own adapter credentials, own payment capacity. Compounds with device attestation (§9.3) — Sybil attacks are expensive to create AND expensive to sustain.
 
