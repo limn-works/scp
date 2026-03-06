@@ -2149,6 +2149,155 @@ async fn ucan_mint_impl(
     })
 }
 
+/// Delegates a UCAN token to another member.
+///
+/// Creates a delegated UCAN from an existing parent token, signed with the
+/// delegator's Ed25519 key via the retained [`KeyCustody`] provider on the
+/// context handle. Delegation enforces attenuation (capabilities can only
+/// narrow, never widen) and links to the parent via its CID in the proof chain.
+///
+/// # Arguments
+///
+/// * `handle` — The context to delegate within (must have key custody
+///   from `context_create` with an `in_memory` identity).
+/// * `delegatee_did` — The DID of the member receiving the delegated token.
+/// * `parent_token` — The encoded parent UCAN token (JWT format). The
+///   delegator must be the audience of this token.
+/// * `capabilities` — List of capability strings to delegate (must be a
+///   subset of the parent token's capabilities).
+///
+/// # Returns
+///
+/// A `UcanToken` handle with the delegated token's metadata and a real
+/// Ed25519 signature.
+///
+/// # Errors
+///
+/// Returns `ScpError::Permission` if the context does not have key custody,
+/// the delegator DID does not match the parent token's audience, or if
+/// capabilities are wider than the parent's (attenuation violation).
+///
+/// See ADR-016 criterion 4 and SCP-214 criterion 8.
+#[uniffi::export]
+pub async fn ucan_delegate(
+    handle: Arc<ContextHandle>,
+    delegatee_did: String,
+    parent_token: String,
+    capabilities: Vec<String>,
+) -> Result<Arc<UcanToken>, ScpError> {
+    ucan_delegate_impl(handle, delegatee_did, parent_token, capabilities).await
+}
+
+/// Inner implementation of [`ucan_delegate`], split out for cfg-gating clarity.
+#[cfg(feature = "allow_in_memory_custody")]
+async fn ucan_delegate_impl(
+    handle: Arc<ContextHandle>,
+    delegatee_did: String,
+    parent_token_str: String,
+    capabilities: Vec<String>,
+) -> Result<Arc<UcanToken>, ScpError> {
+    runtime()
+        .spawn(async move {
+            // Extract key custody and signing key from the context handle (RED-102).
+            let custody =
+                handle
+                    .in_memory_custody
+                    .as_ref()
+                    .ok_or_else(|| ScpError::Permission {
+                        message: "UCAN delegation requires key custody — create the context with \
+                              an in_memory identity (identity_create(\"in_memory\"))"
+                            .to_owned(),
+                        code: "SCP-PERM-3004".to_owned(),
+                    })?;
+            let signing_key = handle.signing_key.ok_or_else(|| ScpError::Permission {
+                message: "UCAN delegation requires a signing key — the context creator identity \
+                          must have an active signing key"
+                    .to_owned(),
+                code: "SCP-PERM-3004".to_owned(),
+            })?;
+
+            // Parse the parent token.
+            let parsed_parent = scp_core::crypto::ucan::validate::parse_ucan(&parent_token_str)
+                .map_err(ScpError::from)?;
+
+            // Build attenuated capabilities from the capability URI strings.
+            let attenuations: Vec<scp_core::crypto::ucan::Attenuation> = capabilities
+                .iter()
+                .map(|cap| {
+                    let cap_uri = if cap.starts_with("scp:ctx:") {
+                        cap.clone()
+                    } else {
+                        format!("scp:ctx:{}/{cap}", handle.context_id)
+                    };
+                    let action = cap_uri.rsplit_once('/').map_or_else(
+                        || cap.clone(),
+                        |(_, a)| {
+                            a.split_once(':')
+                                .map_or_else(|| a.to_owned(), |(_, act)| act.to_owned())
+                        },
+                    );
+                    scp_core::crypto::ucan::Attenuation {
+                        with: cap_uri,
+                        can: action,
+                    }
+                })
+                .collect();
+
+            let params = scp_core::crypto::ucan::mint::DelegateParams {
+                parent_token: &parsed_parent,
+                delegator_did: &handle.creator_did,
+                delegator_key: &signing_key,
+                delegatee_did: &delegatee_did,
+                attenuated_capabilities: &attenuations,
+                lifetime_secs: 3600, // 1 hour default
+                facts: None,
+                key_scope: None,
+                signing_key_id: None,
+            };
+
+            let token = scp_core::crypto::ucan::mint::delegate_ucan(&params, &custody.0)
+                .await
+                .map_err(ScpError::from)?;
+
+            let data = UcanTokenData {
+                token_id: token.payload.nnc.clone(),
+                issuer: token.payload.iss.clone(),
+                audience: token.payload.aud.clone(),
+                capabilities: token.payload.att.iter().map(|a| a.with.clone()).collect(),
+                expires_at: Some(token.payload.exp),
+            };
+
+            increment_handle_count();
+            Ok(Arc::new(UcanToken {
+                data,
+                encoded: token.encoded,
+            }))
+        })
+        .await
+        .map_err(|e| ScpError::Permission {
+            message: format!("tokio task join error during UCAN delegation: {e}"),
+            code: "SCP-PERM-3005".to_owned(),
+        })?
+}
+
+#[cfg(not(feature = "allow_in_memory_custody"))]
+#[allow(clippy::unused_async)] // Must be async to match the cfg(feature) variant's signature.
+async fn ucan_delegate_impl(
+    _handle: Arc<ContextHandle>,
+    _delegatee_did: String,
+    _parent_token: String,
+    _capabilities: Vec<String>,
+) -> Result<Arc<UcanToken>, ScpError> {
+    Err(ScpError::Permission {
+        message: "UCAN delegation requires key custody — the in_memory custody path \
+                  is not available in this build. Enable the \
+                  \"allow_in_memory_custody\" feature for dev/desktop use, or wire \
+                  a KeyCustodyProvider for production."
+            .to_owned(),
+        code: "SCP-PERM-3004".to_owned(),
+    })
+}
+
 /// Revokes a UCAN token.
 ///
 /// Adds the token to the context's revocation list. Revoked tokens are no

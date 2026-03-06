@@ -39,7 +39,7 @@ Single-file bridge (`bridge.rs`) containing all UniFFI exports. Key function gro
 | Identity | `identity_create`, `identity_load`, `identity_resolve` |
 | Context | `context_create`, `context_join`, `context_leave`, `context_close`, `context_send`, `context_subscribe` |
 | Tools | `tool_register`, `tool_invoke`, `tool_verify` |
-| UCAN | `ucan_validate`, `ucan_mint`, `ucan_revoke` |
+| UCAN | `ucan_validate`, `ucan_mint`, `ucan_delegate`, `ucan_revoke` |
 | Event Log | `event_log_query`, `event_log_verify` |
 | Transport | `transport_connect`, `transport_status` |
 
@@ -67,7 +67,7 @@ All I/O-bound functions are `async fn`. UniFFI generates Swift `async` functions
 - `context_create` registers runtime state; `context_close` removes it. If context creation fails partway, the registry entry must be cleaned up.
 - `with_context` closures must return `Result<T, ScpError>` — use typed error variants, not raw strings.
 - UCAN validation delegates to scp-core's full 11-step ADR-016 pipeline. `BridgeDidResolver` handles both `did:dht:z` (zbase32 decode) and `did:key:` (hex decode) formats. Invalid DID methods return `DidNotFound`.
-- `ucan_mint` currently uses `InMemoryKeyCustody` for signing. Real `KeyCustody` wiring is deferred to SCP-214.
+- `ucan_mint` and `ucan_delegate` use the identity's retained `InMemoryKeyCustody` and `KeyHandle` from the `ContextHandle` (wired during `context_create` from the `Identity`). No ephemeral keys. See #326.
 - `EventLog` is a Merkle tree storing only leaf hashes, not event payloads. `event_log_query` returns event count and Merkle root as a JSON `LogSummary`.
 - `event_log_verify` supports two claim types: `"inclusion"` (prove event exists at index) and `"absence"` (prove no event at index). Both use scp-core's `prove_inclusion`/`prove_absence` + `verify_inclusion`.
 - Opaque objects (`Identity`, `ContextHandle`, `UcanToken`, `TransportManager`) use `Arc<T>` wrapping and manual handle counting (`increment_handle_count`/`decrement_handle_count` in `lib.rs`). `Drop` impls decrement counts.
