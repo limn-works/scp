@@ -223,6 +223,15 @@ impl<S: Storage> ProtocolStore<S> {
     /// `cert_pin/{sha256_hex(url)}` wrapped in a `StoredValue` version
     /// envelope.
     ///
+    /// # Raw bytes API
+    ///
+    /// This method accepts raw bytes rather than a typed `CertificatePin`
+    /// because `CertificatePin` lives in `scp-transport`, which `scp-core`
+    /// cannot depend on (it would create a circular dependency). The caller
+    /// is responsible for serializing/deserializing `CertificatePin` to/from
+    /// bytes (e.g., via `rmp_serde`). See `scp_transport::native::cert_pin`
+    /// for the type definition.
+    ///
     /// See spec section 9.13 (Transport Security Requirements).
     ///
     /// # Errors
@@ -236,7 +245,10 @@ impl<S: Storage> ProtocolStore<S> {
 
     /// Loads a certificate pin for a relay URL.
     ///
-    /// Returns `None` if no pin exists for the given relay.
+    /// Returns `None` if no pin exists for the given relay. The returned
+    /// bytes should be deserialized to `scp_transport::native::cert_pin::CertificatePin`
+    /// by the caller (see [`store_cert_pin`](Self::store_cert_pin) for why
+    /// this uses raw bytes).
     ///
     /// See spec section 9.13.
     ///

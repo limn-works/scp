@@ -58,9 +58,14 @@ pub enum CertPinResult {
 
 /// Computes the SHA-256 fingerprint of a DER-encoded certificate.
 ///
-/// This is the standard SPKI (Subject Public Key Info) fingerprint
-/// used for certificate pinning. The input should be the full
-/// DER-encoded certificate bytes.
+/// This is a **whole-certificate fingerprint** — it hashes the entire
+/// DER-encoded certificate, not just the Subject Public Key Info (SPKI).
+/// Whole-certificate pinning is stricter than SPKI pinning: it detects
+/// any change to the certificate (including issuer, validity period, or
+/// extensions), not just key changes. This is appropriate for SCP relay
+/// pinning where the relay operator controls the full certificate.
+///
+/// The input should be the full DER-encoded certificate bytes.
 #[must_use]
 pub fn certificate_fingerprint(der_bytes: &[u8]) -> [u8; 32] {
     let digest = Sha256::digest(der_bytes);
@@ -126,6 +131,63 @@ pub fn update_pin_last_verified(pin: &CertificatePin, now_secs: u64) -> Certific
     CertificatePin {
         last_verified_at: now_secs,
         ..pin.clone()
+    }
+}
+
+/// Verifies a relay's TLS certificate against a stored pin and updates the
+/// pin store.
+///
+/// This is the primary integration point for relay clients. Call this during
+/// TLS connection establishment with the relay's DER-encoded certificate.
+///
+/// # Behavior
+///
+/// - **First connection:** Records the certificate fingerprint as the initial
+///   pin and returns `Ok(CertPinResult::FirstConnection)`.
+/// - **Matching pin:** Updates `last_verified_at` and returns
+///   `Ok(CertPinResult::Consistent)`.
+/// - **Mismatched pin:** Returns `Ok(CertPinResult::Violated { .. })`. The
+///   caller MUST reject the connection (spec §9.13).
+///
+/// # Integration
+///
+/// Relay client implementations should call this method after the TLS
+/// handshake completes but before sending any application data. The
+/// `stored_pin` and storage operations are the caller's responsibility
+/// (typically via `ProtocolStore::load_cert_pin` / `store_cert_pin`).
+///
+/// # Arguments
+///
+/// * `stored` — The previously stored pin, or `None` if first connection.
+/// * `relay_url` — The relay URL for creating new pins.
+/// * `presented_der` — DER-encoded bytes of the relay's TLS certificate.
+/// * `now_secs` — Current Unix timestamp in seconds.
+///
+/// # Returns
+///
+/// A tuple of the check result and an optional updated/new pin to store.
+#[must_use]
+pub fn verify_relay_certificate(
+    stored: Option<&CertificatePin>,
+    relay_url: &str,
+    presented_der: &[u8],
+    now_secs: u64,
+) -> (CertPinResult, Option<CertificatePin>) {
+    let result = check_certificate_pin(stored, presented_der);
+    match &result {
+        CertPinResult::FirstConnection => {
+            let new_pin = create_certificate_pin(relay_url, presented_der, now_secs);
+            (result, Some(new_pin))
+        }
+        CertPinResult::Consistent => {
+            // Update last_verified_at on the existing pin.
+            let updated = stored.map(|p| update_pin_last_verified(p, now_secs));
+            (result, updated)
+        }
+        CertPinResult::Violated { .. } => {
+            // Do not update the pin — the connection should be rejected.
+            (result, None)
+        }
     }
 }
 
@@ -216,5 +278,38 @@ mod tests {
         let bytes = rmp_serde::to_vec(&pin).unwrap();
         let restored: CertificatePin = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(restored, pin);
+    }
+
+    // --- verify_relay_certificate integration tests ---
+
+    #[test]
+    fn verify_relay_certificate_first_connection() {
+        let url = "wss://relay.example.com/scp/v1";
+        let (result, new_pin) = verify_relay_certificate(None, url, CERT_A, 5000);
+        assert_eq!(result, CertPinResult::FirstConnection);
+        let pin = new_pin.expect("should create new pin on first connection");
+        assert_eq!(pin.relay_url, url);
+        assert_eq!(pin.fingerprint, certificate_fingerprint(CERT_A));
+        assert_eq!(pin.pinned_at, 5000);
+    }
+
+    #[test]
+    fn verify_relay_certificate_consistent() {
+        let url = "wss://relay.example.com/scp/v1";
+        let pin = create_certificate_pin(url, CERT_A, 1000);
+        let (result, updated) = verify_relay_certificate(Some(&pin), url, CERT_A, 2000);
+        assert_eq!(result, CertPinResult::Consistent);
+        let updated = updated.expect("should return updated pin");
+        assert_eq!(updated.last_verified_at, 2000);
+        assert_eq!(updated.pinned_at, 1000); // preserved
+    }
+
+    #[test]
+    fn verify_relay_certificate_violated() {
+        let url = "wss://relay.example.com/scp/v1";
+        let pin = create_certificate_pin(url, CERT_A, 1000);
+        let (result, updated) = verify_relay_certificate(Some(&pin), url, CERT_B, 2000);
+        assert!(matches!(result, CertPinResult::Violated { .. }));
+        assert!(updated.is_none(), "should not update pin on violation");
     }
 }

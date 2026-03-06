@@ -35,65 +35,7 @@ use scp_platform::traits::{KeyCustody, KeyHandle, KeyType};
 
 use super::{SenderKey, SenderKeyError, generate_sender_key};
 use crate::identity::SigningKeyId;
-
-// ---------------------------------------------------------------------------
-// Serde helpers for fixed-size byte arrays
-// ---------------------------------------------------------------------------
-
-/// Serde module for `[u8; 64]` fields (Ed25519 signatures).
-///
-/// Serializes via `serde_bytes` for compact binary representation and
-/// validates exact length on deserialization, rejecting anything other
-/// than exactly 64 bytes. This prevents OOM from oversized signature
-/// fields on untrusted input (#347).
-mod serde_signature_64 {
-    use serde::{self, Deserializer, Serializer};
-
-    pub fn serialize<S>(bytes: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serde_bytes::serialize(bytes.as_slice(), serializer)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let v: Vec<u8> = serde_bytes::deserialize(deserializer)?;
-        v.try_into().map_err(|v: Vec<u8>| {
-            serde::de::Error::custom(format!("expected 64-byte signature, got {} bytes", v.len()))
-        })
-    }
-}
-
-/// Serde module for `[u8; 32]` fields (X25519 public keys).
-///
-/// Same pattern as `serde_signature_64` but for 32-byte values.
-/// Prevents OOM from oversized ephemeral pubkey fields (#347).
-mod serde_pubkey_32 {
-    use serde::{self, Deserializer, Serializer};
-
-    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serde_bytes::serialize(bytes.as_slice(), serializer)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let v: Vec<u8> = serde_bytes::deserialize(deserializer)?;
-        v.try_into().map_err(|v: Vec<u8>| {
-            serde::de::Error::custom(format!(
-                "expected 32-byte public key, got {} bytes",
-                v.len()
-            ))
-        })
-    }
-}
+use crate::serde_util::{serde_hpke_sealed_60, serde_pubkey_32, serde_signature_64};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -206,8 +148,9 @@ pub struct SenderKeyResponse {
     /// The epoch of the distributed key.
     pub epoch: u64,
     /// HPKE-sealed sender key bytes (AES-128-GCM nonce || ciphertext || tag).
-    #[serde(with = "serde_bytes")]
-    pub hpke_sealed_key: Vec<u8>,
+    /// Exactly 60 bytes: nonce (12) + encrypted key (32) + tag (16).
+    #[serde(with = "serde_hpke_sealed_60")]
+    pub hpke_sealed_key: [u8; 60],
     /// The ephemeral X25519 public key used in the HPKE encapsulation.
     #[serde(with = "serde_pubkey_32")]
     pub ephemeral_pubkey: [u8; 32],
@@ -651,7 +594,16 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
     let wrapping_bytes: [u8; 32] = request.wrapping_pubkey;
 
     // HPKE seal: encrypt the sender key to the requester's wrapping key.
-    let (sealed, ephemeral_pub) = hpke_seal(params.sender_key.as_bytes(), &wrapping_bytes)?;
+    let (sealed_vec, ephemeral_pub) = hpke_seal(params.sender_key.as_bytes(), &wrapping_bytes)?;
+
+    // Convert to fixed-size array. hpke_seal always returns exactly 60 bytes
+    // (nonce 12 + ciphertext 32 + tag 16) for a 32-byte plaintext input.
+    let sealed: [u8; 60] = sealed_vec.try_into().map_err(|v: Vec<u8>| {
+        SenderKeyError::HpkeEncryptionFailed(format!(
+            "HPKE seal produced {} bytes, expected 60",
+            v.len()
+        ))
+    })?;
 
     let response = SenderKeyResponse {
         sender_did: params.sender_did.to_owned(),
@@ -751,17 +703,8 @@ pub async fn open_sender_key_response(
     wrapping_key_handle: &KeyHandle,
     response: &SenderKeyResponse,
 ) -> Result<SenderKey, SenderKeyError> {
-    // Validate HPKE sealed key length before decryption (#347).
-    // Expected: nonce (12) + ciphertext (32) + AES-128-GCM tag (16) = 60 bytes.
-    const HPKE_SEALED_KEY_EXPECTED: usize = HPKE_NONCE_SIZE + 32 + 16;
-    if response.hpke_sealed_key.len() != HPKE_SEALED_KEY_EXPECTED {
-        return Err(SenderKeyError::HpkeDecryptionFailed(format!(
-            "hpke_sealed_key must be {} bytes, got {}",
-            HPKE_SEALED_KEY_EXPECTED,
-            response.hpke_sealed_key.len()
-        )));
-    }
-
+    // hpke_sealed_key is [u8; 60] — length is enforced at the type level
+    // (nonce 12 + ciphertext 32 + AES-128-GCM tag 16 = 60 bytes).
     // The ephemeral public key is already validated as [u8; 32] by serde.
     let ephemeral_bytes: [u8; 32] = response.ephemeral_pubkey;
 
@@ -1437,8 +1380,7 @@ mod tests {
             signature: advance.signature.to_vec(),
         };
         let legacy_bytes = rmp_serde::to_vec_named(&legacy).unwrap();
-        let deserialized: SenderKeyEpochAdvance =
-            rmp_serde::from_slice(&legacy_bytes).unwrap();
+        let deserialized: SenderKeyEpochAdvance = rmp_serde::from_slice(&legacy_bytes).unwrap();
 
         assert_eq!(
             deserialized.signer_key_ref,
@@ -2571,23 +2513,15 @@ mod tests {
         };
 
         // First call succeeds.
-        let first = handle_sender_key_request(
-            &request,
-            bob_pubkey.as_bytes(),
-            &params,
-            &mut nonce_dedup,
-        )
-        .await;
+        let first =
+            handle_sender_key_request(&request, bob_pubkey.as_bytes(), &params, &mut nonce_dedup)
+                .await;
         assert!(first.is_ok(), "first request should succeed");
 
         // Second call with same nonce should be rejected as replay.
-        let second = handle_sender_key_request(
-            &request,
-            bob_pubkey.as_bytes(),
-            &params,
-            &mut nonce_dedup,
-        )
-        .await;
+        let second =
+            handle_sender_key_request(&request, bob_pubkey.as_bytes(), &params, &mut nonce_dedup)
+                .await;
         assert!(
             matches!(second, Err(SenderKeyError::ReplayedRequest)),
             "replayed request should be rejected, got {second:?}"
@@ -2744,41 +2678,51 @@ mod tests {
     // Deserialization size-limit tests (#347)
     // -------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn hpke_sealed_key_wrong_length_rejected() {
-        // open_sender_key_response must reject hpke_sealed_key with wrong
-        // length before attempting decryption (#347).
-        let custody = InMemoryKeyCustody::new();
-        let wrapping_key = custody.generate_keypair(KeyType::X25519).await.unwrap();
+    #[test]
+    fn hpke_sealed_key_wrong_length_rejected_on_deser() {
+        // hpke_sealed_key is now [u8; 60] — length is enforced at the type
+        // level by serde_hpke_sealed_60. Verify deserialization rejects wrong
+        // sizes (#347).
+        #[derive(serde::Serialize)]
+        struct FakeResponse {
+            sender_did: String,
+            epoch: u64,
+            #[serde(with = "serde_bytes")]
+            hpke_sealed_key: Vec<u8>,
+            #[serde(with = "serde_pubkey_32")]
+            ephemeral_pubkey: [u8; 32],
+            #[serde(with = "serde_bytes")]
+            request_nonce: [u8; REQUEST_NONCE_SIZE],
+        }
 
-        // Construct a SenderKeyResponse with a truncated sealed key (59 bytes
-        // instead of the expected 60).
-        let response = SenderKeyResponse {
+        // 59 bytes — too short.
+        let fake_short = FakeResponse {
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
             hpke_sealed_key: vec![0u8; 59],
             ephemeral_pubkey: [0u8; 32],
             request_nonce: [0u8; REQUEST_NONCE_SIZE],
         };
-
-        let result = open_sender_key_response(&custody, &wrapping_key, &response).await;
-        assert!(result.is_err(), "should reject wrong-length sealed key");
-        let err = format!("{:?}", result.unwrap_err());
+        let serialized = rmp_serde::to_vec_named(&fake_short).unwrap();
+        let result = rmp_serde::from_slice::<SenderKeyResponse>(&serialized);
+        assert!(result.is_err(), "should reject 59-byte sealed key");
+        let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("60 bytes"),
-            "error should mention expected 60 bytes: {err}"
+            err.contains("60-byte HPKE sealed key"),
+            "error should mention 60-byte: {err}"
         );
 
-        // Also test oversized (61 bytes).
-        let response_long = SenderKeyResponse {
+        // 61 bytes — too long.
+        let fake_long = FakeResponse {
             sender_did: "did:dht:alice".to_owned(),
             epoch: 1,
             hpke_sealed_key: vec![0u8; 61],
             ephemeral_pubkey: [0u8; 32],
             request_nonce: [0u8; REQUEST_NONCE_SIZE],
         };
-        let result_long = open_sender_key_response(&custody, &wrapping_key, &response_long).await;
-        assert!(result_long.is_err(), "should reject oversized sealed key");
+        let serialized_long = rmp_serde::to_vec_named(&fake_long).unwrap();
+        let result_long = rmp_serde::from_slice::<SenderKeyResponse>(&serialized_long);
+        assert!(result_long.is_err(), "should reject 61-byte sealed key");
     }
 
     #[test]

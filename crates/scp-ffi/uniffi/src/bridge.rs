@@ -2236,9 +2236,7 @@ async fn ucan_delegate_impl(
                             .iter()
                             .find(|a| a.with.ends_with(&format!("/{cap}")))
                             .map(|a| a.with.clone())
-                            .unwrap_or_else(|| {
-                                format!("scp:ctx:{}/{cap}", handle.context_id)
-                            })
+                            .unwrap_or_else(|| format!("scp:ctx:{}/{cap}", handle.context_id))
                     };
                     let action = cap_uri.rsplit_once('/').map_or_else(
                         || cap.clone(),

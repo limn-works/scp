@@ -8,7 +8,8 @@
 //!
 //! - [`serde_signature_64`] — Ed25519 signatures (exactly 64 bytes)
 //! - [`serde_hash_32`] — SHA-256 hashes (exactly 32 bytes)
-//! - [`serde_pubkey_32`] — X25519 public keys (exactly 32 bytes)
+//! - [`serde_pubkey_32`] — X25519 / Ed25519 public keys (exactly 32 bytes)
+//! - [`serde_hpke_sealed_60`] — HPKE-sealed sender key (exactly 60 bytes)
 //!
 //! # Bounded variable-size
 //!
@@ -71,12 +72,69 @@ pub mod serde_hash_32 {
     }
 }
 
+/// Serde module for `[u8; 32]` fields (X25519 / Ed25519 public keys).
+///
+/// Same pattern as [`serde_hash_32`] but with a domain-specific error message.
+pub mod serde_pubkey_32 {
+    use serde::{self, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serde_bytes::serialize(bytes.as_slice(), serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v: Vec<u8> = serde_bytes::deserialize(deserializer)?;
+        v.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!(
+                "expected 32-byte public key, got {} bytes",
+                v.len()
+            ))
+        })
+    }
+}
+
+/// Serde module for `[u8; 60]` fields (HPKE-sealed sender keys).
+///
+/// The HPKE-sealed sender key is exactly 60 bytes: AES-128-GCM nonce (12) +
+/// encrypted sender key (32) + authentication tag (16). Using a fixed-size
+/// array prevents allocation of arbitrarily large buffers from malicious input.
+pub mod serde_hpke_sealed_60 {
+    use serde::{self, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 60], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serde_bytes::serialize(bytes.as_slice(), serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 60], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v: Vec<u8> = serde_bytes::deserialize(deserializer)?;
+        v.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!(
+                "expected 60-byte HPKE sealed key, got {} bytes",
+                v.len()
+            ))
+        })
+    }
+}
+
 /// Serde module for variable-length `Vec<u8>` fields with a 512 KiB cap.
 ///
 /// Serializes identically to `serde_bytes` but rejects payloads larger than
 /// [`BOUNDED_BYTES_MAX`] on deserialization. This prevents OOM from untrusted
 /// input while remaining compatible with legitimate SCP payloads.
 pub mod serde_bounded_bytes {
+    use serde::de::Visitor;
     use serde::{self, Deserializer, Serializer};
 
     use super::BOUNDED_BYTES_MAX;
@@ -92,15 +150,65 @@ pub mod serde_bounded_bytes {
     where
         D: Deserializer<'de>,
     {
-        let v: Vec<u8> = serde_bytes::deserialize(deserializer)?;
-        if v.len() > BOUNDED_BYTES_MAX {
-            return Err(serde::de::Error::custom(format!(
-                "binary field exceeds {} byte limit (got {} bytes)",
-                BOUNDED_BYTES_MAX,
-                v.len()
-            )));
+        struct BoundedBytesVisitor;
+
+        impl<'de> Visitor<'de> for BoundedBytesVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "binary data up to {} bytes", BOUNDED_BYTES_MAX)
+            }
+
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+                if v.len() > BOUNDED_BYTES_MAX {
+                    return Err(E::custom(format!(
+                        "binary field exceeds {} byte limit (got {} bytes)",
+                        BOUNDED_BYTES_MAX,
+                        v.len()
+                    )));
+                }
+                Ok(v.to_vec())
+            }
+
+            fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+                if v.len() > BOUNDED_BYTES_MAX {
+                    return Err(E::custom(format!(
+                        "binary field exceeds {} byte limit (got {} bytes)",
+                        BOUNDED_BYTES_MAX,
+                        v.len()
+                    )));
+                }
+                Ok(v)
+            }
+
+            // MessagePack may present binary data as a sequence of integers.
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                // Check size_hint before allocating.
+                let hint = seq.size_hint().unwrap_or(0);
+                if hint > BOUNDED_BYTES_MAX {
+                    return Err(serde::de::Error::custom(format!(
+                        "binary field exceeds {} byte limit (declared {} bytes)",
+                        BOUNDED_BYTES_MAX, hint
+                    )));
+                }
+                let mut buf = Vec::with_capacity(hint);
+                while let Some(byte) = seq.next_element::<u8>()? {
+                    if buf.len() >= BOUNDED_BYTES_MAX {
+                        return Err(serde::de::Error::custom(format!(
+                            "binary field exceeds {} byte limit",
+                            BOUNDED_BYTES_MAX
+                        )));
+                    }
+                    buf.push(byte);
+                }
+                Ok(buf)
+            }
         }
-        Ok(v)
+
+        deserializer.deserialize_bytes(BoundedBytesVisitor)
     }
 }
 
@@ -222,5 +330,85 @@ mod tests {
     struct BadHashWrapper {
         #[serde(with = "serde_bytes")]
         hash: Vec<u8>,
+    }
+
+    // --- pubkey_32 tests ---
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct Pubkey32Wrapper {
+        #[serde(with = "serde_pubkey_32")]
+        key: [u8; 32],
+    }
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct BadPubkeyWrapper {
+        #[serde(with = "serde_bytes")]
+        key: Vec<u8>,
+    }
+
+    #[test]
+    fn pubkey_32_roundtrip() {
+        let wrapper = Pubkey32Wrapper { key: [0xEF; 32] };
+        let serialized = rmp_serde::to_vec_named(&wrapper).unwrap();
+        let deserialized: Pubkey32Wrapper = rmp_serde::from_slice(&serialized).unwrap();
+        assert_eq!(deserialized.key, [0xEF; 32]);
+    }
+
+    #[test]
+    fn pubkey_32_rejects_wrong_size() {
+        let bad = BadPubkeyWrapper { key: vec![0u8; 31] };
+        let serialized = rmp_serde::to_vec_named(&bad).unwrap();
+        let result = rmp_serde::from_slice::<Pubkey32Wrapper>(&serialized);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("32-byte public key"),
+            "error should mention 32-byte public key: {err}"
+        );
+    }
+
+    // --- hpke_sealed_60 tests ---
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct HpkeSealed60Wrapper {
+        #[serde(with = "serde_hpke_sealed_60")]
+        sealed: [u8; 60],
+    }
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct BadHpkeSealedWrapper {
+        #[serde(with = "serde_bytes")]
+        sealed: Vec<u8>,
+    }
+
+    #[test]
+    fn hpke_sealed_60_roundtrip() {
+        let wrapper = HpkeSealed60Wrapper { sealed: [0xAB; 60] };
+        let serialized = rmp_serde::to_vec_named(&wrapper).unwrap();
+        let deserialized: HpkeSealed60Wrapper = rmp_serde::from_slice(&serialized).unwrap();
+        assert_eq!(deserialized.sealed, [0xAB; 60]);
+    }
+
+    #[test]
+    fn hpke_sealed_60_rejects_wrong_size() {
+        let bad = BadHpkeSealedWrapper {
+            sealed: vec![0u8; 59],
+        };
+        let serialized = rmp_serde::to_vec_named(&bad).unwrap();
+        let result = rmp_serde::from_slice::<HpkeSealed60Wrapper>(&serialized);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("60-byte HPKE sealed key"),
+            "error should mention 60-byte: {err}"
+        );
+
+        // 61 bytes — too long
+        let bad_long = BadHpkeSealedWrapper {
+            sealed: vec![0u8; 61],
+        };
+        let serialized_long = rmp_serde::to_vec_named(&bad_long).unwrap();
+        let result = rmp_serde::from_slice::<HpkeSealed60Wrapper>(&serialized_long);
+        assert!(result.is_err());
     }
 }

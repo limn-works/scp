@@ -746,7 +746,10 @@ mod tests {
         let result = tracker.validate_and_advance(&env2);
         assert!(result.is_err());
         assert!(
-            matches!(result.unwrap_err(), EnvelopeError::TimestampRegression { .. }),
+            matches!(
+                result.unwrap_err(),
+                EnvelopeError::TimestampRegression { .. }
+            ),
             "timestamp regression should be rejected per §9.8.2(c)"
         );
     }

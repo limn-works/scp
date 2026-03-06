@@ -701,9 +701,10 @@ impl BlobStorage for S3BlobStore {
                 request = request.continuation_token(token);
             }
 
-            let output = request.send().await.map_err(|e| {
-                StorageError::Internal(format!("S3 list failed for count: {e}"))
-            })?;
+            let output = request
+                .send()
+                .await
+                .map_err(|e| StorageError::Internal(format!("S3 list failed for count: {e}")))?;
 
             total += output.contents().len();
 

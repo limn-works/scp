@@ -118,6 +118,44 @@ impl SequenceStore for InMemorySequenceStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Post-resolve hook (TOFU / certificate pinning integration point)
+// ---------------------------------------------------------------------------
+
+/// Hook called after every successful DID resolution.
+///
+/// This is the integration point for TOFU key tracking (spec §9.11) and
+/// certificate pinning (spec §9.13). The `scp-core` crate provides an
+/// implementation that calls `check_tofu` and persists records via
+/// `ProtocolStore`. The identity crate defines this trait (rather than
+/// importing from `scp-core`) to preserve `scp-identity`'s self-contained
+/// dependency graph.
+///
+/// # Rotation authorization on key change
+///
+/// When TOFU detects a key change (`TofuResult::Changed`), the implementation
+/// should verify that the DID document update was properly authorized. For
+/// `did:dht`, BEP44 signature verification during resolution already provides
+/// this guarantee: the DHT record is signed by the Identity Key (`#0`), so
+/// any document update — including key rotations — is cryptographically
+/// authorized by the DID controller. The post-resolve hook does NOT need to
+/// perform additional rotation authorization checks; it can focus on alerting
+/// the user and refusing encrypted operations until the change is accepted.
+pub trait PostResolveHook: Send + Sync {
+    /// Called after a DID document is successfully resolved and verified.
+    ///
+    /// The hook receives the DID string and the resolved document. It may
+    /// inspect verification method keys, compare against stored records,
+    /// and report changes. Errors from this hook are logged but do not
+    /// prevent the resolution result from being returned — TOFU is advisory,
+    /// not a gate on resolution itself.
+    fn on_resolve(
+        &self,
+        did: &str,
+        document: &DidDocument,
+    ) -> Pin<Box<dyn Future<Output = Result<(), IdentityError>> + Send + '_>>;
+}
+
 /// Domain separator for migration proof hashes, preventing cross-protocol
 /// signature confusion. See issue #78.
 const DOMAIN_MIGRATION_V1: &[u8] = b"SCP-MIGRATION-V1:";
@@ -165,6 +203,11 @@ pub struct DidDht<D: DhtClient = InMemoryDhtClient, C: Clock = SystemClock> {
     /// DID document publication and loaded on startup via
     /// [`initialize_sequence`](Self::initialize_sequence).
     sequence_store: Option<Arc<dyn SequenceStore>>,
+    /// Optional post-resolve hook for TOFU key tracking (spec §9.11).
+    ///
+    /// When present, called after every successful DID resolution. Errors
+    /// from the hook are logged but do not prevent resolution from succeeding.
+    post_resolve_hook: Option<Arc<dyn PostResolveHook>>,
 }
 
 // Manual Debug impl because SignFn and dyn SequenceStore can't derive Debug.
@@ -178,6 +221,10 @@ impl<D: DhtClient + std::fmt::Debug, C: Clock + std::fmt::Debug> std::fmt::Debug
             .field(
                 "sequence_store",
                 &self.sequence_store.as_ref().map(|_| "<store>"),
+            )
+            .field(
+                "post_resolve_hook",
+                &self.post_resolve_hook.as_ref().map(|_| "<hook>"),
             )
             .finish()
     }
@@ -204,6 +251,7 @@ impl DidDht<InMemoryDhtClient, SystemClock> {
             sequence: AtomicU64::new(0),
             sign_fn: None,
             sequence_store: None,
+            post_resolve_hook: None,
         }
     }
 }
@@ -219,6 +267,7 @@ impl<D: DhtClient> DidDht<D, SystemClock> {
             sequence: AtomicU64::new(0),
             sign_fn: None,
             sequence_store: None,
+            post_resolve_hook: None,
         }
     }
 }
@@ -242,6 +291,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             sequence: AtomicU64::new(0),
             sign_fn: Some(sign_fn),
             sequence_store: None,
+            post_resolve_hook: None,
         }
     }
 
@@ -264,6 +314,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             sequence: AtomicU64::new(0),
             sign_fn: Some(sign_fn),
             sequence_store: Some(sequence_store),
+            post_resolve_hook: None,
         }
     }
 
@@ -312,6 +363,20 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     #[must_use]
     pub fn sequence_store(&self) -> Option<&Arc<dyn SequenceStore>> {
         self.sequence_store.as_ref()
+    }
+
+    /// Sets a post-resolve hook for TOFU key tracking (spec §9.11).
+    ///
+    /// The hook is called after every successful DID resolution. Use this
+    /// to integrate TOFU key tracking from `scp-core::crypto::tofu`.
+    pub fn set_post_resolve_hook(&mut self, hook: Arc<dyn PostResolveHook>) {
+        self.post_resolve_hook = Some(hook);
+    }
+
+    /// Returns a reference to the post-resolve hook, if configured.
+    #[must_use]
+    pub fn post_resolve_hook(&self) -> Option<&Arc<dyn PostResolveHook>> {
+        self.post_resolve_hook.as_ref()
     }
 
     /// Bootstraps the BEP44 sequence number from persistent storage and/or
@@ -551,7 +616,19 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         // derived from the DID string.
         verify_self_certification(did_string, &document)?;
 
-        // Step 6: Update cache.
+        // Step 6: Post-resolve hook (TOFU key tracking, spec §9.11).
+        // Errors are logged but do not prevent resolution from succeeding.
+        if let Some(hook) = &self.post_resolve_hook {
+            if let Err(e) = hook.on_resolve(did_string, &document).await {
+                tracing::warn!(
+                    did = %did_string,
+                    error = %e,
+                    "post-resolve hook failed (TOFU key tracking may be unavailable)"
+                );
+            }
+        }
+
+        // Step 7: Update cache.
         self.cache
             .insert(did_string, document.clone(), record.seq)
             .await;

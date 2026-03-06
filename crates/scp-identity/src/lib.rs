@@ -45,7 +45,7 @@ pub use attestation::{
 };
 pub use cache::{DidCache, DidResolutionResult, Staleness};
 pub use dht::{
-    DidDht, InMemorySequenceStore, SequenceStore, decode_multibase_key,
+    DidDht, InMemorySequenceStore, PostResolveHook, SequenceStore, decode_multibase_key,
     did_from_ed25519_public_key, extract_public_key, verify_bep44_signature, verify_migration,
     verify_self_certification,
 };
