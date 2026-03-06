@@ -86,9 +86,18 @@
       ],
       "blockedBy": [],
       "sources": [
-        { "file": ".docs/specs/05-contexts.md", "section": "## 5.3 Capability Ceiling" },
-        { "file": ".docs/specs/05-contexts.md", "section": "## 5.7 Metadata" },
-        { "file": ".docs/specs/18-addressability-and-deployment.md", "section": "#### 18.11.2.1 Projection Policy" }
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.3 Capability Ceiling"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.7 Metadata"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "#### 18.11.2.1 Projection Policy"
+        }
       ],
       "details": {}
     },
@@ -125,8 +134,14 @@
       ],
       "blockedBy": [],
       "sources": [
-        { "file": ".docs/adrs/phase-6.md", "section": "## ADR-031: Multi-Admin Governance Models" },
-        { "file": ".docs/specs/05-contexts.md", "section": "## 5.9 Governance" }
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-031: Multi-Admin Governance Models"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.9 Governance"
+        }
       ],
       "details": {}
     },
@@ -167,9 +182,14 @@
         "Update existing tests for new fields",
         "Add tests for template-specific defaults"
       ],
-      "blockedBy": ["SCP-GG-001"],
+      "blockedBy": [
+        "SCP-GG-001"
+      ],
       "sources": [
-        { "file": ".docs/specs/05-contexts.md", "section": "### 5.12.1 Well-Known Templates" }
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.12.1 Well-Known Templates"
+        }
       ],
       "details": {}
     },
@@ -198,10 +218,18 @@
         "Implement public_metadata() on ContextParams",
         "Add unit tests for filtering with various policies"
       ],
-      "blockedBy": ["SCP-GG-003"],
+      "blockedBy": [
+        "SCP-GG-003"
+      ],
       "sources": [
-        { "file": ".docs/specs/05-contexts.md", "section": "## 5.7 Metadata" },
-        { "file": ".docs/specs/05-contexts.md", "section": "### 5.7.1 Metadata Publication and Retrieval" }
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.7 Metadata"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.7.1 Metadata Publication and Retrieval"
+        }
       ],
       "details": {}
     },
@@ -236,10 +264,18 @@
         "Implement governance_unban_subscriber() on BroadcastContext",
         "Add comprehensive tests"
       ],
-      "blockedBy": ["SCP-GG-001"],
+      "blockedBy": [
+        "SCP-GG-001"
+      ],
       "sources": [
-        { "file": ".docs/specs/05-contexts.md", "section": "### 5.14.8 Blocking" },
-        { "file": ".docs/specs/05-contexts.md", "section": "## 5.9 Governance" }
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.14.8 Blocking"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.9 Governance"
+        }
       ],
       "details": {}
     },
@@ -275,10 +311,19 @@
         "Add broadcast state persistence",
         "Add tests"
       ],
-      "blockedBy": ["SCP-GG-002", "SCP-GG-005"],
+      "blockedBy": [
+        "SCP-GG-002",
+        "SCP-GG-005"
+      ],
       "sources": [
-        { "file": ".docs/specs/05-contexts.md", "section": "## 5.9 Governance" },
-        { "file": ".docs/specs/05-contexts.md", "section": "### 5.14.8 Blocking" }
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.9 Governance"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.14.8 Blocking"
+        }
       ],
       "details": {}
     },
@@ -310,10 +355,18 @@
         "Update enable_broadcast_projection signature in lib.rs and all call sites",
         "Update test helpers for new fields"
       ],
-      "blockedBy": ["SCP-GG-001"],
+      "blockedBy": [
+        "SCP-GG-001"
+      ],
       "sources": [
-        { "file": ".docs/specs/18-addressability-and-deployment.md", "section": "## 18.11 HTTP Broadcast Projection" },
-        { "file": ".docs/specs/05-contexts.md", "section": "### 5.14.4 Open vs. Gated Broadcast" }
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "## 18.11 HTTP Broadcast Projection"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.14.4 Open vs. Gated Broadcast"
+        }
       ],
       "details": {}
     },
@@ -355,10 +408,18 @@
         "Validate projection policy constraints in enable_broadcast_projection",
         "Add comprehensive tests"
       ],
-      "blockedBy": ["SCP-GG-007"],
+      "blockedBy": [
+        "SCP-GG-007"
+      ],
       "sources": [
-        { "file": ".docs/specs/18-addressability-and-deployment.md", "section": "### 18.11.2 Activation" },
-        { "file": ".docs/specs/05-contexts.md", "section": "### 5.14.4 Open vs. Gated Broadcast" }
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.11.2 Activation"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.14.4 Open vs. Gated Broadcast"
+        }
       ],
       "details": {}
     }

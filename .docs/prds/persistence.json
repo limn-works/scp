@@ -148,7 +148,7 @@
     },
     {
       "id": "SCP-PERSIST-010",
-      "title": "Implement event log store module (event_log.rs) \u2014 core methods",
+      "title": "Implement event log store module (event_log.rs) — core methods",
       "gate": "gate-persist-1",
       "priority": "P0",
       "severity": "critical",
@@ -204,7 +204,7 @@
         "crates/scp-core/src/store/ucan.rs",
         "crates/scp-core/src/store/mod.rs"
       ],
-      "description": "Relocate `check_and_record_nonce` (ucan.rs lines 232-268) and `prune_expired_nonces` (ucan.rs lines 277-294) from `store/ucan.rs` to a new `store/nonce.rs` module. The spec section 17.4 Module Structure specifies these belong in `nonce.rs`. This is a refactor \u2014 move existing implementations, update all imports and callers, do NOT reimplement. The existing tests in ucan.rs that test nonce methods should also move to nonce.rs.",
+      "description": "Relocate `check_and_record_nonce` (ucan.rs lines 232-268) and `prune_expired_nonces` (ucan.rs lines 277-294) from `store/ucan.rs` to a new `store/nonce.rs` module. The spec section 17.4 Module Structure specifies these belong in `nonce.rs`. This is a refactor — move existing implementations, update all imports and callers, do NOT reimplement. The existing tests in ucan.rs that test nonce methods should also move to nonce.rs.",
       "acceptanceCriteria": [
         "`store/nonce.rs` exists and is registered in `store/mod.rs`",
         "`check_and_record_nonce` and `prune_expired_nonces` moved from ucan.rs to nonce.rs with identical behavior",
@@ -234,7 +234,7 @@
       "details": {
         "phase": 2,
         "crate": "scp-core",
-        "note": "Refactoring story \u2014 existing implementation in ucan.rs lines 232-294 is relocated, not reimplemented"
+        "note": "Refactoring story — existing implementation in ucan.rs lines 232-294 is relocated, not reimplemented"
       }
     },
     {
@@ -248,7 +248,7 @@
         "crates/scp-core/src/store/transport.rs",
         "crates/scp-core/src/store/mod.rs"
       ],
-      "description": "Implement 6 transport methods specified in section 17.4 in a new `store/transport.rs` module. Keys: `relay_score/{url_hash}`, `key_package/{url_hash}/{index:010d}`. URLs contain `/` which fails `sanitize_key_component` \u2014 hash URL with SHA-256 hex as key component. Methods: `store_relay_score`, `load_relay_score`, `list_relay_scores`, `store_key_package`, `load_key_packages`, `delete_key_package`.",
+      "description": "Implement 6 transport methods specified in section 17.4 in a new `store/transport.rs` module. Keys: `relay_score/{url_hash}`, `key_package/{url_hash}/{index:010d}`. URLs contain `/` which fails `sanitize_key_component` — hash URL with SHA-256 hex as key component. Methods: `store_relay_score`, `load_relay_score`, `list_relay_scores`, `store_key_package`, `load_key_packages`, `delete_key_package`.",
       "acceptanceCriteria": [
         "`store/transport.rs` exists and is registered in `store/mod.rs`",
         "`store_relay_score`, `load_relay_score`, `list_relay_scores` use keys `relay_score/{sha256_hex(url)}` (URLs hashed because `/` fails sanitize_key_component; spec key convention adapted)",
@@ -373,7 +373,7 @@
     },
     {
       "id": "SCP-PERSIST-015",
-      "title": "Add economic governance methods to economy module \u2014 policy and receipts",
+      "title": "Add economic governance methods to economy module — policy and receipts",
       "gate": "gate-persist-1",
       "priority": "P0",
       "severity": "critical",
@@ -507,7 +507,7 @@
       "files": [
         "crates/scp-core/src/store/mod.rs"
       ],
-      "description": "Implement the `Migratable` trait and version-aware read per section 17.10. The `Migratable` trait defines `CURRENT_VERSION: u16` and `fn migrate(old_version: u16, data: &[u8]) -> Option<Self>`. Migration functions are pure \u2014 no I/O, no side effects. Each step transforms bytes from version N to N+1. The chain is applied iteratively until reaching CURRENT_VERSION. After migration, the upgraded value is written back to storage so future reads do not re-migrate. If version > current, return StoreError::IncompatibleVersion.",
+      "description": "Implement the `Migratable` trait and version-aware read per section 17.10. The `Migratable` trait defines `CURRENT_VERSION: u16` and `fn migrate(old_version: u16, data: &[u8]) -> Option<Self>`. Migration functions are pure — no I/O, no side effects. Each step transforms bytes from version N to N+1. The chain is applied iteratively until reaching CURRENT_VERSION. After migration, the upgraded value is written back to storage so future reads do not re-migrate. If version > current, return StoreError::IncompatibleVersion.",
       "acceptanceCriteria": [
         "`Migratable` trait defined with `CURRENT_VERSION: u16` const and `fn migrate(old_version, data) -> Option<Self>`",
         "Version-aware read: deserialize `StoredValue`, if version < current apply migration chain iteratively (v1->v2->v3), write back upgraded value to storage",
@@ -588,7 +588,7 @@
       "files": [
         "crates/scp-core/src/context/manager.rs"
       ],
-      "description": "Define the `ContextSnapshot` struct (serializable) containing: context_id, state (ContextState), context_params (ContextParams), membership (MembershipState), role_state (ContextRoleState), executed_proposals (HashSet<ProposalId>), ttl_remaining_secs (Option<u64>). Define the `ContextPersistence` trait (dyn-compatible, Send + Sync) with methods: persist_context, load_context, persist_broadcast, load_broadcast, delete_context, list_persisted_contexts. This trait replaces `BroadcastPersistence` entirely \u2014 one trait, one provider. All methods return `Result<_, Box<dyn Error + Send + Sync>>` for best-effort semantics.",
+      "description": "Define the `ContextSnapshot` struct (serializable) containing: context_id, state (ContextState), context_params (ContextParams), membership (MembershipState), role_state (ContextRoleState), executed_proposals (HashSet<ProposalId>), ttl_remaining_secs (Option<u64>). Define the `ContextPersistence` trait (dyn-compatible, Send + Sync) with methods: persist_context, load_context, persist_broadcast, load_broadcast, delete_context, list_persisted_contexts. This trait replaces `BroadcastPersistence` entirely — one trait, one provider. All methods return `Result<_, Box<dyn Error + Send + Sync>>` for best-effort semantics.",
       "acceptanceCriteria": [
         "`ContextSnapshot` struct with 7 fields: context_id, state, context_params, membership, role_state, executed_proposals, ttl_remaining_secs; derives Serialize, Deserialize, Debug, Clone",
         "`ContextPersistence` trait with 6 dyn-compatible methods: persist_context, load_context, persist_broadcast, load_broadcast, delete_context, list_persisted_contexts",
@@ -666,7 +666,7 @@
     },
     {
       "id": "SCP-PERSIST-022",
-      "title": "Wire ContextPersistence into ContextManager \u2014 replace BroadcastPersistence",
+      "title": "Wire ContextPersistence into ContextManager — replace BroadcastPersistence",
       "gate": "gate-persist-2",
       "priority": "P0",
       "severity": "critical",
@@ -674,7 +674,7 @@
       "files": [
         "crates/scp-core/src/context/manager.rs"
       ],
-      "description": "Replace `broadcast_persistence: Option<Arc<dyn BroadcastPersistence>>` with `persistence: Option<Arc<dyn ContextPersistence>>` in ContextManager. Remove `BroadcastPersistence` trait entirely \u2014 all its call sites are updated to use `ContextPersistence`. Update constructor. Add persist calls after 7 of the 13 mutation points: create_context, join_context, leave_context, send_message, close_context, finalize_close (calls delete_context), handle_ttl_expiry. Each persist call: snapshot under lock, persist after lock drop, log errors but do not abort (best-effort).",
+      "description": "Replace `broadcast_persistence: Option<Arc<dyn BroadcastPersistence>>` with `persistence: Option<Arc<dyn ContextPersistence>>` in ContextManager. Remove `BroadcastPersistence` trait entirely — all its call sites are updated to use `ContextPersistence`. Update constructor. Add persist calls after 7 of the 13 mutation points: create_context, join_context, leave_context, send_message, close_context, finalize_close (calls delete_context), handle_ttl_expiry. Each persist call: snapshot under lock, persist after lock drop, log errors but do not abort (best-effort).",
       "acceptanceCriteria": [
         "`ContextManager` field changed from `broadcast_persistence` to `persistence: Option<Arc<dyn ContextPersistence>>`; `BroadcastPersistence` trait and all its impls removed",
         "Constructor updated to accept `Option<Arc<dyn ContextPersistence>>`",
@@ -757,7 +757,7 @@
     },
     {
       "id": "SCP-PERSIST-024",
-      "title": "Implement context restore path \u2014 load and reconstruct",
+      "title": "Implement context restore path — load and reconstruct",
       "gate": "gate-persist-2",
       "priority": "P0",
       "severity": "critical",
@@ -1134,7 +1134,7 @@
         "Key sub-prefixes per section 17.9: `mls/{id}/group_state`, `mls/{id}/tree/{leaf}`, `mls/{id}/key_schedule/{epoch}`, `mls/{id}/proposal/{hash}`, `mls/{id}/key_package/{hash}`, `mls/{id}/encryption_key/{epoch}/{gen}`",
         "All OpenMLS key types serialized via MessagePack before storage; `ScpMlsProvider<S>` combines crypto + storage",
         "Test: group state store/load roundtrip via the bridge",
-        "Test: context isolation \u2014 two bridges with different context_ids sharing one ProtocolStore do not leak state",
+        "Test: context isolation — two bridges with different context_ids sharing one ProtocolStore do not leak state",
         "Test: state survives simulated restart (drop bridge, recreate with same ProtocolStore, verify persisted)"
       ],
       "actionItems": [
@@ -1263,7 +1263,7 @@
         "bindings/typescript/src/storage/wasm-sqlite.ts",
         "bindings/typescript/package.json"
       ],
-      "description": "Implement browser storage adapter per section 17.6. Uses wa-sqlite with OriginPrivateFileSystemVFS (primary) and IDBBatchAtomicVFS (Safari incognito fallback). Per section 17.5, SQLCipher is unavailable in WASM \u2014 each value is encrypted with AES-GCM using a key derived from the identity's WebCrypto key before writing. TypeScript implementation of Storage interface, communicates with Rust WASM core via binding layer.",
+      "description": "Implement browser storage adapter per section 17.6. Uses wa-sqlite with OriginPrivateFileSystemVFS (primary) and IDBBatchAtomicVFS (Safari incognito fallback). Per section 17.5, SQLCipher is unavailable in WASM — each value is encrypted with AES-GCM using a key derived from the identity's WebCrypto key before writing. TypeScript implementation of Storage interface, communicates with Rust WASM core via binding layer.",
       "acceptanceCriteria": [
         "`WasmSqliteStorage` TypeScript class using wa-sqlite with OriginPrivateFileSystemVFS (IDBBatchAtomicVFS fallback for Safari incognito)",
         "Each value encrypted with AES-GCM using key derived from identity WebCrypto key before writing to wa-sqlite per section 17.5",
@@ -1362,7 +1362,7 @@
         "`SyncableStorage<S: Storage>` struct behind `sync` feature flag wrapping inner storage with monotonic sequence-numbered mutation changelog",
         "`export_changeset(since: u64)` returns all mutations since sequence number; `apply_changeset(changeset)` applies entries sequentially with last-write-wins per key (last entry in changeset wins)",
         "`Changeset` type: `Vec<ChangeEntry>` where `ChangeEntry { seq, key, value: Option<Vec<u8>> }`, serializable via MessagePack; changelog stored in inner storage under `_sync/` key prefix",
-        "Passes `storage_conformance!()` (transparent wrapper \u2014 all Storage methods delegate to inner, store/delete also append to changelog)",
+        "Passes `storage_conformance!()` (transparent wrapper — all Storage methods delegate to inner, store/delete also append to changelog)",
         "Tests: export -> apply roundtrip preserves state, LWW resolves conflicts by sequential ordering (last entry wins), partial apply is safe (idempotent key-value writes; re-applying full changeset converges to correct state)",
         "`cargo test -p scp-platform --features sync` and `cargo clippy -p scp-platform --features sync` pass"
       ],
@@ -1577,7 +1577,7 @@
     },
     {
       "id": "SCP-PERSIST-070",
-      "title": "End-to-end integration tests \u2014 context lifecycle and cross-adapter",
+      "title": "End-to-end integration tests — context lifecycle and cross-adapter",
       "gate": "gate-persist-7",
       "priority": "P0",
       "severity": "critical",
@@ -1624,7 +1624,7 @@
     },
     {
       "id": "SCP-PERSIST-071",
-      "title": "End-to-end integration tests \u2014 sync, relay, and combined node",
+      "title": "End-to-end integration tests — sync, relay, and combined node",
       "gate": "gate-persist-7",
       "priority": "P0",
       "severity": "critical",
