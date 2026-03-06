@@ -320,23 +320,22 @@ All 7 lanes merged to `feat/achieve-production-readiness`:
 
 Additional review fixes (81185a1): deny_unknown_fields on 4 sender key wire types, HandleRequestParams nonce/timestamp validation, saturating_add, conflict detection tests, actions_conflict docstring.
 
-### Phase 2: Governance Cleanup (serial — same files)
+### Phase 2: Governance Cleanup (serial — same files) — PARTIAL
 
-**Branch:** `fix/governance-types` from `main` post-Phase 1
-- #349 → #357 → #360 (all touch `manager.rs` or `governance/mod.rs`)
-- Then: `feat/governance-actions` (#320) — 12 missing variants
+**Step 1:** #349 (f64→u32 basis points) — **COMPLETE** → fadf4ff
+- Remaining: #357 → #360 → #320
 
-### Phase 3: Security Hardening (parallel, needs Phase 1 merged)
+### Phase 3: Security Hardening (parallel, needs Phase 1 merged) — PARTIAL
 
-**Lane A** — `fix/deser-limits` (#347) — needs #345, #346 merged (same files)
-**Lane B** — `fix/ucan-security` (#299, #319, #326) — needs S-B merged
-**Lane C** — `fix/governance-enforcement` (#339, #340) — needs Phase 2 merged
-**Lane D** — `fix/timestamp-validation` (#321) — needs Phase 1 Lane C merged
+**Lane A** — #347 (deser size limits) — **COMPLETE** → 155f2b3 + review fix 1bd9403
+**Lane B** — #299, #319 — **NOT STARTED** (both hit usage limits, need re-dispatch). #326 done in prior iteration.
+**Lane C** — #339, #340 — **BLOCKED** on Phase 2 completion (#357+)
+**Lane D** — #321 — **COMPLETE** (prior iteration) → b7b4e1e + review fix 3eacfb2
 
-### Phase 4: Identity Infrastructure (parallel with Phases 2-3)
+### Phase 4: Identity Infrastructure (parallel with Phases 2-3) — PARTIAL
 
-**Lane A** — `fix/identity-persistence` (#327 → #310 → #311)
-**Lane B** — `fix/identity-features` (#315, #325)
+**Lane A** — #327 (BEP44 sequence persistence) — **COMPLETE** → cc5eff1. Remaining: #310 → #311
+**Lane B** — #315 (BIP-39 mnemonic) — **COMPLETE** → 7e61bb3. #325 (TOFU + cert pinning) — **COMPLETE** → 225c862 + review fix 1bd9403
 
 ### Phase 5: Core Infrastructure (CRITICAL PATH — sequential)
 
