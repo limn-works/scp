@@ -1,79 +1,72 @@
 # Loom Status
 
 ## Failing Tests
-None — full workspace test suite green (2930 tests). Clippy clean with CI features.
+None — full workspace test suite green (2931 scp-core + all other crates). Clippy clean with CI features.
 
 ## Uncommitted Changes
-None — all changes committed. Working tree clean.
+None — all changes committed. Working tree clean (except .claude/agent-memory/bug-catcher/MEMORY.md — unrelated).
 
 ## Fixed This Iteration
-- Merge conflict: key_protocol.rs (ADR-039 doc comment + [u8; 64] type), inner.rs (message_type + [u8; 32] payload_hash)
-- Test compilation: vec![0u8; N] → [0u8; N] in freshness check tests, LegacyAdvance .clone() → .to_vec()
-- FakeAdvance test struct: corrected field names to match SenderKeyEpochAdvance (context_id/new_epoch → sender_did/epoch)
-- Review finding 1 (HIGH): hpke_sealed_key unbounded Vec<u8> → [u8; 60] with serde module
-- Review finding 2 (HIGH): TOFU/cert pinning wired into resolution (PostResolveHook) and connection paths
-- Review finding 3 (MEDIUM): Duplicate serde modules deduplicated to serde_util.rs
-- Review finding 4 (MEDIUM): Added missing serde_pubkey_32 module to serde_util.rs
-- Review finding 5 (MEDIUM): Bounded bytes uses custom visitor with size_hint check before allocation
-- Review finding 6 (LOW): store_cert_pin documented crate boundary reason for raw bytes API
-- Review finding 7 (LOW): certificate_fingerprint doc corrected from "SPKI" to "whole-certificate"
+- Review finding 1 (HIGH): WASM revocation check dead code — rewired to WasmUcanState.revoked_cids with correct CID computation
+- Review finding 2 (HIGH): WASM ceiling check missing — added ceiling compliance check after capability match
+- Review finding 3 (HIGH): WASM accepts tokens with missing exp/aud — made both fields required, reject on absence
+- Review finding 4 (HIGH): Node binary never calls initialize_sequence — added call after DidDht construction
+- Review finding 5 (MEDIUM): Gateway BEP44 signature unverified — added Ed25519 verification in resolve_via_gateway
+- Review finding 6 (MEDIUM): Empty BridgeProofResolver — added proof_tokens parameter to all FFI tool invocation functions
+- Review finding 7 (MEDIUM): Missing acceptance criterion test — added test for UCAN without tool capability → rejected
+- Review finding 8 (LOW): CAS comment inaccuracy — corrected
 
 ## Tests Added / Updated
-- #349: 2 acceptance criteria tests (5/10 quorum met, 4/10 quorum not met) + updated 20+ existing test call sites
-- #347: Oversized signature rejection test, bounded bytes deserialization tests, WebSocket frame limit test
-- #327: 7 new tests (sequence persistence, bootstrap from max(stored, DHT), publish increments)
-- #315: Mnemonic stability tests (same keys → same words), word count verification
-- #325: TOFU check tests (FirstSeen, Consistent, Changed), cert pin tests
-- Review fix: 4 additional tests for hpke_sealed_key bounds and PostResolveHook
+- #319: UCAN tool invocation validation test (mint without capability → rejected) in invoke.rs
+- Review fix: 1 new test added (2931 total in scp-core, up from 2930)
 
 ## Work Summary
 
 ### Phase 0: COMPLETE (prior iterations)
 ### Phase 1: COMPLETE (prior iterations)
+### Phase 2: Step 1 COMPLETE (prior iteration), Steps 2-4 pending
 
-### This Iteration: Phase 2/3/4 Parallel Dispatch + Review Fix
+### This Iteration: Phase 3 Lane B + Phase 4 Lane A
 
-Dispatched 7 subagents with worktree isolation:
+Dispatched 4 subagents with worktree isolation:
 
 | Issue | Phase | Description | Result | Commit |
 |-------|-------|-------------|--------|--------|
-| #349 | P2 Step 1 | f64→u32 basis points | **COMPLETE** | fadf4ff |
-| #347 | P3 Lane A | Deserialization size limits (OOM DoS) | **COMPLETE** | 155f2b3 |
-| #327 | P4 Lane A | BEP44 sequence number persistence | **COMPLETE** | cc5eff1 |
-| #315 | P4 Lane B | BIP-39 mnemonic for key continuity | **COMPLETE** | 7e61bb3 |
-| #325 | P4 Lane B | TOFU key tracking + cert pinning | **COMPLETE** | 225c862 |
-| #299 | P3 Lane B | Wire mint_role_tokens to real UCAN | **FAILED** — usage limit | — |
-| #319 | P3 Lane B | UCAN tool invocation authorization | **FAILED** — usage limit | — |
+| #310 | P4 Lane A | PkarrDhtClient production DHT | **COMPLETE** | 59f18b2 |
+| #319 | P3 Lane B | UCAN tool invocation auth (BLOCKER) | **COMPLETE** | e6b86a9 |
+| #357 | P2 Step 2 | Vote signature verification | **FAILED** — branched from main, 22+ merge conflicts | — |
+| #299 | P3 Lane B | Wire mint_role_tokens to UCAN | **FAILED** — 3rd consecutive failure, escaped worktree | — |
 
-Merge conflict resolution: 92e9b2f
-Review fix (all 7 findings): 1bd9403
-Execution plan update: 5cc2efe
+Review fix (all 8 findings): 04c2281
+Execution plan update: e534c17
 
 ### Review Outcomes
 - Review agent: bug-catcher
-- Result: FAIL (7 findings: 2 HIGH, 3 MEDIUM, 2 LOW)
-- Fix subagent dispatched, all 7 findings addressed in commit 1bd9403
-- Tests green after fix (2930 pass, 0 fail)
+- Result: FAIL (8 findings: 4 HIGH, 3 MEDIUM, 1 LOW)
+- Fix subagent dispatched, all 8 findings addressed in commit 04c2281
+- Tests green after fix (2931 pass, 0 fail)
 - No findings skipped — all factually correct and fixed
 
 ### Issues Commented This Iteration
-#349, #347, #327, #315, #325
+#310, #319
 
-### Cumulative Issues Commented (26)
-#290, #301, #312, #313, #315, #319, #321, #325, #326, #327, #345, #346, #347, #348, #349, #350, #351, #352, #353, #354, #355, #372, #374, #378, #379, #380, #381
+### Cumulative Issues Commented (28)
+#290, #301, #310, #312, #313, #315, #319, #321, #325, #326, #327, #345, #346, #347, #348, #349, #350, #351, #352, #353, #354, #355, #372, #374, #378, #379, #380, #381
 
 ## Next Iteration — Continue Execution Plan
 
 **Phase 2 (serial governance chain — resume here):**
-- #357 → #360 → #320 (all touch manager.rs or governance/mod.rs)
+- #357 — Vote signature verification (re-dispatch against feat/achieve-production-readiness, NOT main)
+- Then #360 → #320
 
-**Phase 3 Lane B (re-dispatch — failed last two iterations):**
+**Phase 3 Lane B (re-dispatch — 3 consecutive failures):**
 - #299 — Wire mint_role_tokens to real UCAN signing
-- #319 — UCAN authorization at tool invocation (BLOCKER)
 
 **Phase 3 Lane C (blocked on Phase 2 completion):**
 - #339 — Context ceiling enforcement
 - #340 — Promotion policy enforcement
 
 **Phase 4 Lane A (resume serial chain):**
-- #310 → #311 (DID production DHT → resolver unification)
+- #311 — DID resolver unification (depends on #310, now complete)
+
+**CRITICAL NOTE:** #357 subagent branched from main instead of feat/achieve-production-readiness, causing 22+ merge conflicts in majority.rs. Next iteration MUST verify subagent worktrees branch from the correct base.
