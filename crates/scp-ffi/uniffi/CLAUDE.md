@@ -25,7 +25,7 @@ Four adapter structs implement scp-core's UCAN validation traits, bridging runti
 
 | Adapter | Implements | Purpose |
 |---------|-----------|---------|
-| `BridgeDidResolver` | `DidResolver` | Resolves `did:dht:z` (zbase32) and `did:key:` (hex) DIDs to Ed25519 public keys |
+| `DispatchDidResolver` | `DidResolver` | Dispatches to `IdentityBackedDidResolver` (production, full DID doc validation) or `BridgeDidResolver` (fallback, string-only). See #311 |
 | `BridgeRevocationChecker` | `RevocationChecker` | Wraps `&RevocationList` for revocation lookups |
 | `BridgeProofResolver` | `ProofResolver` | HashMap-backed resolver for UCAN delegation chain proofs |
 | `BridgeNonceTracker` | `NonceTracker` | Adapts `nonce::NonceTracker` to `validate::NonceTracker` trait |
@@ -66,7 +66,7 @@ All I/O-bound functions are `async fn`. UniFFI generates Swift `async` functions
 - The tokio runtime (`RUNTIME` in `lib.rs`) must be initialized before any async bridge call. It is created as a `OnceLock<Runtime>` and exposed via `runtime()`.
 - `context_create` registers runtime state; `context_close` removes it. If context creation fails partway, the registry entry must be cleaned up.
 - `with_context` closures must return `Result<T, ScpError>` — use typed error variants, not raw strings.
-- UCAN validation delegates to scp-core's full 11-step ADR-016 pipeline. `BridgeDidResolver` handles both `did:dht:z` (zbase32 decode) and `did:key:` (hex decode) formats. Invalid DID methods return `DidNotFound`.
+- UCAN validation delegates to scp-core's full 11-step ADR-016 pipeline. `DispatchDidResolver` uses `IdentityBackedDidResolver` (production, full DID doc validation via scp-identity) when initialized, falling back to `BridgeDidResolver` (string-only). The global resolver is initialized on `identity_create`. See #311.
 - `ucan_mint` and `ucan_delegate` use the identity's retained `InMemoryKeyCustody` and `KeyHandle` from the `ContextHandle` (wired during `context_create` from the `Identity`). No ephemeral keys. See #326.
 - `EventLog` is a Merkle tree storing only leaf hashes, not event payloads. `event_log_query` returns event count and Merkle root as a JSON `LogSummary`.
 - `event_log_verify` supports two claim types: `"inclusion"` (prove event exists at index) and `"absence"` (prove no event at index). Both use scp-core's `prove_inclusion`/`prove_absence` + `verify_inclusion`.
