@@ -149,7 +149,8 @@ pub enum ClientMessage {
         blob_ttl: u32,
 
         /// The opaque blob content. 1--262144 bytes (256 KB).
-        #[serde(with = "serde_bytes")]
+        /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
+        #[serde(with = "scp_core::serde_util::serde_bounded_bytes")]
         blob: Vec<u8>,
     },
 
@@ -307,7 +308,8 @@ pub enum ClientMessage {
         target_routing_id: [u8; 32],
 
         /// Opaque payload to forward. The bridge does NOT inspect this.
-        #[serde(with = "serde_bytes")]
+        /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
+        #[serde(with = "scp_core::serde_util::serde_bounded_bytes")]
         payload: Vec<u8>,
     },
 }
@@ -490,7 +492,8 @@ pub enum RelayMessage {
         stored_at: u64,
 
         /// The opaque blob content.
-        #[serde(with = "serde_bytes")]
+        /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
+        #[serde(with = "scp_core::serde_util::serde_bounded_bytes")]
         blob: Vec<u8>,
     },
 

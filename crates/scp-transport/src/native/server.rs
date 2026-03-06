@@ -650,6 +650,39 @@ pub fn hex_encode_32(bytes: &[u8; 32]) -> String {
     out
 }
 
+/// Accepts a WebSocket connection with frame/message size limits (#347).
+///
+/// Applies a 512 KiB cap on both frame and message size to prevent OOM from
+/// oversized frames. This matches the serde bounded-bytes cap and is 2x the
+/// relay's `MAX_BLOB_SIZE` (256 KiB), leaving room for framing overhead.
+///
+/// When `bridge_secret` is `Some`, the WebSocket upgrade handshake validates
+/// an `Authorization: Bearer <hex>` header via [`BridgeSecretCallback`].
+async fn accept_websocket(
+    stream: TcpStream,
+    bridge_secret: Option<[u8; 32]>,
+) -> Result<tokio_tungstenite::WebSocketStream<TcpStream>, ConnectionError> {
+    let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(512 * 1024),
+        max_frame_size: Some(512 * 1024),
+        ..Default::default()
+    };
+
+    if let Some(secret) = bridge_secret {
+        tokio_tungstenite::accept_hdr_async_with_config(
+            stream,
+            BridgeSecretCallback { expected: secret },
+            Some(ws_config),
+        )
+        .await
+        .map_err(|e| ConnectionError::WebSocket(e.to_string()))
+    } else {
+        tokio_tungstenite::accept_async_with_config(stream, Some(ws_config))
+            .await
+            .map_err(|e| ConnectionError::WebSocket(e.to_string()))
+    }
+}
+
 /// Handles a single WebSocket connection.
 ///
 /// When `config.bridge_secret` is set, the WebSocket upgrade request must
@@ -671,22 +704,7 @@ async fn handle_connection(
     persistence: Option<Arc<dyn RelayPersistence>>,
     bridge_registry: Arc<BridgeRegistry>,
 ) -> Result<(), ConnectionError> {
-    let ws_stream = if let Some(expected_secret) = config.bridge_secret {
-        // Validate the bridge token during the WebSocket handshake.
-        tokio_tungstenite::accept_hdr_async(
-            stream,
-            BridgeSecretCallback {
-                expected: expected_secret,
-            },
-        )
-        .await
-        .map_err(|e| ConnectionError::WebSocket(e.to_string()))?
-    } else {
-        tokio_tungstenite::accept_async(stream)
-            .await
-            .map_err(|e| ConnectionError::WebSocket(e.to_string()))?
-    };
-
+    let ws_stream = accept_websocket(stream, config.bridge_secret).await?;
     let (mut ws_sink, mut ws_source) = ws_stream.split();
 
     // Channel for sending relay messages back to this client.

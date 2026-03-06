@@ -37,6 +37,65 @@ use super::{SenderKey, SenderKeyError, generate_sender_key};
 use crate::identity::SigningKeyId;
 
 // ---------------------------------------------------------------------------
+// Serde helpers for fixed-size byte arrays
+// ---------------------------------------------------------------------------
+
+/// Serde module for `[u8; 64]` fields (Ed25519 signatures).
+///
+/// Serializes via `serde_bytes` for compact binary representation and
+/// validates exact length on deserialization, rejecting anything other
+/// than exactly 64 bytes. This prevents OOM from oversized signature
+/// fields on untrusted input (#347).
+mod serde_signature_64 {
+    use serde::{self, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serde_bytes::serialize(bytes.as_slice(), serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v: Vec<u8> = serde_bytes::deserialize(deserializer)?;
+        v.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!("expected 64-byte signature, got {} bytes", v.len()))
+        })
+    }
+}
+
+/// Serde module for `[u8; 32]` fields (X25519 public keys).
+///
+/// Same pattern as `serde_signature_64` but for 32-byte values.
+/// Prevents OOM from oversized ephemeral pubkey fields (#347).
+mod serde_pubkey_32 {
+    use serde::{self, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serde_bytes::serialize(bytes.as_slice(), serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v: Vec<u8> = serde_bytes::deserialize(deserializer)?;
+        v.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!(
+                "expected 32-byte public key, got {} bytes",
+                v.len()
+            ))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
@@ -86,8 +145,8 @@ pub struct SenderKeyEpochAdvance {
     #[serde(default)]
     pub signer_key_ref: SigningKeyId,
     /// Ed25519 signature over the epoch advance payload.
-    #[serde(with = "serde_bytes")]
-    pub signature: Vec<u8>,
+    #[serde(with = "serde_signature_64")]
+    pub signature: [u8; 64],
 }
 
 /// Request for a sender's current key at a specific epoch.
@@ -107,9 +166,9 @@ pub struct SenderKeyRequest {
     pub sender_did: String,
     /// The epoch number being requested.
     pub epoch: u64,
-    /// Fresh X25519 public key for HPKE wrapping.
-    #[serde(with = "serde_bytes")]
-    pub wrapping_pubkey: Vec<u8>,
+    /// Fresh X25519 public key for HPKE wrapping (32 bytes).
+    #[serde(with = "serde_pubkey_32")]
+    pub wrapping_pubkey: [u8; 32],
     /// Cryptographic nonce for replay protection (16 bytes, generated with
     /// `OsRng`). The responder echoes this in [`SenderKeyResponse::request_nonce`]
     /// and rejects duplicate nonces within [`NONCE_EXPIRY_SECS`].
@@ -117,8 +176,8 @@ pub struct SenderKeyRequest {
     /// Unix timestamp in seconds when the request was created.
     pub timestamp: u64,
     /// Ed25519 signature over the request payload.
-    #[serde(with = "serde_bytes")]
-    pub signature: Vec<u8>,
+    #[serde(with = "serde_signature_64")]
+    pub signature: [u8; 64],
 }
 
 /// Response containing HPKE-encrypted sender key material.
@@ -139,8 +198,8 @@ pub struct SenderKeyResponse {
     #[serde(with = "serde_bytes")]
     pub hpke_sealed_key: Vec<u8>,
     /// The ephemeral X25519 public key used in the HPKE encapsulation.
-    #[serde(with = "serde_bytes")]
-    pub ephemeral_pubkey: Vec<u8>,
+    #[serde(with = "serde_pubkey_32")]
+    pub ephemeral_pubkey: [u8; 32],
     /// Echo of the request nonce from [`SenderKeyRequest::nonce`], binding
     /// this response to the originating request.
     pub request_nonce: [u8; REQUEST_NONCE_SIZE],
@@ -165,8 +224,8 @@ pub struct BlockNotification {
     /// Unix timestamp in milliseconds when the block was issued.
     pub timestamp: u64,
     /// Ed25519 signature from the blocker's Active Signing Key.
-    #[serde(with = "serde_bytes")]
-    pub signature: Vec<u8>,
+    #[serde(with = "serde_signature_64")]
+    pub signature: [u8; 64],
 }
 
 /// Result of [`rotate_sender_key_for_block`], containing the new key,
@@ -221,11 +280,16 @@ pub async fn publish_sender_key_epoch_advance(
         .await
         .map_err(|e| SenderKeyError::SigningFailed(e.to_string()))?;
 
+    let sig_bytes: [u8; 64] = signature
+        .into_bytes()
+        .try_into()
+        .map_err(|_| SenderKeyError::SigningFailed("Ed25519 signature must be 64 bytes".into()))?;
+
     let advance = SenderKeyEpochAdvance {
         sender_did: sender_did.to_owned(),
         epoch,
         signer_key_ref,
-        signature: signature.into_bytes(),
+        signature: sig_bytes,
     };
 
     serde_json::to_vec(&advance).map_err(|e| SenderKeyError::SerializationFailed(e.to_string()))
@@ -356,14 +420,22 @@ pub async fn request_sender_key(
         .await
         .map_err(|e| SenderKeyError::SigningFailed(e.to_string()))?;
 
+    let wrap_bytes: [u8; 32] = wrapping_pubkey.into_bytes().try_into().map_err(|_| {
+        SenderKeyError::KeyCustodyError("X25519 public key must be 32 bytes".into())
+    })?;
+    let sig_bytes: [u8; 64] = signature
+        .into_bytes()
+        .try_into()
+        .map_err(|_| SenderKeyError::SigningFailed("Ed25519 signature must be 64 bytes".into()))?;
+
     let request = SenderKeyRequest {
         requester_did: requester_did.to_owned(),
         sender_did: sender_did.to_owned(),
         epoch,
-        wrapping_pubkey: wrapping_pubkey.into_bytes(),
+        wrapping_pubkey: wrap_bytes,
         nonce,
         timestamp,
-        signature: signature.into_bytes(),
+        signature: sig_bytes,
     };
 
     let message = serde_json::to_vec(&request)
@@ -476,13 +548,8 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
         return Ok(None);
     }
 
-    // Parse the requester's wrapping public key.
-    let wrapping_bytes: [u8; 32] = request.wrapping_pubkey.as_slice().try_into().map_err(|_| {
-        SenderKeyError::VerificationFailed(format!(
-            "wrapping pubkey must be 32 bytes, got {}",
-            request.wrapping_pubkey.len()
-        ))
-    })?;
+    // The wrapping public key is already validated as [u8; 32] by serde.
+    let wrapping_bytes: [u8; 32] = request.wrapping_pubkey;
 
     // HPKE seal: encrypt the sender key to the requester's wrapping key.
     let (sealed, ephemeral_pub) = hpke_seal(sender_key.as_bytes(), &wrapping_bytes)?;
@@ -491,7 +558,7 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
         sender_did: sender_did.to_owned(),
         epoch,
         hpke_sealed_key: sealed,
-        ephemeral_pubkey: ephemeral_pub.to_vec(),
+        ephemeral_pubkey: ephemeral_pub,
         request_nonce: request.nonce,
     };
 
@@ -580,17 +647,19 @@ pub async fn open_sender_key_response(
     wrapping_key_handle: &KeyHandle,
     response: &SenderKeyResponse,
 ) -> Result<SenderKey, SenderKeyError> {
-    let ephemeral_bytes: [u8; 32] =
-        response
-            .ephemeral_pubkey
-            .as_slice()
-            .try_into()
-            .map_err(|_| {
-                SenderKeyError::HpkeDecryptionFailed(format!(
-                    "ephemeral pubkey must be 32 bytes, got {}",
-                    response.ephemeral_pubkey.len()
-                ))
-            })?;
+    // Validate HPKE sealed key length before decryption (#347).
+    // Expected: nonce (12) + ciphertext (32) + AES-128-GCM tag (16) = 60 bytes.
+    const HPKE_SEALED_KEY_EXPECTED: usize = HPKE_NONCE_SIZE + 32 + 16;
+    if response.hpke_sealed_key.len() != HPKE_SEALED_KEY_EXPECTED {
+        return Err(SenderKeyError::HpkeDecryptionFailed(format!(
+            "hpke_sealed_key must be {} bytes, got {}",
+            HPKE_SEALED_KEY_EXPECTED,
+            response.hpke_sealed_key.len()
+        )));
+    }
+
+    // The ephemeral public key is already validated as [u8; 32] by serde.
+    let ephemeral_bytes: [u8; 32] = response.ephemeral_pubkey;
 
     // Compute shared secret inside custody boundary.
     let shared_secret = key_custody
@@ -645,12 +714,17 @@ pub async fn send_block_notification(
         .await
         .map_err(|e| SenderKeyError::SigningFailed(e.to_string()))?;
 
+    let sig_bytes: [u8; 64] = signature
+        .into_bytes()
+        .try_into()
+        .map_err(|_| SenderKeyError::SigningFailed("Ed25519 signature must be 64 bytes".into()))?;
+
     let notification = BlockNotification {
         notification_type: "block_notification".to_owned(),
         blocker: blocker_did.to_owned(),
         blocked: blocked_did.to_owned(),
         timestamp,
-        signature: signature.into_bytes(),
+        signature: sig_bytes,
     };
 
     serde_json::to_vec(&notification)
@@ -2264,5 +2338,81 @@ mod tests {
                 "agent key should be rejected for Category A resource: {resource}"
             );
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Deserialization size-limit tests (#347)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn hpke_sealed_key_wrong_length_rejected() {
+        // open_sender_key_response must reject hpke_sealed_key with wrong
+        // length before attempting decryption (#347).
+        let custody = InMemoryKeyCustody::new();
+        let wrapping_key = custody.generate_keypair(KeyType::X25519).await.unwrap();
+
+        // Construct a SenderKeyResponse with a truncated sealed key (59 bytes
+        // instead of the expected 60).
+        let response = SenderKeyResponse {
+            sender_did: "did:dht:alice".to_owned(),
+            epoch: 1,
+            hpke_sealed_key: vec![0u8; 59],
+            ephemeral_pubkey: [0u8; 32],
+            request_nonce: [0u8; REQUEST_NONCE_SIZE],
+        };
+
+        let result = open_sender_key_response(&custody, &wrapping_key, &response).await;
+        assert!(result.is_err(), "should reject wrong-length sealed key");
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("60 bytes"),
+            "error should mention expected 60 bytes: {err}"
+        );
+
+        // Also test oversized (61 bytes).
+        let response_long = SenderKeyResponse {
+            sender_did: "did:dht:alice".to_owned(),
+            epoch: 1,
+            hpke_sealed_key: vec![0u8; 61],
+            ephemeral_pubkey: [0u8; 32],
+            request_nonce: [0u8; REQUEST_NONCE_SIZE],
+        };
+        let result_long = open_sender_key_response(&custody, &wrapping_key, &response_long).await;
+        assert!(result_long.is_err(), "should reject oversized sealed key");
+    }
+
+    #[test]
+    fn oversized_signature_rejected_on_deser() {
+        // A SenderKeyEpochAdvance with a 65-byte signature field must be
+        // rejected during deserialization because serde_signature_64 enforces
+        // exactly 64 bytes (#347).
+        #[derive(serde::Serialize)]
+        struct FakeAdvance {
+            context_id: String,
+            sender_did: String,
+            new_epoch: u64,
+            timestamp: u64,
+            signing_key_id: SigningKeyId,
+            #[serde(with = "serde_bytes")]
+            signature: Vec<u8>,
+        }
+
+        let fake = FakeAdvance {
+            context_id: "ctx-1".to_owned(),
+            sender_did: "did:dht:alice".to_owned(),
+            new_epoch: 1,
+            timestamp: 1_000_000,
+            signing_key_id: SigningKeyId::Active,
+            signature: vec![0u8; 65],
+        };
+
+        let serialized = rmp_serde::to_vec_named(&fake).unwrap();
+        let result = rmp_serde::from_slice::<SenderKeyEpochAdvance>(&serialized);
+        assert!(result.is_err(), "should reject 65-byte signature");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("64-byte signature"),
+            "error should mention 64-byte: {err}"
+        );
     }
 }
