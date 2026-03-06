@@ -201,7 +201,8 @@ impl<S: Storage> ProtocolStore<S> {
             version: CURRENT_STORE_VERSION,
             data: value,
         };
-        rmp_serde::to_vec(&envelope).map_err(|e| StoreError::SerializationFailed(e.to_string()))
+        rmp_serde::to_vec_named(&envelope)
+            .map_err(|e| StoreError::SerializationFailed(e.to_string()))
     }
 
     /// Deserializes a `StoredValue` envelope from `MessagePack` bytes.
@@ -209,6 +210,10 @@ impl<S: Storage> ProtocolStore<S> {
     /// Checks the version field: if the stored version exceeds the current
     /// version, returns `StoreError::IncompatibleVersion`. Otherwise
     /// deserializes and returns the inner data.
+    ///
+    /// Handles both named (map) and positional (array) MessagePack formats
+    /// for backward compatibility with data serialized before the switch
+    /// to `rmp_serde::to_vec_named`.
     fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, StoreError> {
         let envelope: StoredValue<T> = rmp_serde::from_slice(bytes)
             .map_err(|e| StoreError::DeserializationFailed(e.to_string()))?;
@@ -289,7 +294,7 @@ impl<S: Storage> ProtocolStore<S> {
             version: T::CURRENT_VERSION,
             data: value,
         };
-        let bytes = rmp_serde::to_vec(&envelope)
+        let bytes = rmp_serde::to_vec_named(&envelope)
             .map_err(|e| StoreError::SerializationFailed(e.to_string()))?;
         self.storage.store(key, &bytes).await?;
         Ok(())
