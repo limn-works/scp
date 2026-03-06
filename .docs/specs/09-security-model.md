@@ -213,9 +213,124 @@ The protocol mandates a single ciphersuite for v1. No negotiation, no fallback. 
 
 **Merkle tree hash:** SHA-256. Append-only log tree following Certificate Transparency structure (RFC 6962). Each event entry is `SHA256(previous_hash || event_data)`. The Merkle root provides tamper-evident integrity over the entire event history.
 
-**Envelope signature scope:** The outer envelope is unsigned — it contains only the routing pseudonym, recipient hint, blob TTL, and encrypted blob (§9.10.2). The full signature lives inside the encrypted payload, signed by `#active` (Active Signing Key) or `#agent` (Agent Signing Key) from the sender's DID document (ADR-039): `SHA256("SCP-INNER-ENVELOPE-V1:" || context_id || sender_did || epoch || generation_number || sequence_number || timestamp || payload_hash || provenance_hash)` where `payload_hash = SHA256(original_plaintext)` (before padding) and `provenance_hash = SHA256(serialize(provenance))` if present, or `SHA256(0x00)` if absent. The `SCP-INNER-ENVELOPE-V1:` domain separator prefix prevents cross-protocol hash confusion — the same byte sequence cannot be a valid canonical hash in another protocol. This binds both payload content and provenance metadata to the signature — neither can be stripped, modified, or fabricated without invalidating the envelope signature. Field-swapping attacks (e.g., moving a payload from one context to another) produce invalid signatures. Relay operators cannot verify signatures (they cannot see sender DIDs), which is by design — verification is the responsibility of context members who can decrypt the payload.
+### 9.5.1 Canonical Hash Construction
 
-**Broadcast envelope signature scope:** Broadcast contexts (§5.14) use a different envelope format (`BroadcastEnvelope`) where the sender identity is visible (not inside MLS encryption). The signature covers: `SHA256(context_id || sender_did || sequence || key_epoch || timestamp || content_hash || provenance_hash)` where `content_hash = SHA256(original_plaintext)` and `provenance_hash = SHA256(serialize(provenance))` if present, or `SHA256(0x00)` if absent. This is structurally consistent with the InnerEnvelope signature — it replaces `epoch || generation` (MLS-specific) with `key_epoch` (broadcast-specific) and omits MLS generation numbers (broadcast uses per-sender sequence numbers only). The signature is verified by subscribers against the author's Active Signing Key or Agent Signing Key (resolved from the author's DID document, ADR-039). Both `#active` and `#agent` are valid signing keys for broadcast envelopes.
+All signed structures in the protocol use a single canonical hash construction. This ensures cross-implementation signature interoperability — two implementations that serialize the same logical data MUST produce identical bytes.
+
+**Construction:** `SHA-256(domain_separator || field_1 || field_2 || ... || field_N)`
+
+**Encoding rules:**
+
+- **Domain separator:** UTF-8 string, no length prefix (the separator itself is fixed per struct version).
+- **Variable-length bytes** (strings, byte arrays of unknown length): 4-byte big-endian length prefix followed by the raw bytes. `len(field) as u32` in network byte order.
+- **Fixed-length bytes** (`[u8; 32]`, `[u8; 64]`): raw bytes, no length prefix. The length is known from the schema.
+- **u64 integers:** 8 bytes, big-endian (network byte order).
+- **u32 integers:** 4 bytes, big-endian.
+- **Optional fields:** if present, encoded as above. If absent, encoded as `SHA-256(0x00)` (32-byte sentinel). The sentinel is distinguishable from any real hash because `SHA-256(0x00)` is not a valid hash of structured data with a domain separator.
+
+**Field ordering** is defined per struct and is part of the protocol specification. Changing the field order changes the hash. Fields are listed in the order specified below for each struct.
+
+**Domain separator versioning:** each struct's domain separator includes a version suffix (e.g., `"SCP-INNER-ENVELOPE-V1:"`). Changing any field's encoding, adding a field, or removing a field requires incrementing the version. Old signatures become invalid — this is intentional.
+
+**Reference implementation:** the migration proof (§9.12) uses this exact construction: `SHA-256("SCP-MIGRATION-V1:" || len(old_did) || old_did || len(new_did) || new_did || rotated_at)`.
+
+### 9.5.2 Signed Structure Definitions
+
+**InnerEnvelope** — domain: `"SCP-INNER-ENVELOPE-V1:"`
+
+| Order | Field | Encoding |
+|-------|-------|----------|
+| 1 | `context_id` | 4-byte BE length + UTF-8 bytes |
+| 2 | `sender_did` | 4-byte BE length + UTF-8 bytes |
+| 3 | `signing_key_id` | 4-byte BE length + UTF-8 bytes |
+| 4 | `epoch` | 8-byte BE u64 |
+| 5 | `generation_number` | 8-byte BE u64 |
+| 6 | `sequence_number` | 8-byte BE u64 |
+| 7 | `timestamp` | 8-byte BE u64 |
+| 8 | `payload_hash` | 32 bytes (SHA-256 of original plaintext before padding) |
+| 9 | `provenance_hash` | 32 bytes (SHA-256 of serialized provenance, or `SHA-256(0x00)` if absent) |
+
+The outer envelope is unsigned — it contains only the routing pseudonym, recipient hint, blob TTL, and encrypted blob (§9.10.2). The full signature lives inside the encrypted payload, signed by `#active` (Active Signing Key) or `#agent` (Agent Signing Key) from the sender's DID document (ADR-039). The domain separator prevents cross-protocol hash confusion. Field-swapping attacks (e.g., moving a payload from one context to another) produce invalid signatures. Relay operators cannot verify signatures (they cannot see sender DIDs) — verification is the responsibility of context members who can decrypt the payload.
+
+**BroadcastEnvelope** — domain: `"SCP-BROADCAST-ENVELOPE-V1:"`
+
+| Order | Field | Encoding |
+|-------|-------|----------|
+| 1 | `context_id` | 4-byte BE length + UTF-8 bytes |
+| 2 | `sender_did` | 4-byte BE length + UTF-8 bytes |
+| 3 | `signing_key_id` | 4-byte BE length + UTF-8 bytes |
+| 4 | `sequence` | 8-byte BE u64 |
+| 5 | `key_epoch` | 8-byte BE u64 |
+| 6 | `timestamp` | 8-byte BE u64 |
+| 7 | `content_hash` | 32 bytes (SHA-256 of original plaintext) |
+| 8 | `provenance_hash` | 32 bytes (SHA-256 of serialized provenance, or `SHA-256(0x00)` if absent) |
+
+The signature is verified by subscribers against the author's Active Signing Key or Agent Signing Key (resolved from the author's DID document, ADR-039).
+
+**SenderKeyEpochAdvance** — domain: `"SCP-SENDER-KEY-EPOCH-V1:"`
+
+| Order | Field | Encoding |
+|-------|-------|----------|
+| 1 | `context_id` | 4-byte BE length + UTF-8 bytes |
+| 2 | `sender_did` | 4-byte BE length + UTF-8 bytes |
+| 3 | `epoch` | 8-byte BE u64 |
+
+**SenderKeyRequest** — domain: `"SCP-SENDER-KEY-REQUEST-V1:"`
+
+| Order | Field | Encoding |
+|-------|-------|----------|
+| 1 | `context_id` | 4-byte BE length + UTF-8 bytes |
+| 2 | `requester_did` | 4-byte BE length + UTF-8 bytes |
+| 3 | `sender_did` | 4-byte BE length + UTF-8 bytes |
+| 4 | `epoch` | 8-byte BE u64 |
+| 5 | `wrapping_pubkey` | 32 bytes (X25519 public key) |
+
+**Attestation** — domain: `"SCP-ATTESTATION-V1:"`
+
+| Order | Field | Encoding |
+|-------|-------|----------|
+| 1 | `id` | 4-byte BE length + UTF-8 bytes |
+| 2 | `attestation_type` | 2-byte BE u16 (attestation type tag per `attestation_type_tag()`) |
+| 3 | `issuer` | 4-byte BE length + UTF-8 bytes (DID) |
+| 4 | `subject` | 4-byte BE length + UTF-8 bytes (DID) |
+| 5 | `claim` | 4-byte BE length + raw bytes (serialized claim) |
+| 6 | `evidence` | 4-byte BE length + raw bytes if present, or `SHA-256(0x00)` sentinel if absent |
+| 7 | `issued_at` | 8-byte BE u64 |
+| 8 | `expires` | 8-byte BE u64 |
+
+**ParticipationProfile** — domain: `"SCP-PARTICIPATION-PROFILE-V1:"`
+
+| Order | Field | Encoding |
+|-------|-------|----------|
+| 1 | `subject_did` | 4-byte BE length + UTF-8 bytes |
+| 2 | `signer_public_key` | 32 bytes |
+| 3 | `participation_duration_secs` | 8-byte BE u64 |
+| 4 | `governance_actions_against` | 8-byte BE u64 |
+| 5 | `governance_actions_by` | 8-byte BE u64 |
+| 6 | `tool_invocation_count` | 8-byte BE u64 |
+| 7 | `context_creation_count` | 8-byte BE u64 |
+| 8 | `role_progression_count` | 8-byte BE u64 |
+| 9 | `attestation_count` | 8-byte BE u64 |
+| 10 | `updated_at` | 8-byte BE u64 |
+| 11 | `event_log_root` | 32 bytes |
+
+**BlockNotification** — domain: `"SCP-BLOCK-NOTIFICATION-V1:"`
+
+| Order | Field | Encoding |
+|-------|-------|----------|
+| 1 | `context_id` | 4-byte BE length + UTF-8 bytes |
+| 2 | `blocker_did` | 4-byte BE length + UTF-8 bytes |
+| 3 | `blocked_did` | 4-byte BE length + UTF-8 bytes |
+| 4 | `timestamp` | 8-byte BE u64 |
+
+**AccessKeyRequest** — domain: `"SCP-ACCESS-KEY-REQUEST-V1:"`
+
+| Order | Field | Encoding |
+|-------|-------|----------|
+| 1 | `context_id` | 4-byte BE length + UTF-8 bytes |
+| 2 | `requester_did` | 4-byte BE length + UTF-8 bytes |
+| 3 | `timestamp` | 8-byte BE u64 |
+| 4 | `wrapping_pubkey` | 32 bytes (X25519 public key) |
 
 **UCAN signing:** EdDSA (Ed25519) per UCAN specification. The nonce field (`nnc`) is mandatory and must be unique per token issuance. This prevents UCAN token replay. UCAN token expiry (`exp`) MUST NOT exceed 24 hours (matching the nonce deduplication cache window in §9.8.2). Tokens with longer expiry could be replayed after nonce cache eviction. **UCAN revocation** is per-context via `RevocationList` — an append-only map of token CIDs to revocation states (Active, RevocationPending, Revoked). Revocations are distributed as MLS application messages to all context members. Revocation check is step 10 of the 11-step validation pipeline (ADR-016) and is performed on every capability exercise. The system is **fail-closed**: tokens in `RevocationPending` state (revocation initiated but not yet confirmed via MLS) are denied. See ADR-016 criterion 7 and `scp-core/crypto/ucan/revoke.rs` for the full specification.
 
