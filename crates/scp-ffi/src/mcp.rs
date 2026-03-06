@@ -589,6 +589,15 @@ struct FfiBridgeProvider {
     /// handler blocks longer than this, the invocation returns an error
     /// instead of blocking indefinitely. See issue #123.
     tool_timeout_ms: u64,
+    /// JWT-encoded UCAN token for tool invocation authorization.
+    ///
+    /// When present, `validate_capability` runs the full 11-step ADR-016
+    /// validation pipeline to verify the token grants `tool_invoke:{tool_name}`
+    /// or `tool_invoke:*` for the context. When absent, `validate_capability`
+    /// rejects immediately (UCAN is required for tool invocation).
+    ///
+    /// See spec §6.2, §8, ADR-016, and issue #319.
+    agent_ucan_token: Option<String>,
 }
 
 impl ContextProvider for FfiBridgeProvider {
@@ -633,6 +642,62 @@ impl ContextProvider for FfiBridgeProvider {
     }
 
     fn validate_capability(&self, context_id: &str, tool_name: &str) -> Result<(), String> {
+        // Primary check: UCAN token validation via the full 11-step ADR-016
+        // pipeline. Verifies the token grants tool_invoke:{tool_name} or
+        // tool_invoke:* for this context.
+        // See spec §6.2, §8, ADR-016, and issue #319.
+        if let Some(ref token) = self.agent_ucan_token {
+            crate::runtime::with_context(context_id, |rt| {
+                let did_resolver = crate::bridge_adapters::BridgeDidResolver;
+                let revocation_checker = crate::bridge_adapters::BridgeRevocationChecker {
+                    revocation_list: &rt.revocation_list,
+                };
+                let mut nonce_adapter = crate::bridge_adapters::BridgeNonceTracker {
+                    inner: &mut rt.nonce_tracker,
+                };
+                let proof_resolver = crate::bridge_adapters::BridgeProofResolver {
+                    proofs: std::collections::HashMap::new(),
+                };
+
+                let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
+                    did_resolver: &did_resolver,
+                    nonce_tracker: &mut nonce_adapter,
+                    revocation_checker: &revocation_checker,
+                    proof_resolver: &proof_resolver,
+                    ceiling: &rt.ceiling_strings,
+                    context_creator_did: &rt.creator_did,
+                    presenting_agent_did: &self.agent_did,
+                    clock_skew_tolerance_secs:
+                        scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                };
+
+                scp_core::context::tools::validate_tool_invocation_ucan(
+                    token, context_id, tool_name, &mut ctx,
+                )
+                .map_err(|e| {
+                    tracing::warn!(
+                        agent = %self.agent_did,
+                        tool = %tool_name,
+                        context = %context_id,
+                        error = %e,
+                        "UCAN validation failed for tool invocation"
+                    );
+                    ScpPyError::UcanError(format!(
+                        "UCAN authorization failed for tool '{tool_name}': {e}"
+                    ))
+                })
+            })
+            .map_err(|e| format!("{e}"))?;
+        } else {
+            tracing::warn!(
+                agent = %self.agent_did,
+                tool = %tool_name,
+                context = %context_id,
+                "no UCAN token provided for tool invocation — authorization bypass risk"
+            );
+            return Err("UCAN token required for tool invocation — no token provided".to_owned());
+        }
+
         // Defense-in-depth: check role-state capabilities in addition to the
         // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
         crate::runtime::with_context(context_id, |rt| {
@@ -644,8 +709,6 @@ impl ContextProvider for FfiBridgeProvider {
                 Ok(())
             } else {
                 // Generic message for the wire — detailed info stays server-side.
-                // The Err string propagates into a JSON-RPC error response via
-                // McpServer::handle_tool_call (server.rs:430-435).
                 tracing::warn!(
                     agent = %self.agent_did,
                     tool = %tool_name,
@@ -1010,12 +1073,14 @@ fn generate_handle_id(prefix: &str) -> String {
 /// See ADR-015: MCP server with context namespace mapping.
 #[pyfunction]
 #[pyo3(name = "py_mcp_serve")]
+#[pyo3(signature = (identity_did, context_ids, transport, ucan_token=None))]
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec for #[pyfunction] arguments.
 #[allow(clippy::too_many_lines)] // MCP server startup with stdio/SSE transport dispatch is inherently verbose.
 pub fn py_mcp_serve(
     identity_did: &str,
     context_ids: Vec<String>,
     transport: &str,
+    ucan_token: Option<String>,
 ) -> PyResult<String> {
     validate::validate_did(identity_did)?;
     validate::validate_transport_mode(transport)?;
@@ -1035,6 +1100,7 @@ pub fn py_mcp_serve(
         agent_did: identity_did.to_owned(),
         context_ids: context_ids.clone(),
         tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+        agent_ucan_token: ucan_token.clone(),
     };
     let server = McpServer::new(provider);
     let server = Arc::new(Mutex::new(server));
@@ -1048,6 +1114,7 @@ pub fn py_mcp_serve(
     let transport_mode = transport.to_owned();
     let sse_agent_did = identity_did.to_owned();
     let sse_context_ids = context_ids.clone();
+    let sse_ucan_token = ucan_token;
 
     let task_handle = rt.spawn(async move {
         match transport_mode.as_str() {
@@ -1133,6 +1200,7 @@ pub fn py_mcp_serve(
                     agent_did: sse_agent_did,
                     context_ids: sse_context_ids,
                     tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+                    agent_ucan_token: sse_ucan_token,
                 };
                 let sse_server = McpServer::new(provider);
                 let config =
@@ -2151,6 +2219,7 @@ mod tests {
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec!["ctx-1".to_owned(), "ctx-2".to_owned()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
         };
         assert_eq!(
             provider.active_context_ids(),
@@ -2164,6 +2233,7 @@ mod tests {
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec![],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
         };
         assert_eq!(provider.agent_did(), "did:dht:z6MkTest");
     }
@@ -2174,6 +2244,7 @@ mod tests {
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec!["nonexistent".to_owned()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
         };
         // Unknown context returns empty tool list (no panic).
         let tools = provider.context_tools("nonexistent");
@@ -2234,11 +2305,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FfiBridgeProvider::validate_capability — authorized (creator has all caps)
+    // FfiBridgeProvider::validate_capability — rejects missing UCAN (#319)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn ffi_bridge_provider_validate_capability_allows_authorized() {
+    fn ffi_bridge_provider_validate_capability_rejects_missing_ucan() {
         let creator = "did:dht:z6MkCreatorValCap";
         let ctx_id = setup_test_context(creator, true);
 
@@ -2246,18 +2317,26 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
         };
-        // Creator has ToolInvokeAll, so any tool name should pass.
+        // Even the creator is rejected without a UCAN token.
+        let result = provider.validate_capability(&ctx_id, "calculator");
         assert!(
-            provider.validate_capability(&ctx_id, "calculator").is_ok(),
-            "creator should be authorized to invoke tools"
+            result.is_err(),
+            "should reject when no UCAN token is provided"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("UCAN token required"),
+            "error should mention UCAN requirement: {err}"
         );
 
         crate::runtime::remove_context(&ctx_id);
     }
 
     // -----------------------------------------------------------------------
-    // FfiBridgeProvider::validate_capability — rejects unauthorized
+    // FfiBridgeProvider::validate_capability — rejects unauthorized member
+    // without UCAN token (#319)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2282,16 +2361,17 @@ mod tests {
             agent_did: member.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
         };
         let result = provider.validate_capability(&ctx_id, "calculator");
         assert!(
             result.is_err(),
-            "member without ToolInvoke should be rejected"
+            "member without UCAN token should be rejected"
         );
         let err = result.unwrap_err();
         assert!(
-            err.contains("insufficient permissions"),
-            "error should be generic (no agent DID/tool/context leaked): {err}"
+            err.contains("UCAN token required"),
+            "error should mention UCAN requirement: {err}"
         );
 
         crate::runtime::remove_context(&ctx_id);
@@ -2310,6 +2390,7 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
         };
 
         let input = serde_json::json!({"a": 3, "b": 4});
@@ -2350,6 +2431,7 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
         };
 
         // Invoke in echo mode (no handler registered).
@@ -2402,6 +2484,7 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
         };
 
         let result =
@@ -2438,6 +2521,7 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
         };
 
         // Invoke with invalid input (schema validation fails).
@@ -2471,6 +2555,7 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
         };
 
         // Input schema requires an object with "a" and "b" as required fields.
@@ -2512,6 +2597,7 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
         };
 
         let result = provider.invoke_tool(&ctx_id, "nonexistent", serde_json::json!({}));
@@ -2627,6 +2713,7 @@ mod tests {
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec![],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
         };
         assert!(provider.subscribe_resource("scp://ctx/events").is_ok());
     }
@@ -2660,6 +2747,7 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
         };
 
         let input = serde_json::json!({"a": 3, "b": 4});
@@ -2720,6 +2808,7 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
         };
 
         let result =
@@ -2752,6 +2841,7 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
         };
 
         let result =
@@ -2787,6 +2877,7 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: 50, // 50ms — will expire before the 5s sleep.
+            agent_ucan_token: None,
         };
 
         let result =
@@ -2830,6 +2921,7 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: 5_000, // 5 seconds — plenty for an instant handler.
+            agent_ucan_token: None,
         };
 
         let result =
@@ -2912,6 +3004,7 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
         };
         let server = McpServer::new(provider);
         let server = Arc::new(Mutex::new(server));
@@ -2957,6 +3050,7 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
         };
         let server = McpServer::new(provider);
         let server = Arc::new(Mutex::new(server));

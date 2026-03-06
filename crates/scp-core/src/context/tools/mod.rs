@@ -53,6 +53,7 @@ use crate::context::roles;
 
 pub use invoke::{
     InvocationError, has_tool_invoke_capability, invoke_tool, invoke_tool_with_cancellation,
+    validate_tool_invocation_ucan,
 };
 pub use lifecycle::{
     DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, Provenance, ToolCancel, ToolErrorCode, ToolExecutionError,

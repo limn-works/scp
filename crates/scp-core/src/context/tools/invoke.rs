@@ -12,6 +12,7 @@
 //! See ADR-010 in `.docs/adrs/phase-2.md` for the full design.
 
 use std::future::Future;
+use std::hash::BuildHasher;
 use std::time::Duration;
 
 use super::lifecycle::{
@@ -22,6 +23,12 @@ use super::schema::validate_value_against_schema;
 use super::{DID, ToolId};
 use crate::context::roles::{Capability, ContextRoleState};
 use crate::context::{ContextHandle, ContextState};
+use crate::crypto::ucan::UcanError;
+use crate::crypto::ucan::capability::CapabilityUri;
+use crate::crypto::ucan::validate::{
+    DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext, parse_ucan,
+    validate_ucan,
+};
 
 // ---------------------------------------------------------------------------
 // InvocationError
@@ -362,6 +369,50 @@ pub fn has_tool_invoke_capability(role_state: &ContextRoleState, did: &str, tool
     }
     // Check for specific ToolInvoke(tool_id).
     role_state.member_has_capability(did, &Capability::ToolInvoke(tool_id.to_owned()))
+}
+
+// ---------------------------------------------------------------------------
+// UCAN validation at tool invocation boundary (#319)
+// ---------------------------------------------------------------------------
+
+/// Validates a UCAN token for tool invocation authorization.
+///
+/// Parses the encoded JWT token and runs the full 11-step ADR-016 validation
+/// pipeline, requiring `tool_invoke:{tool_name}` or `tool_invoke:*` capability
+/// scoped to the given context.
+///
+/// This is the primary authorization gate for tool invocations. Role-based
+/// `has_tool_invoke_capability` remains as defense-in-depth.
+///
+/// # Arguments
+///
+/// * `encoded_token` — JWT-encoded UCAN token.
+/// * `context_id` — The context ID the tool belongs to.
+/// * `tool_name` — The name of the tool being invoked.
+/// * `ctx` — The validation context with resolvers, trackers, and ceiling.
+///
+/// # Errors
+///
+/// Returns [`UcanError`] if the token is malformed, expired, revoked, lacks
+/// the required capability, or fails any of the 11 validation steps.
+///
+/// See spec §6.2, §8, ADR-016, and issue #319.
+pub fn validate_tool_invocation_ucan<D, N, R, P, S>(
+    encoded_token: &str,
+    context_id: &str,
+    tool_name: &str,
+    ctx: &mut ValidationContext<'_, D, N, R, P, S>,
+) -> Result<(), UcanError>
+where
+    D: DidResolver,
+    N: NonceTracker,
+    R: RevocationChecker,
+    P: ProofResolver,
+    S: BuildHasher,
+{
+    let parsed = parse_ucan(encoded_token)?;
+    let required_cap = CapabilityUri::new(context_id, "tool_invoke", tool_name);
+    validate_ucan(&parsed, &required_cap, ctx)
 }
 
 // ---------------------------------------------------------------------------

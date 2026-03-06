@@ -683,3 +683,151 @@ where
         f(rt)
     })
 }
+
+// ---------------------------------------------------------------------------
+// WASM-local UCAN validation for tool invocation (#319)
+// ---------------------------------------------------------------------------
+
+/// Validates a UCAN token for tool invocation authorization in the WASM bridge.
+///
+/// WASM cannot depend on scp-core (tokio incompatible), so this implements a
+/// local validation subset: JWT format, base64url decode, payload parse, expiry,
+/// revocation, audience match, capability match (specific + wildcard), and
+/// ceiling compliance.
+///
+/// **Not yet implemented** (deferred to SCP-218 `WebCrypto` wiring):
+/// - Ed25519 signature verification
+/// - Delegation chain traversal
+/// - Root issuer verification
+/// - Nonce replay detection
+///
+/// # Errors
+///
+/// Returns [`ScpWasmError::Permission`] if the token is malformed, expired,
+/// revoked, has an audience mismatch, or lacks the required
+/// `tool_invoke:{tool_name}` capability for the given context.
+///
+/// See CLAUDE.md §UCAN Validation — Known Gaps.
+/// See spec §6.2, §8, ADR-016, and issue #319.
+pub fn validate_tool_ucan_wasm(
+    token: &str,
+    context_id: &str,
+    tool_name: &str,
+    identity_did: &str,
+    rt: &mut WasmContextRuntime,
+) -> Result<(), ScpWasmError> {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    // Step 1: JWT format — three dot-separated parts.
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(ScpWasmError::Permission {
+            message: format!(
+                "UCAN token is not valid JWT format — expected 3 parts, got {}",
+                parts.len()
+            ),
+            code: "SCP-PERM-3001".to_owned(),
+        });
+    }
+
+    // Step 2: Decode payload.
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|e| ScpWasmError::Permission {
+            message: format!("UCAN payload base64url decode failed: {e}"),
+            code: "SCP-PERM-3001".to_owned(),
+        })?;
+
+    let payload: serde_json::Value =
+        serde_json::from_slice(&payload_bytes).map_err(|e| ScpWasmError::Permission {
+            message: format!("UCAN payload is not valid JSON: {e}"),
+            code: "SCP-PERM-3001".to_owned(),
+        })?;
+
+    // Step 3: Expiry check.
+    if let Some(exp) = payload.get("exp").and_then(serde_json::Value::as_u64) {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let now_secs = (js_sys::Date::now() / 1000.0) as u64;
+        if exp <= now_secs {
+            return Err(ScpWasmError::Permission {
+                message: format!("UCAN token has expired (exp={exp}, now={now_secs})"),
+                code: "SCP-PERM-3001".to_owned(),
+            });
+        }
+    }
+
+    // Step 4: Revocation check.
+    let token_cid = compute_token_cid(token);
+    if rt.revoked_tokens.contains(&token_cid) {
+        return Err(ScpWasmError::Permission {
+            message: "UCAN token has been revoked".to_owned(),
+            code: "SCP-PERM-3001".to_owned(),
+        });
+    }
+
+    // Step 5: Audience check — aud must match identity_did.
+    if let Some(aud) = payload.get("aud").and_then(serde_json::Value::as_str)
+        && aud != identity_did
+    {
+        return Err(ScpWasmError::Permission {
+            message: format!("UCAN audience mismatch: expected '{identity_did}', got '{aud}'"),
+            code: "SCP-PERM-3001".to_owned(),
+        });
+    }
+
+    // Step 6: Capability match — att must include tool_invoke:{tool_name}
+    // or tool_invoke:* for this context.
+    let required_resource = format!("scp:ctx:{context_id}/tool_invoke:{tool_name}");
+    let wildcard_resource = format!("scp:ctx:{context_id}/tool_invoke:*");
+    let mut has_capability = false;
+
+    if let Some(att) = payload.get("att").and_then(serde_json::Value::as_array) {
+        for attenuation in att {
+            let with_str = attenuation
+                .get("with")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+
+            if with_str == required_resource || with_str == wildcard_resource {
+                has_capability = true;
+                break;
+            }
+
+            // Check for wildcard action: scp:ctx:{context_id}/tool_invoke:*
+            // via the `can` field being "*".
+            let can_str = attenuation
+                .get("can")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+
+            let expected_prefix = format!("scp:ctx:{context_id}/tool_invoke:");
+            if with_str.starts_with(&expected_prefix) && can_str == "*" {
+                has_capability = true;
+                break;
+            }
+        }
+    }
+
+    if !has_capability {
+        return Err(ScpWasmError::Permission {
+            message: format!(
+                "UCAN token does not grant tool_invoke:{tool_name} capability for context '{context_id}'"
+            ),
+            code: "SCP-PERM-3001".to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Computes a SHA-256 CID from a full JWT token string.
+///
+/// Matches the revocation CID format used by scp-core's
+/// `compute_revocation_cid`. Used for revocation lookups.
+fn compute_token_cid(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    let hash = hasher.finalize();
+    encode_hex(&hash)
+}

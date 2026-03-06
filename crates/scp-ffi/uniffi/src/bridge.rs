@@ -1832,6 +1832,7 @@ pub async fn tool_invoke(
     tool_id: String,
     input_json: String,
     identity: Arc<Identity>,
+    ucan_token: String,
 ) -> Result<String, ScpError> {
     runtime()
         .spawn(async move {
@@ -1847,6 +1848,48 @@ pub async fn tool_invoke(
                 });
             }
             drop(state);
+
+            // Primary authorization: UCAN token validation via the full
+            // 11-step ADR-016 pipeline. Verifies the token grants
+            // tool_invoke:{tool_id} or tool_invoke:* for this context.
+            // See spec §6.2, §8, ADR-016, and issue #319.
+            let context_id = handle.context_id.clone();
+            let identity_did = identity.did.clone();
+            crate::runtime::with_context(&context_id, |rt| {
+                let did_resolver = scp_ffi_common::BridgeDidResolver;
+                let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
+                    revocation_list: &rt.revocation_list,
+                };
+                let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
+                    inner: &mut rt.nonce_tracker,
+                };
+                let proof_resolver = scp_ffi_common::BridgeProofResolver {
+                    proofs: std::collections::HashMap::new(),
+                };
+
+                let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
+                    did_resolver: &did_resolver,
+                    nonce_tracker: &mut nonce_adapter,
+                    revocation_checker: &revocation_checker,
+                    proof_resolver: &proof_resolver,
+                    ceiling: &rt.ceiling_strings,
+                    context_creator_did: &rt.creator_did,
+                    presenting_agent_did: &identity_did,
+                    clock_skew_tolerance_secs:
+                        scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                };
+
+                scp_core::context::tools::validate_tool_invocation_ucan(
+                    &ucan_token,
+                    &context_id,
+                    &tool_id,
+                    &mut ctx,
+                )
+                .map_err(|e| ScpError::Permission {
+                    message: format!("UCAN authorization failed for tool '{tool_id}': {e}"),
+                    code: "SCP-PERM-3001".to_owned(),
+                })
+            })?;
 
             let _ = (tool_id, input_json, identity);
             Ok("{}".to_owned())

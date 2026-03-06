@@ -99,12 +99,19 @@ pub async fn tool_register(
 
 /// Invokes a tool within an SCP context.
 ///
+/// Validates the UCAN token for tool invocation authorization before
+/// dispatching. The UCAN must contain a `tool_invoke:{tool_id}` or
+/// `tool_invoke:*` capability scoped to the context.
+///
 /// # Arguments
 ///
 /// * `handle` — The context containing the tool (must be `"active"`).
 /// * `tool_id` — The ID of the tool to invoke.
 /// * `input_json` — Tool input parameters as a JSON string.
 /// * `identity_did` — The DID of the invoker (used for capability checking).
+/// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
+///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability.
+///   Validated using the full 11-step ADR-016 pipeline.
 ///
 /// # Returns
 ///
@@ -113,8 +120,12 @@ pub async fn tool_register(
 /// # Errors
 ///
 /// - Rejects with `SCP-TOOL-6005` if the context is not `"active"`.
+/// - Rejects with `SCP-PERM-3001` if the UCAN token is invalid, expired,
+///   revoked, or lacks the required tool invocation capability.
 /// - Rejects with `SCP-TOOL-6002` if invocation fails (tool not found,
-///   input fails schema validation, invoker lacks capability).
+///   input fails schema validation, invoker lacks role-based capability).
+///
+/// See spec §6.2, §8, ADR-016, and issue #319 for UCAN enforcement.
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
@@ -123,6 +134,7 @@ pub async fn tool_invoke(
     tool_id: String,
     input_json: String,
     identity_did: String,
+    ucan_token: String,
 ) -> napi::Result<String> {
     let state_str = handle.state()?;
     if state_str != "active" {
@@ -134,6 +146,49 @@ pub async fn tool_invoke(
         }
         .into());
     }
+
+    // Primary authorization: UCAN token validation via the full 11-step
+    // ADR-016 pipeline. Verifies the token grants tool_invoke:{tool_id}
+    // or tool_invoke:* for this context.
+    // See spec §6.2, §8, ADR-016, and issue #319.
+    let context_id = handle.context_id();
+    crate::runtime::ensure_registered(handle)?;
+    crate::runtime::with_context(&context_id, |rt| {
+        let did_resolver = scp_ffi_common::BridgeDidResolver;
+        let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
+            revocation_list: &rt.revocation_list,
+        };
+        let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
+            inner: &mut rt.nonce_tracker,
+        };
+        let proof_resolver = scp_ffi_common::BridgeProofResolver {
+            proofs: std::collections::HashMap::new(),
+        };
+
+        let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
+            did_resolver: &did_resolver,
+            nonce_tracker: &mut nonce_adapter,
+            revocation_checker: &revocation_checker,
+            proof_resolver: &proof_resolver,
+            ceiling: &rt.ceiling_strings,
+            context_creator_did: &rt.creator_did,
+            presenting_agent_did: &identity_did,
+            clock_skew_tolerance_secs:
+                scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        scp_core::context::tools::validate_tool_invocation_ucan(
+            &ucan_token,
+            &context_id,
+            &tool_id,
+            &mut ctx,
+        )
+        .map_err(|e| ScpNapiError::Permission {
+            message: format!("UCAN authorization failed for tool '{tool_id}': {e}"),
+            code: "SCP-PERM-3001".to_owned(),
+        })
+    })
+    .map_err(napi::Error::from)?;
 
     let _ = (tool_id, input_json, identity_did);
     Ok("{}".to_owned())

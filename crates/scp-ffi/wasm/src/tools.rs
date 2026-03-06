@@ -139,6 +139,10 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
 
 /// Invokes a registered tool within an SCP context.
 ///
+/// Validates the UCAN token for tool invocation authorization before
+/// dispatching. The UCAN must contain a `tool_invoke:{tool_id}` or
+/// `tool_invoke:*` capability scoped to the context.
+///
 /// # Arguments
 ///
 /// * `context` — The context handle containing the tool.
@@ -147,6 +151,8 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
 ///   input schema.
 /// * `identity_did` — The DID of the invoking identity (for capability
 ///   checking).
+/// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
+///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability.
 ///
 /// # Returns
 ///
@@ -155,16 +161,20 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
 /// # Errors
 ///
 /// - Rejects with `[SCP-VALID-7000]` if `input_json` is malformed.
+/// - Rejects with `[SCP-PERM-3001]` if the UCAN token is invalid, expired,
+///   revoked, or lacks the required tool invocation capability.
 /// - Rejects with `[SCP-TOOL-6002]` if invocation fails (tool not found,
 ///   insufficient capability, schema mismatch, execution timeout).
 ///
 /// See ADR-022 acceptance criterion 1.
+/// See spec §6.2, §8, ADR-016, and issue #319 for UCAN enforcement.
 #[wasm_bindgen]
 pub fn tool_invoke(
     context: &WasmContextHandle,
     tool_id: String,
     input_json: String,
     identity_did: String,
+    ucan_token: String,
 ) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
@@ -173,6 +183,38 @@ pub fn tool_invoke(
             ScpWasmError::Validation {
                 message: format!("input_json is not valid JSON: {e}"),
                 code: "SCP-VALID-7000".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        // Validate that ucan_token is non-empty (basic check; full validation
+        // requires runtime wiring which is deferred to SCP-218).
+        if ucan_token.is_empty() {
+            return Err(ScpWasmError::Permission {
+                message: "UCAN token required for tool invocation — empty token provided"
+                    .to_owned(),
+                code: "SCP-PERM-3001".to_owned(),
+            }
+            .into_js()
+            .into());
+        }
+
+        // WASM bridge validates UCAN structure (JWT format) as defense-in-depth.
+        // Full 11-step validation requires WebCrypto key custody wiring (SCP-218).
+        // See CLAUDE.md §UCAN Validation — Known Gaps.
+        crate::runtime::with_context(&context_id, |rt| {
+            crate::runtime::validate_tool_ucan_wasm(
+                &ucan_token,
+                &context_id,
+                &tool_id,
+                &identity_did,
+                rt,
+            )
+        })
+        .map_err(|e| {
+            ScpWasmError::Permission {
+                message: format!("UCAN authorization failed for tool '{tool_id}': {e}"),
+                code: "SCP-PERM-3001".to_owned(),
             }
             .into_js()
         })?;

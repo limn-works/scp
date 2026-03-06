@@ -235,6 +235,10 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
 
 /// Invokes a tool within an SCP context.
 ///
+/// Validates the UCAN token for tool invocation authorization before
+/// dispatching. The UCAN must contain a `tool_invoke:{tool_id}` or
+/// `tool_invoke:*` capability scoped to the context.
+///
 /// Dispatches to a registered tool handler if one exists (registered via
 /// [`crate::runtime::register_tool_handler`]). Validates input against the
 /// tool's input schema before dispatch, and output against the output
@@ -255,6 +259,9 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
 ///   input schema.
 /// * `identity_did` — The DID of the invoking identity (used for
 ///   capability checking).
+/// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
+///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability.
+///   Validated using the full 11-step ADR-016 pipeline.
 ///
 /// # Returns
 ///
@@ -262,12 +269,15 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
 ///
 /// # Errors
 ///
+/// Raises `UcanError` if the UCAN token is invalid, expired, revoked,
+/// or lacks the required tool invocation capability.
 /// Raises `ContextError` if the context is not connected, the tool is
-/// not found, the invoker lacks capability, input validation fails,
-/// output validation fails, or the tool handler itself fails.
+/// not found, input validation fails, output validation fails, or the
+/// tool handler itself fails.
 ///
 /// See ADR-013 §4: `py_tool_invoke(handle, tool_id, input, identity) -> PyObject`.
 /// See SCP-212 for the handler registration and dispatch design.
+/// See spec §6.2, §8, ADR-016, and issue #319 for UCAN enforcement.
 #[pyfunction]
 #[pyo3(name = "tool_invoke")]
 pub fn py_tool_invoke(
@@ -276,12 +286,52 @@ pub fn py_tool_invoke(
     tool_id: &str,
     input: &Bound<'_, PyDict>,
     identity_did: &str,
+    ucan_token: &str,
 ) -> PyResult<PyObject> {
     validate::validate_context_id(context_id)?;
     validate::validate_tool_id(tool_id)?;
     validate::validate_did(identity_did)?;
+    validate::validate_ucan_token(ucan_token)?;
     let input_json = py_dict_to_json(input)?;
     let start = std::time::Instant::now();
+
+    // Primary authorization: UCAN token validation via the full 11-step
+    // ADR-016 pipeline. Verifies the token grants tool_invoke:{tool_id}
+    // or tool_invoke:* for this context.
+    // See spec §6.2, §8, ADR-016, and issue #319.
+    crate::runtime::with_context(context_id, |rt| {
+        let did_resolver = crate::bridge_adapters::BridgeDidResolver;
+        let revocation_checker = crate::bridge_adapters::BridgeRevocationChecker {
+            revocation_list: &rt.revocation_list,
+        };
+        let mut nonce_adapter = crate::bridge_adapters::BridgeNonceTracker {
+            inner: &mut rt.nonce_tracker,
+        };
+        let proof_resolver = crate::bridge_adapters::BridgeProofResolver {
+            proofs: std::collections::HashMap::new(),
+        };
+
+        let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
+            did_resolver: &did_resolver,
+            nonce_tracker: &mut nonce_adapter,
+            revocation_checker: &revocation_checker,
+            proof_resolver: &proof_resolver,
+            ceiling: &rt.ceiling_strings,
+            context_creator_did: &rt.creator_did,
+            presenting_agent_did: identity_did,
+            clock_skew_tolerance_secs:
+                scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        scp_core::context::tools::validate_tool_invocation_ucan(
+            ucan_token, context_id, tool_id, &mut ctx,
+        )
+        .map_err(|e| {
+            ScpPyError::UcanError(format!(
+                "UCAN authorization failed for tool '{tool_id}': {e}"
+            ))
+        })
+    })?;
 
     // Validates tool existence, input schema, capability, dispatches to handler,
     // validates output schema, and builds a ToolInvokedEvent for provenance.
@@ -300,7 +350,8 @@ pub fn py_tool_invoke(
         )
         .map_err(|e| ScpPyError::ValidationError(format!("input validation failed: {e}")))?;
 
-        // Check that the invoker has the ToolInvoke capability.
+        // Defense-in-depth: check role-state capabilities in addition to the
+        // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
         if !scp_core::context::tools::has_tool_invoke_capability(
             &rt.role_state,
             identity_did,
