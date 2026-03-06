@@ -324,8 +324,8 @@ mod tests {
 
         let mut engine = MajorityVoteEngine::new(
             eligible_voters,
-            300, // voting_window_secs: 5 minutes
-            0.5, // min_participation: 50%
+            300,  // voting_window_secs: 5 minutes
+            5000, // min_participation_bps: 50%
         )
         .unwrap();
 
