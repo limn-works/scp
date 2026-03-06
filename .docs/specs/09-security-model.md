@@ -226,6 +226,8 @@ All signed structures in the protocol use a single canonical hash construction. 
 - **Fixed-length bytes** (`[u8; 32]`, `[u8; 64]`): raw bytes, no length prefix. The length is known from the schema.
 - **u64 integers:** 8 bytes, big-endian (network byte order).
 - **u32 integers:** 4 bytes, big-endian.
+- **u16 integers:** 2 bytes, big-endian.
+- **Fixed-length bytes of other sizes** (`[u8; 16]`): raw bytes, no length prefix.
 - **Optional fields:** if present, encoded as above. If absent, encoded as `SHA-256(0x00)` (32-byte sentinel). The sentinel is distinguishable from any real hash because `SHA-256(0x00)` is not a valid hash of structured data with a domain separator.
 
 **Field ordering** is defined per struct and is part of the protocol specification. Changing the field order changes the hash. Fields are listed in the order specified below for each struct.
@@ -242,13 +244,15 @@ All signed structures in the protocol use a single canonical hash construction. 
 |-------|-------|----------|
 | 1 | `context_id` | 4-byte BE length + UTF-8 bytes |
 | 2 | `sender_did` | 4-byte BE length + UTF-8 bytes |
-| 3 | `signing_key_id` | 4-byte BE length + UTF-8 bytes |
-| 4 | `epoch` | 8-byte BE u64 |
-| 5 | `generation_number` | 8-byte BE u64 |
-| 6 | `sequence_number` | 8-byte BE u64 |
-| 7 | `timestamp` | 8-byte BE u64 |
-| 8 | `payload_hash` | 32 bytes (SHA-256 of original plaintext before padding) |
-| 9 | `provenance_hash` | 32 bytes (SHA-256 of serialized provenance, or `SHA-256(0x00)` if absent) |
+| 3 | `epoch` | 8-byte BE u64 |
+| 4 | `generation_number` | 8-byte BE u64 |
+| 5 | `sequence_number` | 8-byte BE u64 |
+| 6 | `timestamp` | 8-byte BE u64 |
+| 7 | `payload_hash` | 4-byte BE length + 32 bytes |
+| 8 | `provenance_hash` | 4-byte BE length + 32 bytes (or `SHA-256(0x00)` sentinel if absent) |
+| 9 | `signing_key_id` | 4-byte BE length + UTF-8 bytes |
+
+Note: `signing_key_id` is last (position 9) to match the existing implementation. It binds the signature to the specific verification method (`#active` or `#agent`, ADR-039), preventing key confusion attacks.
 
 The outer envelope is unsigned — it contains only the routing pseudonym, recipient hint, blob TTL, and encrypted blob (§9.10.2). The full signature lives inside the encrypted payload, signed by `#active` (Active Signing Key) or `#agent` (Agent Signing Key) from the sender's DID document (ADR-039). The domain separator prevents cross-protocol hash confusion. Field-swapping attacks (e.g., moving a payload from one context to another) produce invalid signatures. Relay operators cannot verify signatures (they cannot see sender DIDs) — verification is the responsibility of context members who can decrypt the payload.
 
@@ -265,25 +269,32 @@ The outer envelope is unsigned — it contains only the routing pseudonym, recip
 | 7 | `content_hash` | 32 bytes (SHA-256 of original plaintext) |
 | 8 | `provenance_hash` | 32 bytes (SHA-256 of serialized provenance, or `SHA-256(0x00)` if absent) |
 
+Note: the current implementation uses AEAD authentication only; the full signed structure above is the target format. The `BroadcastEnvelope` struct will be expanded to include all fields per #352.
+
 The signature is verified by subscribers against the author's Active Signing Key or Agent Signing Key (resolved from the author's DID document, ADR-039).
 
-**SenderKeyEpochAdvance** — domain: `"SCP-SENDER-KEY-EPOCH-V1:"`
+**SenderKeyEpochAdvance** — domain: `"SCP-EPOCH-ADVANCE-V1:"`
 
 | Order | Field | Encoding |
 |-------|-------|----------|
 | 1 | `context_id` | 4-byte BE length + UTF-8 bytes |
 | 2 | `sender_did` | 4-byte BE length + UTF-8 bytes |
-| 3 | `epoch` | 8-byte BE u64 |
+| 3 | `"key_epoch"` | literal ASCII bytes (domain separation within the hash) |
+| 4 | `epoch` | 8-byte BE u64 |
+| 5 | `signer_key_ref` | 4-byte BE length + UTF-8 bytes (`#active` or `#agent`, prevents key confusion) |
 
-**SenderKeyRequest** — domain: `"SCP-SENDER-KEY-REQUEST-V1:"`
+**SenderKeyRequest** — domain: `"SCP-KEY-REQUEST-V1:"`
 
 | Order | Field | Encoding |
 |-------|-------|----------|
-| 1 | `context_id` | 4-byte BE length + UTF-8 bytes |
-| 2 | `requester_did` | 4-byte BE length + UTF-8 bytes |
-| 3 | `sender_did` | 4-byte BE length + UTF-8 bytes |
-| 4 | `epoch` | 8-byte BE u64 |
-| 5 | `wrapping_pubkey` | 32 bytes (X25519 public key) |
+| 1 | `requester_did` | 4-byte BE length + UTF-8 bytes |
+| 2 | `sender_did` | 4-byte BE length + UTF-8 bytes |
+| 3 | `epoch` | 8-byte BE u64 |
+| 4 | `wrapping_pubkey` | 4-byte BE length + raw bytes |
+| 5 | `nonce` | 16 bytes (fixed-size CSPRNG, prevents replay) |
+| 6 | `timestamp` | 8-byte BE u64 |
+
+Note: `context_id` is not in the current signed hash (the request struct does not carry it). Adding it is tracked by #346.
 
 **Attestation** — domain: `"SCP-ATTESTATION-V1:"`
 
@@ -293,10 +304,12 @@ The signature is verified by subscribers against the author's Active Signing Key
 | 2 | `attestation_type` | 2-byte BE u16 (attestation type tag per `attestation_type_tag()`) |
 | 3 | `issuer` | 4-byte BE length + UTF-8 bytes (DID) |
 | 4 | `subject` | 4-byte BE length + UTF-8 bytes (DID) |
-| 5 | `claim` | 4-byte BE length + raw bytes (serialized claim) |
+| 5 | `claim` | 4-byte BE length + UTF-8 bytes (compact JSON — see note) |
 | 6 | `evidence` | 4-byte BE length + raw bytes if present, or `SHA-256(0x00)` sentinel if absent |
 | 7 | `issued_at` | 8-byte BE u64 |
-| 8 | `expires` | 8-byte BE u64 |
+| 8 | `expires_at` | 8-byte BE u64 (0 if no expiry) |
+
+Note: the `claim` field uses compact JSON with no whitespace (equivalent to Python `json.dumps(separators=(',', ':'))`). JSON key ordering within claim objects is NOT guaranteed deterministic across implementations — claims with nested objects should use only flat key-value structures or pre-serialized byte strings. The `evidence` field, when present, is serialized as MessagePack bytes of the `AttestationEvidence` struct.
 
 **ParticipationProfile** — domain: `"SCP-PARTICIPATION-PROFILE-V1:"`
 

@@ -205,4 +205,108 @@ mod tests {
 
         assert_eq!(hash, expected);
     }
+
+    #[test]
+    fn golden_vector_inner_envelope() {
+        // Golden test vector: a minimal InnerEnvelope canonical hash.
+        // This vector can be reproduced independently in any language.
+        //
+        // Domain: "SCP-INNER-ENVELOPE-V1:"
+        // Fields (in order per §9.5.2):
+        //   1. context_id = "ctx-1" (VarBytes)
+        //   2. sender_did = "did:example:alice" (VarBytes)
+        //   3. epoch = 1 (U64)
+        //   4. generation = 0 (U64)
+        //   5. sequence = 42 (U64)
+        //   6. timestamp = 1709654400 (U64)
+        //   7. payload_hash = SHA-256("hello") with 4-byte length prefix (VarBytes)
+        //   8. provenance_hash = absent sentinel (Absent)
+        //   9. signing_key_id = "#active" (VarBytes)
+        let payload_hash: [u8; 32] = Sha256::digest(b"hello").into();
+
+        let hash = canonical_hash(
+            "SCP-INNER-ENVELOPE-V1:",
+            &[
+                CanonicalField::VarBytes(b"ctx-1"),
+                CanonicalField::VarBytes(b"did:example:alice"),
+                CanonicalField::U64(1),
+                CanonicalField::U64(0),
+                CanonicalField::U64(42),
+                CanonicalField::U64(1_709_654_400),
+                CanonicalField::VarBytes(&payload_hash),
+                CanonicalField::Absent,
+                CanonicalField::VarBytes(b"#active"),
+            ],
+        );
+
+        // Expected: SHA-256 of the concatenation above.
+        // Independently verifiable via:
+        //   import hashlib, struct
+        //   def lp(b): return struct.pack('>I', len(b)) + b
+        //   payload_hash = hashlib.sha256(b'hello').digest()
+        //   absent = hashlib.sha256(b'\x00').digest()
+        //   data = (b'SCP-INNER-ENVELOPE-V1:'
+        //     + lp(b'ctx-1') + lp(b'did:example:alice')
+        //     + struct.pack('>Q', 1) + struct.pack('>Q', 0)
+        //     + struct.pack('>Q', 42) + struct.pack('>Q', 1709654400)
+        //     + lp(payload_hash) + absent + lp(b'#active'))
+        //   print(hashlib.sha256(data).hexdigest())
+        assert_eq!(hex::encode(hash), {
+            // Compute expected at test time (same construction, different code path)
+            let mut h = Sha256::new();
+            h.update(b"SCP-INNER-ENVELOPE-V1:");
+            h.update(5u32.to_be_bytes()); // len("ctx-1")
+            h.update(b"ctx-1");
+            h.update(17u32.to_be_bytes()); // len("did:example:alice")
+            h.update(b"did:example:alice");
+            h.update(1u64.to_be_bytes());
+            h.update(0u64.to_be_bytes());
+            h.update(42u64.to_be_bytes());
+            h.update(1_709_654_400u64.to_be_bytes());
+            h.update(32u32.to_be_bytes()); // len(payload_hash)
+            h.update(payload_hash);
+            h.update(ABSENT_SENTINEL);
+            h.update(7u32.to_be_bytes()); // len("#active")
+            h.update(b"#active");
+            let expected: [u8; 32] = h.finalize().into();
+            hex::encode(expected)
+        });
+    }
+
+    #[test]
+    fn u16_encoding() {
+        let hash = canonical_hash("TEST:", &[CanonicalField::U16(258)]);
+        let mut hasher = Sha256::new();
+        hasher.update(b"TEST:");
+        hasher.update(258u16.to_be_bytes()); // 0x01, 0x02
+        let expected: [u8; 32] = hasher.finalize().into();
+        assert_eq!(hash, expected);
+    }
+
+    #[test]
+    fn fixed64_no_length_prefix() {
+        let sig = [0xCDu8; 64];
+        let hash = canonical_hash("TEST:", &[CanonicalField::Fixed64(&sig)]);
+        let mut hasher = Sha256::new();
+        hasher.update(b"TEST:");
+        hasher.update([0xCD; 64]);
+        let expected: [u8; 32] = hasher.finalize().into();
+        assert_eq!(hash, expected);
+    }
+
+    #[test]
+    fn multiple_absent_fields() {
+        let hash1 = canonical_hash("TEST:", &[CanonicalField::Absent]);
+        let hash2 = canonical_hash("TEST:", &[CanonicalField::Absent, CanonicalField::Absent]);
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn varbytes_32_differs_from_fixed32() {
+        let data = [0xAB; 32];
+        let hash_var = canonical_hash("TEST:", &[CanonicalField::VarBytes(&data)]);
+        let hash_fixed = canonical_hash("TEST:", &[CanonicalField::Fixed32(&data)]);
+        // VarBytes has a 4-byte length prefix; Fixed32 does not.
+        assert_ne!(hash_var, hash_fixed);
+    }
 }
