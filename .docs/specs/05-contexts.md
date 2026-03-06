@@ -201,6 +201,17 @@ Content access actions go through the context's governance model (propose/vote/e
 
 **Content scoping.** Granular content access control (e.g., admin-only channels, per-topic areas) uses child contexts (§5.13) as the scoping mechanism. Each "scope" is a child context with its own keys, governance, and membership. Parent governance controls children via `ParentGovernanceConfig`. Tier 3 governance actions are per-context — submit the action to whichever context (parent or child) it applies to.
 
+**Collection size limits.** Governance actions that append to unbounded collections MUST enforce protocol-level maximums to prevent resource exhaustion. Each collection is cloned into `ContextSnapshot` on every mutation, so unbounded growth has quadratic cost. The following limits are protocol-level constants:
+
+| Collection | Maximum | Rationale |
+|-----------|---------|-----------|
+| `registered_tools` | 256 per context | Tools are heavyweight registrations; 256 exceeds any practical context |
+| `tool_interfaces` | 256 per context | Cross-context interfaces are bilateral agreements; 256 exceeds any practical context |
+| `threshold_signers` | 64 per context | Signers participate in quorum; >64 is operationally impractical |
+| `write_revoked_members` | No artificial cap | Naturally bounded by membership count — cannot revoke write for non-members |
+
+Implementations MUST return an error (e.g., `LimitExceeded`) when an append would exceed the limit. The error message MUST include the limit value for debuggability.
+
 ## 5.10 Context TTL (Time-to-Live)
 
 Contexts gain an optional time-to-live — a declared lifespan after which the context closes automatically. TTL is set at creation and visible in context metadata (visible before opt-in).
