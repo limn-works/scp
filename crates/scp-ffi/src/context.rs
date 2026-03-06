@@ -744,7 +744,7 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
     {
         let routing_id = crate::runtime::with_identity(identity_did, |entry| {
             let rt = crate::runtime().map_err(|e| {
-                crate::error::ScpPyError::IdentityError(format!("runtime not available: {e}"))
+                crate::error::ScpPyError::identity(format!("runtime not available: {e}"))
             })?;
             let pseudonym = rt.block_on(async {
                 entry
@@ -754,14 +754,14 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
             });
             let pk = pseudonym
                 .map_err(|e| {
-                    crate::error::ScpPyError::IdentityError(format!(
+                    crate::error::ScpPyError::identity(format!(
                         "pseudonym derivation failed: {e}"
                     ))
                 })?
                 .public_key;
             let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
-                crate::error::ScpPyError::IdentityError(
-                    "pseudonym public key must be 32 bytes".to_owned(),
+                crate::error::ScpPyError::identity(
+                    "pseudonym public key must be 32 bytes",
                 )
             })?;
             Ok(bytes)
@@ -917,7 +917,7 @@ fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
             .role_state
             .member_has_capability(identity_did, &Capability::ContextClose)
         {
-            return Err(crate::error::ScpPyError::ContextError(format!(
+            return Err(crate::error::ScpPyError::context(format!(
                 "identity '{identity_did}' does not have the ContextClose capability \
                  for context '{context_id}' -- only admins or members with the \
                  context:close capability can close a context"
@@ -991,7 +991,7 @@ fn py_context_send(
     let rt = crate::runtime()?;
     crate::runtime::with_identity(&identity_did_owned, |entry| {
         let now_ms = scp_core::time::now_millis()
-            .map_err(|e| crate::error::ScpPyError::ContextError(format!("{e}")))?;
+            .map_err(|e| crate::error::ScpPyError::context(format!("{e}")))?;
 
         let inner_result = rt.block_on(async {
             let params = scp_core::envelope::InnerEnvelopeParams {
@@ -1015,7 +1015,7 @@ fn py_context_send(
         });
 
         inner_result.map_err(|e| {
-            crate::error::ScpPyError::ContextError(format!("inner envelope creation failed: {e}"))
+            crate::error::ScpPyError::context(format!("inner envelope creation failed: {e}"))
         })?;
 
         Ok(())

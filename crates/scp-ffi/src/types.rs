@@ -96,7 +96,7 @@ pub fn py_dict_to_json(dict: &Bound<'_, PyDict>) -> Result<Value, ScpPyError> {
 /// Depth-tracked implementation of [`py_dict_to_json`].
 fn py_dict_to_json_depth(dict: &Bound<'_, PyDict>, depth: usize) -> Result<Value, ScpPyError> {
     if depth >= MAX_NESTING_DEPTH {
-        return Err(ScpPyError::ValidationError(format!(
+        return Err(ScpPyError::validation(format!(
             "maximum nesting depth ({MAX_NESTING_DEPTH}) exceeded in Python-to-JSON conversion"
         )));
     }
@@ -107,7 +107,7 @@ fn py_dict_to_json_depth(dict: &Bound<'_, PyDict>, depth: usize) -> Result<Value
                 .get_type()
                 .name()
                 .map_or_else(|_| "<unknown>".to_owned(), |n| n.to_string());
-            ScpPyError::ValidationError(format!("dict key must be a string, got {type_name}: {e}",))
+            ScpPyError::validation(format!("dict key must be a string, got {type_name}: {e}",))
         })?;
         let json_value = py_any_to_json(&value, depth + 1)?;
         map.insert(key_str, json_value);
@@ -126,7 +126,7 @@ fn py_any_to_json(obj: &Bound<'_, PyAny>, depth: usize) -> Result<Value, ScpPyEr
     if obj.is_instance_of::<PyBool>() {
         let b: bool = obj
             .extract()
-            .map_err(|e| ScpPyError::ValidationError(format!("failed to extract bool: {e}")))?;
+            .map_err(|e| ScpPyError::validation(format!("failed to extract bool: {e}")))?;
         return Ok(Value::Bool(b));
     }
 
@@ -137,18 +137,18 @@ fn py_any_to_json(obj: &Bound<'_, PyAny>, depth: usize) -> Result<Value, ScpPyEr
     if obj.is_instance_of::<PyString>() {
         let s: String = obj
             .extract()
-            .map_err(|e| ScpPyError::ValidationError(format!("failed to extract string: {e}")))?;
+            .map_err(|e| ScpPyError::validation(format!("failed to extract string: {e}")))?;
         return Ok(Value::String(s));
     }
 
     if obj.is_instance_of::<PyFloat>() {
         let f: f64 = obj
             .extract()
-            .map_err(|e| ScpPyError::ValidationError(format!("failed to extract float: {e}")))?;
+            .map_err(|e| ScpPyError::validation(format!("failed to extract float: {e}")))?;
         return serde_json::Number::from_f64(f)
             .map(Value::Number)
             .ok_or_else(|| {
-                ScpPyError::ValidationError(format!(
+                ScpPyError::validation(format!(
                     "float value {f} is not representable in JSON (NaN or Infinity)"
                 ))
             });
@@ -163,19 +163,19 @@ fn py_any_to_json(obj: &Bound<'_, PyAny>, depth: usize) -> Result<Value, ScpPyEr
     if obj.is_instance_of::<PyDict>() {
         let dict = obj
             .downcast::<PyDict>()
-            .map_err(|e| ScpPyError::ValidationError(format!("failed to downcast to dict: {e}")))?;
+            .map_err(|e| ScpPyError::validation(format!("failed to downcast to dict: {e}")))?;
         return py_dict_to_json_depth(dict, depth);
     }
 
     if obj.is_instance_of::<PyList>() {
         if depth >= MAX_NESTING_DEPTH {
-            return Err(ScpPyError::ValidationError(format!(
+            return Err(ScpPyError::validation(format!(
                 "maximum nesting depth ({MAX_NESTING_DEPTH}) exceeded in Python-to-JSON conversion"
             )));
         }
         let list = obj
             .downcast::<PyList>()
-            .map_err(|e| ScpPyError::ValidationError(format!("failed to downcast to list: {e}")))?;
+            .map_err(|e| ScpPyError::validation(format!("failed to downcast to list: {e}")))?;
         let mut arr = Vec::with_capacity(list.len());
         for item in list.iter() {
             arr.push(py_any_to_json(&item, depth + 1)?);
@@ -187,7 +187,7 @@ fn py_any_to_json(obj: &Bound<'_, PyAny>, depth: usize) -> Result<Value, ScpPyEr
         .get_type()
         .name()
         .map_or_else(|_| "<unknown>".to_owned(), |n| n.to_string());
-    Err(ScpPyError::ValidationError(format!(
+    Err(ScpPyError::validation(format!(
         "unsupported Python type for JSON conversion: {type_name} — \
          only str, int, float, bool, None, list, and dict are supported",
     )))

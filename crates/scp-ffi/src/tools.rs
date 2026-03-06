@@ -157,15 +157,15 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
     // Extract registration fields from the Python dict.
     let name: String = registration
         .get_item("name")?
-        .ok_or_else(|| ScpPyError::ValidationError("missing 'name' field".to_owned()))?
+        .ok_or_else(|| ScpPyError::validation("missing 'name' field".to_owned()))?
         .extract()?;
     let description: String = registration
         .get_item("description")?
-        .ok_or_else(|| ScpPyError::ValidationError("missing 'description' field".to_owned()))?
+        .ok_or_else(|| ScpPyError::validation("missing 'description' field".to_owned()))?
         .extract()?;
     let operator_did: String = registration
         .get_item("operator_did")?
-        .ok_or_else(|| ScpPyError::ValidationError("missing 'operator_did' field".to_owned()))?
+        .ok_or_else(|| ScpPyError::validation("missing 'operator_did' field".to_owned()))?
         .extract()?;
 
     // Validate extracted string fields at the bridge boundary.
@@ -176,10 +176,10 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
     // `output_schema` keys, each being a JSON Schema object.
     let schema_obj = registration
         .get_item("schema")?
-        .ok_or_else(|| ScpPyError::ValidationError("missing 'schema' field".to_owned()))?;
+        .ok_or_else(|| ScpPyError::validation("missing 'schema' field".to_owned()))?;
     let schema_dict = schema_obj
         .downcast::<PyDict>()
-        .map_err(|_| ScpPyError::ValidationError("'schema' must be a dict".to_owned()))?;
+        .map_err(|_| ScpPyError::validation("'schema' must be a dict".to_owned()))?;
     let schema_json = py_dict_to_json(schema_dict)?;
     let input_schema = schema_json
         .get("input_schema")
@@ -226,7 +226,7 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
             core_registration,
             &rt.creator_did.clone(),
         )
-        .map_err(|e| ScpPyError::ContextError(format!("tool registration failed: {e}")))?;
+        .map_err(|e| ScpPyError::context(format!("tool registration failed: {e}")))?;
         Ok(registered_id)
     })?;
 
@@ -274,7 +274,7 @@ fn validate_tool_ucan(
             ucan_token, context_id, tool_id, &mut ctx,
         )
         .map_err(|e| {
-            ScpPyError::UcanError(format!(
+            ScpPyError::ucan(format!(
                 "UCAN authorization failed for tool '{tool_id}': {e}"
             ))
         })
@@ -361,7 +361,7 @@ pub fn py_tool_invoke(
     // Mirrors the dispatch logic in FfiBridgeProvider::invoke_tool (mcp.rs).
     let output_json = crate::runtime::with_context(context_id, |rt| {
         let registration = rt.tool_registry.get(tool_id).ok_or_else(|| {
-            ScpPyError::ContextError(format!(
+            ScpPyError::context(format!(
                 "tool '{tool_id}' not found in context '{context_id}'"
             ))
         })?;
@@ -371,7 +371,7 @@ pub fn py_tool_invoke(
             &input_json,
             &registration.schema.input_schema,
         )
-        .map_err(|e| ScpPyError::ValidationError(format!("input validation failed: {e}")))?;
+        .map_err(|e| ScpPyError::validation(format!("input validation failed: {e}")))?;
 
         // Defense-in-depth: check role-state capabilities in addition to the
         // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
@@ -380,7 +380,7 @@ pub fn py_tool_invoke(
             identity_did,
             tool_id,
         ) {
-            return Err(ScpPyError::UcanError(format!(
+            return Err(ScpPyError::ucan(format!(
                 "invoker '{identity_did}' does not have ToolInvoke capability for '{tool_id}'"
             )));
         }
@@ -389,7 +389,7 @@ pub fn py_tool_invoke(
         let output = if let Some(handler) = rt.tool_handlers.get(tool_id) {
             let handler = handler.clone();
             let out = handler(input_json.clone()).map_err(|e| {
-                ScpPyError::ContextError(format!("tool handler for '{tool_id}' failed: {e}"))
+                ScpPyError::context(format!("tool handler for '{tool_id}' failed: {e}"))
             })?;
 
             // Validate output against the tool's output schema (defense-in-depth).
@@ -398,7 +398,7 @@ pub fn py_tool_invoke(
                 &registration.schema.output_schema,
             )
             .map_err(|msg| {
-                ScpPyError::ValidationError(format!(
+                ScpPyError::validation(format!(
                     "output validation failed for tool '{tool_id}': {msg}"
                 ))
             })?;
@@ -490,7 +490,7 @@ pub fn py_tool_verify(context_id: &str, tool_id: &str) -> PyResult<PyToolVerific
                 serde_json::Value::Null
             },
         )
-        .map_err(|e| ScpPyError::ContextError(format!("tool verification failed: {e}")))?;
+        .map_err(|e| ScpPyError::context(format!("tool verification failed: {e}")))?;
 
         Ok(verification_result)
     })?;
@@ -526,11 +526,11 @@ fn extract_implementation_hash(registration: &Bound<'_, PyDict>) -> PyResult<[u8
     };
 
     let hex_str: String = hash_obj.extract().map_err(|_| {
-        ScpPyError::ValidationError("'implementation_hash' must be a hex string".to_owned())
+        ScpPyError::validation("'implementation_hash' must be a hex string".to_owned())
     })?;
 
     if hex_str.len() != 64 {
-        return Err(ScpPyError::ValidationError(format!(
+        return Err(ScpPyError::validation(format!(
             "'implementation_hash' must be 64 hex chars (SHA-256), got {}",
             hex_str.len()
         ))
@@ -540,10 +540,10 @@ fn extract_implementation_hash(registration: &Bound<'_, PyDict>) -> PyResult<[u8
     let mut hash = [0u8; 32];
     for (i, chunk) in hex_str.as_bytes().chunks(2).enumerate() {
         let byte_str = std::str::from_utf8(chunk).map_err(|_| {
-            ScpPyError::ValidationError("invalid UTF-8 in implementation_hash".to_owned())
+            ScpPyError::validation("invalid UTF-8 in implementation_hash".to_owned())
         })?;
         hash[i] = u8::from_str_radix(byte_str, 16).map_err(|_| {
-            ScpPyError::ValidationError(format!(
+            ScpPyError::validation(format!(
                 "invalid hex in implementation_hash at position {}",
                 i * 2
             ))
@@ -566,13 +566,13 @@ fn extract_economic_metadata(
     };
 
     let dict = meta_obj.downcast::<PyDict>().map_err(|_| {
-        ScpPyError::ValidationError("'economic_metadata' must be a dict".to_owned())
+        ScpPyError::validation("'economic_metadata' must be a dict".to_owned())
     })?;
 
     let cost_per_invoke: u64 = dict
         .get_item("cost_per_invoke")?
         .ok_or_else(|| {
-            ScpPyError::ValidationError("economic_metadata missing 'cost_per_invoke'".to_owned())
+            ScpPyError::validation("economic_metadata missing 'cost_per_invoke'".to_owned())
         })?
         .extract()?;
 
@@ -584,7 +584,7 @@ fn extract_economic_metadata(
 
     let payee: String = dict
         .get_item("payee")?
-        .ok_or_else(|| ScpPyError::ValidationError("economic_metadata missing 'payee'".to_owned()))?
+        .ok_or_else(|| ScpPyError::validation("economic_metadata missing 'payee'".to_owned()))?
         .extract()?;
 
     Ok(Some(scp_core::context::tools::ToolEconomicMetadata {
@@ -608,12 +608,12 @@ fn extract_test_vectors(
 
     let vectors_list = vectors_obj
         .downcast::<pyo3::types::PyList>()
-        .map_err(|_| ScpPyError::ValidationError("'test_vectors' must be a list".to_owned()))?;
+        .map_err(|_| ScpPyError::validation("'test_vectors' must be a list".to_owned()))?;
 
     let mut result = Vec::with_capacity(vectors_list.len());
     for item in vectors_list.iter() {
         let dict = item.downcast::<PyDict>().map_err(|_| {
-            ScpPyError::ValidationError("each test vector must be a dict".to_owned())
+            ScpPyError::validation("each test vector must be a dict".to_owned())
         })?;
         let tv_json = py_dict_to_json(dict)?;
 

@@ -59,12 +59,12 @@ pub const MAX_TRANSPORT_MODE_LEN: usize = 64;
 /// Validates that a string is non-empty and within the given length limit.
 fn validate_non_empty(value: &str, field_name: &str, max_len: usize) -> Result<(), ScpPyError> {
     if value.is_empty() {
-        return Err(ScpPyError::ValidationError(format!(
+        return Err(ScpPyError::validation(format!(
             "{field_name} must not be empty"
         )));
     }
     if value.len() > max_len {
-        return Err(ScpPyError::ValidationError(format!(
+        return Err(ScpPyError::validation(format!(
             "{field_name} exceeds maximum length ({} > {max_len} bytes)",
             value.len()
         )));
@@ -77,7 +77,7 @@ fn validate_non_empty(value: &str, field_name: &str, max_len: usize) -> Result<(
 /// display confusion, and format string issues.
 fn reject_control_chars(value: &str, field_name: &str) -> Result<(), ScpPyError> {
     if let Some(pos) = value.chars().position(char::is_control) {
-        return Err(ScpPyError::ValidationError(format!(
+        return Err(ScpPyError::validation(format!(
             "{field_name} contains control character at position {pos}"
         )));
     }
@@ -110,7 +110,7 @@ pub fn validate_context_id(context_id: &str) -> Result<(), ScpPyError> {
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
-        return Err(ScpPyError::ValidationError(format!(
+        return Err(ScpPyError::validation(format!(
             "context_id contains invalid characters: expected alphanumeric, \
              hyphens, or underscores, got {context_id:?}"
         )));
@@ -143,7 +143,7 @@ pub fn validate_did(did: &str) -> Result<(), ScpPyError> {
     reject_control_chars(did, "DID")?;
 
     if !did.starts_with("did:") {
-        return Err(ScpPyError::ValidationError(format!(
+        return Err(ScpPyError::validation(format!(
             "DID must start with 'did:', got {did:?}"
         )));
     }
@@ -151,7 +151,7 @@ pub fn validate_did(did: &str) -> Result<(), ScpPyError> {
     // Must have at least `did:method:id` (two colons).
     let rest = &did[4..];
     if !rest.contains(':') {
-        return Err(ScpPyError::ValidationError(format!(
+        return Err(ScpPyError::validation(format!(
             "DID must match 'did:{{method}}:{{id}}' format, got {did:?}"
         )));
     }
@@ -163,7 +163,7 @@ pub fn validate_did(did: &str) -> Result<(), ScpPyError> {
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
     {
-        return Err(ScpPyError::ValidationError(format!(
+        return Err(ScpPyError::validation(format!(
             "DID method must be non-empty lowercase alphanumeric, got {method:?} in {did:?}"
         )));
     }
@@ -194,7 +194,7 @@ pub fn validate_tool_name(name: &str) -> Result<(), ScpPyError> {
     reject_control_chars(name, "tool name")?;
 
     if name.contains('{') || name.contains('}') {
-        return Err(ScpPyError::ValidationError(format!(
+        return Err(ScpPyError::validation(format!(
             "tool name must not contain '{{' or '}}' (format string risk), got {name:?}"
         )));
     }
@@ -267,8 +267,8 @@ pub fn validate_ucan_token(token: &str) -> Result<(), ScpPyError> {
     // JWT tokens should not contain newlines or other control chars
     // (base64url alphabet is [A-Za-z0-9_.-]).
     if token.chars().any(char::is_control) {
-        return Err(ScpPyError::ValidationError(
-            "UCAN token contains control characters".to_owned(),
+        return Err(ScpPyError::validation(
+            "UCAN token contains control characters",
         ));
     }
 
@@ -323,7 +323,7 @@ pub fn validate_relay_url(url: &str) -> Result<(), ScpPyError> {
         || url.starts_with("https://");
 
     if !valid_scheme {
-        return Err(ScpPyError::ValidationError(format!(
+        return Err(ScpPyError::validation(format!(
             "relay URL must start with ws://, wss://, http://, or https://, got {url:?}"
         )));
     }
@@ -348,7 +348,7 @@ pub fn validate_transport_mode(mode: &str) -> Result<(), ScpPyError> {
 
     match mode {
         "stdio" | "sse" => Ok(()),
-        _ => Err(ScpPyError::ValidationError(format!(
+        _ => Err(ScpPyError::validation(format!(
             "transport must be 'stdio' or 'sse', got {mode:?}"
         ))),
     }

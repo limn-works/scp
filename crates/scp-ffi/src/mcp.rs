@@ -692,7 +692,7 @@ impl ContextProvider for FfiBridgeProvider {
                         error = %e,
                         "UCAN validation failed for tool invocation"
                     );
-                    ScpPyError::UcanError(format!(
+                    ScpPyError::ucan(format!(
                         "UCAN authorization failed for tool '{tool_name}': {e}"
                     ))
                 })
@@ -725,8 +725,8 @@ impl ContextProvider for FfiBridgeProvider {
                     context = %context_id,
                     "capability check failed: agent lacks ToolInvoke capability"
                 );
-                Err(ScpPyError::ContextError(
-                    "insufficient permissions to invoke tool".to_owned(),
+                Err(ScpPyError::context(
+                    "insufficient permissions to invoke tool",
                 ))
             }
         })
@@ -797,7 +797,7 @@ impl ContextProvider for FfiBridgeProvider {
         // be consumed by the handler).
         let (dispatch, input_hash) = crate::runtime::with_context(context_id, |rt| {
             let registration = rt.tool_registry.get(tool_name).ok_or_else(|| {
-                ScpPyError::ContextError(format!(
+                ScpPyError::context(format!(
                     "tool '{tool_name}' not found in context '{context_id}'"
                 ))
             })?;
@@ -808,7 +808,7 @@ impl ContextProvider for FfiBridgeProvider {
                 &registration.schema.input_schema,
             )
             .map_err(|msg| {
-                ScpPyError::ValidationError(format!(
+                ScpPyError::validation(format!(
                     "input validation failed for tool '{tool_name}': {msg}"
                 ))
             })?;
@@ -935,7 +935,7 @@ impl ContextProvider for FfiBridgeProvider {
             };
 
             scp_event_log::tree::append_unsigned_event(&mut rt.event_log, &event)
-                .map_err(|e| ScpPyError::ContextError(e.to_string()))?;
+                .map_err(|e| ScpPyError::context(e.to_string()))?;
             Ok(())
         }) {
             tracing::warn!(
@@ -1101,7 +1101,7 @@ pub fn py_mcp_serve(
     // Validate that all context IDs are registered in the runtime.
     for ctx_id in &context_ids {
         crate::runtime::with_context(ctx_id, |_rt| Ok(())).map_err(|e| {
-            ScpPyError::TransportError(format!("cannot serve context '{ctx_id}': {e}"))
+            ScpPyError::transport(format!("cannot serve context '{ctx_id}': {e}"))
         })?;
     }
 
@@ -1275,11 +1275,11 @@ pub fn py_mcp_serve(
 pub fn py_mcp_server_stop(handle: &str) -> PyResult<()> {
     validate::validate_mcp_handle(handle)?;
     let mut entry = server_registry().get_mut(handle).ok_or_else(|| {
-        ScpPyError::TransportError(format!("MCP server handle '{handle}' not found"))
+        ScpPyError::transport(format!("MCP server handle '{handle}' not found"))
     })?;
 
     if entry.stopped {
-        return Err(ScpPyError::TransportError(format!(
+        return Err(ScpPyError::transport(format!(
             "MCP server '{handle}' is already stopped"
         ))
         .into());
@@ -1316,7 +1316,7 @@ pub fn py_mcp_server_wait(py: Python<'_>, handle: &str) -> PyResult<()> {
     // Extract the task handle if available.
     let task_handle = {
         let mut entry = server_registry().get_mut(handle).ok_or_else(|| {
-            ScpPyError::TransportError(format!("MCP server handle '{handle}' not found"))
+            ScpPyError::transport(format!("MCP server handle '{handle}' not found"))
         })?;
 
         if entry.stopped && entry.task_handle.is_none() {
@@ -1357,7 +1357,7 @@ pub fn py_mcp_server_wait(py: Python<'_>, handle: &str) -> PyResult<()> {
 pub fn py_mcp_server_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
     validate::validate_mcp_handle(handle)?;
     let entry = server_registry().get(handle).ok_or_else(|| {
-        ScpPyError::TransportError(format!("MCP server handle '{handle}' not found"))
+        ScpPyError::transport(format!("MCP server handle '{handle}' not found"))
     })?;
 
     let dict = PyDict::new(py);
@@ -1387,7 +1387,7 @@ pub fn py_mcp_server_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
 pub fn py_mcp_client_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
     validate::validate_mcp_handle(handle)?;
     let entry = client_registry().get(handle).ok_or_else(|| {
-        ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
+        ScpPyError::transport(format!("MCP client handle '{handle}' not found"))
     })?;
 
     let dict = PyDict::new(py);
@@ -1427,19 +1427,19 @@ pub fn py_mcp_client_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
 pub fn py_mcp_client_connect_stdio(command: Vec<String>) -> PyResult<String> {
     if command.is_empty() {
         return Err(
-            ScpPyError::ValidationError("command must be a non-empty list".to_owned()).into(),
+            ScpPyError::validation("command must be a non-empty list".to_owned()).into(),
         );
     }
 
     // Spawn the subprocess and create the transport.
     let transport = StdioClientTransport::spawn(&command)
-        .map_err(|e| ScpPyError::TransportError(format!("failed to connect stdio client: {e}")))?;
+        .map_err(|e| ScpPyError::transport(format!("failed to connect stdio client: {e}")))?;
 
     // Create the MCP client and perform the initialize handshake.
     let mut client = McpClient::new(ClientTransport::Stdio(transport));
     client
         .initialize()
-        .map_err(|e| ScpPyError::TransportError(format!("MCP initialize handshake failed: {e}")))?;
+        .map_err(|e| ScpPyError::transport(format!("MCP initialize handshake failed: {e}")))?;
 
     let handle = generate_handle_id("mcp-client");
     let state = McpClientState {
@@ -1479,13 +1479,13 @@ pub fn py_mcp_client_connect_sse(url: &str) -> PyResult<String> {
 
     // Connect to the SSE endpoint.
     let transport = SseClientTransport::connect(url)
-        .map_err(|e| ScpPyError::TransportError(format!("failed to connect SSE client: {e}")))?;
+        .map_err(|e| ScpPyError::transport(format!("failed to connect SSE client: {e}")))?;
 
     // Create the MCP client and perform the initialize handshake.
     let mut client = McpClient::new(ClientTransport::Sse(transport));
     client
         .initialize()
-        .map_err(|e| ScpPyError::TransportError(format!("MCP initialize handshake failed: {e}")))?;
+        .map_err(|e| ScpPyError::transport(format!("MCP initialize handshake failed: {e}")))?;
 
     let handle = generate_handle_id("mcp-client");
     let state = McpClientState {
@@ -1520,7 +1520,7 @@ pub fn py_mcp_client_connect_sse(url: &str) -> PyResult<String> {
 pub fn py_mcp_client_disconnect(handle: &str) -> PyResult<()> {
     validate::validate_mcp_handle(handle)?;
     let (_, state) = client_registry().remove(handle).ok_or_else(|| {
-        ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
+        ScpPyError::transport(format!("MCP client handle '{handle}' not found"))
     })?;
 
     // Dropping `state` drops the Arc<Mutex<McpClient>>, which drops the
@@ -1555,7 +1555,7 @@ pub fn py_mcp_client_disconnect(handle: &str) -> PyResult<()> {
 pub fn py_mcp_client_list_tools(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
     validate::validate_mcp_handle(handle)?;
     let entry = client_registry().get(handle).ok_or_else(|| {
-        ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
+        ScpPyError::transport(format!("MCP client handle '{handle}' not found"))
     })?;
 
     // Send the real tools/list request via the MCP client.
@@ -1565,10 +1565,10 @@ pub fn py_mcp_client_list_tools(py: Python<'_>, handle: &str) -> PyResult<PyObje
     let tools = {
         let client_guard = client
             .lock()
-            .map_err(|e| ScpPyError::TransportError(format!("client lock poisoned: {e}")))?;
+            .map_err(|e| ScpPyError::transport(format!("client lock poisoned: {e}")))?;
         client_guard
             .list_tools()
-            .map_err(|e| ScpPyError::TransportError(format!("tools/list failed: {e}")))?
+            .map_err(|e| ScpPyError::transport(format!("tools/list failed: {e}")))?
     };
 
     // Convert tool definitions to JSON array for Python.
@@ -1623,7 +1623,7 @@ pub fn py_mcp_client_invoke(
     validate::validate_context_id(context_id)?;
     validate::validate_did(identity_did)?;
     let entry = client_registry().get(handle).ok_or_else(|| {
-        ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
+        ScpPyError::transport(format!("MCP client handle '{handle}' not found"))
     })?;
 
     let client = Arc::clone(&entry.client);
@@ -1636,10 +1636,10 @@ pub fn py_mcp_client_invoke(
     let result = {
         let client_guard = client
             .lock()
-            .map_err(|e| ScpPyError::TransportError(format!("client lock poisoned: {e}")))?;
+            .map_err(|e| ScpPyError::transport(format!("client lock poisoned: {e}")))?;
         client_guard
             .invoke(tool_name, input_json, context_id, identity_did)
-            .map_err(|e| ScpPyError::TransportError(format!("tools/call failed: {e}")))?
+            .map_err(|e| ScpPyError::transport(format!("tools/call failed: {e}")))?
     };
 
     // Convert the McpToolResult to a Python dict.
@@ -1842,9 +1842,9 @@ fn allowlist_err(e: allowlist::AllowlistError) -> ScpPyError {
         | AllowlistError::NulInEntry(_)
         | AllowlistError::ControlCharInEntry(_)
         | AllowlistError::PathInCommand(_)
-        | AllowlistError::InvalidCommand(_) => ScpPyError::ValidationError(msg),
+        | AllowlistError::InvalidCommand(_) => ScpPyError::validation(msg),
         AllowlistError::NotAllowed { .. } | AllowlistError::LockPoisoned => {
-            ScpPyError::TransportError(msg)
+            ScpPyError::transport(msg)
         }
     }
 }
@@ -1964,7 +1964,7 @@ pub fn py_register_tool_handler(
     validate::validate_tool_name(tool_name)?;
     // Verify the handler is callable before storing it.
     if !handler.bind(py).is_callable() {
-        return Err(ScpPyError::ValidationError("handler must be callable".to_owned()).into());
+        return Err(ScpPyError::validation("handler must be callable".to_owned()).into());
     }
 
     // Wrap the Python callable in a Rust closure that acquires the GIL,
@@ -2315,7 +2315,7 @@ mod tests {
                     registration,
                     creator_did,
                 )
-                .map_err(|e| crate::error::ScpPyError::ContextError(format!("{e}")))?;
+                .map_err(|e| crate::error::ScpPyError::context(format!("{e}")))?;
                 Ok(())
             })
             .unwrap();

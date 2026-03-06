@@ -305,12 +305,11 @@ fn parse_custody(custody: &str) -> Result<(Arc<InMemoryKeyCustody>, String), Scp
             let kc = Arc::new(InMemoryKeyCustody::new());
             Ok((kc, custody.to_owned()))
         }
-        "platform" => Err(ScpPyError::ValidationError(
+        "platform" => Err(ScpPyError::validation(
             "platform custody (Secure Enclave, Android Keystore) is not yet \
-             implemented — use \"in_memory\" for testing"
-                .to_owned(),
+             implemented — use \"in_memory\" for testing",
         )),
-        other => Err(ScpPyError::ValidationError(format!(
+        other => Err(ScpPyError::validation(format!(
             "unknown custody type: {other:?} — expected \"in_memory\" or \"platform\""
         ))),
     }
@@ -351,17 +350,17 @@ fn serialize_identity_state(did: &str, custody: &str) -> Vec<u8> {
 /// Returns `ScpPyError::IdentityError` if the stored data is malformed.
 fn deserialize_identity_state(data: &[u8]) -> Result<(String, String), ScpPyError> {
     let text = std::str::from_utf8(data).map_err(|e| {
-        ScpPyError::IdentityError(format!("stored identity state is not valid UTF-8: {e}"))
+        ScpPyError::identity(format!("stored identity state is not valid UTF-8: {e}"))
     })?;
     let mut lines = text.splitn(2, '\n');
     let did = lines
         .next()
-        .ok_or_else(|| ScpPyError::IdentityError("stored identity state is empty".to_owned()))?
+        .ok_or_else(|| ScpPyError::identity("stored identity state is empty".to_owned()))?
         .to_owned();
     let custody = lines
         .next()
         .ok_or_else(|| {
-            ScpPyError::IdentityError("stored identity state is missing custody type".to_owned())
+            ScpPyError::identity("stored identity state is missing custody type".to_owned())
         })?
         .to_owned();
     Ok((did, custody))
@@ -453,7 +452,7 @@ fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
                 let key = identity_state_key(&did);
                 let data = serialize_identity_state(&did, &custody_str);
                 storage.store(&key, &data).await.map_err(|e| {
-                    ScpPyError::IdentityError(format!("failed to persist identity state: {e}"))
+                    ScpPyError::identity(format!("failed to persist identity state: {e}"))
                 })?;
             }
 
@@ -517,7 +516,7 @@ fn py_identity_create_with_agent_key(py: Python<'_>, custody: &str) -> PyResult<
                 let key = identity_state_key(&did);
                 let data = serialize_identity_state(&did, &custody_str);
                 storage.store(&key, &data).await.map_err(|e| {
-                    ScpPyError::IdentityError(format!("failed to persist identity state: {e}"))
+                    ScpPyError::identity(format!("failed to persist identity state: {e}"))
                 })?;
             }
 
@@ -574,7 +573,7 @@ fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
 
     py.allow_threads(|| {
         if !did_owned.starts_with("did:dht:") {
-            return Err(PyErr::from(ScpPyError::IdentityError(format!(
+            return Err(PyErr::from(ScpPyError::identity(format!(
                 "unsupported DID method: {did_owned} -- only did:dht is supported"
             ))));
         }
@@ -587,12 +586,12 @@ fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
                 .retrieve(&key)
                 .await
                 .map_err(|e| {
-                    ScpPyError::IdentityError(format!(
+                    ScpPyError::identity(format!(
                         "failed to read identity state from storage: {e}"
                     ))
                 })?
                 .ok_or_else(|| {
-                    ScpPyError::IdentityError(format!(
+                    ScpPyError::identity(format!(
                         "identity not found in storage: {did_owned} -- \
                      was it created with py_identity_create?"
                     ))
@@ -601,7 +600,7 @@ fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
             let (stored_did, custody_str) = deserialize_identity_state(&data)?;
 
             if stored_did != did_owned {
-                return Err(PyErr::from(ScpPyError::IdentityError(format!(
+                return Err(PyErr::from(ScpPyError::identity(format!(
                     "stored DID mismatch: expected {did_owned}, found {stored_did}"
                 ))));
             }
@@ -623,7 +622,7 @@ fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
                 });
             }
 
-            Err(PyErr::from(ScpPyError::IdentityError(format!(
+            Err(PyErr::from(ScpPyError::identity(format!(
                 "SCP-IDENT-1010: identity '{did_owned}' was found in storage \
                  but has no live crypto state in the runtime registry. \
                  InMemoryKeyCustody does not persist key material across \
@@ -971,10 +970,10 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
             let pre_rotation_key = custody
                 .generate_keypair(scp_platform::traits::KeyType::Ed25519)
                 .await
-                .map_err(|e| ScpPyError::IdentityError(format!("key generation failed: {e}")))?;
+                .map_err(|e| ScpPyError::identity(format!("key generation failed: {e}")))?;
 
             let rotated_at = scp_core::time::now_secs()
-                .map_err(|e| ScpPyError::IdentityError(format!("{e}")))?;
+                .map_err(|e| ScpPyError::identity(format!("{e}")))?;
 
             let old_identity = ScpIdentity {
                 identity_key: old_identity_key,

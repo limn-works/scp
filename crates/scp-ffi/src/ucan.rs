@@ -172,7 +172,7 @@ pub fn py_ucan_validate(
 
     // Parse the required capability URI.
     let required_cap: CapabilityUri = capability.parse().map_err(|e: CoreUcanError| {
-        ScpPyError::UcanError(format!("invalid capability URI '{capability}': {e}"))
+        ScpPyError::ucan(format!("invalid capability URI '{capability}': {e}"))
     })?;
 
     // Determine the presenting agent DID: explicit parameter or token audience.

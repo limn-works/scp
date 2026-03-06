@@ -130,7 +130,7 @@ pub fn py_transport_connect(relay_url: &str, source: &str) -> PyResult<()> {
         "explicit" => RelayUrlSource::Explicit,
         "peer_discovered" => RelayUrlSource::PeerDiscovered,
         other => {
-            return Err(ScpPyError::ValidationError(format!(
+            return Err(ScpPyError::validation(format!(
                 "invalid relay URL source: {other:?}. Expected one of: \
                  \"dht_resolved\", \"well_known\", \"explicit\", \"peer_discovered\""
             ))
@@ -153,7 +153,7 @@ pub fn py_transport_connect(relay_url: &str, source: &str) -> PyResult<()> {
 
             // Track the URL for status queries.
             *connected_url_state().write().map_err(|_| {
-                ScpPyError::TransportError("connected relay URL lock is poisoned".to_owned())
+                ScpPyError::transport("connected relay URL lock is poisoned".to_owned())
             })? = Some(url);
 
             Ok(())
@@ -178,7 +178,7 @@ pub fn py_transport_disconnect() -> PyResult<()> {
     crate::runtime::clear_relay_connection()?;
 
     *connected_url_state().write().map_err(|_| {
-        ScpPyError::TransportError("connected relay URL lock is poisoned".to_owned())
+        ScpPyError::transport("connected relay URL lock is poisoned".to_owned())
     })? = None;
 
     Ok(())

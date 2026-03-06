@@ -247,7 +247,7 @@ pub fn py_event_log_query(
         #[allow(clippy::cast_precision_loss)] // Unix timestamp seconds fit in f64 mantissa for centuries.
         timestamp: {
             scp_core::time::now_secs()
-                .map_err(|e| ScpPyError::ContextError(format!("{e}")))? as f64
+                .map_err(|e| ScpPyError::context(format!("{e}")))? as f64
         },
         payload,
         sequence: event_count.saturating_sub(1),
@@ -307,8 +307,8 @@ pub fn py_event_log_verify(
         .get("type")
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
-            ScpPyError::ValidationError(
-                "claim must include 'type' field ('inclusion' or 'absence')".to_owned(),
+            ScpPyError::validation(
+                "claim must include 'type' field ('inclusion' or 'absence')",
             )
         })?;
 
@@ -318,8 +318,8 @@ pub fn py_event_log_verify(
                 .get("leaf_index")
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| {
-                    ScpPyError::ValidationError(
-                        "inclusion claim must include 'leaf_index' (integer)".to_owned(),
+                    ScpPyError::validation(
+                        "inclusion claim must include 'leaf_index' (integer)",
                     )
                 })?;
 
@@ -327,7 +327,7 @@ pub fn py_event_log_verify(
             let proof_result = crate::runtime::with_context(context_id, |rt| {
                 let proof = scp_event_log::proof::prove_inclusion(&rt.event_log, leaf_index)
                     .map_err(|e| {
-                        ScpPyError::ContextError(format!("inclusion proof failed: {e}"))
+                        ScpPyError::context(format!("inclusion proof failed: {e}"))
                     })?;
                 let verified = scp_event_log::proof::verify_inclusion(&proof);
 
@@ -371,19 +371,19 @@ pub fn py_event_log_verify(
                 .get("event_hash")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    ScpPyError::ValidationError(
-                        "absence claim must include 'event_hash' (hex string)".to_owned(),
+                    ScpPyError::validation(
+                        "absence claim must include 'event_hash' (hex string)",
                     )
                 })?;
 
             // Decode the hex event hash.
             let event_hash = decode_hex_hash(event_hash_hex)
-                .map_err(|e| ScpPyError::ValidationError(format!("invalid event_hash: {e}")))?;
+                .map_err(|e| ScpPyError::validation(format!("invalid event_hash: {e}")))?;
 
             // Generate the absence proof via scp-core.
             let proof_result = crate::runtime::with_context(context_id, |rt| {
                 let proof = scp_event_log::proof::prove_absence(&rt.event_log, &event_hash)
-                    .map_err(|e| ScpPyError::ContextError(format!("absence proof failed: {e}")))?;
+                    .map_err(|e| ScpPyError::context(format!("absence proof failed: {e}")))?;
 
                 let lower = proof.lower.as_ref().map(|lwp| {
                     serde_json::json!({
@@ -430,7 +430,7 @@ pub fn py_event_log_verify(
                 details,
             })
         }
-        other => Err(ScpPyError::ValidationError(format!(
+        other => Err(ScpPyError::validation(format!(
             "unsupported claim type '{other}': expected 'inclusion' or 'absence'"
         ))
         .into()),
@@ -495,7 +495,7 @@ pub fn py_event_log_checkpoint(
             });
 
             result
-                .map_err(|e| ScpPyError::ContextError(format!("checkpoint generation failed: {e}")))
+                .map_err(|e| ScpPyError::context(format!("checkpoint generation failed: {e}")))
         })
     })?;
 
