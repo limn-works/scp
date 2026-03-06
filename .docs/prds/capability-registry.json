@@ -81,8 +81,14 @@
       ],
       "blockedBy": [],
       "sources": [
-        { "file": ".docs/adrs/phase-4.md", "section": "## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)" },
-        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "#### 7.3.4.1 Capability URI Namespace" }
+        {
+          "file": ".docs/adrs/phase-4.md",
+          "section": "## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "#### 7.3.4.1 Capability URI Namespace"
+        }
       ],
       "details": {}
     },
@@ -124,10 +130,18 @@
         "Add unit tests verifying all 32 registry entries",
         "Re-export from trust/mod.rs"
       ],
-      "blockedBy": ["SCP-ACR-001"],
+      "blockedBy": [
+        "SCP-ACR-001"
+      ],
       "sources": [
-        { "file": ".docs/adrs/phase-4.md", "section": "## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)" },
-        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "#### 7.3.4.3 Protocol Capability Registry" }
+        {
+          "file": ".docs/adrs/phase-4.md",
+          "section": "## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "#### 7.3.4.3 Protocol Capability Registry"
+        }
       ],
       "details": {}
     },
@@ -164,10 +178,19 @@
         "Update all existing tests to use new URI-based ChallengeType",
         "Add migration tests verifying backwards compatibility"
       ],
-      "blockedBy": ["SCP-ACR-001", "SCP-ACR-002"],
+      "blockedBy": [
+        "SCP-ACR-001",
+        "SCP-ACR-002"
+      ],
       "sources": [
-        { "file": ".docs/adrs/phase-4.md", "section": "## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)" },
-        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "### 7.3.4 Challenge-Response Verification" }
+        {
+          "file": ".docs/adrs/phase-4.md",
+          "section": "## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "### 7.3.4 Challenge-Response Verification"
+        }
       ],
       "details": {}
     },
@@ -201,10 +224,18 @@
         "Add test for DID-scoped custom capability challenge",
         "Add negative test for unknown protocol capability rejection"
       ],
-      "blockedBy": ["SCP-ACR-003"],
+      "blockedBy": [
+        "SCP-ACR-003"
+      ],
       "sources": [
-        { "file": ".docs/adrs/phase-4.md", "section": "## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)" },
-        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "#### 7.3.4.3 Protocol Capability Registry" }
+        {
+          "file": ".docs/adrs/phase-4.md",
+          "section": "## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "#### 7.3.4.3 Protocol Capability Registry"
+        }
       ],
       "details": {}
     },
@@ -237,10 +268,18 @@
         "Add test for mixed protocol and DID-scoped capabilities in one service endpoint",
         "Add test for invalid URI rejection"
       ],
-      "blockedBy": ["SCP-ACR-001"],
+      "blockedBy": [
+        "SCP-ACR-001"
+      ],
       "sources": [
-        { "file": ".docs/adrs/phase-4.md", "section": "## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)" },
-        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "#### 7.3.4.1 Capability URI Namespace" }
+        {
+          "file": ".docs/adrs/phase-4.md",
+          "section": "## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "#### 7.3.4.1 Capability URI Namespace"
+        }
       ],
       "details": {}
     },
@@ -268,10 +307,18 @@
         "Verify deduplication works correctly across all three CapabilityUri variants",
         "Add doc comments explaining system capability semantics"
       ],
-      "blockedBy": ["SCP-ACR-005"],
+      "blockedBy": [
+        "SCP-ACR-005"
+      ],
       "sources": [
-        { "file": ".docs/adrs/phase-4.md", "section": "## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)" },
-        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "#### 7.3.4.1 Capability URI Namespace" }
+        {
+          "file": ".docs/adrs/phase-4.md",
+          "section": "## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "#### 7.3.4.1 Capability URI Namespace"
+        }
       ],
       "details": {}
     },
@@ -307,10 +354,19 @@
         "Add unit tests for all acceptance criteria",
         "Document the admission check flow in doc comments"
       ],
-      "blockedBy": ["SCP-ACR-001", "SCP-ACR-003"],
+      "blockedBy": [
+        "SCP-ACR-001",
+        "SCP-ACR-003"
+      ],
       "sources": [
-        { "file": ".docs/adrs/phase-4.md", "section": "## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)" },
-        { "file": ".docs/specs/07-trust-validation-and-capabilities.md", "section": "#### 7.3.4.4 Context Admission via Capability URIs" }
+        {
+          "file": ".docs/adrs/phase-4.md",
+          "section": "## ADR-041: Agent Capability Registry (URI Namespace and Protocol Registry)"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "#### 7.3.4.4 Context Admission via Capability URIs"
+        }
       ],
       "details": {}
     }

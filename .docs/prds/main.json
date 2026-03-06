@@ -5241,7 +5241,10 @@
           "ADR-002": "Signaling messages use envelope format with MessageType::Signaling variant.",
           "ADR-005": "Signaling routed through SCP transport."
         }
-      }
+      },
+      "blockedByIssues": [
+        290
+      ]
     },
     {
       "id": "SCP-093",
@@ -6584,9 +6587,10 @@
         "Document lifecycle integration patterns for SDK consumers"
       ],
       "blockedBy": [
-        "SCP-115",
         "SCP-105",
         "SCP-106",
+        "SCP-115",
+        "SCP-116",
         "SCP-211"
       ],
       "sources": [
@@ -6633,9 +6637,9 @@
         "Add Compose UI tests verifying recomposition on state changes"
       ],
       "blockedBy": [
+        "SCP-106",
         "SCP-116",
         "SCP-117",
-        "SCP-106",
         "SCP-211"
       ],
       "sources": [
@@ -6732,9 +6736,11 @@
         "Add conformance tests to CI pipeline"
       ],
       "blockedBy": [
-        "SCP-115",
         "SCP-099",
         "SCP-106",
+        "SCP-115",
+        "SCP-116",
+        "SCP-117",
         "SCP-211"
       ],
       "sources": [
@@ -9769,7 +9775,10 @@
         "notYetExposedViaFFI": "Two scp-core functions take KeyCustody but have no corresponding FFI bridge function: (1) delegate_ucan (mint.rs:292) \u2014 SCP-056 implemented the scp-core function and SCP-057 defined a Python wrapper, but no py_ucan_delegate bridge function exists in crates/scp-ffi/src/ucan.rs. (2) DidDht::migrate_identity (dht.rs:531) \u2014 SCP-008 implemented scp-core but no py_identity_migrate bridge function exists. This story should add bridge functions for both, since they require KeyCustody and are part of the complete FFI surface.",
         "sealEnvelopeNote": "seal_envelope (outer.rs:169) takes routing_id: &[u8] and InnerEnvelope as pre-computed inputs. It does not take KeyCustody directly, but both inputs require KeyCustody upstream: routing_id comes from derive_pseudonym, and InnerEnvelope comes from create_inner_envelope which signs with KeyCustody. The entire message send path is blocked without this wiring.",
         "inMemoryCodeBug": "InMemoryKeyCustody::derive_pseudonym at key_custody.rs:333 uses signing_key.to_bytes() (Ed25519 private/secret key bytes, 32 bytes) as the HMAC key. ADR-027 mandates verifying_key.to_bytes() (Ed25519 public key bytes, 32 bytes) for cross-platform determinism \u2014 hardware TEE keys (Android Keystore, Secure Enclave) cannot export private bytes. AndroidKeyCustody.kt correctly uses publicKey(keyHandle) at line 178. AppleKeyCustody.swift correctly uses publicKey(). InMemoryKeyCustody is the outlier. The golden vector test at key_custody.rs:626 will need updated expected values after the fix."
-      }
+      },
+      "blockedByIssues": [
+        356
+      ]
     },
     {
       "id": "SCP-215",
@@ -9970,7 +9979,10 @@
         }
       ],
       "actionItems": [],
-      "details": {}
+      "details": {},
+      "blockedByIssues": [
+        306
+      ]
     },
     {
       "id": "SCP-219",
@@ -10035,7 +10047,10 @@
         }
       ],
       "actionItems": [],
-      "details": {}
+      "details": {},
+      "blockedByIssues": [
+        307
+      ]
     },
     {
       "id": "SCP-221",
@@ -10043,8 +10058,8 @@
       "gate": "gate-audit",
       "status": "pending",
       "blockedBy": [
-        "SCP-220",
-        "SCP-103"
+        "SCP-103",
+        "SCP-220"
       ],
       "files": [
         "bindings/swift/Sources/SCP/Mcp.swift",

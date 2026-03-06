@@ -9,7 +9,7 @@ Checks:
   2. Gate registration — story listed in its gate's stories array
   3. Source file existence — sources[].file exists in repo
   4. Source section existence — sources[].section is a heading in the file
-  5. Dependency validity — blockedBy references existing story IDs
+  5. Dependency validity — blockedBy references existing story IDs (same or cross-PRD)
   6. No orphaned stories — story's gate exists in gates array
   7. ID uniqueness — no duplicate story IDs
   8. Gate story completeness — gate stories array only references existing stories
@@ -49,7 +49,7 @@ def extract_headings(filepath: Path) -> set[str]:
     return headings
 
 
-def validate_prd(prd_path: Path) -> list[str]:
+def validate_prd(prd_path: Path, all_story_ids: set[str] | None = None) -> list[str]:
     """Validate a single PRD file. Returns list of error strings."""
     errors: list[str] = []
 
@@ -128,12 +128,21 @@ def validate_prd(prd_path: Path) -> list[str]:
                     f"in its stories array"
                 )
 
-        # --- Check 5: Dependency validity ---
+        # --- Check 5: Dependency validity (same-PRD and cross-PRD) ---
+        valid_ids = (all_story_ids or set()) | seen_ids
         for dep in story.get("blockedBy", []):
-            if dep not in story_ids and dep not in seen_ids:
+            if dep not in valid_ids:
                 errors.append(
                     f"{prefix} blockedBy references non-existent "
                     f"story '{dep}'"
+                )
+
+        # --- Check 5b: blockedByIssues must be positive integers ---
+        for issue_num in story.get("blockedByIssues", []):
+            if not isinstance(issue_num, int) or issue_num <= 0:
+                errors.append(
+                    f"{prefix} blockedByIssues contains invalid "
+                    f"value '{issue_num}' (must be positive integer)"
                 )
 
         # --- Check 3 & 4: Source existence and section headings ---
@@ -187,6 +196,22 @@ def validate_prd(prd_path: Path) -> list[str]:
     return errors
 
 
+def collect_all_story_ids(prd_dir: Path) -> set[str]:
+    """Collect all story IDs across all PRD files for cross-PRD ref validation."""
+    all_ids: set[str] = set()
+    for prd_file in prd_dir.glob("*.json"):
+        try:
+            with open(prd_file, encoding="utf-8") as f:
+                data = json.load(f)
+            for story in data.get("stories", []):
+                sid = story.get("id", "")
+                if sid:
+                    all_ids.add(sid)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return all_ids
+
+
 def main() -> int:
     prd_dir = REPO_ROOT / ".docs" / "prds"
     if not prd_dir.is_dir():
@@ -198,9 +223,12 @@ def main() -> int:
         print("No PRD files found in .docs/prds/")
         return 0
 
+    # First pass: collect all story IDs for cross-PRD validation
+    all_story_ids = collect_all_story_ids(prd_dir)
+
     total_errors: list[str] = []
     for prd_file in prd_files:
-        errors = validate_prd(prd_file)
+        errors = validate_prd(prd_file, all_story_ids)
         total_errors.extend(errors)
 
     if total_errors:

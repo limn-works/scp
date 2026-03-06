@@ -73,7 +73,10 @@
           "section": "## 5.9 Governance"
         }
       ],
-      "details": {}
+      "details": {},
+      "blockedByIssues": [
+        356
+      ]
     },
     {
       "id": "SCP-268",
@@ -183,7 +186,8 @@
         "Add serialization round-trip tests for all new types"
       ],
       "blockedBy": [
-        "SCP-267"
+        "SCP-267",
+        "SCP-268"
       ],
       "sources": [
         {
@@ -199,7 +203,10 @@
           "section": "## 5.10 Context TTL (Time-to-Live)"
         }
       ],
-      "details": {}
+      "details": {},
+      "blockedByIssues": [
+        320
+      ]
     },
     {
       "id": "SCP-270",
@@ -317,7 +324,8 @@
       ],
       "blockedBy": [
         "SCP-268",
-        "SCP-269"
+        "SCP-269",
+        "SCP-270"
       ],
       "sources": [
         {
@@ -377,7 +385,10 @@
           "section": "## ADR-031: Multi-Admin Governance Models"
         }
       ],
-      "details": {}
+      "details": {},
+      "blockedByIssues": [
+        354
+      ]
     },
     {
       "id": "SCP-273",
@@ -420,7 +431,10 @@
           "section": "## ADR-031: Multi-Admin Governance Models"
         }
       ],
-      "details": {}
+      "details": {},
+      "blockedByIssues": [
+        330
+      ]
     },
     {
       "id": "SCP-274",

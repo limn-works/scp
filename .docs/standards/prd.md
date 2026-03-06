@@ -18,7 +18,7 @@ Every story object must include all of these fields. No exceptions.
 | `description` | string | What and why — enough context for autonomous implementation |
 | `acceptanceCriteria` | array | Concrete, machine-verifiable assertions (see below) |
 | `actionItems` | array | Specific implementation steps |
-| `blockedBy` | array | Story IDs this story cannot start without (may be empty) |
+| `blockedBy` | array | Story IDs this story cannot start without (may be empty). May reference stories in other PRDs for cross-PRD dependencies. |
 | `sources` | array | Backlinks to source artifacts (see below) |
 | `details` | object | Arbitrary metadata — use `{}` when empty |
 
@@ -29,6 +29,7 @@ Include when relevant. Absence implies the default.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `tools` | array | `[]` | Capability categories: `browser`, `mobile`, `design` |
+| `blockedByIssues` | array | `[]` | GitHub issue numbers that must be closed before this story can start |
 
 ## Gate Registration
 
@@ -90,7 +91,9 @@ Dependencies must be **forward-only**: a story depends on work that must exist b
 
 ### Validation
 
-Every ID in `blockedBy` must reference an existing story in the same PRD. CI rejects dangling references. CI also warns on stories that are `blockedBy` a `done` story — a completed dependency should not block pending work.
+Every ID in `blockedBy` must reference an existing story — either in the same PRD or in another PRD file (for cross-PRD dependencies). CI rejects dangling references. CI also warns on stories that are `blockedBy` a `done` story — a completed dependency should not block pending work.
+
+Cross-PRD references enable orchestrator scheduling: a story is assignable when all `blockedBy` stories are `"done"` and all `blockedByIssues` (GitHub issue numbers) are closed.
 
 ## Story Scope
 
