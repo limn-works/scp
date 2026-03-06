@@ -211,6 +211,8 @@ The protocol mandates a single ciphersuite for v1. No negotiation, no fallback. 
 
 **DID-to-DID encryption:** HPKE (RFC 9180) with suite DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. Used for MLS Welcome messages. The HPKE suite matches the MLS ciphersuite to minimize the cryptographic surface area.
 
+**Key distribution HPKE:** RFC 9180 Base mode for sender key (§9.16.2), access key (§9.17), and broadcast key (§5.14.2) distribution. The suite is identical to DID-to-DID encryption: DHKEM(X25519, HKDF-SHA256) (KEM ID: 0x0020), HKDF-SHA256 (KDF ID: 0x0001), AES-128-GCM (AEAD ID: 0x0001). AES-128-GCM is used (not AES-256-GCM) because the HPKE AEAD protects a single 32-byte key per operation — the 128-bit security level matches the X25519 KEM and is consistent with the MLS ciphersuite. Each key distribution protocol uses a distinct `info` string for domain separation (see §9.16.2, §9.17.1, §5.14.2). Nonces for the AEAD within HPKE are managed internally by RFC 9180 — implementations MUST NOT generate or supply external nonces for the HPKE AEAD. The HPKE `enc` (encapsulated key) and `ct` (ciphertext) are transmitted in the wire format as specified per protocol.
+
 **Merkle tree hash:** SHA-256. Append-only log tree following Certificate Transparency structure (RFC 6962). Each event entry is `SHA256(previous_hash || event_data)`. The Merkle root provides tamper-evident integrity over the entire event history.
 
 ### 9.5.1 Canonical Hash Construction
@@ -266,8 +268,9 @@ The outer envelope is unsigned — it contains only the routing pseudonym, recip
 | 4 | `sequence` | 8-byte BE u64 |
 | 5 | `key_epoch` | 8-byte BE u64 |
 | 6 | `timestamp` | 8-byte BE u64 |
-| 7 | `content_hash` | 32 bytes (SHA-256 of original plaintext) |
-| 8 | `provenance_hash` | 32 bytes (SHA-256 of serialized provenance, or `SHA-256(0x00)` if absent) |
+| 7 | `nonce` | 12 bytes (AES-256-GCM nonce, random per message) |
+| 8 | `content_hash` | 32 bytes (SHA-256 of original plaintext) |
+| 9 | `provenance_hash` | 32 bytes (SHA-256 of serialized provenance, or `SHA-256(0x00)` if absent) |
 
 Note: the current implementation uses AEAD authentication only; the full signed structure above is the target format. The `BroadcastEnvelope` struct will be expanded to include all fields per #352.
 
@@ -909,7 +912,7 @@ Each participant in a context holds one AES-256 symmetric sender key. All messag
 - **Key size:** 32 bytes per sender key per context member. Storage is trivial.
 - **Encryption order:** Sender-first (AES-256-GCM), then MLS. Recipients decrypt MLS layer, then decrypt sender layer with the cached sender key.
 
-**Wrapping key terminology.** The sender-side key layer uses two distinct wrapping keys, both HPKE-based but serving different roles: (1) the **stable wrapping keypair** (below) protects the persistent per-sender AES-256 symmetric key during key distribution — it is long-lived and published in the MLS LeafNode; (2) the **ephemeral wrapping keypair** (§9.16.2) protects per-request key material during individual key exchanges — it is generated fresh for each `SenderKeyRequest` and discarded after use. Both use X25519 + HPKE for key encapsulation, but the stable key enables offline key distribution while the ephemeral key provides forward secrecy for individual key exchanges.
+**Wrapping key terminology.** The sender-side key layer uses two distinct wrapping keys, both HPKE-based (RFC 9180 Base mode, §9.5) but serving different roles: (1) the **stable wrapping keypair** (below) protects the persistent per-sender AES-256 symmetric key during key distribution — it is long-lived and published in the MLS LeafNode; (2) the **ephemeral wrapping keypair** (§9.16.2) protects per-request key material during individual key exchanges — it is generated fresh for each `SenderKeyRequest` and discarded after use. Both use X25519 DHKEM + HPKE for key encapsulation, but the stable key enables offline key distribution while the ephemeral key provides forward secrecy for individual key exchanges.
 
 **Stable wrapping keypair.** Each member maintains a single dedicated X25519 keypair per context (one per DID, shared by human and agent — ADR-039), used exclusively for HPKE wrapping of sender key distributions (§9.16.2). This keypair is published as an MLS LeafNode extension (`scp_wrapping_key`) and is distinct from the MLS leaf HPKE key used for MLS key agreement. The wrapping keypair does NOT rotate on MLS Updates (epoch advances) — it remains stable across epochs so that sender key distributions can always be unwrapped, even by members who are offline during epoch transitions or who join after an epoch advance. The wrapping keypair rotates only on: (1) identity key rotation (§9.12), or (2) suspected compromise. On rotation, the member publishes the new wrapping public key in their LeafNode extension via an MLS Update and re-distributes their current sender key to all non-blocked members using the new wrapping keys.
 
@@ -923,11 +926,44 @@ Sender keys are distributed via a pull-based request/response protocol. When a s
 
 2. **Key request.** Members who need the key (because they see a new epoch, or because they just joined) send a `SenderKeyRequest { requester_did, sender_did, epoch, wrapping_pubkey, signature }` as an MLS application message with `recipient_hint` directed to the key holder. The `wrapping_pubkey` is a fresh ephemeral X25519 key generated per request.
 
-3. **Key response.** The key holder's SDK processes the request: verifies the signature, checks the block list. If the requester is not blocked, responds with `SenderKeyResponse { sender_did, epoch, hpke_sealed_key, ephemeral_pubkey }` via an MLS application message with `recipient_hint` to the requester. The sender key is HPKE-encrypted to the requester's ephemeral wrapping pubkey. If blocked, no response — the blocked party cannot obtain the key.
+3. **Key response.** The key holder's SDK processes the request: verifies the signature, checks the block list. If the requester is not blocked, responds with `SenderKeyResponse { sender_did, epoch, hpke_sealed_key, ephemeral_pubkey, request_nonce }` via an MLS application message with `recipient_hint` to the requester. The sender key is sealed using HPKE Base mode (RFC 9180) to the requester's ephemeral wrapping public key. If blocked, no response — the blocked party cannot obtain the key. The `ephemeral_pubkey` field carries the HPKE encapsulated key (`enc` in RFC 9180 terminology) and `hpke_sealed_key` carries the AEAD ciphertext (`ct`).
 
-**HPKE assembly:** (1) Generate ephemeral X25519 keypair (software-managed), (2) ECDH between ephemeral secret and requester wrapping pubkey, (3) HKDF to derive encryption key, (4) AES-128-GCM encrypt the sender key. The ephemeral public key is included in the response for decryption.
+**HPKE Base mode specification (RFC 9180).** Sender key distribution uses HPKE Base mode (`mode_base`, §5.1.1 of RFC 9180) with the following suite:
 
-**HPKE open (recipient-side):** Uses `key_custody.dh_agree(wrapping_key_handle, ephemeral_pk)` to compute the shared secret inside the custody boundary, then KDF + AEAD in software to recover the sender key. The wrapping private key never leaves KeyCustody.
+- **KEM:** DHKEM(X25519, HKDF-SHA256) — KEM ID `0x0020` (RFC 9180 §7.1)
+- **KDF:** HKDF-SHA256 — KDF ID `0x0001` (RFC 9180 §7.2)
+- **AEAD:** AES-128-GCM — AEAD ID `0x0001` (RFC 9180 §7.3)
+
+This suite matches the MLS ciphersuite (§9.5) and the DID-to-DID HPKE suite, minimizing the cryptographic surface area.
+
+**Seal (sender-side):**
+
+1. Call `SetupBaseS(requester_wrapping_pubkey, info)` (RFC 9180 §5.1.1) to obtain `(enc, sender_context)`.
+2. Call `sender_context.Seal(aad, sender_key_bytes)` to obtain `ct`.
+3. Transmit `enc` as `ephemeral_pubkey` (32 bytes) and `ct` as `hpke_sealed_key` (32 + 16 = 48 bytes, ciphertext + AEAD tag) in the `SenderKeyResponse`.
+
+**Open (recipient-side):**
+
+1. Call `SetupBaseR(enc, wrapping_secret_key, info)` (RFC 9180 §5.1.1) to obtain `recipient_context`, where `enc` is the `ephemeral_pubkey` from the response. The wrapping secret key is computed inside the `KeyCustody` boundary via `dh_agree(wrapping_key_handle, enc)`.
+2. Call `recipient_context.Open(aad, ct)` to recover `sender_key_bytes`, where `ct` is the `hpke_sealed_key` from the response.
+
+**`info` parameter (domain separation):**
+
+```
+info = "scp-sender-key-v1" || context_id || sender_did || epoch_bytes
+```
+
+Where `context_id` and `sender_did` are UTF-8 bytes (no length prefix — the `info` string is not parsed, only compared) and `epoch_bytes` is the 8-byte big-endian encoding of the sender key epoch. The `info` string binds the HPKE encryption to a specific context, sender, and epoch. Using a different `info` on open produces a different derived key, causing AEAD decryption to fail.
+
+**`aad` parameter (additional authenticated data):**
+
+```
+aad = context_id || sender_did || epoch_bytes
+```
+
+Where fields use the same encoding as `info` (without the domain separator prefix). The AAD binds the ciphertext to the context and sender, preventing cross-context and cross-sender key substitution attacks. Tampering with any field in the wire format causes AEAD verification to fail.
+
+**Nonce:** The AEAD nonce is managed internally by the HPKE context (RFC 9180 §5.2 `ComputeNonce`). Implementations MUST NOT generate or supply an external nonce — HPKE derives it from the key schedule. Since each `SenderKeyResponse` creates a fresh HPKE context (fresh ephemeral keypair), the internal sequence counter starts at 0 and only one `Seal`/`Open` call is made per context.
 
 **New member join (pull-based):** When a new member joins the group, they observe each existing member's current sender key epoch from the group state. The new member publishes a `SenderKeyRequest` for each member whose key they need. Each member's SDK responds automatically (checking block list). Same O(N) total work as a push model, but demand-driven and naturally load-balanced.
 
@@ -1043,7 +1079,7 @@ Content Encryption:
 
 **Key types:**
 - **Content Encryption Key (CEK):** AES-256, generated per message (or per message batch). Encrypts the actual content. Ephemeral — not stored after wrapping.
-- **Access Key:** AES-256, per member per context. Generated at join time. Used to wrap/unwrap CEKs. Stored in the member's local key store and distributed via HPKE (same mechanism as sender keys, §9.16.2). HPKE info strings for access key distribution MUST use a distinct domain separator from sender key distribution: `info = "scp-access-key-v1" || context_id || member_did || epoch` (vs `"scp-sender-key-v1"` for sender keys). This prevents cross-protocol key confusion.
+- **Access Key:** AES-256, per member per context. Generated at join time. Used to wrap/unwrap CEKs. Stored in the member's local key store and distributed via HPKE Base mode (RFC 9180), using the same suite as sender key distribution (§9.16.2): DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. The HPKE `info` string for access key distribution MUST use a distinct domain separator: `info = "scp-access-key-v1" || context_id || member_did || epoch_bytes` (vs `"scp-sender-key-v1"` for sender keys). The `aad` is: `aad = context_id || member_did || epoch_bytes`. Where `epoch_bytes` is the 8-byte big-endian encoding of the access key epoch. This prevents cross-protocol key confusion — an HPKE ciphertext produced for sender key distribution cannot be substituted for an access key distribution response (different `info` produces different derived keys).
 - **Key Wrapping:** AES-256-KW (RFC 3394). Deterministic, no IV needed. The wrapped CEK is stored alongside the ciphertext.
 
 **AES-256-GCM additional authenticated data (AAD).** Content encryption MUST bind `context_id` as AAD: `AAD = context_id || sender_did || sequence_number`. This prevents ciphertext from being moved between contexts or reordered within a context. The AEAD authentication tag provides integrity verification — no separate content hash is needed.
@@ -1052,7 +1088,7 @@ Content Encryption:
 
 ### 9.17.2 Access Key Lifecycle
 
-1. **Generation.** When a member joins a context, a fresh random 32-byte AES-256 access key is generated by the context creator (or the member who executed the `AddMember` governance action). The access key is distributed to the new member via HPKE, using the same pull-based protocol as sender keys (§9.16.2).
+1. **Generation.** When a member joins a context, a fresh random 32-byte AES-256 access key is generated by the context creator (or the member who executed the `AddMember` governance action). The access key is distributed to the new member via the same pull-based HPKE Base mode protocol as sender keys (§9.16.2), with the `info` and `aad` parameters specified in §9.17.1.
 
 2. **Normal operation.** Each message sender generates a fresh CEK, encrypts the content, wraps the CEK with each intended recipient's access key, and publishes the wrapped CEKs alongside the ciphertext. In encrypted contexts, this wrapping occurs BEFORE the MLS encryption layer. In broadcast contexts, it occurs before the sender key encryption.
 

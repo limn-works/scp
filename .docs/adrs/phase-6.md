@@ -3099,7 +3099,7 @@ pub struct WrappedCek {
 
 #### 2. Access Key Lifecycle
 
-**Generation.** When `AddMember` executes (via governance), the executor generates a fresh random 32-byte AES-256 access key for the new member. The access key is distributed via HPKE using the same pull-based protocol as sender keys (ADR-007 §9.16.2): the new member sends an `AccessKeyRequest`, the key holder responds with `AccessKeyResponse` containing the HPKE-encrypted access key. HPKE info strings for access key distribution MUST use a distinct domain separator: `info = "scp-access-key-v1" || context_id || member_did || epoch` (sender keys use `"scp-sender-key-v1"`). This prevents cross-protocol key confusion where a compromised access key response could be replayed as a sender key response.
+**Generation.** When `AddMember` executes (via governance), the executor generates a fresh random 32-byte AES-256 access key for the new member. The access key is distributed via HPKE Base mode (RFC 9180) using the same pull-based protocol and suite as sender keys (ADR-007, §9.16.2): DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. The new member sends an `AccessKeyRequest`, the key holder responds with `AccessKeyResponse` containing the HPKE-sealed access key. The HPKE `info` parameter MUST use a distinct domain separator: `info = "scp-access-key-v1" || context_id || member_did || epoch_bytes`. The `aad` parameter is: `aad = context_id || member_did || epoch_bytes`. Where `epoch_bytes` is the 8-byte big-endian encoding of the access key epoch. Sender keys use `"scp-sender-key-v1"` and broadcast keys use `"scp-broadcast-key-v1"`. This prevents cross-protocol key confusion where a compromised access key response could be replayed as a sender key response — different `info` values produce different HPKE key schedules.
 
 **Distribution.** Access keys are distributed via two new wire types:
 
@@ -3269,7 +3269,7 @@ The access key is destroyed on Full revocation and not archived. Re-wrapping his
    - `AccessKey` struct with 32-byte AES-256 key, context_id, member_did, epoch.
    - `generate_access_key(context_id, member_did) -> AccessKey` generates a cryptographically random key.
    - `AccessKeyRequest`/`AccessKeyResponse` wire types follow the pull-based protocol pattern from ADR-007.
-   - Distribution uses HPKE with ephemeral X25519 keypairs (same as sender key distribution).
+   - Distribution uses HPKE Base mode (RFC 9180) with DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. Info: `"scp-access-key-v1" || context_id || member_did || epoch_bytes`. AAD: `context_id || member_did || epoch_bytes`. Same suite as sender key distribution (§9.16.2).
 
 2. **CEK generation and wrapping:**
 
