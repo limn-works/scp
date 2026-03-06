@@ -741,18 +741,58 @@ pub async fn feed_handler(
     // out their messages when the request lacks valid auth. This prevents
     // the feed from leaking per-author-gated content to unauthenticated
     // clients (RED-302).
+    //
+    // Optimization (#355): pre-compute auth decisions for each distinct
+    // ProjectionRule found in the overrides. This parses the UCAN at most
+    // once per distinct rule instead of re-parsing per message in the
+    // retain loop. ProjectionRule has only 3 variants, so we check each
+    // at most once.
     if let Some(ref policy) = projection_policy
         && !policy.overrides.is_empty()
     {
+        // Pre-compute auth result for each ProjectionRule variant that
+        // appears in the overrides. The default rule already passed auth
+        // above, so we mark it as authorized. For other rules, we call
+        // check_projection_auth once per distinct variant.
+        let auth_public = true; // Public never requires auth
+        let mut auth_gated: Option<bool> = None;
+        let mut auth_author_choice: Option<bool> = None;
+
+        // Mark the default rule as already authorized.
+        match rule {
+            ProjectionRule::Public => {} // auth_public is already true
+            ProjectionRule::Gated => {
+                auth_gated = Some(true);
+            }
+            ProjectionRule::AuthorChoice => {
+                auth_author_choice = Some(true);
+            }
+        }
+
+        // Pre-compute only the rules that actually appear in overrides
+        // and haven't been computed yet.
+        for ov in &policy.overrides {
+            if ov.rule == ProjectionRule::Gated && auth_gated.is_none() {
+                auth_gated = Some(
+                    check_projection_auth(&headers, &context_id, ProjectionRule::Gated).is_ok(),
+                );
+            } else if ov.rule == ProjectionRule::AuthorChoice && auth_author_choice.is_none() {
+                auth_author_choice = Some(
+                    check_projection_auth(&headers, &context_id, ProjectionRule::AuthorChoice)
+                        .is_ok(),
+                );
+            }
+            // ProjectionRule::Public is always authorized; already-computed
+            // rules are skipped by the is_none() guards above.
+        }
+
         messages.retain(|msg| {
             let author_rule =
                 effective_projection_rule(admission, Some(policy), Some(&msg.author_did));
-            // If the per-author rule matches the default, it already passed
-            // pre-auth. Otherwise, check the stricter per-author rule.
-            if author_rule == rule {
-                true
-            } else {
-                check_projection_auth(&headers, &context_id, author_rule).is_ok()
+            match author_rule {
+                ProjectionRule::Public => auth_public,
+                ProjectionRule::Gated => auth_gated.unwrap_or(true),
+                ProjectionRule::AuthorChoice => auth_author_choice.unwrap_or(true),
             }
         });
     }

@@ -30,34 +30,28 @@ use crate::economy::EconomicPolicy;
 pub use super::roles::Capability;
 
 // ---------------------------------------------------------------------------
-// RoleDefinition (placeholder)
+// RoleDefinition (re-export from roles module)
 // ---------------------------------------------------------------------------
 
-/// Definition of a role within a context, mapping a role name to a set of
-/// capabilities.
+/// Re-export of the full [`RoleDefinition`](super::roles::RoleDefinition) type.
 ///
-/// Phase 2 placeholder: roles carry only a name. Full role definitions with
-/// permission sets and hierarchy will be introduced in SCP-023.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RoleDefinition {
-    /// The role name (e.g., `"admin"`, `"member"`, `"observer"`).
-    pub name: String,
-}
+/// Previously a name-only placeholder. Now re-exports the full type from
+/// `roles.rs` which includes `name` and `capabilities: HashSet<Capability>`.
+/// See ADR-009 in `.docs/adrs/phase-2.md`.
+pub use super::roles::RoleDefinition;
 
 // ---------------------------------------------------------------------------
-// ToolRegistration (placeholder)
+// ToolRegistration (re-export from tools/registry module)
 // ---------------------------------------------------------------------------
 
-/// Registration entry for a tool available within a context.
+/// Re-export of the full [`ToolRegistration`](super::tools::ToolRegistration)
+/// type.
 ///
-/// Phase 2 placeholder: tool registrations carry only a name. Full tool
-/// registration with schemas, invocation policies, and verification will be
-/// introduced in SCP-024.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolRegistration {
-    /// The tool name (e.g., `"recipe-search"`, `"nutrition-lookup"`).
-    pub name: String,
-}
+/// Previously a name-only placeholder. Now re-exports the full type from
+/// `tools/registry.rs` which includes `tool_id`, `name`, `description`,
+/// `schema`, `implementation_hash`, `test_vectors`, `operator_did`, and
+/// `economic_metadata`. See ADR-010 in `.docs/adrs/phase-2.md`.
+pub use super::tools::ToolRegistration;
 
 // ---------------------------------------------------------------------------
 // ContextMode
@@ -542,7 +536,10 @@ impl ContextParams {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
+    use crate::context::tools::ToolSchema;
 
     #[test]
     fn context_mode_default_is_encrypted() {
@@ -588,13 +585,28 @@ mod tests {
             roles: vec![
                 RoleDefinition {
                     name: "admin".to_owned(),
+                    capabilities: HashSet::from([
+                        Capability::MessagesRead,
+                        Capability::MessagesWrite,
+                    ]),
                 },
                 RoleDefinition {
                     name: "member".to_owned(),
+                    capabilities: HashSet::from([Capability::MessagesRead]),
                 },
             ],
             tools: vec![ToolRegistration {
+                tool_id: "recipe-search".to_owned(),
                 name: "recipe-search".to_owned(),
+                description: "Search for recipes".to_owned(),
+                schema: ToolSchema {
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: serde_json::json!({"type": "object"}),
+                },
+                implementation_hash: [0u8; 32],
+                test_vectors: vec![],
+                operator_did: "did:dht:z6MkTestOperator".into(),
+                economic_metadata: None,
             }],
             ttl: Some(Duration::from_secs(3600)),
             memory_scope: MemoryScope::Full,
@@ -628,6 +640,7 @@ mod tests {
     fn role_definition_clone_eq() {
         let role = RoleDefinition {
             name: "admin".to_owned(),
+            capabilities: HashSet::from([Capability::MessagesRead]),
         };
         let cloned = role.clone();
         assert_eq!(role, cloned);
@@ -636,7 +649,17 @@ mod tests {
     #[test]
     fn tool_registration_clone_eq() {
         let tool = ToolRegistration {
+            tool_id: "search".to_owned(),
             name: "search".to_owned(),
+            description: "Search tool".to_owned(),
+            schema: ToolSchema {
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: serde_json::json!({"type": "object"}),
+            },
+            implementation_hash: [0u8; 32],
+            test_vectors: vec![],
+            operator_did: "did:dht:z6MkTestOperator".into(),
+            economic_metadata: None,
         };
         let cloned = tool.clone();
         assert_eq!(tool, cloned);
@@ -691,6 +714,7 @@ mod tests {
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: vec![RoleDefinition {
                 name: "member".to_owned(),
+                capabilities: HashSet::from([Capability::MessagesRead]),
             }],
             tools: vec![],
             ttl: Some(Duration::from_secs(300)),
@@ -1004,6 +1028,7 @@ mod tests {
             template_id: Some(TemplateId::PublicBroadcast),
             roles: vec![RoleDefinition {
                 name: "admin".to_owned(),
+                capabilities: HashSet::from([Capability::MessagesRead, Capability::MessagesWrite]),
             }],
             metadata_visibility: MetadataVisibilityPolicy {
                 member_count: FieldVisibility::MemberOnly,

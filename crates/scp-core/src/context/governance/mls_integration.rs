@@ -575,9 +575,19 @@ mod tests {
     #[test]
     fn classify_register_tool_is_no_mls_change() {
         let action = GovernanceAction::RegisterTool {
-            registration: ToolRegistration {
+            registration: Box::new(ToolRegistration {
+                tool_id: "search".to_owned(),
                 name: "search".to_owned(),
-            },
+                description: "Search tool".to_owned(),
+                schema: crate::context::tools::ToolSchema {
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: serde_json::json!({"type": "object"}),
+                },
+                implementation_hash: [0u8; 32],
+                test_vectors: vec![],
+                operator_did: "did:dht:z6MkTestOperator".into(),
+                economic_metadata: None,
+            }),
         };
         assert_eq!(classify_action(&action), MlsImpact::NoMlsChange);
     }

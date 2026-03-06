@@ -457,7 +457,7 @@ pub enum GovernanceAction {
     /// Change a member's role.
     ChangeRole { did: DID, new_role: String },
     /// Register a new tool in the context.
-    RegisterTool { registration: ToolRegistration },
+    RegisterTool { registration: Box<ToolRegistration> },
     /// Remove a tool from the context.
     RemoveTool { tool_id: ToolId },
     /// Modify the capability ceiling (only if `ceiling_policy` is `Governed`).
@@ -1392,9 +1392,19 @@ mod tests {
                 new_role: "observer".to_owned(),
             },
             GovernanceAction::RegisterTool {
-                registration: ToolRegistration {
+                registration: Box::new(ToolRegistration {
+                    tool_id: "search".to_owned(),
                     name: "search".to_owned(),
-                },
+                    description: "Search tool".to_owned(),
+                    schema: crate::context::tools::ToolSchema {
+                        input_schema: serde_json::json!({"type": "object"}),
+                        output_schema: serde_json::json!({"type": "object"}),
+                    },
+                    implementation_hash: [0u8; 32],
+                    test_vectors: vec![],
+                    operator_did: "did:dht:z6MkTestOperator".into(),
+                    economic_metadata: None,
+                }),
             },
             GovernanceAction::RemoveTool {
                 tool_id: "search".to_owned(),
@@ -1837,9 +1847,19 @@ mod tests {
                 new_role: "observer".to_owned(),
             },
             GovernanceAction::RegisterTool {
-                registration: ToolRegistration {
+                registration: Box::new(ToolRegistration {
+                    tool_id: "calc".to_owned(),
                     name: "calc".to_owned(),
-                },
+                    description: "Calculator tool".to_owned(),
+                    schema: crate::context::tools::ToolSchema {
+                        input_schema: serde_json::json!({"type": "object"}),
+                        output_schema: serde_json::json!({"type": "object"}),
+                    },
+                    implementation_hash: [0u8; 32],
+                    test_vectors: vec![],
+                    operator_did: "did:dht:z6MkTestOperator".into(),
+                    economic_metadata: None,
+                }),
             },
             GovernanceAction::RemoveTool {
                 tool_id: "calc".to_owned(),

@@ -28,17 +28,14 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use scp_core::context::roles::{
-    Capability, CapabilityCeiling, ContextRoleState, RoleError, assign_role,
+    Capability, CapabilityCeiling, ContextRoleState, RoleDefinition, RoleError, assign_role,
 };
 use scp_core::context::tools::invoke::{has_tool_invoke_capability, invoke_tool};
 use scp_core::context::tools::lifecycle::ToolStatus;
 use scp_core::context::tools::registry::{
     ToolRegistration, ToolRegistry, ToolSchema, register_tool,
 };
-use scp_core::context::{
-    ContextHandle, ContextParams, ContextState, MemoryScope, RoleDefinition as ParamsRoleDef,
-    ToolRegistration as ParamsToolReg,
-};
+use scp_core::context::{ContextHandle, ContextParams, ContextState, MemoryScope};
 use scp_core::event_log::KeyCustodySigner;
 use scp_event_log::checkpoint::{CheckpointComparison, compare_checkpoint, generate_checkpoint};
 use scp_event_log::tree::{self, GENESIS_PREV_HASH};
@@ -308,15 +305,27 @@ async fn phase2_end_to_end_integration() {
             Capability::ContextClose,
         ],
         roles: vec![
-            ParamsRoleDef {
+            RoleDefinition {
                 name: "admin".to_owned(),
+                capabilities: HashSet::from([Capability::MessagesRead, Capability::MessagesWrite]),
             },
-            ParamsRoleDef {
+            RoleDefinition {
                 name: "member".to_owned(),
+                capabilities: HashSet::from([Capability::MessagesRead]),
             },
         ],
-        tools: vec![ParamsToolReg {
+        tools: vec![ToolRegistration {
+            tool_id: "calculator".to_owned(),
             name: "calculator".to_owned(),
+            description: "Calculator tool".to_owned(),
+            schema: ToolSchema {
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: serde_json::json!({"type": "object"}),
+            },
+            implementation_hash: [0u8; 32],
+            test_vectors: vec![],
+            operator_did: "did:dht:z6MkTestOperator".into(),
+            economic_metadata: None,
         }],
         ttl: Some(Duration::from_secs(300)), // 5 minutes
         memory_scope: MemoryScope::Ephemeral,

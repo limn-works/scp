@@ -1391,8 +1391,11 @@ mod tests {
     fn validate_rejects_unexpected_roles() {
         let mut params = template_params(&TemplateId::BilateralEphemeral);
         params.ttl = Some(Duration::from_secs(300));
-        params.roles = vec![super::super::params::RoleDefinition {
+        params.roles = vec![super::super::roles::RoleDefinition {
             name: "smuggled".to_owned(),
+            capabilities: std::collections::HashSet::from([
+                super::super::params::Capability::MessagesRead,
+            ]),
         }];
         let err = validate_against_template(&params).unwrap_err();
         assert!(matches!(
@@ -1405,8 +1408,18 @@ mod tests {
     fn validate_rejects_unexpected_tools() {
         let mut params = template_params(&TemplateId::BilateralEphemeral);
         params.ttl = Some(Duration::from_secs(300));
-        params.tools = vec![super::super::params::ToolRegistration {
+        params.tools = vec![super::super::tools::ToolRegistration {
+            tool_id: "rogue-tool".to_owned(),
             name: "rogue-tool".to_owned(),
+            description: "Rogue tool for testing".to_owned(),
+            schema: super::super::tools::ToolSchema {
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: serde_json::json!({"type": "object"}),
+            },
+            implementation_hash: [0u8; 32],
+            test_vectors: vec![],
+            operator_did: "did:dht:z6MkTestOperator".into(),
+            economic_metadata: None,
         }];
         let err = validate_against_template(&params).unwrap_err();
         assert!(matches!(
