@@ -446,7 +446,7 @@ pub fn py_ucan_revoke(context_id: &str, token: &str) -> PyResult<()> {
 ///
 /// Parses each proof token and indexes it by its CID (SHA-256 of the encoded
 /// JWT) so that the delegation chain verifier can resolve proof references.
-fn build_proof_resolver(
+pub(crate) fn build_proof_resolver(
     proof_tokens: Option<&[String]>,
 ) -> Result<BridgeProofResolver, ScpPyError> {
     let mut proofs = HashMap::new();
@@ -460,6 +460,15 @@ fn build_proof_resolver(
     }
 
     Ok(BridgeProofResolver { proofs })
+}
+
+/// Public alias for `build_proof_resolver` used by `tools.rs` and `mcp.rs`.
+///
+/// Accepts the same `Option<&[String]>` parameter as the internal function.
+pub(crate) fn build_proof_resolver_from_tokens(
+    proof_tokens: Option<&[String]>,
+) -> Result<BridgeProofResolver, ScpPyError> {
+    build_proof_resolver(proof_tokens)
 }
 
 // ---------------------------------------------------------------------------

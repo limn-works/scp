@@ -401,7 +401,7 @@ pub async fn ucan_revoke(handle: &NapiContextHandle, token: String) -> napi::Res
 /// JWT via `compute_cid`) so that the delegation chain verifier can resolve
 /// proof references. Uses `compute_cid` (not `compute_revocation_cid`) because
 /// the CID must match what was stored in the UCAN `prf` field during minting.
-fn build_proof_resolver(
+pub(crate) fn build_proof_resolver(
     proof_tokens: Option<&[String]>,
 ) -> Result<BridgeProofResolver, ScpNapiError> {
     let mut proofs = HashMap::new();
@@ -417,6 +417,15 @@ fn build_proof_resolver(
     }
 
     Ok(BridgeProofResolver { proofs })
+}
+
+/// Convenience alias that mirrors the PyO3 bridge naming convention.
+///
+/// Builds a [`BridgeProofResolver`] from optional encoded proof token strings.
+pub(crate) fn build_proof_resolver_from_tokens(
+    proof_tokens: Option<&[String]>,
+) -> Result<BridgeProofResolver, ScpNapiError> {
+    build_proof_resolver(proof_tokens)
 }
 
 /// Encodes a byte slice as lowercase hexadecimal.

@@ -233,6 +233,54 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
     Ok(registered_id)
 }
 
+/// Validates a UCAN token for tool invocation authorization.
+///
+/// Runs the full 11-step ADR-016 pipeline, requiring `tool_invoke:{tool_id}`
+/// or `tool_invoke:*` capability. Extracted to keep `py_tool_invoke` within
+/// the 100-line clippy limit.
+fn validate_tool_ucan(
+    context_id: &str,
+    tool_id: &str,
+    ucan_token: &str,
+    identity_did: &str,
+    proof_tokens: &Option<Vec<String>>,
+) -> PyResult<()> {
+    let proof_resolver =
+        crate::ucan::build_proof_resolver_from_tokens(proof_tokens.as_deref())?;
+
+    crate::runtime::with_context(context_id, |rt| {
+        let did_resolver = crate::bridge_adapters::BridgeDidResolver;
+        let revocation_checker = crate::bridge_adapters::BridgeRevocationChecker {
+            revocation_list: &rt.revocation_list,
+        };
+        let mut nonce_adapter = crate::bridge_adapters::BridgeNonceTracker {
+            inner: &mut rt.nonce_tracker,
+        };
+
+        let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
+            did_resolver: &did_resolver,
+            nonce_tracker: &mut nonce_adapter,
+            revocation_checker: &revocation_checker,
+            proof_resolver: &proof_resolver,
+            ceiling: &rt.ceiling_strings,
+            context_creator_did: &rt.creator_did,
+            presenting_agent_did: identity_did,
+            clock_skew_tolerance_secs:
+                scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        scp_core::context::tools::validate_tool_invocation_ucan(
+            ucan_token, context_id, tool_id, &mut ctx,
+        )
+        .map_err(|e| {
+            ScpPyError::UcanError(format!(
+                "UCAN authorization failed for tool '{tool_id}': {e}"
+            ))
+        })
+    })?;
+    Ok(())
+}
+
 /// Invokes a tool within an SCP context.
 ///
 /// Validates the UCAN token for tool invocation authorization before
@@ -280,6 +328,8 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
 /// See spec §6.2, §8, ADR-016, and issue #319 for UCAN enforcement.
 #[pyfunction]
 #[pyo3(name = "tool_invoke")]
+#[pyo3(signature = (context_id, tool_id, input, identity_did, ucan_token, proof_tokens=None))]
+#[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
 pub fn py_tool_invoke(
     py: Python<'_>,
     context_id: &str,
@@ -287,51 +337,23 @@ pub fn py_tool_invoke(
     input: &Bound<'_, PyDict>,
     identity_did: &str,
     ucan_token: &str,
+    proof_tokens: Option<Vec<String>>,
 ) -> PyResult<PyObject> {
     validate::validate_context_id(context_id)?;
     validate::validate_tool_id(tool_id)?;
     validate::validate_did(identity_did)?;
     validate::validate_ucan_token(ucan_token)?;
+    if let Some(ref tokens) = proof_tokens {
+        for t in tokens {
+            validate::validate_ucan_token(t)?;
+        }
+    }
     let input_json = py_dict_to_json(input)?;
     let start = std::time::Instant::now();
 
     // Primary authorization: UCAN token validation via the full 11-step
-    // ADR-016 pipeline. Verifies the token grants tool_invoke:{tool_id}
-    // or tool_invoke:* for this context.
-    // See spec §6.2, §8, ADR-016, and issue #319.
-    crate::runtime::with_context(context_id, |rt| {
-        let did_resolver = crate::bridge_adapters::BridgeDidResolver;
-        let revocation_checker = crate::bridge_adapters::BridgeRevocationChecker {
-            revocation_list: &rt.revocation_list,
-        };
-        let mut nonce_adapter = crate::bridge_adapters::BridgeNonceTracker {
-            inner: &mut rt.nonce_tracker,
-        };
-        let proof_resolver = crate::bridge_adapters::BridgeProofResolver {
-            proofs: std::collections::HashMap::new(),
-        };
-
-        let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
-            did_resolver: &did_resolver,
-            nonce_tracker: &mut nonce_adapter,
-            revocation_checker: &revocation_checker,
-            proof_resolver: &proof_resolver,
-            ceiling: &rt.ceiling_strings,
-            context_creator_did: &rt.creator_did,
-            presenting_agent_did: identity_did,
-            clock_skew_tolerance_secs:
-                scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-        };
-
-        scp_core::context::tools::validate_tool_invocation_ucan(
-            ucan_token, context_id, tool_id, &mut ctx,
-        )
-        .map_err(|e| {
-            ScpPyError::UcanError(format!(
-                "UCAN authorization failed for tool '{tool_id}': {e}"
-            ))
-        })
-    })?;
+    // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
+    validate_tool_ucan(context_id, tool_id, ucan_token, identity_did, &proof_tokens)?;
 
     // Validates tool existence, input schema, capability, dispatches to handler,
     // validates output schema, and builds a ToolInvokedEvent for provenance.

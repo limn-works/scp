@@ -598,6 +598,12 @@ struct FfiBridgeProvider {
     ///
     /// See spec §6.2, §8, ADR-016, and issue #319.
     agent_ucan_token: Option<String>,
+    /// Optional proof tokens for UCAN delegation chain verification.
+    ///
+    /// When the `agent_ucan_token` is a delegated UCAN (non-empty `prf` field),
+    /// the parent tokens must be provided here so the proof resolver can
+    /// verify the delegation chain. Without these, delegated UCANs always fail.
+    agent_proof_tokens: Option<Vec<String>>,
 }
 
 impl ContextProvider for FfiBridgeProvider {
@@ -647,6 +653,12 @@ impl ContextProvider for FfiBridgeProvider {
         // tool_invoke:* for this context.
         // See spec §6.2, §8, ADR-016, and issue #319.
         if let Some(ref token) = self.agent_ucan_token {
+            // Build proof resolver from optional proof tokens (supports delegated UCANs).
+            let proof_resolver = crate::ucan::build_proof_resolver_from_tokens(
+                self.agent_proof_tokens.as_deref(),
+            )
+            .map_err(|e| format!("failed to build proof resolver: {e}"))?;
+
             crate::runtime::with_context(context_id, |rt| {
                 let did_resolver = crate::bridge_adapters::BridgeDidResolver;
                 let revocation_checker = crate::bridge_adapters::BridgeRevocationChecker {
@@ -654,9 +666,6 @@ impl ContextProvider for FfiBridgeProvider {
                 };
                 let mut nonce_adapter = crate::bridge_adapters::BridgeNonceTracker {
                     inner: &mut rt.nonce_tracker,
-                };
-                let proof_resolver = crate::bridge_adapters::BridgeProofResolver {
-                    proofs: std::collections::HashMap::new(),
                 };
 
                 let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
@@ -1101,6 +1110,8 @@ pub fn py_mcp_serve(
         context_ids: context_ids.clone(),
         tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
         agent_ucan_token: ucan_token.clone(),
+
+        agent_proof_tokens: None,
     };
     let server = McpServer::new(provider);
     let server = Arc::new(Mutex::new(server));
@@ -1201,6 +1212,8 @@ pub fn py_mcp_serve(
                     context_ids: sse_context_ids,
                     tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
                     agent_ucan_token: sse_ucan_token,
+
+                    agent_proof_tokens: None,
                 };
                 let sse_server = McpServer::new(provider);
                 let config =
@@ -2220,6 +2233,8 @@ mod tests {
             context_ids: vec!["ctx-1".to_owned(), "ctx-2".to_owned()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
             agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
         assert_eq!(
             provider.active_context_ids(),
@@ -2234,6 +2249,8 @@ mod tests {
             context_ids: vec![],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
             agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
         assert_eq!(provider.agent_did(), "did:dht:z6MkTest");
     }
@@ -2245,6 +2262,8 @@ mod tests {
             context_ids: vec!["nonexistent".to_owned()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
             agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
         // Unknown context returns empty tool list (no panic).
         let tools = provider.context_tools("nonexistent");
@@ -2318,6 +2337,8 @@ mod tests {
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
             agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
         // Even the creator is rejected without a UCAN token.
         let result = provider.validate_capability(&ctx_id, "calculator");
@@ -2362,6 +2383,8 @@ mod tests {
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
             agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
         let result = provider.validate_capability(&ctx_id, "calculator");
         assert!(
@@ -2391,6 +2414,8 @@ mod tests {
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
             agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
 
         let input = serde_json::json!({"a": 3, "b": 4});
@@ -2432,6 +2457,8 @@ mod tests {
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
             agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
 
         // Invoke in echo mode (no handler registered).
@@ -2485,6 +2512,8 @@ mod tests {
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
             agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
 
         let result =
@@ -2522,6 +2551,8 @@ mod tests {
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
             agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
 
         // Invoke with invalid input (schema validation fails).
@@ -2556,6 +2587,8 @@ mod tests {
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
             agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
 
         // Input schema requires an object with "a" and "b" as required fields.
@@ -2598,6 +2631,8 @@ mod tests {
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
             agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
 
         let result = provider.invoke_tool(&ctx_id, "nonexistent", serde_json::json!({}));
@@ -2714,6 +2749,8 @@ mod tests {
             context_ids: vec![],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
             agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
         assert!(provider.subscribe_resource("scp://ctx/events").is_ok());
     }
@@ -2748,6 +2785,8 @@ mod tests {
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
             agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
 
         let input = serde_json::json!({"a": 3, "b": 4});
@@ -2809,6 +2848,8 @@ mod tests {
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
             agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
 
         let result =
@@ -2842,6 +2883,8 @@ mod tests {
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
             agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
 
         let result =
@@ -2878,6 +2921,8 @@ mod tests {
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: 50, // 50ms — will expire before the 5s sleep.
             agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
 
         let result =
@@ -2922,6 +2967,8 @@ mod tests {
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: 5_000, // 5 seconds — plenty for an instant handler.
             agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
 
         let result =
@@ -3005,6 +3052,8 @@ mod tests {
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
             agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
         let server = McpServer::new(provider);
         let server = Arc::new(Mutex::new(server));
@@ -3051,6 +3100,8 @@ mod tests {
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
             agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
         let server = McpServer::new(provider);
         let server = Arc::new(Mutex::new(server));

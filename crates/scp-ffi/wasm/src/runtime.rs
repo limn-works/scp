@@ -46,8 +46,6 @@ pub struct WasmContextRuntime {
     pub tool_registry: ToolRegistry,
     /// Event log (Merkle tree) for this context.
     pub event_log: WasmEventLog,
-    /// UCAN revocation set (token CIDs that have been revoked).
-    pub revoked_tokens: HashSet<String>,
     /// Capability ceiling as `{resource}:{action}` strings for UCAN validation.
     pub ceiling_strings: HashSet<String>,
     /// The DID of the context creator.
@@ -640,7 +638,6 @@ pub fn register_context(context_id: &str, creator_did: &str) -> Result<(), ScpWa
         let runtime = WasmContextRuntime {
             tool_registry: ToolRegistry::new(),
             event_log: WasmEventLog::new(context_id.to_owned()),
-            revoked_tokens: HashSet::new(),
             ceiling_strings,
             creator_did: creator_did.to_owned(),
         };
@@ -716,10 +713,22 @@ pub fn validate_tool_ucan_wasm(
     identity_did: &str,
     rt: &mut WasmContextRuntime,
 ) -> Result<(), ScpWasmError> {
+    let (payload, payload_bytes) = parse_and_decode_ucan_payload(token)?;
+    check_ucan_expiry(&payload)?;
+    check_ucan_revocation(context_id, &payload_bytes)?;
+    check_ucan_audience(&payload, identity_did)?;
+    check_ucan_tool_capability(&payload, context_id, tool_name)?;
+    check_ucan_ceiling(rt, tool_name)?;
+    Ok(())
+}
+
+/// Parses a JWT token string and decodes the payload (steps 1-2).
+fn parse_and_decode_ucan_payload(
+    token: &str,
+) -> Result<(serde_json::Value, Vec<u8>), ScpWasmError> {
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-    // Step 1: JWT format — three dot-separated parts.
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err(ScpWasmError::Permission {
@@ -731,7 +740,6 @@ pub fn validate_tool_ucan_wasm(
         });
     }
 
-    // Step 2: Decode payload.
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(parts[1])
         .map_err(|e| ScpWasmError::Permission {
@@ -745,39 +753,84 @@ pub fn validate_tool_ucan_wasm(
             code: "SCP-PERM-3001".to_owned(),
         })?;
 
-    // Step 3: Expiry check.
-    if let Some(exp) = payload.get("exp").and_then(serde_json::Value::as_u64) {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let now_secs = (js_sys::Date::now() / 1000.0) as u64;
-        if exp <= now_secs {
-            return Err(ScpWasmError::Permission {
-                message: format!("UCAN token has expired (exp={exp}, now={now_secs})"),
-                code: "SCP-PERM-3001".to_owned(),
-            });
-        }
-    }
+    Ok((payload, payload_bytes))
+}
 
-    // Step 4: Revocation check.
-    let token_cid = compute_token_cid(token);
-    if rt.revoked_tokens.contains(&token_cid) {
+/// Checks that the UCAN token has not expired (step 3).
+fn check_ucan_expiry(payload: &serde_json::Value) -> Result<(), ScpWasmError> {
+    let exp = payload
+        .get("exp")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| ScpWasmError::Permission {
+            message: "UCAN token missing required 'exp' field".to_owned(),
+            code: "SCP-PERM-3001".to_owned(),
+        })?;
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let now_secs = (js_sys::Date::now() / 1000.0) as u64;
+    if exp <= now_secs {
+        return Err(ScpWasmError::Permission {
+            message: format!("UCAN token has expired (exp={exp}, now={now_secs})"),
+            code: "SCP-PERM-3001".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Checks the UCAN token against the revocation list (step 4).
+///
+/// Uses `compute_revocation_cid` (JSON payload hash) matching scp-core's format.
+fn check_ucan_revocation(context_id: &str, payload_bytes: &[u8]) -> Result<(), ScpWasmError> {
+    let ucan_payload: crate::ucan::UcanPayloadForRevocation =
+        serde_json::from_slice(payload_bytes).map_err(|e| ScpWasmError::Permission {
+            message: format!("UCAN payload deserialization failed for revocation check: {e}"),
+            code: "SCP-PERM-3001".to_owned(),
+        })?;
+    let revocation_cid =
+        crate::ucan::compute_revocation_cid_from_payload(&ucan_payload).map_err(|e| {
+            ScpWasmError::Permission {
+                message: format!("failed to compute revocation CID: {e}"),
+                code: "SCP-PERM-3001".to_owned(),
+            }
+        })?;
+    let is_revoked =
+        crate::ucan::is_token_revoked(context_id, &revocation_cid).unwrap_or(false);
+    if is_revoked {
         return Err(ScpWasmError::Permission {
             message: "UCAN token has been revoked".to_owned(),
             code: "SCP-PERM-3001".to_owned(),
         });
     }
+    Ok(())
+}
 
-    // Step 5: Audience check — aud must match identity_did.
-    if let Some(aud) = payload.get("aud").and_then(serde_json::Value::as_str)
-        && aud != identity_did
-    {
+/// Checks the UCAN audience matches the expected identity DID (step 5).
+fn check_ucan_audience(
+    payload: &serde_json::Value,
+    identity_did: &str,
+) -> Result<(), ScpWasmError> {
+    let aud = payload
+        .get("aud")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ScpWasmError::Permission {
+            message: "UCAN token missing required 'aud' field".to_owned(),
+            code: "SCP-PERM-3001".to_owned(),
+        })?;
+    if aud != identity_did {
         return Err(ScpWasmError::Permission {
             message: format!("UCAN audience mismatch: expected '{identity_did}', got '{aud}'"),
             code: "SCP-PERM-3001".to_owned(),
         });
     }
+    Ok(())
+}
 
-    // Step 6: Capability match — att must include tool_invoke:{tool_name}
-    // or tool_invoke:* for this context.
+/// Checks the UCAN att array for `tool_invoke:{tool_name}` or wildcard (step 6).
+fn check_ucan_tool_capability(
+    payload: &serde_json::Value,
+    context_id: &str,
+    tool_name: &str,
+) -> Result<(), ScpWasmError> {
     let required_resource = format!("scp:ctx:{context_id}/tool_invoke:{tool_name}");
     let wildcard_resource = format!("scp:ctx:{context_id}/tool_invoke:*");
     let mut has_capability = false;
@@ -794,8 +847,7 @@ pub fn validate_tool_ucan_wasm(
                 break;
             }
 
-            // Check for wildcard action: scp:ctx:{context_id}/tool_invoke:*
-            // via the `can` field being "*".
+            // Check for wildcard action via the `can` field being "*".
             let can_str = attenuation
                 .get("can")
                 .and_then(serde_json::Value::as_str)
@@ -817,17 +869,25 @@ pub fn validate_tool_ucan_wasm(
             code: "SCP-PERM-3001".to_owned(),
         });
     }
-
     Ok(())
 }
 
-/// Computes a SHA-256 CID from a full JWT token string.
-///
-/// Matches the revocation CID format used by scp-core's
-/// `compute_revocation_cid`. Used for revocation lookups.
-fn compute_token_cid(token: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    let hash = hasher.finalize();
-    encode_hex(&hash)
+/// Checks the tool invocation is within the context's capability ceiling (step 7).
+fn check_ucan_ceiling(
+    rt: &WasmContextRuntime,
+    tool_name: &str,
+) -> Result<(), ScpWasmError> {
+    if !rt.ceiling_strings.is_empty() {
+        let capability_name = format!("tool_invoke:{tool_name}");
+        let wildcard = "tool_invoke:*".to_owned();
+        if !rt.ceiling_strings.contains(&capability_name) && !rt.ceiling_strings.contains(&wildcard)
+        {
+            return Err(ScpWasmError::Permission {
+                message: format!("tool_invoke:{tool_name} outside context ceiling"),
+                code: "SCP-PERM-3001".to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
+

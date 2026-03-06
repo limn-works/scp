@@ -1833,6 +1833,7 @@ pub async fn tool_invoke(
     input_json: String,
     identity: Arc<Identity>,
     ucan_token: String,
+    proof_tokens: Option<Vec<String>>,
 ) -> Result<String, ScpError> {
     runtime()
         .spawn(async move {
@@ -1863,9 +1864,8 @@ pub async fn tool_invoke(
                 let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
                     inner: &mut rt.nonce_tracker,
                 };
-                let proof_resolver = scp_ffi_common::BridgeProofResolver {
-                    proofs: std::collections::HashMap::new(),
-                };
+                let proof_resolver =
+                    build_proof_resolver(proof_tokens.as_deref())?;
 
                 let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
                     did_resolver: &did_resolver,
@@ -2472,6 +2472,32 @@ pub async fn event_log_verify(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Builds a [`BridgeProofResolver`] from optional encoded proof token strings.
+///
+/// Parses each proof token and indexes it by its CID (SHA-256 of the encoded
+/// JWT via `compute_cid`) so that the delegation chain verifier can resolve
+/// proof references.
+pub(crate) fn build_proof_resolver(
+    proof_tokens: Option<&[String]>,
+) -> Result<scp_ffi_common::BridgeProofResolver, ScpError> {
+    let mut proofs = std::collections::HashMap::new();
+
+    if let Some(tokens) = proof_tokens {
+        for encoded in tokens {
+            let token = scp_core::crypto::ucan::validate::parse_ucan(encoded).map_err(|e| {
+                ScpError::Permission {
+                    message: format!("failed to parse proof token: {e}"),
+                    code: "SCP-PERM-3001".to_owned(),
+                }
+            })?;
+            let cid = scp_core::crypto::ucan::mint::compute_cid(&token);
+            proofs.insert(cid, token);
+        }
+    }
+
+    Ok(scp_ffi_common::BridgeProofResolver { proofs })
+}
 
 /// Parses a custody type string into a `CustodyMethod`.
 pub(crate) fn parse_custody_method(custody: &str) -> Result<CustodyMethod, ScpError> {

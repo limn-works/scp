@@ -135,6 +135,7 @@ pub async fn tool_invoke(
     input_json: String,
     identity_did: String,
     ucan_token: String,
+    proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<String> {
     let state_str = handle.state()?;
     if state_str != "active" {
@@ -153,6 +154,15 @@ pub async fn tool_invoke(
     // See spec §6.2, §8, ADR-016, and issue #319.
     let context_id = handle.context_id();
     crate::runtime::ensure_registered(handle)?;
+
+    // Build proof resolver from optional proof tokens (supports delegated UCANs).
+    let proof_resolver =
+        crate::ucan::build_proof_resolver_from_tokens(proof_tokens.as_deref())
+            .map_err(|e| napi::Error::from(ScpNapiError::Permission {
+                message: format!("failed to build proof resolver: {e}"),
+                code: "SCP-PERM-3001".to_owned(),
+            }))?;
+
     crate::runtime::with_context(&context_id, |rt| {
         let did_resolver = scp_ffi_common::BridgeDidResolver;
         let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
@@ -160,9 +170,6 @@ pub async fn tool_invoke(
         };
         let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
             inner: &mut rt.nonce_tracker,
-        };
-        let proof_resolver = scp_ffi_common::BridgeProofResolver {
-            proofs: std::collections::HashMap::new(),
         };
 
         let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {

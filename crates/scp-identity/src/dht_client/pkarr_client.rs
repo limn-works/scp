@@ -174,11 +174,26 @@ impl PkarrDhtClient {
 
                             let value = body[GATEWAY_HEADER_SIZE..].to_vec();
 
+                            // Verify BEP44 Ed25519 signature before trusting
+                            // the gateway response. Without this, a malicious
+                            // gateway could inject inflated sequence numbers
+                            // (poisoning initialize_sequence) or fake documents.
+                            if let Err(e) = crate::dht::verify_bep44_signature(
+                                public_key, &signature, &value, seq,
+                            ) {
+                                warn!(
+                                    gateway = %gateway_url,
+                                    error = %e,
+                                    "gateway returned record with invalid BEP44 signature — skipping"
+                                );
+                                continue;
+                            }
+
                             info!(
                                 gateway = %gateway_url,
                                 seq = seq,
                                 value_len = value.len(),
-                                "resolved BEP44 record via HTTP gateway"
+                                "resolved BEP44 record via HTTP gateway (signature verified)"
                             );
 
                             return Ok(Some(DhtRecord {
@@ -239,8 +254,8 @@ impl DhtClient for PkarrDhtClient {
             );
 
             // Use compare-and-swap with the previous sequence number to
-            // prevent overwriting a newer record on the DHT. If seq > 1,
-            // CAS expects the prior sequence; if seq == 0 or 1, no CAS.
+            // prevent overwriting a newer record on the DHT. If seq > 0,
+            // CAS expects the prior sequence; if seq == 0, no CAS (first publish).
             let cas = if seq_i64 > 0 { Some(seq_i64 - 1) } else { None };
 
             debug!(

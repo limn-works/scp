@@ -32,36 +32,39 @@ WASM is single-threaded. The context registry uses `thread_local! { static CONTE
 `WasmContextRuntime` fields:
 - `tool_registry: ToolRegistry` — tool registration/invocation
 - `event_log: WasmEventLog` — Merkle tree (append-only, RFC 6962)
-- `revoked_tokens: HashSet<String>` — UCAN revocation set (CIDs)
 - `ceiling_strings: HashSet<String>` — capability ceiling for UCAN validation
 - `creator_did: String` — DID of the context creator
 
+Note: UCAN revocation state lives in `WasmUcanState` (in `ucan.rs`), not on `WasmContextRuntime`. The `is_token_revoked` helper queries the per-context revocation set via `with_ucan_state`.
+
 ## UCAN Validation — Known Gaps (SCP-218)
 
-`ucan_validate` currently performs partial validation only:
-- JWT format check (3-part dot-split)
-- Base64 decode + JSON parse of payload
-- Expiry check (`exp` field)
-- Capability string match against `att` array
-- Revocation check against `revoked_tokens`
+`validate_tool_ucan_wasm` (in `runtime.rs`) performs 7-step validation:
+1. JWT format check (3-part dot-split)
+2. Base64 decode + JSON parse of payload
+3. Expiry check (`exp` required field)
+4. Revocation check via `WasmUcanState.revoked_cids` using `compute_revocation_cid` (JSON payload hash)
+5. Audience DID validation (`aud` required field)
+6. Capability string match against `att` array (`tool_invoke:{name}` or wildcard)
+7. Capability ceiling compliance
+
+The function is decomposed into 6 focused helpers (`parse_and_decode_ucan_payload`, `check_ucan_expiry`, `check_ucan_revocation`, `check_ucan_audience`, `check_ucan_tool_capability`, `check_ucan_ceiling`) to stay under clippy's 100-line limit.
 
 **Not yet implemented** (deferred to key custody wiring):
 - Ed25519 signature verification — requires `JsKeyCustody` (WebCrypto) injection
 - Delegation chain traversal — requires proof token resolution
 - Root issuer verification
-- Audience DID validation
 - Attenuation enforcement
 - Nonce replay detection (infrastructure exists: add `nonce_tracker: HashSet<String>` to `WasmContextRuntime`)
-- Capability ceiling check (infrastructure exists: `ceiling_strings` field)
 
 Do NOT claim "full validation" in docstrings until all steps are implemented. See `.docs/lessons/wasm-partial-ucan-validation.md`.
 
 ## UCAN Revocation — CID Consistency
 
-`ucan_revoke` and `ucan_validate` MUST hash the same input to compute the revocation CID. **Both must call `compute_token_cid` on the full JWT string** — not a nonce-derived ID, not the payload struct. Any deviation silently breaks revocation. See `.docs/lessons/wasm-cid-consistency.md`.
+`ucan_revoke` and `validate_tool_ucan_wasm` MUST hash the same input to compute the revocation CID. **Both use `compute_revocation_cid` which hashes the JSON-serialized `UcanPayload` struct** (matching scp-core's `compute_revocation_cid` in `revoke.rs`). This means the CID is derived from the payload content, NOT from the full JWT string. Any deviation silently breaks revocation. See `.docs/lessons/wasm-cid-consistency.md`.
 
-`ucan_revoke` parameter: full encoded JWT string (same as PyO3 `py_ucan_revoke`).
-`ucan_validate` revocation check: `compute_token_cid(&token)` where `token` is the full JWT parameter.
+`ucan_revoke` parameter: full encoded JWT string — decoded to payload, then `compute_revocation_cid`.
+`validate_tool_ucan_wasm` revocation check: decodes payload bytes to `UcanPayloadForRevocation`, calls `compute_revocation_cid_from_payload`, checks against `WasmUcanState.revoked_cids`.
 
 ## Capability Wildcard Matching
 

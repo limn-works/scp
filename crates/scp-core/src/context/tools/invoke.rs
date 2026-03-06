@@ -1017,4 +1017,84 @@ mod tests {
         let err = InvocationError::Cancelled;
         assert!(err.to_string().contains("cancelled"));
     }
+
+    // -----------------------------------------------------------------------
+    // validate_tool_invocation_ucan: rejects non-tool capability (#319)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn validate_tool_invocation_ucan_rejects_non_tool_capability() {
+        use crate::crypto::ucan::mint::{MintParams, mint_ucan};
+        use crate::crypto::ucan::validate::{
+            InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+            InMemoryRevocationChecker, ValidationContext, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+        use scp_platform::testing::InMemoryKeyCustody;
+        use scp_platform::traits::{KeyCustody, KeyType};
+
+        // Set up issuer identity.
+        let custody = InMemoryKeyCustody::new();
+        let key_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let pubkey = custody.public_key(&key_handle).await.unwrap();
+        let pk_bytes: [u8; 32] = pubkey.as_bytes().try_into().unwrap();
+        let issuer_did = format!("did:dht:z{}", zbase32::encode(pubkey.as_bytes()));
+
+        // Mint a UCAN with messages:write capability (NOT tool_invoke).
+        let caps = vec!["messages:write".to_owned()];
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-test",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+        };
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        // Build validation context.
+        let resolver = InMemoryDidResolver {
+            keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+            kid_keys: std::collections::HashMap::new(),
+        };
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
+        let ceiling: HashSet<String> = [
+            "messages:write".to_owned(),
+            "tool_invoke:calculator".to_owned(),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut ctx = ValidationContext {
+            did_resolver: &resolver,
+            nonce_tracker: &mut nonce_tracker,
+            revocation_checker: &revocation_checker,
+            proof_resolver: &proof_resolver,
+            ceiling: &ceiling,
+            context_creator_did: &issuer_did,
+            presenting_agent_did: "did:dht:z6MkMember",
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        // validate_tool_invocation_ucan expects tool_invoke:calculator,
+        // but the token only has messages:write — must be rejected.
+        let result =
+            validate_tool_invocation_ucan(&token.encoded, "ctx-test", "calculator", &mut ctx);
+
+        assert!(
+            result.is_err(),
+            "UCAN with messages:write must be rejected for tool invocation"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, UcanError::CapabilityNotGranted(..)),
+            "expected CapabilityNotGranted, got {err:?}"
+        );
+    }
 }

@@ -91,7 +91,7 @@ struct Attenuation {
 
 /// Claims payload for a UCAN token.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct UcanPayload {
+pub(crate) struct UcanPayload {
     iss: String,
     aud: String,
     exp: u64,
@@ -242,7 +242,7 @@ fn parse_ucan(encoded: &str) -> Result<ParsedUcanToken, String> {
 ///
 /// Returns `Err` on serialization failure instead of silently producing a
 /// fallback/constant CID (security-reviewer MEDIUM fix).
-fn compute_revocation_cid(payload: &UcanPayload) -> Result<String, String> {
+pub(crate) fn compute_revocation_cid(payload: &UcanPayload) -> Result<String, String> {
     let payload_bytes = serde_json::to_vec(payload)
         .map_err(|e| format!("revocation CID serialization failed: {e}"))?;
     let hash = Sha256::digest(&payload_bytes);
@@ -1117,5 +1117,37 @@ pub fn ucan_revoke(context: &WasmContextHandle, token: String) -> Promise {
         }
         .into_js()
         .into())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Public helpers for cross-module revocation checking (used by runtime.rs)
+// ---------------------------------------------------------------------------
+
+/// Re-export of `UcanPayload` for use by `runtime.rs` revocation checks.
+///
+/// `runtime.rs` deserializes the raw UCAN payload JSON into this type to
+/// compute the correct revocation CID (which hashes the JSON-serialized
+/// `UcanPayload` struct, not the raw JWT string).
+pub(crate) type UcanPayloadForRevocation = UcanPayload;
+
+/// Computes the revocation CID from a `UcanPayload`.
+///
+/// Wrapper around the internal `compute_revocation_cid` for use by
+/// `runtime.rs::validate_tool_ucan_wasm`.
+pub(crate) fn compute_revocation_cid_from_payload(
+    payload: &UcanPayloadForRevocation,
+) -> Result<String, String> {
+    compute_revocation_cid(payload)
+}
+
+/// Checks if a token with the given revocation CID has been revoked in the
+/// WASM UCAN state for the given context.
+///
+/// Returns `Ok(true)` if revoked, `Ok(false)` if not revoked or if the
+/// context has no UCAN state entry.
+pub(crate) fn is_token_revoked(context_id: &str, revocation_cid: &str) -> Result<bool, String> {
+    with_ucan_state(context_id, |state| {
+        Ok(state.revoked_cids.contains(revocation_cid))
     })
 }

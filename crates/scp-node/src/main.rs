@@ -244,7 +244,11 @@ async fn run_full_node() {
             sequence_store,
         ));
 
-        run_full_node_with(domain, http_addr, custody, did_method).await;
+        let seq_init_method = Arc::clone(&did_method);
+        let seq_init: Box<dyn FnOnce(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), scp_identity::IdentityError>> + Send>> + Send> = Box::new(move |did| {
+            Box::pin(async move { seq_init_method.initialize_sequence(&did).await })
+        });
+        run_full_node_with(domain, http_addr, custody, seq_init, did_method).await;
         return;
     }
 
@@ -278,7 +282,11 @@ async fn run_full_node() {
         sequence_store,
     ));
 
-    run_full_node_with(domain, http_addr, custody, did_method).await;
+    let seq_init_method = Arc::clone(&did_method);
+    let seq_init: Box<dyn FnOnce(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), scp_identity::IdentityError>> + Send>> + Send> = Box::new(move |did| {
+        Box::pin(async move { seq_init_method.initialize_sequence(&did).await })
+    });
+    run_full_node_with(domain, http_addr, custody, seq_init, did_method).await;
 }
 
 /// Shared implementation for `run_full_node`, parameterized over the DID method.
@@ -286,10 +294,17 @@ async fn run_full_node() {
 /// Builds and runs the `ApplicationNode` with the given identity components.
 /// The DID method type `D` is generic so both `DidDht<PkarrDhtClient>` (production)
 /// and `DidDht<InMemoryDhtClient>` (development) work without trait objects.
+///
+/// The `seq_init` callback is invoked with the node's DID string after `build()`
+/// completes, before any publish operation. It should call
+/// `DidDht::initialize_sequence` to recover the BEP44 sequence number from the
+/// persistent store and/or DHT. This prevents sequence number reuse on restart
+/// (which causes BEP44 CAS failures).
 async fn run_full_node_with<D: scp_identity::DidMethod + 'static>(
     domain: String,
     http_addr: SocketAddr,
     custody: Arc<InMemoryKeyCustody>,
+    seq_init: Box<dyn FnOnce(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), scp_identity::IdentityError>> + Send>> + Send>,
     did_method: Arc<D>,
 ) {
     // If SCP_NODE_TLS_SELF_SIGNED=1, use a self-signed certificate for
@@ -327,6 +342,17 @@ async fn run_full_node_with<D: scp_identity::DidMethod + 'static>(
             std::process::exit(1);
         }
     };
+
+    // Initialize BEP44 sequence number from persistent store and/or DHT
+    // BEFORE any publish operation. Without this, a restarting node would
+    // begin from sequence 0, which fails BEP44 CAS against existing records.
+    let did = node.identity().did().to_owned();
+    if let Err(e) = seq_init(did).await {
+        tracing::error!(error = %e, "failed to initialize BEP44 sequence — publishing may fail");
+        // Non-fatal: a new identity has no prior sequence. For existing
+        // identities, the first publish will fail and the operator can
+        // investigate. We log but do not exit.
+    }
 
     tracing::info!(
         did = %node.identity().did(),
