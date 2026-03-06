@@ -59,6 +59,13 @@ const NONCE_EXPIRY_SECS: u64 = 300; // 5 minutes
 /// Maximum age in milliseconds for a block notification to be considered fresh.
 const BLOCK_NOTIFICATION_FRESHNESS_MS: u64 = 30_000; // 30 seconds
 
+/// Maximum age in seconds for a sender key request to be considered fresh.
+///
+/// Matches [`NONCE_EXPIRY_SECS`] so timestamp freshness and nonce dedup windows
+/// are aligned: a request that survived nonce replay should also survive the
+/// freshness check, and vice versa.
+const REQUEST_FRESHNESS_SECS: u64 = NONCE_EXPIRY_SECS;
+
 /// Maximum number of nonces tracked by [`NonceDedup`] to prevent memory exhaustion.
 const NONCE_DEDUP_CAPACITY: usize = 10_000;
 
@@ -75,6 +82,7 @@ const NONCE_DEDUP_CAPACITY: usize = 10_000;
 ///
 /// Signature payload: `SHA-256(context_id || sender_did || "key_epoch" || epoch_BE || signer_key_ref)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SenderKeyEpochAdvance {
     /// The DID of the sender who rotated their key.
     pub sender_did: String,
@@ -100,6 +108,7 @@ pub struct SenderKeyEpochAdvance {
 /// The responder rejects requests with duplicate nonces within a 5-minute
 /// window and echoes the nonce in the response for binding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SenderKeyRequest {
     /// The DID of the member requesting the key.
     pub requester_did: String,
@@ -130,6 +139,7 @@ pub struct SenderKeyRequest {
 /// nonce from the corresponding [`SenderKeyRequest`] to bind the response to
 /// the originating request and prevent response substitution attacks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SenderKeyResponse {
     /// The DID of the sender whose key is being distributed.
     pub sender_did: String,
@@ -154,6 +164,7 @@ pub struct SenderKeyResponse {
 ///
 /// Signature payload: `SHA-256(context_id || "block" || blocker_did || blocked_did || timestamp_BE)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockNotification {
     /// The type discriminator for deserialization.
     #[serde(rename = "type")]
@@ -398,16 +409,86 @@ pub fn verify_sender_key_request(
     verify_ed25519_signature(requester_public_key, &hash, &request.signature)
 }
 
+/// Validates that a [`SenderKeyRequest`] timestamp is within the freshness
+/// window.
+///
+/// Sender key requests older than [`REQUEST_FRESHNESS_SECS`] seconds are
+/// rejected to prevent replay of old requests. Requests with timestamps far
+/// in the future (beyond the freshness window) are also rejected to guard
+/// against clock-skew manipulation.
+///
+/// The freshness window is aligned with [`NONCE_EXPIRY_SECS`] so that
+/// timestamp validation and nonce dedup cover the same time horizon.
+///
+/// # Parameters
+///
+/// - `request` -- The request to validate.
+/// - `now_secs` -- The current Unix timestamp in seconds.
+///
+/// # Errors
+///
+/// Returns [`SenderKeyError::StaleSenderKeyRequest`] if the request
+/// timestamp is outside the freshness window.
+pub const fn validate_sender_key_request_freshness(
+    request: &SenderKeyRequest,
+    now_secs: u64,
+) -> Result<(), SenderKeyError> {
+    // Reject far-future timestamps (clock skew / manipulation).
+    if request.timestamp > now_secs.saturating_add(REQUEST_FRESHNESS_SECS) {
+        return Err(SenderKeyError::StaleSenderKeyRequest);
+    }
+    // Reject stale timestamps.
+    let age_secs = now_secs.saturating_sub(request.timestamp);
+    if age_secs > REQUEST_FRESHNESS_SECS {
+        return Err(SenderKeyError::StaleSenderKeyRequest);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Handle sender key request (responder side)
 // ---------------------------------------------------------------------------
 
-/// Handles an incoming [`SenderKeyRequest`]: verifies the signature, checks
-/// membership and the block list, and HPKE-encrypts the sender key to the
-/// requester's wrapping public key.
+/// Parameters for [`handle_sender_key_request`].
+///
+/// Groups the responder-side context that does not vary per request,
+/// avoiding `clippy::too_many_arguments`.
+pub struct HandleRequestParams<'a, S: BuildHasher = std::collections::hash_map::RandomState> {
+    /// The current sender key to distribute.
+    pub sender_key: &'a SenderKey,
+    /// The sender's full DID.
+    pub sender_did: &'a str,
+    /// The current epoch for the sender key.
+    pub epoch: u64,
+    /// DIDs blocked by this sender. Blocked requesters receive `None`.
+    pub block_list: &'a HashSet<String, S>,
+    /// If `Some`, the requester must be in this set or the request is
+    /// rejected with [`SenderKeyError::NotContextMember`]. Pass `None`
+    /// to disable the membership check (backward compatibility).
+    pub context_members: Option<&'a HashSet<String>>,
+    /// Current Unix timestamp in seconds for freshness validation.
+    pub now_secs: u64,
+}
+
+/// Handles an incoming [`SenderKeyRequest`].
+///
+/// Verifies the signature, validates timestamp freshness, checks nonce
+/// replay, verifies membership and the block list, and HPKE-encrypts
+/// the sender key to the requester's wrapping public key.
 ///
 /// Returns `None` if the requester is blocked (no response, the requester
 /// cannot obtain the key). Returns `Some(serialized_response)` otherwise.
+///
+/// # Replay Protection
+///
+/// Two layers of replay defense:
+///
+/// 1. **Timestamp freshness** — rejects requests with timestamps outside
+///    [`REQUEST_FRESHNESS_SECS`] (past or future), preventing replay of old
+///    requests and guarding against clock-skew manipulation.
+/// 2. **Nonce dedup** — rejects requests whose nonce has been seen within
+///    [`NONCE_EXPIRY_SECS`], preventing replay of recently-valid requests.
+///    After processing, the nonce is recorded in the dedup cache.
 ///
 /// # Sybil Resistance (BLACK-006, §9.16.6)
 ///
@@ -436,19 +517,19 @@ pub fn verify_sender_key_request(
 ///
 /// # Errors
 ///
+/// Returns [`SenderKeyError::StaleSenderKeyRequest`] if the request
+/// timestamp is outside the freshness window.
+/// Returns [`SenderKeyError::ReplayedRequest`] if the request nonce has
+/// already been seen within the dedup window.
 /// Returns [`SenderKeyError::NotContextMember`] if `context_members` is
 /// provided and the requester is not a member.
 /// Returns [`SenderKeyError::VerificationFailed`] if the request signature
 /// is invalid or malformed. Returns other variants for HPKE failures.
-#[allow(clippy::implicit_hasher)] // context_members uses default hasher for ergonomic None inference
 pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
     request: &SenderKeyRequest,
     requester_public_key: &[u8],
-    sender_key: &SenderKey,
-    sender_did: &str,
-    epoch: u64,
-    block_list: &HashSet<String, S>,
-    context_members: Option<&HashSet<String>>,
+    params: &HandleRequestParams<'_, S>,
+    nonce_dedup: &mut NonceDedup,
 ) -> Result<Option<Vec<u8>>, SenderKeyError> {
     // Verify the request signature.
     let valid = verify_sender_key_request(request, requester_public_key)?;
@@ -458,13 +539,21 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
         ));
     }
 
+    // Timestamp freshness: reject requests outside the freshness window.
+    validate_sender_key_request_freshness(request, params.now_secs)?;
+
+    // Nonce replay protection: reject requests with previously-seen nonces.
+    if nonce_dedup.is_replayed(&request.nonce, params.now_secs) {
+        return Err(SenderKeyError::ReplayedRequest);
+    }
+
     // Membership gate (BLACK-006, §9.16.6): reject requests from DIDs
     // that are not context members. This prevents Sybil identities —
     // which bypass per-DID block lists by definition — from obtaining
     // sender keys. The Sybil DID must first pass the context's admission
     // controls (MLS membership, UCAN gating, earned capacity thresholds)
     // before it can even request a key.
-    if let Some(members) = context_members
+    if let Some(members) = params.context_members
         && !members.contains(&request.requester_did)
     {
         return Err(SenderKeyError::NotContextMember {
@@ -473,7 +562,7 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
     }
 
     // Check block list: if requester is blocked, return None (no response).
-    if block_list.contains(&request.requester_did) {
+    if params.block_list.contains(&request.requester_did) {
         return Ok(None);
     }
 
@@ -486,11 +575,11 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
     })?;
 
     // HPKE seal: encrypt the sender key to the requester's wrapping key.
-    let (sealed, ephemeral_pub) = hpke_seal(sender_key.as_bytes(), &wrapping_bytes)?;
+    let (sealed, ephemeral_pub) = hpke_seal(params.sender_key.as_bytes(), &wrapping_bytes)?;
 
     let response = SenderKeyResponse {
-        sender_did: sender_did.to_owned(),
-        epoch,
+        sender_did: params.sender_did.to_owned(),
+        epoch: params.epoch,
         hpke_sealed_key: sealed,
         ephemeral_pubkey: ephemeral_pub.to_vec(),
         request_nonce: request.nonce,
@@ -498,6 +587,11 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
 
     let message = rmp_serde::to_vec_named(&response)
         .map_err(|e| SenderKeyError::SerializationFailed(e.to_string()))?;
+
+    // Record nonce only after successful processing to prevent the dedup
+    // cache from being poisoned by requests that fail for other reasons
+    // (e.g., the requester is blocked or not a member).
+    nonce_dedup.record(request.nonce, params.now_secs);
 
     Ok(Some(message))
 }
@@ -680,7 +774,7 @@ pub const fn validate_block_notification_freshness(
     // Reject future timestamps: saturating_sub would return 0 for future
     // timestamps, bypassing the staleness check. A far-future timestamp
     // would make the notification valid indefinitely.
-    if notification.timestamp > now_ms + BLOCK_NOTIFICATION_FRESHNESS_MS {
+    if notification.timestamp > now_ms.saturating_add(BLOCK_NOTIFICATION_FRESHNESS_MS) {
         return Err(SenderKeyError::StaleBlockNotification);
     }
     let age_ms = now_ms.saturating_sub(notification.timestamp);
@@ -1073,6 +1167,25 @@ mod tests {
         (custody, key)
     }
 
+    /// Creates test fixtures for sender key request handling tests.
+    ///
+    /// Returns `(bob_custody, bob_signing_key, bob_public_key, sender_key)`.
+    async fn setup_request_test_fixtures() -> (
+        InMemoryKeyCustody,
+        KeyHandle,
+        scp_platform::traits::PublicKey,
+        SenderKey,
+    ) {
+        let bob_custody = InMemoryKeyCustody::new();
+        let bob_signing_key = bob_custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .unwrap();
+        let bob_pubkey = bob_custody.public_key(&bob_signing_key).await.unwrap();
+        let sender_key = generate_sender_key();
+        (bob_custody, bob_signing_key, bob_pubkey, sender_key)
+    }
+
     // -------------------------------------------------------------------
     // SenderKeyEpochAdvance tests
     // -------------------------------------------------------------------
@@ -1279,14 +1392,19 @@ mod tests {
 
         // Alice handles the request (no membership gate — backward compat).
         let block_list = HashSet::new();
+        let mut nonce_dedup = NonceDedup::new();
         let response_bytes = handle_sender_key_request(
             &request,
             bob_pubkey.as_bytes(),
-            &sender_key,
-            "did:dht:alice",
-            1,
-            &block_list,
-            None,
+            &HandleRequestParams {
+                sender_key: &sender_key,
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                block_list: &block_list,
+                context_members: None,
+                now_secs: request.timestamp,
+            },
+            &mut nonce_dedup,
         )
         .await
         .unwrap();
@@ -1378,14 +1496,19 @@ mod tests {
         let mut block_list = HashSet::new();
         block_list.insert("did:dht:bob".into());
 
+        let mut nonce_dedup = NonceDedup::new();
         let response = handle_sender_key_request(
             &request,
             bob_pubkey.as_bytes(),
-            &sender_key,
-            "did:dht:alice",
-            1,
-            &block_list,
-            None,
+            &HandleRequestParams {
+                sender_key: &sender_key,
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                block_list: &block_list,
+                context_members: None,
+                now_secs: request.timestamp,
+            },
+            &mut nonce_dedup,
         )
         .await
         .unwrap();
@@ -1424,14 +1547,19 @@ mod tests {
         let mut block_list = HashSet::new();
         block_list.insert("did:dht:dave".into());
 
+        let mut nonce_dedup = NonceDedup::new();
         let response = handle_sender_key_request(
             &request,
             bob_pubkey.as_bytes(),
-            &sender_key,
-            "did:dht:alice",
-            1,
-            &block_list,
-            None,
+            &HandleRequestParams {
+                sender_key: &sender_key,
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                block_list: &block_list,
+                context_members: None,
+                now_secs: request.timestamp,
+            },
+            &mut nonce_dedup,
         )
         .await
         .unwrap();
@@ -1478,14 +1606,19 @@ mod tests {
         members.insert("did:dht:alice".to_owned());
         members.insert("did:dht:bob".to_owned());
 
+        let mut nonce_dedup = NonceDedup::new();
         let result = handle_sender_key_request(
             &request,
             sybil_pubkey.as_bytes(),
-            &sender_key,
-            "did:dht:alice",
-            1,
-            &block_list,
-            Some(&members),
+            &HandleRequestParams {
+                sender_key: &sender_key,
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                block_list: &block_list,
+                context_members: Some(&members),
+                now_secs: request.timestamp,
+            },
+            &mut nonce_dedup,
         )
         .await;
 
@@ -1526,14 +1659,19 @@ mod tests {
         members.insert("did:dht:alice".to_owned());
         members.insert("did:dht:bob".to_owned());
 
+        let mut nonce_dedup = NonceDedup::new();
         let response = handle_sender_key_request(
             &request,
             bob_pubkey.as_bytes(),
-            &sender_key,
-            "did:dht:alice",
-            1,
-            &block_list,
-            Some(&members),
+            &HandleRequestParams {
+                sender_key: &sender_key,
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                block_list: &block_list,
+                context_members: Some(&members),
+                now_secs: request.timestamp,
+            },
+            &mut nonce_dedup,
         )
         .await
         .unwrap();
@@ -1638,14 +1776,19 @@ mod tests {
             }
         });
 
+        let mut nonce_dedup = NonceDedup::new();
         let response = handle_sender_key_request(
             &request,
             sybil_pubkey.as_bytes(),
-            &sender_key,
-            "did:dht:alice",
-            1,
-            &expanded,
-            None,
+            &HandleRequestParams {
+                sender_key: &sender_key,
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                block_list: &expanded,
+                context_members: None,
+                now_secs: request.timestamp,
+            },
+            &mut nonce_dedup,
         )
         .await
         .unwrap();
@@ -1868,14 +2011,19 @@ mod tests {
             rmp_serde::from_slice(&request_result.request_message).unwrap();
 
         // Alice handles Dave's request with the updated block list.
+        let mut nonce_dedup = NonceDedup::new();
         let response = handle_sender_key_request(
             &request,
             dave_pubkey.as_bytes(),
-            &rotate_result.new_key,
-            "did:dht:alice",
-            rotate_result.new_epoch,
-            &block_list,
-            None,
+            &HandleRequestParams {
+                sender_key: &rotate_result.new_key,
+                sender_did: "did:dht:alice",
+                epoch: rotate_result.new_epoch,
+                block_list: &block_list,
+                context_members: None,
+                now_secs: request.timestamp,
+            },
+            &mut nonce_dedup,
         )
         .await
         .unwrap();
@@ -2101,6 +2249,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn future_timestamp_block_notification_rejected() {
+        let (custody, signing_key) = setup().await;
+        let msg = send_block_notification(
+            &custody,
+            &signing_key,
+            "ctx-1",
+            "did:dht:alice",
+            "did:dht:dave",
+        )
+        .await
+        .unwrap();
+
+        let mut notification: BlockNotification = rmp_serde::from_slice(&msg).unwrap();
+        // Set the notification timestamp far ahead of "now" so it exceeds the
+        // freshness window into the future.
+        let now_ms = notification.timestamp;
+        notification.timestamp = now_ms + BLOCK_NOTIFICATION_FRESHNESS_MS + 10_000;
+        let result = validate_block_notification_freshness(&notification, now_ms);
+        assert!(
+            matches!(result, Err(SenderKeyError::StaleBlockNotification)),
+            "future-timestamped notification should be rejected with StaleBlockNotification"
+        );
+    }
+
+    #[tokio::test]
     async fn sender_key_response_echoes_request_nonce() {
         let alice_custody = InMemoryKeyCustody::new();
         let _alice_signing_key = alice_custody
@@ -2135,14 +2308,19 @@ mod tests {
         let request: SenderKeyRequest = rmp_serde::from_slice(&result.request_message).unwrap();
         let original_nonce = request.nonce;
 
+        let mut nonce_dedup = NonceDedup::new();
         let response_bytes = handle_sender_key_request(
             &request,
             requester_pubkey.as_bytes(), // verify requester's signature
-            &sender_key,
-            "did:dht:alice",
-            1,
-            &block_list,
-            None,
+            &HandleRequestParams {
+                sender_key: &sender_key,
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                block_list: &block_list,
+                context_members: None,
+                now_secs: request.timestamp,
+            },
+            &mut nonce_dedup,
         )
         .await
         .unwrap()
@@ -2152,6 +2330,166 @@ mod tests {
         assert_eq!(
             response.request_nonce, original_nonce,
             "response must echo the request nonce"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // validate_sender_key_request_freshness (timestamp + replay)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn fresh_request_passes_freshness_check() {
+        let now = 1_700_000_000u64;
+        let request = SenderKeyRequest {
+            requester_did: "did:dht:bob".to_owned(),
+            sender_did: "did:dht:alice".to_owned(),
+            epoch: 1,
+            wrapping_pubkey: vec![0u8; 32],
+            nonce: [0u8; REQUEST_NONCE_SIZE],
+            timestamp: now,
+            signature: vec![0u8; 64],
+        };
+        assert!(
+            validate_sender_key_request_freshness(&request, now).is_ok(),
+            "request at current time should pass freshness check"
+        );
+    }
+
+    #[test]
+    fn stale_request_rejected_by_freshness_check() {
+        let now = 1_700_000_000u64;
+        let request = SenderKeyRequest {
+            requester_did: "did:dht:bob".to_owned(),
+            sender_did: "did:dht:alice".to_owned(),
+            epoch: 1,
+            wrapping_pubkey: vec![0u8; 32],
+            nonce: [0u8; REQUEST_NONCE_SIZE],
+            timestamp: now,
+            signature: vec![0u8; 64],
+        };
+        // Simulate receiving far in the future.
+        let far_future = now + REQUEST_FRESHNESS_SECS + 1;
+        let result = validate_sender_key_request_freshness(&request, far_future);
+        assert!(
+            matches!(result, Err(SenderKeyError::StaleSenderKeyRequest)),
+            "stale request should be rejected with StaleSenderKeyRequest"
+        );
+    }
+
+    #[test]
+    fn future_timestamp_request_rejected_by_freshness_check() {
+        let now = 1_700_000_000u64;
+        let request = SenderKeyRequest {
+            requester_did: "did:dht:bob".to_owned(),
+            sender_did: "did:dht:alice".to_owned(),
+            epoch: 1,
+            wrapping_pubkey: vec![0u8; 32],
+            nonce: [0u8; REQUEST_NONCE_SIZE],
+            // Timestamp far ahead of "now".
+            timestamp: now + REQUEST_FRESHNESS_SECS + 10_000,
+            signature: vec![0u8; 64],
+        };
+        let result = validate_sender_key_request_freshness(&request, now);
+        assert!(
+            matches!(result, Err(SenderKeyError::StaleSenderKeyRequest)),
+            "future-timestamped request should be rejected with StaleSenderKeyRequest"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_request_rejects_stale_timestamp() {
+        let (bob_custody, bob_signing_key, bob_pubkey, sender_key) =
+            setup_request_test_fixtures().await;
+
+        let request_result = request_sender_key(
+            &bob_custody,
+            &bob_signing_key,
+            "did:dht:bob",
+            "did:dht:alice",
+            1,
+        )
+        .await
+        .unwrap();
+
+        let request: SenderKeyRequest =
+            rmp_serde::from_slice(&request_result.request_message).unwrap();
+
+        let block_list: HashSet<String> = HashSet::new();
+        let mut nonce_dedup = NonceDedup::new();
+        // Simulate receiving the request far in the future.
+        let stale_now = request.timestamp + REQUEST_FRESHNESS_SECS + 100;
+        let result = handle_sender_key_request(
+            &request,
+            bob_pubkey.as_bytes(),
+            &HandleRequestParams {
+                sender_key: &sender_key,
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                block_list: &block_list,
+                context_members: None,
+                now_secs: stale_now,
+            },
+            &mut nonce_dedup,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(SenderKeyError::StaleSenderKeyRequest)),
+            "stale request should be rejected, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_request_rejects_replayed_nonce() {
+        let (bob_custody, bob_signing_key, bob_pubkey, sender_key) =
+            setup_request_test_fixtures().await;
+
+        let request_result = request_sender_key(
+            &bob_custody,
+            &bob_signing_key,
+            "did:dht:bob",
+            "did:dht:alice",
+            1,
+        )
+        .await
+        .unwrap();
+
+        let request: SenderKeyRequest =
+            rmp_serde::from_slice(&request_result.request_message).unwrap();
+
+        let block_list: HashSet<String> = HashSet::new();
+        let mut nonce_dedup = NonceDedup::new();
+
+        let params = HandleRequestParams {
+            sender_key: &sender_key,
+            sender_did: "did:dht:alice",
+            epoch: 1,
+            block_list: &block_list,
+            context_members: None,
+            now_secs: request.timestamp,
+        };
+
+        // First call succeeds.
+        let first = handle_sender_key_request(
+            &request,
+            bob_pubkey.as_bytes(),
+            &params,
+            &mut nonce_dedup,
+        )
+        .await;
+        assert!(first.is_ok(), "first request should succeed");
+
+        // Second call with same nonce should be rejected as replay.
+        let second = handle_sender_key_request(
+            &request,
+            bob_pubkey.as_bytes(),
+            &params,
+            &mut nonce_dedup,
+        )
+        .await;
+        assert!(
+            matches!(second, Err(SenderKeyError::ReplayedRequest)),
+            "replayed request should be rejected, got {second:?}"
         );
     }
 

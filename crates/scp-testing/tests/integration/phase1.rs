@@ -285,14 +285,19 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
         serde_json::from_slice(&req_result.request_message).unwrap();
 
     let block_list: HashSet<String> = HashSet::new();
+    let mut nonce_dedup = scp_core::crypto::sender_keys::NonceDedup::new();
     let resp_bytes = handle_sender_key_request(
         &sk_request,
         &bob_pubkey,
-        &alice_sender_key,
-        &alice_id.did,
-        1,
-        &block_list,
-        None,
+        &scp_core::crypto::sender_keys::HandleRequestParams {
+            sender_key: &alice_sender_key,
+            sender_did: &alice_id.did,
+            epoch: 1,
+            block_list: &block_list,
+            context_members: None,
+            now_secs: sk_request.timestamp,
+        },
+        &mut nonce_dedup,
     )
     .await
     .unwrap()

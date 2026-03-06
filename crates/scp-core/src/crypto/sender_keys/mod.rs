@@ -36,11 +36,13 @@ pub use broadcast::{
 };
 pub use encrypt::{decrypt_sender_layer, encrypt_sender_layer};
 pub use key_protocol::{
-    BlockNotification, NonceDedup, RotateForBlockParams, RotateForBlockResult,
+    BlockNotification, HandleRequestParams, NonceDedup, RotateForBlockParams,
+    RotateForBlockResult,
     SenderKeyEpochAdvance, SenderKeyRequest, SenderKeyRequestResult, SenderKeyResponse,
     expand_block_list, handle_sender_key_request, open_sender_key_response,
     publish_sender_key_epoch_advance, request_sender_key, rotate_sender_key_for_block,
-    send_block_notification, validate_block_notification_freshness, verify_block_notification,
+    send_block_notification, validate_block_notification_freshness,
+    validate_sender_key_request_freshness, verify_block_notification,
     verify_epoch_advance, verify_sender_key_request,
 };
 
@@ -162,6 +164,13 @@ pub enum SenderKeyError {
     /// A block notification timestamp is too old to be considered fresh.
     #[error("stale block notification: timestamp outside freshness window")]
     StaleBlockNotification,
+
+    /// A sender key request timestamp is outside the freshness window.
+    ///
+    /// The request is either too old (stale) or too far in the future,
+    /// indicating clock skew or a replay attempt.
+    #[error("stale sender key request: timestamp outside freshness window")]
+    StaleSenderKeyRequest,
 
     /// The epoch counter overflowed (reached `u64::MAX`).
     #[error("epoch counter overflow: already at u64::MAX")]

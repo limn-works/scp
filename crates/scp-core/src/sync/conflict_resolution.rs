@@ -263,7 +263,9 @@ pub enum ConflictResolutionError {
 /// - Two `ChangeRole` actions for the same DID with different target roles.
 /// - Two `ModifyCeiling` actions with different ceiling sets.
 /// - A `RemoveMember` and a `ChangeRole` targeting the same DID.
+/// - Two `RemoveMember` actions targeting the same member (concurrent removal).
 /// - Two `RemoveMember` actions targeting each other's proposers (mutual removal).
+/// - Two `RotateContentKeys` actions (global property mutation).
 #[must_use]
 pub fn actions_conflict(
     a: &GovernanceAction,
@@ -851,6 +853,42 @@ mod tests {
             reason: None,
         };
         assert!(!actions_conflict(
+            &a,
+            &did("did:dht:alice"),
+            &b,
+            &did("did:dht:bob"),
+        ));
+    }
+
+    #[test]
+    fn conflicting_same_target_removal_by_different_proposers() {
+        // Two different admins both propose to remove the same member.
+        let a = GovernanceAction::RemoveMember {
+            did: did("did:dht:carol"),
+            reason: Some("spam".to_owned()),
+        };
+        let b = GovernanceAction::RemoveMember {
+            did: did("did:dht:carol"),
+            reason: Some("inactive".to_owned()),
+        };
+        assert!(actions_conflict(
+            &a,
+            &did("did:dht:alice"),
+            &b,
+            &did("did:dht:bob"),
+        ));
+    }
+
+    #[test]
+    fn conflicting_rotate_content_keys() {
+        // Two concurrent key rotations are always conflicting (global property).
+        let a = GovernanceAction::RotateContentKeys {
+            reason: Some("compromise detected".to_owned()),
+        };
+        let b = GovernanceAction::RotateContentKeys {
+            reason: Some("periodic rotation".to_owned()),
+        };
+        assert!(actions_conflict(
             &a,
             &did("did:dht:alice"),
             &b,
