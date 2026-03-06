@@ -166,13 +166,55 @@ impl std::fmt::Display for MemoryScope {
 /// Governance model for a context, controlling how administrative decisions
 /// are made.
 ///
-/// Phase 2 implements only `SingleAdmin`. More sophisticated governance models
-/// (multi-admin, consensus, delegation) will be added in later phases.
+/// Four concrete models are supported (ADR-031, spec §5.9):
+/// - `SingleAdmin` — single admin authority, proposals auto-execute.
+/// - `Threshold` — M-of-N approval from designated signers.
+/// - `Majority` — >50% approval from eligible voters.
+/// - `Unanimity` — all eligible voters must approve.
+///
+/// The model is declared at creation and immutable thereafter. Changing the
+/// governance model requires creating a new context.
+///
+/// Note: this enum is a *selector* — it carries the creation-time parameters
+/// needed to instantiate a [`GovernanceEngine`](super::governance::GovernanceEngine).
+/// The richer [`GovernanceModelConfig`](super::governance::GovernanceModelConfig)
+/// carries runtime state (e.g., `admin_did`) and is not suitable for
+/// `ContextParams` (templates cannot know `admin_did` at definition time).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GovernanceModel {
     /// A single administrator controls all governance decisions. The context
     /// creator is the admin by default.
     SingleAdmin,
+
+    /// M-of-N threshold approval. A fixed set of designated signers;
+    /// a proposal passes when at least `threshold` of them approve.
+    ///
+    /// Validation: `threshold` must be in `[1, signers.len()]`.
+    /// `signers` must be non-empty.
+    Threshold {
+        /// Minimum number of approvals required.
+        threshold: u32,
+        /// The set of DIDs authorized to vote.
+        signers: Vec<DID>,
+    },
+
+    /// Majority vote among eligible voters. Proposal passes when
+    /// approvals > 50% of `eligible_voters`.
+    ///
+    /// `eligible_voters` must be non-empty.
+    Majority {
+        /// The set of DIDs eligible to vote.
+        eligible_voters: Vec<DID>,
+    },
+
+    /// Unanimity among eligible voters. Every voter must approve;
+    /// a single rejection defeats the proposal immediately.
+    ///
+    /// `eligible_voters` must be non-empty.
+    Unanimity {
+        /// The set of DIDs that must all approve.
+        eligible_voters: Vec<DID>,
+    },
 }
 
 // ---------------------------------------------------------------------------

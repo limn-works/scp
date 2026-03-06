@@ -336,8 +336,14 @@ impl TtlExtensionProposal {
         let consent_mode = consent_mode_for_member_count(member_count);
         let required_count = match consent_mode {
             ExtensionConsentMode::AllMember => member_count,
-            ExtensionConsentMode::Governance => match governance {
+            ExtensionConsentMode::Governance => match &governance {
                 GovernanceModel::SingleAdmin => 1,
+                GovernanceModel::Threshold { threshold, .. } => *threshold as usize,
+                GovernanceModel::Majority { eligible_voters } => {
+                    // >50% of eligible voters (rounding up).
+                    eligible_voters.len().div_ceil(2)
+                }
+                GovernanceModel::Unanimity { eligible_voters } => eligible_voters.len(),
             },
         };
         Self {

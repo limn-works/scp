@@ -1380,6 +1380,7 @@ mod tests {
             threshold_signers: Vec::new(),
             threshold_value: 0,
             pruning_policy: None,
+            governance_model_config: None,
         }
     }
 
