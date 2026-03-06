@@ -26,6 +26,18 @@
         "SCP-BCH-008",
         "SCP-BCH-009"
       ]
+    },
+    {
+      "id": "gate-bridge-sender-key",
+      "name": "Bridge Sender Key Encryption Model",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-BCH-010",
+        "SCP-BCH-011",
+        "SCP-BCH-012",
+        "SCP-BCH-013"
+      ]
     }
   ],
   "stories": [
@@ -467,6 +479,175 @@
         {
           "file": ".docs/adrs/phase-5.md",
           "section": "## ADR-023: Bridge Connector Protocol"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-BCH-010",
+      "title": "Generate per-shadow sender key on shadow creation",
+      "gate": "gate-bridge-sender-key",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/bridge/shadow.rs",
+        "crates/scp-core/src/crypto/sender_keys/mod.rs"
+      ],
+      "description": "When create_shadow() is called, generate an AES-256-GCM sender key for the new shadow identity and store it in SenderKeyStore keyed by (context_id, shadow_did). This is the foundational key material for the bridge encryption model specified in §12.6.1: shadow identity messages use the sender key layer (§9.16) rather than MLS encryption. Each shadow gets its own sender key so that key compromise of one shadow does not affect others. The generated key must be cryptographically random (32 bytes from the platform CSPRNG).",
+      "acceptanceCriteria": [
+        "create_shadow() generates a 32-byte AES-256-GCM sender key using the platform CSPRNG",
+        "The generated sender key is stored in SenderKeyStore keyed by (context_id, shadow_did)",
+        "Each shadow identity receives a unique sender key — no key reuse across shadows",
+        "Sender key generation failure causes create_shadow() to return an error (no shadow created without a key)",
+        "The sender key is zeroized on drop (Zeroizing wrapper or equivalent)",
+        "Unit tests verify sender key is stored after shadow creation",
+        "Unit tests verify distinct shadows in the same context receive distinct keys",
+        "Unit tests verify shadow creation fails gracefully when SenderKeyStore is unavailable"
+      ],
+      "actionItems": [
+        "Add sender key generation logic to create_shadow() in bridge/shadow.rs",
+        "Generate 32 random bytes via the platform CSPRNG for the AES-256-GCM key",
+        "Store the key in SenderKeyStore with (context_id, shadow_did) as the composite key",
+        "Wrap key material in Zeroizing for safe memory handling",
+        "Add error variant for sender key generation/storage failure",
+        "Add unit tests for key generation, storage, uniqueness, and failure paths"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "### 12.6.1 Bridge Encryption Model"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-BCH-011",
+      "title": "Distribute shadow sender keys via pull-based protocol",
+      "gate": "gate-bridge-sender-key",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/crypto/sender_keys/key_protocol.rs",
+        "crates/scp-core/src/bridge/mod.rs"
+      ],
+      "description": "Native members request shadow sender keys via SenderKeyRequest. The bridge responds with the shadow's sender key wrapped via HPKE. This reuses the existing pull-based sender key distribution protocol specified in §9.16.2: SenderKeyRequest from native member, SenderKeyResponse from bridge containing the HPKE-wrapped key. The bridge operator's identity key is the HPKE sender; the requesting member's identity key is the HPKE recipient. Domain separation label for HPKE must use \"scp-sender-key-v1\" per the existing protocol. New members joining a bridged context automatically request sender keys for all active shadows.",
+      "acceptanceCriteria": [
+        "Native members can send SenderKeyRequest for a shadow's sender key by (context_id, shadow_did)",
+        "Bridge handles SenderKeyRequest by retrieving the shadow's sender key from SenderKeyStore and wrapping it via HPKE",
+        "HPKE wrapping uses the bridge operator's identity key as sender and the requesting member's identity key as recipient",
+        "HPKE domain separation label is \"scp-sender-key-v1\"",
+        "SenderKeyResponse contains the HPKE-wrapped sender key and is routed to the requesting member",
+        "Members joining a bridged context request sender keys for all active shadows",
+        "SenderKeyRequest for a non-existent shadow returns an error (not a silent failure)",
+        "Unit tests verify SenderKeyRequest/Response roundtrip with HPKE wrapping and unwrapping",
+        "Unit tests verify domain separation label is correctly applied"
+      ],
+      "actionItems": [
+        "Extend key_protocol.rs to handle SenderKeyRequest for shadow DIDs routed to the bridge operator",
+        "Implement bridge-side handler that retrieves the shadow's sender key and wraps via HPKE",
+        "Ensure HPKE uses \"scp-sender-key-v1\" domain separation label",
+        "Add logic for new-member-join to request all active shadow sender keys",
+        "Add error handling for missing shadow or unavailable key",
+        "Add unit tests for request/response roundtrip, domain separation, and error paths"
+      ],
+      "blockedBy": [
+        "SCP-BCH-010"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "### 12.6.1 Bridge Encryption Model"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-BCH-012",
+      "title": "Construct sender-key-encrypted envelopes for shadow messages",
+      "gate": "gate-bridge-sender-key",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/bridge/mod.rs",
+        "crates/scp-core/src/envelope/"
+      ],
+      "description": "POST /v1/scp/bridge/message constructs a sender-key-encrypted envelope (not MLS) for shadow messages. AES-256-GCM encryption with the shadow's sender key, random 12-byte nonce per message, BridgeProvenance attached per §12.5. The envelope is distinguishable from MLS envelopes by structure: sender-key-encrypted envelopes contain a sender key ciphertext with the shadow's DID in the sender field, while MLS-encrypted envelopes contain an MLS ciphertext payload (§12.6.1). The receiver uses the envelope structure to select the correct decryption path — MLS for native members, sender key for shadow identities. Both paths already exist in the protocol.",
+      "acceptanceCriteria": [
+        "POST /v1/scp/bridge/message constructs a sender-key-encrypted envelope using the shadow's AES-256-GCM sender key",
+        "Each envelope uses a unique random 12-byte nonce generated from the platform CSPRNG",
+        "BridgeProvenance is attached to the envelope per §12.5 via mark_bridge_provenance()",
+        "The envelope's sender field contains the shadow's DID",
+        "Sender-key-encrypted envelopes are structurally distinguishable from MLS-encrypted envelopes",
+        "Receivers can select the correct decryption path (sender key vs MLS) based on envelope structure alone",
+        "Nonce reuse is prevented — each message gets a fresh random nonce",
+        "Encryption failure (e.g., missing sender key) returns an appropriate error to the bridge endpoint",
+        "Unit tests verify envelope construction with correct AES-256-GCM ciphertext",
+        "Unit tests verify envelope is decryptable with the shadow's sender key",
+        "Unit tests verify BridgeProvenance is present on constructed envelopes",
+        "Unit tests verify sender-key envelopes are distinguishable from MLS envelopes"
+      ],
+      "actionItems": [
+        "Implement sender-key envelope construction in the bridge message handler",
+        "Retrieve the shadow's sender key from SenderKeyStore by (context_id, shadow_did)",
+        "Encrypt message content with AES-256-GCM using the sender key and a random 12-byte nonce",
+        "Attach BridgeProvenance via mark_bridge_provenance()",
+        "Set the envelope sender field to the shadow's DID",
+        "Ensure envelope structure is distinguishable from MLS envelopes per §12.6.1",
+        "Add unit tests for encryption, decryption roundtrip, provenance attachment, and envelope type discrimination"
+      ],
+      "blockedBy": [
+        "SCP-BCH-010",
+        "SCP-BCH-003"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "### 12.6.1 Bridge Encryption Model"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-BCH-013",
+      "title": "Add bridge_operator_did to context metadata on bridge registration",
+      "gate": "gate-bridge-sender-key",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-core/src/bridge/registration.rs",
+        "crates/scp-core/src/context/metadata.rs"
+      ],
+      "description": "When register_bridge() succeeds, add the operator's DID to context metadata (§5.7) so that context members can see bridge presence and evaluate trust accordingly. Per §12.6.1: \"Context metadata (§5.7) MUST include bridge_operator_did when a bridge is registered.\" This is a MUST-level requirement. The bridge_operator_did field is added to context metadata and is visible to all members, including in pre-join context previews. If multiple bridges are registered, all operator DIDs are listed. On bridge deregistration, the operator's DID is removed from context metadata.",
+      "acceptanceCriteria": [
+        "register_bridge() adds bridge_operator_did to context metadata (§5.7) on successful registration",
+        "bridge_operator_did is visible to all context members",
+        "bridge_operator_did is visible in pre-join context previews",
+        "Multiple bridge registrations result in all operator DIDs listed in context metadata",
+        "Bridge deregistration removes the operator's DID from context metadata",
+        "Duplicate bridge registration by the same operator does not create duplicate entries in metadata",
+        "Context metadata update is recorded as a context event",
+        "Unit tests verify bridge_operator_did appears in context metadata after registration",
+        "Unit tests verify bridge_operator_did is removed from context metadata after deregistration",
+        "Unit tests verify multiple operator DIDs are correctly listed for multiple bridges"
+      ],
+      "actionItems": [
+        "Add bridge_operator_did field (or list) to context metadata struct in context/metadata.rs",
+        "Update register_bridge() in bridge/registration.rs to write operator DID to context metadata",
+        "Update deregister_bridge() to remove operator DID from context metadata",
+        "Handle deduplication for same-operator re-registration",
+        "Ensure context metadata change emits a context event",
+        "Add unit tests for registration, deregistration, multiple bridges, and deduplication"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "### 12.6.1 Bridge Encryption Model"
         }
       ],
       "details": {}
