@@ -75,6 +75,7 @@ pub struct Provenance {
 /// All fields are serialized with `MessagePack` via `rmp-serde`. Binary fields
 /// use `serde_bytes` for efficient `MessagePack` binary encoding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InnerEnvelope {
     /// The SCP context identifier.
     pub context_id: String,
