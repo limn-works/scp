@@ -1,6 +1,6 @@
 {
   "project": "scp",
-  "description": "Cooperative mode HTTP binding for bridge connectors: implement the six-endpoint REST API specified in §12.10 as HTTP handlers in scp-node. Platforms implement the shadow/message/attest/status/webhook endpoints; scp-node hosts the bridge node that mediates between these endpoints and SCP protocol operations. Authentication via DID-signed bearer tokens. Webhook receiver for platform-initiated events. Integration with existing bridge submodules (registration, shadow, claiming, provenance).",
+  "description": "Cooperative mode HTTP binding for bridge connectors: implement the six-endpoint REST API specified in \u00a712.10 as HTTP handlers in scp-node. Platforms implement the shadow/message/attest/status/webhook endpoints; scp-node hosts the bridge node that mediates between these endpoints and SCP protocol operations. Authentication via DID-signed bearer tokens. Webhook receiver for platform-initiated events. Integration with existing bridge submodules (registration, shadow, claiming, provenance).",
   "gates": [
     {
       "id": "gate-bridge-http-binding",
@@ -40,7 +40,7 @@
         "crates/scp-node/src/bridge_auth.rs",
         "crates/scp-node/src/lib.rs"
       ],
-      "description": "Implement the authentication layer specified in §12.10.2. The bridge operator authenticates using DID-signed JWTs in the Authorization header. The JWT contains iss (operator DID), aud (node URL), iat, exp, scp_bridge_id, and scp_context_id. The node verifies the JWT signature against the operator's DID document (§3.2). Token lifetime MUST NOT exceed 1 hour. For webhook callbacks (platform to bridge node), verify Ed25519 signatures in the X-SCP-Signature header against the platform's pre-registered public key.\n\nThis story is foundational — all other bridge HTTP endpoints depend on it for authentication.",
+      "description": "Implement the authentication layer specified in \u00a712.10.2. The bridge operator authenticates using DID-signed JWTs in the Authorization header. The JWT contains iss (operator DID), aud (node URL), iat, exp, scp_bridge_id, and scp_context_id. The node verifies the JWT signature against the operator's DID document (\u00a73.2). Token lifetime MUST NOT exceed 1 hour. For webhook callbacks (platform to bridge node), verify Ed25519 signatures in the X-SCP-Signature header against the platform's pre-registered public key.\n\nThis story is foundational \u2014 all other bridge HTTP endpoints depend on it for authentication.",
       "acceptanceCriteria": [
         "BridgeAuthMiddleware extracts bearer token from Authorization header and validates JWT structure",
         "JWT signature is verified against the operator's DID document resolved via scp-identity",
@@ -63,11 +63,23 @@
       ],
       "blockedBy": [],
       "sources": [
-        { "file": ".docs/specs/12-platform-bridge-connectors.md", "section": "### 12.10.2 Authentication" },
-        { "file": ".docs/specs/12-platform-bridge-connectors.md", "section": "### 12.10.3 Error Format" },
-        { "file": ".docs/adrs/phase-5.md", "section": "## ADR-023: Bridge Connector Protocol" }
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "### 12.10.2 Authentication"
+        },
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "### 12.10.3 Error Format"
+        },
+        {
+          "file": ".docs/adrs/phase-5.md",
+          "section": "## ADR-023: Bridge Connector Protocol"
+        }
       ],
-      "details": {}
+      "details": {},
+      "blocked_by_issues": [
+        377
+      ]
     },
     {
       "id": "SCP-BCH-002",
@@ -80,12 +92,12 @@
         "crates/scp-node/src/bridge_handlers.rs",
         "crates/scp-node/src/lib.rs"
       ],
-      "description": "Implement the shadow creation endpoint specified in §12.10.4. Accepts platform_handle, platform_user_id, and optional metadata. Delegates to create_shadow() in scp-core/bridge/shadow.rs. Returns the created shadow identity with shadow_id, attributed_role (observer), and created_at. Idempotent: if a shadow with the same platform_user_id already exists, returns 200 with the existing shadow instead of 201.",
+      "description": "Implement the shadow creation endpoint specified in \u00a712.10.4. Accepts platform_handle, platform_user_id, and optional metadata. Delegates to create_shadow() in scp-core/bridge/shadow.rs. Returns the created shadow identity with shadow_id, attributed_role (observer), and created_at. Idempotent: if a shadow with the same platform_user_id already exists, returns 200 with the existing shadow instead of 201.",
       "acceptanceCriteria": [
         "POST /v1/scp/bridge/shadow accepts JSON body with platform_handle (required), platform_user_id (required), metadata (optional)",
         "Delegates to create_shadow() in scp-core/bridge/shadow.rs",
         "Returns 201 Created with shadow_id, platform_handle, platform_user_id, attributed_role, created_at on success",
-        "attributed_role defaults to 'observer' per §12.3",
+        "attributed_role defaults to 'observer' per \u00a712.3",
         "Idempotent: existing shadow for same platform_user_id returns 200 OK with existing shadow data",
         "Returns 400 INVALID_REQUEST when required fields are missing",
         "Returns 401 BRIDGE_NOT_AUTHORIZED when authentication fails",
@@ -99,12 +111,23 @@
         "Wire handler into axum router at /v1/scp/bridge/shadow",
         "Add unit tests for all response paths"
       ],
-      "blockedBy": ["SCP-BCH-001"],
-      "sources": [
-        { "file": ".docs/specs/12-platform-bridge-connectors.md", "section": "#### POST /v1/scp/bridge/shadow" },
-        { "file": ".docs/specs/12-platform-bridge-connectors.md", "section": "## 12.3 Shadow Identities" }
+      "blockedBy": [
+        "SCP-BCH-001"
       ],
-      "details": {}
+      "sources": [
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "#### POST /v1/scp/bridge/shadow"
+        },
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "## 12.3 Shadow Identities"
+        }
+      ],
+      "details": {},
+      "blocked_by": [
+        "SCP-BCH-001"
+      ]
     },
     {
       "id": "SCP-BCH-003",
@@ -116,7 +139,7 @@
       "files": [
         "crates/scp-node/src/bridge_handlers.rs"
       ],
-      "description": "Implement the message emission endpoint specified in §12.10.4. Accepts shadow_id, content, content_type, optional platform_message_id, and optional platform_timestamp. The bridge node constructs the SCP envelope with BridgeProvenance (§12.5) via mark_bridge_provenance() from scp-core/bridge/provenance.rs and publishes to the context. Returns 202 Accepted with message_id, sequence, and bridge_provenance. Handles claimed shadows by reflecting the claimed provenance status.",
+      "description": "Implement the message emission endpoint specified in \u00a712.10.4. Accepts shadow_id, content, content_type, optional platform_message_id, and optional platform_timestamp. The bridge node constructs the SCP envelope with BridgeProvenance (\u00a712.5) via mark_bridge_provenance() from scp-core/bridge/provenance.rs and publishes to the context. Returns 202 Accepted with message_id, sequence, and bridge_provenance. Handles claimed shadows by reflecting the claimed provenance status.",
       "acceptanceCriteria": [
         "POST /v1/scp/bridge/message accepts JSON body with shadow_id (required), content (required), content_type (required), platform_message_id (optional), platform_timestamp (optional)",
         "Constructs BridgeProvenance via mark_bridge_provenance() with correct originating_platform, bridge_mode, operator_did, and shadow_status",
@@ -134,12 +157,24 @@
         "Wire handler into axum router at /v1/scp/bridge/message",
         "Add unit tests for all response paths including claimed shadow handling"
       ],
-      "blockedBy": ["SCP-BCH-001", "SCP-BCH-002"],
-      "sources": [
-        { "file": ".docs/specs/12-platform-bridge-connectors.md", "section": "#### POST /v1/scp/bridge/message" },
-        { "file": ".docs/specs/12-platform-bridge-connectors.md", "section": "## 12.5 Trust and Provenance for Bridged Content" }
+      "blockedBy": [
+        "SCP-BCH-001",
+        "SCP-BCH-002"
       ],
-      "details": {}
+      "sources": [
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "#### POST /v1/scp/bridge/message"
+        },
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "## 12.5 Trust and Provenance for Bridged Content"
+        }
+      ],
+      "details": {},
+      "blocked_by": [
+        "SCP-BCH-001"
+      ]
     },
     {
       "id": "SCP-BCH-004",
@@ -151,7 +186,7 @@
       "files": [
         "crates/scp-node/src/bridge_handlers.rs"
       ],
-      "description": "Implement the attestation endpoint specified in §12.10.4. The platform vouches for a user's identity by providing attestation evidence (evidence_type, verification_method, verified_at, platform_confidence, optional additional_signals). The bridge node produces an IdentityLink attestation (§3.5) signed by the bridge operator's DID. This attestation feeds into the shadow claiming flow — a user who later joins SCP can present it to claim their shadow. Attestation expiry defaults to 24 hours.",
+      "description": "Implement the attestation endpoint specified in \u00a712.10.4. The platform vouches for a user's identity by providing attestation evidence (evidence_type, verification_method, verified_at, platform_confidence, optional additional_signals). The bridge node produces an IdentityLink attestation (\u00a73.5) signed by the bridge operator's DID. This attestation feeds into the shadow claiming flow \u2014 a user who later joins SCP can present it to claim their shadow. Attestation expiry defaults to 24 hours.",
       "acceptanceCriteria": [
         "POST /v1/scp/bridge/attest accepts JSON body with platform_handle (required), platform_user_id (required), attestation_evidence (required)",
         "attestation_evidence must contain evidence_type, verification_method, verified_at, platform_confidence",
@@ -168,12 +203,23 @@
         "Wire handler into axum router at /v1/scp/bridge/attest",
         "Add unit tests for attestation creation and validation"
       ],
-      "blockedBy": ["SCP-BCH-001"],
-      "sources": [
-        { "file": ".docs/specs/12-platform-bridge-connectors.md", "section": "#### POST /v1/scp/bridge/attest" },
-        { "file": ".docs/specs/12-platform-bridge-connectors.md", "section": "## 12.3 Shadow Identities" }
+      "blockedBy": [
+        "SCP-BCH-001"
       ],
-      "details": {}
+      "sources": [
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "#### POST /v1/scp/bridge/attest"
+        },
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "## 12.3 Shadow Identities"
+        }
+      ],
+      "details": {},
+      "blocked_by": [
+        "SCP-BCH-001"
+      ]
     },
     {
       "id": "SCP-BCH-005",
@@ -185,7 +231,7 @@
       "files": [
         "crates/scp-node/src/bridge_handlers.rs"
       ],
-      "description": "Implement the bridge status and shadow deletion endpoints specified in §12.10.4. The status endpoint returns bridge_id, status, platform, mode, operator_did, registered_at, shadow_count, rate_limits, and shadows array. The delete endpoint removes a shadow identity (historical actions remain in event log), returns 204 on success, 404 if not found, 409 if claimed. Deletion is idempotent (re-deleting returns 204). Both endpoints delegate to existing scp-core/bridge/ functions.",
+      "description": "Implement the bridge status and shadow deletion endpoints specified in \u00a712.10.4. The status endpoint returns bridge_id, status, platform, mode, operator_did, registered_at, shadow_count, rate_limits, and shadows array. The delete endpoint removes a shadow identity (historical actions remain in event log), returns 204 on success, 404 if not found, 409 if claimed. Deletion is idempotent (re-deleting returns 204). Both endpoints delegate to existing scp-core/bridge/ functions.",
       "acceptanceCriteria": [
         "GET /v1/scp/bridge/status returns 200 with bridge_id, status, platform, mode, operator_did, registered_at, shadow_count, rate_limits, shadows array",
         "shadows array includes shadow_id, platform_handle, attributed_role, provenance_status, created_at for each shadow",
@@ -204,12 +250,24 @@
         "Wire handlers into axum router",
         "Add unit tests for all response paths"
       ],
-      "blockedBy": ["SCP-BCH-001", "SCP-BCH-002"],
-      "sources": [
-        { "file": ".docs/specs/12-platform-bridge-connectors.md", "section": "#### GET /v1/scp/bridge/status" },
-        { "file": ".docs/specs/12-platform-bridge-connectors.md", "section": "#### DELETE /v1/scp/bridge/shadow/{shadow_id}" }
+      "blockedBy": [
+        "SCP-BCH-001",
+        "SCP-BCH-002"
       ],
-      "details": {}
+      "sources": [
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "#### GET /v1/scp/bridge/status"
+        },
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "#### DELETE /v1/scp/bridge/shadow/{shadow_id}"
+        }
+      ],
+      "details": {},
+      "blocked_by": [
+        "SCP-BCH-001"
+      ]
     },
     {
       "id": "SCP-BCH-006",
@@ -223,12 +281,12 @@
         "crates/scp-node/src/bridge_webhook.rs",
         "crates/scp-node/src/lib.rs"
       ],
-      "description": "Implement the webhook receiver specified in §12.10.4. Accepts platform-initiated events with event_type (message, presence, identity_update, user_departed, message_edit, message_delete), event_id (for deduplication), timestamp, and event-specific payload. Authentication via X-SCP-Signature header (§12.10.2). Deduplication by event_id. Must respond within 5 seconds; events requiring longer processing are queued internally. Returns accepted/rejected status with reason.",
+      "description": "Implement the webhook receiver specified in \u00a712.10.4. Accepts platform-initiated events with event_type (message, presence, identity_update, user_departed, message_edit, message_delete), event_id (for deduplication), timestamp, and event-specific payload. Authentication via X-SCP-Signature header (\u00a712.10.2). Deduplication by event_id. Must respond within 5 seconds; events requiring longer processing are queued internally. Returns accepted/rejected status with reason.",
       "acceptanceCriteria": [
         "POST /v1/scp/bridge/webhook accepts JSON body with event_type (required), event_id (required), timestamp (required), payload (required)",
         "Supports event types: message, presence, identity_update, user_departed, message_edit, message_delete",
         "Verifies X-SCP-Signature header via Ed25519 signature over raw request body",
-        "Deduplicates events by event_id — repeated delivery of same event_id returns accepted: true without reprocessing",
+        "Deduplicates events by event_id \u2014 repeated delivery of same event_id returns accepted: true without reprocessing",
         "Returns 200 with accepted: true and event_id on successful acceptance",
         "Returns 200 with accepted: false, event_id, and reason when event is rejected (e.g., unknown user)",
         "Response time is under 5 seconds; longer-running processing is queued internally",
@@ -245,12 +303,24 @@
         "Wire handler into axum router at /v1/scp/bridge/webhook",
         "Add unit tests for all event types and deduplication"
       ],
-      "blockedBy": ["SCP-BCH-001", "SCP-BCH-002"],
-      "sources": [
-        { "file": ".docs/specs/12-platform-bridge-connectors.md", "section": "#### POST /v1/scp/bridge/webhook" },
-        { "file": ".docs/specs/12-platform-bridge-connectors.md", "section": "### 12.10.2 Authentication" }
+      "blockedBy": [
+        "SCP-BCH-001",
+        "SCP-BCH-002"
       ],
-      "details": {}
+      "sources": [
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "#### POST /v1/scp/bridge/webhook"
+        },
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "### 12.10.2 Authentication"
+        }
+      ],
+      "details": {},
+      "blocked_by": [
+        "SCP-BCH-001"
+      ]
     },
     {
       "id": "SCP-BCH-007",
@@ -264,7 +334,7 @@
         "crates/scp-node/src/lib.rs",
         "crates/scp-node/tests/bridge_integration.rs"
       ],
-      "description": "Wire all bridge HTTP handlers into the scp-node axum router under the /v1/scp/bridge/ prefix. Add integration tests that exercise the full lifecycle: register bridge, create shadow, emit message, attest identity, check status, receive webhook event, delete shadow. Verify provenance chain is correctly constructed end-to-end. Verify authentication is enforced on all endpoints. Verify error responses conform to §12.10.3.",
+      "description": "Wire all bridge HTTP handlers into the scp-node axum router under the /v1/scp/bridge/ prefix. Add integration tests that exercise the full lifecycle: register bridge, create shadow, emit message, attest identity, check status, receive webhook event, delete shadow. Verify provenance chain is correctly constructed end-to-end. Verify authentication is enforced on all endpoints. Verify error responses conform to \u00a712.10.3.",
       "acceptanceCriteria": [
         "All bridge endpoints are mounted under /v1/scp/bridge/ in the scp-node axum router",
         "Bridge auth middleware is applied to all bridge endpoints",
@@ -280,15 +350,37 @@
         "Apply BridgeAuthMiddleware to the bridge route group",
         "Create bridge_integration.rs with end-to-end lifecycle test",
         "Add test helpers for constructing DID-signed JWTs",
-        "Verify all error responses conform to §12.10.3 format"
+        "Verify all error responses conform to \u00a712.10.3 format"
       ],
-      "blockedBy": ["SCP-BCH-002", "SCP-BCH-003", "SCP-BCH-004", "SCP-BCH-005", "SCP-BCH-006"],
+      "blockedBy": [
+        "SCP-BCH-002",
+        "SCP-BCH-003",
+        "SCP-BCH-004",
+        "SCP-BCH-005",
+        "SCP-BCH-006"
+      ],
       "sources": [
-        { "file": ".docs/specs/12-platform-bridge-connectors.md", "section": "## 12.10 Cooperative Mode HTTP Binding" },
-        { "file": ".docs/specs/12-platform-bridge-connectors.md", "section": "### 12.10.5 Bridge Node Lifecycle" },
-        { "file": ".docs/adrs/phase-5.md", "section": "## ADR-023: Bridge Connector Protocol" }
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "## 12.10 Cooperative Mode HTTP Binding"
+        },
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "### 12.10.5 Bridge Node Lifecycle"
+        },
+        {
+          "file": ".docs/adrs/phase-5.md",
+          "section": "## ADR-023: Bridge Connector Protocol"
+        }
       ],
-      "details": {}
+      "details": {},
+      "blocked_by": [
+        "SCP-BCH-002",
+        "SCP-BCH-003",
+        "SCP-BCH-004",
+        "SCP-BCH-005",
+        "SCP-BCH-006"
+      ]
     },
     {
       "id": "SCP-BCH-008",
@@ -301,7 +393,7 @@
         "crates/scp-core/src/bridge/credentials.rs",
         "crates/scp-core/src/bridge/mod.rs"
       ],
-      "description": "Implement the BridgeCredentialStore trait specified in §12.11. The trait defines the credential lifecycle: provision (store new credentials), retrieve (get credentials for use), rotate (replace credentials), revoke (destroy all credentials for a bridge instance), and list (enumerate credential types for a bridge). Credentials are encrypted at rest using a key derived from the bridge operator's identity key material via HKDF with a bridge-specific salt. The trait is async and returns Result types. On BridgeStatus::Revoked, revoke() destroys all credentials (overwrite with zeros, delete record). On BridgeStatus::Suspended, credentials are retained but retrieve() returns an error indicating the bridge is suspended. Credential access is scoped to bridge instance — cross-bridge credential sharing is prohibited. Add a BridgeCredential struct holding encrypted_data, credential_type, created_at, expires_at, and bridge_id. Add a CredentialType enum with variants OAuthAccessToken, OAuthRefreshToken, ApiKey, WebhookSecret, and Custom(String).",
+      "description": "Implement the BridgeCredentialStore trait specified in \u00a712.11. The trait defines the credential lifecycle: provision (store new credentials), retrieve (get credentials for use), rotate (replace credentials), revoke (destroy all credentials for a bridge instance), and list (enumerate credential types for a bridge). Credentials are encrypted at rest using a key derived from the bridge operator's identity key material via HKDF with a bridge-specific salt. The trait is async and returns Result types. On BridgeStatus::Revoked, revoke() destroys all credentials (overwrite with zeros, delete record). On BridgeStatus::Suspended, credentials are retained but retrieve() returns an error indicating the bridge is suspended. Credential access is scoped to bridge instance \u2014 cross-bridge credential sharing is prohibited. Add a BridgeCredential struct holding encrypted_data, credential_type, created_at, expires_at, and bridge_id. Add a CredentialType enum with variants OAuthAccessToken, OAuthRefreshToken, ApiKey, WebhookSecret, and Custom(String).",
       "acceptanceCriteria": [
         "BridgeCredentialStore trait is defined with async methods: provision, retrieve, rotate, revoke, list",
         "BridgeCredential struct has fields: encrypted_data (Vec<u8>), credential_type (CredentialType), created_at (u64), expires_at (Option<u64>), bridge_id (String)",
@@ -327,9 +419,18 @@
       ],
       "blockedBy": [],
       "sources": [
-        { "file": ".docs/specs/12-platform-bridge-connectors.md", "section": "## 12.11 Bridge Credential Lifecycle" },
-        { "file": ".docs/specs/12-platform-bridge-connectors.md", "section": "### 12.11.2 Requirements" },
-        { "file": ".docs/adrs/phase-5.md", "section": "## ADR-023: Bridge Connector Protocol" }
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "## 12.11 Bridge Credential Lifecycle"
+        },
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "### 12.11.2 Requirements"
+        },
+        {
+          "file": ".docs/adrs/phase-5.md",
+          "section": "## ADR-023: Bridge Connector Protocol"
+        }
       ],
       "details": {}
     },
@@ -345,7 +446,7 @@
         "crates/scp-core/src/bridge/oauth.rs",
         "crates/scp-core/src/bridge/mod.rs"
       ],
-      "description": "Implement the OAuth 2.0 reference binding specified in §12.11.3. This provides a concrete OAuthBridgeFlow struct that orchestrates the Authorization Code + PKCE flow and integrates with BridgeCredentialStore for token storage. The flow is: (1) generate PKCE code verifier and challenge, (2) build authorization URL, (3) exchange authorization code for access + refresh tokens, (4) store both tokens via BridgeCredentialStore::provision, (5) auto-refresh access token when 80% of lifetime has elapsed, (6) on refresh failure, retry with exponential backoff (initial 1s, max 60s, 5 retries). On bridge revocation, call the platform's RFC 7009 token revocation endpoint for both tokens before destroying local copies. Scope minimization: Relay mode requests read-only scopes, Puppet mode requests read+write. The implementation uses reqwest for HTTP calls and is async.",
+      "description": "Implement the OAuth 2.0 reference binding specified in \u00a712.11.3. This provides a concrete OAuthBridgeFlow struct that orchestrates the Authorization Code + PKCE flow and integrates with BridgeCredentialStore for token storage. The flow is: (1) generate PKCE code verifier and challenge, (2) build authorization URL, (3) exchange authorization code for access + refresh tokens, (4) store both tokens via BridgeCredentialStore::provision, (5) auto-refresh access token when 80% of lifetime has elapsed, (6) on refresh failure, retry with exponential backoff (initial 1s, max 60s, 5 retries). On bridge revocation, call the platform's RFC 7009 token revocation endpoint for both tokens before destroying local copies. Scope minimization: Relay mode requests read-only scopes, Puppet mode requests read+write. The implementation uses reqwest for HTTP calls and is async.",
       "acceptanceCriteria": [
         "OAuthBridgeFlow struct is defined with fields: client_id, redirect_uri, token_endpoint, authorization_endpoint, revocation_endpoint (optional), scopes",
         "generate_pkce() returns a (code_verifier, code_challenge) tuple using S256 method",
@@ -373,13 +474,27 @@
         "Add unit tests for PKCE and URL generation",
         "Add integration tests with mock HTTP server for token exchange and refresh"
       ],
-      "blockedBy": ["SCP-BCH-008"],
-      "sources": [
-        { "file": ".docs/specs/12-platform-bridge-connectors.md", "section": "### 12.11.3 OAuth 2.0 Reference Binding" },
-        { "file": ".docs/specs/12-platform-bridge-connectors.md", "section": "### 12.11.1 Lifecycle Phases" },
-        { "file": ".docs/adrs/phase-5.md", "section": "## ADR-023: Bridge Connector Protocol" }
+      "blockedBy": [
+        "SCP-BCH-008"
       ],
-      "details": {}
+      "sources": [
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "### 12.11.3 OAuth 2.0 Reference Binding"
+        },
+        {
+          "file": ".docs/specs/12-platform-bridge-connectors.md",
+          "section": "### 12.11.1 Lifecycle Phases"
+        },
+        {
+          "file": ".docs/adrs/phase-5.md",
+          "section": "## ADR-023: Bridge Connector Protocol"
+        }
+      ],
+      "details": {},
+      "blocked_by": [
+        "SCP-BCH-008"
+      ]
     }
   ]
 }

@@ -73,7 +73,10 @@
           "section": "## 5.9 Governance"
         }
       ],
-      "details": {}
+      "details": {},
+      "blocked_by_issues": [
+        356
+      ]
     },
     {
       "id": "SCP-268",
@@ -132,7 +135,10 @@
           "section": "## 6. Governance"
         }
       ],
-      "details": {}
+      "details": {},
+      "blocked_by": [
+        "SCP-267"
+      ]
     },
     {
       "id": "SCP-269",
@@ -199,7 +205,13 @@
           "section": "## 5.10 Context TTL (Time-to-Live)"
         }
       ],
-      "details": {}
+      "details": {},
+      "blocked_by": [
+        "SCP-268"
+      ],
+      "blocked_by_issues": [
+        320
+      ]
     },
     {
       "id": "SCP-270",
@@ -266,7 +278,10 @@
           "section": "## 5.10 Context TTL (Time-to-Live)"
         }
       ],
-      "details": {}
+      "details": {},
+      "blocked_by": [
+        "SCP-269"
+      ]
     },
     {
       "id": "SCP-271",
@@ -329,7 +344,10 @@
           "section": "## ADR-029: Offline/Sync Strategy"
         }
       ],
-      "details": {}
+      "details": {},
+      "blocked_by": [
+        "SCP-270"
+      ]
     },
     {
       "id": "SCP-272",
@@ -377,7 +395,13 @@
           "section": "## ADR-031: Multi-Admin Governance Models"
         }
       ],
-      "details": {}
+      "details": {},
+      "blocked_by": [
+        "SCP-270"
+      ],
+      "blocked_by_issues": [
+        354
+      ]
     },
     {
       "id": "SCP-273",
@@ -420,7 +444,13 @@
           "section": "## ADR-031: Multi-Admin Governance Models"
         }
       ],
-      "details": {}
+      "details": {},
+      "blocked_by": [
+        "SCP-267"
+      ],
+      "blocked_by_issues": [
+        330
+      ]
     },
     {
       "id": "SCP-274",
@@ -480,7 +510,12 @@
           "section": "## 5.9 Governance"
         }
       ],
-      "details": {}
+      "details": {},
+      "blocked_by": [
+        "SCP-271",
+        "SCP-272",
+        "SCP-273"
+      ]
     }
   ]
 }
