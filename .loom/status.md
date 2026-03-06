@@ -1,72 +1,60 @@
 # Loom Status
 
 ## Failing Tests
-None — full workspace test suite green (2931 scp-core + all other crates). Clippy clean with CI features.
+None — full workspace test suite green (4706 tests pass, 0 failures). Clippy clean with CI features.
 
 ## Uncommitted Changes
-None — all changes committed. Working tree clean (except .claude/agent-memory/bug-catcher/MEMORY.md — unrelated).
+None — all changes committed. Working tree clean (except .claude/agent-memory/bug-catcher/MEMORY.md and .docs/prds/*.json — unrelated).
 
 ## Fixed This Iteration
-- Review finding 1 (HIGH): WASM revocation check dead code — rewired to WasmUcanState.revoked_cids with correct CID computation
-- Review finding 2 (HIGH): WASM ceiling check missing — added ceiling compliance check after capability match
-- Review finding 3 (HIGH): WASM accepts tokens with missing exp/aud — made both fields required, reject on absence
-- Review finding 4 (HIGH): Node binary never calls initialize_sequence — added call after DidDht construction
-- Review finding 5 (MEDIUM): Gateway BEP44 signature unverified — added Ed25519 verification in resolve_via_gateway
-- Review finding 6 (MEDIUM): Empty BridgeProofResolver — added proof_tokens parameter to all FFI tool invocation functions
-- Review finding 7 (MEDIUM): Missing acceptance criterion test — added test for UCAN without tool capability → rejected
-- Review finding 8 (LOW): CAS comment inaccuracy — corrected
+- Review finding 1 (HIGH): 3 FFI call sites (PyO3 tools.rs, NAPI tools.rs, MCP mcp.rs) still used BridgeDidResolver instead of DispatchDidResolver — replaced with production resolver pattern
+- Review finding 2 (MEDIUM): SubscriberRegistration::signing_input concatenated variable-length fields without length prefixes — added u32 BE length prefixes for context_id and subscriber_did
 
 ## Tests Added / Updated
-- #319: UCAN tool invocation validation test (mint without capability → rejected) in invoke.rs
-- Review fix: 1 new test added (2931 total in scp-core, up from 2930)
+- #357: 6 new governance tests (valid vote signature recorded, forged signature rejected, unknown voter rejected, end-to-end quorum with valid/forged votes). 309 governance tests total.
+- #299: Full broadcast subscriber registration test suite — valid signature, invalid signature, open broadcast auto-grant, gated broadcast UCAN required, gated broadcast expired UCAN, deterministic signing_input, round-trip UCAN validation.
+- #311: DID resolver unification tests — IdentityBackedDidResolver, DispatchDidResolver dispatch, sequence tracking, rotation detection.
 
 ## Work Summary
 
-### Phase 0: COMPLETE (prior iterations)
-### Phase 1: COMPLETE (prior iterations)
-### Phase 2: Step 1 COMPLETE (prior iteration), Steps 2-4 pending
+### This Iteration: Phase 2 Step 2 + Phase 3 Lane B + Phase 4 Lane A
 
-### This Iteration: Phase 3 Lane B + Phase 4 Lane A
-
-Dispatched 4 subagents with worktree isolation:
+Dispatched 3 subagents with worktree isolation:
 
 | Issue | Phase | Description | Result | Commit |
 |-------|-------|-------------|--------|--------|
-| #310 | P4 Lane A | PkarrDhtClient production DHT | **COMPLETE** | 59f18b2 |
-| #319 | P3 Lane B | UCAN tool invocation auth (BLOCKER) | **COMPLETE** | e6b86a9 |
-| #357 | P2 Step 2 | Vote signature verification | **FAILED** — branched from main, 22+ merge conflicts | — |
-| #299 | P3 Lane B | Wire mint_role_tokens to UCAN | **FAILED** — 3rd consecutive failure, escaped worktree | — |
+| #357 | P2 Step 2 | Vote signature verification in governance engines | **COMPLETE** | eba59b9 |
+| #299 | P3 Lane B | Broadcast subscriber registration with UCAN | **COMPLETE** | ffd3272 |
+| #311 | P4 Lane A | DID resolver unification (adapter in scp-ffi) | **COMPLETE** | 6b2885e + badfb86 |
 
-Review fix (all 8 findings): 04c2281
-Execution plan update: e534c17
+Review fix (2 findings): fbf0577
+Execution plan update: 521a367
 
 ### Review Outcomes
 - Review agent: bug-catcher
-- Result: FAIL (8 findings: 4 HIGH, 3 MEDIUM, 1 LOW)
-- Fix subagent dispatched, all 8 findings addressed in commit 04c2281
-- Tests green after fix (2931 pass, 0 fail)
-- No findings skipped — all factually correct and fixed
+- Result: FAIL (2 findings: 1 HIGH, 1 MEDIUM)
+- Fix applied directly (no subagent needed — 4 file edits), committed as fbf0577
+- Tests green after fix (4706 pass, 0 fail)
+- No findings skipped — both factually correct and fixed
 
 ### Issues Commented This Iteration
-#310, #319
+#357, #299, #311
 
-### Cumulative Issues Commented (28)
-#290, #301, #310, #312, #313, #315, #319, #321, #325, #326, #327, #345, #346, #347, #348, #349, #350, #351, #352, #353, #354, #355, #372, #374, #378, #379, #380, #381
+### Cumulative Issues Commented (31)
+#290, #299, #301, #310, #311, #312, #313, #315, #319, #321, #325, #326, #327, #345, #346, #347, #348, #349, #350, #351, #352, #353, #354, #355, #357, #372, #374, #378, #379, #380, #381
 
 ## Next Iteration — Continue Execution Plan
 
 **Phase 2 (serial governance chain — resume here):**
-- #357 — Vote signature verification (re-dispatch against feat/achieve-production-readiness, NOT main)
-- Then #360 → #320
+- #360 — Governance collection bounds (next in chain after #357)
+- Then #320 — GovernanceModel enum + proposal lifecycle
 
-**Phase 3 Lane B (re-dispatch — 3 consecutive failures):**
-- #299 — Wire mint_role_tokens to real UCAN signing
-
-**Phase 3 Lane C (blocked on Phase 2 completion):**
+**Phase 3 Lane C (blocked on Phase 2 completion — #360+#320):**
 - #339 — Context ceiling enforcement
 - #340 — Promotion policy enforcement
 
-**Phase 4 Lane A (resume serial chain):**
-- #311 — DID resolver unification (depends on #310, now complete)
+**Phase 3 Lane B is now COMPLETE** (#319, #299, #326 all done).
+**Phase 4 Lane A is now COMPLETE** (#327, #310, #311 all done).
+**Phase 4 Lane B was already COMPLETE** (#315, #325).
 
-**CRITICAL NOTE:** #357 subagent branched from main instead of feat/achieve-production-readiness, causing 22+ merge conflicts in majority.rs. Next iteration MUST verify subagent worktrees branch from the correct base.
+**Phase 4 is COMPLETE.** Next phases after Phase 2 completes: Phase 3 Lane C, then Phase 5 (critical path).
