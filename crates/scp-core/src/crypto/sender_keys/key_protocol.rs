@@ -935,7 +935,7 @@ fn compute_epoch_advance_hash(
         &[
             CanonicalField::VarBytes(context_id.as_bytes()),
             CanonicalField::VarBytes(sender_did.as_bytes()),
-            CanonicalField::VarBytes(b"key_epoch"),
+            CanonicalField::RawBytes(b"key_epoch"),
             CanonicalField::U64(epoch),
             CanonicalField::VarBytes(signer_key_ref.as_bytes()),
         ],
@@ -969,7 +969,7 @@ fn compute_request_hash(
             CanonicalField::VarBytes(sender_did.as_bytes()),
             CanonicalField::U64(epoch),
             CanonicalField::VarBytes(wrapping_pubkey),
-            CanonicalField::VarBytes(nonce),
+            CanonicalField::RawBytes(nonce),
             CanonicalField::U64(timestamp),
         ],
     )

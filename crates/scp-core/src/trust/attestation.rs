@@ -303,7 +303,7 @@ pub fn verify_attestation(
 ) -> Result<(), TrustError> {
     // 1. Verify Ed25519 signature against issuer's public key.
     let public_key_bytes = resolver.resolve_public_key(&attestation.issuer)?;
-    let canonical = canonical_attestation_bytes(attestation);
+    let canonical = canonical_attestation_bytes(attestation)?;
     verify_ed25519_signature(&public_key_bytes, &canonical, &attestation.signature).map_err(
         |reason| TrustError::AttestationSignatureInvalid {
             attestation_id: attestation.id.clone(),
@@ -457,19 +457,27 @@ pub fn check_threshold_attestation(
 /// numeric tag (u16 big-endian) instead of Debug formatting for
 /// cross-version determinism. `issued_at` uses big-endian encoding,
 /// consistent with all other canonical hash functions.
-pub(crate) fn canonical_attestation_bytes(attestation: &Attestation) -> Vec<u8> {
+pub(crate) fn canonical_attestation_bytes(
+    attestation: &Attestation,
+) -> Result<Vec<u8>, TrustError> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
     // Serialize evidence as MessagePack bytes if present.
     let evidence_bytes = attestation
         .evidence
         .as_ref()
-        .map(|e| rmp_serde::to_vec(e).unwrap_or_default());
+        .map(|e| {
+            rmp_serde::to_vec(e).map_err(|err| TrustError::InvalidEventData {
+                sequence: 0,
+                reason: format!("evidence serialization failed: {err}"),
+            })
+        })
+        .transpose()?;
 
     // Field order per §9.5.2: id, attestation_type, issuer, subject, claim,
     // evidence, issued_at, expires_at.
     let claim_bytes = attestation.claim.to_string();
-    canonical_hash(
+    Ok(canonical_hash(
         "SCP-ATTESTATION-V1:",
         &[
             CanonicalField::VarBytes(attestation.id.as_bytes()),
@@ -484,7 +492,7 @@ pub(crate) fn canonical_attestation_bytes(attestation: &Attestation) -> Vec<u8> 
             CanonicalField::U64(attestation.expires_at.unwrap_or(0)),
         ],
     )
-    .to_vec()
+    .to_vec())
 }
 
 /// Validates that evidence is present and appropriate for the attestation type.
@@ -681,7 +689,7 @@ mod tests {
             signature: vec![],
         };
 
-        let canonical = canonical_attestation_bytes(&attestation);
+        let canonical = canonical_attestation_bytes(&attestation).unwrap();
         let sig = signing_key.sign(&canonical);
         attestation.signature = sig.to_bytes().to_vec();
         attestation
@@ -1420,8 +1428,8 @@ mod tests {
             signature: vec![],
         };
 
-        let bytes_a = canonical_attestation_bytes(&att_a);
-        let bytes_b = canonical_attestation_bytes(&att_b);
+        let bytes_a = canonical_attestation_bytes(&att_a).unwrap();
+        let bytes_b = canonical_attestation_bytes(&att_b).unwrap();
         assert_ne!(
             bytes_a, bytes_b,
             "shifting bytes between id and issuer must produce different canonical bytes"

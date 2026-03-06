@@ -246,7 +246,7 @@ mod tests {
             revocation_status: RevocationStatus::Active,
             signature: vec![],
         };
-        let canonical = canonical_attestation_bytes(&attestation);
+        let canonical = canonical_attestation_bytes(&attestation).unwrap();
         let sig = signing_key.sign(&canonical);
         attestation.signature = sig.to_bytes().to_vec();
         attestation
@@ -271,7 +271,7 @@ mod tests {
             revocation_status: RevocationStatus::Active,
             signature: vec![],
         };
-        let canonical = canonical_attestation_bytes(&attestation);
+        let canonical = canonical_attestation_bytes(&attestation).unwrap();
         let sig = signing_key.sign(&canonical);
         attestation.signature = sig.to_bytes().to_vec();
         attestation

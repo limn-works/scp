@@ -32,6 +32,9 @@ const ABSENT_SENTINEL: [u8; 32] = [
 pub enum CanonicalField<'a> {
     /// Variable-length bytes: 4-byte BE length prefix + raw bytes.
     VarBytes(&'a [u8]),
+    /// Raw bytes written without any prefix. Use for fixed-size fields
+    /// that aren't exactly 32 or 64 bytes (e.g., 16-byte nonce, literal tags).
+    RawBytes(&'a [u8]),
     /// Fixed-length 32-byte value (hash, public key): raw bytes, no prefix.
     Fixed32(&'a [u8; 32]),
     /// Fixed-length 64-byte value (signature): raw bytes, no prefix.
@@ -69,6 +72,7 @@ pub fn canonical_hash(domain: &str, fields: &[CanonicalField<'_>]) -> [u8; 32] {
                 hasher.update(len.to_be_bytes());
                 hasher.update(b);
             }
+            CanonicalField::RawBytes(b) => hasher.update(b),
             CanonicalField::Fixed32(b) => hasher.update(b.as_slice()),
             CanonicalField::Fixed64(b) => hasher.update(b.as_slice()),
             CanonicalField::U64(n) => hasher.update(n.to_be_bytes()),
