@@ -51,7 +51,8 @@ pub struct OuterEnvelope {
     pub blob_ttl: u32,
 
     /// The MLS-encrypted blob containing the serialized inner envelope.
-    #[serde(with = "serde_bytes")]
+    /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
+    #[serde(with = "crate::serde_util::serde_bounded_bytes")]
     pub encrypted_blob: Vec<u8>,
 }
 
@@ -272,7 +273,7 @@ pub fn open_envelope(
 
     // 6. Verify content integrity: payload_hash == SHA-256(stripped_payload).
     let computed_hash = Sha256::digest(&stripped_payload);
-    if computed_hash.as_slice() != inner.payload_hash.as_slice() {
+    if computed_hash.as_slice() != &inner.payload_hash[..] {
         return Err(EnvelopeError::ContentIntegrityFailed);
     }
 
@@ -731,7 +732,7 @@ mod seal_open_tests {
 
         // Tamper with payload_hash (this also breaks the signature, but
         // content integrity check runs first).
-        inner.payload_hash = vec![0xFF; 32];
+        inner.payload_hash = [0xFF; 32];
 
         let sender_key = generate_sender_key();
         let routing_id = [0xAA; 32];
@@ -868,7 +869,7 @@ mod seal_open_tests {
         assert!(stripped.is_empty(), "empty payload should roundtrip");
 
         // Verify payload_hash matches SHA-256 of empty bytes.
-        let expected_hash = Sha256::digest(b"").to_vec();
+        let expected_hash: [u8; 32] = Sha256::digest(b"").into();
         assert_eq!(recovered.payload_hash, expected_hash);
     }
 

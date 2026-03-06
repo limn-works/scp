@@ -178,7 +178,8 @@ pub struct BroadcastEnvelope {
     #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
     /// AES-256-GCM encrypted payload: `nonce || ciphertext || auth_tag`.
-    #[serde(with = "serde_bytes")]
+    /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
+    #[serde(with = "crate::serde_util::serde_bounded_bytes")]
     pub encrypted_content: Vec<u8>,
 }
 
@@ -1056,6 +1057,46 @@ mod tests {
         assert!(detector.check_and_advance("did:dht:bob", 1));
         assert!(!detector.check_and_advance("did:dht:alice", 1));
         assert!(detector.check_and_advance("did:dht:bob", 2));
+    }
+
+    // -----------------------------------------------------------------------
+    // Deserialization size limit tests (#347)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn oversized_broadcast_envelope_rejected_on_deser() {
+        // A BroadcastEnvelope with >512 KiB encrypted_content must be rejected
+        // during deserialization to prevent OOM from untrusted input (#347).
+        //
+        // We construct a valid-shaped envelope with 1 MiB of encrypted_content,
+        // serialize it to MessagePack (which is the wire format), then verify
+        // that deserialization fails with the bounded-bytes error.
+        use crate::serde_util::BOUNDED_BYTES_MAX;
+
+        // Build a helper struct that serializes the same field names but uses
+        // raw serde_bytes (no bound) so we can create the oversized payload.
+        #[derive(serde::Serialize)]
+        struct UnboundedEnvelope {
+            author_did: String,
+            key_epoch: u64,
+            #[serde(with = "serde_bytes")]
+            encrypted_content: Vec<u8>,
+        }
+
+        let oversized = UnboundedEnvelope {
+            author_did: "did:dht:test".to_owned(),
+            key_epoch: 0,
+            encrypted_content: vec![0xAB; BOUNDED_BYTES_MAX + 1],
+        };
+
+        let serialized = rmp_serde::to_vec_named(&oversized).unwrap();
+        let result = rmp_serde::from_slice::<BroadcastEnvelope>(&serialized);
+        assert!(result.is_err(), "should reject >512 KiB encrypted_content");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("exceeds"),
+            "error should mention size limit: {err}"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -103,11 +103,12 @@ pub struct InnerEnvelope {
     pub message_type: MessageType,
 
     /// SHA-256 hash of the original plaintext payload (before padding).
-    #[serde(with = "serde_bytes")]
-    pub payload_hash: Vec<u8>,
+    #[serde(with = "crate::serde_util::serde_hash_32")]
+    pub payload_hash: [u8; 32],
 
     /// The message payload (after bucket padding).
-    #[serde(with = "serde_bytes")]
+    /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
+    #[serde(with = "crate::serde_util::serde_bounded_bytes")]
     pub payload: Vec<u8>,
 
     /// Optional provenance metadata.
@@ -115,8 +116,8 @@ pub struct InnerEnvelope {
     pub provenance: Option<Provenance>,
 
     /// SHA-256 hash of the serialized provenance (or SHA-256(0x00) if absent).
-    #[serde(with = "serde_bytes")]
-    pub provenance_hash: Vec<u8>,
+    #[serde(with = "crate::serde_util::serde_hash_32")]
+    pub provenance_hash: [u8; 32],
 
     /// Identifies which DID verification method (`#active` or `#agent`)
     /// produced the signature. Defaults to `Active` for backward compatibility
@@ -125,8 +126,8 @@ pub struct InnerEnvelope {
     pub signing_key_id: SigningKeyId,
 
     /// Ed25519 signature over the canonical hash of all critical fields.
-    #[serde(with = "serde_bytes")]
-    pub signature: Vec<u8>,
+    #[serde(with = "crate::serde_util::serde_signature_64")]
+    pub signature: [u8; 64],
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +211,11 @@ pub async fn create_inner_envelope(
     let padded_payload = pad_to_bucket(params.payload)?;
 
     // 6. Build and return the envelope.
+    let sig_bytes: [u8; 64] = signature
+        .into_bytes()
+        .try_into()
+        .map_err(|_| EnvelopeError::SigningFailed("Ed25519 signature must be 64 bytes".into()))?;
+
     Ok(InnerEnvelope {
         context_id: params.context_id.to_owned(),
         sender_did: params.sender_did.to_owned(),
@@ -218,12 +224,12 @@ pub async fn create_inner_envelope(
         sequence: params.sequence,
         timestamp: params.timestamp,
         message_type: params.message_type,
-        payload_hash: payload_hash.to_vec(),
+        payload_hash,
         payload: padded_payload,
         provenance: params.provenance.clone(),
-        provenance_hash: provenance_hash.to_vec(),
+        provenance_hash,
         signing_key_id: params.signing_key_id,
-        signature: signature.into_bytes(),
+        signature: sig_bytes,
     })
 }
 
@@ -270,14 +276,9 @@ pub fn verify_inner_signature(
         signing_key_id: inner.signing_key_id,
     };
 
-    // Recompute the canonical hash.
-    let payload_hash: &[u8; 32] = inner.payload_hash.as_slice().try_into().map_err(|_| {
-        EnvelopeError::VerificationFailed(format!(
-            "payload_hash must be 32 bytes, got {}",
-            inner.payload_hash.len()
-        ))
-    })?;
-    let canonical_hash = compute_canonical_hash(&params, payload_hash, &provenance_hash);
+    // Recompute the canonical hash. payload_hash and provenance_hash are
+    // already validated as [u8; 32] by serde deserialization.
+    let canonical_hash = compute_canonical_hash(&params, &inner.payload_hash, &provenance_hash);
 
     // Verify using strict mode (rejects small-order points).
     match crate::crypto::ed25519::verify_ed25519_signature_strict(
@@ -467,7 +468,7 @@ mod tests {
         assert_eq!(envelope.signing_key_id, SigningKeyId::Active);
 
         // Verify payload_hash matches original payload.
-        let expected_hash = Sha256::digest(b"hello world").to_vec();
+        let expected_hash: [u8; 32] = Sha256::digest(b"hello world").into();
         assert_eq!(envelope.payload_hash, expected_hash);
 
         // Verify payload is padded.
@@ -568,7 +569,7 @@ mod tests {
         .unwrap();
 
         // Tamper with the payload hash.
-        envelope.payload_hash = vec![0xFF; 32];
+        envelope.payload_hash = [0xFF; 32];
 
         let valid = verify_inner_signature(&envelope, pubkey.as_bytes()).unwrap();
         assert!(!valid, "tampered payload hash should invalidate signature");
