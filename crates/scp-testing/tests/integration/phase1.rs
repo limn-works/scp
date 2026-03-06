@@ -42,7 +42,7 @@ use scp_core::crypto::sender_keys::{
     SenderKeyStore, generate_sender_key, handle_sender_key_request, open_sender_key_response,
     publish_sender_key_epoch_advance, request_sender_key, verify_epoch_advance,
 };
-use scp_core::envelope::inner::{InnerEnvelopeParams, create_inner_envelope};
+use scp_core::envelope::inner::{InnerEnvelopeParams, MessageType, create_inner_envelope};
 use scp_core::envelope::outer::{open_envelope, seal_envelope};
 use scp_core::envelope::padding::strip_padding;
 use scp_core::envelope::pseudonym::derive_pseudonym;
@@ -345,6 +345,7 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
             generation: 0,
             sequence: 1,
             timestamp: 1_700_000_000,
+            message_type: MessageType::Content,
             payload: original_msg,
             provenance: None,
             signing_key_id: scp_core::identity::SigningKeyId::Active,

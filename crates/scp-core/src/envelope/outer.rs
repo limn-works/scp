@@ -403,7 +403,9 @@ mod seal_open_tests {
     use crate::crypto::mls::credential::ScpCredential;
     use crate::crypto::mls::group::{add_member, create_group, generate_key_package, join_group};
     use crate::crypto::sender_keys::generate_sender_key;
-    use crate::envelope::inner::{InnerEnvelopeParams, Provenance, create_inner_envelope};
+    use crate::envelope::inner::{
+        InnerEnvelopeParams, MessageType, Provenance, create_inner_envelope,
+    };
     use crate::envelope::padding::strip_padding;
     use crate::identity::SigningKeyId;
 
@@ -474,6 +476,7 @@ mod seal_open_tests {
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload,
                 provenance,
                 signing_key_id: SigningKeyId::Active,
@@ -499,6 +502,7 @@ mod seal_open_tests {
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload,
                 provenance: None,
                 signing_key_id: SigningKeyId::Active,
@@ -714,6 +718,7 @@ mod seal_open_tests {
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload: b"original data",
                 provenance: None,
                 signing_key_id: SigningKeyId::Active,
@@ -953,6 +958,7 @@ mod seal_open_tests {
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload: b"from unknown sender",
                 provenance: None,
                 signing_key_id: SigningKeyId::Active,

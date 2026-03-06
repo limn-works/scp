@@ -13,6 +13,7 @@
 //! - `u64`: 8 bytes big-endian.
 //! - `u32`: 4 bytes big-endian.
 //! - `u16`: 2 bytes big-endian.
+//! - `u8`: 1 byte (discriminator bytes, message type tags).
 //! - Optional absent: `SHA-256(0x00)` sentinel (32 bytes).
 
 use sha2::{Digest, Sha256};
@@ -45,6 +46,9 @@ pub enum CanonicalField<'a> {
     U32(u32),
     /// Unsigned 16-bit integer: 2 bytes big-endian.
     U16(u16),
+    /// Unsigned 8-bit integer: 1 byte. Used for discriminator bytes (e.g.,
+    /// `MessageType`).
+    U8(u8),
     /// Optional field that is absent: uses `SHA-256(0x00)` sentinel.
     Absent,
 }
@@ -78,6 +82,7 @@ pub fn canonical_hash(domain: &str, fields: &[CanonicalField<'_>]) -> [u8; 32] {
             CanonicalField::U64(n) => hasher.update(n.to_be_bytes()),
             CanonicalField::U32(n) => hasher.update(n.to_be_bytes()),
             CanonicalField::U16(n) => hasher.update(n.to_be_bytes()),
+            CanonicalField::U8(n) => hasher.update([*n]),
             CanonicalField::Absent => hasher.update(ABSENT_SENTINEL),
         }
     }

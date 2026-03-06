@@ -1001,6 +1001,7 @@ fn py_context_send(
                 generation: 0,
                 sequence: 0,
                 timestamp: now_ms,
+                message_type: scp_core::envelope::MessageType::Content,
                 payload: &payload_bytes,
                 provenance: None,
                 signing_key_id: scp_identity::SigningKeyId::Active,

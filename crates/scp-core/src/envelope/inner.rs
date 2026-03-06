@@ -95,6 +95,13 @@ pub struct InnerEnvelope {
     /// Creation timestamp (Unix milliseconds).
     pub timestamp: u64,
 
+    /// The type of message (content vs. signaling). Included in the canonical
+    /// hash to prevent type-flipping attacks. Defaults to `Content` for
+    /// backward compatibility with envelopes created before this field was
+    /// added.
+    #[serde(default)]
+    pub message_type: MessageType,
+
     /// SHA-256 hash of the original plaintext payload (before padding).
     #[serde(with = "serde_bytes")]
     pub payload_hash: Vec<u8>,
@@ -146,6 +153,9 @@ pub struct InnerEnvelopeParams<'a> {
     pub sequence: u64,
     /// Creation timestamp (Unix milliseconds).
     pub timestamp: u64,
+    /// The type of message (content vs. signaling). Included in the canonical
+    /// hash to prevent type-flipping attacks (issue #290).
+    pub message_type: MessageType,
     /// The message payload (before padding).
     pub payload: &'a [u8],
     /// Optional provenance metadata.
@@ -207,6 +217,7 @@ pub async fn create_inner_envelope(
         generation: params.generation,
         sequence: params.sequence,
         timestamp: params.timestamp,
+        message_type: params.message_type,
         payload_hash: payload_hash.to_vec(),
         payload: padded_payload,
         provenance: params.provenance.clone(),
@@ -253,6 +264,7 @@ pub fn verify_inner_signature(
         generation: inner.generation,
         sequence: inner.sequence,
         timestamp: inner.timestamp,
+        message_type: inner.message_type,
         payload: &[],
         provenance: inner.provenance.clone(),
         signing_key_id: inner.signing_key_id,
@@ -364,10 +376,12 @@ fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<[u8; 32], 
 /// ambiguity. `payload_hash` and `provenance_hash` are typed as `&[u8; 32]`
 /// (SHA-256 outputs) and are also length-prefixed for defense in depth.
 /// Fixed-width u64 fields (`epoch`, `generation`, `sequence`, `timestamp`)
-/// need no length prefix.
+/// need no length prefix. The `message_type` discriminator byte is included
+/// to prevent type-flipping attacks (issue #290).
 ///
 /// ```text
-/// SHA-256(DOMAIN_SEPARATOR || len(context_id) || context_id
+/// SHA-256(DOMAIN_SEPARATOR || message_type_byte
+///         || len(context_id) || context_id
 ///         || len(sender_did) || sender_did || epoch_BE
 ///         || generation_BE || sequence_BE || timestamp_BE
 ///         || len(payload_hash) || payload_hash
@@ -381,11 +395,17 @@ fn compute_canonical_hash(
 ) -> Vec<u8> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
-    // Field order per §9.5.2: context_id, sender_did, epoch, generation,
-    // sequence, timestamp, payload_hash, provenance_hash, signing_key_id.
+    // Field order per §9.5.2: message_type (discriminator byte), context_id,
+    // sender_did, epoch, generation, sequence, timestamp, payload_hash,
+    // provenance_hash, signing_key_id.
+    //
+    // message_type is prepended (after domain separator) so that the type
+    // commitment is the first thing in the hash input — making type-flipping
+    // attacks structurally impossible.
     canonical_hash(
         "SCP-INNER-ENVELOPE-V1:",
         &[
+            CanonicalField::U8(params.message_type.as_discriminator_byte()),
             CanonicalField::VarBytes(params.context_id.as_bytes()),
             CanonicalField::VarBytes(params.sender_did.as_bytes()),
             CanonicalField::U64(params.epoch),
@@ -428,6 +448,7 @@ mod tests {
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload: b"hello world",
                 provenance: None,
                 signing_key_id: SigningKeyId::Active,
@@ -475,6 +496,7 @@ mod tests {
                 generation: 3,
                 sequence: 10,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload: b"payload with provenance",
                 provenance: Some(provenance.clone()),
                 signing_key_id: SigningKeyId::Active,
@@ -506,6 +528,7 @@ mod tests {
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload: b"hello",
                 provenance: None,
                 signing_key_id: SigningKeyId::Active,
@@ -533,6 +556,7 @@ mod tests {
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload: b"original",
                 provenance: None,
                 signing_key_id: SigningKeyId::Active,
@@ -568,6 +592,7 @@ mod tests {
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload: b"data",
                 provenance: Some(provenance),
                 signing_key_id: SigningKeyId::Active,
@@ -598,6 +623,7 @@ mod tests {
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload: b"data",
                 provenance: None,
                 signing_key_id: SigningKeyId::Active,
@@ -639,6 +665,7 @@ mod tests {
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload: b"msgpack test",
                 provenance: None,
                 signing_key_id: SigningKeyId::Active,
@@ -672,6 +699,7 @@ mod tests {
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload: b"test",
                 provenance: None,
                 signing_key_id: SigningKeyId::Active,
@@ -699,6 +727,7 @@ mod tests {
             generation: 0,
             sequence: 1,
             timestamp: 1_700_000_000,
+            message_type: MessageType::Content,
             payload: b"test",
             provenance: None,
             signing_key_id: SigningKeyId::Active,
@@ -752,6 +781,151 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // MessageType tests (issue #290)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn verify_rejects_tampered_message_type() {
+        let (custody, signing_key) = setup().await;
+        let pubkey = custody.public_key(&signing_key).await.unwrap();
+
+        let mut envelope = create_inner_envelope(
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
+                payload: b"content message",
+                provenance: None,
+                signing_key_id: SigningKeyId::Active,
+            },
+            &custody,
+            &signing_key,
+        )
+        .await
+        .unwrap();
+
+        // Tamper: flip message_type from Content to Signaling.
+        envelope.message_type = MessageType::Signaling;
+
+        let valid = verify_inner_signature(&envelope, pubkey.as_bytes()).unwrap();
+        assert!(
+            !valid,
+            "changing message_type after signing must invalidate signature"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_and_verify_signaling_envelope() {
+        let (custody, signing_key) = setup().await;
+        let pubkey = custody.public_key(&signing_key).await.unwrap();
+
+        let envelope = create_inner_envelope(
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                message_type: MessageType::Signaling,
+                payload: b"signaling payload",
+                provenance: None,
+                signing_key_id: SigningKeyId::Active,
+            },
+            &custody,
+            &signing_key,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(envelope.message_type, MessageType::Signaling);
+        let valid = verify_inner_signature(&envelope, pubkey.as_bytes()).unwrap();
+        assert!(valid, "Signaling envelope should verify");
+    }
+
+    #[tokio::test]
+    async fn different_message_types_produce_different_signatures() {
+        let (custody, signing_key) = setup().await;
+
+        let content_envelope = create_inner_envelope(
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
+                payload: b"same payload",
+                provenance: None,
+                signing_key_id: SigningKeyId::Active,
+            },
+            &custody,
+            &signing_key,
+        )
+        .await
+        .unwrap();
+
+        let signaling_envelope = create_inner_envelope(
+            &InnerEnvelopeParams {
+                context_id: "ctx-1",
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                message_type: MessageType::Signaling,
+                payload: b"same payload",
+                provenance: None,
+                signing_key_id: SigningKeyId::Active,
+            },
+            &custody,
+            &signing_key,
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(
+            content_envelope.signature, signaling_envelope.signature,
+            "different message_type must produce different signatures"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_type_msgpack_roundtrip() {
+        let (custody, signing_key) = setup().await;
+
+        for msg_type in [MessageType::Content, MessageType::Signaling] {
+            let envelope = create_inner_envelope(
+                &InnerEnvelopeParams {
+                    context_id: "ctx-1",
+                    sender_did: "did:dht:alice",
+                    epoch: 1,
+                    generation: 0,
+                    sequence: 1,
+                    timestamp: 1_700_000_000,
+                    message_type: msg_type,
+                    payload: b"roundtrip test",
+                    provenance: None,
+                    signing_key_id: SigningKeyId::Active,
+                },
+                &custody,
+                &signing_key,
+            )
+            .await
+            .unwrap();
+
+            let bytes = rmp_serde::to_vec_named(&envelope).unwrap();
+            let deserialized: InnerEnvelope = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(deserialized.message_type, msg_type);
+        }
+    }
+
+    // -------------------------------------------------------------------
     // SigningKeyId-specific tests (ADR-039)
     // -------------------------------------------------------------------
 
@@ -768,6 +942,7 @@ mod tests {
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload: b"active key message",
                 provenance: None,
                 signing_key_id: SigningKeyId::Active,
@@ -796,6 +971,7 @@ mod tests {
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload: b"agent key message",
                 provenance: None,
                 signing_key_id: SigningKeyId::Agent,
@@ -824,6 +1000,7 @@ mod tests {
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload: b"signed as active",
                 provenance: None,
                 signing_key_id: SigningKeyId::Active,
@@ -856,6 +1033,7 @@ mod tests {
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload: b"same payload",
                 provenance: None,
                 signing_key_id: SigningKeyId::Active,
@@ -874,6 +1052,7 @@ mod tests {
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload: b"same payload",
                 provenance: None,
                 signing_key_id: SigningKeyId::Agent,
@@ -904,6 +1083,7 @@ mod tests {
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload: b"compat test",
                 provenance: None,
                 signing_key_id: SigningKeyId::Active,
@@ -939,6 +1119,7 @@ mod tests {
                     generation: 0,
                     sequence: 1,
                     timestamp: 1_700_000_000,
+                    message_type: MessageType::Content,
                     payload: b"msgpack roundtrip",
                     provenance: None,
                     signing_key_id: key_id,
@@ -971,6 +1152,7 @@ mod tests {
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload: b"modify DID doc",
                 provenance: None,
                 signing_key_id: SigningKeyId::Agent,
@@ -1003,6 +1185,7 @@ mod tests {
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload: b"send message",
                 provenance: None,
                 signing_key_id: SigningKeyId::Agent,
@@ -1030,6 +1213,7 @@ mod tests {
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload: b"modify DID doc",
                 provenance: None,
                 signing_key_id: SigningKeyId::Active,
@@ -1057,6 +1241,7 @@ mod tests {
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload: b"test",
                 provenance: None,
                 signing_key_id: SigningKeyId::Agent,
@@ -1108,6 +1293,7 @@ mod tests {
                             generation: 0,
                             sequence: 1,
                             timestamp: 1_700_000_000,
+                            message_type: MessageType::Content,
                             payload: &payload,
                             provenance: None,
                             signing_key_id: SigningKeyId::Active,

@@ -27,7 +27,7 @@ use ed25519_dalek::Signer;
 use scp_core::crypto::mls::credential::ScpCredential;
 use scp_core::crypto::ucan::mint::{MintParams, mint_ucan};
 use scp_core::envelope::inner::{
-    InnerEnvelopeParams, Provenance, create_inner_envelope, verify_inner_signature,
+    InnerEnvelopeParams, MessageType, Provenance, create_inner_envelope, verify_inner_signature,
 };
 use scp_core::trust::{
     ActionCategory, CounterAttestation, CustodyViolationType, ScpCustodyViolationAttestation,
@@ -283,6 +283,7 @@ async fn test_agent_binding_full_flow() {
         generation: 0,
         sequence: 42,
         timestamp: 1_700_000_000_000,
+        message_type: MessageType::Content,
         payload,
         provenance: Some(Provenance {
             source: "agent-assistant".to_owned(),
