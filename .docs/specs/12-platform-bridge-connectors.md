@@ -131,6 +131,37 @@ Bridge connectors do not violate context isolation. A bridge registered in Conte
 
 Bridge connectors are not agents — they cannot initiate actions, exercise capabilities, or participate in governance. They are translation infrastructure. All agency flows through the agents and governance of the context they're registered in.
 
+### 12.6.1 Bridge Encryption Model
+
+Bridge connectors are **not MLS group members**. They do not receive MLS key schedule material and cannot decrypt messages between native context members. End-to-end encryption is preserved for native-to-native communication in bridged contexts.
+
+Shadow identity messages use the **sender key layer** (§9.16) rather than MLS encryption. The bridge operator generates a sender key per shadow identity and distributes it via the same pull-based protocol used in broadcast contexts. Native members decrypt bridge-originated messages using the shadow's sender key.
+
+This creates two envelope types within a bridged encrypted context:
+
+- **MLS-encrypted envelopes** — from native members, using the MLS group key schedule. Bridge cannot decrypt these.
+- **Sender-key-encrypted envelopes** — from shadow identities, using per-shadow sender keys. All context members (native and bridge) can decrypt these.
+
+The envelope type discriminator (§9.5) distinguishes the two paths on the receive side. Both decryption paths already exist in the protocol — MLS for encrypted contexts, sender keys for broadcast contexts.
+
+Context metadata (§5.7) MUST include `bridge_operator_did` when a bridge is registered, so members can see that a bridge is present and evaluate trust accordingly.
+
+### 12.6.2 Bridge Threat Model
+
+A malicious bridge operator can:
+
+1. **Fabricate shadow messages** — attribute content to platform users who did not produce it. Mitigated by `BridgeProvenance` (§12.4) which makes bridge attribution visible.
+2. **Selectively drop messages** — suppress platform-to-SCP or SCP-to-platform delivery. Detectable via the platform's own delivery confirmation mechanisms.
+3. **Correlate activity** — observe which platform users correspond to which shadow identities across contexts it operates in. Mitigated by separate bridge registrations per context (§12.6).
+4. **Inject false attestations** — claim platform identity verification that did not occur. Mitigated by attestation freshness checks (§7.4.4) and governance-level bridge revocation (§12.2).
+
+A malicious bridge operator **cannot**:
+
+- Read native-to-native messages (no MLS key material).
+- Modify native member messages (MLS authentication prevents forgery).
+- Exercise capabilities or participate in governance (bridge is not an agent).
+- Access other contexts (bridge registration is per-context).
+
 ## 12.7 Self-Hosting Bridges
 
 Consistent with SCP's self-hosting philosophy (§10), bridge connectors are self-hostable. A user can run their own bridge to connect their own external platform accounts into SCP contexts they participate in. Self-hosted bridges eliminate the need to trust a third-party bridge operator with credentials or data.
@@ -516,7 +547,7 @@ Content entering SCP through the cooperative mode HTTP binding receives enhanced
 
 **For bridge node implementors:**
 
-- All SCP envelope construction, MLS encryption, and provenance marking happen on the bridge node. The platform never sees SCP protocol internals.
+- All SCP envelope construction, sender key encryption (§12.6.1), and provenance marking happen on the bridge node. The bridge does NOT perform MLS encryption — it uses per-shadow sender keys. The platform never sees SCP protocol internals.
 - The bridge node is responsible for rate limiting outbound requests to the platform, respecting the platform's `Retry-After` headers.
 - Shadow state is authoritative on the bridge node. Platform-side state changes arrive via webhooks and are reconciled by the bridge node.
 - Webhook event deduplication is required. The `event_id` field serves as the idempotency key.
