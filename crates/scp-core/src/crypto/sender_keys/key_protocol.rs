@@ -44,7 +44,7 @@ use crate::identity::SigningKeyId;
 const HPKE_NONCE_SIZE: usize = 12;
 
 /// HKDF info string for sender key HPKE encryption.
-const HPKE_INFO: &[u8] = b"scp-sender-key-hpke-v1";
+const HPKE_INFO: &[u8] = b"scp-sender-key-v1";
 
 /// Grace period in seconds during which the old key should still be accepted
 /// for decryption of in-flight messages after an epoch advance.
