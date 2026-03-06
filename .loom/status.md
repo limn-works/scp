@@ -1,77 +1,72 @@
 # Loom Status
 
 ## Failing Tests
-None — full workspace test suite green (3000+ tests pass, 0 failures). Clippy clean with CI features.
+None — full workspace test suite green. Clippy clean with CI features.
 
 ## Uncommitted Changes
 None — all changes committed. Working tree clean.
 
 ## Fixed This Iteration
-N/A — no prior failures existed.
+- Merge conflict fix: added `message_type: MessageType::Content` to #321 validation test helpers (Phase 1 #290 added field)
+- Review finding 1 (HIGH): `ucan_delegate` fallback capability URI used wrong context_id — fixed to resolve against parent token
+- Review finding 2 (MEDIUM): `SequenceTracker` missing per-sender timestamp monotonicity per §9.8.2(c) — added `TimestampRegression` error + tracking
 
 ## Tests Added / Updated
-- 7 wire format compliance tests (serde rename verification)
-- Dedup TTL test updated for 24hr window
-- 26 sender key test sites migrated from serde_json to rmp_serde
-- Legacy serde defaults test rewritten for MessagePack compatibility
-- Future-timestamp block notification rejection test
-- Same-target RemoveMember conflict detection test
-- RotateContentKeys conflict detection test
-- 5 sender key request freshness/nonce replay tests (HandleRequestParams API)
-- 4 MessageType canonical hash tests (tamper detection, Signaling variant, different-type signatures, msgpack roundtrip)
-- Broadcast seal/open tests updated with signing key parameters
-- Broadcast signature verification and replay detection tests
-- Phase1 integration test updated to MessagePack deserialization
+- 26 envelope validation tests (#321 — timestamp bounds, sequence monotonicity, combined validation)
+- 3 timestamp monotonicity tests (review fix — regression rejected, same accepted, increasing accepted)
+- UCAN signing verification tests (#326 — mint round-trip, delegation chain, persistent key verification)
 
 ## Work Summary
 
-### Phase 0: COMPLETE — 8 spec fix lanes
+### Phase 0: COMPLETE — 8 spec fix lanes (prior iteration)
+### Phase 1: COMPLETE — 7 code fix lanes (prior iteration)
 
-| Lane | Issue(s) | Commit |
-|------|----------|--------|
-| S-B | #380 (UCAN nonce format) | aa92b92 |
-| S-C | #378 (Protocol versioning §13) | 23c4b32 |
-| S-E | #372 (Identity private state) | f8bbc6e |
-| S-F | CRYPTO-03/04/18 (HPKE + nonce) | e6ecaa3 |
-| S-G | #381 (Sync anti-replay) | 8c7ae18 |
-| S-H | #374 (Context nesting eligibility) | 5c79ab7 |
-| S-I | #379 (§15 erasure clarification) | aeaf5f9 |
-| S-A, S-D | Pre-existing | Already done |
+### This Iteration: Phase 2/3/4 Parallel Dispatch
 
-### Phase 1: COMPLETE — all 7 lanes
+Dispatched 7 subagents with worktree isolation:
 
-| Issue | Description | Commit |
-|-------|------------|--------|
-| #345 | serde rename (ref_id→ref, event_type→type) | af4192c |
-| #313 | Dedup cache TTL 1hr→24hr | 2444c9a |
-| #348 | ProtocolStore positional→named MessagePack | d174211, 34d05b2 |
-| #354 | Missing conflict detection pairs | 38fe1cf |
-| #351 | deny_unknown_fields on InnerEnvelope | 26e2222 |
-| #312 | HPKE domain separator alignment | 53ed083 |
-| #346 | Sender key JSON→MessagePack + all 4 findings | 7f341b8, 5fb0266 |
-| #290 | MessageType into InnerEnvelope + canonical hash | 5f88141 |
-| #352 | BroadcastEnvelope missing fields + signatures | c78f1b6 |
-| #353 | block_subscriber per-author scope | c78f1b6 |
-| #350 | Replace stub RoleDefinition/ToolRegistration | dd392ae |
-| #355 | Wire missing governance fields | dd392ae |
-| #301 | Wire real metrics to dev API + blob backends | cf3cc06 |
+| Issue | Phase | Description | Result | Commit |
+|-------|-------|-------------|--------|--------|
+| #321 | P3 Lane D | Timestamp bounds + sequence monotonicity | **COMPLETE** | b7b4e1e, e4d17ec (merge fix), 3eacfb2 (review fix) |
+| #326 | P3 Lane B | UniFFI UCAN persistent signing keys | **COMPLETE** | ddeb07e, 3eacfb2 (review fix) |
+| #349 | P2 Step 1 | f64→u32 basis points | **FAILED** — hit usage limit, no commits | — |
+| #347 | P3 Lane A | Deserialization size limits (OOM DoS) | **FAILED** — hit usage limit, no commits | — |
+| #299 | P3 Lane B | Wire mint_role_tokens to real UCAN signing | **FAILED** — hit usage limit, no commits | — |
+| #319 | P3 Lane B | UCAN tool invocation authorization bypass | **FAILED** — hit usage limit, no commits | — |
+| #327 | P4 Lane A | BEP44 sequence number persistence | **FAILED** — hit usage limit, no commits | — |
 
-### Review Fixes (post-Phase 1)
+### Review Outcomes
+- Review agent: bug-catcher
+- Result: FAIL (2 findings)
+- Finding 1 (HIGH): `ucan_delegate` fallback URI used delegator's context_id instead of parent token's — **FIXED** in 3eacfb2
+- Finding 2 (MEDIUM): Missing per-sender timestamp monotonicity per §9.8.2(c) — **FIXED** in 3eacfb2
+- No findings skipped
 
-| Finding | Fix | Commit |
-|---------|-----|--------|
-| deny_unknown_fields on 4 sender key wire types | Added to SenderKeyEpochAdvance, SenderKeyRequest, SenderKeyResponse, BlockNotification | 81185a1 |
-| handle_sender_key_request no timestamp/nonce validation | Added freshness check + NonceDedup replay via HandleRequestParams | 81185a1 |
-| Integer overflow in future-timestamp check | saturating_add | 81185a1 |
-| Missing future-timestamp test | Added | 81185a1 |
-| Missing conflict detection tests | Added same-target RemoveMember + RotateContentKeys | 81185a1 |
-| BlockNotification missing signing_key_id | Added per ADR-007 §6 | 5fb0266 |
-| Nonce fields missing serde_bytes | Added to SenderKeyRequest.nonce + SenderKeyResponse.request_nonce | 5fb0266 |
-| Store version bump unnecessary | Reverted to v1 (nothing shipped) | cd14abc |
-| Integration test using JSON for MessagePack data | Fixed to rmp_serde | a8d2051 |
+### Issues Commented This Iteration
+#321, #326
 
-### Phases 2-12: NOT STARTED
-See `.docs/prod-readiness-exec-plan.md` for the full 12-phase plan.
+### Cumulative Issues Commented (21)
+#290, #301, #312, #313, #321, #326, #345, #346, #348, #350, #351, #352, #353, #354, #355, #372, #374, #378, #379, #380, #381
 
-## Issues Commented (19)
-#290, #301, #312, #313, #345, #346, #348, #350, #351, #352, #353, #354, #355, #372, #374, #378, #379, #380, #381
+## Next Iteration — Re-dispatch Failed Subagents
+
+The following issues need fresh subagents in the next iteration:
+
+**Phase 2 (serial governance chain — MUST start here):**
+- #349 — f64→u32 basis points in MajorityVoteConfig
+
+**Phase 3 (parallel, unblocked):**
+- #347 — Deserialization size limits (OOM DoS prevention)
+- #299 — Wire mint_role_tokens to real UCAN signing
+- #319 — UCAN authorization at tool invocation (BLOCKER)
+
+**Phase 4 (parallel, unblocked):**
+- #327 — BEP44 sequence number persistence
+
+**Phase 4 Lane B (not yet attempted):**
+- #315 — BIP-39 mnemonic for key continuity fingerprints
+- #325 — TOFU key tracking + certificate pinning
+
+**Phase 3 Lane C (blocked on Phase 2):**
+- #339 — Context ceiling enforcement
+- #340 — Promotion policy enforcement
