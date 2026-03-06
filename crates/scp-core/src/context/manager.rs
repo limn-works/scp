@@ -3042,6 +3042,16 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Executes a context promotion (§5.10).
+    ///
+    /// Contexts with `PromotionPolicy::NoPromotion` MUST reject `PromoteContext`
+    /// regardless of governance approval. This is a protocol-level invariant:
+    /// the promotion policy is immutable after creation and overrides any
+    /// governance decision. Only contexts created with
+    /// `PromotionPolicy::Promotable` can be promoted.
+    ///
+    /// On success: TTL is removed, memory scope transitions to `Full`, existing
+    /// event log and key material are preserved.
     async fn execute_promote_context(
         &self,
         context_id: &str,
@@ -7510,6 +7520,196 @@ mod tests {
         assert_eq!(
             deserialized.governance_model_config,
             snapshot.governance_model_config
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Promotion policy enforcement tests (§5.10, #340)
+    // -----------------------------------------------------------------------
+
+    /// §5.10 AC1: a context created with `NoPromotion` rejects `PromoteContext`
+    /// governance proposals with `PermissionDenied`.
+    #[tokio::test]
+    async fn promote_context_rejected_when_policy_is_no_promotion() {
+        use crate::context::governance::{GovernanceProposal, SignedVote, VoteType};
+
+        let (manager, _handle) = setup_active_context().await;
+
+        // setup_active_context uses ContextParams::default() which has
+        // promotion_policy = NoPromotion. Build an approved PromoteContext
+        // proposal with the creator's vote.
+        let proposal = GovernanceProposal {
+            proposal_id: [1u8; 32],
+            context_id: "test-ctx".into(),
+            proposer_did: "did:key:creator".into(),
+            action: GovernanceAction::PromoteContext,
+            status: ProposalStatus::Approved,
+            created_at: 1000,
+            voting_deadline: 2000,
+            approvals: vec![SignedVote {
+                voter_did: "did:key:creator".into(),
+                vote: VoteType::Approve,
+                timestamp: 1000,
+                signature: vec![0u8; 64],
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+
+        let result = manager
+            .execute_governance_action("test-ctx", &proposal)
+            .await;
+
+        assert!(result.is_err(), "NoPromotion context must reject PromoteContext");
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not Promotable"),
+            "error message should contain 'not Promotable', got: {msg}"
+        );
+        assert!(
+            matches!(err, ContextError::PermissionDenied(_)),
+            "should be PermissionDenied, got: {err}"
+        );
+    }
+
+    /// §5.10 AC2: a context created with `Promotable` can be promoted via
+    /// unanimous governance approval. After promotion, TTL is removed and
+    /// memory scope transitions to `Full`.
+    #[tokio::test]
+    async fn promote_context_succeeds_when_policy_is_promotable() {
+        use crate::context::governance::{GovernanceProposal, SignedVote, VoteType};
+        use crate::context::params::{MemoryScope, PromotionPolicy};
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let params = ContextParams {
+            promotion_policy: PromotionPolicy::Promotable,
+            memory_scope: MemoryScope::Ephemeral,
+            ttl: Some(std::time::Duration::from_secs(3600)),
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+            ],
+            ..ContextParams::default()
+        };
+
+        let handle = manager
+            .create_context("promo-ctx".into(), params, "did:key:creator".into())
+            .await
+            .unwrap();
+
+        // Verify preconditions: TTL is set, memory scope is Ephemeral.
+        assert_eq!(handle.params().memory_scope, MemoryScope::Ephemeral);
+        assert_eq!(handle.params().promotion_policy, PromotionPolicy::Promotable);
+
+        // Build an approved PromoteContext proposal with unanimous consent
+        // (only the creator is a member).
+        let proposal = GovernanceProposal {
+            proposal_id: [2u8; 32],
+            context_id: "promo-ctx".into(),
+            proposer_did: "did:key:creator".into(),
+            action: GovernanceAction::PromoteContext,
+            status: ProposalStatus::Approved,
+            created_at: 1000,
+            voting_deadline: 2000,
+            approvals: vec![SignedVote {
+                voter_did: "did:key:creator".into(),
+                vote: VoteType::Approve,
+                timestamp: 1000,
+                signature: vec![0u8; 64],
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+
+        let result = manager
+            .execute_governance_action("promo-ctx", &proposal)
+            .await;
+
+        assert!(result.is_ok(), "Promotable context should accept PromoteContext: {result:?}");
+
+        // Verify postconditions: memory scope is now Full.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("promo-ctx").unwrap();
+        assert_eq!(
+            ctx.handle.params().memory_scope,
+            MemoryScope::Full,
+            "memory scope should transition to Full after promotion"
+        );
+
+        // TTL timer should be cancelled (deadline removed).
+        assert!(
+            ctx.ttl_timer.deadline_unix_secs.is_none(),
+            "TTL deadline should be removed after promotion"
+        );
+    }
+
+    /// §5.10 AC3: after promotion, `promotion_policy` remains `Promotable` —
+    /// the field is not mutated by the promotion itself.
+    #[tokio::test]
+    async fn promote_context_does_not_mutate_promotion_policy() {
+        use crate::context::governance::{GovernanceProposal, SignedVote, VoteType};
+        use crate::context::params::{MemoryScope, PromotionPolicy};
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let params = ContextParams {
+            promotion_policy: PromotionPolicy::Promotable,
+            memory_scope: MemoryScope::Ephemeral,
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+            ],
+            ..ContextParams::default()
+        };
+
+        let handle = manager
+            .create_context("promo-immut-ctx".into(), params, "did:key:creator".into())
+            .await
+            .unwrap();
+
+        assert_eq!(handle.params().promotion_policy, PromotionPolicy::Promotable);
+
+        let proposal = GovernanceProposal {
+            proposal_id: [3u8; 32],
+            context_id: "promo-immut-ctx".into(),
+            proposer_did: "did:key:creator".into(),
+            action: GovernanceAction::PromoteContext,
+            status: ProposalStatus::Approved,
+            created_at: 1000,
+            voting_deadline: 2000,
+            approvals: vec![SignedVote {
+                voter_did: "did:key:creator".into(),
+                vote: VoteType::Approve,
+                timestamp: 1000,
+                signature: vec![0u8; 64],
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+
+        let result = manager
+            .execute_governance_action("promo-immut-ctx", &proposal)
+            .await;
+        assert!(result.is_ok(), "promotion should succeed: {result:?}");
+
+        // Verify promotion_policy is still Promotable (not mutated).
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("promo-immut-ctx").unwrap();
+        assert_eq!(
+            ctx.handle.params().promotion_policy,
+            PromotionPolicy::Promotable,
+            "promotion_policy must remain Promotable after promotion — it is immutable"
         );
     }
 }

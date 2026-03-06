@@ -462,6 +462,10 @@ pub struct ContextParams {
     pub ceiling_policy: CeilingPolicy,
 
     /// Whether the context can be promoted (e.g., from ephemeral to persistent).
+    ///
+    /// Immutable after context creation. No API exists to change this field
+    /// post-creation. The value is declared at context creation time and
+    /// governs the context's entire lifecycle. See spec §5.10.
     pub promotion_policy: PromotionPolicy,
 
     /// Role definitions with permission sets. Each role maps to a subset of
