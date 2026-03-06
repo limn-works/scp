@@ -348,6 +348,19 @@ Note: the `claim` field uses compact JSON with no whitespace (equivalent to Pyth
 | 3 | `timestamp` | 8-byte BE u64 |
 | 4 | `wrapping_pubkey` | 32 bytes (X25519 public key) |
 
+**ResetRequest** — domain: `"SCP-RESET-REQUEST-V1:"`
+
+| Order | Field | Encoding |
+|-------|-------|----------|
+| 1 | `context_id` | 4-byte BE length + UTF-8 bytes |
+| 2 | `member_did` | 4-byte BE length + UTF-8 bytes |
+| 3 | `last_known_epoch` | 8-byte BE u64 |
+| 4 | `reason_tag` | 1 byte (0x01 = ExtendedOffline, 0x02 = CatchUpFailed, 0x03 = GovernanceAction) |
+| 5 | `nonce` | 16 bytes (fixed-size CSPRNG, prevents replay) |
+| 6 | `timestamp` | 8-byte BE u64 |
+
+The `reason_tag` is a single-byte discriminant for the `ResetReason` enum. The reason's inner data (e.g., `offline_duration_secs` for ExtendedOffline) is carried in the request struct but is NOT included in the signed hash -- the tag alone is sufficient to bind the signature to the reason category. Anti-replay validation is specified in §23.5.2: signature check, 30-second freshness window, and nonce deduplication with 60-second TTL.
+
 **UCAN signing:** EdDSA (Ed25519) per UCAN specification. The nonce field (`nnc`) is mandatory and must be unique per token issuance. This prevents UCAN token replay. UCAN token expiry (`exp`) MUST NOT exceed 24 hours (matching the nonce deduplication cache window in §9.8.2). Tokens with longer expiry could be replayed after nonce cache eviction. **UCAN revocation** is per-context via `RevocationList` — an append-only map of token CIDs to revocation states (Active, RevocationPending, Revoked). Revocations are distributed as MLS application messages to all context members. Revocation check is step 10 of the 11-step validation pipeline (ADR-016) and is performed on every capability exercise. The system is **fail-closed**: tokens in `RevocationPending` state (revocation initiated but not yet confirmed via MLS) are denied. See ADR-016 criterion 7 and `scp-core/crypto/ucan/revoke.rs` for the full specification.
 
 **Why single ciphersuite:** Ciphersuite negotiation adds complexity and introduces downgrade attack vectors. For v1, every implementation uses exactly these algorithms. Future protocol versions may introduce additional ciphersuites with a secure negotiation mechanism, but v1 prioritizes simplicity and auditability.
