@@ -25,6 +25,7 @@ pub mod inner;
 pub mod outer;
 pub mod padding;
 pub mod pseudonym;
+pub mod validation;
 
 // Re-export primary types and functions at the envelope module level.
 pub use inner::{
@@ -34,6 +35,10 @@ pub use inner::{
 pub use outer::{OuterEnvelope, create_outer_envelope, open_envelope, seal_envelope};
 pub use padding::{BUCKET_SIZES, pad_to_bucket, strip_padding};
 pub use pseudonym::{derive_pseudonym, derive_rotatable_pseudonym};
+pub use validation::{
+    DEFAULT_CLOCK_SKEW_TOLERANCE_MS, DEFAULT_MAX_MESSAGE_AGE_MS, SequenceTracker,
+    TimestampValidator, validate_received_envelope,
+};
 
 /// Errors produced by envelope operations.
 ///
@@ -132,4 +137,59 @@ pub enum EnvelopeError {
     /// constructed with a DID that is not part of the group.
     #[error("unknown sender: {0}")]
     UnknownSender(String),
+
+    /// The envelope timestamp is too far in the future (§9.8.2(c)).
+    ///
+    /// The `created_at` timestamp exceeds the local clock plus the configured
+    /// clock skew tolerance. This may indicate a replay attack with a
+    /// fabricated timestamp or severe clock desynchronization.
+    #[error(
+        "timestamp in future: envelope={envelope_timestamp}, local={local_time}, \
+         tolerance={tolerance_ms}ms"
+    )]
+    TimestampInFuture {
+        /// The envelope's `timestamp` field (Unix milliseconds).
+        envelope_timestamp: u64,
+        /// The local clock reading (Unix milliseconds).
+        local_time: u64,
+        /// The configured clock skew tolerance (milliseconds).
+        tolerance_ms: u64,
+    },
+
+    /// The envelope timestamp is too old (§9.8.2(c)).
+    ///
+    /// The `created_at` timestamp is more than `max_message_age` behind the
+    /// local clock. This may indicate a time-shifted replay attack.
+    #[error(
+        "timestamp too old: envelope={envelope_timestamp}, local={local_time}, \
+         max_age={max_age_ms}ms"
+    )]
+    TimestampTooOld {
+        /// The envelope's `timestamp` field (Unix milliseconds).
+        envelope_timestamp: u64,
+        /// The local clock reading (Unix milliseconds).
+        local_time: u64,
+        /// The configured maximum message age (milliseconds).
+        max_age_ms: u64,
+    },
+
+    /// The envelope's sequence number is not monotonically increasing
+    /// (§9.8.2, §9.8.5).
+    ///
+    /// The received sequence number is less than or equal to the last seen
+    /// sequence from the same sender in the same context. This is a replay.
+    #[error(
+        "sequence regression: sender={sender_did} in context={context_id}, \
+         received={received_sequence}, last_seen={last_seen_sequence}"
+    )]
+    SequenceRegression {
+        /// The sender's DID.
+        sender_did: String,
+        /// The context identifier.
+        context_id: String,
+        /// The received (regressed) sequence number.
+        received_sequence: u64,
+        /// The highest previously seen sequence number from this sender.
+        last_seen_sequence: u64,
+    },
 }
