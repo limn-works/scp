@@ -659,7 +659,9 @@ impl ContextProvider for FfiBridgeProvider {
                     .map_err(|e| format!("failed to build proof resolver: {e}"))?;
 
             crate::runtime::with_context(context_id, |rt| {
-                let did_resolver = crate::bridge_adapters::BridgeDidResolver;
+                let production_resolver = crate::runtime::did_resolver();
+                let did_resolver =
+                    crate::bridge_adapters::DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
                 let revocation_checker = crate::bridge_adapters::BridgeRevocationChecker {
                     revocation_list: &rt.revocation_list,
                 };

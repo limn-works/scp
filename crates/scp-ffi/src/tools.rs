@@ -248,7 +248,9 @@ fn validate_tool_ucan(
     let proof_resolver = crate::ucan::build_proof_resolver_from_tokens(proof_tokens.as_deref())?;
 
     crate::runtime::with_context(context_id, |rt| {
-        let did_resolver = crate::bridge_adapters::BridgeDidResolver;
+        let production_resolver = crate::runtime::did_resolver();
+        let did_resolver =
+            crate::bridge_adapters::DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
         let revocation_checker = crate::bridge_adapters::BridgeRevocationChecker {
             revocation_list: &rt.revocation_list,
         };

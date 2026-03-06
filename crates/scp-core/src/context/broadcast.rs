@@ -97,9 +97,18 @@ impl SubscriberRegistration {
         wrapping_pubkey: &[u8],
         timestamp: u64,
     ) -> Vec<u8> {
-        let mut input = Vec::new();
-        input.extend_from_slice(context_id.as_bytes());
-        input.extend_from_slice(subscriber_did.0.as_bytes());
+        let ctx_bytes = context_id.as_bytes();
+        let did_bytes = subscriber_did.0.as_bytes();
+        let mut input =
+            Vec::with_capacity(4 + ctx_bytes.len() + 4 + did_bytes.len() + wrapping_pubkey.len() + 8);
+        // Length-prefix variable-length fields to prevent ambiguous concatenation
+        // (e.g. context_id="a" + did="bc" vs context_id="ab" + did="c").
+        input.extend_from_slice(&(ctx_bytes.len() as u32).to_be_bytes());
+        input.extend_from_slice(ctx_bytes);
+        input.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
+        input.extend_from_slice(did_bytes);
+        // wrapping_pubkey is fixed-size (32 bytes) and timestamp is fixed-size (8 bytes)
+        // so no length prefix needed.
         input.extend_from_slice(wrapping_pubkey);
         input.extend_from_slice(&timestamp.to_be_bytes());
         input
