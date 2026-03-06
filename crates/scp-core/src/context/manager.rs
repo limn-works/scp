@@ -6273,6 +6273,28 @@ mod tests {
     // Collection bounds tests (#360, §5.9)
     // -----------------------------------------------------------------------
 
+    /// Build a minimal valid [`ToolRegistration`] for bounds tests.
+    fn test_tool_registration(id: &str) -> ToolRegistration {
+        use crate::context::tools::registry::{TestVector, ToolSchema};
+        ToolRegistration {
+            tool_id: id.to_owned(),
+            name: id.to_owned(),
+            description: "test tool".to_owned(),
+            schema: ToolSchema {
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: serde_json::json!({"type": "object"}),
+            },
+            implementation_hash: [0u8; 32],
+            test_vectors: vec![TestVector {
+                input: serde_json::json!({}),
+                expected_output: serde_json::json!({}),
+                description: "noop".to_owned(),
+            }],
+            operator_did: "did:key:test-operator".into(),
+            economic_metadata: None,
+        }
+    }
+
     /// #360: register exactly 256 tools (the limit), verify the 256th succeeds;
     /// attempt to register a 257th, verify `LimitExceeded` is returned.
     #[tokio::test]
@@ -6282,9 +6304,7 @@ mod tests {
 
         // Register exactly MAX_REGISTERED_TOOLS tools.
         for i in 0..super::MAX_REGISTERED_TOOLS {
-            let reg = ToolRegistration {
-                name: format!("tool-{i}"),
-            };
+            let reg = test_tool_registration(&format!("tool-{i}"));
             manager
                 .execute_register_tool("test-ctx", &reg, pid)
                 .await
@@ -6292,9 +6312,7 @@ mod tests {
         }
 
         // The 257th must fail with LimitExceeded.
-        let overflow = ToolRegistration {
-            name: "tool-overflow".to_owned(),
-        };
+        let overflow = test_tool_registration("tool-overflow");
         let err = manager
             .execute_register_tool("test-ctx", &overflow, pid)
             .await
