@@ -27,7 +27,7 @@ use hkdf::Hkdf;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519Pub};
 use zeroize::Zeroizing;
 
@@ -927,21 +927,20 @@ fn compute_epoch_advance_hash(
     epoch: u64,
     signer_key_ref: SigningKeyId,
 ) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"SCP-EPOCH-ADVANCE-V1:");
-    // DID and key bytes are always < 4 GiB; length prefix fits in u32.
-    #[allow(clippy::cast_possible_truncation)]
-    let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
-        hasher.update((bytes.len() as u32).to_be_bytes());
-        hasher.update(bytes);
-    };
-    length_prefix(&mut hasher, context_id.as_bytes());
-    length_prefix(&mut hasher, sender_did.as_bytes());
-    hasher.update(b"key_epoch");
-    hasher.update(epoch.to_be_bytes());
-    // Bind signer_key_ref to prevent key confusion attacks (ADR-039).
-    length_prefix(&mut hasher, signer_key_ref.as_bytes());
-    hasher.finalize().to_vec()
+    use crate::crypto::canonical::{CanonicalField, canonical_hash};
+
+    // Field order per §9.5.2: context_id, sender_did, "key_epoch" literal, epoch, signer_key_ref.
+    canonical_hash(
+        "SCP-EPOCH-ADVANCE-V1:",
+        &[
+            CanonicalField::VarBytes(context_id.as_bytes()),
+            CanonicalField::VarBytes(sender_did.as_bytes()),
+            CanonicalField::RawBytes(b"key_epoch"),
+            CanonicalField::U64(epoch),
+            CanonicalField::VarBytes(signer_key_ref.as_bytes()),
+        ],
+    )
+    .to_vec()
 }
 
 /// Computes `SHA-256("SCP-KEY-REQUEST-V1:" || len(requester_did) || requester_did
@@ -960,21 +959,21 @@ fn compute_request_hash(
     nonce: &[u8; REQUEST_NONCE_SIZE],
     timestamp: u64,
 ) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    // DID and key bytes are always < 4 GiB; length prefix fits in u32.
-    hasher.update(b"SCP-KEY-REQUEST-V1:");
-    #[allow(clippy::cast_possible_truncation)]
-    let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
-        hasher.update((bytes.len() as u32).to_be_bytes());
-        hasher.update(bytes);
-    };
-    length_prefix(&mut hasher, requester_did.as_bytes());
-    length_prefix(&mut hasher, sender_did.as_bytes());
-    hasher.update(epoch.to_be_bytes());
-    length_prefix(&mut hasher, wrapping_pubkey);
-    hasher.update(nonce);
-    hasher.update(timestamp.to_be_bytes());
-    hasher.finalize().to_vec()
+    use crate::crypto::canonical::{CanonicalField, canonical_hash};
+
+    // Field order per §9.5.2: requester_did, sender_did, epoch, wrapping_pubkey, nonce, timestamp.
+    canonical_hash(
+        "SCP-KEY-REQUEST-V1:",
+        &[
+            CanonicalField::VarBytes(requester_did.as_bytes()),
+            CanonicalField::VarBytes(sender_did.as_bytes()),
+            CanonicalField::U64(epoch),
+            CanonicalField::VarBytes(wrapping_pubkey),
+            CanonicalField::RawBytes(nonce),
+            CanonicalField::U64(timestamp),
+        ],
+    )
+    .to_vec()
 }
 
 /// Computes `SHA-256("SCP-BLOCK-NOTIFICATION-V1:" || len(context_id) || context_id
@@ -991,19 +990,19 @@ fn compute_block_notification_hash(
     blocked_did: &str,
     timestamp: u64,
 ) -> Vec<u8> {
-    // DID and key bytes are always < 4 GiB; length prefix fits in u32.
-    let mut hasher = Sha256::new();
-    hasher.update(b"SCP-BLOCK-NOTIFICATION-V1:");
-    #[allow(clippy::cast_possible_truncation)]
-    let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
-        hasher.update((bytes.len() as u32).to_be_bytes());
-        hasher.update(bytes);
-    };
-    length_prefix(&mut hasher, context_id.as_bytes());
-    length_prefix(&mut hasher, blocker_did.as_bytes());
-    length_prefix(&mut hasher, blocked_did.as_bytes());
-    hasher.update(timestamp.to_be_bytes());
-    hasher.finalize().to_vec()
+    use crate::crypto::canonical::{CanonicalField, canonical_hash};
+
+    // Field order per §9.5.2: context_id, blocker_did, blocked_did, timestamp.
+    canonical_hash(
+        "SCP-BLOCK-NOTIFICATION-V1:",
+        &[
+            CanonicalField::VarBytes(context_id.as_bytes()),
+            CanonicalField::VarBytes(blocker_did.as_bytes()),
+            CanonicalField::VarBytes(blocked_did.as_bytes()),
+            CanonicalField::U64(timestamp),
+        ],
+    )
+    .to_vec()
 }
 
 /// Verifies an Ed25519 signature against a public key and message.

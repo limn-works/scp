@@ -252,7 +252,10 @@ fn verify_claim_signature(request: &ClaimRequest) -> Result<(), ClaimError> {
 fn verify_attestation_signature(attestation: &Attestation) -> Result<(), ClaimError> {
     let public_key_bytes = extract_public_key_from_did(&attestation.issuer)
         .map_err(|reason| ClaimError::InvalidAttestationSignature { reason })?;
-    let canonical_bytes = crate::trust::attestation::canonical_attestation_bytes(attestation);
+    let canonical_bytes = crate::trust::attestation::canonical_attestation_bytes(attestation)
+        .map_err(|e| ClaimError::InvalidAttestationSignature {
+            reason: e.to_string(),
+        })?;
     verify_ed25519_signature(&public_key_bytes, &canonical_bytes, &attestation.signature)
         .map_err(|reason| ClaimError::InvalidAttestationSignature { reason })
 }
@@ -507,7 +510,8 @@ mod tests {
 
         // Sign the attestation with the issuer's key using the canonical
         // bytes from the trust module (the single source of truth).
-        let canonical_bytes = crate::trust::attestation::canonical_attestation_bytes(&attestation);
+        let canonical_bytes =
+            crate::trust::attestation::canonical_attestation_bytes(&attestation).unwrap();
         let sig = signing_key.sign(&canonical_bytes);
         attestation.signature = sig.to_bytes().to_vec();
 

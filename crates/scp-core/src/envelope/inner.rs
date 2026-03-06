@@ -339,11 +339,6 @@ pub fn enforce_inner_envelope_category_a(
 
 /// Domain separator prepended to the canonical hash input to prevent
 /// cross-protocol signature confusion. Because the same Ed25519 key may be
-/// used for multiple signing purposes (envelope, UCAN, DID auth), a unique
-/// prefix ensures that a signature produced for one context can never be
-/// replayed as valid in another.
-const DOMAIN_SEPARATOR: &[u8] = b"SCP-INNER-ENVELOPE-V1:";
-
 /// Computes `SHA-256(serialize(provenance))` if present, or `SHA-256(0x00)` if
 /// absent. Returns a fixed-size 32-byte array (SHA-256 output).
 fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<[u8; 32], EnvelopeError> {
@@ -383,32 +378,25 @@ fn compute_canonical_hash(
     payload_hash: &[u8; 32],
     provenance_hash: &[u8; 32],
 ) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    hasher.update(DOMAIN_SEPARATOR);
+    use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
-    // Length-prefix variable-length fields to prevent boundary ambiguity.
-    #[allow(clippy::cast_possible_truncation)]
-    let len_prefix = |h: &mut Sha256, data: &[u8]| {
-        h.update((data.len() as u32).to_be_bytes());
-        h.update(data);
-    };
-    len_prefix(&mut hasher, params.context_id.as_bytes());
-    len_prefix(&mut hasher, params.sender_did.as_bytes());
-
-    // Fixed-width u64 fields -- no length prefix needed.
-    hasher.update(params.epoch.to_be_bytes());
-    hasher.update(params.generation.to_be_bytes());
-    hasher.update(params.sequence.to_be_bytes());
-    hasher.update(params.timestamp.to_be_bytes());
-
-    len_prefix(&mut hasher, payload_hash);
-    len_prefix(&mut hasher, provenance_hash);
-
-    // Bind signing_key_id to the signature to prevent key confusion attacks
-    // (ADR-039). Length-prefixed like other variable-length fields.
-    len_prefix(&mut hasher, params.signing_key_id.as_bytes());
-
-    hasher.finalize().to_vec()
+    // Field order per §9.5.2: context_id, sender_did, epoch, generation,
+    // sequence, timestamp, payload_hash, provenance_hash, signing_key_id.
+    canonical_hash(
+        "SCP-INNER-ENVELOPE-V1:",
+        &[
+            CanonicalField::VarBytes(params.context_id.as_bytes()),
+            CanonicalField::VarBytes(params.sender_did.as_bytes()),
+            CanonicalField::U64(params.epoch),
+            CanonicalField::U64(params.generation),
+            CanonicalField::U64(params.sequence),
+            CanonicalField::U64(params.timestamp),
+            CanonicalField::VarBytes(payload_hash),
+            CanonicalField::VarBytes(provenance_hash),
+            CanonicalField::VarBytes(params.signing_key_id.as_bytes()),
+        ],
+    )
+    .to_vec()
 }
 
 #[cfg(test)]

@@ -303,7 +303,7 @@ pub fn verify_attestation(
 ) -> Result<(), TrustError> {
     // 1. Verify Ed25519 signature against issuer's public key.
     let public_key_bytes = resolver.resolve_public_key(&attestation.issuer)?;
-    let canonical = canonical_attestation_bytes(attestation);
+    let canonical = canonical_attestation_bytes(attestation)?;
     verify_ed25519_signature(&public_key_bytes, &canonical, &attestation.signature).map_err(
         |reason| TrustError::AttestationSignatureInvalid {
             attestation_id: attestation.id.clone(),
@@ -457,26 +457,42 @@ pub fn check_threshold_attestation(
 /// numeric tag (u16 big-endian) instead of Debug formatting for
 /// cross-version determinism. `issued_at` uses big-endian encoding,
 /// consistent with all other canonical hash functions.
-pub(crate) fn canonical_attestation_bytes(attestation: &Attestation) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"SCP-ATTESTATION-V1:");
+pub(crate) fn canonical_attestation_bytes(
+    attestation: &Attestation,
+) -> Result<Vec<u8>, TrustError> {
+    use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
-    // Length-prefix helper for variable-length fields.
-    #[allow(clippy::cast_possible_truncation)]
-    let length_prefix = |bytes: &mut Vec<u8>, data: &[u8]| {
-        bytes.extend_from_slice(&(data.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(data);
-    };
+    // Serialize evidence as MessagePack bytes if present.
+    let evidence_bytes = attestation
+        .evidence
+        .as_ref()
+        .map(|e| {
+            rmp_serde::to_vec(e).map_err(|err| TrustError::InvalidEventData {
+                sequence: 0,
+                reason: format!("evidence serialization failed: {err}"),
+            })
+        })
+        .transpose()?;
 
-    length_prefix(&mut bytes, attestation.id.as_bytes());
-    bytes.extend_from_slice(
-        &super::attestation_type_tag(&attestation.attestation_type).to_be_bytes(),
-    ); // fixed-width u16, no length prefix needed
-    length_prefix(&mut bytes, attestation.issuer.as_bytes());
-    length_prefix(&mut bytes, attestation.subject.as_bytes());
-    length_prefix(&mut bytes, attestation.claim.to_string().as_bytes());
-    bytes.extend_from_slice(&attestation.issued_at.to_be_bytes()); // fixed-width, no prefix needed
-    bytes
+    // Field order per §9.5.2: id, attestation_type, issuer, subject, claim,
+    // evidence, issued_at, expires_at.
+    let claim_bytes = attestation.claim.to_string();
+    Ok(canonical_hash(
+        "SCP-ATTESTATION-V1:",
+        &[
+            CanonicalField::VarBytes(attestation.id.as_bytes()),
+            CanonicalField::U16(super::attestation_type_tag(&attestation.attestation_type)),
+            CanonicalField::VarBytes(attestation.issuer.as_bytes()),
+            CanonicalField::VarBytes(attestation.subject.as_bytes()),
+            CanonicalField::VarBytes(claim_bytes.as_bytes()),
+            evidence_bytes
+                .as_deref()
+                .map_or(CanonicalField::Absent, CanonicalField::VarBytes),
+            CanonicalField::U64(attestation.issued_at),
+            CanonicalField::U64(attestation.expires_at.unwrap_or(0)),
+        ],
+    )
+    .to_vec())
 }
 
 /// Validates that evidence is present and appropriate for the attestation type.
@@ -673,7 +689,7 @@ mod tests {
             signature: vec![],
         };
 
-        let canonical = canonical_attestation_bytes(&attestation);
+        let canonical = canonical_attestation_bytes(&attestation).unwrap();
         let sig = signing_key.sign(&canonical);
         attestation.signature = sig.to_bytes().to_vec();
         attestation
@@ -1412,8 +1428,8 @@ mod tests {
             signature: vec![],
         };
 
-        let bytes_a = canonical_attestation_bytes(&att_a);
-        let bytes_b = canonical_attestation_bytes(&att_b);
+        let bytes_a = canonical_attestation_bytes(&att_a).unwrap();
+        let bytes_b = canonical_attestation_bytes(&att_b).unwrap();
         assert_ne!(
             bytes_a, bytes_b,
             "shifting bytes between id and issuer must produce different canonical bytes"
