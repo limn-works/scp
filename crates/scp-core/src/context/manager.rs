@@ -4370,6 +4370,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+    use crate::context::params::MemoryScope;
     use crate::context::{ContextMode, ContextState};
 
     // -----------------------------------------------------------------------
@@ -6604,6 +6605,7 @@ mod tests {
         manager.register_local_did("did:key:bob".into()).await;
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: MemoryScope::Full,
             ceiling: vec![
                 Capability::MessagesRead,
                 Capability::MessagesWrite,
@@ -6747,6 +6749,7 @@ mod tests {
         manager.register_local_did("did:key:alice".into()).await;
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: MemoryScope::Full,
             ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
             ..ContextParams::default()
         };
@@ -8642,6 +8645,7 @@ mod tests {
         // Ceiling WITHOUT MemberBan.
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: MemoryScope::Full,
             ceiling: vec![
                 Capability::MessagesRead,
                 Capability::MessagesWrite,
