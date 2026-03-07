@@ -117,8 +117,10 @@ pub use custody_violation::{
 #[cfg(feature = "testing")]
 pub use participation::compute_participation_record;
 pub use participation::{
-    ParticipationAdmissionError, ParticipationFact, ParticipationProfile, ParticipationRecord,
-    ParticipationThreshold, RequireParticipation, produce_participation_profile,
+    PARTICIPATION_STATEMENTS_SERVICE_TYPE, ParticipationAdmissionError, ParticipationFact,
+    ParticipationProfile, ParticipationRecord, ParticipationThreshold, RequireParticipation,
+    add_participation_service, extract_participation_service_endpoint,
+    produce_participation_profile, remove_participation_service,
     verify_participation_requirements,
 };
 pub use renewal::{DefaultRenewalChecker, RenewalChecker, RenewalError, renew_attestation};
