@@ -288,7 +288,7 @@ pub async fn health_handler(State(state): State<Arc<NodeState>>) -> impl IntoRes
         StatusCode::OK,
         Json(HealthResponse {
             uptime_seconds: uptime,
-            // TODO(SCP-245): wire real relay connection count
+            // Stub — see SCP-243: wire real relay connection count
             relay_connections: 0,
             storage_status: "ok".to_owned(),
         }),
@@ -307,7 +307,7 @@ pub async fn identity_handler(State(state): State<Arc<NodeState>>) -> impl IntoR
         StatusCode::OK,
         Json(IdentityResponse {
             did: state.did.clone(),
-            // TODO: return full DidDocument once it is stored in NodeState
+            // Stub — see SCP-243: return full DidDocument once it is stored in NodeState
             document: state.did.clone(),
         }),
     )
@@ -317,7 +317,7 @@ pub async fn identity_handler(State(state): State<Arc<NodeState>>) -> impl IntoR
 ///
 /// Returns a [`RelayStatusResponse`] with the relay's bound address, active
 /// connection count, and blob count. Connection and blob counts are
-/// placeholders until SCP-245 wires real metrics.
+/// placeholders until SCP-243 wires real metrics.
 ///
 /// See spec section 18.10.3.
 pub async fn relay_status_handler(State(state): State<Arc<NodeState>>) -> impl IntoResponse {
@@ -325,9 +325,9 @@ pub async fn relay_status_handler(State(state): State<Arc<NodeState>>) -> impl I
         StatusCode::OK,
         Json(RelayStatusResponse {
             bound_addr: state.relay_addr.to_string(),
-            // TODO(SCP-245): wire real active connection count
+            // Stub — see SCP-243: wire real active connection count
             active_connections: 0,
-            // TODO(SCP-245): wire real blob count from storage backend
+            // Stub — see SCP-243: wire real blob count from storage backend
             blob_count: 0,
         }),
     )

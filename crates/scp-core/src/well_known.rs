@@ -332,7 +332,6 @@ impl WellKnownScp {
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::unimplemented,
     clippy::manual_async_fn
 )]
 mod tests {
@@ -381,19 +380,18 @@ mod tests {
     }
 
     // Mock only implements resolve(); other DidMethod methods are intentionally
-    // unimplemented as they are not exercised by well_known tests.
-    #[allow(clippy::unimplemented)]
+    // unreachable as they are not exercised by well_known tests.
     impl DidMethod for MockDidMethod {
         fn create(
             &self,
             _key_custody: &impl KeyCustody,
         ) -> impl Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send
         {
-            async { unimplemented!("not needed for well_known tests") }
+            async { unreachable!("not called in well_known tests") }
         }
 
         fn verify(&self, _did_string: &str, _public_key: &[u8]) -> bool {
-            unimplemented!("not needed for well_known tests")
+            unreachable!("not called in well_known tests")
         }
 
         fn publish(
@@ -401,7 +399,7 @@ mod tests {
             _identity: &ScpIdentity,
             _document: &DidDocument,
         ) -> impl Future<Output = Result<(), IdentityError>> + Send {
-            async { unimplemented!("not needed for well_known tests") }
+            async { unreachable!("not called in well_known tests") }
         }
 
         fn resolve(
@@ -425,7 +423,7 @@ mod tests {
             _key_custody: &impl KeyCustody,
         ) -> impl Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send
         {
-            async { unimplemented!("not needed for well_known tests") }
+            async { unreachable!("not called in well_known tests") }
         }
     }
 
