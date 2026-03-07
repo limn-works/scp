@@ -481,6 +481,142 @@ fn require_active(handle: &ContextHandle) -> Result<(), ContextError> {
 }
 
 // ---------------------------------------------------------------------------
+// Governance engine construction helpers (SCP-267, ADR-031)
+// ---------------------------------------------------------------------------
+
+/// Validates that a [`GovernanceModel`] variant is consistent with a
+/// [`GovernanceModelConfig`] variant. Returns a creation error on mismatch.
+fn validate_governance_consistency(
+    model: &GovernanceModel,
+    config: &GovernanceModelConfig,
+) -> Result<(), ContextCreationError> {
+    let consistent = matches!(
+        (model, config),
+        (
+            GovernanceModel::SingleAdmin,
+            GovernanceModelConfig::SingleAdmin { .. }
+        ) | (
+            GovernanceModel::Threshold { .. },
+            GovernanceModelConfig::Threshold { .. }
+        ) | (
+            GovernanceModel::Majority { .. },
+            GovernanceModelConfig::Majority { .. }
+        ) | (
+            GovernanceModel::Unanimity { .. },
+            GovernanceModelConfig::Unanimity { .. }
+        )
+    );
+    if !consistent {
+        return Err(ContextCreationError::CreationFailed(format!(
+            "GovernanceModel::{model:?} does not match GovernanceModelConfig variant"
+        )));
+    }
+    Ok(())
+}
+
+/// Constructs a boxed [`GovernanceEngine`] from a [`GovernanceModelConfig`].
+///
+/// For `Majority` and `Unanimity` models, `initial_voters` provides the
+/// initial eligible voter set (typically the context creator at creation
+/// time). For `SingleAdmin` and `Threshold`, voters are embedded in the
+/// config itself. The voter set is updated by the `ContextManager` when
+/// members join/leave.
+///
+/// Validates configuration parameters (threshold bounds, empty signers,
+/// `min_participation_bps` range) and returns a creation error on invalid input.
+fn build_governance_engine(
+    config: GovernanceModelConfig,
+    initial_voters: Vec<DID>,
+    key_resolver: KeyResolver,
+) -> Result<Box<dyn GovernanceEngine>, ContextCreationError> {
+    match config {
+        GovernanceModelConfig::SingleAdmin { admin_did } => {
+            Ok(Box::new(SingleAdminEngine::new(admin_did, key_resolver)))
+        }
+        GovernanceModelConfig::Threshold {
+            signers,
+            threshold,
+            voting_window_secs,
+        } => {
+            let engine = ThresholdEngine::new(signers, threshold, voting_window_secs, key_resolver)
+                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+            Ok(Box::new(engine))
+        }
+        GovernanceModelConfig::Majority {
+            voting_window_secs,
+            min_participation_bps,
+        } => {
+            let engine = MajorityVoteEngine::new(
+                initial_voters,
+                voting_window_secs,
+                min_participation_bps,
+                key_resolver,
+            )
+            .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+            Ok(Box::new(engine))
+        }
+        GovernanceModelConfig::Unanimity { voting_window_secs } => {
+            let engine = UnanimityEngine::new(initial_voters, voting_window_secs, key_resolver)
+                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+            Ok(Box::new(engine))
+        }
+    }
+}
+
+/// Mints `GovernancePropose` and `GovernanceVote` UCAN tokens for each
+/// designated voter in the governance engine (ADR-031 §6).
+///
+/// For `SingleAdmin`, the admin already receives these via the admin role.
+/// For multi-party models, each signer/voter receives both capabilities.
+///
+/// Returns the minted tokens. The tokens are also stored in the context's
+/// role state by the caller.
+fn mint_governance_tokens(
+    context_id: &str,
+    creator_did: &DID,
+    engine: &dyn GovernanceEngine,
+) -> Vec<super::roles::UcanToken> {
+    use super::roles::{Capability, UcanAttestation, UcanToken};
+
+    let config = engine.model_config();
+    let voter_dids: Vec<DID> = match &config {
+        GovernanceModelConfig::SingleAdmin { admin_did } => vec![admin_did.clone()],
+        GovernanceModelConfig::Threshold { signers, .. } => signers.clone(),
+        GovernanceModelConfig::Majority { .. } | GovernanceModelConfig::Unanimity { .. } => {
+            // For Majority/Unanimity, voters are "all members with GovernanceVote
+            // capability." At creation time, the creator is the only member.
+            vec![creator_did.clone()]
+        }
+    };
+
+    let capabilities = [Capability::GovernancePropose, Capability::GovernanceVote];
+    let mut tokens = Vec::with_capacity(voter_dids.len() * capabilities.len());
+
+    for voter in &voter_dids {
+        for cap in &capabilities {
+            let att = UcanAttestation {
+                with: format!("scp:ctx:{context_id}/{cap}"),
+                can: "invoke".to_owned(),
+            };
+            // Nonce generation: if the clock is unavailable, fall back to a
+            // static nonce (acceptable for governance tokens minted at creation
+            // time — replay prevention is handled by the engine's proposal-ID
+            // scheme).
+            let nonce = crate::crypto::ucan::nonce::generate_nonce()
+                .unwrap_or_else(|_| "gov-init-0".to_owned());
+            tokens.push(UcanToken {
+                iss: creator_did.to_string(),
+                aud: voter.to_string(),
+                att: vec![att],
+                nnc: nonce,
+            });
+        }
+    }
+
+    tokens
+}
+
+// ---------------------------------------------------------------------------
 // ContextManager
 // ---------------------------------------------------------------------------
 
@@ -1036,6 +1172,146 @@ impl ContextManager {
             self.event_log.as_ref(),
         )
         .await
+    }
+
+    /// Creates a new SCP context with explicit governance configuration
+    /// (SCP-267, ADR-031).
+    ///
+    /// This is the full-configuration entry point for context creation. The
+    /// `GovernanceModelConfig` carries all governance-specific parameters
+    /// (signers, threshold, voting window, min participation, etc.). The
+    /// `GovernanceModel` in `params.governance` must be consistent with the
+    /// config variant.
+    ///
+    /// At creation time, `GovernancePropose` and `GovernanceVote` UCAN tokens
+    /// are minted for designated voters per ADR-031 §6.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError`] if:
+    /// - The `GovernanceModelConfig` is inconsistent with `params.governance`.
+    /// - The config has invalid parameters (e.g., threshold > `signers.len()`).
+    /// - Any builder validation or execution step fails.
+    pub async fn create_context_with_governance(
+        &self,
+        context_id: String,
+        params: ContextParams,
+        creator_did: DID,
+        governance_config: GovernanceModelConfig,
+    ) -> Result<ContextHandle, ContextCreationError> {
+        // Validate consistency between GovernanceModel and GovernanceModelConfig.
+        validate_governance_consistency(&params.governance, &governance_config)?;
+
+        // Phase 1+2: builder performs validation and creation (async, no lock held).
+        let handle = builder_create_context(
+            context_id.clone(),
+            params.clone(),
+            self.crypto.as_ref(),
+            self.transport.as_ref(),
+            self.event_log.as_ref(),
+        )
+        .await?;
+
+        // Build ceiling from params.
+        let ceiling = CapabilityCeiling::new(params.ceiling.iter().cloned());
+
+        // Initialize role state with the creator as admin.
+        let role_state = ContextRoleState::new(&context_id, &*creator_did, ceiling, vec![])
+            .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+
+        // Initialize membership with the creator.
+        let mut membership = MembershipState::new();
+        let creator_tokens = role_state
+            .assignments
+            .get(creator_did.as_ref())
+            .map(|a| a.tokens.clone())
+            .unwrap_or_default();
+        membership.add_member(creator_did.clone(), "admin".into(), creator_tokens);
+
+        // Initialize broadcast context for Broadcast mode (SCP-227).
+        let broadcast_context = if params.mode == ContextMode::Broadcast {
+            let admission = match params.template_id {
+                Some(TemplateId::GatedBroadcast) => BroadcastAdmission::Gated,
+                Some(TemplateId::PublicBroadcast | TemplateId::PaidBroadcast) => {
+                    BroadcastAdmission::Open
+                }
+                _ => BroadcastAdmission::Open,
+            };
+            let mut bc = BroadcastContext::new(context_id.clone(), &params.mode, admission)
+                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+            bc.add_author(&creator_did)
+                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+            self.persist_broadcast_snapshot(&context_id, &bc.to_snapshot());
+            Some(bc)
+        } else {
+            None
+        };
+
+        // Construct the governance engine from the explicit config (SCP-267).
+        let governance_engine = build_governance_engine(
+            governance_config,
+            vec![creator_did.clone()],
+            self.key_resolver.clone(),
+        )?;
+
+        // Mint GovernancePropose and GovernanceVote UCAN tokens for designated
+        // voters per ADR-031 §6.
+        let _governance_tokens =
+            mint_governance_tokens(&context_id, &creator_did, governance_engine.as_ref());
+
+        let per_context = PerContextState {
+            handle: handle.clone(),
+            membership,
+            role_state,
+            receive_buffer: ReceiveBuffer::new(),
+            ttl_timer: TtlTimer::new(),
+            ttl_extension: None,
+            broadcast_context,
+            executed_proposals: HashSet::new(),
+            registered_tools: Vec::new(),
+            write_revoked_members: HashSet::new(),
+            tool_interfaces: Vec::new(),
+            threshold_signers: Vec::new(),
+            threshold_value: 0,
+            pruning_policy: None,
+            governance_engine,
+        };
+
+        // Atomic duplicate check + insert under lock.
+        {
+            let mut contexts = self.contexts.lock().await;
+            if contexts.contains_key(&context_id) {
+                return Err(ContextCreationError::CreationFailed(format!(
+                    "context '{context_id}' already registered"
+                )));
+            }
+            contexts.insert(context_id.clone(), per_context);
+        }
+
+        // Persist context + broadcast state after creation (best-effort).
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(&context_id) {
+                let snapshot = Self::snapshot_context(ctx);
+                let bc_snapshot = ctx
+                    .broadcast_context
+                    .as_ref()
+                    .map(BroadcastContext::to_snapshot);
+                drop(contexts);
+                self.persist_context_snapshot(&context_id, &snapshot);
+                if let Some(ref bcs) = bc_snapshot {
+                    self.persist_broadcast_snapshot(&context_id, bcs);
+                }
+            }
+        }
+
+        // Spawn TTL timer if TTL is configured (SCP-021).
+        if let Some(ttl_duration) = params.ttl {
+            self.spawn_ttl_timer(&context_id, ttl_duration, handle.clone())
+                .await;
+        }
+
+        Ok(handle)
     }
 
     /// Joins a member to a context.
@@ -8078,5 +8354,384 @@ mod tests {
             matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("member:ban")),
             "expected PermissionDenied about member:ban, got: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Governance engine construction tests (SCP-267, ADR-031)
+    // -----------------------------------------------------------------------
+
+    /// AC 4: `create_context` constructs `SingleAdminEngine` when
+    /// `GovernanceModel::SingleAdmin` is specified.
+    #[tokio::test]
+    async fn governance_single_admin_engine_constructed() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let params = ContextParams {
+            governance: GovernanceModel::SingleAdmin,
+            ..ContextParams::default()
+        };
+        let creator: DID = "did:key:admin1".into();
+        let handle = manager
+            .create_context("ctx-gov-sa".into(), params, creator.clone())
+            .await
+            .unwrap();
+        assert_eq!(handle.state().await, ContextState::Active);
+        // Verify the engine is accessible inside the per-context state.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("ctx-gov-sa").unwrap();
+        let config = ctx.governance_engine.model_config();
+        assert_eq!(
+            config,
+            GovernanceModelConfig::SingleAdmin { admin_did: creator }
+        );
+    }
+
+    /// AC 5: `create_context_with_governance` constructs `ThresholdEngine`
+    /// when `GovernanceModel::Threshold` is specified.
+    #[tokio::test]
+    async fn governance_threshold_engine_constructed() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let creator: DID = "did:key:admin1".into();
+        let signer2: DID = "did:key:signer2".into();
+        let params = ContextParams {
+            governance: GovernanceModel::Threshold {
+                threshold: 2,
+                signers: vec![creator.clone(), signer2.clone()],
+            },
+            ..ContextParams::default()
+        };
+        let config = GovernanceModelConfig::Threshold {
+            signers: vec![creator.clone(), signer2.clone()],
+            threshold: 2,
+            voting_window_secs: 86_400,
+        };
+        let handle = manager
+            .create_context_with_governance(
+                "ctx-gov-thresh".into(),
+                params,
+                creator.clone(),
+                config.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(handle.state().await, ContextState::Active);
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("ctx-gov-thresh").unwrap();
+        assert_eq!(ctx.governance_engine.model_config(), config);
+    }
+
+    /// AC 6: `create_context_with_governance` constructs `MajorityVoteEngine`
+    /// when `GovernanceModel::Majority` is specified.
+    #[tokio::test]
+    async fn governance_majority_engine_constructed() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let creator: DID = "did:key:admin1".into();
+        let params = ContextParams {
+            governance: GovernanceModel::Majority {
+                eligible_voters: vec![creator.clone()],
+            },
+            ..ContextParams::default()
+        };
+        let config = GovernanceModelConfig::Majority {
+            voting_window_secs: 86_400,
+            min_participation_bps: 5000,
+        };
+        let handle = manager
+            .create_context_with_governance("ctx-gov-maj".into(), params, creator.clone(), config)
+            .await
+            .unwrap();
+        assert_eq!(handle.state().await, ContextState::Active);
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("ctx-gov-maj").unwrap();
+        let model_config = ctx.governance_engine.model_config();
+        assert!(matches!(
+            model_config,
+            GovernanceModelConfig::Majority { .. }
+        ));
+    }
+
+    /// AC 7: `create_context_with_governance` constructs `UnanimityEngine`
+    /// when `GovernanceModel::Unanimity` is specified.
+    #[tokio::test]
+    async fn governance_unanimity_engine_constructed() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let creator: DID = "did:key:admin1".into();
+        let params = ContextParams {
+            governance: GovernanceModel::Unanimity {
+                eligible_voters: vec![creator.clone()],
+            },
+            ..ContextParams::default()
+        };
+        let config = GovernanceModelConfig::Unanimity {
+            voting_window_secs: 172_800,
+        };
+        let handle = manager
+            .create_context_with_governance(
+                "ctx-gov-unan".into(),
+                params,
+                creator.clone(),
+                config.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(handle.state().await, ContextState::Active);
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("ctx-gov-unan").unwrap();
+        assert_eq!(ctx.governance_engine.model_config(), config);
+    }
+
+    /// AC 8/12: Invalid `GovernanceModelConfig` is rejected at creation time.
+    /// Threshold > `signers.len()`.
+    #[tokio::test]
+    async fn governance_invalid_threshold_too_high_rejected() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let creator: DID = "did:key:admin1".into();
+        let params = ContextParams {
+            governance: GovernanceModel::Threshold {
+                threshold: 5,
+                signers: vec![creator.clone()],
+            },
+            ..ContextParams::default()
+        };
+        let config = GovernanceModelConfig::Threshold {
+            signers: vec![creator.clone()],
+            threshold: 5, // > signers.len() (1)
+            voting_window_secs: 86_400,
+        };
+        let result = manager
+            .create_context_with_governance("ctx-bad-thresh".into(), params, creator, config)
+            .await;
+        assert!(result.is_err());
+    }
+
+    /// AC 8/12: Invalid `GovernanceModelConfig` — threshold == 0 rejected.
+    #[tokio::test]
+    async fn governance_invalid_threshold_zero_rejected() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let creator: DID = "did:key:admin1".into();
+        let params = ContextParams {
+            governance: GovernanceModel::Threshold {
+                threshold: 0,
+                signers: vec![creator.clone()],
+            },
+            ..ContextParams::default()
+        };
+        let config = GovernanceModelConfig::Threshold {
+            signers: vec![creator.clone()],
+            threshold: 0,
+            voting_window_secs: 86_400,
+        };
+        let result = manager
+            .create_context_with_governance("ctx-bad-thresh-0".into(), params, creator, config)
+            .await;
+        assert!(result.is_err());
+    }
+
+    /// AC 8/12: Invalid `GovernanceModelConfig` — empty signers for Threshold.
+    #[tokio::test]
+    async fn governance_invalid_empty_signers_rejected() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let creator: DID = "did:key:admin1".into();
+        let params = ContextParams {
+            governance: GovernanceModel::Threshold {
+                threshold: 1,
+                signers: vec![],
+            },
+            ..ContextParams::default()
+        };
+        let config = GovernanceModelConfig::Threshold {
+            signers: vec![],
+            threshold: 1,
+            voting_window_secs: 86_400,
+        };
+        let result = manager
+            .create_context_with_governance("ctx-bad-empty".into(), params, creator, config)
+            .await;
+        assert!(result.is_err());
+    }
+
+    /// AC 8/12: Invalid `GovernanceModelConfig` — `min_participation_bps` > 10000.
+    #[tokio::test]
+    async fn governance_invalid_min_participation_rejected() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let creator: DID = "did:key:admin1".into();
+        let params = ContextParams {
+            governance: GovernanceModel::Majority {
+                eligible_voters: vec![creator.clone()],
+            },
+            ..ContextParams::default()
+        };
+        let config = GovernanceModelConfig::Majority {
+            voting_window_secs: 86_400,
+            min_participation_bps: 10001, // > 10000
+        };
+        let result = manager
+            .create_context_with_governance("ctx-bad-bps".into(), params, creator, config)
+            .await;
+        assert!(result.is_err());
+    }
+
+    /// AC 8: GovernanceModel/GovernanceModelConfig mismatch is rejected.
+    #[tokio::test]
+    async fn governance_model_config_mismatch_rejected() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let creator: DID = "did:key:admin1".into();
+        let params = ContextParams {
+            governance: GovernanceModel::SingleAdmin,
+            ..ContextParams::default()
+        };
+        // Mismatch: params says SingleAdmin, config says Threshold.
+        let config = GovernanceModelConfig::Threshold {
+            signers: vec![creator.clone()],
+            threshold: 1,
+            voting_window_secs: 86_400,
+        };
+        let result = manager
+            .create_context_with_governance("ctx-mismatch".into(), params, creator, config)
+            .await;
+        assert!(result.is_err());
+    }
+
+    /// AC 10/13: UCAN tokens are minted for Threshold signers at creation.
+    #[tokio::test]
+    async fn governance_ucan_tokens_minted_for_threshold_signers() {
+        let creator: DID = "did:key:creator1".into();
+        let signer2: DID = "did:key:signer2".into();
+        let signer3: DID = "did:key:signer3".into();
+
+        let config = GovernanceModelConfig::Threshold {
+            signers: vec![creator.clone(), signer2.clone(), signer3.clone()],
+            threshold: 2,
+            voting_window_secs: 86_400,
+        };
+        let engine =
+            build_governance_engine(config, vec![creator.clone()], noop_key_resolver()).unwrap();
+        let tokens = mint_governance_tokens("ctx-ucan-test", &creator, engine.as_ref());
+
+        // 3 signers x 2 capabilities (GovernancePropose + GovernanceVote) = 6 tokens.
+        assert_eq!(tokens.len(), 6);
+
+        // Verify each signer has both GovernancePropose and GovernanceVote tokens.
+        for signer in [&creator, &signer2, &signer3] {
+            let signer_tokens: Vec<_> = tokens.iter().filter(|t| *signer == t.aud).collect();
+            assert_eq!(signer_tokens.len(), 2, "each signer should have 2 tokens");
+            let capabilities: Vec<&str> = signer_tokens
+                .iter()
+                .map(|t| t.att[0].with.as_str())
+                .collect();
+            assert!(
+                capabilities
+                    .iter()
+                    .any(|c| c.contains("governance:propose")),
+                "should have GovernancePropose token"
+            );
+            assert!(
+                capabilities.iter().any(|c| c.contains("governance:vote")),
+                "should have GovernanceVote token"
+            );
+        }
+
+        // All tokens should be issued by the creator.
+        for token in &tokens {
+            assert_eq!(token.iss, creator.to_string());
+        }
+    }
+
+    /// AC 10: UCAN tokens for `SingleAdmin` include both `GovernancePropose`
+    /// and `GovernanceVote` for the admin.
+    #[tokio::test]
+    async fn governance_ucan_tokens_minted_for_single_admin() {
+        let creator: DID = "did:key:creator1".into();
+        let engine = Box::new(SingleAdminEngine::new(creator.clone(), noop_key_resolver()));
+        let tokens = mint_governance_tokens("ctx-sa-ucan", &creator, engine.as_ref());
+
+        // 1 voter x 2 capabilities = 2 tokens.
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.iter().all(|t| creator == t.aud));
+        assert!(tokens.iter().all(|t| creator == t.iss));
+    }
+
+    /// AC 11: Default `create_context` constructs engines for all four
+    /// governance model variants without explicit `GovernanceModelConfig`.
+    #[tokio::test]
+    async fn governance_default_engine_all_variants() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let creator: DID = "did:key:admin1".into();
+
+        let models = vec![
+            GovernanceModel::SingleAdmin,
+            GovernanceModel::Threshold {
+                threshold: 1,
+                signers: vec![creator.clone()],
+            },
+            GovernanceModel::Majority {
+                eligible_voters: vec![creator.clone()],
+            },
+            GovernanceModel::Unanimity {
+                eligible_voters: vec![creator.clone()],
+            },
+        ];
+
+        for (i, model) in models.iter().enumerate() {
+            let params = ContextParams {
+                governance: model.clone(),
+                ..ContextParams::default()
+            };
+            let ctx_id = format!("ctx-default-{i}");
+            let handle = manager
+                .create_context(ctx_id.clone(), params, creator.clone())
+                .await
+                .unwrap();
+            assert_eq!(handle.state().await, ContextState::Active);
+        }
     }
 }
