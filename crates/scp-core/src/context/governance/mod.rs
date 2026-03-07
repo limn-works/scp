@@ -733,10 +733,7 @@ pub struct GovernanceProposal {
 ///
 /// Included in context metadata (spec section 5.7) -- visible before opt-in.
 /// Changing the governance model requires creating a new context.
-///
-/// Note: `PartialEq` only (not `Eq`) because `Majority::min_participation`
-/// is `f64`, which does not implement `Eq`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum GovernanceModelConfig {
     /// Single admin holds all governance authority. Phase 2 baseline.
     /// The creator is the initial (and only) admin. Admin transfer is
@@ -759,8 +756,9 @@ pub enum GovernanceModelConfig {
     Majority {
         /// Voting window in seconds. Default: `86_400` (24 hours).
         voting_window_secs: u64,
-        /// Minimum participation threshold as a fraction (0.0 to 1.0).
-        min_participation: f64,
+        /// Minimum participation threshold in basis points (1..=10000).
+        /// 5000 = 50%, 10000 = 100%.
+        min_participation_bps: u32,
     },
 
     /// Unanimity among all context members holding `GovernanceVote`
@@ -1437,7 +1435,7 @@ mod tests {
             },
             GovernanceModelConfig::Majority {
                 voting_window_secs: 86_400,
-                min_participation: 0.5,
+                min_participation_bps: 5000,
             },
             GovernanceModelConfig::Unanimity {
                 voting_window_secs: 172_800,

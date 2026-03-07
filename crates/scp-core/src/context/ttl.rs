@@ -338,6 +338,13 @@ impl TtlExtensionProposal {
             ExtensionConsentMode::AllMember => member_count,
             ExtensionConsentMode::Governance => match governance {
                 GovernanceModel::SingleAdmin => 1,
+                // Multi-party governance models delegate to the governance
+                // engine's proposal/approval flow. The required_count is the
+                // number of eligible voters (approximated by member_count here;
+                // the actual quorum is enforced by the engine).
+                GovernanceModel::Threshold
+                | GovernanceModel::Majority
+                | GovernanceModel::Unanimity => member_count,
             },
         };
         Self {

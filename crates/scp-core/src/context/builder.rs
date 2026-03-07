@@ -412,9 +412,14 @@ impl CreationReceipt {
 /// Returns [`ContextCreationError::TemplateValidationFailed`] if a template
 /// is specified and the params do not match the template definition.
 fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
-    // Governance model must be set (currently only SingleAdmin is supported).
-    // ContextParams always has a governance field, so this is a placeholder
-    // for future governance model validation.
+    // Governance model validation (SCP-267, ADR-031).
+    // GovernanceModel is a variant-only enum in ContextParams. Structural
+    // validation (e.g., threshold bounds, signer counts) happens in the
+    // ContextManager's create_context/create_context_with_governance methods
+    // where the rich GovernanceModelConfig is available. Here we validate
+    // only that the governance field is set (it always is — enforced by the
+    // type system, since GovernanceModel has no Option wrapper).
+    let _ = &params.governance; // field presence guaranteed by the type
 
     // Validate ceiling policy / ceiling consistency: if ceiling is empty and
     // policy is Governed, that is technically valid (no capabilities to

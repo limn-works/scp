@@ -166,13 +166,31 @@ impl std::fmt::Display for MemoryScope {
 /// Governance model for a context, controlling how administrative decisions
 /// are made.
 ///
-/// Phase 2 implements only `SingleAdmin`. More sophisticated governance models
-/// (multi-admin, consensus, delegation) will be added in later phases.
+/// This is a simple variant-only enum that lives in `ContextParams`. It
+/// selects the governance model; the rich per-model configuration lives in
+/// [`GovernanceModelConfig`](super::governance::GovernanceModelConfig).
+/// The builder maps `GovernanceModel` + creation arguments to the appropriate
+/// `GovernanceModelConfig` and constructs the engine.
+///
+/// All four models per ADR-031 §4:
+/// - `SingleAdmin` -- single admin auto-approve.
+/// - `Threshold` -- M-of-N threshold approval.
+/// - `Majority` -- majority vote among eligible voters.
+/// - `Unanimity` -- all eligible voters must approve.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GovernanceModel {
     /// A single administrator controls all governance decisions. The context
     /// creator is the admin by default.
     SingleAdmin,
+    /// M-of-N threshold approval. A fixed set of designated signers;
+    /// a proposal passes when at least `threshold` of them approve.
+    Threshold,
+    /// Majority vote among all context members holding `GovernanceVote`
+    /// capability.
+    Majority,
+    /// Unanimity among all context members holding `GovernanceVote`
+    /// capability. Every eligible voter must approve.
+    Unanimity,
 }
 
 // ---------------------------------------------------------------------------

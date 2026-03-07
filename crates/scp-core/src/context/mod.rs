@@ -143,7 +143,7 @@ pub use governance::{
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
     GovernanceModelConfig, GovernanceProposal, ProposalId, ProposalStatus, RejectionReason,
     RevocationScope, SignedVote, SingleAdminEngine, VoteType, majority::MajorityVoteEngine,
-    sign_vote, verify_vote,
+    multisig::ThresholdEngine, sign_vote, unanimity::UnanimityEngine, verify_vote,
 };
 
 // Re-export broadcast context types (SCP-227, spec section 5.14, #101).
