@@ -101,6 +101,7 @@ Context metadata follows a two-tier visibility model that balances legibility (i
 - Promotion policy (`no_promotion` or `promotable`), if context has a TTL (§5.10)
 - Memory scope (§5.11)
 - Context mode (`Encrypted` or `Broadcast`, §5.14)
+- Active bridges: `Vec<BridgeMetadata>` where each entry describes an active bridge connector registered with the context (§12.2). Bridge metadata is structural because bridge presence materially affects trust evaluation and privacy — a participant cannot give informed consent without knowing that content may flow to an external platform. Bridge metadata is updated whenever a bridge is registered, revoked, or suspended.
 - Metadata visibility policy itself (so prospective members know what's hidden)
 
 Structural fields are always public regardless of `MetadataVisibilityPolicy`. These are the parameters a prospective member needs to evaluate whether to join — hiding them would undermine informed consent.
@@ -135,6 +136,34 @@ pub struct MetadataVisibilityPolicy {
     pub economic_policy: FieldVisibility,
     pub tool_interface_count: FieldVisibility,
     pub child_context_info: FieldVisibility,
+}
+
+/// Metadata for an active bridge connector (§12.2).
+/// Structural field — always visible before joining.
+pub struct BridgeMetadata {
+    /// External platform name (e.g., "discord", "slack", "x").
+    pub platform: String,
+    /// DID of the bridge operator — the human accountable for
+    /// bridge behavior (§12.2).
+    pub bridge_did: DID,
+    /// Capabilities the bridge exercises in this context.
+    /// Subset of: "relay_messages", "create_shadows",
+    /// "attest_identities", "forward_presence".
+    pub capabilities: Vec<String>,
+    /// Directionality of the bridge.
+    pub mode: BridgeDirectionality,
+}
+
+/// Whether the bridge relays content in both directions or one.
+pub enum BridgeDirectionality {
+    /// Platform-to-SCP and SCP-to-platform.
+    Full,
+    /// Platform-to-SCP only (external content enters SCP,
+    /// but SCP messages are not forwarded to the platform).
+    ReadOnly,
+    /// SCP-to-platform only (SCP messages are forwarded to the
+    /// platform, but no external content enters SCP).
+    WriteOnly,
 }
 ```
 
