@@ -750,8 +750,10 @@ pub async fn context_execute_governance_action(
         rand::rngs::OsRng.fill_bytes(&mut proposal_id);
     }
 
-    let now = scp_core::time::now_secs().ok_or_else(|| {
-        napi::Error::from_reason("system clock unavailable — cannot create governance proposal")
+    let now = scp_core::time::now_secs().map_err(|e| {
+        napi::Error::from_reason(format!(
+            "system clock unavailable — cannot create governance proposal: {e}"
+        ))
     })?;
 
     // Currently all bridge governance actions are auto-approved (SingleAdmin).

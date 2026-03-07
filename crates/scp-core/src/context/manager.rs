@@ -9035,7 +9035,7 @@ mod tests {
     /// #339: `RegisterTool` is rejected when `ToolRegister` is not in ceiling.
     #[tokio::test]
     async fn register_tool_rejected_without_ceiling_capability() {
-        use crate::context::tools::registry::{TestVector, ToolSchema};
+        use crate::context::tools::registry::ToolSchema;
 
         let (manager, _handle, ctx_id) =
             setup_context_with_ceiling(vec![Capability::MessagesRead, Capability::MessagesWrite])
@@ -9074,7 +9074,7 @@ mod tests {
     /// #339: `RegisterTool` succeeds when `ToolRegister` is in ceiling.
     #[tokio::test]
     async fn register_tool_succeeds_with_ceiling_capability() {
-        use crate::context::tools::registry::{TestVector, ToolSchema};
+        use crate::context::tools::registry::ToolSchema;
 
         let (manager, _handle, ctx_id) = setup_context_with_ceiling(vec![
             Capability::MessagesRead,
@@ -9568,7 +9568,7 @@ mod tests {
         );
         let creator: DID = "did:key:admin1".into();
 
-        let models = vec![
+        let models = [
             GovernanceModel::SingleAdmin,
             GovernanceModel::Threshold {
                 threshold: 1,
