@@ -180,13 +180,7 @@ pub enum GovernanceActionResult {
         did: DID,
     },
     /// A governance action was executed successfully with no action-specific
-    /// result payload. Maps to: `ChangeRole`, `ModifyCeiling`, `CloseContext`,
-    /// `ExtendTtl`, `ChangeMemoryScope`, `AddMember`, `RemoveMember`,
-    /// `RegisterTool`, `DeregisterTool`, `ModifyThreshold`, `AddSigner`,
-    /// `RemoveSigner`, `EstablishToolInterface`, `ResetMember`,
-    /// `ResolveConflict`, `PromoteContext`, `RotateContentKeys`,
-    /// `RevokeWriteAccess`, `RestoreWriteAccess`, `ModifyPruningPolicy`,
-    /// `ReconfigureGovernance`, `SetEconomicPolicy`, `ApproveSpend`,
+    /// result payload. Maps to: `SetEconomicPolicy`, `ApproveSpend`,
     /// `LockEconomicPolicy`.
     Executed,
 }
@@ -1294,7 +1288,7 @@ impl ContextManager {
     ///
     /// Returns [`ContextCreationError`] if any validation or execution step
     /// fails.
-    pub async fn create_context_bare(
+    pub(crate) async fn create_context_bare(
         &self,
         context_id: String,
         params: ContextParams,
@@ -2285,14 +2279,6 @@ impl ContextManager {
                 self.execute_lock_economic_policy(context_id, pid).await?;
                 Ok(GovernanceActionResult::Executed)
             }
-            GovernanceAction::ReconfigureGovernance {
-                changes,
-                justification,
-            } => {
-                self.execute_reconfigure_governance(context_id, changes, justification, pid)
-                    .await?;
-                Ok(GovernanceActionResult::Executed)
-            }
             _ => {
                 self.dispatch_context_governance_action(context_id, &proposal.action, pid)
                     .await
@@ -2522,8 +2508,8 @@ impl ContextManager {
     pub async fn propose_governance_action(
         &self,
         context_id: &str,
-        action: GovernanceAction,
         proposer_did: &DID,
+        action: GovernanceAction,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(GovernanceProposal, Vec<GovernanceEvent>), ContextError> {
         let (proposal, events, should_execute) = {
@@ -2747,7 +2733,7 @@ impl ContextManager {
         // Lock dropped.
 
         let (proposal, _events) = self
-            .propose_governance_action(context_id, action, proposer_did, signing_key)
+            .propose_governance_action(context_id, proposer_did, action, signing_key)
             .await?;
 
         let status = proposal.status.clone();
@@ -8216,8 +8202,8 @@ mod tests {
         let (proposal, events) = manager
             .propose_governance_action(
                 "ctx-single-admin-lifecycle",
-                action,
                 &creator_did,
+                action,
                 &signing_key,
             )
             .await
@@ -8292,7 +8278,7 @@ mod tests {
         };
 
         let (proposal, _events) = manager
-            .propose_governance_action("ctx-threshold", action, &alice, &key_a)
+            .propose_governance_action("ctx-threshold", &alice, action, &key_a)
             .await
             .unwrap();
 
@@ -8360,7 +8346,7 @@ mod tests {
         };
 
         let (proposal, _) = manager
-            .propose_governance_action("ctx-majority", action, &alice, &key_a)
+            .propose_governance_action("ctx-majority", &alice, action, &key_a)
             .await
             .unwrap();
 
@@ -8437,7 +8423,7 @@ mod tests {
         };
 
         let (proposal, _) = manager
-            .propose_governance_action("ctx-unanimity", action, &alice, &key_a)
+            .propose_governance_action("ctx-unanimity", &alice, action, &key_a)
             .await
             .unwrap();
 
@@ -8512,7 +8498,7 @@ mod tests {
         };
 
         let (proposal, _) = manager
-            .propose_governance_action("ctx-eligibility", action, &alice, &key_a)
+            .propose_governance_action("ctx-eligibility", &alice, action, &key_a)
             .await
             .unwrap();
 
