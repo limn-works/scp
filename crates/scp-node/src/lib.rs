@@ -874,6 +874,26 @@ pub trait TlsProvider: Send + Sync {
                 + '_,
         >,
     >;
+
+    /// Returns the shared ACME challenge map (token → key authorization).
+    ///
+    /// The default implementation returns an empty map, which is correct
+    /// for mock providers and `SelfSignedTlsProvider`. Production ACME
+    /// providers override this to return the map populated during
+    /// [`provision()`](Self::provision).
+    fn challenges(&self) -> Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>> {
+        Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()))
+    }
+
+    /// Whether this provider requires an HTTP-01 challenge listener.
+    ///
+    /// Returns `true` for real ACME providers that need the CA to probe
+    /// `GET /.well-known/acme-challenge/{token}` on port 80 during
+    /// provisioning. Returns `false` for mock providers and self-signed
+    /// certificate generators. Default: `false`.
+    fn needs_challenge_listener(&self) -> bool {
+        false
+    }
 }
 
 /// Blanket [`TlsProvider`] for [`AcmeProvider`](tls::AcmeProvider).
@@ -888,6 +908,14 @@ impl<S: Storage + 'static> TlsProvider for tls::AcmeProvider<S> {
         >,
     > {
         Box::pin(self.load_or_provision())
+    }
+
+    fn challenges(&self) -> Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>> {
+        self.challenges()
+    }
+
+    fn needs_challenge_listener(&self) -> bool {
+        true
     }
 }
 
@@ -1688,7 +1716,11 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
             &protocol_store,
             self.acme_email.as_ref(),
         );
-        match tls_provider.provision().await {
+
+        let (provision_result, acme_challenges) =
+            provision_with_challenge_listener(&*tls_provider).await?;
+
+        match provision_result {
             Ok(cert_data) => {
                 build_domain_inner(
                     domain,
@@ -1708,6 +1740,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
                     self.projection_rate_limit
                         .unwrap_or(DEFAULT_PROJECTION_RATE_LIMIT),
                     cert_data,
+                    acme_challenges,
                     #[cfg(feature = "http3")]
                     self.http3_config,
                 )
@@ -1825,6 +1858,114 @@ fn resolve_tls<S: Storage + 'static>(
 }
 
 // ---------------------------------------------------------------------------
+// ACME challenge listener (§18.6.3, issue #305)
+// ---------------------------------------------------------------------------
+
+/// Temporary ACME challenge listener handle.
+///
+/// Wraps the tokio task and cancellation token for the temporary HTTP-only
+/// listener that serves `GET /.well-known/acme-challenge/{token}` during
+/// ACME provisioning. Call [`stop`](Self::stop) to shut down the listener
+/// after provisioning completes.
+struct AcmeChallengeListener {
+    /// Cancellation token to signal shutdown.
+    shutdown: CancellationToken,
+    /// Handle to the spawned listener task.
+    task: tokio::task::JoinHandle<Result<(), NodeError>>,
+}
+
+impl AcmeChallengeListener {
+    /// Stop the temporary listener and wait for it to drain.
+    async fn stop(self) {
+        self.shutdown.cancel();
+        let _ = self.task.await;
+        tracing::info!("temporary ACME HTTP-01 challenge listener stopped");
+    }
+}
+
+/// Starts a temporary HTTP-only listener on port 80 to serve ACME HTTP-01
+/// challenges during certificate provisioning (issue #305, spec §18.6.3).
+///
+/// The listener serves only `GET /.well-known/acme-challenge/{token}` from
+/// the provided challenge map. It must be started BEFORE calling
+/// `provision()` so the ACME CA has an endpoint to probe.
+///
+/// # Errors
+///
+/// Returns [`NodeError::Serve`] if the listener cannot bind to port 80.
+async fn start_acme_challenge_listener(
+    challenges: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
+) -> Result<AcmeChallengeListener, NodeError> {
+    let router = tls::acme_challenge_router(challenges);
+    let shutdown = CancellationToken::new();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:80")
+        .await
+        .map_err(|e| {
+            NodeError::Serve(format!(
+                "failed to bind temporary ACME challenge listener on port 80: {e}"
+            ))
+        })?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|e| NodeError::Serve(e.to_string()))?;
+    tracing::info!(
+        addr = %local_addr,
+        "temporary ACME HTTP-01 challenge listener started"
+    );
+    let shutdown_clone = shutdown.clone();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown_clone.cancelled_owned())
+            .await
+            .map_err(|e| NodeError::Serve(format!("ACME challenge listener error: {e}")))
+    });
+    Ok(AcmeChallengeListener { shutdown, task })
+}
+
+/// Runs TLS provisioning with an optional temporary ACME challenge listener.
+///
+/// For real ACME providers (`needs_challenge_listener() == true`), starts
+/// a temporary HTTP-only listener on port 80, calls `provision()`, then
+/// shuts the listener down. For mock providers, calls `provision()` directly.
+///
+/// Returns the provisioning result and an optional shared challenge map
+/// (for mounting in `serve()` to support ACME renewal).
+///
+/// # Errors
+///
+/// Returns [`NodeError::Serve`] if the ACME listener cannot bind.
+async fn provision_with_challenge_listener(
+    provider: &dyn TlsProvider,
+) -> Result<
+    (
+        Result<tls::CertificateData, tls::TlsError>,
+        Option<Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>>,
+    ),
+    NodeError,
+> {
+    let challenges = provider.challenges();
+    let acme_listener = if provider.needs_challenge_listener() {
+        Some(start_acme_challenge_listener(Arc::clone(&challenges)).await?)
+    } else {
+        None
+    };
+
+    let result = provider.provision().await;
+
+    if let Some(listener) = acme_listener {
+        listener.stop().await;
+    }
+
+    let acme_challenges = if provider.needs_challenge_listener() {
+        Some(challenges)
+    } else {
+        None
+    };
+
+    Ok((result, acme_challenges))
+}
+
+// ---------------------------------------------------------------------------
 // NAT strategy resolution (§10.12.8 step 5)
 // ---------------------------------------------------------------------------
 
@@ -1871,6 +2012,7 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     cors_origins: Option<Vec<String>>,
     projection_rate_limit: u32,
     cert_data: tls::CertificateData,
+    acme_challenges: Option<Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>>,
     #[cfg(feature = "http3")] http3_config: Option<scp_transport::http3::Http3Config>,
 ) -> Result<ApplicationNode<S>, NodeError> {
     let relay_url = format!("wss://{domain}/scp/v1");
@@ -1909,6 +2051,7 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         ),
         tls_config: Some(Arc::new(tls_server_config)),
         cert_resolver: Some(cert_resolver),
+        acme_challenges,
     });
 
     Ok(ApplicationNode {
@@ -2031,6 +2174,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         ),
         tls_config: None,
         cert_resolver: None,
+        acme_challenges: None,
     });
 
     // Do NOT serve .well-known/scp — no domain to serve from (§10.12.8).

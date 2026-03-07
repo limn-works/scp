@@ -590,6 +590,7 @@ mod tests {
             ),
             tls_config: None,
             cert_resolver: None,
+            acme_challenges: None,
         })
     }
 

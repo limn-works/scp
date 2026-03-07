@@ -148,6 +148,14 @@ pub struct NodeState {
     ///
     /// See spec section 18.6.3 (auto-renewal).
     pub(crate) cert_resolver: Option<Arc<crate::tls::CertResolver>>,
+    /// Shared ACME challenge map (token → key authorization).
+    ///
+    /// Mounted in [`serve()`](crate::ApplicationNode::serve) at
+    /// `GET /.well-known/acme-challenge/{token}` so that ACME renewal
+    /// challenges can be served without restarting the server (issue #305).
+    /// When `None` (no-domain or self-signed mode), no challenge router is
+    /// mounted.
+    pub(crate) acme_challenges: Option<Arc<RwLock<HashMap<String, String>>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -541,21 +549,22 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
         };
         let dev_bind_addr = self.state.dev_bind_addr;
         let tls_config = self.state.tls_config.clone();
-
-        // Extract HTTP/3 config before destructuring self.
         #[cfg(feature = "http3")]
         let http3_config = self.http3_config;
 
-        // Destructure self so we own the relay handle and state directly.
         let relay = self.relay;
         let state = self.state;
 
         // SCP routes take precedence: merge them last so they override
-        // any conflicting paths in app_router.
-        let merged = app_router
-            .merge(well_known)
-            .merge(relay_rt)
-            .merge(projection);
+        // any conflicting paths in app_router. ACME challenge router is
+        // included for renewal support (issue #305).
+        let merged = build_merged_router(
+            app_router,
+            well_known,
+            relay_rt,
+            projection,
+            state.acme_challenges.as_ref(),
+        );
 
         let dev_api_handle = spawn_dev_api(dev_router, dev_bind_addr, state.shutdown_token.clone());
 
@@ -575,25 +584,21 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
             .local_addr()
             .map_err(|e| NodeError::Serve(e.to_string()))?;
 
-        // Wire the caller-provided shutdown future to the node's cancellation
-        // token so that both the main server and the dev API shut down together.
+        // Wire the caller-provided shutdown future to the node's cancellation token.
         let shutdown_token = state.shutdown_token.clone();
-        {
-            let token = shutdown_token.clone();
-            tokio::spawn(async move {
-                shutdown.await;
-                token.cancel();
-            });
-        }
+        let token = shutdown_token.clone();
+        tokio::spawn(async move {
+            shutdown.await;
+            token.cancel();
+        });
 
         // Branch: TLS-terminated HTTPS or plain HTTP.
         let main_server: std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<(), NodeError>> + Send>,
         > = if let Some(tls_cfg) = tls_config {
-            let scheme = "HTTPS";
             tracing::info!(
-                addr = %local_addr, %scheme,
-                "application node server started (TLS active, broadcast projection endpoints active)"
+                addr = %local_addr, scheme = "HTTPS",
+                "application node server started (TLS active)"
             );
             Box::pin(tls::serve_tls(
                 listener,
@@ -662,6 +667,31 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
 // ---------------------------------------------------------------------------
 // Dev API spawning (extracted for clippy::too_many_lines)
 // ---------------------------------------------------------------------------
+
+/// Builds the merged axum router for `serve()`, combining SCP protocol
+/// routes (well-known, relay, projection, ACME challenges) with the
+/// application router. Extracted from `serve()` for clippy line limits.
+fn build_merged_router(
+    app_router: Router,
+    well_known: Router,
+    relay_rt: Router,
+    projection: Router,
+    acme_challenges: Option<&Arc<RwLock<HashMap<String, String>>>>,
+) -> Router {
+    let merged = app_router
+        .merge(well_known)
+        .merge(relay_rt)
+        .merge(projection);
+
+    // Mount ACME challenge router for renewal challenges (issue #305).
+    // Serves `GET /.well-known/acme-challenge/{token}` so the ACME CA can
+    // validate domain ownership during certificate renewal.
+    if let Some(challenges) = acme_challenges {
+        merged.merge(tls::acme_challenge_router(Arc::clone(challenges)))
+    } else {
+        merged
+    }
+}
 
 /// Spawns the dev API listener if configured.
 ///
@@ -755,6 +785,7 @@ mod tests {
             ),
             tls_config: None,
             cert_resolver: None,
+            acme_challenges: None,
         })
     }
 
