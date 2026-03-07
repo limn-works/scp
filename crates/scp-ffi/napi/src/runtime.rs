@@ -27,9 +27,10 @@ use scp_core::context::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
 };
 use scp_core::context::manager::{ContextManager, ContextPersistence, ContextSnapshot};
+use scp_core::context::roles::{ContextRoleState, default_ceiling};
+use scp_core::context::tools::{SessionStore, ToolRegistry};
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
-use scp_core::context::tools::{SessionStore, ToolRegistry};
 use scp_event_log::EventLog;
 use scp_identity::cache::SystemClock;
 
@@ -113,6 +114,8 @@ pub struct UcanContextState {
     pub creator_did: String,
     /// Event log (Merkle tree) for this context.
     pub event_log: EventLog,
+    /// Role state for capability checking (tool registration, invocation).
+    pub role_state: ContextRoleState,
     /// Tool registry for this context (cross-context + session support).
     pub tool_registry: ToolRegistry,
     /// Session store for stateful tool sessions (spec section 6.2.1).
@@ -160,12 +163,22 @@ pub fn ensure_registered(handle: &NapiContextHandle) -> Result<(), ScpNapiError>
     let revocation_list = RevocationList::new(context_id.clone());
     let nonce_tracker = NonceTracker::new(context_id.clone(), SystemClock);
 
+    // No custom roles and default ceiling cannot fail validation.
+    let role_state = ContextRoleState::new(
+        context_id.clone(),
+        creator_did.clone(),
+        default_ceiling(),
+        Vec::new(),
+    )
+    .expect("ContextRoleState::new with default ceiling and no custom roles cannot fail");
+
     let state = UcanContextState {
         revocation_list,
         nonce_tracker,
         ceiling_strings,
         creator_did,
         event_log,
+        role_state,
         tool_registry: ToolRegistry::new(),
         session_store: SessionStore::new(),
     };
