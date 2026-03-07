@@ -16,6 +16,7 @@ use scp_identity::DID;
 use serde::{Deserialize, Serialize};
 
 use crate::economy::EconomicPolicy;
+use crate::trust::RequireParticipation;
 
 // ---------------------------------------------------------------------------
 // Capability (unified type from roles module)
@@ -533,6 +534,14 @@ pub struct ContextParams {
     /// per-author overrides. `None` for non-broadcast contexts.
     #[serde(default)]
     pub projection_policy: Option<ProjectionPolicy>,
+
+    /// Participation admission requirements (spec §7.3.2.1).
+    ///
+    /// When non-empty, joining members must present [`ParticipationProfile`]
+    /// attestations satisfying every entry. Empty means no participation
+    /// requirements (the default).
+    #[serde(default)]
+    pub participation_requirements: Vec<RequireParticipation>,
 }
 
 impl Default for ContextParams {
@@ -551,6 +560,7 @@ impl Default for ContextParams {
             economic_policy: None,
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
+            participation_requirements: Vec::new(),
         }
     }
 }
@@ -640,6 +650,7 @@ mod tests {
             MetadataVisibilityPolicy::default()
         );
         assert!(params.projection_policy.is_none());
+        assert!(params.participation_requirements.is_empty());
     }
 
     #[test]
@@ -685,6 +696,7 @@ mod tests {
             economic_policy: None,
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
+            participation_requirements: Vec::new(),
         };
 
         assert_eq!(params.mode, ContextMode::Broadcast);
@@ -794,6 +806,7 @@ mod tests {
             economic_policy: None,
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
+            participation_requirements: Vec::new(),
         };
 
         let json = serde_json::to_string(&params).ok();
@@ -845,6 +858,7 @@ mod tests {
             }),
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
+            participation_requirements: Vec::new(),
         };
 
         let json = serde_json::to_string(&params).unwrap();
@@ -877,6 +891,7 @@ mod tests {
             MetadataVisibilityPolicy::default()
         );
         assert!(params.projection_policy.is_none());
+        assert!(params.participation_requirements.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1371,5 +1386,56 @@ mod tests {
         let json = serde_json::to_string(&meta).unwrap();
         let deserialized: PublicMetadata = serde_json::from_str(&json).unwrap();
         assert_eq!(meta.bridge_operator_dids, deserialized.bridge_operator_dids);
+    }
+
+    // -----------------------------------------------------------------------
+    // participation_requirements (SCP-BA-002, §7.3.2.1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn participation_requirements_serde_roundtrip() {
+        use crate::trust::{ParticipationFact, ParticipationThreshold, RequireParticipation};
+
+        let params = ContextParams {
+            participation_requirements: vec![
+                RequireParticipation {
+                    fact: ParticipationFact::ToolInvocationCount,
+                    threshold: ParticipationThreshold::AtLeast(100),
+                    max_age_secs: 86400,
+                    min_contexts: 2,
+                },
+                RequireParticipation {
+                    fact: ParticipationFact::ParticipationDuration,
+                    threshold: ParticipationThreshold::GreaterThan(3600),
+                    max_age_secs: 172800,
+                    min_contexts: 1,
+                },
+            ],
+            ..ContextParams::default()
+        };
+
+        let json = serde_json::to_string(&params).unwrap();
+        let deserialized: ContextParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(params, deserialized);
+        assert_eq!(deserialized.participation_requirements.len(), 2);
+    }
+
+    #[test]
+    fn participation_requirements_backwards_compat() {
+        // JSON without participation_requirements field deserializes to empty vec.
+        let json = r#"{
+            "mode": "Encrypted",
+            "ceiling": [],
+            "ceiling_policy": "Immutable",
+            "promotion_policy": "NoPromotion",
+            "roles": [],
+            "tools": [],
+            "ttl": null,
+            "memory_scope": "Ephemeral",
+            "governance": "SingleAdmin",
+            "template_id": null
+        }"#;
+        let params: ContextParams = serde_json::from_str(json).unwrap();
+        assert!(params.participation_requirements.is_empty());
     }
 }

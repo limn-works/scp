@@ -278,6 +278,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             economic_policy: None,
             metadata_visibility: private_encrypted_visibility(),
             projection_policy: None,
+            participation_requirements: Vec::new(),
         },
         TemplateId::BilateralPersistent => ContextParams {
             mode: ContextMode::Encrypted,
@@ -293,6 +294,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             economic_policy: None,
             metadata_visibility: private_encrypted_visibility(),
             projection_policy: None,
+            participation_requirements: Vec::new(),
         },
         TemplateId::Coordination => ContextParams {
             mode: ContextMode::Encrypted,
@@ -308,6 +310,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             economic_policy: None,
             metadata_visibility: private_encrypted_visibility(),
             projection_policy: None,
+            participation_requirements: Vec::new(),
         },
         TemplateId::GroupDiscussion => ContextParams {
             mode: ContextMode::Encrypted,
@@ -323,6 +326,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             economic_policy: None,
             metadata_visibility: group_discussion_visibility(),
             projection_policy: None,
+            participation_requirements: Vec::new(),
         },
         TemplateId::PublicBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
@@ -341,6 +345,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
                 default_rule: ProjectionRule::Public,
                 overrides: vec![],
             }),
+            participation_requirements: Vec::new(),
         },
         TemplateId::GatedBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
@@ -359,6 +364,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
                 default_rule: ProjectionRule::Gated,
                 overrides: vec![],
             }),
+            participation_requirements: Vec::new(),
         },
         TemplateId::ToolInterfaceTemplate => ContextParams {
             mode: ContextMode::Encrypted,
@@ -374,6 +380,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             economic_policy: None,
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
+            participation_requirements: Vec::new(),
         },
         // Extends scp:template/tool-interface -- same ceiling and governance,
         // but economic_policy is caller-provided and validated separately.
@@ -391,6 +398,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             economic_policy: None,
             metadata_visibility: member_count_hidden_visibility(),
             projection_policy: None,
+            participation_requirements: Vec::new(),
         },
         // Extends scp:template/gated-broadcast -- broadcast mode with gated
         // subscriber admission. economic_policy is caller-provided.
@@ -411,6 +419,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
                 default_rule: ProjectionRule::Gated,
                 overrides: vec![],
             }),
+            participation_requirements: Vec::new(),
         },
     }
 }
