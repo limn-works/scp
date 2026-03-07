@@ -30,6 +30,8 @@
 
 pub mod claiming;
 pub mod credentials;
+pub mod envelope;
+pub mod oauth;
 pub mod provenance;
 pub mod registration;
 pub mod shadow;
