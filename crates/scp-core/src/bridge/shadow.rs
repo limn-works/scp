@@ -33,6 +33,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::{BridgeMode, ContextId, DID, ShadowIdentity, ShadowProvenanceStatus};
+use crate::crypto::sender_keys::{SenderKeyStore, generate_sender_key};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -150,6 +151,19 @@ pub enum ShadowError {
     #[error("shadow identity collision: {reason}")]
     ShadowIdentityCollision {
         /// Human-readable description of the collision.
+        reason: String,
+    },
+
+    /// Failed to store the sender key for a newly created shadow identity.
+    ///
+    /// Shadow creation requires a per-shadow sender key (§12.6.1). If the
+    /// key cannot be stored, the shadow is not created — no shadow exists
+    /// without its sender key.
+    #[error("sender key storage failed for shadow {shadow_id}: {reason}")]
+    SenderKeyStoreFailed {
+        /// The shadow ID for which key storage failed.
+        shadow_id: String,
+        /// Human-readable description of the failure.
         reason: String,
     },
 }
@@ -378,6 +392,39 @@ impl ShadowRegistry {
 }
 
 // ---------------------------------------------------------------------------
+// CreateShadowParams
+// ---------------------------------------------------------------------------
+
+/// Parameters for creating a shadow identity.
+///
+/// Groups the value arguments for [`create_shadow`] to keep the function
+/// signature below the clippy `too_many_arguments` threshold while
+/// maintaining a clear, self-documenting API.
+#[derive(Debug, Clone)]
+pub struct CreateShadowParams<'a> {
+    /// Unique identifier for the new shadow identity.
+    pub shadow_id: &'a str,
+
+    /// The bridge connector creating this shadow.
+    pub bridge_id: &'a str,
+
+    /// The operating mode of the bridge.
+    pub bridge_mode: BridgeMode,
+
+    /// The external platform handle (e.g., `"@user#1234"`).
+    pub platform_handle: &'a str,
+
+    /// Current context member DIDs. The shadow ID is validated against this
+    /// set to prevent a bridge operator from mapping a shadow identity to a
+    /// real member's DID (which would enable message forgery). Pass an empty
+    /// slice if member validation is not available.
+    pub context_member_dids: &'a [&'a str],
+
+    /// Unix timestamp (seconds) of creation.
+    pub timestamp: u64,
+}
+
+// ---------------------------------------------------------------------------
 // create_shadow
 // ---------------------------------------------------------------------------
 
@@ -388,18 +435,18 @@ impl ShadowRegistry {
 /// with the observer-equivalent default role. A [`ShadowCreationEvent`] is
 /// produced for recording in the context's Merkle log.
 ///
+/// A per-shadow AES-256-GCM sender key is generated and stored in the
+/// provided [`SenderKeyStore`], keyed by `(context_id, shadow_id)`. Shadow
+/// identity messages use the sender key layer (§9.16) rather than MLS
+/// encryption (§12.6.1). Each shadow receives a unique sender key so that
+/// key compromise of one shadow does not affect others.
+///
 /// # Arguments
 ///
 /// - `registry` -- The shadow registry for this context.
-/// - `shadow_id` -- Unique identifier for the new shadow identity.
-/// - `bridge_id` -- The bridge connector creating this shadow.
-/// - `bridge_mode` -- The operating mode of the bridge.
-/// - `platform_handle` -- The external platform handle (e.g., `"@user#1234"`).
-/// - `context_member_dids` -- Current context member DIDs. The shadow ID is
-///   validated against this set to prevent a bridge operator from mapping a
-///   shadow identity to a real member's DID (which would enable message
-///   forgery). Pass an empty slice if member validation is not available.
-/// - `timestamp` -- Unix timestamp (seconds) of creation.
+/// - `sender_key_store` -- Store for per-shadow sender keys. The generated
+///   key is stored keyed by `(context_id, shadow_id)`.
+/// - `params` -- Shadow creation parameters (see [`CreateShadowParams`]).
 ///
 /// # Errors
 ///
@@ -416,16 +463,17 @@ impl ShadowRegistry {
 /// Returns [`ShadowError::CapacityExceeded`] if the per-bridge or total
 /// shadow limit would be exceeded.
 ///
-/// See ADR-023 acceptance criterion 3.
+/// See ADR-023 acceptance criterion 3 and §12.6.1 Bridge Encryption Model.
 pub fn create_shadow(
     registry: &mut ShadowRegistry,
-    shadow_id: &str,
-    bridge_id: &str,
-    bridge_mode: BridgeMode,
-    platform_handle: &str,
-    context_member_dids: &[&str],
-    timestamp: u64,
+    sender_key_store: &mut SenderKeyStore,
+    params: &CreateShadowParams<'_>,
 ) -> Result<(ShadowIdentity, ShadowCreationEvent), ShadowError> {
+    let shadow_id = params.shadow_id;
+    let bridge_id = params.bridge_id;
+    let platform_handle = params.platform_handle;
+    let context_member_dids = params.context_member_dids;
+
     // Defense-in-depth: reject shadow ID that collides with a real context
     // member DID. A bridge operator could otherwise map a shadow to a real
     // member's DID, enabling message forgery.
@@ -490,18 +538,25 @@ pub fn create_shadow(
         bridge_id: bridge_id.to_owned(),
         attributed_role: DEFAULT_SHADOW_ROLE.to_owned(),
         provenance_status: ShadowProvenanceStatus::Shadow,
-        created_at: timestamp,
+        created_at: params.timestamp,
     };
 
     let event = ShadowCreationEvent {
         shadow_id: shadow_id.to_owned(),
         platform_handle: platform_handle.to_owned(),
         bridge_id: bridge_id.to_owned(),
-        bridge_mode,
+        bridge_mode: params.bridge_mode.clone(),
         initial_role: DEFAULT_SHADOW_ROLE.to_owned(),
         context_id: registry.context_id.clone(),
-        timestamp,
+        timestamp: params.timestamp,
     };
+
+    // Generate a per-shadow AES-256-GCM sender key (§12.6.1).
+    // Each shadow gets its own sender key so that key compromise of one
+    // shadow does not affect others. The key is stored before the shadow
+    // is committed to the registry — if this fails, no shadow is created.
+    let sender_key = generate_sender_key();
+    sender_key_store.set(&registry.context_id, shadow_id, sender_key);
 
     registry.shadows.push(shadow.clone());
     registry.creation_events.push(event.clone());
@@ -721,6 +776,7 @@ pub fn find_shadow<'a>(
 )]
 mod tests {
     use super::*;
+    use crate::crypto::sender_keys::SenderKeyStore;
 
     // -------------------------------------------------------------------
     // Test helpers
@@ -743,21 +799,35 @@ mod tests {
         }
     }
 
+    fn make_params<'a>(shadow_id: &'a str, handle: &'a str) -> CreateShadowParams<'a> {
+        CreateShadowParams {
+            shadow_id,
+            bridge_id: BRIDGE_ID,
+            bridge_mode: BridgeMode::Relay,
+            platform_handle: handle,
+            context_member_dids: &[],
+            timestamp: 1_700_000_100,
+        }
+    }
+
     fn create_test_shadow(
         registry: &mut ShadowRegistry,
         shadow_id: &str,
         handle: &str,
     ) -> (ShadowIdentity, ShadowCreationEvent) {
-        create_shadow(
-            registry,
-            shadow_id,
-            BRIDGE_ID,
-            BridgeMode::Relay,
-            handle,
-            &[],
-            1_700_000_100,
-        )
-        .unwrap()
+        let mut store = SenderKeyStore::new();
+        create_shadow(registry, &mut store, &make_params(shadow_id, handle)).unwrap()
+    }
+
+    /// Helper that returns both the shadow result and the sender key store
+    /// so tests can verify sender key storage.
+    fn create_test_shadow_with_store(
+        registry: &mut ShadowRegistry,
+        sender_key_store: &mut SenderKeyStore,
+        shadow_id: &str,
+        handle: &str,
+    ) -> (ShadowIdentity, ShadowCreationEvent) {
+        create_shadow(registry, sender_key_store, &make_params(shadow_id, handle)).unwrap()
     }
 
     // -------------------------------------------------------------------
@@ -846,15 +916,15 @@ mod tests {
         let mut registry = make_registry();
         create_test_shadow(&mut registry, "shadow-001", "@alice");
 
-        let result = create_shadow(
-            &mut registry,
-            "shadow-001",
-            BRIDGE_ID,
-            BridgeMode::Relay,
-            "@bob",
-            &[],
-            1_700_000_200,
-        );
+        let params = CreateShadowParams {
+            shadow_id: "shadow-001",
+            bridge_id: BRIDGE_ID,
+            bridge_mode: BridgeMode::Relay,
+            platform_handle: "@bob",
+            context_member_dids: &[],
+            timestamp: 1_700_000_200,
+        };
+        let result = create_shadow(&mut registry, &mut SenderKeyStore::new(), &params);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -872,17 +942,17 @@ mod tests {
     fn create_shadow_rejects_collision_with_context_member_did() {
         let mut registry = make_registry();
         // Simulate a context where "did:dht:real-member" is an existing member.
-        let member_dids = ["did:dht:real-member"];
+        let member_dids: &[&str] = &["did:dht:real-member"];
 
-        let result = create_shadow(
-            &mut registry,
-            "did:dht:real-member", // shadow ID collides with real member
-            BRIDGE_ID,
-            BridgeMode::Relay,
-            "@attacker",
-            member_dids.as_slice(),
-            1_700_000_100,
-        );
+        let params = CreateShadowParams {
+            shadow_id: "did:dht:real-member", // shadow ID collides with real member
+            bridge_id: BRIDGE_ID,
+            bridge_mode: BridgeMode::Relay,
+            platform_handle: "@attacker",
+            context_member_dids: member_dids,
+            timestamp: 1_700_000_100,
+        };
+        let result = create_shadow(&mut registry, &mut SenderKeyStore::new(), &params);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -904,15 +974,15 @@ mod tests {
 
         // Attempt to create another shadow with the same ID on a different bridge.
         // The existing ShadowAlreadyExists check catches same-ID within the registry.
-        let result = create_shadow(
-            &mut registry,
-            "shadow-existing",
-            "bridge-002", // different bridge
-            BridgeMode::Api,
-            "@attacker",
-            &[],
-            1_700_000_200,
-        );
+        let params = CreateShadowParams {
+            shadow_id: "shadow-existing",
+            bridge_id: "bridge-002", // different bridge
+            bridge_mode: BridgeMode::Api,
+            platform_handle: "@attacker",
+            context_member_dids: &[],
+            timestamp: 1_700_000_200,
+        };
+        let result = create_shadow(&mut registry, &mut SenderKeyStore::new(), &params);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -926,17 +996,17 @@ mod tests {
     fn create_shadow_allows_non_colliding_id() {
         let mut registry = make_registry();
         // Context has real members, but shadow ID doesn't collide.
-        let member_dids = ["did:dht:alice", "did:dht:bob"];
+        let member_dids: &[&str] = &["did:dht:alice", "did:dht:bob"];
 
-        let result = create_shadow(
-            &mut registry,
-            "did:dht:shadow-charlie", // does not collide with members
-            BRIDGE_ID,
-            BridgeMode::Relay,
-            "@charlie",
-            member_dids.as_slice(),
-            1_700_000_100,
-        );
+        let params = CreateShadowParams {
+            shadow_id: "did:dht:shadow-charlie", // does not collide with members
+            bridge_id: BRIDGE_ID,
+            bridge_mode: BridgeMode::Relay,
+            platform_handle: "@charlie",
+            context_member_dids: member_dids,
+            timestamp: 1_700_000_100,
+        };
+        let result = create_shadow(&mut registry, &mut SenderKeyStore::new(), &params);
 
         assert!(result.is_ok(), "non-colliding shadow should be created");
     }
@@ -946,15 +1016,15 @@ mod tests {
         let mut registry = make_registry();
         create_test_shadow(&mut registry, "shadow-001", "@alice");
 
-        let result = create_shadow(
-            &mut registry,
-            "shadow-002",
-            BRIDGE_ID,
-            BridgeMode::Relay,
-            "@alice",
-            &[],
-            1_700_000_200,
-        );
+        let params = CreateShadowParams {
+            shadow_id: "shadow-002",
+            bridge_id: BRIDGE_ID,
+            bridge_mode: BridgeMode::Relay,
+            platform_handle: "@alice",
+            context_member_dids: &[],
+            timestamp: 1_700_000_200,
+        };
+        let result = create_shadow(&mut registry, &mut SenderKeyStore::new(), &params);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -969,15 +1039,15 @@ mod tests {
         let mut registry = make_registry();
         create_test_shadow(&mut registry, "shadow-001", "@alice");
 
-        let result = create_shadow(
-            &mut registry,
-            "shadow-002",
-            "bridge-002",
-            BridgeMode::Api,
-            "@alice",
-            &[],
-            1_700_000_200,
-        );
+        let params = CreateShadowParams {
+            shadow_id: "shadow-002",
+            bridge_id: "bridge-002",
+            bridge_mode: BridgeMode::Api,
+            platform_handle: "@alice",
+            context_member_dids: &[],
+            timestamp: 1_700_000_200,
+        };
+        let result = create_shadow(&mut registry, &mut SenderKeyStore::new(), &params);
 
         assert!(result.is_ok());
     }
@@ -985,6 +1055,7 @@ mod tests {
     #[test]
     fn create_shadow_with_different_bridge_modes() {
         let mut registry = make_registry();
+        let mut store = SenderKeyStore::new();
 
         for (i, mode) in [
             BridgeMode::Relay,
@@ -999,15 +1070,15 @@ mod tests {
             let bridge_id = format!("bridge-{i}");
             let handle = format!("@user{i}");
 
-            let result = create_shadow(
-                &mut registry,
-                &shadow_id,
-                &bridge_id,
-                mode.clone(),
-                &handle,
-                &[],
-                1_700_000_100,
-            );
+            let params = CreateShadowParams {
+                shadow_id: &shadow_id,
+                bridge_id: &bridge_id,
+                bridge_mode: mode.clone(),
+                platform_handle: &handle,
+                context_member_dids: &[],
+                timestamp: 1_700_000_100,
+            };
+            let result = create_shadow(&mut registry, &mut store, &params);
 
             assert!(result.is_ok());
             let (_shadow, event) = result.unwrap();
@@ -1022,34 +1093,34 @@ mod tests {
     #[test]
     fn create_shadow_rejects_when_total_limit_reached() {
         let mut registry = ShadowRegistry::with_limits(CTX.to_owned(), 100, 3);
+        let mut store = SenderKeyStore::new();
 
         // Create 3 shadows (at the total limit).
         for i in 0..3 {
             let shadow_id = format!("shadow-{i}");
             let handle = format!("@user{i}");
             let bridge_id = format!("bridge-{i}");
-            create_shadow(
-                &mut registry,
-                &shadow_id,
-                &bridge_id,
-                BridgeMode::Relay,
-                &handle,
-                &[],
-                1_700_000_100,
-            )
-            .unwrap();
+            let params = CreateShadowParams {
+                shadow_id: &shadow_id,
+                bridge_id: &bridge_id,
+                bridge_mode: BridgeMode::Relay,
+                platform_handle: &handle,
+                context_member_dids: &[],
+                timestamp: 1_700_000_100,
+            };
+            create_shadow(&mut registry, &mut store, &params).unwrap();
         }
 
         // The 4th should fail.
-        let result = create_shadow(
-            &mut registry,
-            "shadow-overflow",
-            "bridge-new",
-            BridgeMode::Relay,
-            "@overflow",
-            &[],
-            1_700_000_200,
-        );
+        let params = CreateShadowParams {
+            shadow_id: "shadow-overflow",
+            bridge_id: "bridge-new",
+            bridge_mode: BridgeMode::Relay,
+            platform_handle: "@overflow",
+            context_member_dids: &[],
+            timestamp: 1_700_000_200,
+        };
+        let result = create_shadow(&mut registry, &mut store, &params);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -1066,33 +1137,33 @@ mod tests {
     #[test]
     fn create_shadow_rejects_when_per_bridge_limit_reached() {
         let mut registry = ShadowRegistry::with_limits(CTX.to_owned(), 2, 100);
+        let mut store = SenderKeyStore::new();
 
         // Create 2 shadows on the same bridge (at the per-bridge limit).
         for i in 0..2 {
             let shadow_id = format!("shadow-{i}");
             let handle = format!("@user{i}");
-            create_shadow(
-                &mut registry,
-                &shadow_id,
-                BRIDGE_ID,
-                BridgeMode::Relay,
-                &handle,
-                &[],
-                1_700_000_100,
-            )
-            .unwrap();
+            let params = CreateShadowParams {
+                shadow_id: &shadow_id,
+                bridge_id: BRIDGE_ID,
+                bridge_mode: BridgeMode::Relay,
+                platform_handle: &handle,
+                context_member_dids: &[],
+                timestamp: 1_700_000_100,
+            };
+            create_shadow(&mut registry, &mut store, &params).unwrap();
         }
 
         // The 3rd on the same bridge should fail.
-        let result = create_shadow(
-            &mut registry,
-            "shadow-overflow",
-            BRIDGE_ID,
-            BridgeMode::Relay,
-            "@overflow",
-            &[],
-            1_700_000_200,
-        );
+        let params = CreateShadowParams {
+            shadow_id: "shadow-overflow",
+            bridge_id: BRIDGE_ID,
+            bridge_mode: BridgeMode::Relay,
+            platform_handle: "@overflow",
+            context_member_dids: &[],
+            timestamp: 1_700_000_200,
+        };
+        let result = create_shadow(&mut registry, &mut store, &params);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -1109,33 +1180,33 @@ mod tests {
     #[test]
     fn per_bridge_limit_does_not_affect_other_bridges() {
         let mut registry = ShadowRegistry::with_limits(CTX.to_owned(), 2, 100);
+        let mut store = SenderKeyStore::new();
 
         // Fill bridge-001 to its limit.
         for i in 0..2 {
             let shadow_id = format!("shadow-a-{i}");
             let handle = format!("@user-a-{i}");
-            create_shadow(
-                &mut registry,
-                &shadow_id,
-                "bridge-001",
-                BridgeMode::Relay,
-                &handle,
-                &[],
-                1_700_000_100,
-            )
-            .unwrap();
+            let params = CreateShadowParams {
+                shadow_id: &shadow_id,
+                bridge_id: "bridge-001",
+                bridge_mode: BridgeMode::Relay,
+                platform_handle: &handle,
+                context_member_dids: &[],
+                timestamp: 1_700_000_100,
+            };
+            create_shadow(&mut registry, &mut store, &params).unwrap();
         }
 
         // bridge-002 should still be able to create shadows.
-        let result = create_shadow(
-            &mut registry,
-            "shadow-b-0",
-            "bridge-002",
-            BridgeMode::Relay,
-            "@user-b-0",
-            &[],
-            1_700_000_200,
-        );
+        let params = CreateShadowParams {
+            shadow_id: "shadow-b-0",
+            bridge_id: "bridge-002",
+            bridge_mode: BridgeMode::Relay,
+            platform_handle: "@user-b-0",
+            context_member_dids: &[],
+            timestamp: 1_700_000_200,
+        };
+        let result = create_shadow(&mut registry, &mut store, &params);
         assert!(
             result.is_ok(),
             "different bridge should not be affected by per-bridge limit"
@@ -1276,16 +1347,15 @@ mod tests {
         create_test_shadow(&mut registry, "shadow-002", "@bob");
 
         // Create shadow on a different bridge.
-        create_shadow(
-            &mut registry,
-            "shadow-003",
-            "bridge-002",
-            BridgeMode::Api,
-            "@charlie",
-            &[],
-            1_700_000_300,
-        )
-        .unwrap();
+        let params = CreateShadowParams {
+            shadow_id: "shadow-003",
+            bridge_id: "bridge-002",
+            bridge_mode: BridgeMode::Api,
+            platform_handle: "@charlie",
+            context_member_dids: &[],
+            timestamp: 1_700_000_300,
+        };
+        create_shadow(&mut registry, &mut SenderKeyStore::new(), &params).unwrap();
 
         let bridge_1_shadows = list_shadows(&registry, BRIDGE_ID);
         assert_eq!(bridge_1_shadows.len(), 2);
@@ -1544,5 +1614,114 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("capacity exceeded"));
         assert!(msg.contains("total shadow limit"));
+    }
+
+    // -------------------------------------------------------------------
+    // SCP-BCH-010: Per-shadow sender key generation
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn create_shadow_stores_sender_key_in_store() {
+        let mut registry = make_registry();
+        let mut store = SenderKeyStore::new();
+
+        create_test_shadow_with_store(&mut registry, &mut store, "shadow-001", "@alice");
+
+        let key = store.get(CTX, "shadow-001");
+        assert!(key.is_some(), "sender key must be stored for the shadow");
+        assert_eq!(key.unwrap().as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn create_shadow_distinct_shadows_receive_distinct_keys() {
+        let mut registry = make_registry();
+        let mut store = SenderKeyStore::new();
+
+        create_test_shadow_with_store(&mut registry, &mut store, "shadow-001", "@alice");
+        create_test_shadow_with_store(&mut registry, &mut store, "shadow-002", "@bob");
+
+        let key1 = store.get(CTX, "shadow-001").unwrap();
+        let key2 = store.get(CTX, "shadow-002").unwrap();
+        assert_ne!(
+            key1.as_bytes(),
+            key2.as_bytes(),
+            "distinct shadows must receive distinct sender keys"
+        );
+    }
+
+    #[test]
+    fn create_shadow_sender_key_is_32_bytes() {
+        let mut registry = make_registry();
+        let mut store = SenderKeyStore::new();
+
+        create_test_shadow_with_store(&mut registry, &mut store, "shadow-001", "@alice");
+
+        let key = store.get(CTX, "shadow-001").unwrap();
+        assert_eq!(
+            key.as_bytes().len(),
+            32,
+            "sender key must be exactly 32 bytes (AES-256)"
+        );
+    }
+
+    #[test]
+    fn create_shadow_sender_key_is_not_all_zeros() {
+        let mut registry = make_registry();
+        let mut store = SenderKeyStore::new();
+
+        create_test_shadow_with_store(&mut registry, &mut store, "shadow-001", "@alice");
+
+        let key = store.get(CTX, "shadow-001").unwrap();
+        assert_ne!(
+            key.as_bytes(),
+            &[0u8; 32],
+            "sender key must not be all zeros (indicates CSPRNG failure)"
+        );
+    }
+
+    #[test]
+    fn create_shadow_failed_validation_does_not_store_sender_key() {
+        let mut registry = make_registry();
+        let mut store = SenderKeyStore::new();
+
+        // Create a shadow successfully first.
+        create_test_shadow_with_store(&mut registry, &mut store, "shadow-001", "@alice");
+
+        // Attempt to create a duplicate — should fail validation.
+        let params = CreateShadowParams {
+            shadow_id: "shadow-001", // duplicate ID
+            bridge_id: BRIDGE_ID,
+            bridge_mode: BridgeMode::Relay,
+            platform_handle: "@bob",
+            context_member_dids: &[],
+            timestamp: 1_700_000_200,
+        };
+        let result = create_shadow(&mut registry, &mut store, &params);
+        assert!(result.is_err());
+
+        // The store should still only have the original key.
+        let all = store.get_all(CTX);
+        assert_eq!(
+            all.len(),
+            1,
+            "failed shadow creation must not leave orphan sender keys"
+        );
+    }
+
+    #[test]
+    fn create_shadow_sender_key_keyed_by_context_and_shadow_id() {
+        // Verify the key is stored under (context_id, shadow_id) — not
+        // (context_id, bridge_id) or any other combination.
+        let mut registry = make_registry();
+        let mut store = SenderKeyStore::new();
+
+        create_test_shadow_with_store(&mut registry, &mut store, "shadow-001", "@alice");
+
+        // Lookup by (context_id, shadow_id) should succeed.
+        assert!(store.get(CTX, "shadow-001").is_some());
+
+        // Lookup by (context_id, bridge_id) should fail — the key is not
+        // stored under the bridge ID.
+        assert!(store.get(CTX, BRIDGE_ID).is_none());
     }
 }
