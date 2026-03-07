@@ -1492,4 +1492,57 @@ mod tests {
             "shifting bytes between id and issuer must produce different canonical bytes"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // IdentityDidPublicKeyResolver tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolver_did_key_hex_valid() {
+        let resolver = IdentityDidPublicKeyResolver;
+        let key_hex = "a".repeat(64); // 32 bytes
+        let did = format!("did:key:{key_hex}");
+        let result = resolver.resolve_public_key(&did);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 32);
+    }
+
+    #[test]
+    fn resolver_did_key_invalid_hex() {
+        let resolver = IdentityDidPublicKeyResolver;
+        let result = resolver.resolve_public_key("did:key:not-valid-hex!");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err}").contains("did:key"),
+            "error should mention did:key: {err}"
+        );
+    }
+
+    #[test]
+    fn resolver_unsupported_method() {
+        let resolver = IdentityDidPublicKeyResolver;
+        let result = resolver.resolve_public_key("did:web:example.com");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err}").contains("unsupported"),
+            "error should mention unsupported: {err}"
+        );
+    }
+
+    #[test]
+    fn resolver_empty_string() {
+        let resolver = IdentityDidPublicKeyResolver;
+        let result = resolver.resolve_public_key("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolver_did_dht_malformed() {
+        let resolver = IdentityDidPublicKeyResolver;
+        // Valid prefix but garbage z-base-32
+        let result = resolver.resolve_public_key("did:dht:z!@#$%^&*");
+        assert!(result.is_err());
+    }
 }
