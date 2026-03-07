@@ -5135,6 +5135,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
+ "base64",
  "bytes",
  "coap-lite",
  "ed25519-dalek 2.2.0",

@@ -39,6 +39,8 @@ pub mod http3;
 pub mod manager;
 pub mod nat;
 pub mod native;
+#[cfg(feature = "nostr")]
+pub mod nostr;
 pub mod pool;
 pub mod profile;
 pub mod provider;
@@ -49,6 +51,8 @@ pub mod scoring;
 pub mod traits;
 #[cfg(feature = "udp")]
 pub mod udp;
+#[cfg(feature = "webrtc")]
+pub mod webrtc;
 #[cfg(any(feature = "http3", feature = "webtransport-wasm"))]
 pub mod webtransport;
 
