@@ -331,64 +331,105 @@ mod tests {
         }
     }
 
-    /// Forward secrecy: after epoch advance via commit, messages encrypted
-    /// under the old epoch cannot be decrypted by the receiver whose group
-    /// has advanced past that epoch.
+    /// Grace window: after one epoch advance (N→N+1), messages encrypted
+    /// under epoch N are still decryptable because `max_past_epochs = 2`
+    /// retains past epoch message secrets in `OpenMLS`'s `MessageSecretsStore`.
     ///
-    /// This verifies that `OpenMLS`'s `merge_staged_commit()` deletes
-    /// previous epoch key material (via `delete_previous_epoch_keypairs()`),
-    /// making old-epoch ciphertexts undecryptable.
+    /// This is the core grace window test: Alice sends a Commit advancing
+    /// the epoch, Bob sends a message encrypted under the old epoch (within
+    /// the 30s grace window), and Alice can still decrypt it.
     ///
-    /// **Documented finding (SCP-171):** `OpenMLS`'s `merge_staged_commit()`
-    /// and `merge_pending_commit()` automatically call
-    /// `delete_previous_epoch_keypairs()`, which removes the previous epoch's
-    /// encryption key pairs from the storage provider. Additionally, the
-    /// `MlsGroupCreateConfig` default `max_past_epochs` is 0, meaning no
-    /// past epoch message secrets are retained in the `MessageSecretsStore`.
-    /// Therefore, forward secrecy of cryptographic key material is enforced
-    /// by `OpenMLS` itself, not by the `EpochGraceStore`. The grace store's
-    /// role is to control whether the SCP layer *attempts* decryption for a
-    /// given epoch.
+    /// **Documented finding (SCP-171, issue #324):** `OpenMLS`'s
+    /// `merge_staged_commit()` and `merge_pending_commit()` automatically
+    /// call `delete_previous_epoch_keypairs()`, which removes the previous
+    /// epoch's encryption key pairs. However, `max_past_epochs = 2` ensures
+    /// message secrets are retained for 2 past epochs, allowing decryption
+    /// of in-flight messages during the grace window. Forward secrecy is
+    /// enforced by bounded retention (2 epochs) plus the `EpochGraceStore`
+    /// time bound (30s).
     #[test]
     #[allow(clippy::unwrap_used)]
-    fn forward_secrecy_old_epoch_ciphertext_undecryptable_after_advance() {
+    fn grace_window_old_epoch_ciphertext_decryptable_within_window() {
         use crate::crypto::mls::encrypt::{decrypt, encrypt, serialize_ciphertext};
 
         let (mut alice_group, mut bob_group) = setup_alice_bob();
         let mut grace_store = EpochGraceStore::new();
 
-        // Alice encrypts a message at epoch 1.
-        let old_epoch = alice_group.epoch().unwrap();
-        let ciphertext_msg = encrypt(&mut alice_group, b"secret at old epoch").unwrap();
+        // Bob encrypts a message at epoch 1 (before the epoch advance).
+        let old_epoch = bob_group.epoch().unwrap();
+        let ciphertext_msg = encrypt(&mut bob_group, b"message at old epoch").unwrap();
         let ciphertext_bytes = serialize_ciphertext(&ciphertext_msg).unwrap();
 
         // Alice issues an update, advancing her group to epoch 2.
         let commit = propose_update(&mut alice_group).unwrap();
         let commit_bytes = serialize_commit(&commit).unwrap();
 
-        // Bob processes the commit, advancing to epoch 2.
-        // merge_staged_commit internally calls delete_previous_epoch_keypairs().
-        process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
-
-        assert_eq!(bob_group.epoch().unwrap(), old_epoch + 1);
-
-        // Bob tries to decrypt the old-epoch ciphertext. OpenMLS has already
-        // deleted the epoch 1 key material during the commit merge, so
-        // decryption should fail.
-        let result = decrypt(&mut bob_group, &ciphertext_bytes);
+        // Alice processes Bob's old-epoch ciphertext AFTER advancing her own
+        // epoch. With max_past_epochs=2, Alice retains epoch 1 message secrets
+        // and can decrypt the in-flight message.
+        //
+        // Note: Alice advanced via propose_update (merge_pending_commit), not
+        // via process_commit, so she's the committer. Bob hasn't processed
+        // the commit yet, so his message was encrypted at epoch 1.
+        // Alice should still be able to decrypt it thanks to retained secrets.
+        let result = decrypt(&mut alice_group, &ciphertext_bytes);
         assert!(
-            result.is_err(),
-            "old-epoch ciphertext must be undecryptable after epoch advance \
-             (forward secrecy enforced by OpenMLS key deletion)"
+            result.is_ok(),
+            "old-epoch ciphertext must be decryptable within grace window \
+             (max_past_epochs=2 retains epoch {old_epoch} secrets)"
+        );
+
+        // Also verify Bob can process the commit and advance.
+        process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
+        assert_eq!(bob_group.epoch().unwrap(), old_epoch + 1);
+    }
+
+    /// Grace window with expired time: after the 30-second grace window
+    /// closes, the `EpochGraceStore` rejects messages from old epochs.
+    ///
+    /// This test verifies the SCP-layer enforcement: even though `OpenMLS`
+    /// might still hold the message secrets (`max_past_epochs=2`), the
+    /// `EpochGraceStore` enforces the 30-second time boundary.
+    ///
+    /// We use `with_max_capacity(1)` and add a second epoch to force the
+    /// first to be evicted, simulating time-based expiry without accessing
+    /// private fields.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn grace_window_expired_epoch_rejected_by_grace_store() {
+        // Use capacity=1 so adding epoch 2 evicts epoch 1, simulating
+        // what happens after the 30s grace window expires.
+        let mut grace_store = EpochGraceStore::with_max_capacity(1);
+
+        grace_store.add_epoch(1);
+        assert!(grace_store.is_in_grace(1), "epoch 1 should be in grace");
+
+        // Adding epoch 2 evicts epoch 1 (capacity=1).
+        grace_store.add_epoch(2);
+
+        // After eviction, the grace store rejects epoch 1.
+        assert!(
+            !grace_store.is_in_grace(1),
+            "epoch 1 must NOT be in grace after eviction — \
+             the EpochGraceStore enforces the boundary (§9.7)"
+        );
+        assert!(
+            grace_store.is_in_grace(2),
+            "epoch 2 should still be in grace"
         );
     }
 
-    /// Verify that `OpenMLS` deletes key material across multiple epoch
-    /// advances, not just the most recent one. After two epoch advances,
-    /// ciphertext from epoch N should be undecryptable at epoch N+2.
+    /// Forward secrecy after 3 epoch advances: with `max_past_epochs = 2`,
+    /// only epochs N+1 and N+2 are retained at epoch N+3. Epoch N's message
+    /// secrets have been evicted from `MessageSecretsStore`, so ciphertext
+    /// from epoch N is undecryptable.
+    ///
+    /// This verifies the bounded retention guarantee: two consecutive epoch
+    /// advances (N→N+1→N+2) keep epoch N accessible, but a third advance
+    /// (→N+3) evicts it.
     #[test]
     #[allow(clippy::unwrap_used)]
-    fn forward_secrecy_survives_multiple_epoch_advances() {
+    fn forward_secrecy_epoch_n_undecryptable_after_three_advances() {
         use crate::crypto::mls::encrypt::{decrypt, encrypt, serialize_ciphertext};
 
         let (mut alice_group, mut bob_group) = setup_alice_bob();
@@ -398,20 +439,59 @@ mod tests {
         let ciphertext_msg = encrypt(&mut alice_group, b"epoch 1 secret").unwrap();
         let ciphertext_bytes = serialize_ciphertext(&ciphertext_msg).unwrap();
 
-        // Advance twice: epoch 1 -> 2 -> 3.
+        // Advance three times: epoch 1 → 2 → 3 → 4.
+        // With max_past_epochs=2, at epoch 4 only epochs 2 and 3 are retained.
+        for _ in 0..3 {
+            let commit = propose_update(&mut alice_group).unwrap();
+            let commit_bytes = serialize_commit(&commit).unwrap();
+            process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
+        }
+
+        assert_eq!(bob_group.epoch().unwrap(), 4);
+
+        // Epoch 1 message secrets have been evicted (only epochs 2 and 3
+        // retained with max_past_epochs=2). Decryption must fail.
+        let result = decrypt(&mut bob_group, &ciphertext_bytes);
+        assert!(
+            result.is_err(),
+            "ciphertext from epoch 1 must be undecryptable at epoch 4 \
+             (only 2 past epochs retained, forward secrecy enforced)"
+        );
+    }
+
+    /// Verify that after exactly 2 epoch advances (N→N+1→N+2), epoch N's
+    /// ciphertext is still decryptable because `max_past_epochs = 2` retains
+    /// it. This is the boundary case: 2 past epochs retained means epoch N
+    /// is the oldest retained epoch at epoch N+2.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn grace_window_epoch_n_still_decryptable_after_two_advances() {
+        use crate::crypto::mls::encrypt::{decrypt, encrypt, serialize_ciphertext};
+
+        let (mut alice_group, mut bob_group) = setup_alice_bob();
+        let mut grace_store = EpochGraceStore::new();
+
+        // Bob encrypts at epoch 1.
+        let ciphertext_msg = encrypt(&mut bob_group, b"epoch 1 secret").unwrap();
+        let ciphertext_bytes = serialize_ciphertext(&ciphertext_msg).unwrap();
+
+        // Advance twice: epoch 1 → 2 → 3. At epoch 3, max_past_epochs=2
+        // retains epochs 1 and 2.
         for _ in 0..2 {
             let commit = propose_update(&mut alice_group).unwrap();
             let commit_bytes = serialize_commit(&commit).unwrap();
             process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
         }
 
-        assert_eq!(bob_group.epoch().unwrap(), 3);
+        assert_eq!(alice_group.epoch().unwrap(), 3);
 
-        // The epoch-1 ciphertext should be completely undecryptable.
-        let result = decrypt(&mut bob_group, &ciphertext_bytes);
+        // Alice should still be able to decrypt epoch 1 ciphertext because
+        // max_past_epochs=2 means epochs 1 and 2 are both retained.
+        let result = decrypt(&mut alice_group, &ciphertext_bytes);
         assert!(
-            result.is_err(),
-            "ciphertext from epoch 1 must be undecryptable at epoch 3"
+            result.is_ok(),
+            "ciphertext from epoch 1 must still be decryptable at epoch 3 \
+             (max_past_epochs=2 retains 2 past epochs)"
         );
     }
 

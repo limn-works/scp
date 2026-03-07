@@ -260,9 +260,21 @@ pub fn create_group(credential: &ScpCredential) -> Result<ScpMlsGroup, MlsError>
     // Configure the group with the SCP ciphersuite. The ratchet tree
     // extension is enabled so that Welcome messages include the full tree,
     // allowing new members to join without out-of-band tree distribution.
+    // max_past_epochs(2) retains message secrets for the 2 most recent past
+    // epochs in OpenMLS's MessageSecretsStore. This aligns with the 30-second
+    // sender key grace window (§9.16.2, §9.7, ADR-001 criterion 6): during
+    // epoch transitions, in-flight messages encrypted under a previous epoch
+    // can still be decrypted. Without this, merge_staged_commit() /
+    // merge_pending_commit() delete previous epoch key material immediately
+    // (default max_past_epochs=0), making grace-window messages undecryptable.
+    // Value 2 covers the common case of one in-flight epoch plus one safety
+    // margin. The EpochGraceStore enforces the 30-second time bound at the SCP
+    // layer, so retention is bounded by both count (2) and time (30s).
+    // See issue #324.
     let group_create_config = MlsGroupCreateConfig::builder()
         .ciphersuite(SCP_CIPHERSUITE)
         .use_ratchet_tree_extension(true)
+        .max_past_epochs(2)
         .build();
 
     // Create the MLS group with the creator as the sole member.
@@ -556,7 +568,10 @@ pub fn join_group(
         ));
     };
 
-    let join_config = MlsGroupJoinConfig::builder().build();
+    // max_past_epochs(2) must match create_group's MlsGroupCreateConfig to
+    // ensure joining members also retain past epoch message secrets during
+    // the 30-second grace window. See create_group() and issue #324.
+    let join_config = MlsGroupJoinConfig::builder().max_past_epochs(2).build();
 
     let staged_welcome = StagedWelcome::new_from_welcome(&provider, &join_config, welcome, None)
         .map_err(|e| MlsError::WelcomeProcessingFailed(e.to_string()))?;
