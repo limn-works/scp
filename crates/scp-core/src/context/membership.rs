@@ -283,6 +283,50 @@ pub enum ContextEvent {
         /// The DID whose read access was restored.
         did: DID,
     },
+    /// A member's write access was revoked via governance (§9.17, ADR-038).
+    ///
+    /// The member can no longer publish messages. In `Full` scope, the
+    /// member's sender/broadcast key is also destroyed and historical
+    /// content is suppressed.
+    WriteAccessRevoked {
+        /// The DID whose write access was revoked.
+        did: DID,
+    },
+    /// A member's write access was restored via governance (§9.17, ADR-038).
+    ///
+    /// The member can publish messages again. Restoration is forward-only:
+    /// previously suppressed content remains suppressed.
+    WriteAccessRestored {
+        /// The DID whose write access was restored.
+        did: DID,
+    },
+    /// A member's access key was revoked via governance (§9.17, ADR-038).
+    ///
+    /// The member can no longer decrypt content. All members must purge
+    /// the target's access key from their key stores.
+    AccessKeyRevoked {
+        /// The DID whose access key was revoked.
+        did: DID,
+    },
+    /// A member's access key was restored via governance (§9.17, ADR-038).
+    ///
+    /// The member can decrypt future content. A new access key was generated
+    /// at the specified epoch. Historical content remains inaccessible
+    /// (forward-only restoration).
+    AccessKeyRestored {
+        /// The DID whose access key was restored.
+        did: DID,
+        /// The epoch of the newly generated access key.
+        new_epoch: u64,
+    },
+    /// Context-wide content key rotation was performed (§9.17, ADR-038).
+    ///
+    /// All members received new access keys. Old keys are retained locally
+    /// for historical message decryption.
+    ContentKeysRotated {
+        /// Optional reason for the rotation.
+        reason: Option<String>,
+    },
     /// The context expired due to TTL.
     ///
     /// Replaces the former sentinel DID string `"__ttl_expiry_notification"`.

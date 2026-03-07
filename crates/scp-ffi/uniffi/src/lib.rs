@@ -115,6 +115,7 @@ pub use bridge::{
     governance_execute,
     // Free functions — identity
     identity_create,
+    identity_create_with_custody,
     identity_load,
     identity_resolve,
     is_local_did,

@@ -304,6 +304,13 @@ pub enum ContextError {
     #[error("broadcast contexts only support MemoryScope::Full")]
     InvalidMemoryScopeForBroadcast,
 
+    /// Attempted to restore access that was never revoked (§5.9).
+    ///
+    /// Restoring read or write access for a member whose access was never
+    /// revoked is an error — there is nothing to restore.
+    #[error("nothing to restore: {0}")]
+    NothingToRestore(String),
+
     /// An action-payment integration error occurred during a paid action.
     ///
     /// Wraps [`crate::economy::IntegrationError`] to preserve the specific

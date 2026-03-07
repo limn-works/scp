@@ -247,6 +247,9 @@ pub struct ContextSnapshot {
     /// Members whose write access has been governance-revoked (ADR-031).
     #[serde(default)]
     pub write_revoked_members: HashSet<DID>,
+    /// Members whose read access has been governance-revoked (§5.9, ADR-038).
+    #[serde(default)]
+    pub read_revoked_members: HashSet<DID>,
     /// Established cross-context tool interfaces (§6.2).
     #[serde(default)]
     pub tool_interfaces: Vec<ToolInterface>,
@@ -394,6 +397,8 @@ struct PerContextState {
     registered_tools: Vec<ToolRegistration>,
     /// Members whose write access has been governance-revoked (ADR-031).
     write_revoked_members: HashSet<DID>,
+    /// Members whose read access has been governance-revoked (§5.9, ADR-038).
+    read_revoked_members: HashSet<DID>,
     /// Established cross-context tool interfaces (§6.2).
     tool_interfaces: Vec<ToolInterface>,
     /// Governance threshold signers (for `ThresholdApproval` model).
@@ -923,6 +928,7 @@ impl ContextManager {
             ttl_remaining_secs,
             registered_tools: ctx.registered_tools.clone(),
             write_revoked_members: ctx.write_revoked_members.clone(),
+            read_revoked_members: ctx.read_revoked_members.clone(),
             tool_interfaces: ctx.tool_interfaces.clone(),
             threshold_signers: ctx.threshold_signers.clone(),
             threshold_value: ctx.threshold_value,
@@ -1017,6 +1023,7 @@ impl ContextManager {
             executed_proposals: ctx_snapshot.executed_proposals,
             registered_tools: ctx_snapshot.registered_tools,
             write_revoked_members: ctx_snapshot.write_revoked_members,
+            read_revoked_members: ctx_snapshot.read_revoked_members,
             tool_interfaces: ctx_snapshot.tool_interfaces,
             threshold_signers: ctx_snapshot.threshold_signers,
             threshold_value: ctx_snapshot.threshold_value,
@@ -1234,6 +1241,7 @@ impl ContextManager {
             executed_proposals: HashSet::new(),
             registered_tools: Vec::new(),
             write_revoked_members: HashSet::new(),
+            read_revoked_members: HashSet::new(),
             tool_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
@@ -1401,6 +1409,7 @@ impl ContextManager {
             executed_proposals: HashSet::new(),
             registered_tools: Vec::new(),
             write_revoked_members: HashSet::new(),
+            read_revoked_members: HashSet::new(),
             tool_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
@@ -3088,8 +3097,6 @@ impl ContextManager {
     ) -> Result<GovernanceBanResult, ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        // Replay check and executed_proposals tracking are handled by the
-        // outer execute_governance_action wrapper — not duplicated here.
         let (result, snapshot) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
@@ -3130,27 +3137,22 @@ impl ContextManager {
         Ok(result)
     }
 
-    /// Internal implementation of read access restoration. Only callable
-    /// within the crate -- external callers must go through
-    /// [`execute_governance_action`] with an approved [`GovernanceProposal`]
-    /// containing a [`GovernanceAction::RestoreReadAccess`] action.
+    /// Internal implementation of read access restoration (§5.9, ADR-038).
     ///
-    /// In broadcast mode: removes the DID from all authors' block lists
-    /// (via [`BroadcastContext::governance_unban_subscriber`]). The subscriber
-    /// must re-subscribe to regain access. Does **not** rotate keys -- unban
-    /// is access restoration, not revocation.
+    /// Works for both broadcast and encrypted contexts. Removes the member
+    /// from the read-revoked set. In broadcast mode, also unbans the
+    /// subscriber. Generates a new access key (new epoch) and emits
+    /// `AccessKeyRestored` event. Restoration is always forward-only.
     ///
-    /// Requires the `MemberBan` capability in the context's ceiling (§5.3,
-    /// ADR-031). Restoration is always forward-only: content missed during
-    /// the revocation period remains inaccessible.
-    ///
-    /// Emits a `ReadAccessRestored` event. See SCP-GG-006 and ADR-031.
+    /// If the member was presence-only (both read + write revoked), restoring
+    /// read access brings them to read-only state and restores governance
+    /// capabilities (they can see content again → can vote meaningfully).
     ///
     /// # Errors
     ///
     /// - [`ContextError::PermissionDenied`] if the ceiling lacks `MemberBan`.
-    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-    /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
+    /// - [`ContextError::NothingToRestore`] if the member's read access was
+    ///   never revoked.
     async fn restore_read_access_internal(
         &self,
         context_id: &str,
@@ -4058,13 +4060,6 @@ impl ContextManager {
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
-        // Both Full and FutureOnly block future writes via write_revoked_members.
-        // Full additionally suppresses historical content via access key
-        // destruction (ADR-038 §3) — delegated to the access key layer when
-        // it processes the WriteAccessRevoked event. Scope differentiation
-        // is deferred to the content-access stories (SCP-CAC-007, SCP-CAC-008)
-        // which will thread scope into write_revoked_members and the event.
-        let _ = scope;
 
         let (snapshot, bc_snapshot) = {
             let mut contexts = self.contexts.lock().await;
@@ -4081,21 +4076,37 @@ impl ContextManager {
             if !ctx.membership.contains(did) {
                 return Err(ContextError::MemberNotFound(did.to_string()));
             }
+
+            // Redundant operation handling (§5.9):
+            // Already write-revoked → no-op that returns success.
+            if ctx.write_revoked_members.contains(did) {
+                return Ok(());
+            }
+
             // Mark member as write-revoked. The member remains present but
             // their messages will be rejected by the send path.
-            // No artificial cap on write_revoked_members — naturally bounded
-            // by membership count (§5.9: cannot revoke write for non-members).
             ctx.write_revoked_members.insert(did.clone());
 
-            // Broadcast mode: also destroy the author's broadcast key so
-            // key requests return Deny (§5.14.8 "Author removal").
-            let bc_snap = ctx.broadcast_context.as_mut().map(|bc| {
-                // block_author removes the author from the authors map,
-                // destroying their key and preventing future key distribution.
-                // Ignore error if DID is not an author (may be a subscriber).
-                let _ = bc.block_author(&did.0);
-                bc.to_snapshot()
-            });
+            // Presence-only check: if both read AND write are revoked,
+            // strip GovernanceVote and GovernancePropose capabilities (§5.9).
+            if ctx.read_revoked_members.contains(did) {
+                ctx.role_state.revoke_governance_capabilities(did);
+            }
+
+            // Full scope: destroy the author's sender/broadcast key so
+            // historical content is suppressed and key requests return Deny.
+            // FutureOnly scope: only block future writes via write_revoked_members.
+            let bc_snap = match scope {
+                RevocationScope::Full => ctx.broadcast_context.as_mut().map(|bc| {
+                    let _ = bc.block_author(&did.0);
+                    bc.to_snapshot()
+                }),
+                RevocationScope::FutureOnly => None,
+            };
+
+            // Emit write access revoked event to receive buffer.
+            ctx.receive_buffer
+                .push(ContextEvent::WriteAccessRevoked { did: did.clone() });
 
             (Self::snapshot_context(ctx), bc_snap)
         };
@@ -4129,7 +4140,27 @@ impl ContextManager {
                     "MemberBan capability not in ceiling".to_owned(),
                 ));
             }
+
+            // Redundant operation handling (§5.9):
+            // Restoring access that was never revoked → NothingToRestore.
+            if !ctx.write_revoked_members.contains(did) {
+                return Err(ContextError::NothingToRestore(format!(
+                    "write access was never revoked for {did}"
+                )));
+            }
+
             ctx.write_revoked_members.remove(did);
+
+            // Restore governance capabilities if member is no longer
+            // presence-only (i.e., read access is not also revoked).
+            if !ctx.read_revoked_members.contains(did) {
+                ctx.role_state.restore_governance_capabilities(did);
+            }
+
+            // Emit write access restored event to receive buffer.
+            ctx.receive_buffer
+                .push(ContextEvent::WriteAccessRestored { did: did.clone() });
+
             Self::snapshot_context(ctx)
         };
 
@@ -4142,20 +4173,19 @@ impl ContextManager {
     async fn execute_rotate_content_keys(
         &self,
         context_id: &str,
-        _reason: Option<&str>,
+        reason: Option<&str>,
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        // Broadcast mode: rotate all authors' sender keys under lock.
-        let bc_snapshot = {
+        let (snapshot, bc_snapshot) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
             require_active(&ctx.handle)?;
 
-            if let Some(ref mut bc) = ctx.broadcast_context {
+            let bc_snap = if let Some(ref mut bc) = ctx.broadcast_context {
                 // Rotate every author's broadcast key (epoch advance + new key).
                 bc.rotate_all_author_keys()?;
                 Some(bc.to_snapshot())
@@ -4164,11 +4194,20 @@ impl ContextManager {
                 // update proposals. No direct crypto call needed — the event
                 // signals the MLS layer to issue an Update + Commit.
                 None
-            }
+            };
+
+            // Emit content keys rotated event to receive buffer.
+            ctx.receive_buffer
+                .push(ContextEvent::ContentKeysRotated {
+                    reason: reason.map(String::from),
+                });
+
+            (Self::snapshot_context(ctx), bc_snap)
         };
 
-        if let Some(ref snapshot) = bc_snapshot {
-            self.persist_broadcast_snapshot(context_id, snapshot);
+        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snap) = bc_snapshot {
+            self.persist_broadcast_snapshot(context_id, snap);
         }
 
         self.event_log
@@ -7487,6 +7526,7 @@ mod tests {
             ttl_remaining_secs: None,
             registered_tools: Vec::new(),
             write_revoked_members: HashSet::new(),
+            read_revoked_members: HashSet::new(),
             tool_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
@@ -7579,6 +7619,7 @@ mod tests {
             ttl_remaining_secs: None,
             registered_tools: Vec::new(),
             write_revoked_members: HashSet::new(),
+            read_revoked_members: HashSet::new(),
             tool_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
@@ -7659,6 +7700,7 @@ mod tests {
             ttl_remaining_secs: Some(120), // 120 seconds remaining
             registered_tools: Vec::new(),
             write_revoked_members: HashSet::new(),
+            read_revoked_members: HashSet::new(),
             tool_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
@@ -7718,6 +7760,7 @@ mod tests {
                 ttl_remaining_secs: None,
                 registered_tools: Vec::new(),
                 write_revoked_members: HashSet::new(),
+                read_revoked_members: HashSet::new(),
                 tool_interfaces: Vec::new(),
                 threshold_signers: Vec::new(),
                 threshold_value: 0,
@@ -7776,6 +7819,7 @@ mod tests {
             ttl_remaining_secs: None,
             registered_tools: Vec::new(),
             write_revoked_members: HashSet::new(),
+            read_revoked_members: HashSet::new(),
             tool_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
@@ -8752,6 +8796,7 @@ mod tests {
             ttl_remaining_secs: None,
             registered_tools: Vec::new(),
             write_revoked_members: HashSet::new(),
+            read_revoked_members: HashSet::new(),
             tool_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,

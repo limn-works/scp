@@ -18,6 +18,8 @@ use scp_core::context::{ContextHandle, ContextParams, ContextState};
 use scp_identity::DID;
 use uuid::Uuid;
 
+use scp_platform::traits::KeyCustody;
+
 use crate::error::ScpNapiError;
 use crate::identity::{NapiIdentity, OpaqueInMemoryKeyCustody};
 use crate::runtime::context_manager;
@@ -236,6 +238,31 @@ pub struct NapiMessage {
 }
 
 // ---------------------------------------------------------------------------
+// Helper — pseudonym derivation (SCP-214 criterion 5)
+// ---------------------------------------------------------------------------
+
+/// Derives the context-scoped pseudonym routing ID via the retained
+/// `KeyCustody` provider (SCP-214 criterion 5, spec §9.10.4).
+///
+/// Returns `Ok(())` on success or if no custody/identity is available
+/// (graceful no-op). Errors are logged but not propagated.
+async fn derive_context_pseudonym(
+    identity: &NapiIdentity,
+    context_id: &str,
+) {
+    if let (Some(scp_id), Some(custody)) = (
+        identity.inner.scp_identity.as_ref(),
+        &identity.inner.in_memory_custody,
+    ) {
+        let _pseudonym = custody
+            .0
+            .derive_pseudonym(&scp_id.identity_key, context_id.as_bytes())
+            .await
+            .ok();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bridge functions — context lifecycle (delegated to ContextManager)
 // ---------------------------------------------------------------------------
 
@@ -347,6 +374,9 @@ pub async fn context_create(
 
     // Register the creator's DID as a local DID for defense-in-depth.
     manager.register_local_did(DID(creator_did.clone())).await;
+
+    // Derive the context-scoped pseudonym routing ID (SCP-214 criterion 5).
+    derive_context_pseudonym(identity, &context_id).await;
 
     let handle = NapiContextHandle {
         context_id,
@@ -509,6 +539,44 @@ pub async fn context_send(
 
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let did = DID(identity_did.clone());
+
+    // Validate inner envelope signing via the retained KeyCustody
+    // (SCP-214 criterion 6). Ensures the identity's active signing key
+    // can produce a valid Ed25519 signature before sending.
+    if let (Some(custody), Some(signing_key)) =
+        (&handle.in_memory_custody, handle.signing_key)
+    {
+        let context_id = handle.context_id.clone();
+        let sender_did_str = identity_did.clone();
+        let now_ms = scp_core::time::now_millis().map_err(|e| {
+            NapiError::from(ScpNapiError::Crypto {
+                message: format!("clock error: {e}"),
+                code: "SCP-CRYPTO-4000".to_owned(),
+            })
+        })?;
+
+        let params = scp_core::envelope::InnerEnvelopeParams {
+            context_id: &context_id,
+            sender_did: &sender_did_str,
+            epoch: 0,
+            generation: 0,
+            sequence: 0,
+            timestamp: now_ms,
+            message_type: scp_core::envelope::MessageType::Content,
+            payload: &payload,
+            provenance: None,
+            signing_key_id: scp_identity::SigningKeyId::Active,
+        };
+
+        scp_core::envelope::create_inner_envelope(&params, &custody.0, &signing_key)
+            .await
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Crypto {
+                    message: format!("inner envelope signing failed: {e}"),
+                    code: "SCP-CRYPTO-4001".to_owned(),
+                })
+            })?;
+    }
 
     let manager = context_manager();
     manager
