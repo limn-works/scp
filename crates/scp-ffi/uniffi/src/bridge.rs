@@ -3147,7 +3147,7 @@ pub fn trust_create_challenge(target_did: String) -> Result<ChallengeResult, Scp
     let request = scp_core::trust::issue_challenge(
         "did:key:ephemeral-challenger".into(),
         target_did.into(),
-        scp_core::trust::ChallengeType::SchemaValidation,
+        scp_core::trust::ChallengeType::schema_validation(),
         serde_json::json!({}),
         std::time::Duration::from_secs(300),
         &signer,
