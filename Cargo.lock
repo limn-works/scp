@@ -4747,6 +4747,7 @@ dependencies = [
  "hmac",
  "pyo3",
  "rand 0.8.5",
+ "rmp-serde",
  "scp-core",
  "scp-event-log",
  "scp-ffi-common",

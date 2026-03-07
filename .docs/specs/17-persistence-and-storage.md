@@ -87,6 +87,7 @@ context/{context_id}/membership/{did}
 context/{context_id}/sender_key/{did}
 context/{context_id}/nonce/{nonce_hash}
 context/{context_id}/event/{seq:020d}
+context/{context_id}/event_data/{seq:020d}
 context/{context_id}/event_meta/count
 context/{context_id}/event_meta/root
 context/{context_id}/event_tree/{level}/{index}
@@ -113,6 +114,8 @@ mls/{context_id}/...
 ```
 
 **Zero-padded sequences.** Event sequence numbers and private state sequence numbers use `:020d` formatting (20-digit zero-padded decimal). This ensures lexicographic ordering matches numeric ordering, enabling efficient range queries via `list_keys`. Example: event 42 is stored at `context/{id}/event/00000000000000000042`.
+
+**Event data payloads.** The `event/{seq:020d}` key stores only the 32-byte SHA-256 leaf hash for Merkle tree verification. The `event_data/{seq:020d}` key stores the full MessagePack-serialized `Event` struct (event type, actor DID, timestamp, sequence, payload, prev_hash, signature). This dual-key design preserves the compact Merkle tree structure while enabling event replay and query without transport-layer round-trips. Events persisted before the `event_data/` key convention was introduced will have hash-only entries; `load_event_data` returns `None` for these (backward compatible).
 
 **Nonce keys.** UCAN nonce replay prevention uses `context/{context_id}/nonce/{SHA256(nonce_string)}` — the nonce string is hashed to a fixed-length key. The value stores `(first_seen_timestamp, token_expiry_timestamp)` for pruning. The `exists()` method enables O(1) replay checks without deserializing.
 
