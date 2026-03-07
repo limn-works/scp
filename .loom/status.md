@@ -1,46 +1,51 @@
 # Loom Status
 
 ## Failing Tests
-Cannot verify — disk space exhausted. No Bash commands can execute (ENOSPC on /private/tmp and working directory).
+Cannot verify — subagents did not commit work, no new code on main branch to test.
 
 ## Uncommitted Changes
-None — no files could be written or modified due to disk space exhaustion.
+None on the main worktree branch. Subagent worktrees contain uncommitted files:
+
+### agent-a4b3697d (#343 — Nostr + WebRTC transport adapters)
+- `crates/scp-transport/src/nostr/mod.rs` (new)
+- `crates/scp-transport/src/nostr/adapter.rs` (new)
+- `crates/scp-transport/src/webrtc/mod.rs` (new)
+- `crates/scp-transport/src/webrtc/adapter.rs` (new)
+- Subagent wrote files but could not commit or verify due to disk space exhaustion during execution. Files need review, compilation check, and testing before merging.
+
+### agent-a3095959 (#344 — Artifact Health Report)
+- Subagent hit usage limits ("out of extra usage") before completing. Unknown how much work was done. Worktree exists but needs inspection.
 
 ## Fixed This Iteration
-Nothing new fixed. Verification-only iteration.
+Nothing new — no code merged this iteration.
 
 ## Tests Added / Updated
-None — disk space prevents any file writes.
+None — subagent work not merged.
 
 ## Work Summary
 
-### Verification (3 of 5 Phase 12 issues confirmed COMPLETE)
+### Phase 12 Issue Status
 
 | Issue | Status | Evidence |
 |-------|--------|----------|
-| #291 (stub policy violations) | COMPLETE | Merged commit b3014487 (on this branch via merge commit b2b32713). `grep` confirms zero `todo!`/`unimplemented!` violations remain in crates/. Only remaining `fatalError` is UniFFI-generated boilerplate (excluded per AC). |
-| #301 (dev API hardcoded zeros) | COMPLETE | Already CLOSED on GitHub. Completed in Phase 1 (commit cf3cc06). dev_api.rs has zero remaining TODO comments. |
-| #303 (event log query) | COMPLETE | Merged commit 273ce70d (on this branch via merge commit 916f59c5). All 5 ProtocolStore methods verified: `store_event_data`, `load_event_data`, `load_event_data_range`, `append_event_full`, `query_events`. Tests present in event_log.rs. FFI `py_event_log_query` updated. |
+| #291 (stub policy violations) | COMPLETE | Verified iteration 5. Merged commit b3014487. Zero `todo!`/`unimplemented!` violations in crates/. |
+| #301 (dev API hardcoded zeros) | COMPLETE | CLOSED on GitHub. Completed in Phase 1 (commit cf3cc06). |
+| #303 (event log query) | COMPLETE | Verified iteration 5. Merged commit 273ce70d. All 5 ProtocolStore methods verified. |
+| #343 (Nostr + WebRTC adapters) | IN PROGRESS | Subagent wrote adapter files to worktree (nostr/mod.rs, nostr/adapter.rs, webrtc/mod.rs, webrtc/adapter.rs) but could not commit due to disk space exhaustion. Files exist in agent-a4b3697d worktree, need verification and merge. |
+| #344 (Artifact Health Report) | IN PROGRESS | Subagent hit usage limits before completing. Worktree agent-a3095959 exists but completion state unknown. All 20 findings (S-1 through S-12, M-1 through M-4, Q-1, Q-2, OQ-3, OQ-4, C-1) need to be addressed. |
 
-### Blocked (2 of 5 Phase 12 issues)
-
-| Issue | Status | Reason |
-|-------|--------|--------|
-| #343 (Nostr + WebRTC transport adapters) | BLOCKED | Disk space exhausted — cannot create directories or write files. Both `/private/tmp` (Bash tool output) and the working directory filesystem return ENOSPC. |
-| #344 (Artifact Health Report doc updates) | BLOCKED | Same disk space issue — cannot edit documentation files. |
-
-### Infrastructure Issue
-- `/private/tmp/claude-501/` and the working directory filesystem are at 0 free space
-- ALL Bash tool calls fail with ENOSPC before command execution
-- Agent tool (subagents) cannot be dispatched (requires Bash)
-- Write tool cannot create new files or directories
-- Only Read, Grep, Glob tools function (read-only operations)
+### This Iteration (iteration 6)
+- Confirmed disk space recovered (67Gi available)
+- Verified #301 already closed on GitHub
+- Dispatched two parallel subagents for #343 and #344
+- #343 subagent: wrote Nostr and WebRTC adapter code but couldn't commit (disk space issue during agent execution)
+- #344 subagent: ran out of API usage before completing
 
 ## Review Outcomes
-Review skipped — no new code was written or modified this iteration. Verification-only.
+Review skipped — no new code merged this iteration.
 
 ## Next Iteration
-1. **CRITICAL: Free disk space** before attempting any work. The working directory or /private/tmp must have free space.
-2. **#343**: Implement Nostr adapter (NIP-01 over WebSocket, kind 29078, base64 blobs, use existing tokio-tungstenite) and WebRTC adapter (DataChannels, signaling via SCP relay). Both feature-gated in Cargo.toml.
-3. **#344**: Update `.docs/architecture.md`, `.docs/specs/00-open-questions.md`, `.docs/sketch.md`, `.docs/specs/09-security-model.md`, `.docs/specs/17-persistence-and-storage.md` per the 11 findings (S-1 through S-7, M-1, M-2, Q-1, Q-2).
-4. After both complete: run full test suite, review cycle, close issues, update exec plan.
+1. **#343**: Check agent-a4b3697d worktree for uncommitted Nostr/WebRTC adapter code. If quality is acceptable, copy to main branch, verify compilation (`cargo clippy -p scp-transport --features nostr` and `--features webrtc`), run tests, commit. If not acceptable, re-dispatch subagent.
+2. **#344**: Check agent-a3095959 worktree for any doc changes. If partial, complete remaining findings. If empty, re-dispatch subagent for all 20 findings.
+3. After both complete: run full test suite, review cycle, close issues, update exec plan to mark Phase 12 COMPLETE.
+4. PRD stories for remaining 10 Tier 2 adapters still needed (part of #343 AC).
