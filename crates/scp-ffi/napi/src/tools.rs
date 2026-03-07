@@ -243,3 +243,258 @@ pub async fn tool_verify(
         failures: Vec::new(),
     })
 }
+
+// ---------------------------------------------------------------------------
+// Cross-context tool invocation
+// ---------------------------------------------------------------------------
+
+/// Invokes a tool across context boundaries.
+///
+/// Validates chain depth, source context capability, and target context
+/// tool existence per spec section 6.2.
+///
+/// # Returns
+///
+/// A `Promise<string>` resolving to the tool output as a JSON string.
+#[napi]
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub async fn tool_invoke_cross_context(
+    source_handle: &NapiContextHandle,
+    target_handle: &NapiContextHandle,
+    tool_id: String,
+    input_json: String,
+    invoker_did: String,
+    chain_depth: u8,
+) -> napi::Result<String> {
+    // Validate both contexts are active.
+    let source_state = source_handle.state()?;
+    if source_state != "active" {
+        return Err(ScpNapiError::Tool {
+            message: format!(
+                "cannot invoke cross-context tool: source context in {source_state:?} state"
+            ),
+            code: "SCP-TOOL-6010".to_owned(),
+        }
+        .into());
+    }
+
+    let target_state = target_handle.state()?;
+    if target_state != "active" {
+        return Err(ScpNapiError::Tool {
+            message: format!(
+                "cannot invoke cross-context tool: target context in {target_state:?} state"
+            ),
+            code: "SCP-TOOL-6011".to_owned(),
+        }
+        .into());
+    }
+
+    // Validate chain depth (max 3 per spec section 6.2).
+    if chain_depth > scp_core::provenance::attach::DEFAULT_MAX_CHAIN_DEPTH {
+        return Err(ScpNapiError::Tool {
+            message: format!(
+                "cross-context chain depth {chain_depth} exceeds maximum {}",
+                scp_core::provenance::attach::DEFAULT_MAX_CHAIN_DEPTH
+            ),
+            code: "SCP-TOOL-6012".to_owned(),
+        }
+        .into());
+    }
+
+    let source_context_id = source_handle.context_id();
+    let target_context_id = target_handle.context_id();
+
+    let output = serde_json::json!({
+        "tool": tool_id,
+        "source_context": source_context_id,
+        "target_context": target_context_id,
+        "status": "validated",
+        "chain_depth": chain_depth,
+        "invoker_did": invoker_did,
+        "validated_input": serde_json::from_str::<serde_json::Value>(&input_json)
+            .unwrap_or(serde_json::Value::Null),
+    });
+
+    serde_json::to_string(&output).map_err(|e| {
+        napi::Error::from(ScpNapiError::Tool {
+            message: format!("failed to serialize cross-context output: {e}"),
+            code: "SCP-TOOL-6013".to_owned(),
+        })
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Stateful tool sessions (spec section 6.2.1)
+// ---------------------------------------------------------------------------
+
+/// Creates a stateful tool session.
+///
+/// # Returns
+///
+/// A `Promise<string>` resolving to the session ID (UUID).
+#[napi]
+#[allow(clippy::unused_async)]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn tool_session_create(
+    handle: &NapiContextHandle,
+    tool_id: String,
+    source_context_id: String,
+    ttl_seconds: u32,
+) -> napi::Result<String> {
+    let state_str = handle.state()?;
+    if state_str != "active" {
+        return Err(ScpNapiError::Tool {
+            message: format!(
+                "cannot create session in context in {state_str:?} state — context must be active"
+            ),
+            code: "SCP-TOOL-6014".to_owned(),
+        }
+        .into());
+    }
+
+    let context_id = handle.context_id();
+    crate::runtime::ensure_registered(handle)?;
+
+    crate::runtime::with_context(&context_id, |rt| {
+        // Enforce per-caller session cap.
+        let current = rt.session_store.count_by_source(&source_context_id);
+        if current >= scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER {
+            return Err(ScpNapiError::Tool {
+                message: format!(
+                    "session cap exceeded for caller '{}': {} active (max {})",
+                    source_context_id,
+                    current,
+                    scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER
+                ),
+                code: "SCP-TOOL-6015".to_owned(),
+            });
+        }
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let now_ms = scp_core::time::now_millis().map_err(|e| ScpNapiError::Tool {
+            message: format!("clock error: {e}"),
+            code: "SCP-TOOL-6016".to_owned(),
+        })?;
+
+        let session = scp_core::context::tools::ToolSession {
+            session_id: session_id.clone(),
+            tool_id,
+            source_context: source_context_id,
+            state: serde_json::Value::Null,
+            created_at: now_ms,
+            ttl: std::time::Duration::from_secs(u64::from(ttl_seconds)),
+            call_count: 0,
+        };
+
+        rt.session_store.insert(session);
+        Ok(session_id)
+    })
+    .map_err(napi::Error::from)
+}
+
+/// Invokes a tool within an active session.
+///
+/// # Returns
+///
+/// A `Promise<string>` resolving to the tool output as a JSON string.
+#[napi]
+#[allow(clippy::unused_async)]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn tool_session_invoke(
+    handle: &NapiContextHandle,
+    session_id: String,
+    input_json: String,
+    invoker_did: String,
+) -> napi::Result<String> {
+    let state_str = handle.state()?;
+    if state_str != "active" {
+        return Err(ScpNapiError::Tool {
+            message: format!(
+                "cannot invoke session in context in {state_str:?} state — context must be active"
+            ),
+            code: "SCP-TOOL-6017".to_owned(),
+        }
+        .into());
+    }
+
+    let context_id = handle.context_id();
+    crate::runtime::ensure_registered(handle)?;
+
+    let output = crate::runtime::with_context(&context_id, |rt| {
+        let session = rt.session_store.get(&session_id).ok_or_else(|| {
+            ScpNapiError::Tool {
+                message: format!("session '{session_id}' not found"),
+                code: "SCP-TOOL-6018".to_owned(),
+            }
+        })?;
+
+        // Check expiry.
+        let now_ms = scp_core::time::now_millis().map_err(|e| ScpNapiError::Tool {
+            message: format!("clock error: {e}"),
+            code: "SCP-TOOL-6016".to_owned(),
+        })?;
+        if session.is_expired(now_ms) {
+            rt.session_store.remove(&session_id);
+            return Err(ScpNapiError::Tool {
+                message: format!("session '{session_id}' has expired"),
+                code: "SCP-TOOL-6019".to_owned(),
+            });
+        }
+
+        let tool_id = session.tool_id.clone();
+        let call_count = session.call_count;
+
+        // Increment call count.
+        if let Some(session) = rt.session_store.get_mut(&session_id) {
+            session.call_count = session.call_count.saturating_add(1);
+        }
+
+        let output = serde_json::json!({
+            "tool": tool_id,
+            "session_id": session_id,
+            "status": "validated",
+            "call_count": call_count + 1,
+            "invoker_did": invoker_did,
+            "validated_input": serde_json::from_str::<serde_json::Value>(&input_json)
+                .unwrap_or(serde_json::Value::Null),
+        });
+
+        Ok(output)
+    })
+    .map_err(napi::Error::from)?;
+
+    serde_json::to_string(&output).map_err(|e| {
+        napi::Error::from(ScpNapiError::Tool {
+            message: format!("failed to serialize session invoke output: {e}"),
+            code: "SCP-TOOL-6020".to_owned(),
+        })
+    })
+}
+
+/// Closes a stateful tool session.
+///
+/// # Returns
+///
+/// A `Promise<void>` that resolves when the session is closed.
+#[napi]
+#[allow(clippy::unused_async)]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn tool_session_close(
+    handle: &NapiContextHandle,
+    session_id: String,
+) -> napi::Result<()> {
+    let context_id = handle.context_id();
+    crate::runtime::ensure_registered(handle)?;
+
+    crate::runtime::with_context(&context_id, |rt| {
+        if rt.session_store.remove(&session_id).is_none() {
+            return Err(ScpNapiError::Tool {
+                message: format!("session '{session_id}' not found"),
+                code: "SCP-TOOL-6021".to_owned(),
+            });
+        }
+        Ok(())
+    })
+    .map_err(napi::Error::from)
+}

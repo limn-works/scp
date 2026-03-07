@@ -29,6 +29,7 @@ use scp_core::context::builder::{
 use scp_core::context::manager::{ContextManager, ContextPersistence, ContextSnapshot};
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
+use scp_core::context::tools::{SessionStore, ToolRegistry};
 use scp_event_log::EventLog;
 use scp_identity::cache::SystemClock;
 
@@ -112,6 +113,10 @@ pub struct UcanContextState {
     pub creator_did: String,
     /// Event log (Merkle tree) for this context.
     pub event_log: EventLog,
+    /// Tool registry for this context (cross-context + session support).
+    pub tool_registry: ToolRegistry,
+    /// Session store for stateful tool sessions (spec section 6.2.1).
+    pub session_store: SessionStore,
 }
 
 /// Global registry of per-context UCAN validation state.
@@ -161,6 +166,8 @@ pub fn ensure_registered(handle: &NapiContextHandle) -> Result<(), ScpNapiError>
         ceiling_strings,
         creator_did,
         event_log,
+        tool_registry: ToolRegistry::new(),
+        session_store: SessionStore::new(),
     };
 
     map.entry(context_id).or_insert(state);
@@ -231,6 +238,8 @@ pub fn register_test_context(context_id: &str, creator_did: &str) {
         nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
         ceiling_strings,
         creator_did: creator_did.to_owned(),
+        tool_registry: ToolRegistry::new(),
+        session_store: SessionStore::new(),
     };
 
     map.entry(context_id.to_owned()).or_insert(state);

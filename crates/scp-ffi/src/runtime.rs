@@ -403,6 +403,11 @@ pub struct FfiBridgeState {
     /// Uses `tokio::sync::Mutex` so the lock can be held across `.await`
     /// points in `__anext__`.
     pub message_rx: Option<Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>>,
+    /// Session store for stateful tool sessions (spec section 6.2.1).
+    ///
+    /// Stores active tool sessions keyed by session ID. Sessions are created
+    /// via `py_tool_session_create` and cleaned up on context close.
+    pub session_store: scp_core::context::tools::SessionStore,
 }
 
 /// Buffer capacity for the receive channel (SCP-216, sketch.md §receive).
@@ -457,6 +462,7 @@ pub fn register_ffi_state(context_id: &str, creator_did: &str) -> Result<(), Scp
                 tool_handlers: HashMap::new(),
                 message_tx: None,
                 message_rx: None,
+                session_store: scp_core::context::tools::SessionStore::new(),
             };
 
             vacant.insert(state);

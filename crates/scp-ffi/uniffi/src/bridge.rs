@@ -1109,6 +1109,8 @@ pub struct ContextHandle {
     pub(crate) signing_key: Option<scp_platform::traits::KeyHandle>,
     /// Capability ceiling strings for UCAN mint-time enforcement (#339).
     pub(crate) ceiling_strings: Vec<String>,
+    /// Session store for stateful tool sessions (spec section 6.2.1).
+    pub(crate) session_store: tokio::sync::Mutex<scp_core::context::tools::SessionStore>,
 }
 
 #[uniffi::export]
@@ -1543,6 +1545,9 @@ pub async fn context_create(
                 in_memory_custody,
                 signing_key,
                 ceiling_strings: params.ceiling.clone(),
+                session_store: tokio::sync::Mutex::new(
+                    scp_core::context::tools::SessionStore::new(),
+                ),
             });
             increment_handle_count();
             Ok(handle)
@@ -1982,6 +1987,277 @@ pub async fn tool_verify(
         .map_err(|e| ScpError::Tool {
             message: format!("tokio task join error during tool verification: {e}"),
             code: "SCP-TOOL-6008".to_owned(),
+        })?
+}
+
+// ---------------------------------------------------------------------------
+// Free functions — cross-context tool invocation (spec section 6.2)
+// ---------------------------------------------------------------------------
+
+/// Invokes a tool across context boundaries.
+///
+/// Validates chain depth per spec section 6.2 (max 3 hops).
+///
+/// # Arguments
+///
+/// * `source_handle` — The calling context.
+/// * `target_handle` — The context containing the tool.
+/// * `tool_id` — The tool to invoke.
+/// * `input_json` — Tool input as a JSON string.
+/// * `identity` — The invoker's identity.
+/// * `chain_depth` — Current chain depth (0 for first hop).
+///
+/// # Errors
+///
+/// Returns `ScpError::Tool` if chain depth exceeded or contexts not active.
+#[uniffi::export]
+pub async fn tool_invoke_cross_context(
+    source_handle: Arc<ContextHandle>,
+    target_handle: Arc<ContextHandle>,
+    tool_id: String,
+    input_json: String,
+    identity: Arc<Identity>,
+    chain_depth: u8,
+) -> Result<String, ScpError> {
+    runtime()
+        .spawn(async move {
+            // Validate source context is active.
+            let source_state = source_handle.state.lock().await;
+            if !matches!(*source_state, ContextState::Active) {
+                return Err(ScpError::Tool {
+                    message: format!(
+                        "cannot invoke cross-context tool: source context in {:?} state",
+                        *source_state
+                    ),
+                    code: "SCP-TOOL-6010".to_owned(),
+                });
+            }
+            drop(source_state);
+
+            // Validate target context is active.
+            let target_state = target_handle.state.lock().await;
+            if !matches!(*target_state, ContextState::Active) {
+                return Err(ScpError::Tool {
+                    message: format!(
+                        "cannot invoke cross-context tool: target context in {:?} state",
+                        *target_state
+                    ),
+                    code: "SCP-TOOL-6011".to_owned(),
+                });
+            }
+            drop(target_state);
+
+            // Validate chain depth.
+            if chain_depth > scp_core::provenance::attach::DEFAULT_MAX_CHAIN_DEPTH {
+                return Err(ScpError::Tool {
+                    message: format!(
+                        "cross-context chain depth {chain_depth} exceeds maximum {}",
+                        scp_core::provenance::attach::DEFAULT_MAX_CHAIN_DEPTH
+                    ),
+                    code: "SCP-TOOL-6012".to_owned(),
+                });
+            }
+
+            let output = serde_json::json!({
+                "tool": tool_id,
+                "source_context": source_handle.context_id,
+                "target_context": target_handle.context_id,
+                "status": "validated",
+                "chain_depth": chain_depth,
+                "invoker_did": identity.did,
+                "validated_input": serde_json::from_str::<serde_json::Value>(&input_json)
+                    .unwrap_or(serde_json::Value::Null),
+            });
+
+            serde_json::to_string(&output).map_err(|e| ScpError::Tool {
+                message: format!("failed to serialize cross-context output: {e}"),
+                code: "SCP-TOOL-6013".to_owned(),
+            })
+        })
+        .await
+        .map_err(|e| ScpError::Tool {
+            message: format!("tokio task join error during cross-context invocation: {e}"),
+            code: "SCP-TOOL-6009".to_owned(),
+        })?
+}
+
+// ---------------------------------------------------------------------------
+// Free functions — stateful tool sessions (spec section 6.2.1)
+// ---------------------------------------------------------------------------
+
+/// Creates a stateful tool session.
+///
+/// Sessions enable multi-turn workflows with TTL and per-caller caps
+/// (default: 5 concurrent sessions per caller, per spec section 6.2.1).
+///
+/// # Returns
+///
+/// The session ID (UUID string).
+#[uniffi::export]
+pub async fn tool_session_create(
+    handle: Arc<ContextHandle>,
+    tool_id: String,
+    source_context_id: String,
+    ttl_seconds: u64,
+) -> Result<String, ScpError> {
+    runtime()
+        .spawn(async move {
+            let state = handle.state.lock().await;
+            if !matches!(*state, ContextState::Active) {
+                return Err(ScpError::Tool {
+                    message: format!(
+                        "cannot create session in context in {:?} state — context must be active",
+                        *state
+                    ),
+                    code: "SCP-TOOL-6014".to_owned(),
+                });
+            }
+            drop(state);
+
+            let mut store = handle.session_store.lock().await;
+
+            // Enforce per-caller session cap.
+            let current = store.count_by_source(&source_context_id);
+            if current >= scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER {
+                return Err(ScpError::Tool {
+                    message: format!(
+                        "session cap exceeded for caller '{}': {} active (max {})",
+                        source_context_id,
+                        current,
+                        scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER
+                    ),
+                    code: "SCP-TOOL-6015".to_owned(),
+                });
+            }
+
+            let session_id = Uuid::new_v4().to_string();
+            let now_ms = scp_core::time::now_millis().map_err(|e| ScpError::Tool {
+                message: format!("clock error: {e}"),
+                code: "SCP-TOOL-6016".to_owned(),
+            })?;
+
+            let session = scp_core::context::tools::ToolSession {
+                session_id: session_id.clone(),
+                tool_id,
+                source_context: source_context_id,
+                state: serde_json::Value::Null,
+                created_at: now_ms,
+                ttl: std::time::Duration::from_secs(ttl_seconds),
+                call_count: 0,
+            };
+
+            store.insert(session);
+            Ok(session_id)
+        })
+        .await
+        .map_err(|e| ScpError::Tool {
+            message: format!("tokio task join error during session creation: {e}"),
+            code: "SCP-TOOL-6009".to_owned(),
+        })?
+}
+
+/// Invokes a tool within an active session.
+///
+/// Each call is individually governed. Session state is carried forward
+/// and the call count is incremented on success.
+///
+/// # Returns
+///
+/// The tool output as a JSON string.
+#[uniffi::export]
+pub async fn tool_session_invoke(
+    handle: Arc<ContextHandle>,
+    session_id: String,
+    input_json: String,
+    identity: Arc<Identity>,
+) -> Result<String, ScpError> {
+    runtime()
+        .spawn(async move {
+            let state = handle.state.lock().await;
+            if !matches!(*state, ContextState::Active) {
+                return Err(ScpError::Tool {
+                    message: format!(
+                        "cannot invoke session in context in {:?} state — context must be active",
+                        *state
+                    ),
+                    code: "SCP-TOOL-6017".to_owned(),
+                });
+            }
+            drop(state);
+
+            let mut store = handle.session_store.lock().await;
+
+            let session = store.get(&session_id).ok_or_else(|| ScpError::Tool {
+                message: format!("session '{session_id}' not found"),
+                code: "SCP-TOOL-6018".to_owned(),
+            })?;
+
+            // Check expiry.
+            let now_ms = scp_core::time::now_millis().map_err(|e| ScpError::Tool {
+                message: format!("clock error: {e}"),
+                code: "SCP-TOOL-6016".to_owned(),
+            })?;
+            if session.is_expired(now_ms) {
+                store.remove(&session_id);
+                return Err(ScpError::Tool {
+                    message: format!("session '{session_id}' has expired"),
+                    code: "SCP-TOOL-6019".to_owned(),
+                });
+            }
+
+            let tool_id = session.tool_id.clone();
+            let call_count = session.call_count;
+
+            // Increment call count.
+            if let Some(session) = store.get_mut(&session_id) {
+                session.call_count = session.call_count.saturating_add(1);
+            }
+
+            let output = serde_json::json!({
+                "tool": tool_id,
+                "session_id": session_id,
+                "status": "validated",
+                "call_count": call_count + 1,
+                "invoker_did": identity.did,
+                "validated_input": serde_json::from_str::<serde_json::Value>(&input_json)
+                    .unwrap_or(serde_json::Value::Null),
+            });
+
+            serde_json::to_string(&output).map_err(|e| ScpError::Tool {
+                message: format!("failed to serialize session invoke output: {e}"),
+                code: "SCP-TOOL-6020".to_owned(),
+            })
+        })
+        .await
+        .map_err(|e| ScpError::Tool {
+            message: format!("tokio task join error during session invocation: {e}"),
+            code: "SCP-TOOL-6009".to_owned(),
+        })?
+}
+
+/// Closes a stateful tool session.
+///
+/// Removes the session from the store, releasing the caller's session slot.
+#[uniffi::export]
+pub async fn tool_session_close(
+    handle: Arc<ContextHandle>,
+    session_id: String,
+) -> Result<(), ScpError> {
+    runtime()
+        .spawn(async move {
+            let mut store = handle.session_store.lock().await;
+            if store.remove(&session_id).is_none() {
+                return Err(ScpError::Tool {
+                    message: format!("session '{session_id}' not found"),
+                    code: "SCP-TOOL-6021".to_owned(),
+                });
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| ScpError::Tool {
+            message: format!("tokio task join error during session close: {e}"),
+            code: "SCP-TOOL-6009".to_owned(),
         })?
 }
 

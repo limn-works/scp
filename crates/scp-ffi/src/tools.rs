@@ -643,6 +643,346 @@ fn extract_test_vectors(
 }
 
 // ---------------------------------------------------------------------------
+// Cross-context tool invocation
+// ---------------------------------------------------------------------------
+
+/// Invokes a tool across context boundaries.
+///
+/// The source context exposes the tool and the target context accepts the
+/// interface. Both contexts must have approved the interface before calls
+/// are permitted. Rate limits and chain depth are enforced per spec section
+/// 6.2.
+///
+/// # Arguments
+///
+/// * `source_context_id` — The ID of the calling context.
+/// * `target_context_id` — The ID of the context containing the tool.
+/// * `tool_id` — The ID of the tool to invoke.
+/// * `input` — A Python dict of input parameters.
+/// * `invoker_did` — The DID of the participant invoking the tool.
+/// * `chain_depth` — Current cross-context chain depth (0 for first hop).
+///
+/// # Returns
+///
+/// A Python object (dict) containing the tool's JSON-compatible output.
+///
+/// # Errors
+///
+/// Raises `ContextError` if either context is not connected, the tool is
+/// not found, chain depth is exceeded, or the interface is not approved.
+#[pyfunction]
+#[pyo3(name = "tool_invoke_cross_context")]
+pub fn py_tool_invoke_cross_context(
+    py: Python<'_>,
+    source_context_id: &str,
+    target_context_id: &str,
+    tool_id: &str,
+    input: &Bound<'_, PyDict>,
+    invoker_did: &str,
+    chain_depth: u8,
+) -> PyResult<PyObject> {
+    validate::validate_context_id(source_context_id)?;
+    validate::validate_context_id(target_context_id)?;
+    validate::validate_tool_id(tool_id)?;
+    validate::validate_did(invoker_did)?;
+    let input_json = py_dict_to_json(input)?;
+
+    // Validate the source context has the invoker's capability.
+    let source_has_capability =
+        crate::runtime::with_context(source_context_id, |rt| {
+            Ok(scp_core::context::tools::has_tool_invoke_capability(
+                &rt.role_state,
+                invoker_did,
+                tool_id,
+            ))
+        })?;
+
+    if !source_has_capability {
+        return Err(ScpPyError::ucan(format!(
+            "invoker '{invoker_did}' does not have ToolInvoke capability for '{tool_id}' in source context"
+        ))
+        .into());
+    }
+
+    // Validate chain depth (max 3 per spec section 6.2).
+    if chain_depth > scp_core::provenance::attach::DEFAULT_MAX_CHAIN_DEPTH {
+        return Err(ScpPyError::context(format!(
+            "cross-context chain depth {chain_depth} exceeds maximum {}",
+            scp_core::provenance::attach::DEFAULT_MAX_CHAIN_DEPTH
+        ))
+        .into());
+    }
+
+    // Invoke the tool in the target context with echo mode.
+    let output_json = crate::runtime::with_context(target_context_id, |rt| {
+        let registration = rt.tool_registry.get(tool_id).ok_or_else(|| {
+            ScpPyError::context(format!(
+                "tool '{tool_id}' not found in target context '{target_context_id}'"
+            ))
+        })?;
+
+        // Validate input against the tool's input schema.
+        scp_core::context::tools::validate_value_against_schema(
+            &input_json,
+            &registration.schema.input_schema,
+        )
+        .map_err(|e| ScpPyError::validation(format!("input validation failed: {e}")))?;
+
+        // Dispatch to handler or echo mode.
+        let output = if let Some(handler) = rt.tool_handlers.get(tool_id) {
+            let handler = handler.clone();
+            let out = handler(input_json.clone()).map_err(|e| {
+                ScpPyError::context(format!(
+                    "cross-context tool handler for '{tool_id}' failed: {e}"
+                ))
+            })?;
+
+            scp_core::context::tools::validate_value_against_schema(
+                &out,
+                &registration.schema.output_schema,
+            )
+            .map_err(|msg| {
+                ScpPyError::validation(format!(
+                    "output validation failed for tool '{tool_id}': {msg}"
+                ))
+            })?;
+
+            out
+        } else {
+            serde_json::json!({
+                "tool": tool_id,
+                "source_context": source_context_id,
+                "target_context": target_context_id,
+                "status": "validated",
+                "chain_depth": chain_depth,
+                "input_valid": true,
+                "validated_input": input_json,
+            })
+        };
+
+        Ok(output)
+    })?;
+
+    json_to_py_dict(py, &output_json)
+}
+
+// ---------------------------------------------------------------------------
+// Stateful tool sessions (spec section 6.2.1)
+// ---------------------------------------------------------------------------
+
+/// Creates a stateful tool session.
+///
+/// Sessions enable multi-turn workflows with state preservation across
+/// invocations. Each session has a TTL and is subject to per-caller caps
+/// (default: 5 concurrent sessions per caller, per spec section 6.2.1).
+///
+/// # Arguments
+///
+/// * `context_id` — The context containing the tool.
+/// * `tool_id` — The tool to create a session for.
+/// * `source_context_id` — The calling context (session cap tracked per caller).
+/// * `ttl_seconds` — Time-to-live for the session, in seconds.
+///
+/// # Returns
+///
+/// The session ID (UUID string).
+///
+/// # Errors
+///
+/// Raises `ContextError` if the context is not connected, the tool is
+/// not found, or the per-caller session cap is exceeded.
+#[pyfunction]
+#[pyo3(name = "tool_session_create")]
+pub fn py_tool_session_create(
+    context_id: &str,
+    tool_id: &str,
+    source_context_id: &str,
+    ttl_seconds: u64,
+) -> PyResult<String> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_tool_id(tool_id)?;
+    validate::validate_context_id(source_context_id)?;
+
+    let session_id = crate::runtime::with_context(context_id, |rt| {
+        // Validate tool exists.
+        if !rt.tool_registry.contains(tool_id) {
+            return Err(ScpPyError::context(format!(
+                "tool '{tool_id}' not found in context '{context_id}'"
+            )));
+        }
+
+        // Enforce per-caller session cap.
+        let current = rt.session_store.count_by_source(source_context_id);
+        if current >= scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER {
+            return Err(ScpPyError::context(format!(
+                "session cap exceeded for caller '{}': {} active (max {})",
+                source_context_id,
+                current,
+                scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER
+            )));
+        }
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let now_ms = scp_core::time::now_millis().map_err(|e| {
+            ScpPyError::context(format!("clock error: {e}"))
+        })?;
+
+        let session = scp_core::context::tools::ToolSession {
+            session_id: session_id.clone(),
+            tool_id: tool_id.to_owned(),
+            source_context: source_context_id.to_owned(),
+            state: serde_json::Value::Null,
+            created_at: now_ms,
+            ttl: std::time::Duration::from_secs(ttl_seconds),
+            call_count: 0,
+        };
+
+        rt.session_store.insert(session);
+        Ok(session_id)
+    })?;
+
+    Ok(session_id)
+}
+
+/// Invokes a tool within an active session.
+///
+/// Each call is individually governed: the invoker must hold `ToolInvoke`
+/// capability. Session state is carried forward across invocations. The
+/// session's call count is incremented on each successful invocation.
+///
+/// # Arguments
+///
+/// * `context_id` — The context containing the tool session.
+/// * `session_id` — The session to invoke within.
+/// * `input` — A Python dict of input parameters.
+/// * `invoker_did` — The DID of the invoker (capability checked per call).
+///
+/// # Returns
+///
+/// A Python object (dict) containing the tool's JSON-compatible output.
+///
+/// # Errors
+///
+/// Raises `ContextError` if the session is not found, has expired, or
+/// the invoker lacks capability.
+#[pyfunction]
+#[pyo3(name = "tool_session_invoke")]
+pub fn py_tool_session_invoke(
+    py: Python<'_>,
+    context_id: &str,
+    session_id: &str,
+    input: &Bound<'_, PyDict>,
+    invoker_did: &str,
+) -> PyResult<PyObject> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_did(invoker_did)?;
+    let input_json = py_dict_to_json(input)?;
+
+    let output_json = crate::runtime::with_context(context_id, |rt| {
+        // Look up session.
+        let session = rt.session_store.get(session_id).ok_or_else(|| {
+            ScpPyError::context(format!("session '{session_id}' not found"))
+        })?;
+
+        // Check expiry.
+        let now_ms = scp_core::time::now_millis().map_err(|e| {
+            ScpPyError::context(format!("clock error: {e}"))
+        })?;
+        if session.is_expired(now_ms) {
+            rt.session_store.remove(session_id);
+            return Err(ScpPyError::context(format!(
+                "session '{session_id}' has expired"
+            )));
+        }
+
+        let tool_id = session.tool_id.clone();
+        let current_state = session.state.clone();
+
+        // Per-call UCAN governance: check ToolInvoke capability.
+        if !scp_core::context::tools::has_tool_invoke_capability(
+            &rt.role_state,
+            invoker_did,
+            &tool_id,
+        ) {
+            return Err(ScpPyError::ucan(format!(
+                "invoker '{invoker_did}' does not have ToolInvoke capability for '{tool_id}'"
+            )));
+        }
+
+        // Validate input against tool's input schema.
+        if let Some(registration) = rt.tool_registry.get(&tool_id) {
+            scp_core::context::tools::validate_value_against_schema(
+                &input_json,
+                &registration.schema.input_schema,
+            )
+            .map_err(|e| ScpPyError::validation(format!("input validation failed: {e}")))?;
+        }
+
+        // Execute via handler or echo mode, passing session state.
+        let (new_state, output) = if let Some(handler) = rt.tool_handlers.get(&tool_id) {
+            let handler = handler.clone();
+            let out = handler(input_json.clone()).map_err(|e| {
+                ScpPyError::context(format!(
+                    "tool handler for '{tool_id}' failed: {e}"
+                ))
+            })?;
+            (current_state, out)
+        } else {
+            let out = serde_json::json!({
+                "tool": tool_id,
+                "session_id": session_id,
+                "status": "validated",
+                "call_count": session.call_count + 1,
+                "session_state": current_state,
+                "validated_input": input_json,
+            });
+            (current_state, out)
+        };
+
+        // Update session state and increment call count.
+        if let Some(session) = rt.session_store.get_mut(session_id) {
+            session.state = new_state;
+            session.call_count = session.call_count.saturating_add(1);
+        }
+
+        Ok(output)
+    })?;
+
+    json_to_py_dict(py, &output_json)
+}
+
+/// Closes a stateful tool session.
+///
+/// Removes the session from the store, releasing the caller's session slot.
+/// After closing, any further invocations with this session ID will fail.
+///
+/// # Arguments
+///
+/// * `context_id` — The context containing the tool session.
+/// * `session_id` — The session to close.
+///
+/// # Errors
+///
+/// Raises `ContextError` if the context is not connected or the session
+/// is not found.
+#[pyfunction]
+#[pyo3(name = "tool_session_close")]
+pub fn py_tool_session_close(context_id: &str, session_id: &str) -> PyResult<()> {
+    validate::validate_context_id(context_id)?;
+
+    crate::runtime::with_context(context_id, |rt| {
+        if rt.session_store.remove(session_id).is_none() {
+            return Err(ScpPyError::context(format!(
+                "session '{session_id}' not found"
+            )));
+        }
+        Ok(())
+    })?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
@@ -659,5 +999,9 @@ pub fn register_tools(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_tool_register, m)?)?;
     m.add_function(wrap_pyfunction!(py_tool_invoke, m)?)?;
     m.add_function(wrap_pyfunction!(py_tool_verify, m)?)?;
+    m.add_function(wrap_pyfunction!(py_tool_invoke_cross_context, m)?)?;
+    m.add_function(wrap_pyfunction!(py_tool_session_create, m)?)?;
+    m.add_function(wrap_pyfunction!(py_tool_session_invoke, m)?)?;
+    m.add_function(wrap_pyfunction!(py_tool_session_close, m)?)?;
     Ok(())
 }

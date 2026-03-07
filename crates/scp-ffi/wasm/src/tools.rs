@@ -217,3 +217,143 @@ pub fn tool_verify(context: &WasmContextHandle, tool_id: String) -> Promise {
         }))
     })
 }
+
+// ---------------------------------------------------------------------------
+// Cross-context tool invocation (spec section 6.2)
+// ---------------------------------------------------------------------------
+
+/// Invokes a tool across context boundaries.
+///
+/// # Returns
+///
+/// `Promise<string>` — resolves to a JSON string of the tool's output.
+#[wasm_bindgen]
+pub fn tool_invoke_cross_context(
+    source_context: &WasmContextHandle,
+    target_context: &WasmContextHandle,
+    tool_id: String,
+    input_json: String,
+    invoker_did: String,
+    chain_depth: u8,
+) -> Promise {
+    let source_id = source_context.context_id();
+    let target_id = target_context.context_id();
+    future_to_promise(async move {
+        let input: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("input_json is not valid JSON: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        let result = with_manager(|mgr| {
+            mgr.invoke_tool_cross_context(
+                &source_id,
+                &target_id,
+                &tool_id,
+                &input,
+                &invoker_did,
+                chain_depth,
+            )
+        })
+        .map_err(ScpWasmError::into_js)?;
+
+        let json_str = serde_json::to_string(&result).map_err(|e| {
+            ScpWasmError::Tool {
+                message: format!("failed to serialize cross-context output: {e}"),
+                code: "SCP-TOOL-6013".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        Ok(JsValue::from_str(&json_str))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Stateful tool sessions (spec section 6.2.1)
+// ---------------------------------------------------------------------------
+
+/// Creates a stateful tool session.
+///
+/// # Returns
+///
+/// `Promise<string>` — resolves to the session ID (UUID).
+#[wasm_bindgen]
+pub fn tool_session_create(
+    context: &WasmContextHandle,
+    tool_id: String,
+    source_context_id: String,
+    ttl_seconds: u32,
+) -> Promise {
+    let context_id = context.context_id();
+    future_to_promise(async move {
+        let session_id = with_manager(|mgr| {
+            mgr.session_create(
+                &context_id,
+                &tool_id,
+                &source_context_id,
+                u64::from(ttl_seconds),
+            )
+        })
+        .map_err(ScpWasmError::into_js)?;
+
+        Ok(JsValue::from_str(&session_id))
+    })
+}
+
+/// Invokes a tool within an active session.
+///
+/// # Returns
+///
+/// `Promise<string>` — resolves to the tool output as a JSON string.
+#[wasm_bindgen]
+pub fn tool_session_invoke(
+    context: &WasmContextHandle,
+    session_id: String,
+    input_json: String,
+    invoker_did: String,
+) -> Promise {
+    let context_id = context.context_id();
+    future_to_promise(async move {
+        let input: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("input_json is not valid JSON: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        let result = with_manager(|mgr| {
+            mgr.session_invoke(&context_id, &session_id, &input, &invoker_did)
+        })
+        .map_err(ScpWasmError::into_js)?;
+
+        let json_str = serde_json::to_string(&result).map_err(|e| {
+            ScpWasmError::Tool {
+                message: format!("failed to serialize session invoke output: {e}"),
+                code: "SCP-TOOL-6020".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        Ok(JsValue::from_str(&json_str))
+    })
+}
+
+/// Closes a stateful tool session.
+///
+/// # Returns
+///
+/// `Promise<void>` — resolves when the session is closed.
+#[wasm_bindgen]
+pub fn tool_session_close(context: &WasmContextHandle, session_id: String) -> Promise {
+    let context_id = context.context_id();
+    future_to_promise(async move {
+        with_manager(|mgr| mgr.session_close(&context_id, &session_id))
+            .map_err(ScpWasmError::into_js)?;
+
+        Ok(JsValue::UNDEFINED)
+    })
+}
