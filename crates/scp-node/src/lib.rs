@@ -1724,30 +1724,19 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
 
         let (provision_result, acme_challenges) =
             provision_with_challenge_listener(&*tls_provider).await?;
+        let rate_limit = self
+            .projection_rate_limit
+            .unwrap_or(DEFAULT_PROJECTION_RATE_LIMIT);
 
         match provision_result {
             Ok(cert_data) => {
                 build_domain_inner(
-                    domain,
-                    identity,
-                    document,
-                    did_method,
-                    protocol_store,
-                    shutdown_handle,
-                    bound_addr,
-                    bridge_secret,
-                    dev_token,
-                    self.local_api_addr,
-                    blob_storage,
-                    relay_config,
-                    http_bind_addr,
-                    self.cors_origins.clone(),
-                    self.projection_rate_limit
-                        .unwrap_or(DEFAULT_PROJECTION_RATE_LIMIT),
-                    cert_data,
-                    connection_tracker.clone(),
-                    subscription_registry.clone(),
-                    acme_challenges,
+                    domain, identity, document, did_method, protocol_store,
+                    shutdown_handle, bound_addr, bridge_secret, dev_token,
+                    self.local_api_addr, blob_storage, relay_config,
+                    http_bind_addr, self.cors_origins.clone(), rate_limit,
+                    cert_data, connection_tracker.clone(),
+                    subscription_registry.clone(), acme_challenges,
                     #[cfg(feature = "http3")]
                     self.http3_config,
                 )
@@ -1759,31 +1748,15 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
                     "TLS provisioning failed, falling through to NAT-traversed mode (§10.12.8)"
                 );
                 let strategy = resolve_nat(
-                    self.nat_strategy,
-                    self.stun_server,
-                    self.bridge_relay,
-                    self.port_mapper,
-                    self.reachability_probe,
+                    self.nat_strategy, self.stun_server, self.bridge_relay,
+                    self.port_mapper, self.reachability_probe,
                 );
                 build_no_domain_inner(
-                    identity,
-                    document,
-                    did_method,
-                    protocol_store,
-                    shutdown_handle,
-                    bound_addr,
-                    strategy,
-                    bridge_secret,
-                    dev_token,
-                    self.local_api_addr,
-                    blob_storage,
-                    relay_config,
-                    Some(http_bind_addr),
-                    self.cors_origins,
-                    self.projection_rate_limit
-                        .unwrap_or(DEFAULT_PROJECTION_RATE_LIMIT),
-                    self.network_detector,
-                    connection_tracker,
+                    identity, document, did_method, protocol_store,
+                    shutdown_handle, bound_addr, strategy, bridge_secret,
+                    dev_token, self.local_api_addr, blob_storage, relay_config,
+                    Some(http_bind_addr), self.cors_origins, rate_limit,
+                    self.network_detector, connection_tracker,
                     subscription_registry,
                 )
                 .await

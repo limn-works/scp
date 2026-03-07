@@ -13,7 +13,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use redb::{Database, MultimapTableDefinition, ReadableTable, TableDefinition};
+use redb::{Database, MultimapTableDefinition, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
