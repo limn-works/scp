@@ -366,12 +366,14 @@ Blocking chain: `#385 → (#386 + #387 + #388 + #389 parallel) → #390` — **A
 
 **Step 1:** #333 (MLS integration) — **COMPLETE** → 723ec9e
 **Step 2:** #324 (MLS epoch conflict) — **COMPLETE** → d57a7f8
-**Step 3:** #314 (MLS LeafNode extension)
+**Step 3:** #314 (MLS LeafNode extension) — **COMPLETE** → 1789598
 **Step 4:** #309 (ADR-038 content access control) — unlocks SCP-CAC-*
 **Step 5:** #317 (SDK-mandated state destruction) — **DONE** (closed)
 
 Then content access PRD (serial — same subsystem, depends on #309):
-SCP-CAC-001 → SCP-CAC-002 → SCP-CAC-003 → SCP-CAC-004 → SCP-CAC-005 → SCP-CAC-006 → SCP-CAC-007 → SCP-CAC-008 → SCP-CAC-009 → SCP-CAC-010
+SCP-CAC-001 — **COMPLETE** → 7d56fdf
+SCP-CAC-004 — **COMPLETE** → 8c38383
+SCP-CAC-002 → SCP-CAC-003 → SCP-CAC-005 → SCP-CAC-006 → SCP-CAC-007 → SCP-CAC-008 → SCP-CAC-009 → SCP-CAC-010
 
 ### Phase 7: Governance Integration (depends on Phase 2 + Phase 5)
 
@@ -380,6 +382,8 @@ SCP-267 → SCP-268 → SCP-269 → SCP-270 → SCP-271 → SCP-272 → SCP-273 
 
 - SCP-267 — **COMPLETE** → bfe5245
 - SCP-268 — **COMPLETE** → 3df2cd7
+- SCP-269 — **COMPLETE** → a758149
+- SCP-270 — **COMPLETE** → 6a5cea5
 - SCP-267–268 need #356 (ContextManager wiring)
 - SCP-269–270 need #320 (GovernanceModel enum expansion + proposal lifecycle — all 24 actions already dispatched per PR #296)
 - SCP-272 needs #354 (conflict detection)
@@ -405,7 +409,7 @@ SCP-267 → SCP-268 → SCP-269 → SCP-270 → SCP-271 → SCP-272 → SCP-273 
 
 ### Phase 10: New Features (partially blocked by spec)
 
-**Lane A:** SCP-ACR-001–007 (capability registry) — independent, can start now
+**Lane A:** SCP-ACR-001 — **COMPLETE** → ad83cef. SCP-ACR-002–007 remaining (capability registry)
 **Lane B:** SCP-BCH-001–013 (bridge cooperative + credentials + sender key encryption) — **BLOCKED by S-D** (bridge MLS model)
 **Lane C:** SCP-BA-001–006 (participation admission) — **soft-blocked by S-A** (canonical serialization for profiles)
 **Lane D:** #362, #363, #364, #365, #366, #367
