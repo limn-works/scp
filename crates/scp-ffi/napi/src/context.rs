@@ -750,7 +750,9 @@ pub async fn context_execute_governance_action(
         rand::rngs::OsRng.fill_bytes(&mut proposal_id);
     }
 
-    let now = scp_core::time::now_secs().unwrap_or(0);
+    let now = scp_core::time::now_secs().ok_or_else(|| {
+        napi::Error::from_reason("system clock unavailable — cannot create governance proposal")
+    })?;
 
     let proposal = GovernanceProposal {
         proposal_id,

@@ -1107,6 +1107,8 @@ pub struct ContextHandle {
     /// Points into `in_memory_custody`. Used by `ucan_mint`.
     #[allow(dead_code)]
     pub(crate) signing_key: Option<scp_platform::traits::KeyHandle>,
+    /// Capability ceiling strings for UCAN mint-time enforcement (#339).
+    pub(crate) ceiling_strings: Vec<String>,
 }
 
 #[uniffi::export]
@@ -1540,6 +1542,7 @@ pub async fn context_create(
                 #[cfg(feature = "allow_in_memory_custody")]
                 in_memory_custody,
                 signing_key,
+                ceiling_strings: params.ceiling.clone(),
             });
             increment_handle_count();
             Ok(handle)
@@ -2182,7 +2185,11 @@ async fn ucan_mint_impl(
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
-                ceiling: None,
+                ceiling: if handle.ceiling_strings.is_empty() {
+                    None
+                } else {
+                    Some(handle.ceiling_strings.iter().cloned().collect())
+                },
             };
 
             let token = scp_core::crypto::ucan::mint::mint_ucan(&params, &custody.0)

@@ -315,7 +315,9 @@ pub async fn ucan_mint(
     let context_id = handle.context_id();
 
     // Get ceiling from the context handle for mint-time enforcement (#339).
+    // Empty ceiling means unrestricted — pass None, not Some(empty_set).
     let ceiling_strings: std::collections::HashSet<String> = handle.ceiling().into_iter().collect();
+    let ceiling = if ceiling_strings.is_empty() { None } else { Some(ceiling_strings) };
 
     let params = MintParams {
         issuer_did: &creator_did,
@@ -329,7 +331,7 @@ pub async fn ucan_mint(
         facts: None,
         key_scope: None,
         signing_key_id: None,
-        ceiling: Some(ceiling_strings),
+        ceiling,
     };
 
     // Sign the token using the real InMemoryKeyCustody via scp-core.

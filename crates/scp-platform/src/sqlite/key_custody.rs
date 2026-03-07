@@ -123,7 +123,7 @@ impl SqliteKeyCustody {
             }
 
             let key_type_byte = data[0];
-            let mut key_bytes = [0u8; 32];
+            let mut key_bytes = Zeroizing::new([0u8; 32]);
             key_bytes.copy_from_slice(&data[1..33]);
 
             match key_type_byte {
@@ -133,19 +133,18 @@ impl SqliteKeyCustody {
                     key_types.insert(id, KEY_TYPE_ED25519);
                 }
                 KEY_TYPE_X25519 => {
-                    let secret = StaticSecret::from(key_bytes);
+                    let secret = StaticSecret::from(*key_bytes);
                     x25519_keys.insert(id, secret);
                     key_types.insert(id, KEY_TYPE_X25519);
                 }
                 other => {
+                    // key_bytes is Zeroizing — automatically zeroed on drop
                     return Err(PlatformError::StorageError(format!(
                         "key {id} has unknown type {other}"
                     )));
                 }
             }
-
-            // Zeroize the temporary buffer.
-            key_bytes.fill(0);
+            // key_bytes automatically zeroed on drop via Zeroizing
         }
 
         // Start counter from the greater of: persisted counter or max observed ID + 1.
