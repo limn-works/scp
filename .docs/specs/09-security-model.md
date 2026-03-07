@@ -185,6 +185,38 @@ Three layers compose:
 
 These layers interact: earned capacity makes new identities limited, social and economic cost makes depth expensive to fake, and context-level thresholds let high-value spaces demand the depth that sybil accounts lack. Consequences for coordinated attacks render sybil accounts single-use — once detected and penalized, the investment in aging and building history is lost. This makes sustained sybil campaigns economically irrational even when individual identity creation is feasible.
 
+**Earned capacity protocol-level defaults (RECOMMENDED per RFC 2119):**
+
+The protocol defines baseline earned capacity parameters. Implementations MAY override these values, but MUST document deviations. These defaults are calibrated to make sybil accounts expensive to mature while not penalizing legitimate new users:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `initial_context_creation_limit` | 3 | Maximum contexts a new identity (age < 7 days) can create. |
+| `initial_context_membership_limit` | 10 | Maximum contexts a new identity can join simultaneously. |
+| `initial_message_rate` | 60/hour | Maximum messages per hour across all contexts for a new identity. |
+| `initial_tool_invocation_rate` | 10/hour | Maximum tool invocations per hour for a new identity. |
+| `capacity_growth_interval` | 7 days | Duration between capacity tier increases. |
+| `capacity_growth_factor` | 2x | Multiplier applied to all rate limits at each growth interval. |
+| `maximum_capacity_tier` | 5 | Number of growth intervals before capacity is uncapped (5 tiers = 35 days to full capacity). |
+| `capacity_decay_trigger` | 30 days inactive | Duration of inactivity (no signed messages or context operations) before capacity decays by one tier. |
+| `capacity_decay_interval` | 14 days | Duration between successive tier decreases during continued inactivity. |
+| `measurement_window` | 1 hour (sliding) | Window over which rate limits are evaluated. |
+
+**Capacity tier progression (at default values):**
+
+| Tier | Age | Context creation | Membership | Message rate | Tool rate |
+|------|-----|-----------------|------------|-------------|-----------|
+| 0 (new) | 0-6d | 3 | 10 | 60/h | 10/h |
+| 1 | 7-13d | 6 | 20 | 120/h | 20/h |
+| 2 | 14-20d | 12 | 40 | 240/h | 40/h |
+| 3 | 21-27d | 24 | 80 | 480/h | 80/h |
+| 4 | 28-34d | 48 | 160 | 960/h | 160/h |
+| 5 (uncapped) | 35d+ | no limit | no limit | no limit | no limit |
+
+Age alone is necessary but not sufficient — the identity MUST also have at least `tier * 2` participation records from distinct contexts (not self-created) to advance. This prevents aging-only sybil attacks where an attacker creates identities and waits without interacting.
+
+**Enforcement:** Earned capacity is enforced at the SDK level. The SDK tracks the identity's creation timestamp (from the DID document's initial BEP44 sequence), participation record count (from context state), and inactivity duration. Rate limit violations produce `ErrorCode::RATE_LIMITED` (error code 4001) with a `Retry-After` hint. Context governance MAY impose stricter thresholds than the protocol defaults (§9.3 layer 3), but MUST NOT relax them below the protocol floor for identities at tier 0-2.
+
 Sybil resistance is a **deterrent**, not an enforcement guarantee. The defense is structural: expensive to mount, expensive to sustain, costly when detected.
 
 ## 9.4 Systemic Defense Philosophy
@@ -211,7 +243,16 @@ The protocol mandates a single ciphersuite for v1. No negotiation, no fallback. 
 
 **DID-to-DID encryption:** HPKE (RFC 9180) with suite DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. Used for MLS Welcome messages. The HPKE suite matches the MLS ciphersuite to minimize the cryptographic surface area.
 
-**Merkle tree hash:** SHA-256. Append-only log tree following Certificate Transparency structure (RFC 6962). Each event entry is `SHA256(previous_hash || event_data)`. The Merkle root provides tamper-evident integrity over the entire event history.
+**Merkle tree hash:** SHA-256. Append-only log tree following Certificate Transparency structure (RFC 6962 §2). SCP uses the RFC 6962 hash construction with domain-separated leaf and interior node hashing to support efficient inclusion proofs and consistency proofs:
+
+- **Leaf hash:** `SHA-256(0x00 || event_data)` — the `0x00` prefix byte identifies leaf nodes.
+- **Interior node hash:** `SHA-256(0x01 || left_child_hash || right_child_hash)` — the `0x01` prefix byte identifies interior nodes.
+- **Empty tree:** The Merkle root of an empty tree is defined as `SHA-256("")` (the hash of the empty string, `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`).
+- **Tree construction:** Events are appended as leaves in order. The tree is built incrementally — each new leaf extends the tree per RFC 6962 §2. The root is recomputed after each append.
+
+The `0x00`/`0x01` domain separation prevents second-preimage attacks where an attacker constructs an interior node that is interpreted as a leaf (or vice versa). This is a critical security property: without it, an attacker could forge inclusion proofs by substituting tree layers.
+
+The Merkle root provides tamper-evident integrity over the entire event history. Inclusion proofs (proving a specific event is in the log) require `O(log N)` hashes. Consistency proofs (proving one log state is an extension of another) also require `O(log N)` hashes. These are used for equivocation detection (§9.9) and context state verification (§7.3.1).
 
 ### 9.5.1 Canonical Hash Construction
 
@@ -414,12 +455,14 @@ MLS (RFC 9420) provides the group encryption layer for SCP. This section specifi
 | Epoch | Context epoch | Increments on every membership change or key update. Included in all SCP envelopes. |
 | LeafNode credential | DID + UCAN + signing_key_id | The MLS credential field contains the member's DID, their context-scoped UCAN token, and the `signing_key_id` (`#active` or `#agent`) identifying which verification method signed this leaf node (ADR-039). |
 | Welcome message | Context join token | HPKE-encrypted to new member's KeyPackage. Contains the group state needed to decrypt future messages. |
-| KeyPackage | Pre-key bundle | Published to relays so others can add the identity to groups even when offline. Signed by identity key. Single-use. |
+| KeyPackage | Pre-key bundle | Published to relays so others can add the identity to groups even when offline. Signed by the Active Signing Key (`#active`) or Agent Signing Key (`#agent`) — NOT the Identity Key (`#0`). Single-use. See note below. |
 | Proposal (Add/Remove/Update) | Governance action | MLS membership proposals map to SCP membership changes. |
 | Commit | Governance commit | Finalizes pending proposals and advances the epoch. |
 | Application message | SCP envelope payload | The encrypted content within an SCP envelope. |
 | Delivery Service (DS) | SCP relay(s) | The untrusted store-and-forward layer. Any transport adapter (native relay, Nostr, Matrix, etc.) serves this role. |
 | Authentication Service (AS) | DID resolution + UCAN validation | SCP's identity layer serves as MLS's AS. No separate trusted server. |
+
+**KeyPackage signing key.** Per RFC 9420 §10.1, the signature key in a KeyPackage's `leaf_node` field is the key used to sign the KeyPackage. In SCP, this is the Active Signing Key (`#active`) for human-initiated joins, or the Agent Signing Key (`#agent`) for agent-initiated joins (ADR-039). The Identity Key (`#0`) is NOT used for KeyPackage signing — `#0` is reserved exclusively for DID document operations and pre-rotation commitments (ADR-003). Using `#active` or `#agent` for KeyPackages is consistent with the MLS credential model: the `leaf_node` credential contains the `signing_key_id` field (`#active` or `#agent`), and the KeyPackage signature MUST be verifiable against the corresponding verification method in the signer's DID document. On key rotation (§9.12), all outstanding KeyPackages signed by the old key MUST be deleted from relays and replaced with KeyPackages signed by the new key.
 
 **Group context extensions for nesting.** Child contexts include parent context IDs and governance configuration hashes in the MLS `group_context` extensions field (§5.13.3). This cryptographically binds the parent lineage to the child's group identity — the derived `group_id` is a function of the parent references. Root contexts (no parents) have empty nesting extensions.
 

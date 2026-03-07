@@ -15,7 +15,69 @@ Users never see or manage keys directly. Custody is delegated to whatever the us
 - Hardware security keys
 - Self-managed keys (power users who want direct control)
 
-The identity layer abstracts custody. The user authenticates however they choose; under the hood it resolves to a protocol-level DID. Migration between custody methods is possible without changing identity.
+The identity layer abstracts custody. The user authenticates however they choose; under the hood it resolves to a protocol-level DID. Migration between custody methods is possible without changing identity, using the key custody migration protocol (§3.2.1).
+
+### 3.2.1 Key Custody Migration Protocol
+
+Custody migration moves the operational signing capability from one custody provider to another (e.g., Secure Enclave to hardware security key, or passkey to self-managed key) without changing the identity (DID string). The Identity Key (`#0`) remains the root of trust throughout.
+
+**Two cases:**
+
+1. **Active Signing Key migration (common).** The Active Signing Key (`#active`) is rotatable by design (ADR-003 §4a). Migration generates a new `#active` key in the target custody provider and publishes an updated DID document signed by `#0`. The old `#active` key is revoked. The DID string does not change because it is derived from `#0`, not `#active`. This is the standard `rotate_active_key` operation applied to a custody change rather than a compromise.
+
+2. **Identity Key migration (rare).** If `#0` itself must move (e.g., the Secure Enclave device is being decommissioned and the key cannot be exported), the pre-rotation key mechanism (ADR-003 §4b, §9.12) is used. This creates a new DID — identity continuity is maintained through the `alsoKnownAs` forwarding record and the `DidRotationEvent` sent to all active contexts. The pre-rotation proof cryptographically binds the old identity to the new one.
+
+**Migration protocol (case 1 — Active Signing Key):**
+
+```
+1. INITIATE on target device:
+   a. Generate new Ed25519 keypair in target custody provider.
+   b. Create CustodyMigrationRequest:
+      - new_active_pubkey: [u8; 32]
+      - target_custody_type: enum { SecureEnclave, AndroidKeystore, HardwareKey, Passkey, Software }
+      - requested_at: u64 (Unix timestamp)
+
+2. AUTHORIZE on device holding #0:
+   a. Verify the migration request was initiated by the identity owner
+      (device-local authentication — biometric, PIN, or platform credential).
+   b. Construct updated DID document:
+      - Replace #active verification method with new_active_pubkey.
+      - Retain #0 and #agent (if present) unchanged.
+      - Increment BEP44 sequence number.
+   c. Sign DID document with #0 (Identity Key).
+
+3. PUBLISH:
+   a. Publish updated DID document to both resolution layers (§3.10.5).
+   b. Issue MLS Update proposals in all active contexts with credentials
+      referencing the new #active key (§9.7.3).
+   c. Revoke all UCAN tokens signed by the old #active key.
+      Reissue under the new #active key.
+
+4. TRANSFER attestation chain:
+   a. Identity attestations (§3.5) that were signed by the old #active key
+      MUST be re-signed by the new #active key and republished.
+   b. The SDK enumerates all published attestations and re-signs them
+      as part of the migration transaction.
+
+5. DESTROY old key material:
+   a. After confirmation that the new DID document has propagated
+      (verified by resolving from at least one relay and DHT),
+      the old #active private key is destroyed in the source custody provider.
+   b. Destruction is best-effort for HSM-backed keys (the HSM may not support
+      explicit deletion, but the key becomes inaccessible once the device
+      is decommissioned).
+```
+
+**Failure semantics:**
+
+- **Step 2 fails (authorization denied):** No state change. The old custody provider remains active. The new keypair generated in step 1 is discarded.
+- **Step 3a fails (publication fails on some relays/DHT):** The SDK retries publication. The RepublishManager (§3.10.5) will propagate on its next cycle. Partial publication is safe — peers that resolve the old document continue to work; peers that resolve the new document use the new key. Both are valid until the old key is destroyed.
+- **Step 3b/3c fails (MLS Update or UCAN reissuance fails in some contexts):** The SDK queues failed operations for retry. Contexts that have not received the Update continue to verify messages against the old `#active` key (still in the previously-resolved DID document). The migration converges as retries succeed.
+- **Step 5 fails (old key destruction fails):** The migration is still complete — the DID document references the new key. The old key is orphaned but harmless: UCAN tokens signed by it are revoked, and peers verify against the new DID document.
+
+**Multi-device coordination:** If the identity owner has multiple devices (e.g., phone + laptop + tablet), each device holds its own key material for signing. Custody migration affects only the `#active` key published in the DID document — the single authoritative signing key. Other devices learn of the migration by resolving the updated DID document (§3.10.4). After migration, only the device with the new custody provider can sign as `#active`. Other devices that need signing capability must independently generate keys and request delegation via scoped UCANs from the new `#active` key holder.
+
+**Invariant:** At no point during migration are there zero valid signing keys for the identity. The old key remains valid until the new DID document propagates. The new key becomes valid upon publication. The overlap window ensures continuity.
 
 ## 3.3 Recovery
 
@@ -123,11 +185,45 @@ Identity (DID)
 
 **Storage model.** Same as context state: encrypted blobs stored on your published relays. Relays see "DID X has encrypted private state." Relays store and serve it. Relays cannot read, modify, or interpret it. This is encryption-as-access-control (§10.5) applied to identity rather than context — the same infrastructure, the same relay behavior, the same trust assumptions.
 
+**Routing ID derivation.** Identity private state blobs are addressed on relays by a deterministic `routing_id` derived from the identity's DID string:
+
+```
+private_state_routing_id = HKDF-SHA-256(
+    ikm:  identity_key_material,      // raw bytes of #0 public key
+    salt: SHA-256("scp-private-state-salt-v1"),
+    info: "scp-private-state-v1" || did_string,
+    len:  32
+)
+```
+
+HKDF (RFC 5869) is used instead of plain SHA-256 to prevent the relay from computing the `routing_id` from a known DID string. With plain `SHA-256("scp:private:" || did_string)`, any relay that knows a DID could identify which routing ID holds that identity's private state, enabling targeted censorship or surveillance. The HKDF derivation requires `identity_key_material` (the `#0` public key bytes), which the relay does not possess unless it has previously resolved the DID — and even then, the derivation is not obvious without knowing the salt and info strings. This provides pseudonymity for private state storage relative to relays that have not correlated the identity.
+
+The domain separation (`"scp-private-state-v1"` info string and `"scp-private-state-salt-v1"` salt) prevents collision with other routing ID derivation schemes: DID document routing uses `SHA-256("scp:did:" || did_string)` (§3.10.2), encrypted context routing uses HKDF from identity key material with `"scp-pseudonym"` (§9.10.4), broadcast context routing uses `SHA-256(context_id)` (§5.14), and context metadata routing uses `SHA-256(context_id || "scp-metadata")` (§5.7).
+
+The `IdentityPrivateState` service endpoint in the DID document (see below) lists which relays store the private state. The `routing_id` tells the SDK how to address those blobs on those relays.
+
 **Sync model.** Append-only event log, same pattern as context event logs. Each device appends events ("blocked DID Y at timestamp T", "granted Bob graph visibility at scope Z"). Any device reconstructs current state from the log. Multi-device consistency: two phones and a laptop all append to the same log, all converge to the same state.
 
 Most identity private state operations are naturally commutative — "block X" and "block Y" produce the same result regardless of order. Simultaneous updates from multiple devices resolve without conflict in most cases. The event log records all operations; state is derived from the full log.
 
-**Integrity.** The event log is authenticated (Merkle root or equivalent). If a relay tampers with your private state, you detect it on next read. Single-owner verification is simpler than multi-party — you're the only writer — but the integrity guarantee is the same.
+**Integrity.** The event log is authenticated via an append-only hash chain. Each event entry is hashed as:
+
+```
+event_hash[0] = SHA-256("SCP-PRIVATE-LOG-V1:" || event_data[0])
+event_hash[i] = SHA-256("SCP-PRIVATE-LOG-V1:" || event_hash[i-1] || event_data[i])
+```
+
+The head hash (`event_hash[N-1]`) serves as the integrity root for the entire log. On each read from a relay, the device verifies the chain by recomputing hashes from the last verified checkpoint forward. If a relay has tampered with, reordered, or omitted events, the hash chain breaks and the device detects it.
+
+**Verification procedure:**
+
+1. The device stores the last verified `(event_count, head_hash)` tuple locally (in platform secure storage, alongside identity key material).
+2. On fetch, the device receives new events from the relay starting after `event_count`.
+3. The device computes `event_hash[event_count]` using the stored `head_hash` as the previous hash and the first new event's data.
+4. Each subsequent event extends the chain: `event_hash[i] = SHA-256("SCP-PRIVATE-LOG-V1:" || event_hash[i-1] || event_data[i])`.
+5. If the relay also returns a claimed head hash, the device verifies it matches the locally computed chain head. Mismatch indicates tampering.
+
+The domain separator `"SCP-PRIVATE-LOG-V1:"` prevents cross-domain hash collisions with context event logs (which use the construction in §9.5). `event_data` is the serialized event bytes (MessagePack per §17). This is a linear hash chain (not a Merkle tree) because the single-owner case does not require efficient inclusion proofs or consistency proofs — the owner holds the full log and verifies sequentially. Context event logs use the full Merkle tree construction (§9.5) because multi-party verification requires proof exchange.
 
 **Relationship to context state.** Identity private state is the single-owner degenerate case of context state. Same storage infrastructure. Same integrity model. Same relay interaction. No governance, no roles, no capability ceiling — because it's your data. The protocol doesn't need new infrastructure for this — it's the existing infrastructure with membership count of one and no access control layer (the encryption IS the access control, and only you have the key).
 
