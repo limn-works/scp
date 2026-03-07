@@ -36,7 +36,9 @@ The `version` field is added as the first field in the signed structure (§9.5.2
 | 9 | `provenance_hash` | 4-byte BE length + 32 bytes (or `SHA-256(0x00)` sentinel if absent) |
 | 10 | `signing_key_id` | 4-byte BE length + UTF-8 bytes |
 
-Adding `version` as field 1 changes the field positions of all subsequent fields, which changes the signed bytes. This is intentional — the version field is part of the signature commitment. The domain separator increments to `"SCP-INNER-ENVELOPE-V2:"` to reflect the structural change. Implementations of SCP/1.0 MUST use `V2` domain separators from initial release (the `V1` separator in §9.5.2 was the pre-versioning format; it is superseded by this section).
+Adding `version` as field 1 changes the field positions of all subsequent fields, which changes the signed bytes. This is intentional — the version field is part of the signature commitment. The domain separator increments to `"SCP-INNER-ENVELOPE-V2:"` to reflect the structural change.
+
+> **Implementation note:** The current codebase uses V1 domain separators (defined in §9.5.2) without a `version` field. The V2 format described here is the target for protocol version negotiation support. Migration from V1 to V2 will be coordinated as part of the version negotiation rollout. Until then, §9.5.2 V1 formats are canonical.
 
 The `InnerEnvelope` MessagePack serialization includes `version` as the first map key (or first positional field if using positional encoding per #348).
 
