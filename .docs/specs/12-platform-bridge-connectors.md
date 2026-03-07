@@ -44,6 +44,65 @@ Properties of bridge connectors:
 - **Transparent.** Bridge presence, operator identity, connected platform, and operating mode are visible to all context members via the `bridges` structural field in context metadata (§5.7). Because `bridges` is a structural field, it is always visible before opt-in — prospective members see active bridges before deciding whether to join. The canonical definition of `BridgeMetadata` lives in §5.7; this section describes the protocol semantics. When a bridge is registered, revoked, or suspended, the context's metadata record MUST be republished with updated bridge metadata (§5.7.1).
 - **Revocable.** Context governance can remove a bridge at any time, severing the connection to the external platform.
 
+### 12.2.1 Bridge Registration Protocol
+
+Bridge registration is a governance-gated operation using the `RegisterBridge` governance action:
+
+```
+RegisterBridge {
+  operator_did:    DID,              // the bridge operator's DID
+  platform:        String,           // platform identifier (e.g., "discord", "slack", "x")
+  mode:            BridgeMode,       // Relay | Puppet | API | Cooperative
+  webhook_url:     Option<String>,   // for cooperative mode: platform's webhook receiver URL
+  platform_key:    Option<[u8; 32]>, // for cooperative mode: platform's Ed25519 public key
+  max_shadows:     u32,              // governance-configured shadow limit for this bridge
+  metadata:        BridgeMetadata,   // display name, description, operator contact
+}
+```
+
+**Registration flow:**
+
+1. The bridge operator submits a `RegisterBridge` proposal to the context via the standard governance mechanism (§5.9). The operator MUST be a context member or hold a valid UCAN granting `bridging` capability in the context.
+2. The context's governance model processes the proposal (SingleAdmin: admin approves; Threshold/MajorityVote/Unanimity: members vote).
+3. On approval, the context emits a `BridgeRegistered` event in the Merkle event log containing the full `RegisterBridge` payload, the approving governance action ID, and the assigned `bridge_id` (SHA-256 of `context_id || operator_did || platform || timestamp`).
+4. The context metadata is republished with the new bridge in the `bridges` structural field (§5.7).
+5. For cooperative mode: the bridge node stores the `platform_key` for webhook signature verification (§12.10.2).
+
+**Bridge status state machine:**
+
+```
+Active ──→ Suspended ──→ Active     (reactivation via governance)
+Active ──→ Suspended ──→ Revoked    (permanent removal)
+Active ──→ Revoked                  (immediate permanent removal)
+```
+
+`Revoked` is a terminal state — a revoked bridge cannot be reactivated. A new `RegisterBridge` proposal is required to re-establish a bridge with the same operator and platform.
+
+### 12.2.2 Bridge Removal Protocol
+
+Bridge removal uses the `RevokeBridge` governance action:
+
+```
+RevokeBridge {
+  bridge_id:       [u8; 32],         // the bridge to revoke
+  reason:          String,           // governance justification
+  destroy_shadows: bool,             // true = retire all shadows; false = shadows persist as orphaned
+}
+```
+
+**Removal flow:**
+
+1. An admin or governance-authorized member submits a `RevokeBridge` proposal.
+2. On governance approval, the context emits a `BridgeRevoked` event in the Merkle event log.
+3. The bridge's `BridgeStatus` transitions to `Revoked`.
+4. If `destroy_shadows` is true: all shadow identities associated with this bridge are retired. Each shadow retirement emits a `ShadowRetired` event. Historical actions attributed to shadows remain in the event log with their original provenance.
+5. If `destroy_shadows` is false: shadows persist but are orphaned — no new messages can be emitted through them, but their historical attributions remain.
+6. The credential store for this bridge instance MUST destroy all delegated credentials (§12.11.1 Phase 5).
+7. In-flight messages from shadows that have not yet been committed to the event log are dropped. The bridge node receives a `BRIDGE_SUSPENDED` or `BRIDGE_FORBIDDEN` error on subsequent API calls.
+8. Context metadata is republished with the bridge removed from the `bridges` field.
+
+**Suspension** uses `SuspendBridge { bridge_id, reason, duration: Option<u64> }`. Suspension stops message processing but retains shadow state and credentials (§12.11.1). If `duration` is set, the bridge automatically reactivates after the specified seconds. Otherwise, explicit `ReactivateBridge { bridge_id }` governance action is required.
+
 ## 12.3 Shadow Identities
 
 When a bridge connector brings external platform participants into an SCP context, it creates **shadow identities** — protocol-level representations of entities that exist on the external platform but do not (yet) have native SCP identities.
@@ -53,7 +112,16 @@ Shadow identities differ from native SCP identities in critical ways:
 - **Attributed but not verified.** A shadow identity for `@dave_x` asserts that this entity is Dave on X. The assertion comes from the bridge operator, not from Dave himself. The trust in this attribution depends on trust in the bridge operator.
 - **Restricted by default.** Shadow identities receive a constrained role — typically observer-equivalent. They cannot exercise capabilities that require verified identity. Specific role assignment is up to context governance.
 - **Marked as bridged.** All actions and content associated with a shadow identity carry provenance marking indicating the bridge source. No shadow identity can be mistaken for a native SCP participant.
+- **Bounded per bridge.** Each bridge has a governance-configured `max_shadows` limit (set during registration, §12.2.1). The protocol default is 10,000 shadows per bridge instance. Contexts MAY set lower limits. When the limit is reached, `POST /v1/scp/bridge/shadow` returns `RATE_LIMITED` (429) with a message indicating the shadow cap. The limit prevents resource exhaustion from unbounded shadow creation.
 - **Claimable.** If Dave later joins SCP and publishes an identity attestation (§3.5) binding his X handle to his DID, his shadow identity can be claimed and merged with his native identity. Past actions attributed to the shadow are now attributed to Dave's DID. This transition is one-way and irreversible — once claimed, the shadow is retired.
+
+**Claimed shadow role upgrade path.** When a shadow is claimed by a DID:
+
+1. The shadow's `provenance_status` transitions from `Shadow` to `Claimed`.
+2. The claimant does NOT automatically become a context member — claiming a shadow and joining a context are independent operations. The claimant MUST separately join the context via the standard join flow (§5.12).
+3. On successful join, the context governance MAY automatically upgrade the claimant's role from the default join role to the shadow's previous role (if the governance model permits role inheritance from claimed shadows). This is a governance policy decision, not a protocol default.
+4. Historical messages attributed to the shadow are retroactively associated with the claimant's DID in the event log metadata. The original `BridgeProvenance` marking is preserved — historical content carries `provenance_status: "ClaimedHistorical"` to distinguish pre-claim bridged content from post-claim native content.
+5. The shadow entry is retired: no further messages can be emitted through it via the bridge. The bridge operator receives `SHADOW_ALREADY_CLAIMED` (409) on subsequent message attempts for this shadow.
 
 ```
   Before claiming:                   After claiming:
