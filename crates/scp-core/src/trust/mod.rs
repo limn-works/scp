@@ -59,6 +59,10 @@
 //! - [`CounterAttestation`] -- Counter-evidence for reputation restoration.
 //! - [`CustodyViolationError`] -- Validation errors for custody violation types.
 //! - [`CustodyViolationResult`] -- Result of a Category A enforcement check.
+//! - [`ParticipationFact`] -- Participation fact categories for admission (§7.3.2.1).
+//! - [`ParticipationThreshold`] -- Comparison operators for admission thresholds.
+//! - [`RequireParticipation`] -- Participation admission requirement.
+//! - [`ParticipationProfile`] -- Context-hosted signed participation attestation.
 
 pub mod aggregate;
 pub mod attestation;
@@ -95,9 +99,12 @@ pub use custody_violation::{
     ActionCategory, CounterAttestation, CustodyViolationError, CustodyViolationResult,
     CustodyViolationType, ScpCustodyViolationAttestation, classify_action, enforce_category_a,
 };
-pub use participation::ParticipationRecord;
 #[cfg(feature = "testing")]
 pub use participation::compute_participation_record;
+pub use participation::{
+    ParticipationFact, ParticipationProfile, ParticipationRecord, ParticipationThreshold,
+    RequireParticipation,
+};
 pub use renewal::{DefaultRenewalChecker, RenewalChecker, RenewalError, renew_attestation};
 
 // ---------------------------------------------------------------------------
