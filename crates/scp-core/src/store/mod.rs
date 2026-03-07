@@ -18,6 +18,7 @@
 //!
 //! See spec section 17.4 and ADR-006.
 
+pub mod access_keys;
 pub mod context;
 pub mod economy;
 pub mod event_log;
