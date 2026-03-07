@@ -339,7 +339,7 @@ Additional review fixes (81185a1): deny_unknown_fields on 4 sender key wire type
 **Lane A** — #327 (BEP44 sequence persistence) — **COMPLETE** → cc5eff1. #310 (PkarrDhtClient) — **COMPLETE** → 59f18b2 + review fix 04c2281. #311 (DID resolver unification) — **COMPLETE** → 6b2885e + review fix fbf0577
 **Lane B** — #315 (BIP-39 mnemonic) — **COMPLETE** → 7e61bb3. #325 (TOFU + cert pinning) — **COMPLETE** → 225c862 + review fix 1bd9403
 
-### Phase 5: Core Infrastructure (CRITICAL PATH)
+### Phase 5: Core Infrastructure (CRITICAL PATH) — COMPLETE
 
 #356 has been decomposed into 6 sub-issues. #300 is absorbed into #385.
 
@@ -356,10 +356,11 @@ Additional review fixes (81185a1): deny_unknown_fields on 4 sender key wire type
   - Integration fixes → 606cf0d (key_resolver, did_resolver, error variants, missing fields)
   - Closes: #328, #332, #329, #335, #336, #338
   - Partially advances: #306, #307, #369, #370 (context ops fixed; remaining stubs in Phase 9)
-**Step 3:** #390 — E2E integration tests (blocked by #386 at minimum)
-  - Message round-trip, governance, broadcast, persistence — all through FFI
+**Step 3:** #390 — E2E integration tests — **COMPLETE** → 9f22230
+  - 8 E2E tests: message round-trip, governance, broadcast, persistence, lifecycle, multi-bridge API
+  - All through ContextManager pipeline (same API surface as FFI bridges)
 
-Blocking chain: `#385 → (#386 + #387 + #388 + #389 parallel) → #390`
+Blocking chain: `#385 → (#386 + #387 + #388 + #389 parallel) → #390` — **ALL COMPLETE**
 
 ### Phase 6: MLS, Encryption & Content Access (depends on Phase 5)
 
