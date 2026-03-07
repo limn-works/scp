@@ -267,6 +267,24 @@ impl BridgeRegistry {
     pub fn events(&self) -> &[BridgeRegistrationEvent] {
         &self.events
     }
+
+    /// Returns deduplicated operator DIDs for all active bridges.
+    ///
+    /// Used to populate `bridge_operator_dids` in context metadata (§5.7)
+    /// per the MUST requirement in §12.6.1. The result is deduplicated: if
+    /// the same operator runs multiple bridges in this context, their DID
+    /// appears only once. Only active bridges are included — revoked and
+    /// suspended bridges are excluded.
+    #[must_use]
+    pub fn bridge_operator_dids(&self) -> Vec<DID> {
+        let mut dids: Vec<DID> = Vec::new();
+        for bridge in &self.bridges {
+            if bridge.status == BridgeStatus::Active && !dids.contains(&bridge.operator_did) {
+                dids.push(bridge.operator_did.clone());
+            }
+        }
+        dids
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1546,6 +1564,161 @@ mod tests {
         let active = list_active_bridges(&registry);
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].bridge_id, "bridge-002");
+    }
+
+    // -------------------------------------------------------------------
+    // All bridge modes can be registered
+    // -------------------------------------------------------------------
+
+    // -------------------------------------------------------------------
+    // bridge_operator_dids (SCP-BCH-013, §12.6.1)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn bridge_operator_dids_empty_when_no_bridges() {
+        let registry = BridgeRegistry::new(CTX_A.to_owned());
+        assert!(registry.bridge_operator_dids().is_empty());
+    }
+
+    #[test]
+    fn bridge_operator_dids_after_registration() {
+        let mut registry = BridgeRegistry::new(CTX_A.to_owned());
+        register_and_approve(&mut registry, "bridge-001");
+        let dids = registry.bridge_operator_dids();
+        assert_eq!(dids.len(), 1);
+        assert_eq!(dids[0], DID::from(OPERATOR_DID));
+    }
+
+    #[test]
+    fn bridge_operator_dids_removed_after_revocation() {
+        let mut registry = BridgeRegistry::new(CTX_A.to_owned());
+        register_and_approve(&mut registry, "bridge-001");
+
+        let mut shadows = vec![];
+        revoke_bridge(
+            &mut registry,
+            "bridge-001",
+            &DID::from(GOVERNANCE_DID),
+            &mut shadows,
+            1_700_000_002,
+        )
+        .unwrap();
+
+        assert!(registry.bridge_operator_dids().is_empty());
+    }
+
+    #[test]
+    fn bridge_operator_dids_multiple_operators() {
+        let mut registry = BridgeRegistry::new(CTX_A.to_owned());
+        register_and_approve(&mut registry, "bridge-001");
+
+        // Register a second bridge with a different operator.
+        let req = BridgeRegistrationRequest {
+            bridge_id: "bridge-002".to_owned(),
+            operator_did: "did:dht:z6MkOther".into(),
+            platform: "slack".to_owned(),
+            mode: BridgeMode::Api,
+            context_id: CTX_A.to_owned(),
+            requested_at: 1_700_000_000,
+            self_hosted: false,
+        };
+        register_bridge(&mut registry, req).unwrap();
+        approve_registration(
+            &mut registry,
+            "bridge-002",
+            &DID::from(GOVERNANCE_DID),
+            1_700_000_001,
+        )
+        .unwrap();
+
+        let dids = registry.bridge_operator_dids();
+        assert_eq!(dids.len(), 2);
+        assert!(dids.contains(&DID::from(OPERATOR_DID)));
+        assert!(dids.contains(&DID::from("did:dht:z6MkOther")));
+    }
+
+    #[test]
+    fn bridge_operator_dids_deduplicates_same_operator() {
+        let mut registry = BridgeRegistry::new(CTX_A.to_owned());
+
+        // Same operator registers two bridges.
+        register_and_approve(&mut registry, "bridge-001");
+
+        let req = BridgeRegistrationRequest {
+            bridge_id: "bridge-002".to_owned(),
+            operator_did: OPERATOR_DID.into(),
+            platform: "slack".to_owned(),
+            mode: BridgeMode::Api,
+            context_id: CTX_A.to_owned(),
+            requested_at: 1_700_000_000,
+            self_hosted: false,
+        };
+        register_bridge(&mut registry, req).unwrap();
+        approve_registration(
+            &mut registry,
+            "bridge-002",
+            &DID::from(GOVERNANCE_DID),
+            1_700_000_001,
+        )
+        .unwrap();
+
+        // Same operator — should appear only once.
+        let dids = registry.bridge_operator_dids();
+        assert_eq!(dids.len(), 1);
+        assert_eq!(dids[0], DID::from(OPERATOR_DID));
+    }
+
+    #[test]
+    fn bridge_operator_dids_operator_retained_if_other_bridges_active() {
+        let mut registry = BridgeRegistry::new(CTX_A.to_owned());
+
+        // Same operator registers two bridges.
+        register_and_approve(&mut registry, "bridge-001");
+
+        let req = BridgeRegistrationRequest {
+            bridge_id: "bridge-002".to_owned(),
+            operator_did: OPERATOR_DID.into(),
+            platform: "slack".to_owned(),
+            mode: BridgeMode::Api,
+            context_id: CTX_A.to_owned(),
+            requested_at: 1_700_000_000,
+            self_hosted: false,
+        };
+        register_bridge(&mut registry, req).unwrap();
+        approve_registration(
+            &mut registry,
+            "bridge-002",
+            &DID::from(GOVERNANCE_DID),
+            1_700_000_001,
+        )
+        .unwrap();
+
+        // Revoke one bridge — operator still has another active.
+        let mut shadows = vec![];
+        revoke_bridge(
+            &mut registry,
+            "bridge-001",
+            &DID::from(GOVERNANCE_DID),
+            &mut shadows,
+            1_700_000_002,
+        )
+        .unwrap();
+
+        let dids = registry.bridge_operator_dids();
+        assert_eq!(dids.len(), 1);
+        assert_eq!(dids[0], DID::from(OPERATOR_DID));
+
+        // Revoke the second bridge — operator should now be removed.
+        revoke_bridge(
+            &mut registry,
+            "bridge-002",
+            &DID::from(GOVERNANCE_DID),
+            &mut shadows,
+            1_700_000_003,
+        )
+        .unwrap();
+
+        assert!(registry.bridge_operator_dids().is_empty());
     }
 
     // -------------------------------------------------------------------
