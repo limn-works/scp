@@ -754,6 +754,11 @@ pub async fn context_execute_governance_action(
         napi::Error::from_reason("system clock unavailable — cannot create governance proposal")
     })?;
 
+    // Currently all bridge governance actions are auto-approved (SingleAdmin).
+    // Multi-party governance (Threshold/Majority/Unanimity) requires the
+    // propose→vote→execute lifecycle exposed via ContextManager::propose_governance_action,
+    // which needs signing keys for vote signatures. This will be wired when
+    // multi-party governance is exposed through the NAPI bridge (SCP-270).
     let proposal = GovernanceProposal {
         proposal_id,
         context_id: handle.context_id.clone(),
