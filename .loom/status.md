@@ -1,97 +1,84 @@
 # Loom Status — Phase 10 Features
 
 **Branch:** `feat/phase-10-features`
-**Last commit:** `18fa82a` — feat: merge ACR-003 challenge-type unification
+**Last commit:** `941a501e` — chore(loom): iteration 1 checkpoint
 **Date:** 2026-03-07
+**Iteration:** 3
 
 ## Failing Tests
 
-None known — last `cargo check -p scp-core` passed clean (1 pre-existing warning: `create_context_bare` unused).
+Unknown — disk space exhaustion on `/private/tmp` prevented running any tests or git commands.
 
 ## Uncommitted Changes
 
-**4 agent worktrees have uncommitted changes that need extraction:**
+### Stashed changes
+- `git stash list` entry `phase10-iter1-363-partial` — partial #363 (context export/import) work from iteration 1. 276 lines across `context/builder.rs`, `context/manager.rs`, `context/mod.rs`, `context/providers/event_log.rs`. New file `context/export_import.rs` is untracked.
 
-| Agent ID | Story | Worktree Path | Status |
-|----------|-------|---------------|--------|
-| `agent-a8c1f3e3` | SCP-BCH-009 (OAuth 2.0) | `.claude/worktrees/agent-a8c1f3e3/` | New `oauth.rs` + `mod.rs` edit |
-| `agent-adb8502a` | SCP-ACR-004 (capability admission) | `.claude/worktrees/agent-adb8502a/` | Unknown files changed |
-| `agent-a1fe421a` | #365 (device attestation) | `.claude/worktrees/agent-a1fe421a/` | `document.rs` modified |
-| `agent-a7bdfcde` | SCP-BA-006 (participation service) | `.claude/worktrees/agent-a7bdfcde/` | `document.rs` modified |
+### Agent worktrees with committed work (ready to merge)
+| Agent Branch | Story | Commit | Status |
+|---|---|---|---|
+| `worktree-agent-a7df9ffe` | SCP-ACR-005 | `d99f7860` | **COMMITTED** — ready to merge |
 
-**To commit worktree changes:**
-```bash
-for agent in agent-a8c1f3e3 agent-adb8502a agent-a1fe421a agent-a7bdfcde; do
-  WT=".claude/worktrees/$agent"
-  git -C "$WT" add -A
-  git -C "$WT" status
-  git -C "$WT" commit -m "feat: agent work from Phase 10"
-done
-```
+### Agent worktrees with completed but uncommitted work
+| Agent Branch | Story | Status |
+|---|---|---|
+| `worktree-agent-afc4f71d` | SCP-ACR-004 | Hit usage limit. Tests passing (37/37) but no commit. |
+| `worktree-agent-a46ebe8f` | SCP-BCH-004 | Hit usage limit. Clippy error (function too long). No commit. |
+| `worktree-agent-aefbb407` | SCP-BCH-002 | Completed implementation. Commit status unknown (disk full). |
+| `worktree-agent-a663e8f9` | SCP-BA-002 | Completed. 2844 tests passing, clippy clean. Could not commit (disk full). |
 
-Then merge each worktree branch into `feat/phase-10-features`.
+### Iteration 1 worktrees (confirmed 0 commits — work is lost)
+- `worktree-agent-a8c1f3e3` (SCP-BCH-009), `worktree-agent-adb8502a` (SCP-ACR-004), `worktree-agent-a1fe421a` (#365), `worktree-agent-a7bdfcde` (SCP-BA-006) — all 0 commits ahead.
 
 ## Fixed This Iteration
 
-- **trust/mod.rs duplicate re-exports:** Removed stale duplicate `capability_registry` and `capability_uri` re-export block (lines 101-105) left from ACR-003 merge conflict resolution.
-- **AgentCapabilityUri → CapabilityUri:** Updated doc comments referencing old type name.
-
-## Merged This Iteration (from Wave 1)
-
-| Branch | Story/Issue | Commit |
-|--------|-------------|--------|
-| feat/ba-001 | SCP-BA-001 (participation types) | merged |
-| feat/bch-008 | SCP-BCH-008 (credential store) | merged |
-| feat/issue-366 | #366 (jitter config) | merged (conflict: kept 86_400s TTL) |
-| feat/bch-001 | SCP-BCH-001 (HTTP binding) | merged (conflict: lockfile + dup dep) |
-| feat/bch-010 | SCP-BCH-010 (sender key) | merged |
-| feat/bch-013 | SCP-BCH-013 (summary disputes) | merged |
-| feat/acr-003 | SCP-ACR-003 (challenge unification) | 18fa82a |
+Nothing — disk space prevented any merges or test runs.
 
 ## Tests Added / Updated
 
-Tests from merged Wave 1 branches (exact count unknown — pre-merge baseline was 5204).
+None on the main branch. ACR-005 agent added 16 tests (on worktree branch). BA-002 agent added 3 tests (uncommitted in worktree).
 
 ## Outcomes
 
-### Completed (merged into feat/phase-10-features)
-- SCP-BA-001: **PASS** — participation types
-- SCP-BCH-001: **PASS** — HTTP binding
-- SCP-BCH-008: **PASS** — credential store
-- SCP-BCH-010: **PASS** — sender key
-- SCP-BCH-013: **PASS** — summary disputes
-- SCP-ACR-003: **PASS** — challenge-type unification
-- #366: **PASS** — jitter config field
+### Completed (committed in worktrees, not yet merged)
+- **SCP-ACR-005:** PASS — CapabilityEntry uses CapabilityUri type (commit d99f7860)
 
-### Completed (in worktrees, NOT yet merged)
-- SCP-BCH-009: **PASS** — OAuth 2.0 (27 tests, 13 ACs met)
-- SCP-ACR-004: **PASS** — capability admission (2887 tests pass)
-- SCP-BA-006: **PASS** — participation statements service (8 tests)
-- #365: **PASS** — device attestation service entry
+### Completed (work done, not committed — disk full / rate limit)
+- **SCP-BA-002:** PASS — 2844 tests passing, clippy clean, but disk full prevented commit
+- **SCP-BCH-002:** PASS — implementation complete, commit status unknown
+- **SCP-ACR-004:** PARTIAL — tests passing but hit usage limit before commit
+- **SCP-BCH-004:** PARTIAL — hit usage limit, had clippy error (function too long)
 
-### Rate-Limited (no work produced, need re-dispatch)
-- SCP-ACR-005, SCP-BCH-002, SCP-BCH-004, SCP-BCH-011
-- SCP-BA-002, SCP-BA-003, SCP-BA-005
-- #362, #363, #364, #367, SCP-092, SCP-038
-
-### Not Yet Started (Wave 2 blocked items + Waves 3-4)
-- SCP-ACR-006, SCP-ACR-007 (blocked on ACR-005)
-- SCP-BCH-003, BCH-005, BCH-006, BCH-007, BCH-012
-- SCP-BA-004
+### Not Yet Started (Waves 2-6)
+- SCP-BCH-009, BCH-011, BA-003, BA-005, BA-006
+- SCP-ACR-006, ACR-007, #362, #363, #365, #367
+- SCP-BCH-003, BCH-005, BCH-006, BCH-012, #364
+- SCP-BA-004, SCP-038, SCP-092
+- SCP-BCH-007
 
 ## Blockers
 
-1. **Disk full:** `/private/tmp` is full from 17 agent output files. No bash commands work. Clean up: `rm /private/tmp/claude-501/...phase-10.../tasks/*.output`
-2. **Rate limits:** 13 of 17 agents hit API rate limits. Limit to 4-5 parallel agents next run.
-3. **Bash guard hook:** Blocks all commands containing paths with agent worktree directories, even after agents complete. Prevents merging completed worktree changes via git.
+1. **DISK FULL (`/private/tmp` and root filesystem):** CRITICAL. The Bash tool creates output files at `/private/tmp/claude-501/.../tasks/*.output` BEFORE executing any command. When disk is full, ALL bash commands fail — including cleanup commands. This is a chicken-and-egg deadlock. MUST be freed externally before any work can proceed. Agent worktrees with Rust build artifacts are likely the main consumer.
+
+2. **Rate limits:** 2 of 5 Wave 1 agents hit API usage limits.
+
+3. **Bash guard hook:** Blocks access to agent worktree directories.
+
+## Already Completed (merged into feat/phase-10-features)
+- SCP-ACR-001, ACR-002, ACR-003
+- SCP-BA-001
+- SCP-BCH-001, BCH-008, BCH-010, BCH-013
+- #366
 
 ## Next Iteration
 
-1. Clean `/private/tmp` disk space
-2. Commit + merge 4 agent worktrees (BCH-009, ACR-004, BA-006, #365)
-3. Re-dispatch rate-limited stories (max 4-5 at a time): ACR-005, BCH-002, BCH-004, BCH-011, BA-002, BA-003, BA-005, #362, #363, #364, #367, SCP-092, SCP-038
-4. Wave 3: BCH-003, BCH-005, BCH-006, BCH-012, BA-004
-5. Wave 4: BCH-007 (integration)
-6. ACR-006, ACR-007 (after ACR-005)
-7. Full test suite + review cycle
-8. Update exec plan to mark Phase 10 COMPLETE
+1. **PREREQUISITE:** Free disk space externally:
+   - `find /private/tmp -name "*.output" -delete`
+   - Remove agent worktree target/ directories or set shared CARGO_TARGET_DIR
+   - Prune old worktrees: `git worktree prune`
+2. Merge ACR-005 from `worktree-agent-a7df9ffe`
+3. Check BCH-002 (`worktree-agent-aefbb407`) and BA-002 (`worktree-agent-a663e8f9`) for commits
+4. Re-dispatch: ACR-004, BCH-004 (and BCH-002/BA-002 if no commits)
+5. Waves 2-6: 21 remaining stories (limit 3 agents parallel)
+6. Full test suite + review cycle
+7. Update exec plan to mark Phase 10 COMPLETE
