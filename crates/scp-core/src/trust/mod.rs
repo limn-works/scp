@@ -62,6 +62,7 @@
 
 pub mod aggregate;
 pub mod attestation;
+pub mod capability_uri;
 pub mod challenge;
 pub mod consequence;
 pub mod custody_violation;
@@ -83,6 +84,7 @@ pub use attestation::{
 // ParticipationRecord and compute_participation_record are not part of
 // the public API. The module is pub(crate); the testing feature gate
 // re-exports compute_participation_record for integration tests.
+pub use capability_uri::{CapabilityUri, CapabilityUriError};
 pub use challenge::{
     ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,
     VerificationMethod, issue_challenge, verify_challenge_response,
