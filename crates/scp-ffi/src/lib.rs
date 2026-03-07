@@ -51,6 +51,7 @@ pub mod provenance;
 pub mod runtime;
 pub mod tools;
 pub mod transport;
+pub mod trust;
 pub mod types;
 pub mod ucan;
 pub mod validate;
@@ -199,6 +200,7 @@ fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     event_log::register_event_log(m)?;
     provenance::register_provenance(m)?;
     mcp::register_mcp(m)?;
+    trust::register_trust(m)?;
 
     Ok(())
 }

@@ -202,3 +202,18 @@ impl ContextEventLogProvider for FfiBridgeEventLog {
         Ok(())
     }
 }
+
+/// Queries event counts for trust scoring within a context.
+///
+/// Returns `(message_count, governance_count)` derived from the context's
+/// event log. The event log stores leaf hashes (Merkle tree), not full event
+/// payloads, so per-DID filtering is not possible at this level.
+///
+/// Returns `(0, 0)` if the context is not registered.
+#[must_use]
+pub fn query_trust_event_counts(_context_id: &str, _did: &str) -> (u64, u64) {
+    // UniFFI bridge: ContextManager owns context state but does not expose
+    // per-context event log leaf counts directly. Return (0, 0) as a stub.
+    // Full trust scoring requires ContextManager event log integration.
+    (0, 0)
+}

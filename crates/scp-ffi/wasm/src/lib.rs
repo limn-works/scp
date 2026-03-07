@@ -82,6 +82,7 @@ pub mod runtime;
 pub mod storage;
 pub mod tools;
 pub mod transport;
+pub mod trust;
 pub mod ucan;
 
 use wasm_bindgen::prelude::*;

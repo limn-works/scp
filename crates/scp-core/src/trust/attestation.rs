@@ -272,6 +272,63 @@ pub trait DidPublicKeyResolver {
 }
 
 // ---------------------------------------------------------------------------
+// IdentityDidPublicKeyResolver — production implementation
+// ---------------------------------------------------------------------------
+
+/// Production [`DidPublicKeyResolver`] that resolves public keys from DID
+/// strings using `scp-identity`.
+///
+/// For `did:dht:z...` DIDs, extracts the Ed25519 public key embedded in the
+/// DID string itself (the identity key, verification method `#0`).
+///
+/// For `did:key:` DIDs (only accepted when `scp-core/testing` feature is
+/// enabled), decodes the hex-encoded key.
+///
+/// This resolver does NOT perform full DID document resolution (DHT lookup,
+/// relay query, cache check). It extracts the identity key directly from the
+/// DID string, which is sufficient for attestation signature verification
+/// because the identity key (`#0`) is the canonical signing key for
+/// attestations per ADR-017.
+///
+/// For use cases that require resolving the active signing key (`#active`) or
+/// agent key (`#agent`), callers should use the full DID resolution pipeline
+/// in `scp-identity` directly.
+pub struct IdentityDidPublicKeyResolver;
+
+impl DidPublicKeyResolver for IdentityDidPublicKeyResolver {
+    fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
+        // did:dht:z... — extract the 32-byte Ed25519 public key from the
+        // z-base-32-encoded suffix.
+        if did.starts_with("did:dht:z") {
+            let key = scp_identity::extract_public_key(did).map_err(|e| {
+                TrustError::AttestationSignatureInvalid {
+                    attestation_id: String::new(),
+                    reason: format!("failed to extract public key from DID {did}: {e}"),
+                }
+            })?;
+            return Ok(key.to_vec());
+        }
+
+        // did:key:{hex} — testing format only (see issue #128).
+        #[cfg(any(test, feature = "testing"))]
+        if did.starts_with("did:key:") {
+            let hex_str = did.strip_prefix("did:key:").unwrap_or_default();
+            let key_bytes =
+                hex::decode(hex_str).map_err(|e| TrustError::AttestationSignatureInvalid {
+                    attestation_id: String::new(),
+                    reason: format!("failed to decode did:key hex for {did}: {e}"),
+                })?;
+            return Ok(key_bytes);
+        }
+
+        Err(TrustError::AttestationSignatureInvalid {
+            attestation_id: String::new(),
+            reason: format!("unsupported DID method for public key resolution: {did}"),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // verify_attestation
 // ---------------------------------------------------------------------------
 

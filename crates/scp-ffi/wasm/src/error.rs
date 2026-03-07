@@ -34,7 +34,7 @@
 //!
 //! See ADR-022 and `.docs/standards/sdk-common.md` for the full spec.
 
-use wasm_bindgen::JsError;
+use wasm_bindgen::{JsError, JsValue};
 
 // ---------------------------------------------------------------------------
 // ScpWasmError — unified error type for the WASM bridge layer
@@ -127,6 +127,16 @@ impl ScpWasmError {
     #[must_use]
     pub fn into_js(self) -> JsError {
         JsError::new(&self.to_string())
+    }
+
+    /// Creates a `Validation` error with the standard error code.
+    #[must_use]
+    pub fn validation(message: &str) -> JsValue {
+        let err = Self::Validation {
+            message: message.to_owned(),
+            code: "SCP-VALID-7000".to_owned(),
+        };
+        JsValue::from_str(&err.to_string())
     }
 }
 

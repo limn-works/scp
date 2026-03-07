@@ -2987,3 +2987,183 @@ pub fn evaluate_provenance_quality(
 
     Ok(quality as u32)
 }
+
+// ---------------------------------------------------------------------------
+// Trust engine bridge functions (§7 — Four-Layer Trust Evaluation)
+// ---------------------------------------------------------------------------
+
+/// Result of a trust score query.
+///
+/// Contains participation-derived event counts and a normalized composite
+/// score for convenience. The trust engine does not produce authoritative
+/// scores — agents apply their own criteria to these inputs.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TrustScoreResult {
+    /// Number of message events attributed to the DID.
+    pub message_count: u64,
+    /// Number of governance action events attributed to the DID.
+    pub governance_count: u64,
+    /// Normalized composite score (0.0–1.0) based on total participation.
+    pub composite_score: f64,
+}
+
+/// Result of attestation verification.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AttestationVerificationResult {
+    /// Whether the attestation is valid.
+    pub valid: bool,
+    /// Chain depth (1 for a single attestation).
+    pub chain_depth: u32,
+    /// Error message if verification failed, empty string if valid.
+    pub error_message: String,
+}
+
+/// Result of creating a challenge request.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ChallengeResult {
+    /// The unique challenge ID (UUID v4).
+    pub challenge_id: String,
+    /// The serialized challenge request (JSON).
+    pub challenge_json: String,
+}
+
+/// Queries participation-based trust data for a DID within a context.
+///
+/// See ADR-017 Layer 2 (Participation).
+#[uniffi::export]
+pub fn trust_query_score(did: String, context_id: String) -> Result<TrustScoreResult, ScpError> {
+    if did.is_empty() {
+        return Err(ScpError::Validation {
+            message: "DID must not be empty".to_owned(),
+            code: "SCP-VALID-7010".to_owned(),
+        });
+    }
+    if context_id.is_empty() {
+        return Err(ScpError::Validation {
+            message: "context_id must not be empty".to_owned(),
+            code: "SCP-VALID-7011".to_owned(),
+        });
+    }
+
+    // The runtime registry tracks per-context event logs. Event counts are
+    // a best-effort approximation at this layer (Merkle tree stores hashes,
+    // not full events). For per-DID counts, use the full participation
+    // record computation with event objects.
+    let (message_count, governance_count) =
+        crate::runtime::query_trust_event_counts(&context_id, &did);
+
+    let total = message_count + governance_count;
+    #[allow(clippy::cast_precision_loss)]
+    let composite_score = (1.0 + total as f64).log10().min(1.0);
+
+    Ok(TrustScoreResult {
+        message_count,
+        governance_count,
+        composite_score,
+    })
+}
+
+/// Verifies an attestation's Ed25519 signature, evidence, expiry, and
+/// revocation status.
+///
+/// See ADR-017 Layer 3 (Attestation).
+#[uniffi::export]
+pub fn trust_verify_attestation(
+    attestation_json: String,
+) -> Result<AttestationVerificationResult, ScpError> {
+    let attestation: scp_core::trust::Attestation = serde_json::from_str(&attestation_json)
+        .map_err(|e| ScpError::Validation {
+            message: format!("failed to parse attestation JSON: {e}"),
+            code: "SCP-VALID-7012".to_owned(),
+        })?;
+
+    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
+    let clock = scp_identity::cache::SystemClock;
+
+    match scp_core::trust::verify_attestation(&attestation, &resolver, &clock) {
+        Ok(()) => Ok(AttestationVerificationResult {
+            valid: true,
+            chain_depth: 1,
+            error_message: String::new(),
+        }),
+        Err(e) => Ok(AttestationVerificationResult {
+            valid: false,
+            chain_depth: 0,
+            error_message: format!("{e}"),
+        }),
+    }
+}
+
+/// Creates a challenge request for capability verification.
+///
+/// See ADR-017 Layer 3 (Challenge-Response).
+#[uniffi::export]
+pub fn trust_create_challenge(target_did: String) -> Result<ChallengeResult, ScpError> {
+    if target_did.is_empty() {
+        return Err(ScpError::Validation {
+            message: "target DID must not be empty".to_owned(),
+            code: "SCP-VALID-7013".to_owned(),
+        });
+    }
+
+    struct EphemeralSigner(ed25519_dalek::SigningKey);
+    impl scp_core::trust::ChallengeSigner for EphemeralSigner {
+        fn sign(&self, data: &[u8]) -> Result<Vec<u8>, scp_core::trust::TrustError> {
+            use ed25519_dalek::Signer;
+            let sig = self.0.sign(data);
+            Ok(sig.to_bytes().to_vec())
+        }
+    }
+
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let signer = EphemeralSigner(signing_key);
+
+    let request = scp_core::trust::issue_challenge(
+        "did:key:ephemeral-challenger".into(),
+        target_did.into(),
+        scp_core::trust::ChallengeType::SchemaValidation,
+        serde_json::json!({}),
+        std::time::Duration::from_secs(300),
+        &signer,
+    )
+    .map_err(|e| ScpError::Validation {
+        message: format!("challenge creation failed: {e}"),
+        code: "SCP-VALID-7014".to_owned(),
+    })?;
+
+    let challenge_json = serde_json::to_string(&request).map_err(|e| ScpError::Validation {
+        message: format!("failed to serialize challenge: {e}"),
+        code: "SCP-VALID-7015".to_owned(),
+    })?;
+
+    Ok(ChallengeResult {
+        challenge_id: request.challenge_id,
+        challenge_json,
+    })
+}
+
+/// Verifies a challenge response against its original challenge request.
+///
+/// See ADR-017 Layer 3 (Challenge-Response).
+#[uniffi::export]
+pub fn trust_verify_response(
+    challenge_json: String,
+    response_json: String,
+) -> Result<bool, ScpError> {
+    let request: scp_core::trust::ChallengeRequest = serde_json::from_str(&challenge_json)
+        .map_err(|e| ScpError::Validation {
+            message: format!("failed to parse challenge JSON: {e}"),
+            code: "SCP-VALID-7016".to_owned(),
+        })?;
+
+    let response: scp_core::trust::ChallengeResponse = serde_json::from_str(&response_json)
+        .map_err(|e| ScpError::Validation {
+            message: format!("failed to parse response JSON: {e}"),
+            code: "SCP-VALID-7017".to_owned(),
+        })?;
+
+    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
+    let clock = scp_identity::cache::SystemClock;
+
+    Ok(scp_core::trust::verify_challenge_response(&request, &response, &resolver, &clock).is_ok())
+}

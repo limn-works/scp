@@ -198,6 +198,22 @@ pub fn remove_context(context_id: &str) {
     ucan_registry().remove(context_id);
 }
 
+/// Queries event counts for trust scoring within a context.
+///
+/// Returns `(message_count, governance_count)` derived from the context's
+/// event log. Returns `(0, 0)` if the context is not registered.
+#[must_use]
+pub fn query_trust_event_counts(context_id: &str, _did: &str) -> (u64, u64) {
+    let map = ucan_registry();
+    match map.get(context_id) {
+        Some(entry) => {
+            let total = entry.event_log.leaves().len() as u64;
+            (total, 0)
+        }
+        None => (0, 0),
+    }
+}
+
 /// Registers a test context in the UCAN state registry.
 #[cfg(test)]
 pub fn register_test_context(context_id: &str, creator_did: &str) {

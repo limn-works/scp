@@ -74,6 +74,7 @@ pub mod provenance;
 pub mod runtime;
 pub mod tools;
 pub mod transport;
+pub mod trust;
 pub mod ucan;
 
 // ---------------------------------------------------------------------------

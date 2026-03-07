@@ -77,8 +77,8 @@ use scp_identity::DID;
 // Re-export all public types from submodules.
 pub use attestation::{
     Attestation, AttestationEvidence, AttestorInfo, DidPublicKeyResolver, FreshnessStatus,
-    RevocationStatus, ThresholdRequirement, ThresholdResult, check_attestation_freshness,
-    check_threshold_attestation, verify_attestation,
+    IdentityDidPublicKeyResolver, RevocationStatus, ThresholdRequirement, ThresholdResult,
+    check_attestation_freshness, check_threshold_attestation, verify_attestation,
 };
 // ParticipationRecord and compute_participation_record are not part of
 // the public API. The module is pub(crate); the testing feature gate

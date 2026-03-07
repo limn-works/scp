@@ -1068,6 +1068,39 @@ pub fn registry_stats() -> Result<RegistryStats, ScpPyError> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Trust engine helpers
+// ---------------------------------------------------------------------------
+
+/// Queries event counts for trust scoring within a context.
+///
+/// Returns `(message_count, governance_count)` derived from the context's
+/// event log. The event log stores leaf hashes (Merkle tree), not full event
+/// payloads, so per-DID filtering is not possible at this level. The returned
+/// counts represent total context-level event counts.
+///
+/// For per-DID behavioral data, use the full participation record computation
+/// in `scp-core::trust::participation::compute_participation_record` with
+/// the actual event objects.
+///
+/// Returns `(0, 0)` if the context is not registered.
+#[must_use]
+pub fn query_trust_event_counts(context_id: &str, _did: &str) -> (u64, u64) {
+    let map = ffi_state_registry();
+    match map.get(context_id) {
+        Some(entry) => {
+            let total = entry.event_log.leaves().len() as u64;
+            // The event log records all event types as leaf hashes without
+            // type discrimination. We report total events as message_count
+            // and 0 governance_count as a best-effort approximation. For
+            // precise per-type counts, callers should use the full
+            // participation record computation with event objects.
+            (total, 0)
+        }
+        None => (0, 0),
+    }
+}
+
 /// Removes an identity from the global registry.
 ///
 /// Returns `true` if the identity was present and removed, `false` if not found.

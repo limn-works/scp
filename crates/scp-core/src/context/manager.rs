@@ -4250,6 +4250,82 @@ impl ContextManager {
             ctx.ttl_timer.task = Some(task);
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Trust engine integration (§7 — Four-Layer Trust Evaluation)
+    // -----------------------------------------------------------------------
+
+    /// Verifies an attestation chain (Layer 3) using the production DID
+    /// public key resolver.
+    ///
+    /// Delegates to [`crate::trust::verify_attestation`] with
+    /// [`crate::trust::IdentityDidPublicKeyResolver`] for key resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError`] wrapping the underlying [`TrustError`] if
+    /// signature verification, expiry checks, or revocation checks fail.
+    pub fn verify_attestation(
+        &self,
+        attestation: &crate::trust::Attestation,
+    ) -> Result<(), ContextError> {
+        let resolver = crate::trust::IdentityDidPublicKeyResolver;
+        let clock = scp_identity::cache::SystemClock;
+        crate::trust::verify_attestation(attestation, &resolver, &clock).map_err(|e| {
+            ContextError::PermissionDenied(format!("attestation verification failed: {e}"))
+        })
+    }
+
+    /// Issues a challenge request (Layer 3 — Challenge-Response) using the
+    /// production DID resolver.
+    ///
+    /// Delegates to [`crate::trust::issue_challenge`] to construct and sign
+    /// a challenge request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError`] if signing fails.
+    pub fn create_challenge(
+        &self,
+        challenger_did: &DID,
+        subject_did: &DID,
+        challenge_type: crate::trust::ChallengeType,
+        params: serde_json::Value,
+        timeout: std::time::Duration,
+        signer: &impl crate::trust::ChallengeSigner,
+    ) -> Result<crate::trust::ChallengeRequest, ContextError> {
+        crate::trust::issue_challenge(
+            challenger_did.clone(),
+            subject_did.clone(),
+            challenge_type,
+            params,
+            timeout,
+            signer,
+        )
+        .map_err(|e| ContextError::PermissionDenied(format!("challenge creation failed: {e}")))
+    }
+
+    /// Verifies a challenge response (Layer 3 — Challenge-Response) using the
+    /// production DID resolver.
+    ///
+    /// Delegates to [`crate::trust::verify_challenge_response`] with
+    /// [`crate::trust::IdentityDidPublicKeyResolver`] for key resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError`] wrapping the underlying [`TrustError`] if
+    /// verification fails.
+    pub fn verify_challenge_response(
+        &self,
+        request: &crate::trust::ChallengeRequest,
+        response: &crate::trust::ChallengeResponse,
+    ) -> Result<crate::trust::ChallengeVerification, ContextError> {
+        let resolver = crate::trust::IdentityDidPublicKeyResolver;
+        let clock = scp_identity::cache::SystemClock;
+        crate::trust::verify_challenge_response(request, response, &resolver, &clock).map_err(|e| {
+            ContextError::PermissionDenied(format!("challenge verification failed: {e}"))
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

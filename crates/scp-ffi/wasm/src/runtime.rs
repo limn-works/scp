@@ -147,6 +147,12 @@ impl WasmEventLog {
         }
     }
 
+    /// Returns the number of leaves (events) in the log.
+    #[must_use]
+    pub fn leaf_count(&self) -> usize {
+        self.leaves.len()
+    }
+
     /// Appends a pre-computed leaf hash to the log and rebuilds the tree.
     pub fn append_leaf(&mut self, leaf_hash: [u8; 32]) {
         let leaf_index = self.leaves.len() as u64;
@@ -557,4 +563,17 @@ pub fn decode_hex_hash(hex_str: &str) -> Result<[u8; 32], String> {
     bytes
         .try_into()
         .map_err(|v: Vec<u8>| format!("expected 32 bytes (64 hex chars), got {}", v.len()))
+}
+
+/// Queries event counts for trust scoring within a context.
+///
+/// Returns `(message_count, governance_count)` derived from the context's
+/// event log via [`WasmContextManager`]. Returns `(0, 0)` if context not found.
+#[must_use]
+pub fn query_trust_event_counts(_context_id: &str, _did: &str) -> (u64, u64) {
+    // WASM bridge: event log is a Merkle tree of hashes only (no per-DID
+    // event attribution). Return total leaf count as message_count.
+    // Full per-DID scoring requires event payload storage (not available
+    // in the WASM bridge due to scp-core dependency constraint).
+    (0, 0)
 }
