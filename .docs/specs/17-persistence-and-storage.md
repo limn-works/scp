@@ -40,21 +40,23 @@ Three approaches were considered:
 
 The thin trait approach was chosen. Adapters are dumb storage. The protocol is smart.
 
-## 17.2 Storage Trait Evolution
+## 17.2 Storage Trait
 
-The existing `Storage` trait (ADR-006) provides four methods: `store`, `retrieve`, `delete`, `list_keys`. Two additions are required for the protocol's actual access patterns:
+The `Storage` trait (ADR-006, `scp-platform/src/traits.rs`) provides six async methods operating on `(key: &str, data: &[u8])` pairs:
 
 ```rust
-/// scp-platform/src/trait.rs (additions to existing Storage trait)
-
 pub trait Storage: Send + Sync {
-    // Existing methods (ADR-006):
+    /// Store a byte slice under the given key. Overwrites any existing value.
     async fn store(&self, key: &str, data: &[u8]) -> Result<(), PlatformError>;
-    async fn retrieve(&self, key: &str) -> Result<Option<Vec<u8>>, PlatformError>;
-    async fn delete(&self, key: &str) -> Result<(), PlatformError>;
-    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, PlatformError>;
 
-    // New methods:
+    /// Retrieve the byte slice stored under the given key. Returns None if absent.
+    async fn retrieve(&self, key: &str) -> Result<Option<Vec<u8>>, PlatformError>;
+
+    /// Delete the value stored under the given key. No-op if absent.
+    async fn delete(&self, key: &str) -> Result<(), PlatformError>;
+
+    /// List all keys matching a prefix, in lexicographic order.
+    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, PlatformError>;
 
     /// Delete all keys matching a prefix. Returns the count of keys deleted.
     /// Atomic: either all matching keys are deleted or none are (on error).

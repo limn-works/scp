@@ -250,22 +250,26 @@ SCP doesn't implement MCP, WebMCP, or UCP. It wraps them with identity, trust, a
 
 ### 2.1 Crate Structure (Rust)
 
+The workspace contains 12 crates under `crates/`. `scp-identity` and `scp-event-log` were extracted from `scp-core` into standalone Layer 1 crates (issues #93, #94). `scp-primitives` was extracted as a Layer 0 leaf crate (issue #233).
+
 ```
 scp/
 ├── crates/
 │   ├── scp-core/              # Protocol engine — the heart
 │   │   ├── context/           # Context lifecycle, membership, roles, governance
-│   │   ├── identity/          # DID operations, key management
 │   │   ├── trust/             # 4-layer trust evaluation, behavioral records
 │   │   ├── discovery/         # Tool-interface discovery (§6.2.2)
 │   │   ├── crypto/            # MLS wrapper, UCAN wrapper, Merkle trees
 │   │   ├── envelope/          # SCP envelope creation, parsing, validation
 │   │   ├── provenance/        # Data provenance tagging
-│   │   ├── event_log/         # Append-only verifiable log
 │   │   └── store/             # ProtocolStore — typed domain storage (§17.4)
 │   │
+│   ├── scp-identity/          # DID operations, key management (extracted from scp-core, Layer 1)
+│   │
+│   ├── scp-event-log/         # Append-only verifiable log (extracted from scp-core, Layer 1)
+│   │
 │   ├── scp-transport/         # Transport abstraction + adapters
-│   │   ├── traits.rs          # TransportAdapter trait (5 methods)
+│   │   ├── traits.rs          # TransportAdapter trait (5 methods: send, subscribe, unsubscribe, query, delete)
 │   │   ├── config.rs          # TransportConfig, CoverTrafficTier, CoverTrafficConfig
 │   │   ├── profile.rs         # TransportProfile enum, platform inference (§10.13)
 │   │   ├── pool.rs            # ConnectionPool keyed by (relay_url, transport_type)
@@ -311,12 +315,6 @@ scp/
 │   │   ├── server.rs          # SCP agent as MCP server
 │   │   └── client.rs          # SCP agent as MCP client (consuming tools)
 │   │
-│   ├── scp-bridge/            # Bridge adapters
-│   │   ├── trait.rs           # BridgeAdapter trait
-│   │   ├── x/                 # X/Twitter bridge
-│   │   ├── bluesky/           # Bluesky/AT Protocol bridge
-│   │   └── shadow.rs          # Shadow identity management
-│   │
 │   ├── scp-testing/            # Network simulation test harness (§16, dev-dependency)
 │   │   ├── clock.rs           # SimulatedClock (manual time control)
 │   │   ├── relay/             # InMemoryRelay, BlobStore, BehaviorMode, SubscriptionRegistry
@@ -339,18 +337,9 @@ scp/
 │   ├── scp-media/             # Real-time media transport types (§10.9)
 │   │   └── lib.rs             # WebRTC signaling types, MLS key export for DTLS-SRTP
 │   │
-│   ├── scp-ffi/               # Foreign function interface layer
-│   │   ├── uniffi/            # UniFFI definitions → Swift, Kotlin
-│   │   └── pyo3/              # PyO3 definitions → Python
-│   │
-│   ├── scp-ffi-cbindgen/      # C ABI bridge (cbindgen) → Go, C#, Java
-│   │
-│   ├── scp-ffi-wasm/          # WebAssembly bridge (wasm-bindgen) → browser TypeScript
-│   │
-│   ├── scp-ffi-napi/          # Node.js bridge (napi-rs) → Node TypeScript
-│   │
-│   └── scp-cli/               # CLI tool for testing/development
-│       └── main.rs
+│   └── scp-ffi/               # Foreign function interface layer
+│       ├── uniffi/            # UniFFI definitions → Swift, Kotlin
+│       └── pyo3/              # PyO3 definitions → Python
 │
 ├── bindings/
 │   ├── python/                # Python package (scp-sdk)
@@ -615,51 +604,50 @@ State:
 
 ### 2.3 Dependency Graph
 
+12-crate workspace. Dependencies flow strictly upward (Layer 0 → 1 → 2 → 3 → 4).
+
 ```
-                    scp-cli
-                      │
-                      ▼
-              ┌── scp-ffi ──┐
-              │   (PyO3 +   │
+              ┌── scp-ffi ──┐                           Layer 3
+              │  (PyO3 +    │
               │   UniFFI)   │
               └──────┬──────┘
                      │
                      ▼
-               scp-core ◄─────────── scp-mcp
-              ╱    │    ╲
-             ╱     │     ╲
-            ▼      ▼      ▼
-    scp-transport  │  scp-bridge
-            │      │      │
-            ▼      ▼      ▼
-         scp-platform (traits)
-              │
-              ▼
-     platform implementations
-     (testing/) — production adapters live in bindings/{swift,kotlin}/
+               scp-core ◄─────────── scp-mcp            Layer 1-2
+              ╱    │    ╲               │
+             ╱     │     ╲              │
+            ▼      ▼      ▼            ▼
+  scp-transport  scp-identity   scp-event-log           Layer 1-2
+            │         │              │
+            ▼         ▼              ▼
+         scp-primitives    scp-platform (traits)         Layer 0
+                                │
+                                ▼
+                       platform implementations
+                       (testing/) — production in bindings/{swift,kotlin}/
 
-   scp-node (§18.6 — application deployment)
+   scp-node (§18.6 — application deployment)            Layer 3
         │
         ├──► scp-core
         ├──► scp-transport
         └──► scp-platform
 
-   scp-relay (standalone binary)
+   scp-relay (standalone binary)                         Layer 3
         │
         └──► scp-transport
 
-   scp-media (real-time media types, §10.9)
+   scp-media (real-time media types, §10.9)              Layer 2
         │
         └──► scp-core
 
-   scp-testing (dev-dependency, §16)
+   scp-testing (dev-dependency, §16)                     Layer 4
         │
         ├──► scp-core
         ├──► scp-transport
         └──► scp-platform
 ```
 
-Build order follows the dependency graph bottom-up: platform traits → transport → core → FFI → bindings.
+Build order follows the dependency graph bottom-up: scp-primitives + scp-platform → scp-identity + scp-event-log → scp-core → scp-transport + scp-mcp + scp-media → scp-ffi + scp-node + scp-relay → bindings.
 
 `scp-testing` is a dev-dependency only — it depends on core, transport, and platform but is never imported by production code. It provides the network simulation harness (InMemoryRelay, InMemoryTransport, SimulatedClock, ScenarioBuilder), trait conformance test macros, and distributed assertion utilities. See `.docs/specs/16-test-infrastructure.md` for the full specification.
 
@@ -697,17 +685,19 @@ Layer 0 ─ scp-primitives            Pure utility crate (time, encoding, hashin
            │                          DeviceAttestation, Push).
            │                          Zero SCP dependencies — leaf crates.
            │
-Layer 1 ─ scp-core                  Protocol engine. Contexts, identity, trust, discovery,
-           │                          crypto, event log, store, envelope, provenance, economy.
-           │                          Depends on scp-primitives and scp-platform.
+Layer 1 ─ scp-core                  Protocol engine. Contexts, trust, discovery, crypto,
+           │                          store, envelope, provenance, economy.
+           │  scp-identity             DID operations, key management (extracted from scp-core, #93).
+           │  scp-event-log            Append-only verifiable log (extracted from scp-core, #94).
+           │                          All depend on scp-primitives and scp-platform.
            │
 Layer 2 ─ scp-transport             Transport abstraction + native relay adapter.
            │  scp-mcp                 MCP bridge (server + client).
            │  scp-media               Media session handling.
-           │                          All depend on scp-core (and transitively layers 0).
+           │                          All depend on scp-core (and transitively layers 0-1).
            │
 Layer 3 ─ scp-node                  Application deployment node (AGPL boundary).
-           │  scp-ffi                 Language bindings (PyO3, UniFFI, wasm-bindgen, napi-rs).
+           │  scp-ffi                 Language bindings (PyO3, UniFFI).
            │  scp-relay               Standalone relay binary.
            │                          Depend on layers 0-2 as needed.
            │
@@ -716,8 +706,6 @@ Layer 4 ─ scp-testing               Dev-dependency only. Network simulation ha
                                       Depends on scp-core, scp-transport, scp-platform.
                                       Never imported by production code.
 ```
-
-**Completed extractions:** `scp-identity` and `scp-event-log` have been extracted from `scp-core` into standalone Layer 1 crates (issues #93, #94). `scp-primitives` was extracted as a Layer 0 leaf crate housing shared utilities (time, encoding, hashing) that previously lived in `scp-core` (issue #233).
 
 #### 2.5.2 Replaceable Subsystems
 
@@ -1248,7 +1236,7 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 | did:dht library gaps | Medium | Medium | did:dht is the primary method. If libraries hit a wall, did:web is the contingency fallback (not a planned path). SDK abstracts the DID method so the fallback is transparent to apps. |
 | WASM limitations | Low | Medium | Browser WASM can't access Secure Enclave. Web SDK uses WebCrypto (software keys). Acceptable for web; native is stronger. |
 | Transport adapter availability | Low | Low | SCP native relay is canonical and purpose-built. Multiple adapter options (Nostr, Hyperswarm, libp2p, Matrix, etc.) provide redundancy. No single-transport dependency. |
-| MLS group state sync (offline) | High | High | Offline members accumulate pending proposals. Extended offline (days) may require group state reset. This is the hardest unsolved problem. |
+| MLS group state sync (offline) | — | — | **Resolved.** ADR-029 (`.docs/adrs/phase-6.md`) specifies the three-tier offline strategy: Tier 1 (hours — relay buffering + MLS catch-up), Tier 2 (days — state snapshot + delta sync), Tier 3 (weeks — forced re-join with group state reset). Implemented in `crates/scp-core/src/sync/`. |
 
 ---
 
