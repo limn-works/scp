@@ -762,7 +762,12 @@ mod tests {
             0x1A, 0x99, 0xF4, 0x3B, 0xFB, 0x98, 0x8B, 0x9B, 0x7A, 0x02, 0xDD, 0x21,
         ];
 
-        let kek = AccessKey::from_parts(kek_bytes, "ctx-test".to_owned(), "did:dht:test".to_owned(), 0);
+        let kek = AccessKey::from_parts(
+            kek_bytes,
+            "ctx-test".to_owned(),
+            "did:dht:test".to_owned(),
+            0,
+        );
         let cek = ContentEncryptionKey::from_bytes(key_data);
 
         let wrapped = wrap_cek(&cek, &kek).unwrap();

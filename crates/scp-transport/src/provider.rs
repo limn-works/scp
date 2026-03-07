@@ -119,7 +119,9 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
         let adapter = Arc::clone(&self.adapter);
 
         let result = tokio::task::block_in_place(|| {
-            let guard = adapter.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let guard = adapter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             tokio::runtime::Handle::current().block_on(guard.send(&envelope))
         });
 
@@ -135,7 +137,9 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
         let adapter = Arc::clone(&self.adapter);
 
         let result = tokio::task::block_in_place(|| {
-            let guard = adapter.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let guard = adapter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             tokio::runtime::Handle::current().block_on(guard.delete(&blob_id))
         });
 
@@ -160,7 +164,9 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
         let adapter = Arc::clone(&self.adapter);
 
         let result = tokio::task::block_in_place(|| {
-            let guard = adapter.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let guard = adapter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             tokio::runtime::Handle::current().block_on(guard.send(&envelope))
         });
 

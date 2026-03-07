@@ -1,48 +1,48 @@
 # Loom Status
 
 ## Failing Tests
-None. All 568 transport tests pass. Workspace compiles.
+None known — no code merged yet this iteration.
 
 ## Uncommitted Changes
-None.
+None on orchestrator branch. 5 subagents working in worktrees (see below).
 
 ## Fixed This Iteration
-- #343 (Nostr + WebRTC transport adapters) — commit 298666cd
-- #344 (Artifact Health Report) — commit 7f45bcb1
-- Phase 12 marked COMPLETE — commit 3af47f67
+N/A — iteration in progress, no merges yet.
 
 ## Tests Added / Updated
-- 20 new unit tests in nostr/protocol.rs (event ID, message serialization/parsing)
-- 6 new unit tests in nostr/adapter.rs (adapter creation, subscription IDs, event structure, deletion, base64, config)
-- 10 new unit tests in webrtc/signaling.rs (ICE config, signaling serialization)
-- 8 new unit tests in webrtc/adapter.rs (creation, SDP exchange, delete not supported, query empty, config defaults, SDP offer, unsubscribe, channel creation)
+N/A — subagents are writing tests in their worktrees but haven't completed yet.
 
 ## Work Summary
 
-### Phase 12 Issue Status — ALL COMPLETE
+### Phase 9 SDK Bindings — Wave 1 Dispatched
 
-| Issue | Status | Evidence |
-|-------|--------|----------|
-| #291 (stub policy violations) | COMPLETE | Commit b3014487. Zero `todo!`/`unimplemented!` violations. |
-| #301 (dev API hardcoded zeros) | COMPLETE | Closed on GitHub (commit cf3cc06, Phase 1). |
-| #303 (event log query) | COMPLETE | Commit 273ce70d. All 5 ProtocolStore methods verified. |
-| #343 (Nostr + WebRTC adapters) | COMPLETE | Commit 298666cd. Nostr adapter (3 files), WebRTC adapter (3 files), 12 PRD stories (SCP-275 through SCP-286). |
-| #344 (Artifact Health Report) | COMPLETE | Commit 7f45bcb1. All 11 findings resolved (S-1 through S-7, M-1, M-2, Q-1, Q-2). |
+5 parallel subagents launched in worktree isolation. All are actively reading code, editing files, and implementing their assigned work:
 
-### This Iteration (iteration 11)
-- Implemented Nostr transport adapter: NostrAdapter with protocol types, all 5 TransportAdapter methods, feature-gated via `nostr`
-- Implemented WebRTC transport adapter: WebRtcAdapter with signaling types, all 5 TransportAdapter methods, feature-gated via `webrtc`
-- Filed 12 Tier 2 adapter PRD stories (SCP-275 through SCP-286) in transport-expansion.json gate-transport-6
-- Resolved all 11 artifact health findings in .docs/ files
-- Marked Phase 12 COMPLETE in execution plan with commit hashes
+| Lane | Subagent | Task | Status |
+|------|----------|------|--------|
+| F | agent-a5c71063 | #304 — Remove Go/Java/C# scaffolding | IN PROGRESS — editing .docs/scaffold/shared.md, .docs/prds/main.json, removing bindings |
+| A | agent-ad003127 | #306 + SCP-218 — WASM bridge wiring (tools, UCAN, event log, identity, TS adapter) | IN PROGRESS — rewriting tools.rs, event_log.rs with WASM-local implementations |
+| B | agent-a126c791 | #307 + SCP-220 — UniFFI + NAPI bridge wiring (tools, UCAN, event log, transport) | IN PROGRESS — updating runtime.rs with ToolRegistry+ContextRoleState, wiring context_create |
+| C | agent-a3db4061 | SCP-214 — KeyCustodyProvider wiring across all FFI bridges | IN PROGRESS — found InMemoryKeyCustody bug already fixed, wiring routing ID derivation in UniFFI/NAPI |
+| G | agent-ad0f24fe | SCP-116 — Kotlin Flow/Channel streaming layer | IN PROGRESS — adding searchResults() to ColdStreamFactory, writing multi-collector and backpressure tests |
+
+### Waves 2-3 Pending
+
+Blocked by Wave 1 completion:
+- **Wave 2:** SCP-221 (Swift SDK wrappers), #341 (TypeScript SDK), SCP-117 (Android lifecycle)
+- **Wave 3:** #322 (cross-context tool interfaces), #331 (Swift Trust/MCP), SCP-118 (Compose state holders), SCP-120 (Kotlin conformance tests)
+
+### Lane E (SCP-215)
+Already done (status: done in PRD). No work needed.
 
 ## Review Outcomes
-Pre-commit verification:
-- `cargo check -p scp-transport --features nostr,webrtc` — clean
-- `cargo clippy -p scp-transport --features nostr,webrtc` — zero errors, warnings are all pre-existing (significant_drop_tightening nursery false positives)
-- `cargo test -p scp-transport --features nostr,webrtc` — 568 tests pass
-- `cargo fmt --all` — clean
-- `python3.12 scripts/validate-prd.py` — 12 files, 348 stories, passed
+Review not yet applicable — no code merged this iteration.
 
 ## Next Iteration
-Phase 12 is COMPLETE. No further work in scope. This loom session can be closed.
+1. Wait for Wave 1 subagents to complete (or re-dispatch any that hit limits)
+2. Merge Wave 1 worktree branches, resolve conflicts
+3. Run full test suite
+4. Launch Wave 2 subagents
+5. Repeat merge/test/launch for Wave 3
+6. Run review cycle on complete Phase 9 diff
+7. Update .docs/prod-readiness-exec-plan.md to mark Phase 9 progress

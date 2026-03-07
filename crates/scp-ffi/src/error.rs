@@ -431,9 +431,7 @@ impl From<scp_event_log::EventLogError> for ScpPyError {
 impl From<scp_core::provenance::ProvenanceError> for ScpPyError {
     fn from(e: scp_core::provenance::ProvenanceError) -> Self {
         Self::ValidationError {
-            message: format!(
-                "provenance validation failed: {e} — check cross-context chain depth"
-            ),
+            message: format!("provenance validation failed: {e} — check cross-context chain depth"),
             code: "SCP-VALID-7002".to_owned(),
         }
     }
@@ -457,9 +455,7 @@ impl From<scp_core::trust::TrustError> for ScpPyError {
 impl From<scp_core::uri::ScpUriError> for ScpPyError {
     fn from(e: scp_core::uri::ScpUriError) -> Self {
         Self::ValidationError {
-            message: format!(
-                "invalid SCP URI: {e} — check URI format (scp://relay/context-id)"
-            ),
+            message: format!("invalid SCP URI: {e} — check URI format (scp://relay/context-id)"),
             code: "SCP-VALID-7004".to_owned(),
         }
     }
@@ -470,9 +466,7 @@ impl From<scp_core::uri::ScpUriError> for ScpPyError {
 impl From<scp_core::well_known::WellKnownValidationError> for ScpPyError {
     fn from(e: scp_core::well_known::WellKnownValidationError) -> Self {
         Self::ValidationError {
-            message: format!(
-                "well-known validation failed: {e} — check relay configuration"
-            ),
+            message: format!("well-known validation failed: {e} — check relay configuration"),
             code: "SCP-VALID-7005".to_owned(),
         }
     }
@@ -546,9 +540,7 @@ impl From<scp_platform::PlatformError> for ScpPyError {
 impl From<serde_json::Error> for ScpPyError {
     fn from(e: serde_json::Error) -> Self {
         Self::ValidationError {
-            message: format!(
-                "JSON serialization/deserialization failed: {e} — check input format"
-            ),
+            message: format!("JSON serialization/deserialization failed: {e} — check input format"),
             code: "SCP-VALID-7006".to_owned(),
         }
     }

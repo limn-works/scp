@@ -317,7 +317,11 @@ pub async fn ucan_mint(
     // Get ceiling from the context handle for mint-time enforcement (#339).
     // Empty ceiling means unrestricted — pass None, not Some(empty_set).
     let ceiling_strings: std::collections::HashSet<String> = handle.ceiling().into_iter().collect();
-    let ceiling = if ceiling_strings.is_empty() { None } else { Some(ceiling_strings) };
+    let ceiling = if ceiling_strings.is_empty() {
+        None
+    } else {
+        Some(ceiling_strings)
+    };
 
     let params = MintParams {
         issuer_did: &creator_did,

@@ -617,7 +617,6 @@ impl GovernanceEngine for ThresholdEngine {
             proposal_id: *proposal_id,
             status: ProposalStatus::Invalidated { reason },
         }])
-
     }
 }
 
@@ -1661,7 +1660,8 @@ mod tests {
     #[test]
     fn threshold_set_economic_policy() {
         let signers = vec![alice(), bob()];
-        let mut engine = ThresholdEngine::new(signers, 2, 86_400, mock_resolver()).expect("valid config");
+        let mut engine =
+            ThresholdEngine::new(signers, 2, 86_400, mock_resolver()).expect("valid config");
         let ctx = test_context_at(1_700_000_000);
 
         let action = GovernanceAction::SetEconomicPolicy {
@@ -1688,7 +1688,8 @@ mod tests {
     #[test]
     fn threshold_approve_spend() {
         let signers = vec![alice(), bob()];
-        let mut engine = ThresholdEngine::new(signers, 2, 86_400, mock_resolver()).expect("valid config");
+        let mut engine =
+            ThresholdEngine::new(signers, 2, 86_400, mock_resolver()).expect("valid config");
         let ctx = test_context_at(1_700_000_000);
 
         let action = GovernanceAction::ApproveSpend {
@@ -1704,7 +1705,8 @@ mod tests {
     #[test]
     fn threshold_lock_economic_policy() {
         let signers = vec![alice(), bob()];
-        let mut engine = ThresholdEngine::new(signers, 2, 86_400, mock_resolver()).expect("valid config");
+        let mut engine =
+            ThresholdEngine::new(signers, 2, 86_400, mock_resolver()).expect("valid config");
         let ctx = test_context_at(1_700_000_000);
 
         let action = GovernanceAction::LockEconomicPolicy;
