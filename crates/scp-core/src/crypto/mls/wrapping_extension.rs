@@ -439,8 +439,8 @@ mod tests {
     async fn sender_key_request_response_with_wrapping_key() {
         use crate::crypto::sender_keys::generate_sender_key;
         use crate::crypto::sender_keys::key_protocol::{
-            handle_sender_key_request, open_sender_key_response, request_sender_key,
-            HandleRequestParams, NonceDedup,
+            HandleRequestParams, NonceDedup, handle_sender_key_request, open_sender_key_response,
+            request_sender_key,
         };
         use scp_platform::testing::InMemoryKeyCustody;
         use scp_platform::traits::{KeyCustody, KeyType};
@@ -473,6 +473,7 @@ mod tests {
             bob_pubkey.as_bytes(),
             &HandleRequestParams {
                 sender_key: &sender_key,
+                context_id: "ctx-roundtrip",
                 sender_did: "did:dht:alice",
                 epoch: 1,
                 block_list: &block_list,
@@ -489,10 +490,14 @@ mod tests {
             rmp_serde::from_slice(&response_bytes).unwrap();
 
         // Bob decrypts the response using his ephemeral wrapping key handle.
-        let recovered =
-            open_sender_key_response(&custody, &request_result.wrapping_key_handle, &response)
-                .await
-                .unwrap();
+        let recovered = open_sender_key_response(
+            &custody,
+            &request_result.wrapping_key_handle,
+            "ctx-roundtrip",
+            &response,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             recovered.as_bytes(),
@@ -508,8 +513,8 @@ mod tests {
     async fn tampered_wrapping_key_prevents_decryption() {
         use crate::crypto::sender_keys::generate_sender_key;
         use crate::crypto::sender_keys::key_protocol::{
-            generate_wrapping_keypair, handle_sender_key_request, request_sender_key,
-            HandleRequestParams, NonceDedup,
+            HandleRequestParams, NonceDedup, generate_wrapping_keypair, handle_sender_key_request,
+            request_sender_key,
         };
         use scp_platform::testing::InMemoryKeyCustody;
         use scp_platform::traits::{KeyCustody, KeyType};
@@ -544,6 +549,7 @@ mod tests {
             bob_pubkey.as_bytes(),
             &HandleRequestParams {
                 sender_key: &sender_key,
+                context_id: "ctx-roundtrip",
                 sender_did: "did:dht:alice",
                 epoch: 1,
                 block_list: &block_list,
