@@ -373,7 +373,9 @@ Blocking chain: `#385 → (#386 + #387 + #388 + #389 parallel) → #390` — **A
 Then content access PRD (serial — same subsystem, depends on #309):
 SCP-CAC-001 — **COMPLETE** → 7d56fdf
 SCP-CAC-004 — **COMPLETE** → 8c38383
-SCP-CAC-002 → SCP-CAC-003 → SCP-CAC-005 → SCP-CAC-006 → SCP-CAC-007 → SCP-CAC-008 → SCP-CAC-009 → SCP-CAC-010
+SCP-CAC-002 — **COMPLETE** → 586e025
+SCP-CAC-005 — **COMPLETE** → 7ede865
+SCP-CAC-003 → SCP-CAC-006 → SCP-CAC-007 → SCP-CAC-008 → SCP-CAC-009 → SCP-CAC-010
 
 ### Phase 7: Governance Integration (depends on Phase 2 + Phase 5)
 
@@ -384,6 +386,7 @@ SCP-267 → SCP-268 → SCP-269 → SCP-270 → SCP-271 → SCP-272 → SCP-273 
 - SCP-268 — **COMPLETE** → 3df2cd7
 - SCP-269 — **COMPLETE** → a758149
 - SCP-270 — **COMPLETE** → 6a5cea5
+- SCP-271 — **COMPLETE** → 6ae5dc2
 - SCP-267–268 need #356 (ContextManager wiring)
 - SCP-269–270 need #320 (GovernanceModel enum expansion + proposal lifecycle — all 24 actions already dispatched per PR #296)
 - SCP-272 needs #354 (conflict detection)
@@ -409,7 +412,7 @@ SCP-267 → SCP-268 → SCP-269 → SCP-270 → SCP-271 → SCP-272 → SCP-273 
 
 ### Phase 10: New Features (partially blocked by spec)
 
-**Lane A:** SCP-ACR-001 — **COMPLETE** → ad83cef. SCP-ACR-002–007 remaining (capability registry)
+**Lane A:** SCP-ACR-001 — **COMPLETE** → ad83cef. SCP-ACR-002 — **COMPLETE** → 5b26f18. SCP-ACR-003–007 remaining
 **Lane B:** SCP-BCH-001–013 (bridge cooperative + credentials + sender key encryption) — **BLOCKED by S-D** (bridge MLS model)
 **Lane C:** SCP-BA-001–006 (participation admission) — **soft-blocked by S-A** (canonical serialization for profiles)
 **Lane D:** #362, #363, #364, #365, #366, #367
