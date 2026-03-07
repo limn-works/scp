@@ -152,10 +152,11 @@ Context metadata (§5.7) MUST include a `BridgeMetadata` entry in the `bridges` 
 
 A malicious bridge operator can:
 
-1. **Fabricate shadow messages** — attribute content to platform users who did not produce it. Mitigated by `BridgeProvenance` (§12.5) which makes bridge attribution visible.
-2. **Selectively drop messages** — suppress platform-to-SCP or SCP-to-platform delivery. Detectable via the platform's own delivery confirmation mechanisms.
-3. **Correlate activity** — observe which platform users correspond to which shadow identities across contexts it operates in. Mitigated by separate bridge registrations per context (§12.6).
-4. **Inject false attestations** — claim platform identity verification that did not occur. Mitigated by attestation freshness checks (§7.4.4) and governance-level bridge revocation (§12.2).
+1. **Read all MLS-encrypted messages in the context** — the bridge operator is an MLS group member (§12.6.1) and can decrypt all messages. This is an inherent property of bidirectional bridging, not mitigated — it is why bridge admission is a governance decision.
+2. **Fabricate shadow messages** — attribute content to platform users who did not produce it. Mitigated by `BridgeProvenance` (§12.5) which makes bridge attribution visible.
+3. **Selectively drop messages** — suppress platform-to-SCP or SCP-to-platform delivery. Detectable via the platform's own delivery confirmation mechanisms.
+4. **Correlate activity** — observe which platform users correspond to which shadow identities across contexts it operates in. Mitigated by separate bridge registrations per context (§12.6).
+5. **Inject false attestations** — claim platform identity verification that did not occur. Mitigated by attestation freshness checks (§7.4.4) and governance-level bridge revocation (§12.2).
 
 A malicious bridge operator **cannot**:
 
