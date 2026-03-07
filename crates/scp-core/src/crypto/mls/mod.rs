@@ -33,15 +33,22 @@ pub mod key_package;
 pub mod provider;
 pub mod ratchet;
 pub mod storage;
+pub mod wrapping_extension;
 
 // Re-export primary public API types for convenience.
 pub use credential::ScpCredential;
 pub use error::MlsError;
 pub use group::{
     AddMemberResult, RemoveMemberResult, SCP_CIPHERSUITE, ScpMlsGroup, add_member, create_group,
-    destroy_group, generate_key_package, join_group, remove_member,
+    create_group_with_wrapping_key, destroy_group, generate_key_package,
+    generate_key_package_with_wrapping_key, join_group, remove_member,
 };
 pub use provider::MlsCryptoProvider;
 pub use storage::{
     InMemoryMlsProvider, MlsStorageBridge, MlsStorageBridgeError, ScpMlsProvider, new_provider,
+};
+pub use wrapping_extension::{
+    SCP_WRAPPING_KEY_EXTENSION_TYPE, extract_member_wrapping_key, extract_own_wrapping_key,
+    extract_wrapping_key, find_leaf_index_by_did, leaf_node_params_with_wrapping_key,
+    make_wrapping_key_extension, scp_capabilities_with_wrapping_key,
 };

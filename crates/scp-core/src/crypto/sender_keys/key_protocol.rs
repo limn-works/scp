@@ -38,6 +38,31 @@ use crate::identity::SigningKeyId;
 use crate::serde_util::{serde_hpke_sealed_60, serde_pubkey_32, serde_signature_64};
 
 // ---------------------------------------------------------------------------
+// Wrapping keypair generation (§9.16.1)
+// ---------------------------------------------------------------------------
+
+/// Generates a stable X25519 wrapping keypair for sender key distribution.
+///
+/// Each member maintains one keypair per context, published as the
+/// `scp_wrapping_key` MLS `LeafNode` extension. The keypair is used for HPKE
+/// wrapping of sender key distributions (§9.16.2) and remains stable across
+/// MLS epoch advances, rotating only on identity key rotation (§9.12) or
+/// suspected compromise.
+///
+/// Returns `(public_key, secret_key)` as raw 32-byte arrays. The secret key
+/// should be persisted via `ProtocolStore::store_wrapping_keypair` and the
+/// public key included in the `LeafNode` extension via `make_wrapping_key_extension`.
+///
+/// See spec §9.16.1.
+#[must_use]
+pub fn generate_wrapping_keypair() -> ([u8; 32], [u8; 32]) {
+    use x25519_dalek::StaticSecret;
+    let secret = StaticSecret::random_from_rng(OsRng);
+    let public = X25519Pub::from(&secret);
+    (public.to_bytes(), secret.to_bytes())
+}
+
+// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 

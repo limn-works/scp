@@ -28,6 +28,7 @@ pub mod tofu;
 pub mod tools;
 pub mod transport;
 pub mod ucan;
+pub mod wrapping_key;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use zeroize::Zeroize;

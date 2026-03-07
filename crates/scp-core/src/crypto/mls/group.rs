@@ -237,6 +237,34 @@ impl ScpMlsGroup {
 ///
 /// See ADR-001 acceptance criterion 1.
 pub fn create_group(credential: &ScpCredential) -> Result<ScpMlsGroup, MlsError> {
+    create_group_with_wrapping_key(credential, None)
+}
+
+/// Creates a new MLS group with the creator as the sole member, optionally
+/// including an `scp_wrapping_key` `LeafNode` extension.
+///
+/// When `wrapping_pubkey` is `Some`, the creator's `LeafNode` includes the
+/// `scp_wrapping_key` extension with the given 32-byte X25519 public key.
+/// This allows other members to read the wrapping key from the MLS tree
+/// for sender key distribution (§9.16.1).
+///
+/// # Arguments
+///
+/// * `credential` - The creator's SCP credential (DID + optional UCAN).
+/// * `wrapping_pubkey` - Optional 32-byte X25519 public key for the
+///   `scp_wrapping_key` `LeafNode` extension.
+///
+/// # Errors
+///
+/// Returns [`MlsError::CredentialSerializationFailed`] if the credential
+/// cannot be serialized. Returns [`MlsError::GroupCreationFailed`] if
+/// `OpenMLS` group creation fails.
+///
+/// See ADR-001 acceptance criterion 1, spec §9.16.1.
+pub fn create_group_with_wrapping_key(
+    credential: &ScpCredential,
+    wrapping_pubkey: Option<&[u8; 32]>,
+) -> Result<ScpMlsGroup, MlsError> {
     let provider = InMemoryMlsProvider::default();
 
     // Generate an Ed25519 signing key pair for the creator.
@@ -271,11 +299,26 @@ pub fn create_group(credential: &ScpCredential) -> Result<ScpMlsGroup, MlsError>
     // margin. The EpochGraceStore enforces the 30-second time bound at the SCP
     // layer, so retention is bounded by both count (2) and time (30s).
     // See issue #324.
-    let group_create_config = MlsGroupCreateConfig::builder()
+    let mut builder = MlsGroupCreateConfig::builder()
         .ciphersuite(SCP_CIPHERSUITE)
         .use_ratchet_tree_extension(true)
-        .max_past_epochs(2)
-        .build();
+        .max_past_epochs(2);
+
+    // If a wrapping key is provided, declare the extension type in
+    // capabilities and include the wrapping key in the LeafNode extensions.
+    if let Some(pubkey) = wrapping_pubkey {
+        let caps = super::wrapping_extension::scp_capabilities_with_wrapping_key();
+        builder = builder.capabilities(caps);
+
+        let ext = super::wrapping_extension::make_wrapping_key_extension(pubkey);
+        let leaf_extensions = Extensions::<LeafNode>::single(ext)
+            .map_err(|e| MlsError::GroupCreationFailed(format!("wrapping key extension: {e}")))?;
+        builder = builder
+            .with_leaf_node_extensions(leaf_extensions)
+            .map_err(|e| MlsError::GroupCreationFailed(format!("leaf node extensions: {e}")))?;
+    }
+
+    let group_create_config = builder.build();
 
     // Create the MLS group with the creator as the sole member.
     let group = MlsGroup::new(
@@ -501,6 +544,33 @@ pub fn destroy_group(group: &mut ScpMlsGroup) -> Result<(), MlsError> {
 pub fn generate_key_package(
     credential: &ScpCredential,
 ) -> Result<(KeyPackageBundle, SignatureKeyPair, InMemoryMlsProvider), MlsError> {
+    generate_key_package_with_wrapping_key(credential, None)
+}
+
+/// Generates a `KeyPackage` with an optional `scp_wrapping_key` `LeafNode`
+/// extension.
+///
+/// When `wrapping_pubkey` is `Some`, the generated `KeyPackage`'s `LeafNode`
+/// includes the `scp_wrapping_key` extension with the given 32-byte X25519
+/// public key. This publishes the wrapping key so that other members can
+/// read it from the MLS tree for sender key distribution (§9.16.1).
+///
+/// # Arguments
+///
+/// * `credential` - The participant's SCP credential (DID + optional UCAN).
+/// * `wrapping_pubkey` - Optional 32-byte X25519 public key for the
+///   `scp_wrapping_key` `LeafNode` extension.
+///
+/// # Errors
+///
+/// Returns [`MlsError::CredentialSerializationFailed`] if the credential
+/// cannot be serialized.
+/// Returns [`MlsError::KeyPackageGenerationFailed`] if key package
+/// generation fails.
+pub fn generate_key_package_with_wrapping_key(
+    credential: &ScpCredential,
+    wrapping_pubkey: Option<&[u8; 32]>,
+) -> Result<(KeyPackageBundle, SignatureKeyPair, InMemoryMlsProvider), MlsError> {
     let provider = InMemoryMlsProvider::default();
 
     let signer = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm())
@@ -517,7 +587,20 @@ pub fn generate_key_package(
         signature_key: signer.to_public_vec().into(),
     };
 
-    let key_package_bundle = KeyPackage::builder()
+    let mut builder = KeyPackage::builder();
+
+    if let Some(pubkey) = wrapping_pubkey {
+        let caps = super::wrapping_extension::scp_capabilities_with_wrapping_key();
+        builder = builder.leaf_node_capabilities(caps);
+
+        let ext = super::wrapping_extension::make_wrapping_key_extension(pubkey);
+        let leaf_extensions = Extensions::<LeafNode>::single(ext).map_err(|e| {
+            MlsError::KeyPackageGenerationFailed(format!("wrapping key extension: {e}"))
+        })?;
+        builder = builder.leaf_node_extensions(leaf_extensions);
+    }
+
+    let key_package_bundle = builder
         .build(SCP_CIPHERSUITE, &provider, &signer, credential_with_key)
         .map_err(|e| MlsError::KeyPackageGenerationFailed(e.to_string()))?;
 

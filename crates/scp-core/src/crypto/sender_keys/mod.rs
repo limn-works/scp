@@ -39,9 +39,9 @@ pub use encrypt::{decrypt_sender_layer, encrypt_sender_layer};
 pub use key_protocol::{
     BlockNotification, HandleRequestParams, NonceDedup, RotateForBlockParams, RotateForBlockResult,
     SenderKeyEpochAdvance, SenderKeyRequest, SenderKeyRequestResult, SenderKeyResponse,
-    expand_block_list, handle_sender_key_request, open_sender_key_response,
-    publish_sender_key_epoch_advance, request_sender_key, rotate_sender_key_for_block,
-    send_block_notification, validate_block_notification_freshness,
+    expand_block_list, generate_wrapping_keypair, handle_sender_key_request,
+    open_sender_key_response, publish_sender_key_epoch_advance, request_sender_key,
+    rotate_sender_key_for_block, send_block_notification, validate_block_notification_freshness,
     validate_sender_key_request_freshness, verify_block_notification, verify_epoch_advance,
     verify_sender_key_request,
 };

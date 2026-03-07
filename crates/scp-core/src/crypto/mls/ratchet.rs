@@ -143,6 +143,54 @@ pub fn propose_update(group: &mut ScpMlsGroup) -> Result<MlsMessageOut, MlsError
     Ok(commit)
 }
 
+/// Issues an MLS Update proposal that preserves the `scp_wrapping_key`
+/// `LeafNode` extension, immediately committing it.
+///
+/// This is the production-path variant of [`propose_update`] that ensures
+/// the wrapping key remains stable across MLS epoch advances, as required
+/// by §9.16.1. The wrapping key does NOT rotate on MLS Updates — only on
+/// identity key rotation (§9.12) or suspected compromise.
+///
+/// # Arguments
+///
+/// * `group` - The MLS group to update within. Must be active.
+/// * `wrapping_pubkey` - The 32-byte X25519 public key to include in the
+///   `scp_wrapping_key` `LeafNode` extension. Must be the same key that was
+///   originally published at context join time, unless this is an identity
+///   key rotation.
+///
+/// # Errors
+///
+/// Returns [`MlsError::GroupDestroyed`] if the group has been destroyed.
+/// Returns [`MlsError::UpdateFailed`] if the Update proposal or Commit
+/// generation fails.
+/// Returns [`MlsError::MergePendingCommitFailed`] if merging the pending
+/// commit fails.
+///
+/// See spec §9.16.1, ADR-001 acceptance criterion 7.
+pub fn propose_update_with_wrapping_key(
+    group: &mut ScpMlsGroup,
+    wrapping_pubkey: &[u8; 32],
+) -> Result<MlsMessageOut, MlsError> {
+    let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
+
+    let leaf_params =
+        super::wrapping_extension::leaf_node_params_with_wrapping_key(wrapping_pubkey)?;
+
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+    let bundle = g
+        .self_update(&group.provider, signer, leaf_params)
+        .map_err(|e| MlsError::UpdateFailed(e.to_string()))?;
+
+    let commit = bundle.into_commit();
+
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+    g.merge_pending_commit(&group.provider)
+        .map_err(|e| MlsError::MergePendingCommitFailed(e.to_string()))?;
+
+    Ok(commit)
+}
+
 /// Serializes an [`MlsMessageOut`] to bytes for transmission.
 ///
 /// Convenience function for converting Commit messages from [`propose_update`]
