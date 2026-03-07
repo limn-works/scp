@@ -24,11 +24,12 @@
 //!
 //! # AAD Binding (Security)
 //!
-//! The `author_did` and `key_epoch` fields in [`BroadcastEnvelope`] are cleartext
-//! metadata that must be authenticated by the AEAD tag. Both [`seal_broadcast`]
-//! and [`open_broadcast`] bind these fields as Additional Authenticated Data
-//! (AAD) in the AES-256-GCM construction using a length-prefixed binary format:
-//! `[4-byte DID length (BE)][DID bytes][8-byte epoch (BE)]`.
+//! The `context_id`, `author_did`, `key_epoch`, and `sequence` fields in
+//! [`BroadcastEnvelope`] are cleartext metadata that must be authenticated by
+//! the AEAD tag. Both [`seal_broadcast`] and [`open_broadcast`] bind these
+//! fields as Additional Authenticated Data (AAD) in the AES-256-GCM
+//! construction using a length-prefixed binary format:
+//! `[4-byte context_id len (BE)][context_id bytes][4-byte DID len (BE)][DID bytes][8-byte epoch (BE)][8-byte sequence (BE)]`.
 //! This prevents attribution forgery by context members who possess the
 //! broadcast key (issue #228, cryptographer review finding 1, RED-210).
 //!
@@ -145,12 +146,14 @@ pub struct BroadcastKeyEpochAdvance {
 /// Encrypted broadcast message envelope per §5.14.5.
 ///
 /// Contains AES-256-GCM encrypted content along with all 8 spec-defined fields
-/// (minus `content_hash` per ADR-038). The `encrypted_content` field uses the
-/// same wire format as [`encrypt_sender_layer`]: `nonce (12 bytes) || ciphertext || tag (16 bytes)`.
+/// (minus `content_hash` per ADR-038). The `nonce` field holds the 12-byte
+/// AES-256-GCM nonce separately from `encrypted_content` (which contains only
+/// `ciphertext || tag`), per §5.14.5.
 ///
-/// The `author_did` and `key_epoch` fields are authenticated via AES-256-GCM
-/// AAD binding (length-prefixed binary format). Tampering with either field
-/// causes AEAD tag verification to fail on decryption. See issue #228.
+/// The `context_id`, `author_did`, `key_epoch`, and `sequence` fields are
+/// authenticated via AES-256-GCM AAD binding (length-prefixed binary format).
+/// Tampering with any of these fields causes AEAD tag verification to fail on
+/// decryption. See issue #228, #396.
 ///
 /// The `signature` field is an Ed25519 signature over the canonical hash
 /// `SHA-256("SCP-BROADCAST-ENVELOPE-V1:" || len(context_id) || context_id || len(author_did) || author_did || sequence || timestamp || key_epoch)`.
@@ -177,10 +180,29 @@ pub struct BroadcastEnvelope {
     /// with fields: `context_id`, `author_did`, `sequence`, `timestamp`, `key_epoch`.
     #[serde(with = "crate::serde_util::serde_signature_64")]
     pub signature: [u8; 64],
-    /// AES-256-GCM encrypted payload: `nonce || ciphertext || auth_tag`.
+    /// AES-256-GCM nonce (12 bytes), stored as a top-level field per §5.14.5.
+    #[serde(with = "serde_nonce")]
+    pub nonce: [u8; 12],
+    /// AES-256-GCM encrypted payload: `ciphertext || auth_tag`.
     /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
     #[serde(with = "crate::serde_util::serde_bounded_bytes")]
     pub encrypted_content: Vec<u8>,
+}
+
+/// Serde module for `[u8; 12]` nonce fields.
+mod serde_nonce {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(data: &[u8; 12], serializer: S) -> Result<S::Ok, S::Error> {
+        data.as_slice().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 12], D::Error> {
+        let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
+        bytes.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!("expected 12-byte nonce, got {} bytes", v.len()))
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -259,24 +281,35 @@ pub fn rotate_broadcast_key(
 /// Constructs the Additional Authenticated Data (AAD) for `BroadcastEnvelope`
 /// AES-256-GCM operations.
 ///
-/// Format: length-prefixed binary — `[4-byte DID length (BE)][DID bytes][8-byte epoch (BE)]`.
-/// This binds the cleartext metadata fields to the AEAD tag, preventing
-/// attribution forgery and epoch substitution by context members who possess
-/// the broadcast key. Both [`seal_broadcast`] and [`open_broadcast`] use this
-/// identical construction.
+/// Format: length-prefixed binary —
+/// `[4-byte context_id len (BE)][context_id bytes][4-byte DID len (BE)][DID bytes][8-byte epoch (BE)][8-byte sequence (BE)]`.
+///
+/// This binds all cleartext metadata fields to the AEAD tag, preventing
+/// attribution forgery, epoch substitution, context confusion, and sequence
+/// manipulation by context members who possess the broadcast key. Both
+/// [`seal_broadcast`] and [`open_broadcast`] use this identical construction.
 ///
 /// The binary format is canonically parseable by construction. The previous
 /// colon-delimited string format (`"{did}:{epoch}"`) was ambiguous because
 /// DIDs themselves contain colons (e.g., `did:dht:abc`, `did:web:host:path`).
 ///
-/// See issue #228, cryptographer review finding 1, RED-210.
-#[allow(clippy::cast_possible_truncation)] // DID strings are always < 4 GiB
-fn build_broadcast_aad(author_did: &str, key_epoch: u64) -> Vec<u8> {
+/// See issue #228, #396, cryptographer review finding 1, RED-210.
+#[allow(clippy::cast_possible_truncation)] // String lengths are always < 4 GiB
+fn build_broadcast_aad(
+    context_id: &str,
+    author_did: &str,
+    key_epoch: u64,
+    sequence: u64,
+) -> Vec<u8> {
+    let ctx_bytes = context_id.as_bytes();
     let did_bytes = author_did.as_bytes();
-    let mut aad = Vec::with_capacity(4 + did_bytes.len() + 8);
+    let mut aad = Vec::with_capacity(4 + ctx_bytes.len() + 4 + did_bytes.len() + 8 + 8);
+    aad.extend_from_slice(&(ctx_bytes.len() as u32).to_be_bytes());
+    aad.extend_from_slice(ctx_bytes);
     aad.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
     aad.extend_from_slice(did_bytes);
     aad.extend_from_slice(&key_epoch.to_be_bytes());
+    aad.extend_from_slice(&sequence.to_be_bytes());
     aad
 }
 
@@ -334,13 +367,15 @@ fn build_signing_payload(
 /// Encrypts a payload with the author's broadcast key and packages it into a
 /// [`BroadcastEnvelope`].
 ///
-/// Uses AES-256-GCM with a random 12-byte nonce per invocation. The wire
-/// format matches [`encrypt_sender_layer`]: `nonce (12 bytes) || ciphertext || auth_tag (16 bytes)`.
+/// Uses AES-256-GCM with a random 12-byte nonce per invocation. The nonce is
+/// stored as a top-level field in the envelope (per §5.14.5), and
+/// `encrypted_content` contains only `ciphertext || auth_tag`.
 ///
-/// The `author_did` and `key_epoch` from the broadcast key are bound as
+/// The `context_id`, `author_did`, `key_epoch`, and `sequence` are bound as
 /// Additional Authenticated Data (AAD) in the AES-256-GCM construction.
 /// This cryptographically authenticates the cleartext metadata fields,
-/// preventing attribution forgery. See issue #228.
+/// preventing attribution forgery and context/sequence confusion. See issue
+/// #228, #396.
 ///
 /// The envelope is signed with the author's Ed25519 key over the canonical
 /// concatenation of metadata fields. The signature is verified BEFORE
@@ -370,8 +405,13 @@ pub fn seal_broadcast(
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let aad = build_broadcast_aad(&key.author_did, key.epoch);
-    let ciphertext = cipher
+    let aad = build_broadcast_aad(
+        params.context_id,
+        &key.author_did,
+        key.epoch,
+        params.sequence,
+    );
+    let encrypted_content = cipher
         .encrypt(
             nonce,
             Payload {
@@ -380,10 +420,6 @@ pub fn seal_broadcast(
             },
         )
         .map_err(|e| SenderKeyError::EncryptionFailed(e.to_string()))?;
-
-    let mut encrypted_content = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
-    encrypted_content.extend_from_slice(&nonce_bytes);
-    encrypted_content.extend_from_slice(&ciphertext);
 
     // Sign over canonical field concatenation.
     let signing_payload = build_signing_payload(
@@ -406,6 +442,7 @@ pub fn seal_broadcast(
         key_epoch: key.epoch,
         provenance: params.provenance.clone(),
         signature: signature.to_bytes(),
+        nonce: nonce_bytes,
         encrypted_content,
     })
 }
@@ -426,25 +463,22 @@ fn decrypt_envelope(
         });
     }
 
-    if envelope.encrypted_content.len() < NONCE_SIZE {
-        return Err(SenderKeyError::CiphertextTooShort {
-            actual: envelope.encrypted_content.len(),
-            minimum: NONCE_SIZE,
-        });
-    }
-
-    let (nonce_bytes, encrypted) = envelope.encrypted_content.split_at(NONCE_SIZE);
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::from_slice(&envelope.nonce);
 
     let cipher = Aes256Gcm::new_from_slice(key.key.as_bytes())
         .map_err(|e| SenderKeyError::EncryptionFailed(e.to_string()))?;
 
-    let aad = build_broadcast_aad(&envelope.author_did, envelope.key_epoch);
+    let aad = build_broadcast_aad(
+        &envelope.context_id,
+        &envelope.author_did,
+        envelope.key_epoch,
+        envelope.sequence,
+    );
     cipher
         .decrypt(
             nonce,
             Payload {
-                msg: encrypted,
+                msg: &envelope.encrypted_content,
                 aad: &aad,
             },
         )
@@ -827,9 +861,8 @@ mod tests {
         let key = generate_broadcast_key("did:dht:alice");
         let mut envelope = test_seal(&key, b"tamper test");
 
-        let tamper_idx = NONCE_SIZE + 1;
-        if tamper_idx < envelope.encrypted_content.len() {
-            envelope.encrypted_content[tamper_idx] ^= 0xFF;
+        if !envelope.encrypted_content.is_empty() {
+            envelope.encrypted_content[0] ^= 0xFF;
         }
 
         let result = test_open(&key, &envelope);
@@ -837,7 +870,9 @@ mod tests {
     }
 
     #[test]
-    fn open_with_too_short_ciphertext_fails() {
+    fn open_with_empty_ciphertext_fails() {
+        // With nonce as a separate field, encrypted_content can be empty
+        // but decryption will still fail due to AEAD tag verification.
         let key = generate_broadcast_key("did:dht:alice");
         let envelope = BroadcastEnvelope {
             context_id: "test-ctx".to_owned(),
@@ -847,27 +882,21 @@ mod tests {
             key_epoch: 0,
             provenance: None,
             signature: [0u8; 64],
-            encrypted_content: vec![0u8; 5],
+            nonce: [0u8; 12],
+            encrypted_content: vec![],
         };
         let result = test_open(&key, &envelope);
-        assert!(matches!(
-            result,
-            Err(SenderKeyError::CiphertextTooShort {
-                actual: 5,
-                minimum: 12
-            })
-        ));
+        assert!(matches!(result, Err(SenderKeyError::AuthenticationFailed)));
     }
 
     #[test]
-    fn seal_produces_nonce_plus_ciphertext_plus_tag() {
+    fn seal_produces_ciphertext_plus_tag() {
         let key = generate_broadcast_key("did:dht:alice");
         let plaintext = b"size check";
         let envelope = test_seal(&key, plaintext);
-        assert_eq!(
-            envelope.encrypted_content.len(),
-            NONCE_SIZE + plaintext.len() + 16
-        );
+        // Nonce is now a separate field; encrypted_content = ciphertext + 16-byte tag.
+        assert_eq!(envelope.nonce.len(), NONCE_SIZE);
+        assert_eq!(envelope.encrypted_content.len(), plaintext.len() + 16);
     }
 
     #[test]
@@ -956,6 +985,40 @@ mod tests {
     }
 
     #[test]
+    fn open_with_tampered_context_id_fails() {
+        // Seal with context "test-ctx", then forge the envelope's context_id.
+        // The AAD mismatch must cause AEAD tag verification to fail.
+        let key = generate_broadcast_key("did:dht:alice");
+        let mut forged_envelope = test_seal(&key, b"context check");
+
+        // Forge: change context_id in the envelope.
+        forged_envelope.context_id = "wrong-ctx".to_owned();
+
+        let result = test_open(&key, &forged_envelope);
+        assert!(
+            matches!(result, Err(SenderKeyError::AuthenticationFailed)),
+            "tampered context_id must cause AEAD failure, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn open_with_tampered_sequence_fails() {
+        // Seal with sequence 1, then forge the envelope's sequence.
+        // The AAD mismatch must cause AEAD tag verification to fail.
+        let key = generate_broadcast_key("did:dht:alice");
+        let mut forged_envelope = test_seal(&key, b"sequence check");
+
+        // Forge: change sequence in the envelope.
+        forged_envelope.sequence = 999;
+
+        let result = test_open(&key, &forged_envelope);
+        assert!(
+            matches!(result, Err(SenderKeyError::AuthenticationFailed)),
+            "tampered sequence must cause AEAD failure, got {result:?}"
+        );
+    }
+
+    #[test]
     fn open_with_both_author_and_epoch_tampered_fails() {
         // Seal as Alice at epoch 0, forge to Bob at epoch 3.
         let key_alice = generate_broadcast_key("did:dht:alice");
@@ -980,40 +1043,56 @@ mod tests {
     fn aad_binding_verified_on_build_broadcast_aad() {
         // Verify the AAD construction is deterministic and uses the
         // length-prefixed binary format:
-        //   [4-byte DID length (BE)][DID bytes][8-byte epoch (BE)]
-        let aad = build_broadcast_aad("did:dht:alice", 42);
+        //   [4-byte ctx_id len (BE)][ctx_id bytes][4-byte DID len (BE)][DID bytes][8-byte epoch (BE)][8-byte sequence (BE)]
+        let aad = build_broadcast_aad("test-ctx", "did:dht:alice", 42, 7);
+        let ctx_bytes = b"test-ctx";
         let did_bytes = b"did:dht:alice";
         let mut expected = Vec::new();
+        expected.extend_from_slice(&(ctx_bytes.len() as u32).to_be_bytes());
+        expected.extend_from_slice(ctx_bytes);
         expected.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
         expected.extend_from_slice(did_bytes);
         expected.extend_from_slice(&42_u64.to_be_bytes());
+        expected.extend_from_slice(&7_u64.to_be_bytes());
         assert_eq!(aad, expected);
 
-        let aad_zero = build_broadcast_aad("did:dht:bob", 0);
+        let aad_zero = build_broadcast_aad("ctx-0", "did:dht:bob", 0, 0);
+        let ctx_bytes_0 = b"ctx-0";
         let did_bytes_bob = b"did:dht:bob";
         let mut expected_zero = Vec::new();
+        expected_zero.extend_from_slice(&(ctx_bytes_0.len() as u32).to_be_bytes());
+        expected_zero.extend_from_slice(ctx_bytes_0);
         expected_zero.extend_from_slice(&(did_bytes_bob.len() as u32).to_be_bytes());
         expected_zero.extend_from_slice(did_bytes_bob);
         expected_zero.extend_from_slice(&0_u64.to_be_bytes());
+        expected_zero.extend_from_slice(&0_u64.to_be_bytes());
         assert_eq!(aad_zero, expected_zero);
 
-        let aad_max = build_broadcast_aad("did:dht:charlie", u64::MAX);
+        let aad_max = build_broadcast_aad("ctx-max", "did:dht:charlie", u64::MAX, u64::MAX);
+        let ctx_bytes_max = b"ctx-max";
         let did_bytes_charlie = b"did:dht:charlie";
         let mut expected_max = Vec::new();
+        expected_max.extend_from_slice(&(ctx_bytes_max.len() as u32).to_be_bytes());
+        expected_max.extend_from_slice(ctx_bytes_max);
         expected_max.extend_from_slice(&(did_bytes_charlie.len() as u32).to_be_bytes());
         expected_max.extend_from_slice(did_bytes_charlie);
+        expected_max.extend_from_slice(&u64::MAX.to_be_bytes());
         expected_max.extend_from_slice(&u64::MAX.to_be_bytes());
         assert_eq!(aad_max, expected_max);
     }
 
     #[test]
-    fn aad_empty_author_did_produces_correct_binary_layout() {
-        // Empty DID: 4-byte zero length prefix + no DID bytes + 8-byte epoch.
-        let aad = build_broadcast_aad("", 42);
+    fn aad_empty_fields_produces_correct_binary_layout() {
+        // Empty context_id and DID: 4-byte zero length + 4-byte zero length + 8-byte epoch + 8-byte sequence.
+        let aad = build_broadcast_aad("", "", 42, 1);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&0_u32.to_be_bytes()); // context_id len
+        expected.extend_from_slice(&0_u32.to_be_bytes()); // did len
+        expected.extend_from_slice(&42_u64.to_be_bytes()); // epoch
+        expected.extend_from_slice(&1_u64.to_be_bytes()); // sequence
         assert_eq!(
-            aad,
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 42],
-            "empty DID must produce [4-byte zero length][8-byte epoch BE]"
+            aad, expected,
+            "empty context_id + DID must produce [4-byte zero len][4-byte zero len][8-byte epoch BE][8-byte sequence BE]"
         );
     }
 
@@ -1122,15 +1201,29 @@ mod tests {
         // raw serde_bytes (no bound) so we can create the oversized payload.
         #[derive(serde::Serialize)]
         struct UnboundedEnvelope {
+            context_id: String,
             author_did: String,
+            sequence: u64,
+            timestamp: u64,
             key_epoch: u64,
+            provenance: Option<()>,
+            #[serde(with = "crate::serde_util::serde_signature_64")]
+            signature: [u8; 64],
+            #[serde(with = "super::serde_nonce")]
+            nonce: [u8; 12],
             #[serde(with = "serde_bytes")]
             encrypted_content: Vec<u8>,
         }
 
         let oversized = UnboundedEnvelope {
+            context_id: "ctx-test".to_owned(),
             author_did: "did:dht:test".to_owned(),
+            sequence: 0,
+            timestamp: 0,
             key_epoch: 0,
+            provenance: None,
+            signature: [0u8; 64],
+            nonce: [0u8; 12],
             encrypted_content: vec![0xAB; BOUNDED_BYTES_MAX + 1],
         };
 
