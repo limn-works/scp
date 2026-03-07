@@ -73,6 +73,45 @@ The ceiling policy is visible in context metadata (§5.7) before opt-in. A prosp
 
 **Economic policy is orthogonal to capability ceiling.** Ceiling governs what CAN happen; economic policy (§19.3) governs what it COSTS. Economic policy is not a ceiling category — it does not restrict or expand what actions are available, only what they cost.
 
+### 5.3.1 Exhaustive Capability Categories
+
+The following is the complete enumeration of capability categories available for context ceiling declarations. These are the ONLY valid values in a ceiling array. SDKs MUST reject unrecognized capability categories at context creation time.
+
+| Category | Description | Gated by |
+|----------|-------------|----------|
+| `messagesRead` | Read messages in the context | Role permission |
+| `messagesWrite` | Send messages to the context | Role permission |
+| `toolRegister` | Register new tools in the context | Role permission |
+| `toolInvokeAll` | Invoke any registered tool | Role permission |
+| `toolInvoke:{tool_id}` | Invoke a specific tool (parameterized) | Role permission |
+| `memberInvite` | Invite new members to the context | Role permission |
+| `memberRemove` | Remove members from the context | Role permission + governance |
+| `memberBan` | Ban members (revoke read access) | Role permission + governance |
+| `roleAssign` | Assign or change member roles | Role permission + governance |
+| `media.voice` | Real-time voice communication (§10.9.1) | Role permission |
+| `media.video` | Real-time video communication (§10.9.1) | Role permission |
+| `media.screenShare` | Screen sharing (§10.9.1) | Role permission |
+| `bridging` | Bridge connector participation (§12) | Role permission + governance |
+| `toolInterface` | Cross-context tool interface exposure (§6.2) | Role permission |
+| `childContext` | Create child contexts (§5.13) | Role permission |
+| `governancePropose` | Submit governance proposals (§5.9) | Role permission |
+| `governanceVote` | Vote on governance proposals (§5.9) | Role permission |
+| `metadataEdit` | Edit context operational metadata (§5.7) | Role permission + governance |
+
+**Parameterized categories.** `toolInvoke:{tool_id}` is the only parameterized category — it restricts invocation to a specific tool. `toolInvokeAll` grants invocation of all registered tools. A ceiling containing `toolInvokeAll` implicitly includes all `toolInvoke:{tool_id}` capabilities.
+
+**Category validation.** At context creation, the SDK validates that every entry in the ceiling array is a recognized category string (exact match, case-sensitive). Unrecognized categories cause creation to fail with `InvalidCeilingCategory` error. This prevents forward-compatibility issues where an old SDK creates a context with categories it cannot enforce.
+
+### 5.3.2 Governed Ceiling Change Notification Protocol
+
+When a context uses the `governed` ceiling policy and a ceiling change is approved through governance:
+
+1. **Proposal logged.** The `CeilingChangeProposed` event is recorded in the event log, containing the proposed new ceiling, the proposer's DID, and the governance justification.
+2. **Notification period.** A mandatory notification period of 72 hours begins. During this period, the existing ceiling remains in effect. All current members receive a `CeilingChangeNotification` message (MLS application message in encrypted contexts, broadcast message in broadcast contexts) containing the proposed changes.
+3. **Member response window.** During the notification period, members MAY leave the context if they disagree with the proposed changes. Members who leave during the notification period are recorded as `DepartedDuringCeilingChange` in the event log — this is informational, not punitive.
+4. **Activation.** After the notification period expires, the new ceiling takes effect. A `CeilingChanged` event is recorded with the old ceiling hash, new ceiling, and the governance proposal ID.
+5. **Retroactive UCAN validation.** After ceiling change activation, UCANs that reference capabilities no longer in the ceiling are automatically invalidated. The SDK MUST re-validate all cached UCANs against the new ceiling on the next action attempt.
+
 ## 5.4 Tools
 
 Contexts provide tools: stateless functions that agents invoke. Tools have no identity, no agency, no ability to initiate. They take input and return output. They are scoped to their context and cannot span contexts.
@@ -88,6 +127,54 @@ Tool registrations include:
 - **Cost metadata (optional).** Per-invocation cost declared by the tool, additive with context-level costs (§19.3). Fields: `cost: Option<Amount>`, `cost_currency: Option<CurrencyCode>`, `cost_payee: Option<DID>`. A tool calling an external API can pass through its cost. Tool costs carry their own payee DID, which may differ from the context payee. Tools without cost metadata are free.
 
 Tool mutations (implementation hash change, schema modification, test vector update) are recorded in the context's verifiable event log (§7.3.1). Silent tool modification is not possible — any change is visible to all context members.
+
+### 5.4.1 Tool Registration Wire Format
+
+Tool registrations are serialized as MessagePack (§17.5) and stored in the context's tool registry. The canonical structure:
+
+```
+ToolRegistration {
+  tool_id:          String,          // Unique within the context. Format: [a-z0-9_-], max 128 chars.
+  name:             String,          // Human-readable name. Max 256 UTF-8 bytes.
+  description:      String,          // Tool description. Max 4096 UTF-8 bytes.
+  operator_did:     DID,             // The identity accountable for this tool.
+  schema: {
+    input:          JSONSchema,      // MCP-compatible JSON Schema for input. Max 64 KiB serialized.
+    output:         JSONSchema,      // MCP-compatible JSON Schema for output. Max 64 KiB serialized.
+  },
+  implementation_hash: [u8; 32],    // SHA-256 of the tool's implementation artifact (see below).
+  test_vectors:     Vec<TestVector>, // Known input-output pairs. Min 0, max 100.
+  cost:             Option<ToolCost>, // Per-invocation cost (§19.3).
+  registered_at:    u64,             // Unix timestamp (seconds) of registration.
+  signature:        Ed25519Signature, // Operator DID signs all fields except signature.
+}
+
+TestVector {
+  input:            Value,           // MessagePack value matching the input schema.
+  expected_output:  Value,           // MessagePack value. Verification uses structural comparison,
+                                     // not byte equality (§7.3.3).
+  description:      Option<String>,  // Optional human-readable description of what this tests.
+}
+
+ToolCost {
+  amount:           Amount,          // Cost per invocation in smallest currency unit.
+  currency:         CurrencyCode,    // ISO 4217 or protocol-defined.
+  payee:            DID,             // Who receives payment. May differ from operator_did.
+}
+```
+
+**Implementation hash target.** The `implementation_hash` is `SHA-256(canonical_artifact)` where `canonical_artifact` depends on the tool type:
+
+| Tool type | Hash target | Description |
+|-----------|-------------|-------------|
+| Statically deployed (WASM, container) | SHA-256 of the binary artifact | The compiled WASM module or container image digest. Deterministic builds ensure the hash is reproducible. |
+| Source-available | SHA-256 of the source archive | A tar.gz of the source tree, files sorted lexicographically, normalized line endings (LF). |
+| Remote service (API-backed) | SHA-256 of the OpenAPI/JSON Schema spec | The canonical JSON serialization (RFC 8785) of the tool's API specification. |
+| LLM-backed (non-deterministic) | SHA-256 of the system prompt + model identifier | `SHA-256(model_id || ":" || system_prompt_utf8)`. Changes to the model or system prompt change the hash. |
+
+The hash target type is NOT stored in the registration — the operator chooses what constitutes their implementation artifact. The hash provides a change-detection mechanism, not a verification mechanism. Verifiers detect changes (hash differs from registration); they do not verify what the hash covers.
+
+**Signature scope.** The operator signs `SHA-256("SCP-TOOL-REGISTRATION-V1:" || tool_id || name || operator_did || schema_hash || implementation_hash || test_vectors_hash || cost_hash || registered_at)` where `schema_hash = SHA-256(MessagePack(schema))`, `test_vectors_hash = SHA-256(MessagePack(test_vectors))`, and `cost_hash = SHA-256(MessagePack(cost))` (or `SHA-256(0x00)` if absent).
 
 ## 5.5 Roles
 
@@ -106,6 +193,36 @@ Properties of roles:
 - **Subscriber** — holds `messagesRead` (auto-granted on DID-authenticated registration in open broadcast contexts, or requiring an explicit admin-issued UCAN in gated broadcast contexts). Subscribers receive author broadcast keys on request. Subscribers are unbounded.
 
 The author/subscriber distinction mirrors the writer/reader two-tier model from discovery contexts (§6.2.2B). Open broadcast subscriber registration follows the same DID-authenticated pattern as discovery context reader-tier access.
+
+### 5.5.1 Default Role Set
+
+Every context has a minimum set of built-in roles. Context creators MAY define additional custom roles, but these four are always present:
+
+| Role | Permissions | Description |
+|------|------------|-------------|
+| `admin` | All capabilities in ceiling + `memberInvite` + `memberRemove` + `roleAssign` + `governancePropose` + `governanceVote` + `metadataEdit` | Full control. The context creator is always assigned this role at creation. |
+| `moderator` | `messagesRead` + `messagesWrite` + `toolInvokeAll` + `memberRemove` + `governancePropose` | Can moderate content and members but cannot change roles or governance structure. |
+| `member` | `messagesRead` + `messagesWrite` + `toolInvokeAll` | Standard participant. Can read, write, and use tools. |
+| `observer` | `messagesRead` | Read-only access. Cannot send messages, invoke tools, or participate in governance. Observers can see all content and membership but cannot create state. |
+
+**Observer role permissions (detailed):**
+
+Observers can:
+- Read all messages in the context (subject to memory scope and access key restrictions).
+- View the member list, roles, and context metadata.
+- View tool registrations and their schemas.
+- View the event log (governance actions, membership changes).
+- Leave the context voluntarily.
+
+Observers cannot:
+- Send messages or reactions.
+- Invoke tools (no `toolInvokeAll` or `toolInvoke:{id}`).
+- Invite members.
+- Propose or vote on governance actions.
+- Modify context metadata.
+- Register or deregister tools.
+
+**Custom roles.** Context creators define custom roles by specifying a role name (string, max 64 chars, `[a-z0-9_-]`) and a permission set (subset of the ceiling). Custom role permissions MUST be a subset of the ceiling — a custom role cannot grant capabilities beyond the ceiling. Custom roles are stored in the context's role registry (`context/{id}/role/{role_name}` per §17.3) and visible in context metadata.
 
 ## 5.6 Membership
 
@@ -325,6 +442,32 @@ The promotion policy is visible in context metadata (§5.7) before opt-in.
 
 **Key destruction on expiry.** When TTL expires, key destruction follows the memory scope (§5.11). The destruction protocol includes platform-attested verification where available — see §9.15 for the ephemeral key destruction verification mechanism.
 
+### 5.10.1 TTL Extension Governance Protocol
+
+TTL extension is a governance action with additional consent requirements beyond standard governance approval:
+
+1. **Proposal.** An admin submits a `ProposeTTLExtension` governance proposal:
+   ```
+   ProposeTTLExtension {
+     new_ttl: u64,              // New TTL in seconds from context creation time (MUST be > current TTL)
+     reason: String,            // Human-readable justification
+   }
+   ```
+2. **Governance approval.** The proposal follows the context's governance model (§5.9). SingleAdmin auto-executes; Threshold/Majority/Unanimity require their configured quorum.
+3. **Unanimous member consent.** After governance approval, ALL current members MUST explicitly consent to the extension. Consent is expressed via a signed `TTLExtensionConsent` message (MLS application message):
+   ```
+   TTLExtensionConsent {
+     proposal_id: [u8; 32],     // Hash of the TTL extension proposal
+     consented: bool,           // true = consent, false = reject
+     signature: Ed25519Signature,
+   }
+   ```
+4. **Consent deadline.** Members have 24 hours to respond. Members who do not respond within 24 hours are treated as having rejected the extension. This prevents indefinite extension of a context that a member expected to be temporary.
+5. **Activation.** If all members consent, the TTL is updated. A `TTLExtended` event is recorded in the event log with the old TTL, new TTL, proposal ID, and list of consenting members.
+6. **Rejection.** If any member rejects (explicitly or by timeout), the extension fails. A `TTLExtensionRejected` event is recorded. The original TTL remains in effect.
+
+**Bilateral context shortcut.** For two-party contexts, TTL extension requires only the other party's consent (the proposer's consent is implicit in the proposal). No governance proposal is needed — a direct `TTLExtensionConsent` exchange suffices.
+
 ## 5.11 Memory Scope
 
 Contexts gain a declared memory scope — what happens to the context's data when it closes or expires. Memory scope is set at creation and visible in context metadata (visible before opt-in).
@@ -335,7 +478,26 @@ Three scopes:
 
 Relay deletion is best-effort — relays are untrusted infrastructure and cannot be forced to delete. Defense in depth: even if a relay retains the encrypted blobs, the keys are destroyed and the data is unreadable. Relay compliance with deletion requests is tracked as part of relay reliability scoring (§9.9.2) — relays that retain data they were asked to delete are scored lower and deprioritized for future context creation.
 
+**Relay deletion request format.** The SDK issues deletion requests to all relays that store blobs for the closing context. The request uses the relay protocol's existing `DELETE /blobs` endpoint (§10.4):
+
+```
+EphemeralDeletionRequest {
+  routing_id:   [u8; 32],        // SHA-256(context_id) or HKDF-derived routing ID
+  requester_did: DID,            // DID of the member requesting deletion
+  context_close_proof: {
+    context_id:  ContextId,
+    close_event_hash: [u8; 32],  // Hash of the ContextClosed event in the Merkle log
+    merkle_root: [u8; 32],       // Current Merkle root of the context's event log
+  },
+  signature:    Ed25519Signature, // Signed by requester's #active or #agent key
+}
+```
+
+The relay verifies the signature and MAY verify the close proof against its cached event log state. Relays SHOULD process deletion requests within 60 seconds. The relay responds with a `DeletionAcknowledgement` containing the count of blobs deleted. The SDK retries failed deletion requests with exponential backoff (initial 5s, max 300s, 5 retries) and records relay compliance for reliability scoring.
+
 **Summary.** Context produces a structured summary on close. Full content is destroyed (keys destroyed as with ephemeral). The summary persists with full provenance. Both parties can verify the summary against the event log before keys are destroyed. The summary format is defined by the context (via tools or governance), not by the protocol — the protocol provides the lifecycle hooks (pre-close summary generation, verification window, key destruction) but does not prescribe summary content.
+
+The **verification window** is the period between summary generation and key destruction during which members can verify the summary against the full event log. The verification window duration is 300 seconds (5 minutes). During this window: (a) the summary is published as a signed MLS application message, (b) all members can read the full event log and compare it against the summary, (c) any member can raise a `SummaryDisputed` event if the summary is inaccurate, (d) after 300 seconds with no dispute, key destruction proceeds automatically. If a dispute is raised, key destruction is paused until the dispute is resolved through governance. Disputes that are not resolved within 24 hours result in key destruction proceeding anyway — the 24-hour limit prevents indefinite postponement of an ephemeral context's destruction guarantee.
 
 **Full.** Standard behavior. Context persists indefinitely. No memory restrictions. Content remains accessible to members. This is the default when no memory scope is specified.
 
@@ -1233,6 +1395,8 @@ Where `nonce` is the raw 12 bytes (fixed-size, no length prefix) and `provenance
 **Send path:** validate UCAN (`messagesWrite`) → assign sequence number → generate random 12-byte nonce → hash plaintext → hash provenance → sign (including nonce in hash) → AES-256-GCM encrypt with author broadcast key using nonce and AAD → serialize → wrap in OuterEnvelope → relay PUBLISH.
 
 **Receive path:** transport receive → dedup by blob hash → deserialize → verify signature against author's Active Signing Key or Agent Signing Key from sender's DID document → decrypt with cached author broadcast key for this epoch using envelope nonce and reconstructed AAD → verify `content_hash == SHA-256(decrypted_content)` → verify author UCAN → replay check (sequence number) → deliver to application layer.
+
+**`content_hash` confirmation oracle analysis.** The `content_hash` field contains `SHA-256(plaintext)` and is included in the signature (which is over cleartext metadata). An observer who possesses the broadcast key can decrypt and verify the content directly — the `content_hash` provides no additional information to them. An observer who does NOT possess the broadcast key can see `content_hash` in the signed envelope metadata but cannot decrypt `content`. This creates a confirmation oracle: if the observer suspects the plaintext is one of a small set of values, they can compute `SHA-256(candidate)` and compare against `content_hash` to confirm. This is acceptable for broadcast contexts because: (1) broadcast content is intended for wide distribution (potentially unlimited subscribers), (2) broadcast contexts are designed for public or semi-public content, not high-confidentiality communication, (3) the AEAD authentication tag already provides integrity — `content_hash` is defense-in-depth for non-AEAD-aware verification paths. For contexts requiring confidentiality against non-members, use `ContextMode::Encrypted` which does NOT include a `content_hash` in cleartext metadata. This design decision is intentional: broadcast mode trades metadata confidentiality for verification simplicity, consistent with its public-distribution purpose.
 
 ### 5.14.6 Routing
 
