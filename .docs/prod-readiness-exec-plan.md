@@ -447,9 +447,9 @@ Spec-only fixes for the 37 NEW HIGH findings. Grouped by topic:
 
 Wire format and crypto fixes identified by spec review. All are code changes to match prescriptive spec:
 
-- #395 — HPKE sender key wrapping: add context_id/sender_did/epoch to info + AAD
-- #396 — BroadcastEnvelope: add top-level nonce field, expand AAD with context_id + sequence
-- #397 — ResetRequest: add nonce field, anti-replay validation (signature + 30s freshness + nonce dedup)
+- #395 — HPKE sender key wrapping: add context_id/sender_did/epoch to info + AAD ✅ (1fe28a47)
+- #396 — BroadcastEnvelope: add top-level nonce field, expand AAD with context_id + sequence ✅ (b4b9161c)
+- #397 — ResetRequest: add nonce field, anti-replay validation (signature + 30s freshness + nonce dedup) ✅ (d6146a16)
 - #398 — Envelope version field: add `version: u16` to InnerEnvelope, BroadcastEnvelope, OuterEnvelope + canonical hashes
 
 ### Phase 12: Polish
