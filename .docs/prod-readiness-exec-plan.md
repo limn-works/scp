@@ -458,6 +458,23 @@ Wire format and crypto fixes identified by spec review. All are code changes to 
 
 ---
 
+## Parallel Loom Execution (2026-03-07)
+
+Four loom sessions running simultaneously on separate branches to maximize throughput.
+File ownership is strictly partitioned to prevent merge conflicts.
+
+| Loom | Branch | Scope | Owned Files |
+|------|--------|-------|-------------|
+| Loom 1 (primary) | `feat/achieve-production-readiness` | Phase 6, Phase 7, #398 | `manager.rs`, `inner.rs`, `broadcast.rs`, `context/` governance |
+| Loom 2 | `feat/phase-9-sdk` | Phase 9 (SDK bindings) | `scp-ffi/`, `bindings/` |
+| Loom 3 | `feat/phase-10-features` | Phase 10 (new features) | PRD story modules, new files |
+| Loom 4 | `feat/phase-11-spec-polish` | Phase 11, Phase 12, #395-397 | `.docs/specs/`, misc code, `key_protocol.rs`, `sync/` |
+
+**Merge order:** All branches merge into `feat/achieve-production-readiness` after completion.
+**Conflict avoidance:** #398 assigned to Loom 1 (touches same files as Phase 6/7). #395-397 assigned to Loom 4 (no overlap with Loom 1's files).
+
+---
+
 ## Issue Audit Notes (2026-03-06)
 
 All ~50 open issues audited for AC quality, spec reference accuracy, and scope. Changes applied directly to GitHub issues.
