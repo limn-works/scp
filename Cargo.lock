@@ -4903,6 +4903,7 @@ name = "scp-ffi-napi"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "cc",
  "dashmap",
  "ed25519-dalek 2.2.0",
  "hex",
@@ -4915,6 +4916,7 @@ dependencies = [
  "scp-ffi-common",
  "scp-identity",
  "scp-platform",
+ "scp-transport",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
