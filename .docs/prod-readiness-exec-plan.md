@@ -468,10 +468,12 @@ File ownership is strictly partitioned to prevent merge conflicts.
 | Loom 1 (primary) | `feat/achieve-production-readiness` | Phase 6, Phase 7, #398 | `manager.rs`, `inner.rs`, `broadcast.rs`, `context/` governance |
 | Loom 2 | `feat/phase-9-sdk` | Phase 9 (SDK bindings) | `scp-ffi/`, `bindings/` |
 | Loom 3 | `feat/phase-10-features` | Phase 10 (new features) | PRD story modules, new files |
-| Loom 4 | `feat/phase-11-spec-polish` | Phase 11, Phase 12, #395-397 | `.docs/specs/`, misc code, `key_protocol.rs`, `sync/` |
+| Loom 4 | `feat/phase-11-spec` | Phase 11 (spec audit HIGHs) | `.docs/specs/` only |
+| Loom 5 | `feat/phase-12-polish` | Phase 12 (polish) | misc code, `scp-transport/`, event log |
+| Loom 6 | `feat/spec-code-alignment` | #395, #396, #397 | `key_protocol.rs`, `broadcast.rs`, `sync/` |
 
 **Merge order:** All branches merge into `feat/achieve-production-readiness` after completion.
-**Conflict avoidance:** #398 assigned to Loom 1 (touches same files as Phase 6/7). #395-397 assigned to Loom 4 (no overlap with Loom 1's files).
+**Conflict avoidance:** #398 assigned to Loom 1 (touches same files as Phase 6/7). #395-397 on Loom 6 (no overlap with Loom 1). Phase 11 is spec-only (no code). Phase 12 touches misc files with no overlap.
 
 ---
 
