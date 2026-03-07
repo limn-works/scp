@@ -18,7 +18,8 @@ use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use dashmap::DashMap;
-use scp_core::context::roles::default_ceiling;
+use scp_core::context::roles::{ContextRoleState, default_ceiling};
+use scp_core::context::tools::ToolRegistry;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_event_log::EventLog;
@@ -37,10 +38,15 @@ fn registry() -> &'static DashMap<String, ContextRuntime> {
 
 /// Per-context runtime state: the live objects needed by bridge functions.
 ///
-/// Each context gets its own event log, UCAN revocation list, nonce tracker,
-/// and capability ceiling string set. These are created lazily on first access
-/// from UCAN or event log bridge functions.
+/// Each context gets its own tool registry, role state, event log, UCAN
+/// revocation list, nonce tracker, and capability ceiling string set. These
+/// are created lazily on first access from tool, UCAN, or event log bridge
+/// functions.
 pub struct ContextRuntime {
+    /// Tool registry for this context.
+    pub tool_registry: ToolRegistry,
+    /// Role state for capability checking.
+    pub role_state: ContextRoleState,
     /// Event log (Merkle tree) for this context.
     pub event_log: EventLog,
     /// UCAN revocation list for this context.
@@ -76,14 +82,36 @@ pub fn ensure_registered(handle: &NapiContextHandle) -> Result<(), ScpNapiError>
     let creator_did = handle.creator_did();
     let handle_ceiling = handle.ceiling();
 
-    let ceiling_strings = if handle_ceiling.is_empty() {
-        default_ceiling()
+    let (ceiling_strings, role_state) = if handle_ceiling.is_empty() {
+        let ceiling = default_ceiling();
+        let strings = ceiling
             .capabilities
             .iter()
             .map(std::string::ToString::to_string)
-            .collect::<HashSet<String>>()
+            .collect::<HashSet<String>>();
+        let rs =
+            ContextRoleState::new(&context_id, &creator_did, ceiling, vec![]).map_err(|e| {
+                ScpNapiError::Context {
+                    message: format!("failed to create role state: {e}"),
+                    code: "SCP-CTX-2023".to_owned(),
+                }
+            })?;
+        (strings, rs)
     } else {
-        handle_ceiling.into_iter().collect::<HashSet<String>>()
+        let strings = handle_ceiling.iter().cloned().collect::<HashSet<String>>();
+        let ceiling = scp_core::context::roles::CapabilityCeiling::new(
+            handle_ceiling
+                .iter()
+                .map(scp_core::context::roles::Capability::new),
+        );
+        let rs =
+            ContextRoleState::new(&context_id, &creator_did, ceiling, vec![]).map_err(|e| {
+                ScpNapiError::Context {
+                    message: format!("failed to create role state: {e}"),
+                    code: "SCP-CTX-2023".to_owned(),
+                }
+            })?;
+        (strings, rs)
     };
 
     let event_log = EventLog::new(context_id.clone());
@@ -91,6 +119,8 @@ pub fn ensure_registered(handle: &NapiContextHandle) -> Result<(), ScpNapiError>
     let nonce_tracker = NonceTracker::new(context_id.clone(), SystemClock);
 
     let runtime = ContextRuntime {
+        tool_registry: ToolRegistry::new(),
+        role_state,
         event_log,
         revocation_list,
         nonce_tracker,
@@ -146,16 +176,22 @@ pub fn remove_context(context_id: &str) {
 /// tests that need to exercise runtime state without constructing a full
 /// `NapiContextHandle`.
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::missing_panics_doc)] // Test helper — panicking on failure is the correct behavior.
 pub fn register_test_context(context_id: &str, creator_did: &str) {
     let map = registry();
 
-    let ceiling_strings = default_ceiling()
+    let ceiling = default_ceiling();
+    let ceiling_strings = ceiling
         .capabilities
         .iter()
         .map(std::string::ToString::to_string)
         .collect::<HashSet<String>>();
+    let role_state = ContextRoleState::new(context_id, creator_did, ceiling, vec![])
+        .expect("default ceiling should always produce valid role state in tests");
 
     let runtime = ContextRuntime {
+        tool_registry: ToolRegistry::new(),
+        role_state,
         event_log: EventLog::new(context_id.to_owned()),
         revocation_list: RevocationList::new(context_id.to_owned()),
         nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),

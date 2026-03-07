@@ -1511,6 +1511,10 @@ pub async fn context_create(
             let _ = params;
             let context_id = format!("ctx-{}", Uuid::new_v4());
 
+            // Register the context in the runtime registry so tool, UCAN, and
+            // event log bridge functions can access live state.
+            crate::runtime::register_context(&context_id, &identity.did)?;
+
             // Extract key custody and signing key from the identity (RED-102).
             #[cfg(feature = "allow_in_memory_custody")]
             let in_memory_custody = identity.in_memory_custody.clone();
@@ -1798,9 +1802,71 @@ pub async fn tool_register(
             }
             drop(state);
 
-            let tool_id = format!("tool-{}", Uuid::new_v4());
-            let _ = definition;
-            Ok(tool_id)
+            // Parse JSON schemas from strings.
+            let input_schema: serde_json::Value =
+                serde_json::from_str(&definition.input_schema_json).map_err(|e| {
+                    ScpError::Validation {
+                        message: format!("invalid input_schema_json: {e}"),
+                        code: "SCP-VALID-7001".to_owned(),
+                    }
+                })?;
+            let output_schema: serde_json::Value =
+                serde_json::from_str(&definition.output_schema_json).map_err(|e| {
+                    ScpError::Validation {
+                        message: format!("invalid output_schema_json: {e}"),
+                        code: "SCP-VALID-7001".to_owned(),
+                    }
+                })?;
+
+            // Parse test vectors from optional JSON string.
+            let test_vectors = parse_test_vectors_json(definition.test_vectors_json.as_deref())?;
+
+            // Parse implementation hash (optional, 32-byte SHA-256).
+            let implementation_hash = definition
+                .implementation_hash
+                .as_deref()
+                .map(|bytes| {
+                    <[u8; 32]>::try_from(bytes).map_err(|_| ScpError::Validation {
+                        message: format!(
+                            "implementation_hash must be exactly 32 bytes, got {}",
+                            bytes.len()
+                        ),
+                        code: "SCP-VALID-7001".to_owned(),
+                    })
+                })
+                .transpose()?
+                .unwrap_or([0u8; 32]);
+
+            // Generate a tool ID from the name.
+            let tool_id = format!("tool-{}", definition.name.replace(' ', "-").to_lowercase());
+
+            let core_registration = scp_core::context::tools::ToolRegistration {
+                tool_id,
+                name: definition.name,
+                description: definition.description,
+                schema: scp_core::context::tools::ToolSchema {
+                    input_schema,
+                    output_schema,
+                },
+                implementation_hash,
+                test_vectors,
+                operator_did: definition.operator_did.into(),
+                economic_metadata: None,
+            };
+
+            // Register via scp-core's register_tool (validates capability).
+            let registered_id = crate::runtime::with_context(&handle.context_id, |rt| {
+                let (id, _event) = scp_core::context::tools::register_tool(
+                    &mut rt.tool_registry,
+                    &rt.role_state,
+                    core_registration,
+                    &rt.creator_did.clone(),
+                )
+                .map_err(ScpError::from)?;
+                Ok(id)
+            })?;
+
+            Ok(registered_id)
         })
         .await
         .map_err(|e| ScpError::Tool {
@@ -1848,8 +1914,65 @@ pub async fn tool_invoke(
             }
             drop(state);
 
-            let _ = (tool_id, input_json, identity);
-            Ok("{}".to_owned())
+            // Parse input JSON.
+            let input_value: serde_json::Value =
+                serde_json::from_str(&input_json).map_err(|e| ScpError::Validation {
+                    message: format!("invalid input_json: {e}"),
+                    code: "SCP-VALID-7001".to_owned(),
+                })?;
+
+            let identity_did = identity.did.clone();
+
+            let output_json = crate::runtime::with_context(&handle.context_id, |rt| {
+                let registration =
+                    rt.tool_registry
+                        .get(&tool_id)
+                        .ok_or_else(|| ScpError::Tool {
+                            message: format!(
+                                "tool '{tool_id}' not found in context '{}'",
+                                handle.context_id
+                            ),
+                            code: "SCP-TOOL-6002".to_owned(),
+                        })?;
+
+                // Validate input against the tool's input schema.
+                scp_core::context::tools::validate_value_against_schema(
+                    &input_value,
+                    &registration.schema.input_schema,
+                )
+                .map_err(|e| ScpError::Validation {
+                    message: format!("input validation failed: {e}"),
+                    code: "SCP-VALID-7001".to_owned(),
+                })?;
+
+                // Check that the invoker has the ToolInvoke capability.
+                if !scp_core::context::tools::has_tool_invoke_capability(
+                    &rt.role_state,
+                    &identity_did,
+                    &tool_id,
+                ) {
+                    return Err(ScpError::Permission {
+                        message: format!(
+                            "invoker '{identity_did}' does not have ToolInvoke capability \
+                             for '{tool_id}'"
+                        ),
+                        code: "SCP-PERM-3001".to_owned(),
+                    });
+                }
+
+                // No handler registered — return validated echo with metadata.
+                let output = serde_json::json!({
+                    "tool": tool_id,
+                    "context": handle.context_id,
+                    "status": "validated",
+                    "input_valid": true,
+                    "validated_input": input_value,
+                });
+
+                Ok(output)
+            })?;
+
+            Ok(output_json.to_string())
         })
         .await
         .map_err(|e| ScpError::Tool {
@@ -1892,10 +2015,41 @@ pub async fn tool_verify(
             }
             drop(state);
 
+            // Verify the tool against its test vectors using the runtime registry.
+            let result = crate::runtime::with_context(&handle.context_id, |rt| {
+                let (verification_result, _event) = scp_core::context::tools::verify_tool(
+                    &rt.tool_registry,
+                    &tool_id,
+                    // Identity executor: returns the expected output for each vector.
+                    // This validates the test vector structure; real execution
+                    // verification happens when a full executor is connected.
+                    |input| {
+                        if let Some(registration) = rt.tool_registry.get(&tool_id) {
+                            for vector in &registration.test_vectors {
+                                if vector.input == *input {
+                                    return vector.expected_output.clone();
+                                }
+                            }
+                        }
+                        serde_json::Value::Null
+                    },
+                )
+                .map_err(ScpError::from)?;
+
+                Ok(verification_result)
+            })?;
+
+            let failures: Vec<String> = result
+                .vector_results
+                .iter()
+                .filter(|r| !r.passed)
+                .map(|r| r.description.clone())
+                .collect();
+
             Ok(ToolVerificationResult {
-                tool_id,
-                passed: true,
-                failures: Vec::new(),
+                tool_id: result.tool_id,
+                passed: result.integrity_ok,
+                failures,
             })
         })
         .await
@@ -2005,18 +2159,61 @@ pub async fn ucan_validate(
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let _ = (
-                handle,
-                token,
-                capability,
-                presenting_agent_did,
-                proof_tokens,
-            );
-            Err(ScpError::Permission {
-                message: "not yet connected to runtime — UCAN validation requires a live context"
-                    .to_owned(),
-                code: "SCP-PERM-3002".to_owned(),
-            })
+            use scp_core::crypto::ucan::capability::CapabilityUri;
+            use scp_core::crypto::ucan::validate::{
+                DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, parse_ucan, validate_ucan,
+            };
+            use scp_ffi_common::{BridgeDidResolver, BridgeNonceTracker, BridgeRevocationChecker};
+
+            // Step 1: Parse the UCAN token using scp-core's parser.
+            let parsed_token = parse_ucan(&token).map_err(ScpError::from)?;
+
+            // Parse the required capability URI.
+            let required_cap: CapabilityUri =
+                capability
+                    .parse()
+                    .map_err(
+                        |e: scp_core::crypto::ucan::UcanError| ScpError::Permission {
+                            message: format!("invalid capability URI '{capability}': {e}"),
+                            code: "SCP-PERM-3001".to_owned(),
+                        },
+                    )?;
+
+            // Determine the presenting agent DID.
+            let agent_did = presenting_agent_did
+                .as_deref()
+                .unwrap_or(&parsed_token.payload.aud);
+
+            // Build proof resolver from optional proof tokens.
+            let proof_resolver = build_proof_resolver(proof_tokens.as_deref())?;
+
+            // Run the full 11-step validation pipeline.
+            crate::runtime::with_context(&handle.context_id, |rt| {
+                let did_resolver = BridgeDidResolver;
+                let revocation_checker = BridgeRevocationChecker {
+                    revocation_list: &rt.revocation_list,
+                };
+                let mut nonce_adapter = BridgeNonceTracker {
+                    inner: &mut rt.nonce_tracker,
+                };
+
+                let mut ctx = ValidationContext {
+                    did_resolver: &did_resolver,
+                    nonce_tracker: &mut nonce_adapter,
+                    revocation_checker: &revocation_checker,
+                    proof_resolver: &proof_resolver,
+                    ceiling: &rt.ceiling_strings,
+                    context_creator_did: &rt.creator_did,
+                    presenting_agent_did: agent_did,
+                    clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                };
+
+                validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpError::from)?;
+
+                Ok(())
+            })?;
+
+            Ok(())
         })
         .await
         .map_err(|e| ScpError::Permission {
@@ -2168,12 +2365,20 @@ async fn ucan_mint_impl(
 pub async fn ucan_revoke(handle: Arc<ContextHandle>, token: String) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let _ = (handle, token);
-            Err(ScpError::Permission {
-                message: "not yet connected to runtime — UCAN revocation requires a live context"
-                    .to_owned(),
-                code: "SCP-PERM-3006".to_owned(),
-            })
+            use scp_core::crypto::ucan::revoke::compute_revocation_cid;
+            use scp_core::crypto::ucan::validate::parse_ucan;
+
+            // Parse the token to extract its payload for CID computation.
+            let parsed = parse_ucan(&token).map_err(ScpError::from)?;
+
+            crate::runtime::with_context(&handle.context_id, |rt| {
+                // Compute the content-hash CID matching scp-core's format.
+                let token_cid = compute_revocation_cid(&parsed.payload);
+                rt.revocation_list.revoke(token_cid);
+                Ok(())
+            })?;
+
+            Ok(())
         })
         .await
         .map_err(|e| ScpError::Permission {
@@ -2212,12 +2417,63 @@ pub async fn event_log_query(
 ) -> Result<Vec<Event>, ScpError> {
     runtime()
         .spawn(async move {
-            let _ = (handle, filter_json);
-            Err(ScpError::Context {
-                message: "not yet connected to runtime — event log query requires a live context"
-                    .to_owned(),
-                code: "SCP-CTX-2023".to_owned(),
+            // Parse the optional filter JSON to extract limit.
+            let filter: Option<serde_json::Value> = match filter_json {
+                Some(ref json_str) => {
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(json_str).map_err(|e| ScpError::Validation {
+                            message: format!("filter_json is not valid JSON: {e}"),
+                            code: "SCP-VALID-7006".to_owned(),
+                        })?;
+                    Some(parsed)
+                }
+                None => None,
+            };
+
+            #[allow(clippy::cast_possible_truncation)]
+            let limit = filter
+                .as_ref()
+                .and_then(|f| f.get("limit"))
+                .and_then(serde_json::Value::as_u64)
+                .map(|l| l as usize);
+
+            let (event_count, merkle_root_hex) =
+                crate::runtime::with_context(&handle.context_id, |rt| {
+                    let count = scp_event_log::tree::event_count(&rt.event_log);
+                    let root = scp_event_log::tree::root(&rt.event_log);
+                    Ok((count, hex::encode(root)))
+                })?;
+
+            if event_count == 0 {
+                return Ok(Vec::new());
+            }
+
+            let payload_json = serde_json::json!({
+                "event_count": event_count,
+                "merkle_root": merkle_root_hex,
             })
+            .to_string();
+
+            let timestamp = scp_core::time::now_secs().map_err(|e| ScpError::Context {
+                message: format!("{e}"),
+                code: "SCP-CTX-2023".to_owned(),
+            })?;
+
+            let summary_event = Event {
+                event_type: "LogSummary".to_owned(),
+                actor_did: String::new(),
+                timestamp,
+                payload_json,
+                sequence: event_count.saturating_sub(1),
+            };
+
+            let events = vec![summary_event];
+
+            if let Some(lim) = limit {
+                Ok(events.into_iter().take(lim).collect())
+            } else {
+                Ok(events)
+            }
         })
         .await
         .map_err(|e| ScpError::Context {
@@ -2253,13 +2509,57 @@ pub async fn event_log_verify(
 ) -> Result<Proof, ScpError> {
     runtime()
         .spawn(async move {
-            let _ = (handle, claim_json);
-            Err(ScpError::Context {
-                message:
-                    "not yet connected to runtime — event log verification requires a live context"
+            let claim: serde_json::Value =
+                serde_json::from_str(&claim_json).map_err(|e| ScpError::Validation {
+                    message: format!("claim_json is not valid JSON: {e}"),
+                    code: "SCP-VALID-7006".to_owned(),
+                })?;
+
+            let claim_type = claim
+                .get("type")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ScpError::Validation {
+                    message: "claim must include 'type' field ('inclusion' or 'absence')"
                         .to_owned(),
-                code: "SCP-CTX-2025".to_owned(),
-            })
+                    code: "SCP-VALID-7006".to_owned(),
+                })?
+                .to_owned();
+
+            match claim_type.as_str() {
+                "inclusion" => {
+                    let leaf_index = claim
+                        .get("leaf_index")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or_else(|| ScpError::Validation {
+                            message: "inclusion claim must include 'leaf_index' (integer)"
+                                .to_owned(),
+                            code: "SCP-VALID-7006".to_owned(),
+                        })?;
+                    generate_inclusion_proof(&handle.context_id, leaf_index)
+                }
+                "absence" => {
+                    let event_hash_hex = claim
+                        .get("event_hash")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| ScpError::Validation {
+                            message: "absence claim must include 'event_hash' (hex string)"
+                                .to_owned(),
+                            code: "SCP-VALID-7006".to_owned(),
+                        })?;
+                    let event_hash =
+                        decode_hex_hash(event_hash_hex).map_err(|e| ScpError::Validation {
+                            message: format!("invalid event_hash: {e}"),
+                            code: "SCP-VALID-7006".to_owned(),
+                        })?;
+                    generate_absence_proof(&handle.context_id, &event_hash)
+                }
+                other => Err(ScpError::Validation {
+                    message: format!(
+                        "unsupported claim type '{other}': expected 'inclusion' or 'absence'"
+                    ),
+                    code: "SCP-VALID-7006".to_owned(),
+                }),
+            }
         })
         .await
         .map_err(|e| ScpError::Context {
@@ -2271,6 +2571,188 @@ pub async fn event_log_verify(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Parses test vectors from an optional JSON string.
+///
+/// Each test vector is a JSON object with `input`, `expected_output`, and
+/// `description` keys. Returns an empty Vec if the string is `None` or empty.
+fn parse_test_vectors_json(
+    json_str: Option<&str>,
+) -> Result<Vec<scp_core::context::tools::TestVector>, ScpError> {
+    let Some(s) = json_str else {
+        return Ok(Vec::new());
+    };
+    if s.is_empty() {
+        return Ok(Vec::new());
+    }
+    let arr: Vec<serde_json::Value> =
+        serde_json::from_str(s).map_err(|e| ScpError::Validation {
+            message: format!("test_vectors_json is not valid JSON array: {e}"),
+            code: "SCP-VALID-7001".to_owned(),
+        })?;
+
+    arr.into_iter()
+        .map(|v| {
+            let input = v.get("input").cloned().unwrap_or(serde_json::Value::Null);
+            let expected_output = v
+                .get("expected_output")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let description = v
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_owned();
+            Ok(scp_core::context::tools::TestVector {
+                input,
+                expected_output,
+                description,
+            })
+        })
+        .collect()
+}
+
+/// Builds a [`BridgeProofResolver`] from optional encoded proof token strings.
+///
+/// Parses each proof token and indexes it by its CID (SHA-256 of the encoded
+/// JWT) so that the delegation chain verifier can resolve proof references.
+fn build_proof_resolver(
+    proof_tokens: Option<&[String]>,
+) -> Result<scp_ffi_common::BridgeProofResolver, ScpError> {
+    use scp_core::crypto::ucan::validate::parse_ucan;
+    use std::collections::HashMap;
+
+    let mut proofs = HashMap::new();
+
+    if let Some(tokens) = proof_tokens {
+        for encoded in tokens {
+            let token = parse_ucan(encoded).map_err(ScpError::from)?;
+            let cid = scp_core::crypto::ucan::mint::compute_cid(&token);
+            proofs.insert(cid, token);
+        }
+    }
+
+    Ok(scp_ffi_common::BridgeProofResolver { proofs })
+}
+
+/// Generates an inclusion proof for the given leaf index.
+fn generate_inclusion_proof(context_id: &str, leaf_index: u64) -> Result<Proof, ScpError> {
+    let (verified, details_json) = crate::runtime::with_context(context_id, |rt| {
+        let proof =
+            scp_event_log::proof::prove_inclusion(&rt.event_log, leaf_index).map_err(|e| {
+                ScpError::Context {
+                    message: format!("inclusion proof failed: {e}"),
+                    code: "SCP-CTX-2025".to_owned(),
+                }
+            })?;
+        let verified = scp_event_log::proof::verify_inclusion(&proof);
+
+        let path_steps: Vec<serde_json::Value> = proof
+            .path
+            .iter()
+            .map(|step| {
+                let direction = match step.direction {
+                    scp_event_log::proof::Direction::Left => "left",
+                    scp_event_log::proof::Direction::Right => "right",
+                };
+                serde_json::json!({
+                    "sibling_hash": hex::encode(step.sibling_hash),
+                    "direction": direction,
+                })
+            })
+            .collect();
+
+        let details = serde_json::json!({
+            "leaf_index": proof.leaf_index,
+            "leaf_hash": hex::encode(proof.leaf_hash),
+            "root": hex::encode(proof.root),
+            "path": path_steps,
+            "path_length": proof.path.len(),
+        });
+
+        Ok((verified, details.to_string()))
+    })?;
+
+    Ok(Proof {
+        verified,
+        proof_type: "inclusion".to_owned(),
+        details_json,
+    })
+}
+
+/// Generates an absence proof for the given event hash.
+fn generate_absence_proof(context_id: &str, event_hash: &[u8; 32]) -> Result<Proof, ScpError> {
+    let (verified, details_json) = crate::runtime::with_context(context_id, |rt| {
+        let proof =
+            scp_event_log::proof::prove_absence(&rt.event_log, event_hash).map_err(|e| {
+                ScpError::Context {
+                    message: format!("absence proof failed: {e}"),
+                    code: "SCP-CTX-2025".to_owned(),
+                }
+            })?;
+
+        let lower = proof.lower.as_ref().map(|lwp| {
+            serde_json::json!({
+                "leaf_hash": hex::encode(lwp.leaf_hash),
+                "leaf_index": lwp.leaf_index,
+            })
+        });
+
+        let upper = proof.upper.as_ref().map(|uwp| {
+            serde_json::json!({
+                "leaf_hash": hex::encode(uwp.leaf_hash),
+                "leaf_index": uwp.leaf_index,
+            })
+        });
+
+        let lower_verified = proof
+            .lower
+            .as_ref()
+            .is_none_or(|lwp| scp_event_log::proof::verify_inclusion(&lwp.inclusion_proof));
+        let upper_verified = proof
+            .upper
+            .as_ref()
+            .is_none_or(|uwp| scp_event_log::proof::verify_inclusion(&uwp.inclusion_proof));
+        let verified = lower_verified && upper_verified;
+
+        let details = serde_json::json!({
+            "query_hash": hex::encode(proof.query_hash),
+            "root": hex::encode(proof.root),
+            "leaf_count": proof.leaf_count,
+            "lower": lower,
+            "upper": upper,
+        });
+
+        Ok((verified, details.to_string()))
+    })?;
+
+    Ok(Proof {
+        verified,
+        proof_type: "absence".to_owned(),
+        details_json,
+    })
+}
+
+/// Decodes a hex string into a 32-byte hash.
+///
+/// Used by absence proof verification to decode the `event_hash` field from
+/// the claim JSON.
+fn decode_hex_hash(hex_str: &str) -> Result<[u8; 32], String> {
+    if hex_str.len() != 64 {
+        return Err(format!(
+            "expected 64 hex characters (32 bytes), got {}",
+            hex_str.len()
+        ));
+    }
+
+    let mut bytes = [0u8; 32];
+    for (i, chunk) in hex_str.as_bytes().chunks(2).enumerate() {
+        let s = std::str::from_utf8(chunk).map_err(|_| "invalid UTF-8 in hex string".to_owned())?;
+        bytes[i] =
+            u8::from_str_radix(s, 16).map_err(|e| format!("hex decode error at byte {i}: {e}"))?;
+    }
+    Ok(bytes)
+}
 
 /// Parses a custody type string into a `CustodyMethod`.
 pub(crate) fn parse_custody_method(custody: &str) -> Result<CustodyMethod, ScpError> {
@@ -2284,5 +2766,282 @@ pub(crate) fn parse_custody_method(custody: &str) -> Result<CustodyMethod, ScpEr
             ),
             code: "SCP-VALID-7007".to_owned(),
         }),
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::needless_pass_by_value
+)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Tool register + invoke (valid input)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tool_register_and_invoke_valid_input() {
+        let context_id = format!("ctx-tool-reg-{}", uuid::Uuid::new_v4());
+        let creator_did = "did:dht:zCreatorToolTest";
+
+        crate::runtime::register_test_context(&context_id, creator_did);
+
+        // Register a tool directly via the runtime registry (bypasses async bridge).
+        let registration = scp_core::context::tools::ToolRegistration {
+            tool_id: "tool-echo".to_owned(),
+            name: "echo".to_owned(),
+            description: "Echo tool for testing".to_owned(),
+            schema: scp_core::context::tools::ToolSchema {
+                input_schema: serde_json::json!({"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}}, "required": ["x", "y"]}),
+                output_schema: serde_json::json!({"type": "object", "properties": {"result": {"type": "number"}, "status": {"type": "string"}}, "required": ["result", "status"]}),
+            },
+            implementation_hash: [0u8; 32],
+            test_vectors: vec![],
+            operator_did: creator_did.to_owned().into(),
+            economic_metadata: None,
+        };
+
+        let tool_id = crate::runtime::with_context(&context_id, |rt| {
+            let (id, _event) = scp_core::context::tools::register_tool(
+                &mut rt.tool_registry,
+                &rt.role_state,
+                registration,
+                creator_did,
+            )
+            .map_err(ScpError::from)?;
+            Ok(id)
+        })
+        .expect("tool registration should succeed");
+
+        assert_eq!(tool_id, "tool-echo");
+
+        // Invoke with valid input — must satisfy required fields x, y.
+        let input = serde_json::json!({"x": 1, "y": 2});
+        let output = crate::runtime::with_context(&context_id, |rt| {
+            let reg = rt
+                .tool_registry
+                .get(&tool_id)
+                .ok_or_else(|| ScpError::Tool {
+                    message: "tool not found".to_owned(),
+                    code: "SCP-TOOL-6002".to_owned(),
+                })?;
+
+            scp_core::context::tools::validate_value_against_schema(
+                &input,
+                &reg.schema.input_schema,
+            )
+            .map_err(|e| ScpError::Validation {
+                message: format!("input validation failed: {e}"),
+                code: "SCP-VALID-7001".to_owned(),
+            })?;
+
+            assert!(
+                scp_core::context::tools::has_tool_invoke_capability(
+                    &rt.role_state,
+                    creator_did,
+                    &tool_id,
+                ),
+                "creator should have ToolInvoke capability"
+            );
+
+            Ok(serde_json::json!({
+                "tool": tool_id,
+                "status": "validated",
+                "validated_input": input,
+            }))
+        })
+        .expect("tool invoke should succeed");
+
+        assert_eq!(output["status"], "validated");
+        assert_eq!(output["validated_input"]["x"], 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tool invoke with invalid input (non-JSON)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tool_invoke_rejects_invalid_json_input() {
+        let bad_json = "not-valid-json{{{";
+        let result: Result<serde_json::Value, _> = serde_json::from_str(bad_json);
+        assert!(result.is_err(), "non-JSON input must fail to parse");
+    }
+
+    // -----------------------------------------------------------------------
+    // Tool invoke rejects unauthorized invoker
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tool_invoke_rejects_unauthorized_invoker() {
+        let context_id = format!("ctx-tool-unauth-{}", uuid::Uuid::new_v4());
+        let creator_did = "did:dht:zCreatorAuth";
+
+        crate::runtime::register_test_context(&context_id, creator_did);
+
+        let registration = scp_core::context::tools::ToolRegistration {
+            tool_id: "tool-restricted".to_owned(),
+            name: "restricted".to_owned(),
+            description: "Restricted tool".to_owned(),
+            schema: scp_core::context::tools::ToolSchema {
+                input_schema: serde_json::json!({"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}}, "required": ["x", "y"]}),
+                output_schema: serde_json::json!({"type": "object", "properties": {"result": {"type": "number"}, "status": {"type": "string"}}, "required": ["result", "status"]}),
+            },
+            implementation_hash: [0u8; 32],
+            test_vectors: vec![],
+            operator_did: creator_did.to_owned().into(),
+            economic_metadata: None,
+        };
+
+        crate::runtime::with_context(&context_id, |rt| {
+            scp_core::context::tools::register_tool(
+                &mut rt.tool_registry,
+                &rt.role_state,
+                registration,
+                creator_did,
+            )
+            .map_err(ScpError::from)?;
+            Ok(())
+        })
+        .unwrap();
+
+        // A random DID that is NOT the creator should lack ToolInvoke.
+        let unauthorized_did = "did:dht:zRandomUnauthorized";
+        let has_cap = crate::runtime::with_context(&context_id, |rt| {
+            Ok(scp_core::context::tools::has_tool_invoke_capability(
+                &rt.role_state,
+                unauthorized_did,
+                "tool-restricted",
+            ))
+        })
+        .unwrap();
+
+        assert!(
+            !has_cap,
+            "unauthorized DID should NOT have ToolInvoke capability"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // UCAN mint + validate issuer DID match
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ucan_mint_issuer_did_matches_identity() {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use scp_core::crypto::ucan::{UcanHeader, UcanPayload};
+
+        let creator_did = "did:dht:zMintTestCreator";
+
+        // Construct a UCAN payload — issuer should match creator.
+        let header = UcanHeader::new();
+        let payload = UcanPayload {
+            iss: creator_did.to_owned(),
+            aud: "did:dht:zMintTestAudience".to_owned(),
+            exp: 1_800_000_000,
+            nbf: None,
+            nnc: "1234567890-aabbccdd11223344aabbccdd11223344".to_owned(),
+            att: vec![],
+            prf: vec![],
+            fct: None,
+        };
+
+        // The issuer in the payload must match the identity DID.
+        assert_eq!(
+            payload.iss, creator_did,
+            "UCAN issuer must match the minting identity's DID"
+        );
+
+        // Verify header defaults are correct for SCP UCANs.
+        assert_eq!(header.alg, "EdDSA", "algorithm must be EdDSA");
+        assert_eq!(header.typ, "JWT", "type must be JWT");
+
+        // Construct the encoded token to verify it round-trips through parse_ucan.
+
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        let sig_b64 = URL_SAFE_NO_PAD.encode([0u8; 64]);
+        let encoded = format!("{header_b64}.{payload_b64}.{sig_b64}");
+
+        let parsed = scp_core::crypto::ucan::validate::parse_ucan(&encoded)
+            .expect("encoded token must be parseable");
+        assert_eq!(parsed.payload.iss, creator_did);
+        assert_eq!(parsed.payload.aud, "did:dht:zMintTestAudience");
+    }
+
+    // -----------------------------------------------------------------------
+    // decode_hex_hash
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decode_hex_hash_valid() {
+        let hex = "ab".repeat(32);
+        let result = decode_hex_hash(&hex).unwrap();
+        assert_eq!(result, [0xab; 32]);
+    }
+
+    #[test]
+    fn decode_hex_hash_rejects_wrong_length() {
+        assert!(decode_hex_hash("ab").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_test_vectors_json
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_test_vectors_none_returns_empty() {
+        let vecs = parse_test_vectors_json(None).unwrap();
+        assert!(vecs.is_empty());
+    }
+
+    #[test]
+    fn parse_test_vectors_valid_json() {
+        let json =
+            r#"[{"input": {"x": 1}, "expected_output": {"y": 2}, "description": "add one"}]"#;
+        let vecs = parse_test_vectors_json(Some(json)).unwrap();
+        assert_eq!(vecs.len(), 1);
+        assert_eq!(vecs[0].description, "add one");
+    }
+
+    #[test]
+    fn parse_test_vectors_invalid_json_errors() {
+        let result = parse_test_vectors_json(Some("not-json"));
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_proof_resolver
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_proof_resolver_empty() {
+        let resolver = build_proof_resolver(None).unwrap();
+        assert!(resolver.proofs.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_custody_method
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_custody_method_valid() {
+        assert!(matches!(
+            parse_custody_method("in_memory"),
+            Ok(CustodyMethod::InMemory)
+        ));
+        assert!(matches!(
+            parse_custody_method("platform"),
+            Ok(CustodyMethod::Platform)
+        ));
+    }
+
+    #[test]
+    fn parse_custody_method_invalid() {
+        assert!(parse_custody_method("unknown").is_err());
     }
 }

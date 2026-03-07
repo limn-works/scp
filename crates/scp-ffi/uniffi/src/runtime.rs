@@ -1,13 +1,9 @@
-// Runtime registry infrastructure — built in this PR, wired in follow-up.
-// context_create/context_close in bridge.rs will call register/remove_context.
-#![allow(dead_code)]
-
 //! Global runtime registry mapping context IDs to live `scp-core` objects.
 //!
 //! Mirrors the `PyO3` bridge's `runtime.rs` pattern: a `DashMap` maps context IDs
-//! to per-context runtime state (event log, revocation list, nonce tracker,
-//! capability ceiling, creator DID). Bridge functions call [`with_context`] to
-//! access this state.
+//! to per-context runtime state (event log, tool registry, role state, revocation
+//! list, nonce tracker, capability ceiling, creator DID). Bridge functions call
+//! [`with_context`] to access this state.
 //!
 //! # Lifecycle
 //!
@@ -19,7 +15,8 @@ use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use dashmap::DashMap;
-use scp_core::context::roles::default_ceiling;
+use scp_core::context::roles::{ContextRoleState, default_ceiling};
+use scp_core::context::tools::ToolRegistry;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_event_log::EventLog;
@@ -35,6 +32,10 @@ fn registry() -> &'static DashMap<String, ContextRuntime> {
 
 /// Per-context runtime state: the live objects needed by bridge functions.
 pub struct ContextRuntime {
+    /// Tool registry for this context.
+    pub tool_registry: ToolRegistry,
+    /// Role state for capability checking.
+    pub role_state: ContextRoleState,
     /// Event log (Merkle tree) for this context.
     pub event_log: EventLog,
     /// UCAN revocation list for this context.
@@ -51,12 +52,14 @@ pub struct ContextRuntime {
 
 /// Registers a new context in the global runtime registry.
 ///
-/// Creates an [`EventLog`], [`RevocationList`], [`NonceTracker`], and
-/// capability ceiling for the context. Called by `context_create`.
+/// Creates a [`ToolRegistry`], [`ContextRoleState`], [`EventLog`],
+/// [`RevocationList`], [`NonceTracker`], and capability ceiling for the
+/// context. Called by `context_create`.
 ///
 /// # Errors
 ///
-/// Returns `ScpError::Context` if the context ID is already registered.
+/// Returns `ScpError::Context` if the context ID is already registered or
+/// if role state creation fails.
 pub fn register_context(context_id: &str, creator_did: &str) -> Result<(), ScpError> {
     use dashmap::mapref::entry::Entry;
 
@@ -75,10 +78,17 @@ pub fn register_context(context_id: &str, creator_did: &str) -> Result<(), ScpEr
                 .iter()
                 .map(std::string::ToString::to_string)
                 .collect::<HashSet<String>>();
+            let role_state = ContextRoleState::new(context_id, creator_did, ceiling, vec![])
+                .map_err(|e| ScpError::Context {
+                    message: format!("failed to create role state: {e}"),
+                    code: "SCP-CTX-2030".to_owned(),
+                })?;
             let revocation_list = RevocationList::new(context_id.to_owned());
             let nonce_tracker = NonceTracker::new(context_id.to_owned(), SystemClock);
 
             vacant.insert(ContextRuntime {
+                tool_registry: ToolRegistry::new(),
+                role_state,
                 event_log,
                 revocation_list,
                 nonce_tracker,
@@ -116,6 +126,40 @@ where
 /// Removes a context from the global runtime registry.
 ///
 /// Called when a context is closed. All associated runtime objects are dropped.
+#[allow(dead_code)]
 pub fn remove_context(context_id: &str) {
     registry().remove(context_id);
+}
+
+/// Registers a test context directly in the runtime registry.
+///
+/// Creates a `ContextRuntime` with the default ceiling, the given creator DID,
+/// and empty tool registry, event log, revocation list, and nonce tracker.
+/// This is for unit tests that need to exercise runtime state without
+/// constructing a full `ContextHandle`.
+#[cfg(test)]
+#[allow(clippy::expect_used)] // Test helper — panicking on failure is the correct behavior.
+pub fn register_test_context(context_id: &str, creator_did: &str) {
+    let map = registry();
+
+    let ceiling = default_ceiling();
+    let ceiling_strings = ceiling
+        .capabilities
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<HashSet<String>>();
+    let role_state = ContextRoleState::new(context_id, creator_did, ceiling, vec![])
+        .expect("default ceiling should always produce valid role state in tests");
+
+    let runtime = ContextRuntime {
+        tool_registry: ToolRegistry::new(),
+        role_state,
+        event_log: EventLog::new(context_id.to_owned()),
+        revocation_list: RevocationList::new(context_id.to_owned()),
+        nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
+        ceiling_strings,
+        creator_did: creator_did.to_owned(),
+    };
+
+    map.entry(context_id.to_owned()).or_insert(runtime);
 }
