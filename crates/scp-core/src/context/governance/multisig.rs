@@ -1591,4 +1591,63 @@ mod tests {
         assert_eq!(p.status, ProposalStatus::Pending);
         assert_eq!(p.approvals.len(), 1, "only proposer's vote");
     }
+
+    // -----------------------------------------------------------------------
+    // Economic governance action tests — Threshold (#334)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn threshold_set_economic_policy() {
+        let signers = vec![alice(), bob()];
+        let mut engine = ThresholdEngine::new(signers, 2, 86_400, mock_resolver()).expect("valid config");
+        let ctx = test_context_at(1_700_000_000);
+
+        let action = GovernanceAction::SetEconomicPolicy {
+            policy: crate::economy::types::EconomicPolicy {
+                locked: false,
+                cost_schedule: crate::economy::types::CostSchedule {
+                    currency: crate::economy::types::CurrencyCode::from("USD"),
+                    per_message: Some(crate::economy::types::Amount::new(10)),
+                    per_tool_invoke: None,
+                    per_join: None,
+                    per_period: None,
+                    per_byte_stored: None,
+                },
+                payment_adapters: vec![],
+                pricing_formula: None,
+                payee: DID::from("did:dht:z6MkPayee"),
+            },
+        };
+
+        let (proposal, _) = engine.propose(&alice(), action, &ctx, &sk_alice()).unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Pending);
+    }
+
+    #[test]
+    fn threshold_approve_spend() {
+        let signers = vec![alice(), bob()];
+        let mut engine = ThresholdEngine::new(signers, 2, 86_400, mock_resolver()).expect("valid config");
+        let ctx = test_context_at(1_700_000_000);
+
+        let action = GovernanceAction::ApproveSpend {
+            spender: alice(),
+            amount: crate::economy::types::Amount::new(1000),
+            purpose: "tool costs".to_owned(),
+        };
+
+        let (proposal, _) = engine.propose(&alice(), action, &ctx, &sk_alice()).unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Pending);
+    }
+
+    #[test]
+    fn threshold_lock_economic_policy() {
+        let signers = vec![alice(), bob()];
+        let mut engine = ThresholdEngine::new(signers, 2, 86_400, mock_resolver()).expect("valid config");
+        let ctx = test_context_at(1_700_000_000);
+
+        let action = GovernanceAction::LockEconomicPolicy;
+
+        let (proposal, _) = engine.propose(&alice(), action, &ctx, &sk_alice()).unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Pending);
+    }
 }

@@ -35,6 +35,7 @@ use crate::crypto::sender_keys::encrypt::{decrypt_sender_layer, encrypt_sender_l
 ///
 /// Binary fields use `serde_bytes` for efficient `MessagePack` encoding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OuterEnvelope {
     /// Per-context pseudonym derived via `HMAC-SHA256`. Used as the routing
     /// key by relays. 32 bytes.

@@ -903,6 +903,7 @@ impl ContextProvider for FfiBridgeProvider {
             execution_time_ms: elapsed_ms,
             input_hash,
             output_hash: Some(scp_core::context::tools::sha256_json(&output)),
+            cost: None,
         };
 
         let payload_data = serde_json::to_vec(&tool_event).unwrap_or_default();

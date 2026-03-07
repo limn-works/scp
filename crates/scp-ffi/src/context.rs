@@ -1289,6 +1289,41 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
 }
 
 // ---------------------------------------------------------------------------
+// Economic policy bridge (§19.3, ADR-033)
+// ---------------------------------------------------------------------------
+
+/// Sets the economic policy for a context (§19.3).
+///
+/// Accepts the economic policy as a JSON string. Validates the JSON against
+/// the `EconomicPolicy` schema before storing.
+///
+/// # Errors
+///
+/// - `ValueError` if the JSON is invalid or does not parse as `EconomicPolicy`.
+/// - `ScpContextError` if the context handle is not valid.
+#[pyfunction]
+#[pyo3(signature = (handle, policy_json))]
+fn py_set_economic_policy(handle: &mut PyContextHandle, policy_json: &str) -> PyResult<()> {
+    let _policy: scp_core::economy::types::EconomicPolicy = serde_json::from_str(policy_json)
+        .map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid economic policy JSON: {e}"))
+        })?;
+    handle.params.economic_policy = Some(policy_json.to_owned());
+    Ok(())
+}
+
+/// Returns the economic policy for a context as a JSON string, or `None`.
+///
+/// # Errors
+///
+/// Returns `PyErr` if the context handle is not valid.
+#[pyfunction]
+#[pyo3(signature = (handle,))]
+fn py_get_economic_policy(handle: &PyContextHandle) -> PyResult<Option<String>> {
+    Ok(handle.params.economic_policy.clone())
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
@@ -1310,6 +1345,8 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_context_close, m)?)?;
     m.add_function(wrap_pyfunction!(py_context_send, m)?)?;
     m.add_function(wrap_pyfunction!(py_context_receive, m)?)?;
+    m.add_function(wrap_pyfunction!(py_set_economic_policy, m)?)?;
+    m.add_function(wrap_pyfunction!(py_get_economic_policy, m)?)?;
     Ok(())
 }
 
@@ -1818,5 +1855,63 @@ mod tests {
         assert_eq!(handle.promotion_policy(), "no_promotion");
         assert!(handle.template_id().is_none());
         assert!(handle.economic_policy().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Economic policy bridge tests (#334)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn set_economic_policy_valid_json() {
+        let mut handle = PyContextHandle::new(
+            "ctx-econ-1".to_owned(),
+            "did:test:creator".to_owned(),
+            default_params(),
+        );
+        assert!(handle.params.economic_policy.is_none());
+
+        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":1,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
+        py_set_economic_policy(&mut handle, json).unwrap();
+        assert_eq!(handle.params.economic_policy.as_deref(), Some(json));
+    }
+
+    #[test]
+    fn set_economic_policy_invalid_json_rejects() {
+        let mut handle = PyContextHandle::new(
+            "ctx-econ-2".to_owned(),
+            "did:test:creator".to_owned(),
+            default_params(),
+        );
+
+        let result = py_set_economic_policy(&mut handle, "not valid json");
+        assert!(result.is_err());
+        // Original value should be unchanged.
+        assert!(handle.params.economic_policy.is_none());
+    }
+
+    #[test]
+    fn get_economic_policy_none() {
+        let handle = PyContextHandle::new(
+            "ctx-econ-3".to_owned(),
+            "did:test:creator".to_owned(),
+            default_params(),
+        );
+        let result = py_get_economic_policy(&handle).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn get_economic_policy_some() {
+        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":1,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
+        let handle = PyContextHandle::new(
+            "ctx-econ-4".to_owned(),
+            "did:test:creator".to_owned(),
+            PyContextParams {
+                economic_policy: Some(json.to_owned()),
+                ..default_params()
+            },
+        );
+        let result = py_get_economic_policy(&handle).unwrap();
+        assert_eq!(result.as_deref(), Some(json));
     }
 }

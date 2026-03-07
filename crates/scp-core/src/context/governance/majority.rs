@@ -2178,4 +2178,67 @@ mod tests {
             "expected InvalidSignature for forged vote"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Economic governance action tests — MajorityVote (#334)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn majority_set_economic_policy() {
+        let voters = vec![alice(), bob(), carol()];
+        let mut engine =
+            MajorityVoteEngine::new(voters.clone(), 86_400, 5000, mock_resolver()).expect("valid config");
+        let ctx = test_context(&voters, 1_700_000_000);
+
+        let action = GovernanceAction::SetEconomicPolicy {
+            policy: crate::economy::types::EconomicPolicy {
+                locked: false,
+                cost_schedule: crate::economy::types::CostSchedule {
+                    currency: crate::economy::types::CurrencyCode::from("USD"),
+                    per_message: Some(crate::economy::types::Amount::new(10)),
+                    per_tool_invoke: None,
+                    per_join: None,
+                    per_period: None,
+                    per_byte_stored: None,
+                },
+                payment_adapters: vec![],
+                pricing_formula: None,
+                payee: DID::from("did:dht:z6MkPayee"),
+            },
+        };
+
+        let (proposal, events) = engine.propose(&alice(), action, &ctx, &sk_alice()).unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Pending);
+        assert_eq!(events.len(), 1); // ProposalCreated
+    }
+
+    #[test]
+    fn majority_approve_spend() {
+        let voters = vec![alice(), bob()];
+        let mut engine =
+            MajorityVoteEngine::new(voters.clone(), 86_400, 5000, mock_resolver()).expect("valid config");
+        let ctx = test_context(&voters, 1_700_000_000);
+
+        let action = GovernanceAction::ApproveSpend {
+            spender: bob(),
+            amount: crate::economy::types::Amount::new(5000),
+            purpose: "tool budget".to_owned(),
+        };
+
+        let (proposal, _) = engine.propose(&alice(), action, &ctx, &sk_alice()).unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Pending);
+    }
+
+    #[test]
+    fn majority_lock_economic_policy() {
+        let voters = vec![alice(), bob()];
+        let mut engine =
+            MajorityVoteEngine::new(voters.clone(), 86_400, 5000, mock_resolver()).expect("valid config");
+        let ctx = test_context(&voters, 1_700_000_000);
+
+        let action = GovernanceAction::LockEconomicPolicy;
+
+        let (proposal, _) = engine.propose(&alice(), action, &ctx, &sk_alice()).unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Pending);
+    }
 }

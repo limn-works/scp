@@ -435,6 +435,7 @@ pub fn py_tool_invoke(
             execution_time_ms: elapsed_ms,
             input_hash: scp_core::context::tools::sha256_json(&input_json),
             output_hash: Some(scp_core::context::tools::sha256_json(&output)),
+            cost: None,
         };
 
         Ok(output)

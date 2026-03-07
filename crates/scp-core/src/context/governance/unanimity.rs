@@ -1747,4 +1747,63 @@ mod tests {
             GovernanceError::VerificationFailed(_)
         ));
     }
+
+    // -----------------------------------------------------------------------
+    // Economic governance action tests — Unanimity (#334)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unanimity_set_economic_policy() {
+        let members = vec![alice(), bob()];
+        let mut engine = UnanimityEngine::new(members, 86_400).expect("valid config");
+        let ctx = test_context_at(1_700_000_000);
+
+        let action = GovernanceAction::SetEconomicPolicy {
+            policy: crate::economy::types::EconomicPolicy {
+                locked: false,
+                cost_schedule: crate::economy::types::CostSchedule {
+                    currency: crate::economy::types::CurrencyCode::from("USD"),
+                    per_message: Some(crate::economy::types::Amount::new(10)),
+                    per_tool_invoke: None,
+                    per_join: None,
+                    per_period: None,
+                    per_byte_stored: None,
+                },
+                payment_adapters: vec![],
+                pricing_formula: None,
+                payee: DID::from("did:dht:z6MkPayee"),
+            },
+        };
+
+        let (proposal, _) = engine.propose(&alice(), action, &ctx, &sk_alice()).unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Pending);
+    }
+
+    #[test]
+    fn unanimity_approve_spend() {
+        let members = vec![alice(), bob()];
+        let mut engine = UnanimityEngine::new(members, 86_400).expect("valid config");
+        let ctx = test_context_at(1_700_000_000);
+
+        let action = GovernanceAction::ApproveSpend {
+            spender: bob(),
+            amount: crate::economy::types::Amount::new(2000),
+            purpose: "agent budget".to_owned(),
+        };
+
+        let (proposal, _) = engine.propose(&alice(), action, &ctx, &sk_alice()).unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Pending);
+    }
+
+    #[test]
+    fn unanimity_lock_economic_policy() {
+        let members = vec![alice(), bob()];
+        let mut engine = UnanimityEngine::new(members, 86_400).expect("valid config");
+        let ctx = test_context_at(1_700_000_000);
+
+        let action = GovernanceAction::LockEconomicPolicy;
+
+        let (proposal, _) = engine.propose(&alice(), action, &ctx, &sk_alice()).unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Pending);
+    }
 }

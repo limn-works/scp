@@ -41,6 +41,7 @@ use crate::crypto::ucan::UcanToken;
 use crate::crypto::ucan::validate::{
     DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext,
 };
+use crate::economy::types::EconomicPolicy;
 use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
@@ -167,6 +168,27 @@ pub enum GovernanceActionResult {
     /// Legacy variant — new code should use `WriteAccessRevoked` with
     /// `RevocationScope::Full`.
     AuthorBlocked(AuthorBlockResult),
+    /// A subscriber's read access was revoked in a broadcast context
+    /// (ADR-031, §5.9). The subscriber was removed from the registry and
+    /// added to all authors' block lists; all author keys were rotated.
+    SubscriberBanned(GovernanceBanResult),
+    /// A subscriber's read access was restored in a broadcast context
+    /// (ADR-031, §5.9). The DID was removed from all authors' block lists.
+    /// The subscriber must re-subscribe to regain access.
+    SubscriberUnbanned {
+        /// The DID whose read access was restored.
+        did: DID,
+    },
+    /// A governance action was executed successfully with no action-specific
+    /// result payload. Maps to: `ChangeRole`, `ModifyCeiling`, `CloseContext`,
+    /// `ExtendTtl`, `ChangeMemoryScope`, `AddMember`, `RemoveMember`,
+    /// `RegisterTool`, `DeregisterTool`, `ModifyThreshold`, `AddSigner`,
+    /// `RemoveSigner`, `EstablishToolInterface`, `ResetMember`,
+    /// `ResolveConflict`, `PromoteContext`, `RotateContentKeys`,
+    /// `RevokeWriteAccess`, `RestoreWriteAccess`, `ModifyPruningPolicy`,
+    /// `ReconfigureGovernance`, `SetEconomicPolicy`, `ApproveSpend`,
+    /// `LockEconomicPolicy`.
+    Executed,
 }
 
 // ---------------------------------------------------------------------------
@@ -247,6 +269,11 @@ pub struct ContextSnapshot {
     /// the first admin DID from membership).
     #[serde(default)]
     pub governance_model_config: Option<GovernanceModelConfig>,
+    /// Mutable economic policy (§19.3, ADR-033). Updated via
+    /// `SetEconomicPolicy` / `LockEconomicPolicy` governance actions.
+    /// `None` means free context (no payment required).
+    #[serde(default)]
+    pub economic_policy: Option<EconomicPolicy>,
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +412,9 @@ struct PerContextState {
     /// evaluation. The engine is restored from `GovernanceModelConfig` on
     /// restart.
     governance_engine: Box<dyn GovernanceEngine>,
+    /// Mutable economic policy (§19.3, ADR-033). Updated via
+    /// `SetEconomicPolicy` / `LockEconomicPolicy` governance actions.
+    economic_policy: Option<EconomicPolicy>,
 }
 
 /// Creates a governance engine from a [`GovernanceModel`] selector and
@@ -904,6 +934,7 @@ impl ContextManager {
             threshold_value: ctx.threshold_value,
             pruning_policy: ctx.pruning_policy.clone(),
             governance_model_config: Some(ctx.governance_engine.model_config()),
+            economic_policy: ctx.economic_policy.clone(),
         }
     }
 
@@ -997,6 +1028,7 @@ impl ContextManager {
             threshold_value: ctx_snapshot.threshold_value,
             pruning_policy: ctx_snapshot.pruning_policy,
             governance_engine,
+            economic_policy: ctx_snapshot.economic_policy,
         };
 
         {
@@ -1212,6 +1244,7 @@ impl ContextManager {
             threshold_value: 0,
             pruning_policy: None,
             governance_engine,
+            economic_policy: params.economic_policy.clone(),
         };
 
         // Atomic duplicate check + insert under lock -- no .await inside this scope.
@@ -1377,6 +1410,7 @@ impl ContextManager {
             threshold_value: 0,
             pruning_policy: None,
             governance_engine,
+            economic_policy: None,
         };
 
         // Atomic duplicate check + insert under lock.
@@ -2232,6 +2266,32 @@ impl ContextManager {
                 self.execute_promote_context(context_id, &proposal.approvals, pid)
                     .await?;
                 Ok(GovernanceActionResult::ContextPromoted)
+            }
+            GovernanceAction::SetEconomicPolicy { policy } => {
+                self.execute_set_economic_policy(context_id, policy, pid)
+                    .await?;
+                Ok(GovernanceActionResult::Executed)
+            }
+            GovernanceAction::ApproveSpend {
+                spender,
+                amount,
+                purpose,
+            } => {
+                self.execute_approve_spend(context_id, spender, *amount, purpose, pid)
+                    .await?;
+                Ok(GovernanceActionResult::Executed)
+            }
+            GovernanceAction::LockEconomicPolicy => {
+                self.execute_lock_economic_policy(context_id, pid).await?;
+                Ok(GovernanceActionResult::Executed)
+            }
+            GovernanceAction::ReconfigureGovernance {
+                changes,
+                justification,
+            } => {
+                self.execute_reconfigure_governance(context_id, changes, justification, pid)
+                    .await?;
+                Ok(GovernanceActionResult::Executed)
             }
             _ => {
                 self.dispatch_context_governance_action(context_id, &proposal.action, pid)
@@ -4032,6 +4092,139 @@ impl ContextManager {
         self.persist_context_snapshot(context_id, &snapshot);
         self.event_log
             .append_context_event(&context_id_bytes, "GovernanceReconfigured")?;
+        Ok(())
+    }
+
+    /// Sets or updates the economic policy for a context (§19.3, ADR-033).
+    ///
+    /// If the existing policy is locked, rejects the change. If the new policy
+    /// has `locked: true`, it becomes immutable after this action.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::PermissionDenied`] if the existing policy is locked.
+    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::ContextNotActive`] if the context is not active.
+    async fn execute_set_economic_policy(
+        &self,
+        context_id: &str,
+        policy: &EconomicPolicy,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            // Check if existing policy is locked.
+            if let Some(existing) = &ctx.economic_policy
+                && existing.locked
+            {
+                return Err(ContextError::PermissionDenied(
+                    "economic policy is locked and cannot be changed".to_owned(),
+                ));
+            }
+
+            ctx.economic_policy = Some(policy.clone());
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "EconomicPolicyChanged")?;
+        Ok(())
+    }
+
+    /// Approves a spending authorization for a member (§19.5, ADR-033).
+    ///
+    /// Records the spend approval in the event log. Budget enforcement is
+    /// handled at the tool invocation layer, not here — this action simply
+    /// records governance approval for the spend.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::MembershipFailed`] if the context is not registered
+    ///   or the spender is not a member.
+    /// - [`ContextError::ContextNotActive`] if the context is not active.
+    async fn execute_approve_spend(
+        &self,
+        context_id: &str,
+        spender: &DID,
+        _amount: crate::economy::types::Amount,
+        _purpose: &str,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            // Verify the spender is a member of the context.
+            if !ctx.membership.contains(spender.as_ref()) {
+                return Err(ContextError::MemberNotFound(spender.to_string()));
+            }
+
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "SpendApproved")?;
+        Ok(())
+    }
+
+    /// Locks the economic policy, making it immutable (§19.3).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::PermissionDenied`] if no economic policy is set or
+    ///   the policy is already locked.
+    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::ContextNotActive`] if the context is not active.
+    async fn execute_lock_economic_policy(
+        &self,
+        context_id: &str,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            match &mut ctx.economic_policy {
+                None => {
+                    return Err(ContextError::PermissionDenied(
+                        "cannot lock economic policy: no policy is set".to_owned(),
+                    ));
+                }
+                Some(policy) if policy.locked => {
+                    return Err(ContextError::PermissionDenied(
+                        "economic policy is already locked".to_owned(),
+                    ));
+                }
+                Some(policy) => {
+                    policy.locked = true;
+                }
+            }
+
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "EconomicPolicyLocked")?;
         Ok(())
     }
 
@@ -7106,6 +7299,7 @@ mod tests {
             threshold_value: 0,
             pruning_policy: None,
             governance_model_config: None,
+            economic_policy: None,
         };
 
         let bc_snapshot = test_broadcast_snapshot("persist-ctx-2");
@@ -7197,6 +7391,7 @@ mod tests {
             threshold_value: 0,
             pruning_policy: None,
             governance_model_config: None,
+            economic_policy: None,
         };
 
         persistence
@@ -7276,6 +7471,7 @@ mod tests {
             threshold_value: 0,
             pruning_policy: None,
             governance_model_config: None,
+            economic_policy: None,
         };
 
         persistence.persist_context("ttl-ctx", &snapshot).unwrap();
@@ -7334,6 +7530,7 @@ mod tests {
                 threshold_value: 0,
                 pruning_policy: None,
                 governance_model_config: None,
+                economic_policy: None,
             };
             persistence.persist_context(ctx_name, &snapshot).unwrap();
         }
@@ -7391,6 +7588,7 @@ mod tests {
             threshold_value: 0,
             pruning_policy: None,
             governance_model_config: None,
+            economic_policy: None,
         };
 
         let bc_snapshot = test_broadcast_snapshot("dup-ctx");
@@ -8376,6 +8574,7 @@ mod tests {
                     voting_window_secs: 86_400,
                 },
             ),
+            economic_policy: None,
         };
 
         let json = serde_json::to_string(&snapshot).expect("serialize");

@@ -112,7 +112,10 @@ pub const fn classify_action(action: &GovernanceAction) -> MlsImpact {
         | GovernanceAction::RevokeWriteAccess { .. }
         | GovernanceAction::RestoreWriteAccess { .. }
         | GovernanceAction::RotateContentKeys { .. }
-        | GovernanceAction::ReconfigureGovernance { .. } => MlsImpact::NoMlsChange,
+        | GovernanceAction::ReconfigureGovernance { .. }
+        | GovernanceAction::SetEconomicPolicy { .. }
+        | GovernanceAction::ApproveSpend { .. }
+        | GovernanceAction::LockEconomicPolicy => MlsImpact::NoMlsChange,
     }
 }
 

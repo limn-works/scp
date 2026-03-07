@@ -2384,17 +2384,36 @@ pub async fn governance_execute(
                 .await
                 .map_err(ScpError::from)?;
             // Serialize the result variant name for the caller.
+            use scp_core::context::manager::GovernanceActionResult;
             let result_str = match result {
-                scp_core::context::manager::GovernanceActionResult::AuthorBlocked(_) => {
-                    "AuthorBlocked"
-                }
-                scp_core::context::manager::GovernanceActionResult::SubscriberBanned(_) => {
-                    "SubscriberBanned"
-                }
-                scp_core::context::manager::GovernanceActionResult::SubscriberUnbanned {
-                    ..
-                } => "SubscriberUnbanned",
-                scp_core::context::manager::GovernanceActionResult::Executed => "Executed",
+                GovernanceActionResult::MemberAdded => "MemberAdded",
+                GovernanceActionResult::MemberRemoved => "MemberRemoved",
+                GovernanceActionResult::RoleChanged => "RoleChanged",
+                GovernanceActionResult::ToolRegistered => "ToolRegistered",
+                GovernanceActionResult::ToolRemoved => "ToolRemoved",
+                GovernanceActionResult::CeilingModified => "CeilingModified",
+                GovernanceActionResult::ContextClosed => "ContextClosed",
+                GovernanceActionResult::TtlExtended => "TtlExtended",
+                GovernanceActionResult::PruningPolicyModified => "PruningPolicyModified",
+                GovernanceActionResult::AdminTransferred => "AdminTransferred",
+                GovernanceActionResult::SignerAdded => "SignerAdded",
+                GovernanceActionResult::SignerRemoved => "SignerRemoved",
+                GovernanceActionResult::ThresholdModified => "ThresholdModified",
+                GovernanceActionResult::ChildContextCreated => "ChildContextCreated",
+                GovernanceActionResult::ToolInterfaceEstablished => "ToolInterfaceEstablished",
+                GovernanceActionResult::MemberReset => "MemberReset",
+                GovernanceActionResult::ConflictResolved => "ConflictResolved",
+                GovernanceActionResult::ContextPromoted => "ContextPromoted",
+                GovernanceActionResult::ReadAccessRevoked(_) => "ReadAccessRevoked",
+                GovernanceActionResult::ReadAccessRestored(_) => "ReadAccessRestored",
+                GovernanceActionResult::WriteAccessRevoked(_) => "WriteAccessRevoked",
+                GovernanceActionResult::WriteAccessRestored(_) => "WriteAccessRestored",
+                GovernanceActionResult::ContentKeysRotated(_) => "ContentKeysRotated",
+                GovernanceActionResult::GovernanceReconfigured(_) => "GovernanceReconfigured",
+                GovernanceActionResult::AuthorBlocked(_) => "AuthorBlocked",
+                GovernanceActionResult::SubscriberBanned(_) => "SubscriberBanned",
+                GovernanceActionResult::SubscriberUnbanned { .. } => "SubscriberUnbanned",
+                GovernanceActionResult::Executed => "Executed",
             };
             Ok(result_str.to_owned())
         })

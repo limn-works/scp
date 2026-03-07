@@ -1143,7 +1143,8 @@ fn compute_block_notification_hash(
     .to_vec()
 }
 
-/// Verifies an Ed25519 signature against a public key and message.
+/// Verifies an Ed25519 signature against a public key and message using
+/// strict verification (rejects small-order points).
 ///
 /// Returns `Ok(true)` if valid, `Ok(false)` if well-formed but invalid.
 ///
@@ -1156,7 +1157,7 @@ fn verify_ed25519_signature(
     message: &[u8],
     signature: &[u8],
 ) -> Result<bool, SenderKeyError> {
-    match crate::crypto::ed25519::verify_ed25519_signature(public_key, message, signature) {
+    match crate::crypto::ed25519::verify_ed25519_signature_strict(public_key, message, signature) {
         Ok(()) => Ok(true),
         Err(reason) => {
             // Distinguish malformed inputs (public key / signature byte length

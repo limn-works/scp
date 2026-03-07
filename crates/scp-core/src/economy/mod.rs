@@ -25,6 +25,7 @@
 
 pub mod adapter;
 pub mod antispam;
+pub mod budget;
 pub mod credentials;
 pub mod estimate;
 pub mod integration;
@@ -38,6 +39,7 @@ pub use adapter::{
     PaymentReceipt, RefundConfirmation, VerificationResult,
 };
 pub use antispam::{EscalationConfig, EscalationThreshold, SenderVelocityTracker};
+pub use budget::{BudgetError, MemberBudgetTracker};
 pub use credentials::{
     AdapterCredential, AdapterCredentialStore, CredentialError, EncryptedBlob, configure_adapter,
     retrieve_adapter_credential, validate_adapter,

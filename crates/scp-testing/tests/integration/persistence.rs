@@ -1091,6 +1091,7 @@ async fn context_manager_broadcast_restore_roundtrip() {
         threshold_value: 0,
         pruning_policy: None,
         governance_model_config: None,
+        economic_policy: None,
     };
     persistence
         .persist_context(ctx_id, &context_snapshot)

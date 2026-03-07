@@ -37,7 +37,7 @@
 
 use aes_gcm::aead::Payload;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
-use ed25519_dalek::{Signer, Verifier};
+use ed25519_dalek::Signer;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -152,8 +152,8 @@ pub struct BroadcastKeyEpochAdvance {
 /// AAD binding (length-prefixed binary format). Tampering with either field
 /// causes AEAD tag verification to fail on decryption. See issue #228.
 ///
-/// The `signature` field is an Ed25519 signature over the canonical
-/// concatenation of `context_id || author_did || sequence || timestamp || key_epoch`.
+/// The `signature` field is an Ed25519 signature over the canonical hash
+/// `SHA-256("SCP-BROADCAST-ENVELOPE-V1:" || len(context_id) || context_id || len(author_did) || author_did || sequence || timestamp || key_epoch)`.
 /// Verified BEFORE decryption in [`open_broadcast`] to reject forgeries early.
 /// See issue #352.
 ///
@@ -173,10 +173,10 @@ pub struct BroadcastEnvelope {
     pub key_epoch: u64,
     /// Optional provenance metadata for cross-context data flows (§7.7.1).
     pub provenance: Option<crate::provenance::DataProvenance>,
-    /// Ed25519 signature over the canonical field concatenation.
-    /// Signs: `context_id || author_did || sequence (8 BE) || timestamp (8 BE) || key_epoch (8 BE)`.
-    #[serde(with = "serde_bytes")]
-    pub signature: Vec<u8>,
+    /// Ed25519 signature over `canonical_hash("SCP-BROADCAST-ENVELOPE-V1:", ...)`
+    /// with fields: `context_id`, `author_did`, `sequence`, `timestamp`, `key_epoch`.
+    #[serde(with = "crate::serde_util::serde_signature_64")]
+    pub signature: [u8; 64],
     /// AES-256-GCM encrypted payload: `nonce || ciphertext || auth_tag`.
     /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
     #[serde(with = "crate::serde_util::serde_bounded_bytes")]
@@ -303,7 +303,12 @@ pub struct SealBroadcastParams<'a> {
 
 /// Constructs the canonical signing payload for a `BroadcastEnvelope`.
 ///
-/// Format: `context_id_bytes || author_did_bytes || sequence (8 BE) || timestamp (8 BE) || key_epoch (8 BE)`.
+/// Uses [`canonical_hash`] with domain separator `"SCP-BROADCAST-ENVELOPE-V1:"`
+/// and length-prefixed variable-length fields, matching the pattern used by
+/// [`compute_block_notification_hash`] in `key_protocol.rs`.
+///
+/// Field order: `context_id`, `author_did`, `sequence`, `timestamp`, `key_epoch`.
+///
 /// Used by both [`seal_broadcast`] (sign) and [`open_broadcast`] (verify).
 fn build_signing_payload(
     context_id: &str,
@@ -311,16 +316,19 @@ fn build_signing_payload(
     sequence: u64,
     timestamp: u64,
     key_epoch: u64,
-) -> Vec<u8> {
-    let ctx_bytes = context_id.as_bytes();
-    let did_bytes = author_did.as_bytes();
-    let mut payload = Vec::with_capacity(ctx_bytes.len() + did_bytes.len() + 24);
-    payload.extend_from_slice(ctx_bytes);
-    payload.extend_from_slice(did_bytes);
-    payload.extend_from_slice(&sequence.to_be_bytes());
-    payload.extend_from_slice(&timestamp.to_be_bytes());
-    payload.extend_from_slice(&key_epoch.to_be_bytes());
-    payload
+) -> [u8; 32] {
+    use crate::crypto::canonical::{CanonicalField, canonical_hash};
+
+    canonical_hash(
+        "SCP-BROADCAST-ENVELOPE-V1:",
+        &[
+            CanonicalField::VarBytes(context_id.as_bytes()),
+            CanonicalField::VarBytes(author_did.as_bytes()),
+            CanonicalField::U64(sequence),
+            CanonicalField::U64(timestamp),
+            CanonicalField::U64(key_epoch),
+        ],
+    )
 }
 
 /// Encrypts a payload with the author's broadcast key and packages it into a
@@ -397,7 +405,7 @@ pub fn seal_broadcast(
         timestamp: params.timestamp,
         key_epoch: key.epoch,
         provenance: params.provenance.clone(),
-        signature: signature.to_bytes().to_vec(),
+        signature: signature.to_bytes(),
         encrypted_content,
     })
 }
@@ -480,10 +488,9 @@ pub fn open_broadcast(
         envelope.timestamp,
         envelope.key_epoch,
     );
-    let signature = ed25519_dalek::Signature::from_slice(&envelope.signature)
-        .map_err(|e| SenderKeyError::VerificationFailed(format!("invalid signature bytes: {e}")))?;
+    let signature = ed25519_dalek::Signature::from_bytes(&envelope.signature);
     verifying_key
-        .verify(&signing_payload, &signature)
+        .verify_strict(&signing_payload, &signature)
         .map_err(|e| {
             SenderKeyError::VerificationFailed(format!("signature verification failed: {e}"))
         })?;
@@ -519,14 +526,24 @@ pub fn open_broadcast_trusted(
 // Replay detection
 // ---------------------------------------------------------------------------
 
+/// Maximum number of distinct authors tracked by [`BroadcastReplayDetector`].
+///
+/// When this limit is reached, the entry with the oldest (lowest) timestamp
+/// is evicted to make room for the new author. This prevents unbounded memory
+/// growth from a flood of distinct author DIDs.
+const REPLAY_DETECTOR_MAX_AUTHORS: usize = 10_000;
+
 /// Per-author sequence tracker for broadcast replay detection.
 ///
 /// Maintains the last-seen sequence number per author DID. Messages with
 /// `sequence <= last_seen` are rejected as replays (§5.14.5).
+///
+/// Bounded to [`REPLAY_DETECTOR_MAX_AUTHORS`] entries. When full, the entry
+/// with the lowest timestamp is evicted (oldest-first).
 #[derive(Debug, Default)]
 pub struct BroadcastReplayDetector {
-    /// Map of author DID to last-seen sequence number.
-    last_seen: std::collections::HashMap<String, u64>,
+    /// Map of author DID to (last-seen sequence number, last-seen timestamp).
+    last_seen: std::collections::HashMap<String, (u64, u64)>,
 }
 
 impl BroadcastReplayDetector {
@@ -540,24 +557,39 @@ impl BroadcastReplayDetector {
     ///
     /// Returns `true` and updates the tracker if `sequence > last_seen` for
     /// the given author. Returns `false` if `sequence <= last_seen` (replay).
-    pub fn check_and_advance(&mut self, author_did: &str, sequence: u64) -> bool {
-        let entry = self.last_seen.entry(author_did.to_owned()).or_insert(0);
-        if sequence > *entry {
-            *entry = sequence;
-            true
-        } else {
-            // First message (sequence 1) must pass even when entry is 0.
-            // Actually, sequence 0 is never valid for first message since
-            // AuthorState.next_sequence starts at 1. But handle edge case:
-            // if entry is 0 and sequence is 0, it's a replay of the initial state.
-            false
+    ///
+    /// When the detector is at capacity and a new author is seen, the entry
+    /// with the oldest timestamp is evicted.
+    pub fn check_and_advance(&mut self, author_did: &str, sequence: u64, timestamp: u64) -> bool {
+        if let Some(entry) = self.last_seen.get_mut(author_did) {
+            if sequence > entry.0 {
+                *entry = (sequence, timestamp);
+                return true;
+            }
+            return false;
         }
+
+        // New author — evict oldest if at capacity.
+        if self.last_seen.len() >= REPLAY_DETECTOR_MAX_AUTHORS {
+            if let Some(oldest_key) = self
+                .last_seen
+                .iter()
+                .min_by_key(|(_, (_, ts))| *ts)
+                .map(|(k, _)| k.clone())
+            {
+                self.last_seen.remove(&oldest_key);
+            }
+        }
+
+        self.last_seen
+            .insert(author_did.to_owned(), (sequence, timestamp));
+        true
     }
 
     /// Returns the last-seen sequence for an author, or `None` if never seen.
     #[must_use]
     pub fn last_seen(&self, author_did: &str) -> Option<u64> {
-        self.last_seen.get(author_did).copied()
+        self.last_seen.get(author_did).map(|(seq, _)| *seq)
     }
 }
 
@@ -814,7 +846,7 @@ mod tests {
             timestamp: 1_700_000_000_000,
             key_epoch: 0,
             provenance: None,
-            signature: vec![0u8; 64],
+            signature: [0u8; 64],
             encrypted_content: vec![0u8; 5],
         };
         let result = test_open(&key, &envelope);
@@ -1035,28 +1067,41 @@ mod tests {
     #[test]
     fn replay_detector_accepts_increasing_sequences() {
         let mut detector = BroadcastReplayDetector::new();
-        assert!(detector.check_and_advance("did:dht:alice", 1));
-        assert!(detector.check_and_advance("did:dht:alice", 2));
-        assert!(detector.check_and_advance("did:dht:alice", 5));
+        assert!(detector.check_and_advance("did:dht:alice", 1, 1000));
+        assert!(detector.check_and_advance("did:dht:alice", 2, 2000));
+        assert!(detector.check_and_advance("did:dht:alice", 5, 5000));
         assert_eq!(detector.last_seen("did:dht:alice"), Some(5));
     }
 
     #[test]
     fn replay_detector_rejects_duplicate_and_old_sequences() {
         let mut detector = BroadcastReplayDetector::new();
-        assert!(detector.check_and_advance("did:dht:alice", 3));
-        assert!(!detector.check_and_advance("did:dht:alice", 3)); // duplicate
-        assert!(!detector.check_and_advance("did:dht:alice", 1)); // old
-        assert!(detector.check_and_advance("did:dht:alice", 4)); // new
+        assert!(detector.check_and_advance("did:dht:alice", 3, 3000));
+        assert!(!detector.check_and_advance("did:dht:alice", 3, 3000)); // duplicate
+        assert!(!detector.check_and_advance("did:dht:alice", 1, 1000)); // old
+        assert!(detector.check_and_advance("did:dht:alice", 4, 4000)); // new
     }
 
     #[test]
     fn replay_detector_tracks_authors_independently() {
         let mut detector = BroadcastReplayDetector::new();
-        assert!(detector.check_and_advance("did:dht:alice", 1));
-        assert!(detector.check_and_advance("did:dht:bob", 1));
-        assert!(!detector.check_and_advance("did:dht:alice", 1));
-        assert!(detector.check_and_advance("did:dht:bob", 2));
+        assert!(detector.check_and_advance("did:dht:alice", 1, 1000));
+        assert!(detector.check_and_advance("did:dht:bob", 1, 1000));
+        assert!(!detector.check_and_advance("did:dht:alice", 1, 1000));
+        assert!(detector.check_and_advance("did:dht:bob", 2, 2000));
+    }
+
+    #[test]
+    fn replay_detector_evicts_oldest_when_full() {
+        let mut detector = BroadcastReplayDetector::new();
+        // Fill to capacity.
+        for i in 0..super::REPLAY_DETECTOR_MAX_AUTHORS {
+            assert!(detector.check_and_advance(&format!("did:dht:author-{i}"), 1, i as u64));
+        }
+        // The oldest entry (timestamp 0 = "did:dht:author-0") should be evicted.
+        assert!(detector.check_and_advance("did:dht:new-author", 1, 20_000));
+        assert_eq!(detector.last_seen("did:dht:author-0"), None);
+        assert_eq!(detector.last_seen("did:dht:new-author"), Some(1));
     }
 
     // -----------------------------------------------------------------------

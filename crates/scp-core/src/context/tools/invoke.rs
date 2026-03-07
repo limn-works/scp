@@ -97,6 +97,23 @@ pub enum InvocationError {
         /// Description of the execution failure.
         message: String,
     },
+
+    /// The invoker's spending budget has been exceeded (§19.5, ADR-033).
+    ///
+    /// Returned when the context has an economic policy with a per-tool-invoke
+    /// cost and the invoker's cumulative spending would exceed their
+    /// governance-approved budget.
+    ///
+    /// Error code: `SCP-PERM-3030`.
+    #[error("budget exceeded for invoker \"{did}\": cost {cost}, remaining {remaining}")]
+    BudgetExceeded {
+        /// The DID that attempted invocation.
+        did: String,
+        /// The cost of the tool invocation.
+        cost: u64,
+        /// The remaining budget for the invoker.
+        remaining: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +230,7 @@ where
         execution_time_ms,
         input_hash,
         output_hash,
+        cost: None,
     };
 
     // 8. Return tool output and event.
@@ -329,6 +347,7 @@ where
         execution_time_ms,
         input_hash,
         output_hash,
+        cost: None,
     };
 
     Ok((output, event))

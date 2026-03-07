@@ -1506,6 +1506,7 @@ mod tests {
             threshold_value: 0,
             pruning_policy: None,
             governance_model_config: None,
+            economic_policy: None,
         }
     }
 

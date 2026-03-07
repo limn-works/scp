@@ -58,6 +58,7 @@ use sha2::{Digest, Sha256};
 use super::params::{Capability, ContextParams, ToolRegistration};
 use super::roles::ToolId;
 use super::tools::interface::ToolInterface;
+use crate::economy::types::{Amount, EconomicPolicy};
 use scp_event_log::{ContextId, Ed25519Signature};
 use scp_identity::DID;
 
@@ -613,6 +614,33 @@ pub enum GovernanceAction {
         /// Justification for the deadlock recovery.
         justification: DeadlockJustification,
     },
+    /// Set or update the context's economic policy (§19.3, ADR-033).
+    ///
+    /// Requires the economic policy to not be locked. If the new policy has
+    /// `locked: true`, the policy becomes immutable after this action.
+    SetEconomicPolicy {
+        /// The new economic policy to apply.
+        policy: EconomicPolicy,
+    },
+    /// Approve a spending authorization for a member (§19.5, ADR-033).
+    ///
+    /// Grants the specified member permission to spend up to `amount` in the
+    /// context's currency. The `purpose` field documents the reason for the
+    /// spend authorization.
+    ApproveSpend {
+        /// The DID of the member authorized to spend.
+        spender: DID,
+        /// The maximum amount authorized.
+        amount: Amount,
+        /// Human-readable purpose for the spending authorization.
+        purpose: String,
+    },
+    /// Lock the context's economic policy, making it immutable (§19.3).
+    ///
+    /// Once locked, the economic policy cannot be changed through governance.
+    /// The lock is itself immutable: once set, it cannot be reverted.
+    /// Requires an economic policy to already be set on the context.
+    LockEconomicPolicy,
 }
 
 // ---------------------------------------------------------------------------
@@ -2039,6 +2067,28 @@ mod tests {
             GovernanceAction::CreateChildContext {
                 params: Box::new(ContextParams::default()),
             },
+            GovernanceAction::SetEconomicPolicy {
+                policy: crate::economy::types::EconomicPolicy {
+                    locked: false,
+                    cost_schedule: crate::economy::types::CostSchedule {
+                        currency: crate::economy::types::CurrencyCode::from("USD"),
+                        per_message: Some(crate::economy::types::Amount::new(1)),
+                        per_tool_invoke: None,
+                        per_join: None,
+                        per_period: None,
+                        per_byte_stored: None,
+                    },
+                    payment_adapters: vec![],
+                    pricing_formula: None,
+                    payee: DID::from("did:dht:z6MkPayee"),
+                },
+            },
+            GovernanceAction::ApproveSpend {
+                spender: bob(),
+                amount: Amount::new(1000),
+                purpose: "tool costs".to_owned(),
+            },
+            GovernanceAction::LockEconomicPolicy,
         ];
 
         let sk = test_signing_key();
@@ -2613,5 +2663,74 @@ mod tests {
             result.unwrap_err(),
             GovernanceError::VerificationFailed(_)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Economic governance action tests — SingleAdmin (§19.3, ADR-033, #334)
+    // -----------------------------------------------------------------------
+
+    fn test_economic_policy() -> EconomicPolicy {
+        EconomicPolicy {
+            locked: false,
+            cost_schedule: crate::economy::types::CostSchedule {
+                currency: crate::economy::types::CurrencyCode::from("USD"),
+                per_message: Some(Amount::new(10)),
+                per_tool_invoke: Some(Amount::new(50)),
+                per_join: None,
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec!["x402".to_owned()],
+            pricing_formula: None,
+            payee: DID::from("did:dht:z6MkPayee"),
+        }
+    }
+
+    #[test]
+    fn single_admin_set_economic_policy() {
+        let admin = alice();
+        let mut engine = SingleAdminEngine::new(admin.clone());
+        let ctx = test_context(&admin);
+        let sk = test_signing_key();
+
+        let action = GovernanceAction::SetEconomicPolicy {
+            policy: test_economic_policy(),
+        };
+
+        let (proposal, events) = engine.propose(&admin, action, &ctx, &sk).unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Approved);
+        assert_eq!(events.len(), 3); // Created, VoteCast, Resolved
+    }
+
+    #[test]
+    fn single_admin_approve_spend() {
+        let admin = alice();
+        let mut engine = SingleAdminEngine::new(admin.clone());
+        let ctx = test_context(&admin);
+        let sk = test_signing_key();
+
+        let action = GovernanceAction::ApproveSpend {
+            spender: bob(),
+            amount: Amount::new(5000),
+            purpose: "tool invocation budget".to_owned(),
+        };
+
+        let (proposal, events) = engine.propose(&admin, action, &ctx, &sk).unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Approved);
+        assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn single_admin_lock_economic_policy() {
+        let admin = alice();
+        let mut engine = SingleAdminEngine::new(admin.clone());
+        let ctx = test_context(&admin);
+        let sk = test_signing_key();
+
+        let action = GovernanceAction::LockEconomicPolicy;
+
+        let (proposal, events) = engine.propose(&admin, action, &ctx, &sk).unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Approved);
+        assert_eq!(events.len(), 3);
     }
 }
