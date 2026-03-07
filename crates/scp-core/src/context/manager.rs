@@ -23,6 +23,7 @@ use super::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
     create_context as builder_create_context,
 };
+use super::governance::timeout::GovernanceTimeoutTask;
 use super::governance::{
     GovernanceAction, GovernanceProposal, ProposalId, ProposalStatus, PruningPolicy,
     RevocationScope,
@@ -253,6 +254,15 @@ struct PerContextState {
     threshold_value: u32,
     /// Pruning policy override (ADR-030 §6).
     pruning_policy: Option<PruningPolicy>,
+    /// Governance timeout task (SCP-271, ADR-031 §5).
+    ///
+    /// Runs a 60-second interval loop that checks pending proposals for
+    /// timeout, handles proposer/voter departures, and detects deadlock.
+    /// Starts when the context enters Active state; stops on close/drop.
+    /// The task is cancelled automatically via [`Drop`] on the
+    /// [`GovernanceTimeoutTask`] when the per-context state is dropped.
+    #[allow(dead_code)]
+    governance_timeout_task: GovernanceTimeoutTask,
 }
 
 /// Reads the context state synchronously via [`ContextHandle::try_read_state`].
@@ -536,6 +546,7 @@ impl ContextManager {
             threshold_signers: ctx_snapshot.threshold_signers,
             threshold_value: ctx_snapshot.threshold_value,
             pruning_policy: ctx_snapshot.pruning_policy,
+            governance_timeout_task: GovernanceTimeoutTask::new(),
         };
 
         {
@@ -743,6 +754,7 @@ impl ContextManager {
             threshold_signers: Vec::new(),
             threshold_value: 0,
             pruning_policy: None,
+            governance_timeout_task: GovernanceTimeoutTask::new(),
         };
 
         // Atomic duplicate check + insert under lock -- no .await inside this scope.

@@ -46,6 +46,7 @@
 pub mod majority;
 pub mod mls_integration;
 pub mod multisig;
+pub mod timeout;
 pub mod unanimity;
 
 use std::collections::HashMap;
@@ -892,6 +893,15 @@ pub enum GovernanceEvent {
         proposal_id: ProposalId,
         status: ProposalStatus,
     },
+    /// Deadlock recovery was triggered (ADR-031 §10).
+    ///
+    /// Logged when a `ReconfigureGovernance` proposal is approved via
+    /// fallback quorum (majority-of-active). Records the justification
+    /// and the governance parameter changes applied.
+    DeadlockRecovery {
+        justification: DeadlockJustification,
+        changes: Vec<GovernanceReconfigAction>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1029,6 +1039,51 @@ pub trait GovernanceEngine: Send + Sync {
 
     /// Look up a proposal by ID. Returns `None` if not found.
     fn get_proposal(&self, proposal_id: &ProposalId) -> Option<&GovernanceProposal>;
+
+    /// Return the IDs of all pending proposals.
+    ///
+    /// Used by the [`GovernanceTimeoutTask`](super::governance::timeout::GovernanceTimeoutTask)
+    /// to find proposals that may need timeout processing.
+    fn pending_proposal_ids(&self) -> Vec<ProposalId>;
+
+    /// Remove a voter's vote from a pending proposal due to departure.
+    ///
+    /// When an eligible voter leaves the context, their vote is removed from
+    /// the tally. This may change the resolution (ADR-031 §5). Returns the
+    /// updated status and any events produced by automatic resolution.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns `Ok(None)` for engines that do not support voter departure
+    /// handling (e.g., `SingleAdminEngine`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GovernanceError::ProposalNotFound`] if the proposal does not exist.
+    fn remove_departed_voter(
+        &mut self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        context: &GovernanceContext,
+    ) -> Result<(Option<ProposalStatus>, Vec<GovernanceEvent>), GovernanceError> {
+        let _ = (proposal_id, voter, context);
+        Ok((None, Vec::new()))
+    }
+
+    /// Invalidate a pending proposal.
+    ///
+    /// Used for proposer departure and epoch reset scenarios (ADR-031 §5).
+    /// Transitions a `Pending` proposal to `Invalidated` with the given reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GovernanceError::ProposalNotFound`] if the proposal does not exist.
+    /// Returns [`GovernanceError::ProposalNotPending`] if the proposal is not `Pending`.
+    fn invalidate_proposal(
+        &mut self,
+        proposal_id: &ProposalId,
+        reason: String,
+    ) -> Result<Vec<GovernanceEvent>, GovernanceError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1214,6 +1269,38 @@ impl GovernanceEngine for SingleAdminEngine {
 
     fn get_proposal(&self, proposal_id: &ProposalId) -> Option<&GovernanceProposal> {
         self.proposals.get(proposal_id)
+    }
+
+    fn pending_proposal_ids(&self) -> Vec<ProposalId> {
+        self.proposals
+            .iter()
+            .filter(|(_, p)| p.status.is_pending())
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    fn invalidate_proposal(
+        &mut self,
+        proposal_id: &ProposalId,
+        reason: String,
+    ) -> Result<Vec<GovernanceEvent>, GovernanceError> {
+        let proposal = self.proposals.get_mut(proposal_id).ok_or_else(|| {
+            GovernanceError::ProposalNotFound {
+                id: hex::encode(proposal_id),
+            }
+        })?;
+        if !proposal.status.is_pending() {
+            return Err(GovernanceError::ProposalNotPending {
+                status: format!("{:?}", proposal.status),
+            });
+        }
+        proposal.status = ProposalStatus::Invalidated {
+            reason: reason.clone(),
+        };
+        Ok(vec![GovernanceEvent::ProposalResolved {
+            proposal_id: *proposal_id,
+            status: ProposalStatus::Invalidated { reason },
+        }])
     }
 }
 
