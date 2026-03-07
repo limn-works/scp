@@ -45,6 +45,7 @@ use wasm_bindgen_futures::future_to_promise;
 
 use crate::context::WasmContextHandle;
 use crate::error::ScpWasmError;
+use crate::runtime;
 
 /// Maximum token lifetime: 24 hours in seconds (spec section 9.5).
 const MAX_EXPIRY_SECS: u64 = 24 * 60 * 60;
@@ -374,6 +375,38 @@ fn zbase32_decode(input: &str) -> Result<Vec<u8>, String> {
     }
 
     Ok(output)
+}
+
+/// Minimal z-base-32 encoder. Encodes bytes to z-base-32 strings as used in did:dht.
+///
+/// z-base-32 uses the alphabet `ybndrfg8ejkmcpqxot1uwisza345h769`.
+fn zbase32_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+
+    let mut bits: u64 = 0;
+    let mut bit_count: u32 = 0;
+    let mut output = String::new();
+
+    for &byte in input {
+        bits = (bits << 8) | u64::from(byte);
+        bit_count += 8;
+        while bit_count >= 5 {
+            bit_count -= 5;
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = ((bits >> bit_count) & 0x1f) as usize;
+            output.push(ALPHABET[idx] as char);
+            bits &= (1u64 << bit_count) - 1;
+        }
+    }
+
+    // Encode remaining bits (padded to 5 bits).
+    if bit_count > 0 {
+        #[allow(clippy::cast_possible_truncation)]
+        let idx = ((bits << (5 - bit_count)) & 0x1f) as usize;
+        output.push(ALPHABET[idx] as char);
+    }
+
+    output
 }
 
 // ---------------------------------------------------------------------------
@@ -763,6 +796,85 @@ fn verify_attenuation(
     Ok(())
 }
 
+/// Builds and signs a UCAN token.
+///
+/// Generates a fresh Ed25519 keypair, constructs the JWT header and payload,
+/// signs the token, and returns the `WasmUcanToken` handle.
+fn build_ucan_token(
+    creator_did: &str,
+    member_did: &str,
+    cap_strings: &[String],
+) -> Result<WasmUcanToken, String> {
+    use ed25519_dalek::Signer;
+
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let verifying_key = signing_key.verifying_key();
+
+    let issuer_did = if creator_did.is_empty() {
+        let pub_bytes = verifying_key.to_bytes();
+        format!("did:dht:z{}", zbase32_encode(&pub_bytes))
+    } else {
+        creator_did.to_owned()
+    };
+
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let now = now_secs();
+    let exp = now + 3600;
+
+    let payload = UcanPayload {
+        iss: issuer_did.clone(),
+        aud: member_did.to_owned(),
+        exp,
+        nbf: Some(now),
+        nnc: nonce.clone(),
+        att: cap_strings
+            .iter()
+            .map(|cap| Attenuation {
+                with: cap.clone(),
+                can: cap
+                    .rsplit_once(':')
+                    .map_or_else(|| "*".to_owned(), |(_, action)| action.to_owned()),
+            })
+            .collect(),
+        prf: Vec::new(),
+        fct: None,
+    };
+
+    let header = UcanHeader {
+        alg: "EdDSA".to_owned(),
+        typ: "JWT".to_owned(),
+        ucv: "0.10.0".to_owned(),
+    };
+
+    let header_json =
+        serde_json::to_vec(&header).map_err(|e| format!("header serialization failed: {e}"))?;
+    let payload_json =
+        serde_json::to_vec(&payload).map_err(|e| format!("payload serialization failed: {e}"))?;
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+    let signing_input = format!("{header_b64}.{payload_b64}");
+
+    let signature = signing_key.sign(signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+    let encoded_token = format!("{signing_input}.{sig_b64}");
+
+    let capabilities_json = serde_json::to_string(&cap_strings)
+        .map_err(|e| format!("capabilities serialization failed: {e}"))?;
+
+    let token_id = format!("tk-{}", &nonce[..8]);
+
+    #[allow(clippy::cast_precision_loss)]
+    Ok(WasmUcanToken {
+        token_id,
+        issuer: issuer_did,
+        audience: member_did.to_owned(),
+        capabilities_json,
+        expires_at: Some(exp as f64),
+        encoded: encoded_token,
+    })
+}
+
 /// Computes the CID of a token as the hex-encoded SHA-256 of the encoded JWT string.
 fn compute_token_cid(encoded: &str) -> String {
     let hash = Sha256::digest(encoded.as_bytes());
@@ -818,6 +930,9 @@ pub struct WasmUcanToken {
     /// Expiry timestamp (seconds since Unix epoch). `None` (JS `null`) if
     /// the token does not expire (not recommended for security).
     expires_at: Option<f64>,
+    /// The full encoded JWT string. Needed for revocation (revoke takes
+    /// the full token) and for delegation chain verification.
+    encoded: String,
 }
 
 #[wasm_bindgen]
@@ -859,6 +974,16 @@ impl WasmUcanToken {
     #[wasm_bindgen(getter, js_name = "expiresAt")]
     pub fn expires_at(&self) -> Option<f64> {
         self.expires_at
+    }
+
+    /// Returns the full encoded JWT string.
+    ///
+    /// Needed for revocation (`ucan_revoke` takes the full token) and
+    /// for delegation chain verification.
+    #[must_use]
+    #[wasm_bindgen(getter)]
+    pub fn encoded(&self) -> String {
+        self.encoded.clone()
     }
 }
 
@@ -1057,8 +1182,6 @@ pub fn ucan_mint(
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let _ = (context_id, member_did);
-
         // Validate each capability URI is parseable.
         for cap in &cap_strings {
             CapabilityUri::parse(cap).map_err(|e| {
@@ -1070,14 +1193,50 @@ pub fn ucan_mint(
             })?;
         }
 
-        Err(ScpWasmError::Permission {
-            message: "not yet connected to runtime -- UCAN minting requires a live context handle \
-                      wired to scp-core"
-                .to_owned(),
-            code: "SCP-PERM-3000".to_owned(),
+        // Read ceiling and creator_did from UCAN state. Sync first.
+        let (ceiling, creator_did) = with_ucan_state(&context_id, |state| {
+            Ok((state.ceiling.clone(), state.creator_did.clone()))
+        })
+        .map_err(|e| {
+            ScpWasmError::Permission {
+                message: e,
+                code: "SCP-PERM-3000".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        // Validate capabilities are within the context ceiling.
+        if !ceiling.is_empty() {
+            for cap in &cap_strings {
+                let parsed = CapabilityUri::parse(cap).map_err(|e| {
+                    ScpWasmError::Permission {
+                        message: format!("capability parse failed: {e}"),
+                        code: "SCP-PERM-3000".to_owned(),
+                    }
+                    .into_js()
+                })?;
+                let cap_name = parsed.capability_name();
+                if !ceiling.contains(&cap_name) {
+                    return Err(ScpWasmError::Permission {
+                        message: format!("capability outside ceiling: {cap_name}"),
+                        code: "SCP-PERM-3000".to_owned(),
+                    }
+                    .into_js()
+                    .into());
+                }
+            }
         }
-        .into_js()
-        .into())
+
+        // Build and sign the UCAN token.
+        let token = build_ucan_token(&creator_did, &member_did, &cap_strings).map_err(|e| {
+            ScpWasmError::Permission {
+                message: e,
+                code: "SCP-PERM-3000".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        Ok(JsValue::from(token))
     })
 }
 
@@ -1105,17 +1264,37 @@ pub fn ucan_mint(
 #[wasm_bindgen]
 pub fn ucan_revoke(context: &WasmContextHandle, token: String) -> Promise {
     let context_id = context.context_id();
-    future_to_promise(async move {
-        let _ = (context_id, token);
 
-        Err(ScpWasmError::Permission {
-            message:
-                "not yet connected to runtime -- UCAN revocation requires a live context handle \
-                      wired to scp-core"
-                    .to_owned(),
-            code: "SCP-PERM-3000".to_owned(),
-        }
-        .into_js()
-        .into())
+    // Sync context state from handle before revocation.
+    sync_context_state(context);
+
+    future_to_promise(async move {
+        // Compute the CID of the token. Both ucan_revoke and ucan_validate
+        // MUST hash the same input — the full JWT string.
+        // See `.docs/lessons/wasm-cid-consistency.md`.
+        let cid = compute_token_cid(&token);
+
+        // Add to the per-context revocation list.
+        with_ucan_state(&context_id, |state| {
+            state.revoked_cids.insert(cid.clone());
+            Ok(())
+        })
+        .map_err(|e| {
+            ScpWasmError::Permission {
+                message: e,
+                code: "SCP-PERM-3000".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        // Also add to the runtime registry's revoked_tokens set for
+        // consistency with the context runtime state.
+        runtime::with_context(&context_id, |rt| {
+            rt.revoked_tokens.insert(cid);
+            Ok(())
+        })
+        .map_err(ScpWasmError::into_js)?;
+
+        Ok(JsValue::UNDEFINED)
     })
 }
