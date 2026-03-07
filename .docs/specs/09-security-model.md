@@ -385,8 +385,18 @@ Note: the `claim` field uses compact JSON with no whitespace (equivalent to Pyth
 | 2 | `requester_did` | 4-byte BE length + UTF-8 bytes |
 | 3 | `timestamp` | 8-byte BE u64 |
 | 4 | `wrapping_pubkey` | 32 bytes (X25519 public key) |
+| 5 | `nonce` | 16 bytes (random, unique per request) |
 
 **UCAN signing:** EdDSA (Ed25519) per UCAN specification. The nonce field (`nnc`) is mandatory and must be unique per token issuance. This prevents UCAN token replay. UCAN token expiry (`exp`) MUST NOT exceed 24 hours (matching the nonce deduplication cache window in §9.8.2). Tokens with longer expiry could be replayed after nonce cache eviction. **UCAN revocation** is per-context via `RevocationList` — an append-only map of token CIDs to revocation states (Active, RevocationPending, Revoked). Revocations are distributed as MLS application messages to all context members. Revocation check is step 10 of the 11-step validation pipeline (ADR-016) and is performed on every capability exercise. The system is **fail-closed**: tokens in `RevocationPending` state (revocation initiated but not yet confirmed via MLS) are denied. See ADR-016 criterion 7 and `scp-core/crypto/ucan/revoke.rs` for the full specification.
+
+**UCAN CID computation.** UCAN tokens are identified by Content Identifiers (CIDs) in the `RevocationList` and in delegation chain `prf` references. CID computation MUST use the following parameters:
+
+- **CID version:** CIDv1 (multicodec prefix `0x01`).
+- **Hash algorithm:** SHA-256 (multihash code `0x12`, digest length 32 bytes).
+- **Content codec:** DAG-CBOR (`0x71`). The UCAN payload (header + claims, excluding the signature) is serialized to canonical CBOR (RFC 8949 deterministic encoding, §4.2) before hashing. This ensures that CIDs are computed over a deterministic byte representation regardless of the original token encoding (JWT string vs. binary).
+- **Serialization order for CID computation:** The UCAN payload fields are serialized in lexicographic key order per DAG-CBOR conventions: `att`, `aud`, `exp`, `fct` (if present), `iss`, `nbf` (if present), `nnc`, `prf`. This is the canonical field set from UCAN 0.10+.
+- **Multibase encoding:** `base32lower` (multibase prefix `b`) for display and logging. Raw CID bytes (no multibase prefix) for wire format in `RevocationList` entries, `prf` references, and MLS application messages.
+- **Implementation note:** The CID is computed over the UCAN payload only (not the full JWT including the signature), because the payload uniquely identifies the token's claims and the signature is verifiable separately. Two tokens with identical payloads but different signatures (e.g., reissued after key rotation) produce the same CID — this is intentional and ensures that revocations target the claim content, not the cryptographic binding.
 
 **Why single ciphersuite:** Ciphersuite negotiation adds complexity and introduces downgrade attack vectors. For v1, every implementation uses exactly these algorithms. Future protocol versions may introduce additional ciphersuites with a secure negotiation mechanism, but v1 prioritizes simplicity and auditability.
 
@@ -655,6 +665,38 @@ Checkpoints are sent as regular MLS application messages (encrypted, authenticat
 
 **Sybil-amplified equivocation defense:** The Relay Consistency Protocol is NOT a majority vote. ANY divergence between ANY two honest members detects equivocation. An attacker who controls Sybil members and a relay can make the Sybil members confirm the attacker's version, but this is irrelevant — two honest members comparing checkpoints will detect the equivocation regardless of how many Sybils agree with the attacker. The defense requires only two honest members in the context.
 
+**Equivocation response protocol.** When equivocation is detected (divergent Merkle roots at the same event count between two honest members), the detecting member initiates the following response:
+
+1. **EquivocationAlert event.** The detector publishes an `EquivocationAlert` as an MLS application message, signed by the detector's Active Signing Key or Agent Signing Key (ADR-039):
+
+```
+EquivocationAlert {
+  detector_did:         DID
+  context_id:           String
+  relay_url:            String              // the relay suspected of equivocation
+  local_checkpoint:     ConsistencyCheckpoint
+  divergent_checkpoint: ConsistencyCheckpoint  // the checkpoint that diverges
+  conflicting_hashes:   Vec<[u8; 32]>       // event hashes where logs diverge
+  proof:                Vec<MerkleProof>     // inclusion proofs for the conflicting events
+  timestamp:            DateTime
+  signature:            Ed25519Signature     // signed by detector's #active or #agent key
+}
+```
+
+The signature covers `context_id || detector_did || relay_url || local_checkpoint.merkleRoot || divergent_checkpoint.merkleRoot || timestamp` using the canonical signed structure format (§9.5.2). The `proof` field includes Merkle inclusion proofs for the conflicting events from both the detector's and the divergent member's logs, enabling independent verification by any group member.
+
+2. **Alert distribution.** The `EquivocationAlert` is distributed to all context members as a standard MLS application message (encrypted, authenticated). Every member's SDK processes the alert independently.
+
+3. **Governance response.** The context's governance engine processes the `EquivocationAlert`. The response is configurable per context via `equivocation_policy` in context parameters:
+
+   - `warn` — Log the alert and notify the application layer. No automated enforcement. Suitable for low-stakes contexts where equivocation may be benign (e.g., relay software bugs).
+   - `suspend_relay` (default) — Mark the suspected relay as untrusted in the context's relay set. Members MUST stop publishing to and subscribing from the suspected relay for this context. Members migrate to alternative relays in the context's relay set. If no alternative relays are available, the context enters a degraded state and members are notified.
+   - `remove_relay` — Permanently remove the suspected relay from the context's relay set via a governance action (`UpdateRelaySet`). Requires governance authority (admin or vote depending on governance model).
+
+4. **Trust score impact.** The equivocating relay's trust score (§9.3) is reduced. Members who operate relay infrastructure and whose relay is implicated in equivocation receive a `RelayEquivocationViolation` record in the `ViolationStore` (ADR-039). This violation is durable and affects the operator's trust score across all contexts where other members observe the violation record.
+
+5. **Member-initiated equivocation.** If equivocation is attributed to a member (e.g., a member publishes conflicting events to different relays intentionally), the governance engine processes it as a member violation. The configurable response is: `warn` (log only), `suspend_write` (suspend the equivocating member's write access pending admin review — this is the default), or `remove` (remove the member from the context via MLS Remove proposal). Write suspension is implemented by the governance engine adding the member's DID to a `write_suspended` set; the SDK checks this set before accepting application messages from that member and rejects messages from suspended members with an `EquivocationSuspension` error. The suspension is recorded as an `EventType::MemberWriteSuspended { did, reason: "equivocation" }` in the context event log.
+
 ### 9.9.4 Selective Suppression of MLS Commits
 
 A specific relay attack: suppress an MLS Remove Commit to keep an excluded member in the group.
@@ -712,7 +754,27 @@ Pad plaintext to the next bucket boundary before encryption to prevent message s
 
 **Bucket sizes:** 256B, 1KB, 4KB, 16KB, 64KB, 256KB.
 
-Messages larger than 256KB are chunked into 256KB blocks. Padding happens below the application layer and above the transport layer — the SDK handles it transparently. Application developers never see it. Relay operators see uniform bucket-sized blobs.
+Messages larger than 256KB are chunked. Padding happens below the application layer and above the transport layer — the SDK handles it transparently. Application developers never see it. Relay operators see uniform bucket-sized blobs.
+
+**Chunking protocol.** When a padded message exceeds the relay's `max_blob_size` (or 256KB if the relay does not advertise a limit), the SDK splits it into chunks before encryption:
+
+```
+ChunkEnvelope {
+  chunk_id:      [u8; 16]   // random, unique per logical message
+  sequence:      u32         // 0-indexed chunk position
+  total_chunks:  u32         // total number of chunks in this message
+  payload:       Vec<u8>     // chunk payload (plaintext fragment)
+}
+```
+
+1. **Splitting.** The SDK generates a random 16-byte `chunk_id` per logical message. The padded plaintext is split into fragments whose size does not exceed the relay's `max_blob_size`. Each fragment is wrapped in a `ChunkEnvelope` with its `sequence` index and the `total_chunks` count.
+2. **Individual encryption.** Each `ChunkEnvelope` is independently encrypted as a separate MLS application message (in encrypted contexts) or a separate sender-key-encrypted message (in broadcast contexts). This means each chunk is individually authenticated (inner signature + MLS membership_tag or sender key AEAD) and individually padded to the nearest bucket boundary (§9.10.3). Individual encryption ensures that a relay cannot correlate chunks by ciphertext similarity — each chunk is an opaque, independently-sized blob.
+3. **Transmission.** Chunks are published as separate relay blobs. The relay treats each chunk as an independent message. Chunks MAY be published to different relays in the context's relay set for redundancy.
+4. **Reassembly.** The recipient decrypts each chunk individually, then reassembles by `chunk_id` + `sequence` ordering. The recipient maintains a per-`chunk_id` reassembly buffer.
+5. **Reassembly timeout.** The recipient MUST discard incomplete chunk sets (not all `total_chunks` received) after 60 seconds from receipt of the first chunk in the set. This prevents resource exhaustion from partial chunk deliveries.
+6. **Maximum chunks per message.** A single logical message MUST NOT exceed 256 chunks. Messages requiring more than 256 chunks MUST use out-of-band blob storage with an in-band reference (§10.6). This bounds the reassembly buffer to 256 entries per in-flight message.
+7. **Maximum chunk payload size.** Each chunk's `payload` size MUST NOT exceed the relay's advertised `max_blob_size` (from `.well-known/scp` relay_config, §10.5.1). If the relay does not advertise a limit, the default maximum chunk payload size is 256KB.
+8. **Chunk authentication.** Because each chunk is a separate MLS/sender-key message, chunk forgery and chunk replay are prevented by the same mechanisms as regular messages (§9.8.1, §9.8.2). A chunk with a mismatched `total_chunks` (e.g., an attacker injects a chunk claiming `total_chunks: 1` with a valid `chunk_id`) is detected because the reassembled plaintext will fail application-layer integrity checks (the original message includes a content hash in the envelope metadata).
 
 ### 9.10.4 Per-Context Pseudonyms
 
@@ -1091,7 +1153,7 @@ Content Encryption:
 
 **AES-256-GCM additional authenticated data (AAD).** Content encryption MUST bind `context_id` as AAD: `AAD = context_id || sender_did || sequence_number`. This prevents ciphertext from being moved between contexts or reordered within a context. The AEAD authentication tag provides integrity verification — no separate content hash is needed.
 
-**Access key request protocol.** `AccessKeyRequest` messages MUST include a signed payload: `{ context_id, requester_did, epoch, timestamp }` signed with the requester's Active Signing Key or Agent Signing Key (either `#active` or `#agent` is valid — ADR-039). The responder verifies the signature, checks the block list and revocation list, and responds with the HPKE-encrypted access key only if the requester is authorized. The timestamp prevents replay (requests older than 30 seconds are rejected).
+**Access key request protocol.** `AccessKeyRequest` messages MUST include a signed payload: `{ context_id, requester_did, epoch, timestamp, nonce }` signed with the requester's Active Signing Key or Agent Signing Key (either `#active` or `#agent` is valid — ADR-039). The `nonce` is a 16-byte random value, unique per request. The responder verifies the signature, checks the block list and revocation list, and responds with the HPKE-encrypted access key only if the requester is authorized. **Replay prevention:** The responder validates that the request timestamp is within 5 minutes of local time (consistent with the protocol-wide clock skew tolerance, §9.14) and that the `nonce` has not been previously seen. The responder maintains a nonce deduplication cache with a 5-minute TTL — nonces are single-use and cached for the duration of the validity window. Requests with expired timestamps or duplicate nonces are rejected. This replaces the previous 30-second window, which was inconsistent with the 5-minute clock skew tolerance (§9.14) — a 30-second window with 5-minute skew would reject legitimate requests from slightly-skewed clocks.
 
 ### 9.17.2 Access Key Lifecycle
 

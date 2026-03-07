@@ -295,6 +295,51 @@ Mobile devices need push notifications. On iOS the only mechanism is APNs (Apple
 - **The push service knows timing, not content or source.** Apple/Google learn when a device received a notification. They cannot determine which context, which sender, or even whether the notification corresponds to one message or many.
 - **A sovereign push alternative is desirable but not blocking.** If a mechanism emerges that enables push without platform gatekeepers, the protocol should adopt it. For now, this is an accepted constraint with the opacity guarantee limiting metadata exposure to timing only.
 
+### 10.7.1 Push Registration Protocol
+
+Clients register for push notifications with relays via the following wire protocol:
+
+**PushRegistration message:**
+
+```
+PushRegistration {
+  did:          DID                       // the registering identity
+  platform:     enum { APNS, FCM, WebPush }  // push service platform
+  token:        String                    // platform-specific push token (APNs device token, FCM registration token, WebPush endpoint URL)
+  contexts:     Vec<ContextId>            // contexts for which to receive push notifications (empty = all contexts on this relay)
+  timestamp:    DateTime                  // registration time
+  signature:    Ed25519Signature          // signed by the DID's Active Signing Key (#active)
+}
+```
+
+The signature covers `did || platform (1-byte tag: 0x01=APNS, 0x02=FCM, 0x03=WebPush) || token || contexts (length-prefixed concatenation) || timestamp` using the canonical signed structure format (§9.5.2).
+
+**Registration flow:**
+
+1. The client generates a `PushRegistration` message and signs it with the DID's Active Signing Key.
+2. The client sends the `PushRegistration` to the relay via a PUBLISH operation (ADR-004) with a reserved `routing_id` of `SHA-256("scp-push-registration" || relay_url)`.
+3. The relay verifies the signature against the DID's public key (resolved via DID document). Invalid signatures are rejected.
+4. The relay stores the registration, associating the push token with the DID and the listed context routing IDs.
+5. On new message arrival for a registered context (matching the routing IDs the DID subscribes to), the relay sends an opaque push notification to the registered token. The push payload is exactly `{ "scp": 1 }` — a wake signal with no content, no context, no sender, no metadata.
+6. The relay MUST rate-limit push notifications to at most one push per 30 seconds per device token to prevent push notification flooding.
+
+**Token refresh:** When the platform issues a new push token (e.g., APNs token rotation), the client sends a new `PushRegistration` with the updated token. The relay replaces the previous registration for that DID + platform combination. Registrations are idempotent — re-registering with the same token is a no-op.
+
+**PushDeregistration message:**
+
+```
+PushDeregistration {
+  did:          DID
+  platform:     enum { APNS, FCM, WebPush }
+  timestamp:    DateTime
+  signature:    Ed25519Signature          // signed by the DID's Active Signing Key (#active)
+}
+```
+
+The client sends a `PushDeregistration` to explicitly remove its push registration. The relay deletes the stored registration for the DID + platform combination. Implicit deregistration occurs when the relay observes push delivery failures (invalid token responses from APNs/FCM) — the relay MUST remove registrations after 3 consecutive delivery failures for the same token.
+
+**Relay-side storage:** Push registrations are stored in the relay's local state (not in the protocol's encrypted state). The relay operator can see which DIDs have registered for push and their platform tokens — this is an accepted tradeoff, equivalent to any push notification service. The push token itself does not reveal which contexts the DID participates in beyond the routing IDs the DID subscribes to (which the relay already knows from SUBSCRIBE operations).
+
 ## 10.8 Multi-Device
 
 Multi-device coordination — read state, session continuity, notification deduplication, device handoff — is a client-scope concern. The protocol provides the building blocks:
@@ -304,6 +349,24 @@ Multi-device coordination — read state, session continuity, notification dedup
 - **Encrypted envelopes** are available on relays for any device that holds the keys.
 
 How a client uses these to implement read markers, notification deduplication, or session handoff is the client's decision. A simple client might treat each device as independent. A sophisticated client might sync UI state through identity private state or through a dedicated coordination mechanism. The protocol delivers the same encrypted envelopes to all devices; the client decides how to present them.
+
+### 10.8.1 Multi-Device MLS Participation Model
+
+While client-level coordination (read markers, notification dedup) is a client-scope concern, MLS group membership for multiple devices is a protocol-level concern. Each device MUST have its own MLS leaf node — MLS does not support shared leaf nodes across devices (RFC 9420 §14).
+
+**Per-device MLS leaf nodes:**
+
+1. **Each device has its own MLS leaf.** A DID with N devices appears as N leaf nodes in every MLS group the DID participates in. Each device generates its own MLS leaf key (X25519) and maintains independent MLS epoch state.
+2. **Per-device KeyPackages.** Each device generates its own KeyPackages, signed by the DID's Active Signing Key (`#active`). The KeyPackage's credential contains the DID (shared across devices) plus a `device_id` field (a random 16-byte identifier, stable per device) in the LeafNode extensions. This enables other members to distinguish leaf nodes belonging to the same DID.
+3. **Governance counting.** For governance purposes (voting, quorum, role assignment), a DID with N devices counts as ONE participant, not N. The governance engine deduplicates by DID — it does not matter how many leaf nodes a DID has. This prevents multi-device users from gaining disproportionate governance weight.
+4. **Sender key and access key sharing.** Sender keys (§9.16) and access keys (§9.17) are per-DID, not per-device. All devices for a DID share the same sender key and access key. When a device requests a sender key (§9.16.2), the key holder responds to the DID — any of the DID's devices can decrypt the response using the DID's wrapping key (which is also per-DID, stored in KeyCustody and synchronized across devices via identity private state, §3.7).
+
+**Device list management:**
+
+5. **Device list in DID document.** The DID document MAY include a `devices` service endpoint listing active device IDs. This is informational — group members use MLS group state (which leaf nodes exist) as the authoritative device list for a DID. The `devices` endpoint enables pre-join device enumeration (e.g., to determine how many KeyPackages to fetch when adding a new member).
+6. **Adding a new device.** When a user adds a new device: (a) the new device generates an MLS leaf key and publishes KeyPackages to relays, (b) an existing device (which is already a group member) sends an MLS Add proposal for the new device's KeyPackage in each active context, (c) the group processes the Add via a Commit, and the new device receives a Welcome message. The existing device coordinates this — the new device cannot add itself because it is not yet a group member.
+7. **Removing a device.** When a device is decommissioned: (a) an existing device or context admin sends an MLS Remove proposal for the departing device's leaf node, (b) the group processes the Remove via a Commit, advancing the epoch and revoking the removed device's access to future messages. If the removed device was the last device for a DID, the DID is effectively removed from the group.
+8. **Device limit.** A single DID MUST NOT have more than 10 active devices in any single MLS group. This bounds the leaf node overhead per participant. SDKs MUST reject Add proposals that would exceed this limit.
 
 ## 10.9 Real-Time and Async
 
@@ -320,7 +383,13 @@ The SDK provides the transport abstraction and envelope delivery. Whether that d
 Real-time media (voice, video, screen sharing) has different performance requirements than messaging. The full SCP message pipeline — sender-side encryption, MLS group encryption, fixed bucket padding, store-and-forward relay delivery — adds per-frame overhead and latency incompatible with real-time media at 30-60fps. Media transport uses a delegated model:
 
 1. **Context establishes the session.** The context provides identity (who's in the call), trust (are they authorized), governance (does the context allow media), and membership enforcement. All of this happens through the standard SCP message pipeline.
-2. **MLS derives media session keys.** The MLS group's key schedule exports keying material for the media session (MLS exporter, RFC 9420 §8). This binds the media encryption to the context's group state — only current members can derive the keys.
+2. **MLS derives media session keys.** The MLS group's key schedule exports keying material for the media session via the MLS exporter (RFC 9420 §8.5). Key derivation parameters:
+   - **Exporter label:** `"scp-media-key-v1"`
+   - **Exporter context:** `context_id || session_id` where `session_id` is a random 16-byte value generated by the session initiator and distributed to participants via the SCP signaling message (step 4). The `context_id` is length-prefixed (4-byte BE length + UTF-8 bytes) and `session_id` is exactly 16 bytes. This binds the exported key to both the context and the specific media session.
+   - **Key length:** 32 bytes (256 bits, suitable for AES-256).
+   - **DTLS-SRTP binding:** The 32-byte exported key is used as the DTLS-SRTP external PSK (pre-shared key) via the `external_psk_identity` extension (RFC 8446 §4.2.11). DTLS-SRTP negotiation uses this PSK to establish the SRTP master key, binding the media encryption to the MLS group state. Only current MLS group members can derive the PSK — non-members cannot decrypt media.
+   - **Key rotation:** The media session key MUST be re-derived on every MLS epoch change (Commit processing). When the MLS epoch advances, all participants independently re-export the key using the new epoch's key schedule with the same label and context. The DTLS-SRTP session is rekeyed with the new derived key via a DTLS KeyUpdate. This ensures that members removed from the MLS group (who triggered the epoch advance) lose media decryption access immediately.
+   - **Session ID distribution:** The session initiator generates `session_id` and includes it in the `MediaSessionStart` signaling message (step 4). All participants use this `session_id` for key derivation, ensuring they derive the same key.
 3. **Media flows over WebRTC.** DTLS-SRTP handles the actual media encryption and transport, using keys derived from step 2. Media frames flow peer-to-peer (or through a WebRTC SFU) without passing through SCP relays or the MLS encryption pipeline. WebRTC provides the low-latency, high-throughput transport that media requires.
 4. **Signaling goes through SCP.** WebRTC session negotiation (SDP offers/answers, ICE candidates) flows through the context as standard SCP messages. This means signaling is end-to-end encrypted, authenticated, and governed by the context — only members can initiate or join media sessions.
 
@@ -719,7 +788,19 @@ QUIC replaces WebSocket for native (non-browser) clients. Same relay, same Messa
 ### 10.14.2 Connection Lifecycle
 
 1. **Initial connection.** Client opens a QUIC connection to the relay using `quinn` (or equivalent QUIC implementation). TLS 1.3 is built into QUIC — no separate TLS handshake.
-2. **0-RTT resumption.** Resumed QUIC sessions use 0-RTT to send application data immediately without waiting for the handshake to complete, eliminating round-trip latency on reconnection. Session tickets are stored locally and rotated per the QUIC specification. 0-RTT data has no replay protection (RFC 9001 §9.2); SCP operations sent as 0-RTT MUST be idempotent or the relay MUST implement anti-replay measures.
+2. **0-RTT resumption.** Resumed QUIC sessions use 0-RTT to send application data immediately without waiting for the handshake to complete, eliminating round-trip latency on reconnection. Session tickets are stored locally and rotated per the QUIC specification. 0-RTT data has no replay protection from the transport layer (RFC 9001 §9.2). SCP specifies the following 0-RTT safety classification:
+
+   **0-RTT-safe operations (idempotent — MAY be sent as 0-RTT data):**
+   - `SUBSCRIBE` — subscribing to a routing ID is idempotent; duplicate subscriptions are no-ops.
+   - `QUERY` — read-only queries produce the same result regardless of replay.
+   - `PING` — keepalive, inherently idempotent.
+
+   **0-RTT-unsafe operations (non-idempotent — MUST NOT be sent as 0-RTT data):**
+   - `PUBLISH` — publishing a message is not idempotent; replaying a PUBLISH creates duplicate blobs on the relay. Clients MUST wait for the 1-RTT handshake to complete before sending PUBLISH operations.
+   - `DELETE` — while semantically idempotent (deleting an already-deleted blob is a no-op), DELETE carries authorization implications and MUST NOT be sent in 0-RTT to prevent replay-based deletion attacks.
+   - `UNSUBSCRIBE` — replaying an UNSUBSCRIBE could cancel a subscription established after the original UNSUBSCRIBE.
+
+   **Relay enforcement:** Relays MUST reject 0-RTT-unsafe operations received as 0-RTT data with an error response (`{ op: "ERR", code: 4010, message: "operation not permitted in 0-RTT" }`). The client MUST retry the operation after the 1-RTT handshake completes. Relays that accept 0-RTT data MUST additionally maintain a nonce-based anti-replay cache as defense-in-depth: each 0-RTT QUIC packet's `client_initial` is cached (keyed by the session ticket + packet number) with a TTL of 10 minutes. Duplicate 0-RTT packets are silently dropped.
 3. **Connection migration.** When the client's IP address changes (e.g., WiFi → cellular), QUIC migrates the connection without closing it. Active subscription streams continue uninterrupted. This is critical for mobile profiles where network transitions are frequent.
 4. **Reconnection.** On connection loss, the client uses profile-aware exponential backoff (§10.13.1). After reconnection, the client re-opens subscription streams with `since = last_received_stored_at - 5s` overlap (same gap-fill strategy as WebSocket, per ADR-004).
 5. **Keepalive.** QUIC's native PING frame mechanism (RFC 9000 §19.2) replaces WebSocket PING/PONG. PING frames are ack-eliciting, resetting the idle timeout. No application-level keepalive is needed.
