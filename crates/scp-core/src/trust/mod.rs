@@ -47,7 +47,10 @@
 //! - [`ChallengeRequest`] -- Challenge request for capability verification.
 //! - [`ChallengeResponse`] -- Response to a challenge request.
 //! - [`ChallengeVerification`] -- Result of verifying a challenge response.
-//! - [`ChallengeType`] -- Standard and custom challenge types.
+//! - [`AgentCapabilityUri`] -- Validated agent capability URI (ADR-041).
+//! - [`CapabilityUriError`] -- Error type for capability URI parsing.
+//! - [`RegistryEntry`] -- Metadata for a registered protocol capability.
+//! - [`ChallengeType`] -- URI-based challenge types (unified with `AgentCapabilityUri`).
 //! - [`VerificationMethod`] -- Self-attested vs challenge-verified.
 //! - [`ChallengeSigner`] -- Trait for signing challenge requests.
 //! - [`RenewalError`] -- Error type for attestation renewal.
@@ -62,6 +65,8 @@
 
 pub mod aggregate;
 pub mod attestation;
+pub mod capability_registry;
+pub mod capability_uri;
 pub mod challenge;
 pub mod consequence;
 pub mod custody_violation;
@@ -83,6 +88,11 @@ pub use attestation::{
 // ParticipationRecord and compute_participation_record are not part of
 // the public API. The module is pub(crate); the testing feature gate
 // re-exports compute_participation_record for integration tests.
+pub use capability_registry::{
+    RegistryEntry, is_known_protocol_capability, lookup_protocol_capability,
+    lookup_system_capability, validate_capability_uri,
+};
+pub use capability_uri::{AgentCapabilityUri, CapabilityUriError};
 pub use challenge::{
     ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,
     VerificationMethod, issue_challenge, verify_challenge_response,
