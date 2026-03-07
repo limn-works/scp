@@ -47,7 +47,10 @@
 //! - [`ChallengeRequest`] -- Challenge request for capability verification.
 //! - [`ChallengeResponse`] -- Response to a challenge request.
 //! - [`ChallengeVerification`] -- Result of verifying a challenge response.
-//! - [`ChallengeType`] -- Standard and custom challenge types.
+//! - [`CapabilityUri`] -- Validated agent capability URI (ADR-041).
+//! - [`CapabilityUriError`] -- Error type for capability URI parsing.
+//! - [`RegistryEntry`] -- Metadata for a registered protocol capability.
+//! - [`ChallengeType`] -- URI-based challenge types (unified with `CapabilityUri`).
 //! - [`VerificationMethod`] -- Self-attested vs challenge-verified.
 //! - [`ChallengeSigner`] -- Trait for signing challenge requests.
 //! - [`RenewalError`] -- Error type for attestation renewal.

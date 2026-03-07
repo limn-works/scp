@@ -661,9 +661,9 @@ mod tests {
             challenge_id: challenge_id.to_owned(),
             challenger_did: "did:key:challenger".into(),
             responder_did: responder.into(),
-            challenge_type: ChallengeType::SchemaValidation,
+            challenge_type: ChallengeType::schema_validation(),
             verification_method: VerificationMethod::ChallengeVerified {
-                challenge_type: ChallengeType::SchemaValidation,
+                challenge_type: ChallengeType::schema_validation(),
             },
             result: serde_json::json!({"passed": true}),
             completed_at,

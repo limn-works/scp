@@ -1,8 +1,9 @@
 //! Challenge-response protocol for trust verification.
 //!
 //! Enables verification of testable capabilities through a structured
-//! challenge-response flow. Standard challenge suites include prompt injection
-//! resistance, schema validation, and rate limit compliance.
+//! challenge-response flow. Challenge types are identified by
+//! [`CapabilityUri`] (ADR-041), unifying the previously separate
+//! `ChallengeType` variants with the protocol capability registry.
 //!
 //! # Flow
 //!
@@ -20,7 +21,8 @@
 //! capabilities (validated through this protocol). This distinction is
 //! captured in [`VerificationMethod`].
 //!
-//! See ADR-017 acceptance criteria 4-5 in `.docs/adrs/phase-4.md`.
+//! See ADR-017 acceptance criteria 4-5 in `.docs/adrs/phase-4.md` and
+//! ADR-041 acceptance criterion 3 for `ChallengeType` unification.
 
 use std::time::Duration;
 
@@ -33,43 +35,137 @@ use scp_identity::cache::Clock;
 
 use super::TrustError;
 use super::attestation::DidPublicKeyResolver;
+use super::capability_uri::CapabilityUri;
 
 // ---------------------------------------------------------------------------
 // ChallengeType
 // ---------------------------------------------------------------------------
 
-/// The type of challenge to issue.
+/// The type of challenge to issue, identified by an [`CapabilityUri`].
 ///
-/// Standard challenge suites cover common capability categories. Custom
-/// challenges allow context-specific verification.
+/// Replaces the former enum variants (`PromptInjectionResistance`,
+/// `SchemaValidation`, `RateLimitCompliance`, `Custom(String)`) with a
+/// single URI-based variant per ADR-041 acceptance criterion 3.
 ///
-/// See ADR-017 acceptance criterion 4.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// # Legacy Mapping
+///
+/// | Old Variant                    | URI                                              |
+/// |-------------------------------|--------------------------------------------------|
+/// | `PromptInjectionResistance`    | `scp:capability:prompt-injection-resistance/v1`  |
+/// | `SchemaValidation`             | `scp:capability:schema-validation/v1`            |
+/// | `RateLimitCompliance`          | `scp:capability:rate-limit-compliance/v1`        |
+/// | `Custom("name")`              | DID-scoped or protocol URI                       |
+///
+/// # Serialization
+///
+/// Serializes as the URI string. Deserializes from both URI strings and
+/// legacy variant names (backwards-compatible).
+///
+/// See ADR-041 in `.docs/adrs/phase-4.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ChallengeType {
-    /// Tests whether the subject resists prompt injection attacks.
-    ///
-    /// Parameters should include test prompts and expected behavior. The
-    /// response result should indicate pass/fail for each injection vector.
-    PromptInjectionResistance,
+    /// A challenge type identified by a validated capability URI.
+    Uri(CapabilityUri),
+}
 
-    /// Tests whether the subject correctly validates schemas.
+impl ChallengeType {
+    /// Creates a `ChallengeType` from a legacy variant name string.
     ///
-    /// Parameters should include schemas and test payloads (both valid and
-    /// invalid). The response result should indicate validation outcomes.
-    SchemaValidation,
+    /// Maps the three former enum variant names to their protocol URIs:
+    /// - `"PromptInjectionResistance"` → `scp:capability:prompt-injection-resistance/v1`
+    /// - `"SchemaValidation"` → `scp:capability:schema-validation/v1`
+    /// - `"RateLimitCompliance"` → `scp:capability:rate-limit-compliance/v1`
+    ///
+    /// Returns `None` for unrecognized legacy names.
+    #[must_use]
+    pub fn from_legacy(name: &str) -> Option<Self> {
+        match name {
+            "PromptInjectionResistance" => Some(Self::prompt_injection_resistance()),
+            "SchemaValidation" => Some(Self::schema_validation()),
+            "RateLimitCompliance" => Some(Self::rate_limit_compliance()),
+            _ => None,
+        }
+    }
 
-    /// Tests whether the subject complies with rate limits.
-    ///
-    /// Parameters should specify the rate limit and observation window. The
-    /// response result should demonstrate that the subject stays within
-    /// limits.
-    RateLimitCompliance,
+    /// Convenience constructor for prompt injection resistance challenges.
+    #[must_use]
+    pub fn prompt_injection_resistance() -> Self {
+        Self::Uri(CapabilityUri::Protocol {
+            name: "prompt-injection-resistance".to_owned(),
+            version: 1,
+        })
+    }
 
-    /// A custom challenge type identified by a string key.
-    ///
-    /// Allows context-specific challenge definitions beyond the standard
-    /// suites.
-    Custom(String),
+    /// Convenience constructor for schema validation challenges.
+    #[must_use]
+    pub fn schema_validation() -> Self {
+        Self::Uri(CapabilityUri::Protocol {
+            name: "schema-validation".to_owned(),
+            version: 1,
+        })
+    }
+
+    /// Convenience constructor for rate limit compliance challenges.
+    #[must_use]
+    pub fn rate_limit_compliance() -> Self {
+        Self::Uri(CapabilityUri::Protocol {
+            name: "rate-limit-compliance".to_owned(),
+            version: 1,
+        })
+    }
+
+    /// Returns a reference to the inner [`CapabilityUri`].
+    #[must_use]
+    pub const fn uri(&self) -> &CapabilityUri {
+        let Self::Uri(uri) = self;
+        uri
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Serialize / Deserialize (backwards-compatible)
+// ---------------------------------------------------------------------------
+
+impl Serialize for ChallengeType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Self::Uri(uri) = self;
+        serializer.serialize_str(&uri.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ChallengeType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+
+        // Try legacy variant names first (backwards compatibility).
+        if let Some(ct) = Self::from_legacy(&s) {
+            return Ok(ct);
+        }
+
+        // Try legacy Custom format: "Custom:name"
+        if let Some(custom_name) = s.strip_prefix("Custom:") {
+            // Legacy Custom strings that use scp:capability:* prefix must be
+            // rejected — they would bypass registry validation.
+            if custom_name.starts_with("scp:capability:") {
+                return Err(serde::de::Error::custom(format!(
+                    "legacy Custom string uses reserved scp:capability:* prefix: {custom_name}"
+                )));
+            }
+            // Try to parse as a capability URI directly.
+            if let Ok(uri) = custom_name.parse::<CapabilityUri>() {
+                return Ok(Self::Uri(uri));
+            }
+            // Legacy unstructured custom strings can't be represented as
+            // CapabilityUri — reject them.
+            return Err(serde::de::Error::custom(format!(
+                "legacy Custom string '{custom_name}' is not a valid capability URI"
+            )));
+        }
+
+        // Try parsing as a capability URI.
+        let uri: CapabilityUri = s.parse().map_err(serde::de::Error::custom)?;
+        Ok(Self::Uri(uri))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -230,7 +326,7 @@ const DOMAIN_CHALLENGE_RESP_V1: &[u8] = b"SCP-CHALLENGE-RESP-V1:";
 /// Builds the canonical byte representation of a challenge request for signing.
 ///
 /// The canonical form is: `"SCP-CHALLENGE-REQ-V1:" || challenge_id
-/// || challenge_type || challenger_did || subject_did || parameters
+/// || challenge_type_uri || challenger_did || subject_did || parameters
 /// || timeout_secs`. The domain separator prevents cross-protocol signature
 /// confusion. This ensures signatures cover all semantically meaningful
 /// fields.
@@ -272,14 +368,12 @@ fn canonical_challenge_response_bytes(response: &ChallengeResponse) -> Vec<u8> {
     bytes
 }
 
-/// Returns a deterministic string tag for a challenge type.
+/// Returns the canonical URI string for a challenge type.
+///
+/// Used as the type tag in canonical byte construction for signatures.
 fn challenge_type_tag(ct: &ChallengeType) -> String {
-    match ct {
-        ChallengeType::PromptInjectionResistance => "PromptInjectionResistance".to_owned(),
-        ChallengeType::SchemaValidation => "SchemaValidation".to_owned(),
-        ChallengeType::RateLimitCompliance => "RateLimitCompliance".to_owned(),
-        ChallengeType::Custom(s) => format!("Custom:{s}"),
-    }
+    let ChallengeType::Uri(uri) = ct;
+    uri.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -525,6 +619,185 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // ChallengeType construction and from_legacy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_legacy_prompt_injection_resistance() {
+        let ct = ChallengeType::from_legacy("PromptInjectionResistance").unwrap();
+        assert_eq!(
+            ct,
+            ChallengeType::Uri(
+                "scp:capability:prompt-injection-resistance/v1"
+                    .parse()
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn from_legacy_schema_validation() {
+        let ct = ChallengeType::from_legacy("SchemaValidation").unwrap();
+        assert_eq!(
+            ct,
+            ChallengeType::Uri("scp:capability:schema-validation/v1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn from_legacy_rate_limit_compliance() {
+        let ct = ChallengeType::from_legacy("RateLimitCompliance").unwrap();
+        assert_eq!(
+            ct,
+            ChallengeType::Uri("scp:capability:rate-limit-compliance/v1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn from_legacy_unknown_returns_none() {
+        assert!(ChallengeType::from_legacy("Unknown").is_none());
+    }
+
+    #[test]
+    fn convenience_constructors() {
+        let pir = ChallengeType::prompt_injection_resistance();
+        let sv = ChallengeType::schema_validation();
+        let rlc = ChallengeType::rate_limit_compliance();
+
+        assert_eq!(
+            challenge_type_tag(&pir),
+            "scp:capability:prompt-injection-resistance/v1"
+        );
+        assert_eq!(
+            challenge_type_tag(&sv),
+            "scp:capability:schema-validation/v1"
+        );
+        assert_eq!(
+            challenge_type_tag(&rlc),
+            "scp:capability:rate-limit-compliance/v1"
+        );
+    }
+
+    #[test]
+    fn uri_accessor() {
+        let ct = ChallengeType::schema_validation();
+        let uri = ct.uri();
+        assert!(uri.is_protocol());
+        assert_eq!(uri.name(), "schema-validation");
+    }
+
+    // -----------------------------------------------------------------------
+    // Serialization / Deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn serialize_as_uri_string() {
+        let ct = ChallengeType::schema_validation();
+        let json = serde_json::to_string(&ct).unwrap();
+        assert_eq!(json, "\"scp:capability:schema-validation/v1\"");
+    }
+
+    #[test]
+    fn deserialize_from_uri_string() {
+        let ct: ChallengeType =
+            serde_json::from_str("\"scp:capability:schema-validation/v1\"").unwrap();
+        assert_eq!(ct, ChallengeType::schema_validation());
+    }
+
+    #[test]
+    fn deserialize_from_legacy_variant_name() {
+        let ct: ChallengeType = serde_json::from_str("\"PromptInjectionResistance\"").unwrap();
+        assert_eq!(ct, ChallengeType::prompt_injection_resistance());
+    }
+
+    #[test]
+    fn deserialize_from_legacy_schema_validation() {
+        let ct: ChallengeType = serde_json::from_str("\"SchemaValidation\"").unwrap();
+        assert_eq!(ct, ChallengeType::schema_validation());
+    }
+
+    #[test]
+    fn deserialize_from_legacy_rate_limit() {
+        let ct: ChallengeType = serde_json::from_str("\"RateLimitCompliance\"").unwrap();
+        assert_eq!(ct, ChallengeType::rate_limit_compliance());
+    }
+
+    #[test]
+    fn deserialize_did_scoped_uri() {
+        let ct: ChallengeType =
+            serde_json::from_str("\"did:dht:z6Mk123:capability:custom-check/v1\"").unwrap();
+        assert_eq!(
+            ct,
+            ChallengeType::Uri(
+                "did:dht:z6Mk123:capability:custom-check/v1"
+                    .parse()
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_unknown_protocol_uri() {
+        // Unknown scp:capability:* URIs that parse fine syntactically should
+        // still deserialize (validation is separate from parsing).
+        let ct: ChallengeType = serde_json::from_str("\"scp:capability:nonexistent/v1\"").unwrap();
+        assert_eq!(
+            ct,
+            ChallengeType::Uri("scp:capability:nonexistent/v1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_invalid_uri() {
+        let result: Result<ChallengeType, _> = serde_json::from_str("\"not-a-uri\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn serde_roundtrip() {
+        let types = [
+            ChallengeType::prompt_injection_resistance(),
+            ChallengeType::schema_validation(),
+            ChallengeType::rate_limit_compliance(),
+            ChallengeType::Uri("did:dht:z6Mk123:capability:custom/v1".parse().unwrap()),
+        ];
+        for ct in &types {
+            let json = serde_json::to_string(ct).unwrap();
+            let deserialized: ChallengeType = serde_json::from_str(&json).unwrap();
+            assert_eq!(ct, &deserialized, "roundtrip failed for {json}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // challenge_type_tag
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn challenge_type_tag_returns_uri_string() {
+        assert_eq!(
+            challenge_type_tag(&ChallengeType::schema_validation()),
+            "scp:capability:schema-validation/v1"
+        );
+        assert_eq!(
+            challenge_type_tag(&ChallengeType::prompt_injection_resistance()),
+            "scp:capability:prompt-injection-resistance/v1"
+        );
+        assert_eq!(
+            challenge_type_tag(&ChallengeType::rate_limit_compliance()),
+            "scp:capability:rate-limit-compliance/v1"
+        );
+    }
+
+    #[test]
+    fn challenge_type_tag_did_scoped() {
+        let ct = ChallengeType::Uri("did:dht:z6Mk123:capability:custom/v1".parse().unwrap());
+        assert_eq!(
+            challenge_type_tag(&ct),
+            "did:dht:z6Mk123:capability:custom/v1"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // issue_challenge tests
     // -----------------------------------------------------------------------
 
@@ -536,7 +809,7 @@ mod tests {
         let request = issue_challenge(
             "did:key:challenger".into(),
             "did:key:subject".into(),
-            ChallengeType::SchemaValidation,
+            ChallengeType::schema_validation(),
             serde_json::json!({"schema": "test"}),
             Duration::from_secs(300),
             &signer,
@@ -547,7 +820,7 @@ mod tests {
         assert!(!req.challenge_id.is_empty());
         assert_eq!(req.challenger_did, "did:key:challenger");
         assert_eq!(req.subject_did, "did:key:subject");
-        assert_eq!(req.challenge_type, ChallengeType::SchemaValidation);
+        assert_eq!(req.challenge_type, ChallengeType::schema_validation());
         assert_eq!(req.parameters, serde_json::json!({"schema": "test"}));
         assert_eq!(req.timeout, Duration::from_secs(300));
         assert_eq!(req.signature.len(), 64);
@@ -561,7 +834,7 @@ mod tests {
         let r1 = issue_challenge(
             "did:key:challenger".into(),
             "did:key:subject".into(),
-            ChallengeType::PromptInjectionResistance,
+            ChallengeType::prompt_injection_resistance(),
             serde_json::json!({}),
             Duration::from_secs(60),
             &signer,
@@ -571,7 +844,7 @@ mod tests {
         let r2 = issue_challenge(
             "did:key:challenger".into(),
             "did:key:subject".into(),
-            ChallengeType::PromptInjectionResistance,
+            ChallengeType::prompt_injection_resistance(),
             serde_json::json!({}),
             Duration::from_secs(60),
             &signer,
@@ -587,10 +860,10 @@ mod tests {
         let signer = TestSigner::new(challenger_key);
 
         for ct in [
-            ChallengeType::PromptInjectionResistance,
-            ChallengeType::SchemaValidation,
-            ChallengeType::RateLimitCompliance,
-            ChallengeType::Custom("my-test".into()),
+            ChallengeType::prompt_injection_resistance(),
+            ChallengeType::schema_validation(),
+            ChallengeType::rate_limit_compliance(),
+            ChallengeType::Uri("did:dht:z6Mk123:capability:custom/v1".parse().unwrap()),
         ] {
             let result = issue_challenge(
                 "did:key:c".into(),
@@ -622,7 +895,7 @@ mod tests {
         let request = issue_challenge(
             "did:key:challenger".into(),
             "did:key:subject".into(),
-            ChallengeType::SchemaValidation,
+            ChallengeType::schema_validation(),
             serde_json::json!({"schema": "test"}),
             Duration::from_secs(300),
             &signer,
@@ -644,11 +917,14 @@ mod tests {
         assert_eq!(verification.challenge_id, request.challenge_id);
         assert_eq!(verification.challenger_did, "did:key:challenger");
         assert_eq!(verification.responder_did, "did:key:subject");
-        assert_eq!(verification.challenge_type, ChallengeType::SchemaValidation);
+        assert_eq!(
+            verification.challenge_type,
+            ChallengeType::schema_validation()
+        );
         assert_eq!(
             verification.verification_method,
             VerificationMethod::ChallengeVerified {
-                challenge_type: ChallengeType::SchemaValidation
+                challenge_type: ChallengeType::schema_validation()
             }
         );
         assert_eq!(verification.result, serde_json::json!({"passed": true}));
@@ -669,7 +945,7 @@ mod tests {
         let request = issue_challenge(
             "did:key:challenger".into(),
             "did:key:subject".into(),
-            ChallengeType::RateLimitCompliance,
+            ChallengeType::rate_limit_compliance(),
             serde_json::json!({}),
             Duration::from_secs(600),
             &signer,
@@ -691,7 +967,7 @@ mod tests {
         assert_eq!(
             verification.verification_method,
             VerificationMethod::ChallengeVerified {
-                challenge_type: ChallengeType::RateLimitCompliance
+                challenge_type: ChallengeType::rate_limit_compliance()
             }
         );
         assert_ne!(
@@ -713,7 +989,7 @@ mod tests {
         let request = issue_challenge(
             "did:key:challenger".into(),
             "did:key:subject".into(),
-            ChallengeType::SchemaValidation,
+            ChallengeType::schema_validation(),
             serde_json::json!({}),
             Duration::from_secs(300),
             &signer,
@@ -749,7 +1025,7 @@ mod tests {
         let request = issue_challenge(
             "did:key:challenger".into(),
             "did:key:subject".into(),
-            ChallengeType::SchemaValidation,
+            ChallengeType::schema_validation(),
             serde_json::json!({}),
             Duration::from_secs(300),
             &signer,
@@ -787,7 +1063,7 @@ mod tests {
         let request = issue_challenge(
             "did:key:challenger".into(),
             "did:key:subject".into(),
-            ChallengeType::SchemaValidation,
+            ChallengeType::schema_validation(),
             serde_json::json!({}),
             Duration::from_secs(60), // 60 second timeout
             &signer,
@@ -825,7 +1101,7 @@ mod tests {
         let request = issue_challenge(
             "did:key:challenger".into(),
             "did:key:subject".into(),
-            ChallengeType::PromptInjectionResistance,
+            ChallengeType::prompt_injection_resistance(),
             serde_json::json!({}),
             Duration::from_secs(300), // 5-minute timeout
             &signer,
@@ -859,7 +1135,7 @@ mod tests {
         let request = issue_challenge(
             "did:key:challenger".into(),
             "did:key:subject".into(),
-            ChallengeType::SchemaValidation,
+            ChallengeType::schema_validation(),
             serde_json::json!({}),
             Duration::from_secs(300),
             &signer,
@@ -900,7 +1176,7 @@ mod tests {
         let request = issue_challenge(
             "did:key:challenger".into(),
             "did:key:subject".into(),
-            ChallengeType::SchemaValidation,
+            ChallengeType::schema_validation(),
             serde_json::json!({}),
             Duration::from_secs(300),
             &signer,
@@ -936,7 +1212,7 @@ mod tests {
         let request = issue_challenge(
             "did:key:challenger".into(),
             "did:key:subject".into(),
-            ChallengeType::SchemaValidation,
+            ChallengeType::schema_validation(),
             serde_json::json!({}),
             Duration::from_secs(300),
             &signer,
@@ -961,30 +1237,30 @@ mod tests {
         // the two modes.
         let self_attested = VerificationMethod::SelfAttested;
         let challenge_verified = VerificationMethod::ChallengeVerified {
-            challenge_type: ChallengeType::PromptInjectionResistance,
+            challenge_type: ChallengeType::prompt_injection_resistance(),
         };
 
         assert_ne!(self_attested, challenge_verified);
 
         // Different challenge types produce different verification methods.
         let verified_schema = VerificationMethod::ChallengeVerified {
-            challenge_type: ChallengeType::SchemaValidation,
+            challenge_type: ChallengeType::schema_validation(),
         };
         assert_ne!(challenge_verified, verified_schema);
     }
 
     #[test]
-    fn challenge_type_custom_variant_preserves_key() {
-        let ct = ChallengeType::Custom("my-custom-test".into());
+    fn challenge_type_did_scoped_preserves_uri() {
+        let ct = ChallengeType::Uri("did:dht:z6Mk123:capability:custom-test/v1".parse().unwrap());
         let tag = challenge_type_tag(&ct);
-        assert_eq!(tag, "Custom:my-custom-test");
+        assert_eq!(tag, "did:dht:z6Mk123:capability:custom-test/v1");
     }
 
     #[test]
     fn canonical_bytes_are_deterministic() {
         let request = ChallengeRequest {
             challenge_id: "test-id".into(),
-            challenge_type: ChallengeType::SchemaValidation,
+            challenge_type: ChallengeType::schema_validation(),
             challenger_did: "did:key:c".into(),
             subject_did: "did:key:s".into(),
             parameters: serde_json::json!({"key": "value"}),
@@ -1007,5 +1283,62 @@ mod tests {
         let rbytes1 = canonical_challenge_response_bytes(&response);
         let rbytes2 = canonical_challenge_response_bytes(&response);
         assert_eq!(rbytes1, rbytes2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Backwards-compatibility deserialization tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn deserialize_legacy_custom_with_did_scoped_uri() {
+        // Legacy "Custom:did:dht:z6Mk:capability:x/v1" should deserialize.
+        let ct: ChallengeType =
+            serde_json::from_str("\"Custom:did:dht:z6Mk:capability:x/v1\"").unwrap();
+        assert_eq!(
+            ct,
+            ChallengeType::Uri("did:dht:z6Mk:capability:x/v1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn deserialize_legacy_custom_rejects_scp_capability_prefix() {
+        // Legacy "Custom:scp:capability:..." should be rejected — it would
+        // bypass registry validation.
+        let result: Result<ChallengeType, _> =
+            serde_json::from_str("\"Custom:scp:capability:fake/v1\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn deserialize_legacy_custom_rejects_unstructured_string() {
+        // Legacy "Custom:my-custom-test" is not a valid capability URI.
+        let result: Result<ChallengeType, _> = serde_json::from_str("\"Custom:my-custom-test\"");
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // ChallengeType derives
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn challenge_type_eq_and_hash() {
+        use std::collections::HashSet;
+        let a = ChallengeType::schema_validation();
+        let b = ChallengeType::schema_validation();
+        assert_eq!(a, b);
+
+        let mut set = HashSet::new();
+        set.insert(a);
+        set.insert(b);
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn challenge_type_clone_and_debug() {
+        let ct = ChallengeType::schema_validation();
+        let cloned = ct.clone();
+        assert_eq!(ct, cloned);
+        let debug = format!("{ct:?}");
+        assert!(debug.contains("Uri"));
     }
 }
