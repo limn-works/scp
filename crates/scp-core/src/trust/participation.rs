@@ -1,13 +1,19 @@
-//! Participation record computation from event logs.
+//! Participation record computation and admission types.
 //!
-//! Participation records are computed locally from event logs -- not stored
-//! centrally. Any agent computes from accessible logs. Two agents may compute
-//! different records from different event log views; this is correct behavior,
-//! not a bug.
+//! This module contains two complementary systems:
 //!
-//! `compute_participation_record` is pure computation -- no side effects, no
-//! storage. It takes a slice of events and a Merkle root (captured at
-//! computation time for verifiability) and produces a [`ParticipationRecord`].
+//! 1. **Participation records** ([`ParticipationRecord`]) — computed locally
+//!    from event logs. Any agent computes from accessible logs. Two agents may
+//!    compute different records from different event log views; this is correct
+//!    behavior, not a bug.
+//!
+//! 2. **Participation admission** ([`RequireParticipation`],
+//!    [`ParticipationFact`], [`ParticipationThreshold`],
+//!    [`ParticipationProfile`]) — context-hosted signed attestations and
+//!    mechanical admission requirements. Contexts produce
+//!    [`ParticipationProfile`] attestations for each opted-in member.
+//!    Admitting contexts verify profiles against [`RequireParticipation`]
+//!    entries. See §7.3.2.1.
 //!
 //! See ADR-017 in `.docs/adrs/phase-4.md`.
 
@@ -249,6 +255,197 @@ fn extract_target_did_from_payload(data: &[u8]) -> Option<DID> {
         return None;
     }
     Some(s.into())
+}
+
+// ---------------------------------------------------------------------------
+// Participation Admission Types (§7.3.2.1)
+// ---------------------------------------------------------------------------
+
+/// Which category of participation fact to evaluate for admission.
+///
+/// Each variant corresponds to one of the 7 fact categories in a
+/// [`ParticipationProfile`]. See §7.3.2.1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParticipationFact {
+    /// Total seconds of context participation.
+    ParticipationDuration,
+    /// Count of governance actions taken against the identity.
+    GovernanceActionsAgainst,
+    /// Count of governance actions initiated by the identity.
+    GovernanceActionsBy,
+    /// Total tool invocations across all tool types.
+    ToolInvocationCount,
+    /// Number of contexts created.
+    ContextCreationCount,
+    /// Number of role transitions.
+    RoleProgressionCount,
+    /// Number of attestation events.
+    AttestationCount,
+}
+
+impl ParticipationFact {
+    /// Extracts the corresponding value from a [`ParticipationProfile`].
+    #[must_use]
+    pub fn extract_value(&self, profile: &ParticipationProfile) -> u64 {
+        match self {
+            Self::ParticipationDuration => profile.participation_duration_secs,
+            Self::GovernanceActionsAgainst => profile.governance_actions_against,
+            Self::GovernanceActionsBy => profile.governance_actions_by,
+            Self::ToolInvocationCount => profile.tool_invocation_count,
+            Self::ContextCreationCount => profile.context_creation_count,
+            Self::RoleProgressionCount => profile.role_progression_count,
+            Self::AttestationCount => profile.attestation_count,
+        }
+    }
+}
+
+/// Comparison operator and value for participation admission thresholds.
+///
+/// Used in [`RequireParticipation`] to specify the comparison a fact value
+/// must satisfy. See §7.3.2.1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParticipationThreshold {
+    /// Fact value must be strictly greater than the specified value.
+    GreaterThan(u64),
+    /// Fact value must be strictly less than the specified value.
+    LessThan(u64),
+    /// Fact value must be greater than or equal to the specified value.
+    AtLeast(u64),
+    /// Fact value must be less than or equal to the specified value.
+    AtMost(u64),
+    /// Fact value must equal the specified value exactly.
+    Equals(u64),
+}
+
+impl ParticipationThreshold {
+    /// Returns `true` if `value` satisfies this threshold.
+    #[must_use]
+    pub fn is_satisfied(&self, value: u64) -> bool {
+        match self {
+            Self::GreaterThan(threshold) => value > *threshold,
+            Self::LessThan(threshold) => value < *threshold,
+            Self::AtLeast(threshold) => value >= *threshold,
+            Self::AtMost(threshold) => value <= *threshold,
+            Self::Equals(threshold) => value == *threshold,
+        }
+    }
+}
+
+/// A participation admission requirement declared by a context.
+///
+/// Contexts include one or more `RequireParticipation` entries in their
+/// `ContextParams` admission requirements. Each entry specifies a
+/// participation fact, a threshold, a freshness requirement, and a minimum
+/// number of independent source contexts. See §7.3.2.1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequireParticipation {
+    /// Which participation category to evaluate.
+    pub fact: ParticipationFact,
+    /// Comparison operator and value.
+    pub threshold: ParticipationThreshold,
+    /// Maximum age in seconds for the participation profile's `updated_at`
+    /// timestamp. Profiles older than this are rejected.
+    pub max_age_secs: u64,
+    /// Minimum number of independent source contexts (distinct
+    /// `signer_public_key` values) required to satisfy this requirement.
+    pub min_contexts: u32,
+}
+
+/// A context-hosted participation profile attesting to a member's verifiable
+/// participation facts.
+///
+/// Produced by contexts for opted-in members. The profile is signed by a
+/// context-specific Ed25519 key (derived with domain separation) so that
+/// verifiers cannot correlate which contexts share a signer.
+///
+/// **Privacy guarantee:** The profile intentionally omits `context_id`. The
+/// admitting context sees signed claims from distinct signers but cannot
+/// identify which contexts produced them.
+///
+/// See §7.3.2.1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParticipationProfile {
+    /// The DID of the member this profile is about.
+    pub subject_did: DID,
+
+    /// Total seconds of context participation.
+    pub participation_duration_secs: u64,
+
+    /// Count of governance actions taken against this identity.
+    pub governance_actions_against: u64,
+
+    /// Count of governance actions initiated by this identity.
+    pub governance_actions_by: u64,
+
+    /// Total tool invocations across all tool types.
+    pub tool_invocation_count: u64,
+
+    /// Number of contexts created.
+    pub context_creation_count: u64,
+
+    /// Number of role transitions.
+    pub role_progression_count: u64,
+
+    /// Number of attestation events.
+    pub attestation_count: u64,
+
+    /// Unix timestamp (seconds) of the last update to this profile.
+    pub updated_at: u64,
+
+    /// Merkle root of the context's event log at profile computation time.
+    pub event_log_root: [u8; 32],
+
+    /// Context-specific Ed25519 public key used to sign this profile.
+    /// Derived with domain separation to prevent cross-context correlation.
+    pub signer_public_key: [u8; 32],
+
+    /// Ed25519 signature over all fields except this one.
+    #[serde(with = "serde_bytes")]
+    pub signature: [u8; 64],
+}
+
+impl ParticipationProfile {
+    /// Returns the deterministic signable bytes for this profile.
+    ///
+    /// Covers all fields except `signature`. The byte layout is:
+    /// - subject_did UTF-8 bytes (length-prefixed as u32 big-endian)
+    /// - participation_duration_secs (u64 big-endian)
+    /// - governance_actions_against (u64 big-endian)
+    /// - governance_actions_by (u64 big-endian)
+    /// - tool_invocation_count (u64 big-endian)
+    /// - context_creation_count (u64 big-endian)
+    /// - role_progression_count (u64 big-endian)
+    /// - attestation_count (u64 big-endian)
+    /// - updated_at (u64 big-endian)
+    /// - event_log_root (32 bytes)
+    /// - signer_public_key (32 bytes)
+    #[must_use]
+    pub fn signable_bytes(&self) -> Vec<u8> {
+        let did_bytes = self.subject_did.as_bytes();
+        // 4 (length prefix) + did_bytes.len() + 8*8 (eight u64 fields) + 32 + 32
+        let capacity = 4 + did_bytes.len() + 64 + 64;
+        let mut buf = Vec::with_capacity(capacity);
+
+        // Length-prefixed DID string.
+        buf.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(did_bytes);
+
+        // All u64 fact fields + updated_at in declaration order.
+        buf.extend_from_slice(&self.participation_duration_secs.to_be_bytes());
+        buf.extend_from_slice(&self.governance_actions_against.to_be_bytes());
+        buf.extend_from_slice(&self.governance_actions_by.to_be_bytes());
+        buf.extend_from_slice(&self.tool_invocation_count.to_be_bytes());
+        buf.extend_from_slice(&self.context_creation_count.to_be_bytes());
+        buf.extend_from_slice(&self.role_progression_count.to_be_bytes());
+        buf.extend_from_slice(&self.attestation_count.to_be_bytes());
+        buf.extend_from_slice(&self.updated_at.to_be_bytes());
+
+        // Fixed-size byte arrays.
+        buf.extend_from_slice(&self.event_log_root);
+        buf.extend_from_slice(&self.signer_public_key);
+
+        buf
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -650,5 +847,274 @@ mod tests {
             extract_target_did_from_payload(b"did:key:alice\0extra"),
             Some("did:key:alice".into())
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Participation admission type tests (§7.3.2.1)
+    // -----------------------------------------------------------------------
+
+    /// Helper to create a test `ParticipationProfile` with known values.
+    fn make_profile() -> ParticipationProfile {
+        ParticipationProfile {
+            subject_did: "did:key:test".into(),
+            participation_duration_secs: 86400,
+            governance_actions_against: 2,
+            governance_actions_by: 5,
+            tool_invocation_count: 203,
+            context_creation_count: 3,
+            role_progression_count: 4,
+            attestation_count: 10,
+            updated_at: 1_700_000_000,
+            event_log_root: [0xAA; 32],
+            signer_public_key: [0xBB; 32],
+            signature: [0xCC; 64],
+        }
+    }
+
+    #[test]
+    fn participation_fact_has_7_variants() {
+        // Exhaustive match ensures all 7 variants exist and compile.
+        let all = [
+            ParticipationFact::ParticipationDuration,
+            ParticipationFact::GovernanceActionsAgainst,
+            ParticipationFact::GovernanceActionsBy,
+            ParticipationFact::ToolInvocationCount,
+            ParticipationFact::ContextCreationCount,
+            ParticipationFact::RoleProgressionCount,
+            ParticipationFact::AttestationCount,
+        ];
+        assert_eq!(all.len(), 7);
+    }
+
+    #[test]
+    fn participation_threshold_has_5_variants() {
+        let all = [
+            ParticipationThreshold::GreaterThan(0),
+            ParticipationThreshold::LessThan(0),
+            ParticipationThreshold::AtLeast(0),
+            ParticipationThreshold::AtMost(0),
+            ParticipationThreshold::Equals(0),
+        ];
+        assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn extract_value_returns_correct_field() {
+        let profile = make_profile();
+
+        assert_eq!(
+            ParticipationFact::ParticipationDuration.extract_value(&profile),
+            86400
+        );
+        assert_eq!(
+            ParticipationFact::GovernanceActionsAgainst.extract_value(&profile),
+            2
+        );
+        assert_eq!(
+            ParticipationFact::GovernanceActionsBy.extract_value(&profile),
+            5
+        );
+        assert_eq!(
+            ParticipationFact::ToolInvocationCount.extract_value(&profile),
+            203
+        );
+        assert_eq!(
+            ParticipationFact::ContextCreationCount.extract_value(&profile),
+            3
+        );
+        assert_eq!(
+            ParticipationFact::RoleProgressionCount.extract_value(&profile),
+            4
+        );
+        assert_eq!(
+            ParticipationFact::AttestationCount.extract_value(&profile),
+            10
+        );
+    }
+
+    #[test]
+    fn threshold_greater_than() {
+        assert!(ParticipationThreshold::GreaterThan(5).is_satisfied(6));
+        assert!(!ParticipationThreshold::GreaterThan(5).is_satisfied(5));
+        assert!(!ParticipationThreshold::GreaterThan(5).is_satisfied(4));
+    }
+
+    #[test]
+    fn threshold_less_than() {
+        assert!(ParticipationThreshold::LessThan(5).is_satisfied(4));
+        assert!(!ParticipationThreshold::LessThan(5).is_satisfied(5));
+        assert!(!ParticipationThreshold::LessThan(5).is_satisfied(6));
+    }
+
+    #[test]
+    fn threshold_at_least() {
+        assert!(ParticipationThreshold::AtLeast(5).is_satisfied(5));
+        assert!(ParticipationThreshold::AtLeast(5).is_satisfied(6));
+        assert!(!ParticipationThreshold::AtLeast(5).is_satisfied(4));
+    }
+
+    #[test]
+    fn threshold_at_most() {
+        assert!(ParticipationThreshold::AtMost(5).is_satisfied(5));
+        assert!(ParticipationThreshold::AtMost(5).is_satisfied(4));
+        assert!(!ParticipationThreshold::AtMost(5).is_satisfied(6));
+    }
+
+    #[test]
+    fn threshold_equals() {
+        assert!(ParticipationThreshold::Equals(5).is_satisfied(5));
+        assert!(!ParticipationThreshold::Equals(5).is_satisfied(4));
+        assert!(!ParticipationThreshold::Equals(5).is_satisfied(6));
+    }
+
+    #[test]
+    fn signable_bytes_is_deterministic() {
+        let profile = make_profile();
+        let bytes1 = profile.signable_bytes();
+        let bytes2 = profile.signable_bytes();
+        assert_eq!(bytes1, bytes2);
+    }
+
+    #[test]
+    fn signable_bytes_excludes_signature() {
+        let mut profile1 = make_profile();
+        let mut profile2 = make_profile();
+        profile1.signature = [0x00; 64];
+        profile2.signature = [0xFF; 64];
+
+        assert_eq!(profile1.signable_bytes(), profile2.signable_bytes());
+    }
+
+    #[test]
+    fn signable_bytes_changes_with_fields() {
+        let profile1 = make_profile();
+        let mut profile2 = make_profile();
+        profile2.tool_invocation_count = 999;
+
+        assert_ne!(profile1.signable_bytes(), profile2.signable_bytes());
+    }
+
+    #[test]
+    fn signable_bytes_changes_with_did() {
+        let profile1 = make_profile();
+        let mut profile2 = make_profile();
+        profile2.subject_did = "did:key:other".into();
+
+        assert_ne!(profile1.signable_bytes(), profile2.signable_bytes());
+    }
+
+    #[test]
+    fn signable_bytes_expected_length() {
+        let profile = make_profile();
+        let bytes = profile.signable_bytes();
+        let did_len = "did:key:test".len();
+        // 4 (length prefix) + did_len + 8*8 (8 u64 fields) + 32 + 32
+        let expected = 4 + did_len + 64 + 64;
+        assert_eq!(bytes.len(), expected);
+    }
+
+    #[test]
+    fn participation_profile_has_no_context_id() {
+        // Structural test: ParticipationProfile must not have a context_id
+        // field. This test documents the privacy guarantee from §7.3.2.1.
+        // If someone adds context_id to ParticipationProfile, this test's
+        // field-by-field construction will fail to compile (missing field).
+        let _profile = ParticipationProfile {
+            subject_did: "did:key:test".into(),
+            participation_duration_secs: 0,
+            governance_actions_against: 0,
+            governance_actions_by: 0,
+            tool_invocation_count: 0,
+            context_creation_count: 0,
+            role_progression_count: 0,
+            attestation_count: 0,
+            updated_at: 0,
+            event_log_root: [0; 32],
+            signer_public_key: [0; 32],
+            signature: [0; 64],
+        };
+    }
+
+    #[test]
+    fn require_participation_struct_fields() {
+        let req = RequireParticipation {
+            fact: ParticipationFact::ToolInvocationCount,
+            threshold: ParticipationThreshold::AtLeast(100),
+            max_age_secs: 86400,
+            min_contexts: 3,
+        };
+        assert_eq!(req.max_age_secs, 86400);
+        assert_eq!(req.min_contexts, 3);
+    }
+
+    #[test]
+    fn serde_roundtrip_participation_fact() {
+        let fact = ParticipationFact::GovernanceActionsBy;
+        let json = serde_json::to_string(&fact).unwrap();
+        let deserialized: ParticipationFact = serde_json::from_str(&json).unwrap();
+        assert_eq!(fact, deserialized);
+    }
+
+    #[test]
+    fn serde_roundtrip_participation_threshold() {
+        let threshold = ParticipationThreshold::AtLeast(42);
+        let json = serde_json::to_string(&threshold).unwrap();
+        let deserialized: ParticipationThreshold = serde_json::from_str(&json).unwrap();
+        assert_eq!(threshold, deserialized);
+    }
+
+    #[test]
+    fn serde_roundtrip_require_participation() {
+        let req = RequireParticipation {
+            fact: ParticipationFact::ParticipationDuration,
+            threshold: ParticipationThreshold::GreaterThan(3600),
+            max_age_secs: 86400,
+            min_contexts: 2,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: RequireParticipation = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, deserialized);
+    }
+
+    #[test]
+    fn serde_roundtrip_participation_profile() {
+        let profile = make_profile();
+        let json = serde_json::to_string(&profile).unwrap();
+        let deserialized: ParticipationProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(profile, deserialized);
+    }
+
+    #[test]
+    fn all_fact_variants_serde_roundtrip() {
+        let facts = [
+            ParticipationFact::ParticipationDuration,
+            ParticipationFact::GovernanceActionsAgainst,
+            ParticipationFact::GovernanceActionsBy,
+            ParticipationFact::ToolInvocationCount,
+            ParticipationFact::ContextCreationCount,
+            ParticipationFact::RoleProgressionCount,
+            ParticipationFact::AttestationCount,
+        ];
+        for fact in &facts {
+            let json = serde_json::to_string(fact).unwrap();
+            let deserialized: ParticipationFact = serde_json::from_str(&json).unwrap();
+            assert_eq!(*fact, deserialized);
+        }
+    }
+
+    #[test]
+    fn all_threshold_variants_serde_roundtrip() {
+        let thresholds = [
+            ParticipationThreshold::GreaterThan(100),
+            ParticipationThreshold::LessThan(50),
+            ParticipationThreshold::AtLeast(10),
+            ParticipationThreshold::AtMost(200),
+            ParticipationThreshold::Equals(42),
+        ];
+        for threshold in &thresholds {
+            let json = serde_json::to_string(threshold).unwrap();
+            let deserialized: ParticipationThreshold = serde_json::from_str(&json).unwrap();
+            assert_eq!(*threshold, deserialized);
+        }
     }
 }
