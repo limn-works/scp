@@ -4966,6 +4966,7 @@ name = "scp-relay"
 version = "0.1.0"
 dependencies = [
  "scp-transport",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

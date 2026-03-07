@@ -5,9 +5,25 @@
 //!
 //! Supports a `--health` flag that probes the relay's bind address via TCP
 //! and exits with code 0 (reachable) or 1 (unreachable).
+//!
+//! ## Storage backend selection
+//!
+//! The relay selects a blob storage backend via the `SCP_RELAY_STORAGE_BACKEND`
+//! environment variable. Valid values:
+//!
+//! | Value      | Backend    | Config env vars                              | Default |
+//! |------------|------------|----------------------------------------------|---------|
+//! | `sqlite`   | `SQLite`     | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.db`) | **yes** |
+//! | `redb`     | redb       | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.redb`) | |
+//! | `postgres` | `PostgreSQL` | `SCP_RELAY_DATABASE_URL` (required)           | |
+//! | `s3`       | S3-compat  | `SCP_RELAY_S3_BUCKET` (required) + AWS env    | |
+//! | `memory`   | In-memory  | —                                             | |
+//!
+//! See §10.5 of the SCP infrastructure spec.
 
 use std::env;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use scp_transport::native::server::{RelayConfig, RelayServer};
@@ -44,6 +60,84 @@ fn config_from_env() -> RelayConfig {
     }
 }
 
+/// Valid backend names for error messages.
+const VALID_BACKENDS: &str = "sqlite, redb, postgres, s3, memory";
+
+/// Constructs the blob storage backend from environment configuration.
+///
+/// Reads `SCP_RELAY_STORAGE_BACKEND` (default: `sqlite`) and delegates to the
+/// appropriate backend constructor. Exits on misconfiguration with a
+/// descriptive error naming the valid options.
+async fn storage_from_env() -> BlobStorageBackend {
+    let backend = env::var("SCP_RELAY_STORAGE_BACKEND")
+        .unwrap_or_else(|_| "sqlite".to_owned())
+        .to_lowercase();
+
+    match backend.as_str() {
+        "sqlite" => {
+            let path =
+                env::var("SCP_RELAY_STORAGE_PATH").unwrap_or_else(|_| "./scp-relay.db".to_owned());
+            let path = PathBuf::from(path);
+            tracing::info!(path = %path.display(), "using sqlite blob storage");
+            BlobStorageBackend::sqlite(&path).unwrap_or_else(|e| {
+                tracing::error!(error = %e, path = %path.display(), "failed to open sqlite storage");
+                std::process::exit(1);
+            })
+        }
+        "redb" => {
+            let path = env::var("SCP_RELAY_STORAGE_PATH")
+                .unwrap_or_else(|_| "./scp-relay.redb".to_owned());
+            let path = PathBuf::from(path);
+            tracing::info!(path = %path.display(), "using redb blob storage");
+            BlobStorageBackend::redb(&path).unwrap_or_else(|e| {
+                tracing::error!(error = %e, path = %path.display(), "failed to open redb storage");
+                std::process::exit(1);
+            })
+        }
+        "postgres" => {
+            let Ok(url) = env::var("SCP_RELAY_DATABASE_URL") else {
+                eprintln!(
+                    "error: SCP_RELAY_STORAGE_BACKEND=postgres requires SCP_RELAY_DATABASE_URL to be set"
+                );
+                std::process::exit(1);
+            };
+            tracing::info!("using postgres blob storage");
+            let store = scp_transport::native::postgres_blob::PostgresBlobStore::open(&url)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::error!(error = %e, "failed to connect to postgres");
+                    std::process::exit(1);
+                });
+            BlobStorageBackend::Postgres(store)
+        }
+        "s3" => {
+            let Ok(bucket) = env::var("SCP_RELAY_S3_BUCKET") else {
+                eprintln!(
+                    "error: SCP_RELAY_STORAGE_BACKEND=s3 requires SCP_RELAY_S3_BUCKET to be set"
+                );
+                std::process::exit(1);
+            };
+            let prefix = env::var("SCP_RELAY_S3_PREFIX").unwrap_or_else(|_| "blobs/".to_owned());
+            tracing::info!(bucket = %bucket, prefix = %prefix, "using s3 blob storage");
+            let store = scp_transport::native::s3_blob::S3BlobStore::open(&bucket, &prefix)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::error!(error = %e, "failed to initialize s3 storage");
+                    std::process::exit(1);
+                });
+            BlobStorageBackend::S3(store)
+        }
+        "memory" => {
+            tracing::warn!("using in-memory blob storage — all data will be lost on restart");
+            BlobStorageBackend::in_memory()
+        }
+        other => {
+            eprintln!("error: unknown storage backend '{other}'. Valid options: {VALID_BACKENDS}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Initializes the `tracing` subscriber.
 ///
 /// Log level is determined by `RUST_LOG` (takes precedence) or
@@ -61,10 +155,14 @@ fn init_tracing() {
     if format == "json" {
         tracing_subscriber::fmt()
             .json()
+            .with_writer(std::io::stderr)
             .with_env_filter(filter)
             .init();
     } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(filter)
+            .init();
     }
 }
 
@@ -101,7 +199,7 @@ async fn main() {
         "starting scp-relay"
     );
 
-    let storage = Arc::new(BlobStorageBackend::in_memory());
+    let storage = Arc::new(storage_from_env().await);
     let server = RelayServer::new(config, storage);
 
     let (handle, local_addr) = match server.start().await {

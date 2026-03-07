@@ -728,7 +728,10 @@ impl BlobStorage for S3BlobStore {
                 self: Pin<&mut Self>,
                 cx: &mut Context<'_>,
             ) -> Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
-                let mut guard = self.0.lock().expect("StreamBody mutex poisoned");
+                let mut guard = match self.0.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
                 match guard.as_mut().poll_next(cx) {
                     Poll::Ready(Some(Ok(bytes))) => {
                         Poll::Ready(Some(Ok(http_body::Frame::data(bytes))))
