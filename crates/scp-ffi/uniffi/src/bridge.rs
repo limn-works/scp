@@ -1596,6 +1596,7 @@ pub async fn context_join(
 
             let key_package = KeyPackage {
                 owner_did: identity.did.clone().into(),
+                mls_key_package_bytes: None,
             };
 
             manager

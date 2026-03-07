@@ -862,6 +862,7 @@ fn py_context_join(handle: &PyContextHandle, identity_did: &str) -> PyResult<()>
         // Build a key package for the joining member.
         let key_package = scp_core::context::membership::KeyPackage {
             owner_did: scp_identity::DID(member_did.clone()),
+            mls_key_package_bytes: None,
         };
 
         // Look up the ContextHandle from a completed create_context call.

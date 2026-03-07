@@ -184,7 +184,11 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn validate_key_package(&self, owner_did: &str) -> Result<(), ContextError> {
+    fn validate_key_package(
+        &self,
+        owner_did: &str,
+        _key_package_bytes: Option<&[u8]>,
+    ) -> Result<(), ContextError> {
         // In production, we validate that the key package DID matches, that the
         // ciphersuite is SCP_CIPHERSUITE, and that the credential is well-formed.
         // The actual OpenMLS key package validation happens during `add_member`
@@ -202,7 +206,12 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn add_member(&self, context_id: &[u8; 32], member_did: &str) -> Result<(), ContextError> {
+    fn add_member(
+        &self,
+        context_id: &[u8; 32],
+        member_did: &str,
+        _key_package_bytes: Option<&[u8]>,
+    ) -> Result<(), ContextError> {
         // Generate a key package for the new member so we can add them.
         let member_credential =
             ScpCredential::new(member_did.to_owned(), None, SigningKeyId::Active)
@@ -394,19 +403,19 @@ mod tests {
     #[test]
     fn validate_key_package_rejects_empty_did() {
         let provider = MlsCryptoProvider::new(test_did());
-        assert!(provider.validate_key_package("").is_err());
+        assert!(provider.validate_key_package("", None).is_err());
     }
 
     #[test]
     fn validate_key_package_rejects_non_did() {
         let provider = MlsCryptoProvider::new(test_did());
-        assert!(provider.validate_key_package("not-a-did").is_err());
+        assert!(provider.validate_key_package("not-a-did", None).is_err());
     }
 
     #[test]
     fn validate_key_package_accepts_valid_did() {
         let provider = MlsCryptoProvider::new(test_did());
-        assert!(provider.validate_key_package("did:dht:z6MkAlice").is_ok());
+        assert!(provider.validate_key_package("did:dht:z6MkAlice", None).is_ok());
     }
 
     #[test]
@@ -487,7 +496,7 @@ mod tests {
 
         // Add a member.
         let member_did = "did:dht:z6MkNewMember";
-        assert!(provider.add_member(&ctx_id, member_did).is_ok());
+        assert!(provider.add_member(&ctx_id, member_did, None).is_ok());
 
         // Verify the group now has 2 members.
         let groups = provider.groups.lock().unwrap();

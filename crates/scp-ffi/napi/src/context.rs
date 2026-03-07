@@ -391,6 +391,7 @@ pub async fn context_join(handle: &NapiContextHandle, identity_did: String) -> n
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let key_package = scp_core::context::membership::KeyPackage {
         owner_did: DID(identity_did.clone()),
+        mls_key_package_bytes: None,
     };
 
     let manager = context_manager();

@@ -99,11 +99,20 @@ impl ContextCryptoProvider for FfiBridgeCrypto {
         Ok(())
     }
 
-    fn validate_key_package(&self, _owner_did: &str) -> Result<(), ContextError> {
+    fn validate_key_package(
+        &self,
+        _owner_did: &str,
+        _key_package_bytes: Option<&[u8]>,
+    ) -> Result<(), ContextError> {
         Ok(())
     }
 
-    fn add_member(&self, _context_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
+    fn add_member(
+        &self,
+        _context_id: &[u8; 32],
+        _member_did: &str,
+        _key_package_bytes: Option<&[u8]>,
+    ) -> Result<(), ContextError> {
         Ok(())
     }
 

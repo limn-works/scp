@@ -86,10 +86,19 @@ impl ContextCryptoProvider for MockCrypto {
     fn destroy_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn validate_key_package(&self, _owner_did: &str) -> Result<(), ContextError> {
+    fn validate_key_package(
+        &self,
+        _owner_did: &str,
+        _key_package_bytes: Option<&[u8]>,
+    ) -> Result<(), ContextError> {
         Ok(())
     }
-    fn add_member(&self, _ctx_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
+    fn add_member(
+        &self,
+        _ctx_id: &[u8; 32],
+        _member_did: &str,
+        _key_package_bytes: Option<&[u8]>,
+    ) -> Result<(), ContextError> {
         Ok(())
     }
     fn remove_member(&self, _ctx_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
@@ -408,6 +417,7 @@ async fn e2e_message_round_trip_encrypted() {
     // Step 2: Bob joins the context — membership confirmed.
     let kp = KeyPackage {
         owner_did: bob_did.clone(),
+        mls_key_package_bytes: None,
     };
     manager.join_context(&handle, kp).await.unwrap();
 
@@ -467,6 +477,7 @@ async fn e2e_governance_role_change_and_unauthorized_rejection() {
     // Step 2: Member joins.
     let kp = KeyPackage {
         owner_did: member_did.clone(),
+        mls_key_package_bytes: None,
     };
     manager.join_context(&handle, kp).await.unwrap();
     assert_eq!(manager.member_count(ctx_id).await, Some(2));
@@ -689,6 +700,7 @@ async fn e2e_persistence_drop_and_restore() {
         // Add a member.
         let kp = KeyPackage {
             owner_did: member_did.clone(),
+            mls_key_package_bytes: None,
         };
         manager.join_context(&handle, kp).await.unwrap();
         assert_eq!(manager.member_count(ctx_id).await, Some(2));
@@ -934,6 +946,7 @@ async fn e2e_governance_replay_protection() {
 
     let kp = KeyPackage {
         owner_did: member_did.clone(),
+        mls_key_package_bytes: None,
     };
     manager.join_context(&handle, kp).await.unwrap();
 
@@ -1005,6 +1018,7 @@ async fn e2e_full_lifecycle_create_join_send_leave_close() {
     // Join.
     let kp = KeyPackage {
         owner_did: member_did.clone(),
+        mls_key_package_bytes: None,
     };
     manager.join_context(&handle, kp).await.unwrap();
     assert_eq!(manager.member_count(ctx_id).await, Some(2));
@@ -1086,6 +1100,7 @@ async fn e2e_multi_bridge_api_surface_verification() {
             &enc_handle,
             KeyPackage {
                 owner_did: bob.clone(),
+                mls_key_package_bytes: None,
             },
         )
         .await
