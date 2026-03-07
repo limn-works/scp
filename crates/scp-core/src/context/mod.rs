@@ -101,7 +101,9 @@ pub use builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
     CreationReceipt, EventLogHandle, MlsGroupHandle, SenderKeyHandle, create_context,
 };
-pub use manager::{ContextManager, ContextPersistence, ContextSnapshot, GovernanceActionResult};
+pub use manager::{
+    ContextManager, ContextPersistence, ContextSnapshot, GovernanceActionResult, ProposalOutcome,
+};
 
 // Re-export membership types.
 pub use membership::{

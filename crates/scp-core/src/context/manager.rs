@@ -92,6 +92,30 @@ pub enum GovernanceActionResult {
 }
 
 // ---------------------------------------------------------------------------
+// ProposalOutcome -- result of proposing a governance action
+// ---------------------------------------------------------------------------
+
+/// Result of submitting a governance proposal via
+/// [`ContextManager::propose_governance_action`].
+///
+/// Contains the created proposal, its current status, and an optional
+/// execution result. The `execution_result` is always `None` in this
+/// implementation -- it exists so that SCP-270 (auto-execution on approval)
+/// can populate it without changing this struct.
+#[derive(Debug)]
+pub struct ProposalOutcome {
+    /// The governance proposal created by the engine.
+    pub proposal: GovernanceProposal,
+    /// The current status of the proposal after creation. For
+    /// `SingleAdmin`, this is always `Approved` (auto-approve per
+    /// ADR-031 section 4a).
+    pub status: ProposalStatus,
+    /// The result of executing the approved action, if auto-execution
+    /// is wired. Always `None` until SCP-270 is implemented.
+    pub execution_result: Option<GovernanceActionResult>,
+}
+
+// ---------------------------------------------------------------------------
 // ContextSnapshot -- serializable full context state for persistence
 // ---------------------------------------------------------------------------
 
@@ -2468,6 +2492,213 @@ impl ContextManager {
             .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
 
         Ok(ctx.governance_engine.list_proposals())
+    }
+
+    // -------------------------------------------------------------------
+    // Capability-gated governance proposal lifecycle (SCP-268, ADR-031)
+    // -------------------------------------------------------------------
+
+    /// Submits a new governance proposal with capability validation.
+    ///
+    /// Validates that the proposer holds the `GovernancePropose` capability
+    /// (UCAN) before delegating to the governance engine. Returns a
+    /// [`ProposalOutcome`] containing the proposal, its status, and an
+    /// optional execution result.
+    ///
+    /// For `SingleAdmin`, the proposal is simultaneously created and approved
+    /// (ADR-031 section 4a). The returned `ProposalOutcome::status` reflects this.
+    /// Auto-execution is NOT wired -- `execution_result` is always `None`
+    /// (SCP-270 responsibility). Use
+    /// [`propose_governance_action`](Self::propose_governance_action) followed
+    /// by [`execute_governance_action`](Self::execute_governance_action) for
+    /// auto-execution.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::PermissionDenied`] if the proposer lacks
+    ///   `GovernancePropose` capability.
+    pub async fn propose_governance_action_checked(
+        &self,
+        context_id: &str,
+        proposer_did: &DID,
+        action: GovernanceAction,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<ProposalOutcome, ContextError> {
+        // Validate capability before delegating.
+        {
+            let contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+            if !ctx
+                .role_state
+                .member_has_capability(proposer_did.as_ref(), &Capability::GovernancePropose)
+            {
+                return Err(ContextError::PermissionDenied(format!(
+                    "member {proposer_did} does not have governance:propose capability"
+                )));
+            }
+        }
+        // Lock dropped.
+
+        let (proposal, _events) = self
+            .propose_governance_action(context_id, action, proposer_did, signing_key)
+            .await?;
+
+        let status = proposal.status.clone();
+        Ok(ProposalOutcome {
+            proposal,
+            status,
+            execution_result: None, // SCP-270 wires auto-execution.
+        })
+    }
+
+    /// Casts an approval vote on a pending governance proposal.
+    ///
+    /// Validates that the voter holds the `GovernanceVote` capability (UCAN)
+    /// before delegating to the governance engine. Events are recorded in the
+    /// context event log and the action is auto-executed if quorum is reached.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::PermissionDenied`] if the voter lacks `GovernanceVote`
+    ///   capability or the engine rejects the vote.
+    pub async fn approve_governance_proposal(
+        &self,
+        context_id: &str,
+        proposal_id: &ProposalId,
+        voter_did: &DID,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<ProposalStatus, ContextError> {
+        // Validate capability before delegating.
+        {
+            let contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+            if !ctx
+                .role_state
+                .member_has_capability(voter_did.as_ref(), &Capability::GovernanceVote)
+            {
+                return Err(ContextError::PermissionDenied(format!(
+                    "member {voter_did} does not have governance:vote capability"
+                )));
+            }
+        }
+        // Lock dropped.
+
+        let (status, _events) = self
+            .vote_on_proposal(context_id, proposal_id, voter_did, true, signing_key)
+            .await?;
+
+        Ok(status)
+    }
+
+    /// Casts a rejection vote on a pending governance proposal.
+    ///
+    /// Validates that the voter holds the `GovernanceVote` capability (UCAN)
+    /// before delegating to the governance engine. Events are recorded in the
+    /// context event log.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::PermissionDenied`] if the voter lacks `GovernanceVote`
+    ///   capability or the engine rejects the vote.
+    pub async fn reject_governance_proposal(
+        &self,
+        context_id: &str,
+        proposal_id: &ProposalId,
+        voter_did: &DID,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<ProposalStatus, ContextError> {
+        // Validate capability before delegating.
+        {
+            let contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+            if !ctx
+                .role_state
+                .member_has_capability(voter_did.as_ref(), &Capability::GovernanceVote)
+            {
+                return Err(ContextError::PermissionDenied(format!(
+                    "member {voter_did} does not have governance:vote capability"
+                )));
+            }
+        }
+        // Lock dropped.
+
+        let (status, _events) = self
+            .vote_on_proposal(context_id, proposal_id, voter_did, false, signing_key)
+            .await?;
+
+        Ok(status)
+    }
+
+    /// Withdraws a previously cast vote on a pending governance proposal.
+    ///
+    /// The voter must have already voted on this proposal. No signing key
+    /// is required -- withdrawal is the voter's privileged operation on
+    /// their own vote (per the `GovernanceEngine::withdraw_vote` trait).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::PermissionDenied`] if the engine rejects the
+    ///   withdrawal (proposal not found, voter hasn't voted, etc.).
+    pub async fn withdraw_governance_vote(
+        &self,
+        context_id: &str,
+        proposal_id: &ProposalId,
+        voter_did: &DID,
+    ) -> Result<ProposalStatus, ContextError> {
+        let (status, events) = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            let gov_ctx = Self::build_governance_context(ctx);
+            ctx.governance_engine
+                .withdraw_vote(proposal_id, voter_did, &gov_ctx)
+                .map_err(|e| ContextError::PermissionDenied(e.to_string()))?
+        };
+
+        let context_id_bytes = context_id_to_bytes(context_id);
+        for event in &events {
+            let event_str = match event {
+                GovernanceEvent::ProposalCreated { .. } => "GovernanceProposalCreated",
+                GovernanceEvent::VoteCast { .. } => "GovernanceVoteCast",
+                GovernanceEvent::VoteWithdrawn { .. } => "GovernanceVoteWithdrawn",
+                GovernanceEvent::ProposalResolved { .. } => "GovernanceProposalResolved",
+            };
+            let _ = self
+                .event_log
+                .append_context_event(&context_id_bytes, event_str);
+        }
+
+        // Persist context state after withdrawal.
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(context_id) {
+                let snapshot = Self::snapshot_context(ctx);
+                drop(contexts);
+                self.persist_context_snapshot(context_id, &snapshot);
+            }
+        }
+
+        Ok(status)
     }
 
     /// Internal implementation of author blocking. Only callable within the
@@ -8733,5 +8964,343 @@ mod tests {
                 .unwrap();
             assert_eq!(handle.state().await, ContextState::Active);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Governance proposal lifecycle tests (SCP-268)
+    // -----------------------------------------------------------------------
+
+    /// Helper: creates a manager with an active context whose ceiling includes
+    /// governance capabilities, so propose/vote operations succeed.
+    async fn setup_governance_context() -> (ContextManager, ContextHandle, String) {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let params = ContextParams {
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+                crate::context::params::Capability::new("role:assign"),
+                crate::context::params::Capability::new("governance:propose"),
+                crate::context::params::Capability::new("governance:vote"),
+            ],
+            ..ContextParams::default()
+        };
+
+        let admin_did: DID = "did:key:admin".into();
+        let handle = manager
+            .create_context("gov-ctx".into(), params, admin_did)
+            .await
+            .unwrap();
+
+        (manager, handle, "gov-ctx".to_owned())
+    }
+
+    /// SCP-268 AC1: `SingleAdmin.propose()` returns `ProposalOutcome` with
+    /// `Approved` status (auto-approve per ADR-031 section 4a) and `execution_result: None`.
+    #[tokio::test]
+    async fn governance_single_admin_propose_checked_auto_approves() {
+        let (manager, _handle, ctx_id) = setup_governance_context().await;
+        let admin_did: DID = "did:key:admin".into();
+        let signing_key = signing_key_for_did(&admin_did);
+
+        let action = super::GovernanceAction::CloseContext { reason: None };
+
+        let outcome = manager
+            .propose_governance_action_checked(&ctx_id, &admin_did, action, &signing_key)
+            .await
+            .unwrap();
+
+        // SingleAdmin auto-approves (ADR-031 section 4a).
+        assert!(
+            matches!(outcome.status, super::ProposalStatus::Approved),
+            "SingleAdmin proposals should be auto-approved"
+        );
+        assert!(
+            outcome.execution_result.is_none(),
+            "execution_result must be None (SCP-270 responsibility)"
+        );
+        assert_eq!(outcome.proposal.proposer_did, admin_did);
+        assert_eq!(outcome.proposal.context_id, ctx_id);
+    }
+
+    /// SCP-268 AC5: proposing on a non-Active context returns `ContextNotActive`.
+    #[tokio::test]
+    async fn governance_propose_checked_on_inactive_context_returns_not_active() {
+        let (manager, handle, ctx_id) = setup_governance_context().await;
+        let admin_did: DID = "did:key:admin".into();
+        let signing_key = signing_key_for_did(&admin_did);
+
+        // Transition to Closing.
+        handle.transition_to(&ContextState::Closing).await.unwrap();
+
+        let result = manager
+            .propose_governance_action_checked(
+                &ctx_id,
+                &admin_did,
+                super::GovernanceAction::CloseContext { reason: None },
+                &signing_key,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ContextError::ContextNotActive
+        ));
+    }
+
+    /// SCP-268 AC6: proposing without `GovernancePropose` capability is rejected.
+    #[tokio::test]
+    async fn governance_propose_checked_without_capability_rejected() {
+        let (manager, _handle, ctx_id) = setup_governance_context().await;
+
+        // Join bob as a member (default role = member, which has messages:read/write
+        // but not governance:propose).
+        let kp = KeyPackage::mock("did:key:bob".into());
+        let handle_ref = {
+            let contexts = manager.contexts.lock().await;
+            contexts.get(&ctx_id).unwrap().handle.clone()
+        };
+        manager.join_context(&handle_ref, kp).await.unwrap();
+
+        let bob_did: DID = "did:key:bob".into();
+        let signing_key = signing_key_for_did(&bob_did);
+        let result = manager
+            .propose_governance_action_checked(
+                &ctx_id,
+                &bob_did,
+                super::GovernanceAction::CloseContext { reason: None },
+                &signing_key,
+            )
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ContextError::PermissionDenied(_)),
+            "member without governance:propose should be rejected: {err}"
+        );
+    }
+
+    /// SCP-268 AC7: approve/reject without `GovernanceVote` capability is rejected.
+    #[tokio::test]
+    async fn governance_vote_without_capability_rejected() {
+        let (manager, _handle, ctx_id) = setup_governance_context().await;
+
+        // Join bob as member (no governance:vote capability).
+        let kp = KeyPackage::mock("did:key:bob".into());
+        let handle_ref = {
+            let contexts = manager.contexts.lock().await;
+            contexts.get(&ctx_id).unwrap().handle.clone()
+        };
+        manager.join_context(&handle_ref, kp).await.unwrap();
+
+        let bob_did: DID = "did:key:bob".into();
+        let signing_key = signing_key_for_did(&bob_did);
+        let fake_proposal_id = [0u8; 32];
+
+        // approve should fail
+        let approve_result = manager
+            .approve_governance_proposal(&ctx_id, &fake_proposal_id, &bob_did, &signing_key)
+            .await;
+        assert!(approve_result.is_err());
+        assert!(matches!(
+            approve_result.unwrap_err(),
+            ContextError::PermissionDenied(_)
+        ));
+
+        // reject should fail
+        let reject_result = manager
+            .reject_governance_proposal(&ctx_id, &fake_proposal_id, &bob_did, &signing_key)
+            .await;
+        assert!(reject_result.is_err());
+        assert!(matches!(
+            reject_result.unwrap_err(),
+            ContextError::PermissionDenied(_)
+        ));
+    }
+
+    /// SCP-268 AC8: governance events are recorded in the event log.
+    #[tokio::test]
+    async fn governance_propose_checked_records_events() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::<MockEventLog>::from(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let params = ContextParams {
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+                crate::context::params::Capability::new("governance:propose"),
+                crate::context::params::Capability::new("governance:vote"),
+            ],
+            ..ContextParams::default()
+        };
+
+        let admin_did: DID = "did:key:admin".into();
+        let _handle = manager
+            .create_context("ev-ctx".into(), params, admin_did.clone())
+            .await
+            .unwrap();
+
+        let signing_key = signing_key_for_did(&admin_did);
+
+        let outcome = manager
+            .propose_governance_action_checked(
+                "ev-ctx",
+                &admin_did,
+                super::GovernanceAction::CloseContext { reason: None },
+                &signing_key,
+            )
+            .await
+            .unwrap();
+
+        // SingleAdmin produces ProposalCreated + VoteCast + ProposalResolved
+        // events. Verify they were logged.
+        assert!(matches!(outcome.status, super::ProposalStatus::Approved));
+    }
+
+    /// SCP-268 AC3/AC4: `ThresholdEngine` governance multi-vote lifecycle.
+    /// Propose creates `Pending` proposal; approve reaches quorum -> `Approved`.
+    #[tokio::test]
+    async fn governance_threshold_propose_approve_lifecycle() {
+        let alice_did: DID = "did:key:alice".into();
+        let bob_did: DID = "did:key:bob".into();
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let params = ContextParams {
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+                crate::context::params::Capability::new("role:assign"),
+                crate::context::params::Capability::new("governance:propose"),
+                crate::context::params::Capability::new("governance:vote"),
+            ],
+            governance: GovernanceModel::Threshold {
+                threshold: 2,
+                signers: vec![alice_did.clone(), bob_did.clone()],
+            },
+            ..ContextParams::default()
+        };
+
+        let handle = manager
+            .create_context("thresh-ctx".into(), params, alice_did.clone())
+            .await
+            .unwrap();
+
+        // Join bob.
+        let kp = KeyPackage::mock("did:key:bob".into());
+        manager.join_context(&handle, kp).await.unwrap();
+
+        // Grant governance capabilities to bob.
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("thresh-ctx").unwrap();
+            ctx.role_state
+                .member_capabilities
+                .entry("did:key:bob".to_owned())
+                .or_default()
+                .insert(Capability::GovernancePropose);
+            ctx.role_state
+                .member_capabilities
+                .entry("did:key:bob".to_owned())
+                .or_default()
+                .insert(Capability::GovernanceVote);
+        }
+
+        let signing_key_alice = signing_key_for_did(&alice_did);
+        let signing_key_bob = signing_key_for_did(&bob_did);
+
+        // Alice proposes via capability-checked path.
+        let outcome = manager
+            .propose_governance_action_checked(
+                "thresh-ctx",
+                &alice_did,
+                super::GovernanceAction::CloseContext { reason: None },
+                &signing_key_alice,
+            )
+            .await
+            .unwrap();
+
+        // Threshold 2-of-2: proposer's vote counts as 1, so status is Pending.
+        assert!(
+            matches!(outcome.status, super::ProposalStatus::Pending),
+            "2-of-2 threshold should start as Pending after first vote, got: {:?}",
+            outcome.status
+        );
+
+        let proposal_id = outcome.proposal.proposal_id;
+
+        // Bob approves -> quorum reached -> Approved.
+        let status = manager
+            .approve_governance_proposal("thresh-ctx", &proposal_id, &bob_did, &signing_key_bob)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(status, super::ProposalStatus::Approved),
+            "2-of-2 threshold should be Approved after second vote, got: {status:?}"
+        );
+    }
+
+    /// SCP-268: proposing on a non-existent context returns `MembershipFailed`.
+    #[tokio::test]
+    async fn governance_propose_checked_on_nonexistent_context() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let admin_did: DID = "did:key:admin".into();
+        let signing_key = signing_key_for_did(&admin_did);
+        let result = manager
+            .propose_governance_action_checked(
+                "nonexistent",
+                &admin_did,
+                super::GovernanceAction::CloseContext { reason: None },
+                &signing_key,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ContextError::MembershipFailed(_)
+        ));
+    }
+
+    /// SCP-268: `withdraw_governance_vote` returns `PermissionDenied` for `SingleAdmin`.
+    #[tokio::test]
+    async fn governance_withdraw_vote_single_admin_not_supported() {
+        let (manager, _handle, ctx_id) = setup_governance_context().await;
+        let admin_did: DID = "did:key:admin".into();
+        let fake_proposal_id = [0u8; 32];
+
+        let result = manager
+            .withdraw_governance_vote(&ctx_id, &fake_proposal_id, &admin_did)
+            .await;
+
+        // SingleAdmin does not support withdraw_vote.
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ContextError::PermissionDenied(_)
+        ));
     }
 }
