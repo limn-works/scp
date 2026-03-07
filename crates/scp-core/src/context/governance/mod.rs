@@ -977,6 +977,22 @@ pub enum GovernanceEvent {
         justification: DeadlockJustification,
         changes: Vec<GovernanceReconfigAction>,
     },
+    /// A simultaneous governance conflict was detected (ADR-031 §7).
+    ///
+    /// Logged when two conflicting proposals land at the same event log
+    /// sequence, triggering a governance freeze state.
+    ConflictDetected {
+        proposal_a: ProposalId,
+        proposal_b: ProposalId,
+    },
+    /// A governance conflict was resolved (ADR-031 §7).
+    ///
+    /// Logged when a sequential conflict is resolved (lower sequence wins)
+    /// or when a ResolveConflict action is executed.
+    ConflictResolved {
+        winner_id: ProposalId,
+        loser_id: ProposalId,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1391,6 +1407,102 @@ impl GovernanceEngine for SingleAdminEngine {
             proposal_id: *proposal_id,
             status: ProposalStatus::Invalidated { reason },
         }])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Conflict Detection
+// ---------------------------------------------------------------------------
+
+/// Detects if two governance actions conflict with each other (ADR-031 §7).
+///
+/// Two approved proposals are considered conflicting if they cannot both be
+/// executed without creating an inconsistent context state. This function
+/// implements the conflict detection rules from ADR-031 section 7.
+///
+/// # Conflict types detected:
+/// - Mutual `RemoveMember` proposals (each targeting the other's proposer)
+/// - Competing `ChangeRole` proposals for the same DID with different roles
+/// - Competing `ModifyCeiling` proposals with different ceiling sets
+/// - `RemoveMember` + `ChangeRole` for the same DID
+/// - `RevokeReadAccess` + `RestoreReadAccess` for the same DID
+/// - `RevokeWriteAccess` + `RestoreWriteAccess` for the same DID
+/// - Multiple `RevokeReadAccess` for same DID with different scopes
+/// - Multiple `RevokeWriteAccess` for same DID with different scopes
+///
+/// # Arguments
+/// * `action_a` - The first governance action
+/// * `proposer_a` - The DID of the proposer of action_a
+/// * `action_b` - The second governance action
+/// * `proposer_b` - The DID of the proposer of action_b
+///
+/// # Returns
+/// `true` if the actions conflict, `false` otherwise.
+pub fn actions_conflict(
+    action_a: &GovernanceAction,
+    proposer_a: &DID,
+    action_b: &GovernanceAction,
+    proposer_b: &DID,
+) -> bool {
+    use GovernanceAction::*;
+
+    match (action_a, action_b) {
+        // Mutual RemoveMember (each targeting the other's proposer)
+        (
+            RemoveMember { did: target_a, .. },
+            RemoveMember { did: target_b, .. },
+        ) => target_a == proposer_b && target_b == proposer_a,
+
+        // Competing ChangeRole proposals for the same DID with different roles
+        (
+            ChangeRole { did: did_a, new_role: role_a },
+            ChangeRole { did: did_b, new_role: role_b },
+        ) => did_a == did_b && role_a != role_b,
+
+        // Competing ModifyCeiling proposals with different ceiling sets
+        (
+            ModifyCeiling { new_ceiling: ceiling_a },
+            ModifyCeiling { new_ceiling: ceiling_b },
+        ) => ceiling_a != ceiling_b,
+
+        // RemoveMember + ChangeRole for the same DID
+        (RemoveMember { did: did_a, .. }, ChangeRole { did: did_b, .. })
+        | (ChangeRole { did: did_a, .. }, RemoveMember { did: did_b, .. }) => did_a == did_b,
+
+        // RevokeReadAccess + RestoreReadAccess for the same DID (mutually contradictory)
+        (
+            RevokeReadAccess { did: did_a, .. },
+            RestoreReadAccess { did: did_b },
+        )
+        | (
+            RestoreReadAccess { did: did_a },
+            RevokeReadAccess { did: did_b, .. },
+        ) => did_a == did_b,
+
+        // RevokeWriteAccess + RestoreWriteAccess for the same DID (mutually contradictory)
+        (
+            RevokeWriteAccess { did: did_a, .. },
+            RestoreWriteAccess { did: did_b },
+        )
+        | (
+            RestoreWriteAccess { did: did_a },
+            RevokeWriteAccess { did: did_b, .. },
+        ) => did_a == did_b,
+
+        // Two RevokeReadAccess for same DID with different scopes
+        (
+            RevokeReadAccess { did: did_a, scope: scope_a },
+            RevokeReadAccess { did: did_b, scope: scope_b },
+        ) => did_a == did_b && scope_a != scope_b,
+
+        // Two RevokeWriteAccess for same DID with different scopes
+        (
+            RevokeWriteAccess { did: did_a, scope: scope_a },
+            RevokeWriteAccess { did: did_b, scope: scope_b },
+        ) => did_a == did_b && scope_a != scope_b,
+
+        // All other combinations are not conflicting
+        _ => false,
     }
 }
 

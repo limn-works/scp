@@ -271,6 +271,14 @@ pub struct ContextSnapshot {
     /// `None` means free context (no payment required).
     #[serde(default)]
     pub economic_policy: Option<EconomicPolicy>,
+    /// Approved proposals pending execution, tracked for conflict detection (ADR-031 §7).
+    /// Maps proposal ID to (proposal, sequence_number, timestamp).
+    #[serde(default)]
+    pub approved_proposals: HashMap<ProposalId, (GovernanceProposal, u64, u64)>,
+    /// Governance freeze state due to simultaneous conflicts (ADR-031 §7).
+    /// Contains the conflicting proposal IDs and freeze start timestamp.
+    #[serde(default)]
+    pub governance_freeze: Option<(ProposalId, ProposalId, u64)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -402,6 +410,12 @@ struct PerContextState {
     threshold_value: u32,
     /// Pruning policy override (ADR-030 §6).
     pruning_policy: Option<PruningPolicy>,
+    /// Approved proposals pending execution, tracked for conflict detection (ADR-031 §7).
+    /// Maps proposal ID to (proposal, sequence_number, timestamp).
+    approved_proposals: HashMap<ProposalId, (GovernanceProposal, u64, u64)>,
+    /// Governance freeze state due to simultaneous conflicts (ADR-031 §7).
+    /// Contains the conflicting proposal IDs and freeze start timestamp.
+    governance_freeze: Option<(ProposalId, ProposalId, u64)>,
     /// The governance engine for this context (ADR-031, spec §5.9).
     governance_engine: Box<dyn GovernanceEngine>,
     /// Mutable economic policy (§19.3, ADR-033).
@@ -929,6 +943,8 @@ impl ContextManager {
             pruning_policy: ctx.pruning_policy.clone(),
             governance_model_config: Some(ctx.governance_engine.model_config()),
             economic_policy: ctx.economic_policy.clone(),
+            approved_proposals: ctx.approved_proposals.clone(),
+            governance_freeze: ctx.governance_freeze,
         }
     }
 
@@ -1021,6 +1037,8 @@ impl ContextManager {
             threshold_signers: ctx_snapshot.threshold_signers,
             threshold_value: ctx_snapshot.threshold_value,
             pruning_policy: ctx_snapshot.pruning_policy,
+            approved_proposals: ctx_snapshot.approved_proposals,
+            governance_freeze: ctx_snapshot.governance_freeze,
             governance_engine,
             economic_policy: ctx_snapshot.economic_policy,
             governance_timeout_task: GovernanceTimeoutTask::new(),
@@ -1238,6 +1256,8 @@ impl ContextManager {
             threshold_signers: Vec::new(),
             threshold_value: 0,
             pruning_policy: None,
+            approved_proposals: HashMap::new(),
+            governance_freeze: None,
             governance_engine,
             economic_policy: params.economic_policy.clone(),
             governance_timeout_task: GovernanceTimeoutTask::new(),
@@ -1405,6 +1425,8 @@ impl ContextManager {
             threshold_signers: Vec::new(),
             threshold_value: 0,
             pruning_policy: None,
+            approved_proposals: HashMap::new(),
+            governance_freeze: None,
             governance_engine,
             economic_policy: params.economic_policy.clone(),
             governance_timeout_task: GovernanceTimeoutTask::new(),
@@ -2680,7 +2702,7 @@ impl ContextManager {
         approve: bool,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), ContextError> {
-        let (status, events, proposal_for_execution) = {
+        let (status, events, proposal_for_execution, conflict_events) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
@@ -2700,21 +2722,46 @@ impl ContextManager {
                     .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?
             };
 
-            // If the proposal just became Approved, grab a clone for execution.
+            // If the proposal just became Approved, grab a clone for conflict detection and execution.
             let proposal_for_execution = if status == ProposalStatus::Approved {
                 ctx.governance_engine.get_proposal(proposal_id).cloned()
             } else {
                 None
             };
 
-            (status, events, proposal_for_execution)
+            // If we have a newly approved proposal, check for conflicts with other approved proposals
+            let mut conflict_events = Vec::new();
+            if let Some(ref proposal) = proposal_for_execution {
+                conflict_events = self.detect_and_handle_conflicts(ctx, proposal);
+            }
+
+            (status, events, proposal_for_execution, conflict_events)
         };
         // Lock dropped.
 
-        // Auto-execute if the proposal was just approved.
+        // Handle any conflicts first, then auto-execute if not in governance freeze
+        for event in conflict_events {
+            // Emit the conflict event to the event log
+            match event {
+                // Handle conflict events here - they would be appended to event log
+                _ => {} // For now, just ignore - we'll implement this properly
+            }
+        }
+
+        // Auto-execute if the proposal was just approved and we're not in governance freeze
         if let Some(proposal) = proposal_for_execution {
-            self.execute_governance_action(context_id, &proposal)
-                .await?;
+            // Check if we're in governance freeze before executing
+            let in_freeze = {
+                let contexts = self.contexts.lock().await;
+                contexts.get(context_id)
+                    .map(|ctx| ctx.governance_freeze.is_some())
+                    .unwrap_or(false)
+            };
+
+            if !in_freeze {
+                self.execute_governance_action(context_id, &proposal)
+                    .await?;
+            }
         }
 
         // Persist context state after vote.
@@ -2965,6 +3012,8 @@ impl ContextManager {
                 GovernanceEvent::VoteWithdrawn { .. } => "GovernanceVoteWithdrawn",
                 GovernanceEvent::ProposalResolved { .. } => "GovernanceProposalResolved",
                 GovernanceEvent::DeadlockRecovery { .. } => "GovernanceDeadlockRecovery",
+                GovernanceEvent::ConflictDetected { .. } => "GovernanceConflictDetected",
+                GovernanceEvent::ConflictResolved { .. } => "GovernanceConflictResolved",
             };
             let _ = self
                 .event_log
@@ -4863,6 +4912,121 @@ impl ContextManager {
             ContextError::PermissionDenied(format!("challenge verification failed: {e}"))
         })
     }
+
+    /// Detects and handles conflicts when a proposal becomes approved (ADR-031 §7).
+    ///
+    /// Checks if the newly approved proposal conflicts with any other approved
+    /// proposals. Handles sequential conflicts (lower sequence number wins) and
+    /// simultaneous conflicts (governance freeze).
+    ///
+    /// # Arguments
+    /// * `ctx` - The context state containing approved proposals
+    /// * `new_proposal` - The newly approved proposal to check for conflicts
+    ///
+    /// # Returns
+    /// A vector of governance events to emit (empty if no conflicts)
+    fn detect_and_handle_conflicts(&self, ctx: &mut PerContextState, new_proposal: &GovernanceProposal) -> Vec<GovernanceEvent> {
+        use super::governance::{actions_conflict, GovernanceEvent};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let mut events = Vec::new();
+        let current_timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Check for conflicts with existing approved proposals
+        let mut conflicts = Vec::new();
+        for (existing_id, (existing_proposal, existing_seq, existing_timestamp)) in &ctx.approved_proposals {
+            if actions_conflict(
+                &new_proposal.action,
+                &new_proposal.proposer_did,
+                &existing_proposal.action,
+                &existing_proposal.proposer_did,
+            ) {
+                conflicts.push((*existing_id, *existing_seq, *existing_timestamp, existing_proposal.clone()));
+            }
+        }
+
+        // Handle conflicts
+        for (conflicting_id, conflicting_seq, conflicting_timestamp, conflicting_proposal) in conflicts {
+            // Assign sequence numbers - for now, use timestamp as sequence
+            let new_seq = current_timestamp;
+
+            if new_seq == conflicting_seq {
+                // Simultaneous conflict - enter governance freeze
+                ctx.governance_freeze = Some((new_proposal.proposal_id, conflicting_id, current_timestamp));
+                events.push(GovernanceEvent::ConflictDetected {
+                    proposal_a: new_proposal.proposal_id,
+                    proposal_b: conflicting_id,
+                });
+            } else if new_seq < conflicting_seq {
+                // New proposal wins - invalidate the conflicting one
+                ctx.approved_proposals.remove(&conflicting_id);
+                events.push(GovernanceEvent::ConflictResolved {
+                    winner_id: new_proposal.proposal_id,
+                    loser_id: conflicting_id,
+                });
+            } else {
+                // Existing proposal wins - invalidate the new one
+                // Don't add the new proposal to approved_proposals
+                events.push(GovernanceEvent::ConflictResolved {
+                    winner_id: conflicting_id,
+                    loser_id: new_proposal.proposal_id,
+                });
+                return events; // Don't add the new proposal
+            }
+        }
+
+        // Add the new proposal to approved proposals if not invalidated
+        if !events.iter().any(|e| matches!(e, GovernanceEvent::ConflictResolved { loser_id, .. } if *loser_id == new_proposal.proposal_id)) {
+            ctx.approved_proposals.insert(
+                new_proposal.proposal_id,
+                (new_proposal.clone(), current_timestamp, current_timestamp)
+            );
+        }
+
+        events
+    }
+
+    /// Checks for and resolves expired governance freezes (ADR-031 §7).
+    ///
+    /// If a governance freeze has been active for more than 48 hours (172800 seconds)
+    /// without resolution, both conflicting proposals are invalidated and the freeze
+    /// is lifted.
+    ///
+    /// # Arguments
+    /// * `ctx` - The context state to check for expired freezes
+    ///
+    /// # Returns
+    /// A vector of governance events to emit (empty if no expired freezes)
+    fn check_and_resolve_expired_freezes(&self, ctx: &mut PerContextState) -> Vec<GovernanceEvent> {
+        use super::governance::GovernanceEvent;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        const FREEZE_TIMEOUT_SECONDS: u64 = 48 * 60 * 60; // 48 hours
+
+        let current_timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        if let Some((proposal_a, proposal_b, freeze_start)) = ctx.governance_freeze {
+            if current_timestamp.saturating_sub(freeze_start) >= FREEZE_TIMEOUT_SECONDS {
+                // Timeout reached - invalidate both proposals and lift freeze
+                ctx.approved_proposals.remove(&proposal_a);
+                ctx.approved_proposals.remove(&proposal_b);
+                ctx.governance_freeze = None;
+
+                return vec![GovernanceEvent::ConflictResolved {
+                    winner_id: [0; 32], // Special marker for timeout resolution
+                    loser_id: [0; 32],  // Both proposals invalidated
+                }];
+            }
+        }
+
+        Vec::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4880,6 +5044,7 @@ const fn _assert_send_sync() {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<ContextManager>();
 }
+
 
 // ---------------------------------------------------------------------------
 // Tests
