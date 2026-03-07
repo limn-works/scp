@@ -19,10 +19,12 @@
 
 pub mod lifecycle;
 pub mod wire;
+pub mod wrapping;
 
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 // ---------------------------------------------------------------------------
@@ -154,7 +156,172 @@ pub enum AccessKeyError {
     /// The system clock is unavailable or before the Unix epoch.
     #[error("clock error: {0}")]
     ClockError(#[from] crate::time::ClockError),
+
+    /// AES-256-GCM encryption failed.
+    #[error("content encryption failed: {0}")]
+    EncryptionFailed(String),
+
+    /// AES-256-GCM authentication tag verification failed.
+    #[error("integrity check failed: AEAD tag verification failure")]
+    IntegrityFailure,
+
+    /// AES-256-KW integrity check failed during CEK unwrapping.
+    #[error("key unwrap failed: AES-256-KW integrity check failure")]
+    KeyUnwrapFailed,
+
+    /// The recipient's `member_id` was not found in the `wrapped_ceks` list.
+    #[error("not a recipient: member_id not found in wrapped_ceks")]
+    NotRecipient,
+
+    /// The wrapped key has an invalid length (expected 40 bytes).
+    #[error("invalid wrapped key length: expected 40 bytes, got {0}")]
+    InvalidWrappedKeyLength(usize),
 }
+
+// ---------------------------------------------------------------------------
+// ContentEncryptionKey
+// ---------------------------------------------------------------------------
+
+/// Content Encryption Key — ephemeral, per-message.
+///
+/// Generated fresh for each message, used once for AES-256-GCM content
+/// encryption, then discarded after being wrapped for each recipient.
+/// See ADR-038 §1 and §9.17.1.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct ContentEncryptionKey {
+    key: [u8; 32],
+}
+
+impl ContentEncryptionKey {
+    /// Generates a fresh random 32-byte CEK.
+    #[must_use]
+    pub fn generate() -> Self {
+        let mut bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut bytes);
+        Self { key: bytes }
+    }
+
+    /// Creates a CEK from raw 32-byte key material.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self { key: bytes }
+    }
+
+    /// Returns a reference to the raw 32-byte key material.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.key
+    }
+}
+
+impl std::fmt::Debug for ContentEncryptionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContentEncryptionKey")
+            .field("key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WrappedCek
+// ---------------------------------------------------------------------------
+
+/// A CEK wrapped with a member's access key via AES-256-KW (RFC 3394).
+///
+/// The 32-byte CEK becomes 40 bytes after wrapping (32-byte key + 8-byte
+/// integrity check value). See ADR-038 §4 and §9.17.3.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WrappedCek {
+    /// Truncated SHA-256 of the member's DID (first 8 bytes).
+    #[serde(with = "serde_member_id")]
+    pub member_id: [u8; 8],
+    /// AES-256-KW wrapped CEK (40 bytes).
+    #[serde(with = "serde_wrapped_key")]
+    pub wrapped_key: [u8; 40],
+}
+
+// ---------------------------------------------------------------------------
+// WrappedContent
+// ---------------------------------------------------------------------------
+
+/// Content with per-member access-key-wrapped CEKs.
+///
+/// Uses `Vec<WrappedCek>` (not `HashMap`) for deterministic serialization.
+/// Integrity verified by AES-256-GCM's authentication tag — no separate
+/// content hash. See ADR-038 §4 and §9.17.3.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WrappedContent {
+    /// AES-256-GCM encrypted content.
+    #[serde(with = "serde_bytes")]
+    pub ciphertext: Vec<u8>,
+    /// AES-256-GCM nonce (12 bytes).
+    #[serde(with = "serde_nonce")]
+    pub nonce: [u8; 12],
+    /// Per-recipient wrapped CEKs.
+    pub wrapped_ceks: Vec<WrappedCek>,
+}
+
+// ---------------------------------------------------------------------------
+// Helper: compute_member_id
+// ---------------------------------------------------------------------------
+
+/// Computes the member_id for a DID: first 8 bytes of SHA-256(member_did).
+#[must_use]
+pub fn compute_member_id(member_did: &str) -> [u8; 8] {
+    let hash = Sha256::digest(member_did.as_bytes());
+    let mut id = [0u8; 8];
+    id.copy_from_slice(&hash[..8]);
+    id
+}
+
+// ---------------------------------------------------------------------------
+// Serde helpers for fixed-size arrays
+// ---------------------------------------------------------------------------
+
+mod serde_member_id {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub fn serialize<S: Serializer>(data: &[u8; 8], serializer: S) -> Result<S::Ok, S::Error> {
+        data.as_slice().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 8], D::Error> {
+        let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
+        bytes.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!("expected 8 bytes, got {}", v.len()))
+        })
+    }
+}
+
+mod serde_wrapped_key {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(data: &[u8; 40], serializer: S) -> Result<S::Ok, S::Error> {
+        data.as_slice().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 40], D::Error> {
+        let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
+        bytes.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!("expected 40 bytes, got {}", v.len()))
+        })
+    }
+}
+
+mod serde_nonce {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(data: &[u8; 12], serializer: S) -> Result<S::Ok, S::Error> {
+        data.as_slice().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 12], D::Error> {
+        let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
+        bytes.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!("expected 12 bytes, got {}", v.len()))
+        })
+    }
 
 // ---------------------------------------------------------------------------
 // Key generation

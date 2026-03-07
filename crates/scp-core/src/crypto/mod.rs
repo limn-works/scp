@@ -3,7 +3,8 @@
 //! This module contains the cryptographic primitives and protocol wrappers
 //! used by SCP:
 //!
-//! - [`access_keys`] — Per-member AES-256 access key layer for content access control (ADR-038).
+//! - [`access_keys`] — Content access key layer: per-member AES-256 access keys,
+//!   CEK wrapping with AES-256-KW, and the `WrappedContent` wire format (ADR-038, §9.17).
 //! - [`ed25519`] — Shared Ed25519 signature verification helpers.
 //! - [`key_continuity`] — Key continuity fingerprint computation (spec section 9.11, ADR-039).
 //! - [`tofu`] — Trust On First Use (TOFU) key tracking and comparison (spec section 9.11).
