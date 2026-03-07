@@ -4896,6 +4896,7 @@ dependencies = [
  "async-trait",
  "base64",
  "dashmap",
+ "ed25519-dalek 2.2.0",
  "hex",
  "rand 0.8.5",
  "scp-core",
@@ -5072,7 +5073,7 @@ name = "scp-testing"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "ed25519-dalek",
+ "ed25519-dalek 2.2.0",
  "futures",
  "hex",
  "openmls",

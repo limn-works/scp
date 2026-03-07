@@ -29,6 +29,7 @@ use scp_core::context::broadcast::BroadcastContextSnapshot;
 use scp_core::context::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
 };
+use scp_core::context::governance::KeyResolver;
 use scp_core::context::manager::{ContextManager, ContextPersistence, ContextSnapshot};
 use scp_core::context::membership::{ContextEvent, KeyPackage};
 use scp_core::context::{
@@ -273,12 +274,51 @@ impl ContextPersistence for InMemoryContextPersistence {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Test key registry: maps DID strings to deterministic signing key indices.
+/// Key material is derived from a per-DID seed byte to avoid collisions.
+///
+/// The governance engine verifies vote signatures during `propose()`, so the
+/// key resolver must return real verifying keys that match the signing keys
+/// used by test helpers.
+fn test_key_resolver() -> KeyResolver {
+    std::sync::Arc::new(|did: &DID| -> Option<ed25519_dalek::VerifyingKey> {
+        // Derive a deterministic signing key from the DID string.
+        // Use the first byte of the SHA-256 hash to seed.
+        use ed25519_dalek::SigningKey;
+        let seed = did_to_seed(did);
+        let sk = SigningKey::from_bytes(&seed);
+        Some(sk.verifying_key())
+    })
+}
+
+/// Derives a deterministic 32-byte seed from a DID string.
+fn did_to_seed(did: &DID) -> [u8; 32] {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    did.as_ref().hash(&mut hasher);
+    let h = hasher.finish();
+    let mut seed = [0u8; 32];
+    seed[..8].copy_from_slice(&h.to_le_bytes());
+    seed
+}
+
+/// Returns a deterministic signing key for a given DID.
+fn signing_key_for(did: &DID) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&did_to_seed(did))
+}
+
+/// Returns a deterministic signing key for test use (legacy, for broadcast).
+fn test_signing_key() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[1u8; 32])
+}
+
 /// Creates a ContextManager with default mock providers and standard capabilities.
 fn make_manager() -> ContextManager {
     ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
+        test_key_resolver(),
     )
 }
 
@@ -316,8 +356,8 @@ fn make_approved_proposal(
     action: GovernanceAction,
     members: Vec<(DID, String)>,
 ) -> GovernanceProposal {
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let mut engine = SingleAdminEngine::new(admin_did.clone());
+    let signing_key = signing_key_for(admin_did);
+    let mut engine = SingleAdminEngine::new(admin_did.clone(), test_key_resolver());
     let gov_ctx = GovernanceContext {
         context_id: context_id.to_owned(),
         members,
@@ -379,7 +419,7 @@ async fn e2e_message_round_trip_encrypted() {
     // Step 3: Alice sends an encrypted message.
     let original_msg = b"Hello Bob, this is a secret message from Alice!";
     manager
-        .send_message(&handle, &alice_did, original_msg)
+        .send_message(&handle, &alice_did, original_msg, None)
         .await
         .unwrap();
 
@@ -474,8 +514,8 @@ async fn e2e_governance_role_change_and_unauthorized_rejection() {
     // the proposer to be the admin, we construct a proposal manually with
     // the member as proposer but use the admin engine. The engine should
     // auto-approve only for the admin. For a member, propose() returns an error.
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
-    let mut engine = SingleAdminEngine::new(admin_did.clone());
+    let signing_key = signing_key_for(&member_did);
+    let mut engine = SingleAdminEngine::new(admin_did.clone(), test_key_resolver());
     let gov_ctx = GovernanceContext {
         context_id: ctx_id.to_owned(),
         members: vec![
@@ -555,7 +595,7 @@ async fn e2e_broadcast_publish_subscribe() {
     // Step 3: Publisher publishes content.
     let content = b"Breaking news: SCP protocol is production ready!";
     let envelope = manager
-        .publish_broadcast(ctx_id, &publisher_did, content)
+        .publish_broadcast(ctx_id, &publisher_did, content, &test_signing_key())
         .await;
     assert!(envelope.is_ok(), "publish should succeed: {envelope:?}");
     let envelope = envelope.unwrap();
@@ -637,6 +677,7 @@ async fn e2e_persistence_drop_and_restore() {
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
             Box::new(ArcPersistenceWrapper(persistence.clone())),
+            test_key_resolver(),
         );
 
         let handle = manager
@@ -654,7 +695,7 @@ async fn e2e_persistence_drop_and_restore() {
 
         // Send a message to advance sequence numbers.
         manager
-            .send_message(&handle, &admin_did, b"pre-restart message")
+            .send_message(&handle, &admin_did, b"pre-restart message", None)
             .await
             .unwrap();
     }
@@ -674,6 +715,7 @@ async fn e2e_persistence_drop_and_restore() {
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         Box::new(ArcPersistenceWrapper(persistence.clone())),
+        test_key_resolver(),
     );
 
     let restored_ids = manager2.restore_all_contexts().await.unwrap();
@@ -809,6 +851,7 @@ async fn e2e_broadcast_persistence_drop_and_restore() {
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
             Box::new(ArcPersistenceWrapper(persistence.clone())),
+            test_key_resolver(),
         );
         manager.register_local_did(publisher_did.clone()).await;
 
@@ -842,6 +885,7 @@ async fn e2e_broadcast_persistence_drop_and_restore() {
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         Box::new(ArcPersistenceWrapper(persistence.clone())),
+        test_key_resolver(),
     );
     manager2.register_local_did(publisher_did.clone()).await;
 
@@ -967,7 +1011,7 @@ async fn e2e_full_lifecycle_create_join_send_leave_close() {
 
     // Send message.
     manager
-        .send_message(&handle, &admin_did, b"lifecycle test message")
+        .send_message(&handle, &admin_did, b"lifecycle test message", None)
         .await
         .unwrap();
 
@@ -1066,7 +1110,7 @@ async fn e2e_multi_bridge_api_surface_verification() {
 
     // send_message
     manager
-        .send_message(&enc_handle, &alice, b"bridge test")
+        .send_message(&enc_handle, &alice, b"bridge test", None)
         .await
         .unwrap();
 
@@ -1130,7 +1174,7 @@ async fn e2e_multi_bridge_api_surface_verification() {
 
     // publish_broadcast
     let envelope = manager
-        .publish_broadcast(bc_ctx_id, &alice, b"broadcast bridge test")
+        .publish_broadcast(bc_ctx_id, &alice, b"broadcast bridge test", &test_signing_key())
         .await
         .unwrap();
     assert!(!envelope.encrypted_content.is_empty());

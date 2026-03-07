@@ -99,6 +99,22 @@
 - HIGH: validate_projection_ucan structural-only; message_handler Gated check after decryption
 - MEDIUM: conflict_resolution missing RestoreReadAccess vs RestoreReadAccess pair (still open)
 
+### UCAN Ceiling Enforcement (#339) -- 2026-03-06
+- HIGH: FFI bridges (PyO3/NAPI/UniFFI) pass Some(empty_set) not None for contexts without ceiling -- blocks ALL ucan_mint/delegate
+- HIGH: Option<HashSet<String>> on MintParams/DelegateParams is fail-open; all ~70 test sites pass ceiling: None
+- MEDIUM: mint_ucan parses capabilities twice (ceiling check + attestation build) -- TOCTOU-class divergence risk
+- GOOD: WASM bridge handles empty ceiling correctly (skips when empty); delegate ordering correct (attenuation before ceiling)
+- Pattern: empty-collection-wrapped-in-Some vs None -- recurring FFI bridge issue. Always convert empty to None at boundary.
+
+### Production Providers (#385) -- 2026-03-06
+- HIGH: encrypt_message skips sender key layer -- only MLS, no ADR-007 sender key encryption. Defeats blocking/content access control.
+- HIGH: init_broadcast_key generates broadcast key then discards it, stores unrelated sender key material. Three keys generated, none correct.
+- MEDIUM: Merkle hash lacks length prefix on variable-length event name -- collision possible at event/timestamp boundary
+- MEDIUM: unwrap_or_default() on SystemTime in event log (recurring pattern)
+- MEDIUM: init_broadcast_key and destroy_sender_key acquire broadcast_keys/sender_keys mutexes in opposite order -- deadlock risk
+- MEDIUM: validate_key_package only checks "did:" prefix -- no ciphersuite, signature, or credential validation
+- GOOD: PoisonError::into_inner consistent; lock scopes minimal; encrypt/decrypt round-trip test real crypto; Merkle chain verification tested
+
 ### General Patterns
 - clippy deny unwrap/expect in lib code; thiserror; Rust 2024; #![forbid(unsafe_code)] except scp-ffi
 - zeroize inconsistent: store layer yes, identity signing keys and MLS key pairs no
@@ -108,3 +124,5 @@
 - validate_projection_ucan structural-only -- recurring UCAN validation gap
 - Signed wire types should have deny_unknown_fields (InnerEnvelope fixed; sender key types still missing)
 - handle_sender_key_request has no timestamp freshness or NonceDedup integration
+- Multiple Mutex locks on same struct: enforce consistent acquisition order to prevent deadlock (crypto.rs broadcast_keys vs sender_keys)
+- Hash inputs with variable-length fields need length prefixes or domain separators to prevent boundary-shift collisions
