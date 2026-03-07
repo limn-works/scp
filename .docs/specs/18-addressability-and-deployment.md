@@ -58,6 +58,8 @@ SCP uses multiple DID document service endpoint types, each serving a distinct p
 | `IdentityPrivateState` | Relay URLs storing identity private state blobs | Identity Manager | §3.7 |
 | `PreRotationCommitment` | SHA-256 commitment hash for pre-rotation key (applies to `#0` and `#active` only; `#agent` is a software key with simpler rotation — no pre-rotation needed, see ADR-039) | Identity Manager (§9.12) | ADR-003 |
 | `SCPBroadcastContext` | Broadcast context ID + relay URLs for author discovery | Discovery Engine | §5.14.11 |
+| `ParticipationStatements` | Relay URL(s) where the agent's participation statements can be fetched by verifiers | Participation Admission (§7.3.2.1) | §7.3.2.1 |
+| `AttestationRevocations` | Endpoint(s) for checking attestation revocation status | Attestation Verification (§7.4.4) | §7.4.4 |
 
 **SCPRelay vs SCPCapabilities.** These are distinct service types with different consumers and different purposes:
 

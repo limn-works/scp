@@ -29,14 +29,90 @@ This is the mechanism for all structured inter-agent interaction across context 
 
 Properties:
 
-- Both contexts opt in explicitly (bidirectional consent at the context level, not the agent level).
+- Both contexts opt in explicitly (bidirectional consent at the context level, not the agent level — see §6.2.0.1 for the consent protocol).
 - Data flows through defined function signatures, not through agent memory or discretion.
 - Auditable: every call through an interface is logged in both contexts' event logs with full provenance (§7.7).
 - Tool interfaces carry provenance: data received through an interface carries its origin context, invoking agent, timestamp, and chain depth (§7.7.1).
-- Rate-limited: both contexts can enforce rate limits on interface calls.
+- Rate-limited: both contexts can enforce rate limits on interface calls (see §6.2.0.2 for defaults).
 - **Chain depth limit.** Cross-context tool calls carry a `chain_depth` counter, incremented on each hop. A tool call at maximum depth cannot trigger further cross-context tool calls. The protocol defines a hard maximum of 5 hops that cannot be exceeded. Contexts MAY configure a lower maximum via `max_chain_depth` in `ContextParams` (RECOMMENDED default: 3). This bounds amplification and makes transitive provenance degradation mechanically enforced (§9.2.1, §24.4).
 - **Schema constraints.** Tool schemas must satisfy a structural specificity floor at registration time — no unbounded string-only interfaces, minimum two distinct fields in input or output. This prevents degenerate broad-schema tools that function as arbitrary message channels (§9.2.1).
 - **Tool-level costs.** Individual tools may declare per-invocation costs in their registration metadata (§5.4). These are additive with context-level costs and carry their own payee DID. Cross-context tool calls inherit the target tool's cost structure. See §19.3 for economic policy and §19.2.2 for the payment integration sequence.
+
+#### 6.2.0.1 Bidirectional Consent Protocol
+
+Tool interface creation requires explicit consent from both the exposing context and the consuming context. The consent protocol:
+
+1. **Interface proposal.** An admin in Context A proposes exposing a tool to Context B via a governance action:
+   ```
+   ProposeToolInterface {
+     tool_id:        ToolId,       // Tool to expose
+     target_context: ContextId,    // Context B
+     outbound_policy: OutboundPolicy,
+     max_calls_per_minute: u32,    // Rate limit for this interface
+   }
+   ```
+   This proposal follows Context A's governance model (§5.9).
+
+2. **Outbound policy validation.** Context A validates that `toolInterface` is in its ceiling (§5.3) and the proposer holds the `toolInterface` capability.
+
+3. **Interface offer.** On governance approval, Context A publishes an `InterfaceOffer` to its event log:
+   ```
+   InterfaceOffer {
+     offer_id:       [u8; 32],     // SHA-256(context_a_id || tool_id || context_b_id || timestamp)
+     source_context: ContextId,    // Context A
+     target_context: ContextId,    // Context B
+     tool_schema:    ToolRegistration, // Full tool schema (§5.4.1)
+     outbound_policy: OutboundPolicy,
+     expires_at:     u64,          // Offer expires if not accepted within 7 days
+   }
+   ```
+
+4. **Acceptance.** A shared member carries the offer to Context B (shared-member bridging). Context B's governance decides whether to accept:
+   ```
+   AcceptToolInterface {
+     offer_id:       [u8; 32],
+     inbound_policy: InboundPolicy,
+   }
+   ```
+   This follows Context B's governance model. Acceptance creates an `InterfaceEstablished` event in both event logs.
+
+5. **Teardown.** Either context can revoke the interface at any time via governance action `RevokeToolInterface { interface_id }`. Revocation is unilateral — no consent from the other side is needed. An `InterfaceRevoked` event is recorded in the revoking context's event log.
+
+**Outbound and inbound policies:**
+
+```
+OutboundPolicy {
+  allowed_callers:      Vec<DID>,   // DIDs in Context A authorized to use this interface.
+                                    // Empty = any member with toolInterface capability.
+  max_calls_per_minute: u32,        // Rate limit from Context A's perspective.
+  max_payload_bytes:    u32,        // Maximum request payload size. Default: 65536 (64 KiB).
+  require_provenance:   bool,       // Whether responses must carry provenance. Default: true.
+}
+
+InboundPolicy {
+  allowed_source_roles: Vec<String>, // Roles in Context A whose members can call. Empty = any.
+  max_calls_per_minute: u32,        // Rate limit from Context B's perspective.
+  max_response_bytes:   u32,        // Maximum response payload size. Default: 65536 (64 KiB).
+  require_spending_ucan: bool,      // Whether callers must present spending UCANs. Default: false.
+}
+```
+
+Outbound policy is set by Context A (the exposing context). Inbound policy is set by Context B (the consuming context). Both policies are enforced — a call must satisfy BOTH to proceed. The effective rate limit is `min(outbound.max_calls_per_minute, inbound.max_calls_per_minute)`.
+
+#### 6.2.0.2 Tool Interface Rate Limit Defaults
+
+Rate limits for cross-context tool interfaces use a sliding window counter with the following defaults:
+
+| Parameter | Default | Configurable range |
+|-----------|---------|-------------------|
+| Per-interface calls/minute | 60 | 1 - 6000 |
+| Per-caller calls/minute | 10 | 1 - 1000 |
+| Burst allowance | 5 (calls above limit within 1 second) | 0 - 50 |
+| Window duration | 60 seconds (sliding) | 10 - 3600 seconds |
+
+**Enforcement semantics.** When a rate limit is exceeded, the call is rejected with error code `TOOL_INTERFACE_RATE_LIMITED` (code 4030). The response includes a `Retry-After` header indicating seconds until the next call will be accepted. Calls are NOT queued — rate-limited calls fail immediately. The caller's SDK MAY retry after the indicated delay.
+
+**Per-caller vs. per-interface limits.** Both limits are enforced independently. A single caller is limited to 10 calls/minute by default; all callers combined are limited to 60 calls/minute per interface. This prevents a single caller from monopolizing an interface.
 
 ### 6.2.1 Stateful Tool Sessions
 
