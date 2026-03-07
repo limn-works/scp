@@ -4976,6 +4976,7 @@ name = "scp-testing"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "ed25519-dalek",
  "futures",
  "hex",
  "openmls",
