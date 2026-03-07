@@ -34,9 +34,10 @@ use scp_core::bridge::provenance::{
 use scp_core::bridge::registration::{
     BridgeRegistrationRequest, BridgeRegistry, approve_registration, register_bridge,
 };
-use scp_core::bridge::shadow::{ShadowRegistry, create_shadow};
+use scp_core::bridge::shadow::{CreateShadowParams, ShadowRegistry, create_shadow};
 use scp_core::bridge::{BridgeMode, BridgeStatus, ShadowProvenanceStatus};
 use scp_core::context::MemoryScope;
+use scp_core::crypto::sender_keys::SenderKeyStore;
 use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
 use scp_core::trust::attestation::{AttestationEvidence, RevocationStatus};
 use scp_core::trust::{Attestation, AttestationType};
@@ -339,16 +340,18 @@ fn bridge_registration_shadow_creation_provenance_and_claiming() {
     let platform_handle = "@alice#1234";
     let shadow_id = "shadow-phase5-001";
 
-    let (shadow, creation_event) = create_shadow(
-        &mut shadow_registry,
+    let mut sender_key_store = SenderKeyStore::new();
+    let shadow_params = CreateShadowParams {
         shadow_id,
-        "bridge-phase5-001",
-        BridgeMode::Relay,
+        bridge_id: "bridge-phase5-001",
+        bridge_mode: BridgeMode::Relay,
         platform_handle,
-        &[],
-        1_700_000_100,
-    )
-    .expect("shadow creation should succeed");
+        context_member_dids: &[],
+        timestamp: 1_700_000_100,
+    };
+    let (shadow, creation_event) =
+        create_shadow(&mut shadow_registry, &mut sender_key_store, &shadow_params)
+            .expect("shadow creation should succeed");
 
     assert_eq!(shadow.shadow_id, shadow_id);
     assert_eq!(shadow.platform_handle, platform_handle);
@@ -848,14 +851,18 @@ async fn cross_adr_platform_key_custody_signs_claim_request() {
 
     // Create a shadow registry and shadow.
     let mut shadow_registry = ShadowRegistry::new("ctx-platform-claim".to_owned());
+    let shadow_params = CreateShadowParams {
+        shadow_id,
+        bridge_id: "bridge-platform-001",
+        bridge_mode: BridgeMode::Relay,
+        platform_handle,
+        context_member_dids: &[],
+        timestamp: 1_700_000_100,
+    };
     create_shadow(
         &mut shadow_registry,
-        shadow_id,
-        "bridge-platform-001",
-        BridgeMode::Relay,
-        platform_handle,
-        &[],
-        1_700_000_100,
+        &mut SenderKeyStore::new(),
+        &shadow_params,
     )
     .expect("shadow creation");
 
