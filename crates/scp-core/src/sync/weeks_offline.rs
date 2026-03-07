@@ -28,11 +28,13 @@
 //!
 //! See ADR-029 in `.docs/adrs/phase-6.md`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
 use super::{ContextId, Ed25519Signature, SyncError, SyncOutcome};
+use crate::crypto::canonical::{CanonicalField, canonical_hash};
 use scp_identity::DID;
 
 /// Safely compare a `u64` against a `usize` without truncation.
@@ -82,6 +84,30 @@ pub const RESET_WELCOME_TIMEOUT_SECS: u64 = 60;
 ///
 /// Prevents unbounded memory growth if the transition stalls.
 pub const MAX_INFLIGHT_QUEUE_SIZE: usize = 500;
+
+/// Domain separator for `ResetRequest` canonical hash (§23, ADR-029).
+///
+/// Used in `SHA-256(domain_separator || field_1 || ... || field_N)` to produce
+/// the bytes that are signed and verified.
+pub const RESET_REQUEST_DOMAIN_SEPARATOR: &str = "SCP-RESET-REQUEST-V1:";
+
+/// Maximum age of a `ResetRequest` before it is rejected as stale (seconds).
+///
+/// A 30-second freshness window prevents replaying captured reset requests
+/// after the original processing window. Matches the multi-device
+/// reconnection dedup window (§23.8).
+///
+/// See §23.5.2, ADR-029 section 4.
+pub const RESET_REQUEST_FRESHNESS_SECS: u64 = 30;
+
+/// TTL for tracking seen `ResetRequest` nonces (seconds).
+///
+/// Nonces older than this are evicted from the in-memory tracker.
+/// Set to 60 seconds — 2x the freshness window — to ensure that replays
+/// within the freshness window are always caught even with minor clock skew.
+///
+/// See §23.5.2, ADR-029 section 4.
+pub const RESET_REQUEST_NONCE_TTL_SECS: u64 = 60;
 
 // ---------------------------------------------------------------------------
 // ResetReason
@@ -143,7 +169,11 @@ impl std::fmt::Display for ResetReason {
 /// the member may not be able to encrypt at the current epoch. Signed by the
 /// member's Active Signing Key for authentication.
 ///
-/// See ADR-029 section 4, step 1.
+/// The `nonce` field provides anti-replay protection: each request carries a
+/// cryptographically random 16-byte nonce that is included in the canonical
+/// hash (at position 5) and checked for uniqueness by the processing admin.
+///
+/// See §23.5.2, ADR-029 section 4, step 1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResetRequest {
     /// The context in which the member needs to be reset.
@@ -154,11 +184,187 @@ pub struct ResetRequest {
     pub last_known_epoch: u64,
     /// Why the reset is being requested.
     pub reason: ResetReason,
+    /// Cryptographically random 16-byte nonce for anti-replay protection.
+    ///
+    /// Included in the canonical hash at position 5. The processing admin
+    /// tracks seen nonces with a 60-second TTL to reject replays.
+    ///
+    /// See §23.5.2, ADR-029 section 4.
+    pub nonce: [u8; 16],
     /// Unix timestamp (seconds) when the request was created.
     pub timestamp: u64,
-    /// Ed25519 signature over all fields (except signature itself).
+    /// Ed25519 signature over the canonical hash of all fields (except
+    /// signature itself). Domain separator: `"SCP-RESET-REQUEST-V1:"`.
     #[serde(with = "serde_bytes")]
     pub signature: Ed25519Signature,
+}
+
+impl ResetRequest {
+    /// Computes the canonical hash for this `ResetRequest`.
+    ///
+    /// The hash covers all fields except `signature` using the domain separator
+    /// `"SCP-RESET-REQUEST-V1:"`. Field order per §23.5.2:
+    ///
+    /// 1. `context_id` (`VarBytes`)
+    /// 2. `member_did` (`VarBytes`)
+    /// 3. `last_known_epoch` (`U64`)
+    /// 4. `reason` (`VarBytes` — Display string)
+    /// 5. `nonce` (`RawBytes` — 16 bytes, no length prefix)
+    /// 6. `timestamp` (`U64`)
+    ///
+    /// The result is the message to be signed/verified.
+    #[must_use]
+    pub fn canonical_hash(&self) -> [u8; 32] {
+        let reason_str = self.reason.to_string();
+        canonical_hash(
+            RESET_REQUEST_DOMAIN_SEPARATOR,
+            &[
+                CanonicalField::VarBytes(self.context_id.as_bytes()),
+                CanonicalField::VarBytes(self.member_did.as_bytes()),
+                CanonicalField::U64(self.last_known_epoch),
+                CanonicalField::VarBytes(reason_str.as_bytes()),
+                CanonicalField::RawBytes(&self.nonce),
+                CanonicalField::U64(self.timestamp),
+            ],
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ResetRequestNonceTracker
+// ---------------------------------------------------------------------------
+
+/// In-memory nonce deduplication tracker for `ResetRequest` anti-replay.
+///
+/// Tracks seen nonces with a configurable TTL. When a nonce is checked,
+/// expired entries are lazily evicted. Thread-safe via internal `Mutex`.
+///
+/// This is the primary, synchronous anti-replay defense. The persistent
+/// `ProtocolStore` nonce tracking is a defence-in-depth layer for crash
+/// recovery (same pattern as UCAN `NonceTracker` in `crypto/ucan/nonce.rs`).
+///
+/// See §23.5.2, ADR-029 section 4.
+#[derive(Debug)]
+pub struct ResetRequestNonceTracker {
+    /// Map of nonce bytes to the timestamp when they were first seen.
+    seen: Mutex<HashMap<[u8; 16], u64>>,
+    /// TTL for nonce entries in seconds.
+    ttl_secs: u64,
+}
+
+impl ResetRequestNonceTracker {
+    /// Creates a new nonce tracker with the given TTL.
+    #[must_use]
+    pub fn new(ttl_secs: u64) -> Self {
+        Self {
+            seen: Mutex::new(HashMap::new()),
+            ttl_secs,
+        }
+    }
+
+    /// Creates a new nonce tracker with the default TTL
+    /// ([`RESET_REQUEST_NONCE_TTL_SECS`]).
+    #[must_use]
+    pub fn with_default_ttl() -> Self {
+        Self::new(RESET_REQUEST_NONCE_TTL_SECS)
+    }
+
+    /// Checks if a nonce has been seen before and records it if new.
+    ///
+    /// Returns `true` if the nonce is new (not a replay).
+    /// Returns `false` if the nonce has been seen within the TTL window.
+    ///
+    /// Lazily evicts expired entries on each call.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (another thread panicked
+    /// while holding the lock). This is unrecoverable.
+    #[must_use = "ignoring nonce check result is a security bug"]
+    pub fn check_and_record(&self, nonce: &[u8; 16], now: u64) -> bool {
+        #[allow(clippy::expect_used)]
+        let mut seen = self.seen.lock().expect("nonce tracker lock poisoned");
+
+        // Lazy eviction of expired entries.
+        seen.retain(|_, first_seen| now.saturating_sub(*first_seen) < self.ttl_secs);
+
+        // Check for replay.
+        if seen.contains_key(nonce) {
+            return false;
+        }
+
+        // Record the nonce.
+        seen.insert(*nonce, now);
+        true
+    }
+}
+
+impl Default for ResetRequestNonceTracker {
+    fn default() -> Self {
+        Self::with_default_ttl()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// validate_reset_request
+// ---------------------------------------------------------------------------
+
+/// Validation result for a `ResetRequest`.
+///
+/// Returned by [`validate_reset_request`] when anti-replay checks pass.
+/// The caller is responsible for verifying the Ed25519 signature over
+/// [`ResetRequest::canonical_hash`] using the member's DID verification
+/// method (`#active` or `#agent`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedResetRequest {
+    /// The canonical hash that was validated.
+    pub canonical_hash: [u8; 32],
+}
+
+/// Validates a `ResetRequest` for anti-replay (freshness + nonce dedup).
+///
+/// This function performs two checks:
+///
+/// 1. **Freshness:** Rejects requests where `now - request.timestamp` exceeds
+///    [`RESET_REQUEST_FRESHNESS_SECS`] (30 seconds).
+/// 2. **Nonce dedup:** Rejects requests whose nonce has already been seen
+///    within the tracker's TTL window (60 seconds).
+///
+/// Signature verification is NOT performed here — the caller must verify
+/// the Ed25519 signature over the returned `canonical_hash` using the
+/// member's DID verification method. This separation allows the validation
+/// logic to remain transport- and identity-layer agnostic.
+///
+/// # Errors
+///
+/// Returns [`WeeksOfflineError::StaleResetRequest`] if the request is too old.
+/// Returns [`WeeksOfflineError::ReplayedResetRequest`] if the nonce was seen.
+pub fn validate_reset_request(
+    request: &ResetRequest,
+    now: u64,
+    nonce_tracker: &ResetRequestNonceTracker,
+) -> Result<ValidatedResetRequest, WeeksOfflineError> {
+    // Check 1: freshness (30-second window).
+    let age = now.saturating_sub(request.timestamp);
+    if age > RESET_REQUEST_FRESHNESS_SECS {
+        return Err(WeeksOfflineError::StaleResetRequest {
+            context_id: request.context_id.clone(),
+            age_secs: age,
+            max_age_secs: RESET_REQUEST_FRESHNESS_SECS,
+        });
+    }
+
+    // Check 2: nonce dedup (60-second TTL).
+    if !nonce_tracker.check_and_record(&request.nonce, now) {
+        return Err(WeeksOfflineError::ReplayedResetRequest {
+            context_id: request.context_id.clone(),
+            nonce: request.nonce,
+        });
+    }
+
+    Ok(ValidatedResetRequest {
+        canonical_hash: request.canonical_hash(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -591,6 +797,33 @@ pub enum WeeksOfflineError {
         context_id: ContextId,
         /// Human-readable reason.
         reason: String,
+    },
+
+    /// The `ResetRequest` is too old (exceeds freshness window).
+    ///
+    /// See §23.5.2, ADR-029 section 4.
+    #[error(
+        "stale reset request for context {context_id}: \
+         age {age_secs}s exceeds max {max_age_secs}s"
+    )]
+    StaleResetRequest {
+        /// The context where the stale request was received.
+        context_id: ContextId,
+        /// Actual age of the request in seconds.
+        age_secs: u64,
+        /// Maximum allowed age in seconds.
+        max_age_secs: u64,
+    },
+
+    /// The `ResetRequest` nonce was already seen (replay attempt).
+    ///
+    /// See §23.5.2, ADR-029 section 4.
+    #[error("replayed reset request for context {context_id}: nonce already seen")]
+    ReplayedResetRequest {
+        /// The context where the replay was detected.
+        context_id: ContextId,
+        /// The replayed nonce.
+        nonce: [u8; 16],
     },
 
     /// In-flight message queue overflow.
@@ -1228,6 +1461,7 @@ mod tests {
             reason: ResetReason::ExtendedOffline {
                 offline_duration_secs: EIGHT_DAYS_SECS,
             },
+            nonce: [0xAB; 16],
             timestamp: BASE_TIMESTAMP,
             signature: vec![0u8; 64],
         };
@@ -1490,5 +1724,237 @@ mod tests {
     #[test]
     fn max_inflight_queue_size_is_five_hundred() {
         assert_eq!(MAX_INFLIGHT_QUEUE_SIZE, 500);
+    }
+
+    // -----------------------------------------------------------------------
+    // ResetRequest canonical hash tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn canonical_hash_is_deterministic() {
+        let request = ResetRequest {
+            context_id: "ctx-1".to_owned(),
+            member_did: DID::from("did:dht:z6MkBob"),
+            last_known_epoch: 42,
+            reason: ResetReason::ExtendedOffline {
+                offline_duration_secs: EIGHT_DAYS_SECS,
+            },
+            nonce: [0xAB; 16],
+            timestamp: BASE_TIMESTAMP,
+            signature: vec![0u8; 64],
+        };
+        let hash1 = request.canonical_hash();
+        let hash2 = request.canonical_hash();
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn canonical_hash_differs_with_different_nonce() {
+        let mut request = ResetRequest {
+            context_id: "ctx-1".to_owned(),
+            member_did: DID::from("did:dht:z6MkBob"),
+            last_known_epoch: 42,
+            reason: ResetReason::ExtendedOffline {
+                offline_duration_secs: EIGHT_DAYS_SECS,
+            },
+            nonce: [0xAA; 16],
+            timestamp: BASE_TIMESTAMP,
+            signature: vec![0u8; 64],
+        };
+        let hash1 = request.canonical_hash();
+        request.nonce = [0xBB; 16];
+        let hash2 = request.canonical_hash();
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn canonical_hash_uses_correct_domain_separator() {
+        use crate::crypto::canonical::{CanonicalField as CF, canonical_hash as ch};
+
+        let request = ResetRequest {
+            context_id: "ctx-1".to_owned(),
+            member_did: DID::from("did:dht:z6MkBob"),
+            last_known_epoch: 42,
+            reason: ResetReason::ExtendedOffline {
+                offline_duration_secs: EIGHT_DAYS_SECS,
+            },
+            nonce: [0xAB; 16],
+            timestamp: BASE_TIMESTAMP,
+            signature: vec![],
+        };
+        let hash = request.canonical_hash();
+        // Verify by manual construction using the same canonical_hash utility.
+        let reason_str = request.reason.to_string();
+        let expected = ch(
+            "SCP-RESET-REQUEST-V1:",
+            &[
+                CF::VarBytes(b"ctx-1"),
+                CF::VarBytes(b"did:dht:z6MkBob"),
+                CF::U64(42),
+                CF::VarBytes(reason_str.as_bytes()),
+                CF::RawBytes(&[0xAB; 16]),
+                CF::U64(BASE_TIMESTAMP),
+            ],
+        );
+        assert_eq!(hash, expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // ResetRequestNonceTracker tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn nonce_tracker_accepts_new_nonce() {
+        let tracker = ResetRequestNonceTracker::with_default_ttl();
+        let nonce = [0x01; 16];
+        assert!(tracker.check_and_record(&nonce, BASE_TIMESTAMP));
+    }
+
+    #[test]
+    fn nonce_tracker_rejects_duplicate_nonce() {
+        let tracker = ResetRequestNonceTracker::with_default_ttl();
+        let nonce = [0x01; 16];
+        assert!(tracker.check_and_record(&nonce, BASE_TIMESTAMP));
+        assert!(!tracker.check_and_record(&nonce, BASE_TIMESTAMP + 1));
+    }
+
+    #[test]
+    fn nonce_tracker_accepts_after_ttl_expires() {
+        let tracker = ResetRequestNonceTracker::new(60);
+        let nonce = [0x01; 16];
+        assert!(tracker.check_and_record(&nonce, BASE_TIMESTAMP));
+        // 61 seconds later — TTL expired, nonce evicted.
+        assert!(tracker.check_and_record(&nonce, BASE_TIMESTAMP + 61));
+    }
+
+    #[test]
+    fn nonce_tracker_different_nonces_both_accepted() {
+        let tracker = ResetRequestNonceTracker::with_default_ttl();
+        let nonce_a = [0xAA; 16];
+        let nonce_b = [0xBB; 16];
+        assert!(tracker.check_and_record(&nonce_a, BASE_TIMESTAMP));
+        assert!(tracker.check_and_record(&nonce_b, BASE_TIMESTAMP));
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_reset_request tests
+    // -----------------------------------------------------------------------
+
+    fn make_test_request(nonce: [u8; 16], timestamp: u64) -> ResetRequest {
+        ResetRequest {
+            context_id: "ctx-test".to_owned(),
+            member_did: DID::from("did:dht:z6MkBob"),
+            last_known_epoch: 100,
+            reason: ResetReason::ExtendedOffline {
+                offline_duration_secs: EIGHT_DAYS_SECS,
+            },
+            nonce,
+            timestamp,
+            signature: vec![0u8; 64],
+        }
+    }
+
+    #[test]
+    fn validate_accepts_fresh_unique_request() {
+        let tracker = ResetRequestNonceTracker::with_default_ttl();
+        let request = make_test_request([0x01; 16], BASE_TIMESTAMP);
+        let result = validate_reset_request(&request, BASE_TIMESTAMP + 5, &tracker);
+        assert!(result.is_ok());
+        let validated = result.unwrap();
+        assert_eq!(validated.canonical_hash, request.canonical_hash());
+    }
+
+    #[test]
+    fn validate_rejects_stale_request() {
+        let tracker = ResetRequestNonceTracker::with_default_ttl();
+        let request = make_test_request([0x01; 16], BASE_TIMESTAMP);
+        // 31 seconds later — exceeds 30-second freshness window.
+        let result = validate_reset_request(&request, BASE_TIMESTAMP + 31, &tracker);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WeeksOfflineError::StaleResetRequest {
+                age_secs,
+                max_age_secs,
+                ..
+            } => {
+                assert_eq!(age_secs, 31);
+                assert_eq!(max_age_secs, RESET_REQUEST_FRESHNESS_SECS);
+            }
+            other => panic!("expected StaleResetRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_request_at_exact_freshness_boundary() {
+        let tracker = ResetRequestNonceTracker::with_default_ttl();
+        let request = make_test_request([0x01; 16], BASE_TIMESTAMP);
+        // Exactly 30 seconds — NOT exceeded (must be strictly >).
+        let result = validate_reset_request(&request, BASE_TIMESTAMP + 30, &tracker);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_replayed_request() {
+        let tracker = ResetRequestNonceTracker::with_default_ttl();
+        let nonce = [0x42; 16];
+        let request = make_test_request(nonce, BASE_TIMESTAMP);
+
+        // First submission succeeds.
+        let result = validate_reset_request(&request, BASE_TIMESTAMP + 1, &tracker);
+        assert!(result.is_ok());
+
+        // Second submission with same nonce is rejected.
+        let result = validate_reset_request(&request, BASE_TIMESTAMP + 2, &tracker);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WeeksOfflineError::ReplayedResetRequest {
+                nonce: replayed_nonce,
+                ..
+            } => {
+                assert_eq!(replayed_nonce, nonce);
+            }
+            other => panic!("expected ReplayedResetRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_stale_checked_before_nonce() {
+        // A stale request should be rejected even if the nonce is new.
+        // This verifies that freshness is checked first (fail fast).
+        let tracker = ResetRequestNonceTracker::with_default_ttl();
+        let request = make_test_request([0xFF; 16], BASE_TIMESTAMP);
+        let result = validate_reset_request(&request, BASE_TIMESTAMP + 100, &tracker);
+        assert!(matches!(
+            result,
+            Err(WeeksOfflineError::StaleResetRequest { .. })
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Anti-replay error Display tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn error_display_stale_reset_request() {
+        let err = WeeksOfflineError::StaleResetRequest {
+            context_id: "ctx-1".to_owned(),
+            age_secs: 45,
+            max_age_secs: 30,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("ctx-1"));
+        assert!(msg.contains("45s"));
+        assert!(msg.contains("30s"));
+    }
+
+    #[test]
+    fn error_display_replayed_reset_request() {
+        let err = WeeksOfflineError::ReplayedResetRequest {
+            context_id: "ctx-2".to_owned(),
+            nonce: [0xAB; 16],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("ctx-2"));
+        assert!(msg.contains("nonce already seen"));
     }
 }
