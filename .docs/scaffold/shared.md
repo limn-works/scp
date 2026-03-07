@@ -15,7 +15,6 @@ crates/
   scp-ffi/
     pyo3/             # Python FFI bridge (PyO3 + maturin)
     uniffi/           # Swift + Kotlin FFI bridge (UniFFI UDL)
-    cbindgen/         # C ABI bridge → Go (cgo), C# (P/Invoke), Java (JNA)
     wasm/             # Browser TypeScript FFI (wasm-bindgen)
     napi/             # Node/Bun TypeScript FFI (napi-rs)
 bindings/
@@ -23,9 +22,6 @@ bindings/
   typescript/         # @scp/sdk (npm) — dual target: browser WASM + Bun/Node native
   swift/              # SCP (Swift Package Manager)
   kotlin/             # com.limn:scp-sdk-kotlin (Maven Central)
-  go/                 # github.com/limn/scp-go (Go module)
-  csharp/             # Limn.Scp (NuGet)
-  java/               # com.limn:scp-sdk-java (Maven Central)
 ```
 
 ## Crate Responsibilities
@@ -36,17 +32,16 @@ bindings/
 | `scp-transport` | Transport trait + adapters. Native relay server/client. Multi-transport routing | tokio, tokio-tungstenite, futures |
 | `scp-platform` | Platform abstraction traits + in-memory testing adapters | ed25519-dalek, rand |
 | `scp-mcp` | MCP JSON-RPC server/client for tool exposition | serde_json, tokio, axum |
-| `crates/scp-ffi/*` | Language-specific FFI bridges. Thin translation layers only — zero protocol logic | pyo3, uniffi, cbindgen, wasm-bindgen, napi-rs |
+| `crates/scp-ffi/*` | Language-specific FFI bridges. Thin translation layers only — zero protocol logic | pyo3, uniffi, wasm-bindgen, napi-rs |
 
 ## FFI Bridge Strategy
 
-Three bridges serve eight languages:
+Three bridges serve five languages:
 
 | Bridge | Crate | Target languages | Mechanism |
 |--------|-------|------------------|-----------|
 | **PyO3** | `crates/scp-ffi/pyo3` | Python | Direct Rust-Python interop via `#[pyfunction]`/`#[pyclass]` |
 | **UniFFI** | `crates/scp-ffi/uniffi` | Swift, Kotlin | Single UDL definition generates Swift + Kotlin bindings |
-| **cbindgen** | `crates/scp-ffi/cbindgen` | Go, C#, Java | C ABI header → cgo, P/Invoke, JNA |
 | **wasm-bindgen** | `crates/scp-ffi/wasm` | TypeScript (browser) | WASM module loaded in browser |
 | **napi-rs** | `crates/scp-ffi/napi` | TypeScript (Bun/Node) | Native addon for server-side JS runtimes |
 
@@ -205,9 +200,6 @@ Binary artifact build, sign, and distribute workflow. Conformance gate (100% pas
 | TypeScript (Node/Bun) | `@scp/sdk-node` | npm | napi-rs native addon |
 | Swift | `SCP` | Swift Package Manager | XCFramework binary target |
 | Kotlin | `com.limn:scp-sdk-kotlin` | Maven Central | AAR with bundled .so |
-| Go | `github.com/limn/scp-go` | Go modules | Source + pre-built .so |
-| C# | `Limn.Scp` | NuGet | Native runtime pack |
-| Java | `com.limn:scp-sdk-java` | Maven Central | JAR with bundled natives |
 
 ### Version pinning
 

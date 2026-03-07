@@ -7751,10 +7751,7 @@
         "bindings/python/README.md",
         "bindings/typescript/README.md",
         "bindings/swift/README.md",
-        "bindings/kotlin/README.md",
-        "bindings/go/README.md",
-        "bindings/csharp/README.md",
-        "bindings/java/README.md"
+        "bindings/kotlin/README.md"
       ],
       "description": "Every SDK ships with: (1) README.md — Quick start (install, create identity, create context, send message) in under 30 lines, (2) API reference — Generated from source (rustdoc, pydoc, typedoc, DocC, KDoc, godoc, xmldoc, javadoc), (3) Type stubs / declarations — For IDE autocompletion and static analysis (.pyi, .d.ts, etc.), (4) Examples directory — Runnable examples covering: basic messaging, tool invocation, MCP integration, multi-agent coordination.",
       "acceptanceCriteria": [
