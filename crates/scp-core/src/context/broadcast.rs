@@ -3909,7 +3909,7 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("invalid wrapping public key length"),
+            err_msg.contains("invalid wrapping_pubkey length"),
             "must indicate wrapping key issue: {err_msg}"
         );
     }

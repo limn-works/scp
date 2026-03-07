@@ -138,7 +138,6 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
             let guard = adapter.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             tokio::runtime::Handle::current().block_on(guard.delete(&blob_id))
         });
-        });
 
         match result {
             Ok(()) => Ok(()),

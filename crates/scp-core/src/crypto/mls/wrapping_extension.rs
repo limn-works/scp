@@ -440,6 +440,7 @@ mod tests {
         use crate::crypto::sender_keys::generate_sender_key;
         use crate::crypto::sender_keys::key_protocol::{
             handle_sender_key_request, open_sender_key_response, request_sender_key,
+            HandleRequestParams, NonceDedup,
         };
         use scp_platform::testing::InMemoryKeyCustody;
         use scp_platform::traits::{KeyCustody, KeyType};
@@ -462,25 +463,30 @@ mod tests {
                 .unwrap();
 
         let request: crate::crypto::sender_keys::SenderKeyRequest =
-            serde_json::from_slice(&request_result.request_message).unwrap();
+            rmp_serde::from_slice(&request_result.request_message).unwrap();
 
         // Alice handles the request.
         let block_list: HashSet<String> = HashSet::new();
+        let mut nonce_dedup = NonceDedup::new();
         let response_bytes = handle_sender_key_request(
             &request,
             bob_pubkey.as_bytes(),
-            &sender_key,
-            "did:dht:alice",
-            1,
-            &block_list,
-            None,
+            &HandleRequestParams {
+                sender_key: &sender_key,
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                block_list: &block_list,
+                context_members: None,
+                now_secs: request.timestamp,
+            },
+            &mut nonce_dedup,
         )
         .await
         .unwrap()
         .expect("Alice should respond to non-blocked Bob");
 
         let response: crate::crypto::sender_keys::SenderKeyResponse =
-            serde_json::from_slice(&response_bytes).unwrap();
+            rmp_serde::from_slice(&response_bytes).unwrap();
 
         // Bob decrypts the response using his ephemeral wrapping key handle.
         let recovered =
@@ -503,6 +509,7 @@ mod tests {
         use crate::crypto::sender_keys::generate_sender_key;
         use crate::crypto::sender_keys::key_protocol::{
             generate_wrapping_keypair, handle_sender_key_request, request_sender_key,
+            HandleRequestParams, NonceDedup,
         };
         use scp_platform::testing::InMemoryKeyCustody;
         use scp_platform::traits::{KeyCustody, KeyType};
@@ -522,23 +529,28 @@ mod tests {
                 .unwrap();
 
         let mut request: crate::crypto::sender_keys::SenderKeyRequest =
-            serde_json::from_slice(&request_result.request_message).unwrap();
+            rmp_serde::from_slice(&request_result.request_message).unwrap();
 
         // Tamper: replace Bob's wrapping pubkey with a random key.
         let (fake_pub, _fake_sec) = generate_wrapping_keypair();
-        request.wrapping_pubkey = fake_pub.to_vec();
+        request.wrapping_pubkey = fake_pub;
 
         // Alice handles the tampered request. The signature covers the
         // wrapping_pubkey, so verification must fail.
         let block_list: HashSet<String> = HashSet::new();
+        let mut nonce_dedup = NonceDedup::new();
         let result = handle_sender_key_request(
             &request,
             bob_pubkey.as_bytes(),
-            &sender_key,
-            "did:dht:alice",
-            1,
-            &block_list,
-            None,
+            &HandleRequestParams {
+                sender_key: &sender_key,
+                sender_did: "did:dht:alice",
+                epoch: 1,
+                block_list: &block_list,
+                context_members: None,
+                now_secs: request.timestamp,
+            },
+            &mut nonce_dedup,
         )
         .await;
 

@@ -2729,7 +2729,7 @@ mod tests {
     #[test]
     fn single_admin_set_economic_policy() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
         let sk = test_signing_key();
 
@@ -2745,7 +2745,7 @@ mod tests {
     #[test]
     fn single_admin_approve_spend() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
         let sk = test_signing_key();
 
@@ -2763,7 +2763,7 @@ mod tests {
     #[test]
     fn single_admin_lock_economic_policy() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
         let sk = test_signing_key();
 
