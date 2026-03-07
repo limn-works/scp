@@ -62,6 +62,7 @@
 
 pub mod aggregate;
 pub mod attestation;
+pub mod capability_registry;
 pub mod capability_uri;
 pub mod challenge;
 pub mod consequence;
@@ -81,10 +82,15 @@ pub use attestation::{
     IdentityDidPublicKeyResolver, RevocationStatus, ThresholdRequirement, ThresholdResult,
     check_attestation_freshness, check_threshold_attestation, verify_attestation,
 };
+pub use capability_registry::{
+    CapabilityRegistryError, RegistryEntry, is_known_protocol_capability,
+    is_known_system_capability, lookup_protocol_capability, lookup_system_capability,
+    validate_capability_uri,
+};
+pub use capability_uri::{CapabilityUri, CapabilityUriError};
 // ParticipationRecord and compute_participation_record are not part of
 // the public API. The module is pub(crate); the testing feature gate
 // re-exports compute_participation_record for integration tests.
-pub use capability_uri::{CapabilityUri, CapabilityUriError};
 pub use challenge::{
     ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,
     VerificationMethod, issue_challenge, verify_challenge_response,
