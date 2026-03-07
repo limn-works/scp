@@ -118,7 +118,8 @@ pub use custody_violation::{
 pub use participation::compute_participation_record;
 pub use participation::{
     ParticipationAdmissionError, ParticipationFact, ParticipationProfile, ParticipationRecord,
-    ParticipationThreshold, RequireParticipation, verify_participation_requirements,
+    ParticipationThreshold, RequireParticipation, produce_participation_profile,
+    verify_participation_requirements,
 };
 pub use renewal::{DefaultRenewalChecker, RenewalChecker, RenewalError, renew_attestation};
 
@@ -267,6 +268,20 @@ pub enum TrustError {
     NotChallengeable {
         /// The system capability URI that was rejected.
         uri: String,
+    },
+
+    /// The requested DID is not a member of the context.
+    #[error("DID is not a member of this context: {did}")]
+    NotAMember {
+        /// The DID that is not a member.
+        did: String,
+    },
+
+    /// The member has not opted in to participation profile publication.
+    #[error("member has not opted in to participation profile publication: {did}")]
+    NotOptedIn {
+        /// The DID that has not opted in.
+        did: String,
     },
 }
 

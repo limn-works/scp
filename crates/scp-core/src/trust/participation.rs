@@ -654,6 +654,135 @@ fn verify_statement_signature(
 }
 
 // ---------------------------------------------------------------------------
+// Context-Hosted ParticipationProfile Production (SCP-BA-005)
+// ---------------------------------------------------------------------------
+
+/// Domain separator for deriving context-specific participation signing keys.
+///
+/// Used with HKDF-SHA256 to derive a deterministic Ed25519 signing key from
+/// the context's key material. Each context produces a distinct signer,
+/// preventing cross-context correlation.
+const PARTICIPATION_KEY_DOMAIN: &[u8] = b"scp-participation-statement-v1";
+
+/// Derives a context-specific Ed25519 signing key for participation profiles.
+///
+/// Uses HKDF-SHA256 with the context key material as IKM and
+/// `"scp-participation-statement-v1"` as the info string. The same context
+/// key material always produces the same signing key (deterministic), but
+/// different contexts produce different keys (preventing correlation).
+fn derive_participation_signing_key(
+    context_key_material: &[u8; 32],
+) -> ed25519_dalek::SigningKey {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+
+    let hk = Hkdf::<Sha256>::new(None, context_key_material);
+    let mut okm = [0u8; 32];
+    // 32 bytes is well within HKDF-SHA256's output limit (255 * 32 = 8160).
+    // The only failure mode is requesting more than 8160 bytes, which cannot
+    // happen here, so the match arm is unreachable.
+    if hk.expand(PARTICIPATION_KEY_DOMAIN, &mut okm).is_err() {
+        unreachable!("HKDF-SHA256 expand for 32 bytes cannot fail");
+    }
+    ed25519_dalek::SigningKey::from_bytes(&okm)
+}
+
+/// Produces a signed [`ParticipationProfile`] for a member from the context's
+/// event log.
+///
+/// This is the core protocol operation where a context produces a profile
+/// attesting to a member's verifiable participation facts. Key properties:
+///
+/// - **Context-controlled:** Only contexts produce profiles; agents cannot
+///   write, modify, or delete them.
+/// - **Privacy-preserving:** The profile omits `context_id`. The signing key
+///   is derived with domain separation so verifiers cannot correlate it to the
+///   context identity.
+/// - **Replacement semantics:** Calling this again for the same member produces
+///   a new profile that replaces (not appends to) the prior one.
+///
+/// # Parameters
+///
+/// - `context_key_material` — The context's 32-byte key material, used to
+///   derive the context-specific Ed25519 signing key.
+/// - `member_did` — The DID of the member to produce the profile for.
+/// - `events` — The context's event log entries.
+/// - `merkle_root` — Merkle root of the event log at computation time.
+/// - `is_member` — Whether `member_did` is a current member of the context.
+/// - `is_opted_in` — Whether `member_did` has opted in to profile publication.
+/// - `current_time` — Unix timestamp (seconds) for `updated_at`.
+///
+/// # Errors
+///
+/// - [`TrustError::NotAMember`] if `is_member` is false.
+/// - [`TrustError::NotOptedIn`] if `is_opted_in` is false.
+/// - [`TrustError::EmptyEventLog`] if `events` is empty.
+///
+/// See §7.3.2.1.
+pub fn produce_participation_profile(
+    context_key_material: &[u8; 32],
+    member_did: &str,
+    events: &[Event],
+    merkle_root: [u8; 32],
+    is_member: bool,
+    is_opted_in: bool,
+    current_time: u64,
+) -> Result<ParticipationProfile, TrustError> {
+    use ed25519_dalek::Signer;
+
+    if !is_member {
+        return Err(TrustError::NotAMember {
+            did: member_did.to_owned(),
+        });
+    }
+
+    if !is_opted_in {
+        return Err(TrustError::NotOptedIn {
+            did: member_did.to_owned(),
+        });
+    }
+
+    // Compute participation facts from the event log. We use a dummy
+    // context_id since ParticipationProfile intentionally omits it.
+    let record = compute_participation_record(
+        events,
+        member_did,
+        "_internal",
+        merkle_root,
+        current_time,
+    )?;
+
+    // Derive the context-specific signing key.
+    let signing_key = derive_participation_signing_key(context_key_material);
+    let verifying_key = signing_key.verifying_key();
+
+    // Build the profile with all 7 fact values from the record.
+    let total_tool_invocations: u64 = record.tool_invocations.values().sum();
+
+    let mut profile = ParticipationProfile {
+        subject_did: member_did.into(),
+        participation_duration_secs: record.participation_duration_seconds,
+        governance_actions_against: record.governance_actions_against.len() as u64,
+        governance_actions_by: record.governance_actions_by.len() as u64,
+        tool_invocation_count: total_tool_invocations,
+        context_creation_count: record.context_creation_count,
+        role_progression_count: record.role_history.len() as u64,
+        attestation_count: record.attestation_history.len() as u64,
+        updated_at: current_time,
+        event_log_root: merkle_root,
+        signer_public_key: verifying_key.to_bytes(),
+        signature: [0u8; 64], // placeholder, overwritten below
+    };
+
+    // Sign the profile.
+    let signable = profile.signable_bytes();
+    let sig = signing_key.sign(&signable);
+    profile.signature = sig.to_bytes();
+
+    Ok(profile)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1671,6 +1800,284 @@ mod tests {
             }
             other => panic!("expected ThresholdNotMet, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // produce_participation_profile tests (SCP-BA-005)
+    // -----------------------------------------------------------------------
+
+    fn make_member_events(actor_did: &str) -> Vec<Event> {
+        vec![
+            make_event(EventType::ContextCreated, actor_did, 1000, 0, vec![]),
+            make_event(EventType::MemberJoined, actor_did, 1001, 1, vec![]),
+            make_event(
+                EventType::ToolInvoked,
+                actor_did,
+                1002,
+                2,
+                b"tool-a".to_vec(),
+            ),
+            make_event(
+                EventType::ToolInvoked,
+                actor_did,
+                1003,
+                3,
+                b"tool-b".to_vec(),
+            ),
+            make_event(
+                EventType::ToolInvoked,
+                actor_did,
+                1004,
+                4,
+                b"tool-a".to_vec(),
+            ),
+            make_event(
+                EventType::GovernanceAction,
+                actor_did,
+                1005,
+                5,
+                b"did:key:target".to_vec(),
+            ),
+            make_event(
+                EventType::GovernanceAction,
+                "did:key:admin",
+                1006,
+                6,
+                actor_did.as_bytes().to_vec(),
+            ),
+            make_event(
+                EventType::RoleAssigned,
+                "did:key:admin",
+                1007,
+                7,
+                actor_did.as_bytes().to_vec(),
+            ),
+            make_event(EventType::ToolVerified, actor_did, 1008, 8, vec![]),
+            make_event(EventType::MessageSent, actor_did, 1100, 9, vec![]),
+        ]
+    }
+
+    #[test]
+    fn produce_profile_for_valid_opted_in_member() {
+        let key_material = [42u8; 32];
+        let events = make_member_events("did:key:alice");
+        let merkle_root = [0xAA; 32];
+
+        let profile = produce_participation_profile(
+            &key_material,
+            "did:key:alice",
+            &events,
+            merkle_root,
+            true,
+            true,
+            5000,
+        )
+        .unwrap();
+
+        assert_eq!(profile.subject_did, "did:key:alice");
+        assert_eq!(profile.participation_duration_secs, 100); // 1100 - 1000
+        assert_eq!(profile.governance_actions_by, 1);
+        assert_eq!(profile.governance_actions_against, 1);
+        assert_eq!(profile.tool_invocation_count, 3); // tool-a x2 + tool-b x1
+        assert_eq!(profile.context_creation_count, 1);
+        assert_eq!(profile.role_progression_count, 1);
+        assert_eq!(profile.attestation_count, 1);
+        assert_eq!(profile.updated_at, 5000);
+        assert_eq!(profile.event_log_root, merkle_root);
+    }
+
+    #[test]
+    fn produce_profile_signature_verifies() {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        let key_material = [42u8; 32];
+        let events = make_member_events("did:key:alice");
+
+        let profile = produce_participation_profile(
+            &key_material,
+            "did:key:alice",
+            &events,
+            [0; 32],
+            true,
+            true,
+            5000,
+        )
+        .unwrap();
+
+        let vk = VerifyingKey::from_bytes(&profile.signer_public_key).unwrap();
+        let sig = Signature::from_bytes(&profile.signature);
+        let signable = profile.signable_bytes();
+        assert!(vk.verify(&signable, &sig).is_ok());
+    }
+
+    #[test]
+    fn produce_profile_non_member_returns_error() {
+        let events = make_member_events("did:key:alice");
+        let result = produce_participation_profile(
+            &[0u8; 32],
+            "did:key:alice",
+            &events,
+            [0; 32],
+            false, // not a member
+            true,
+            5000,
+        );
+        match result {
+            Err(TrustError::NotAMember { did }) => assert_eq!(did, "did:key:alice"),
+            other => panic!("expected NotAMember, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn produce_profile_not_opted_in_returns_error() {
+        let events = make_member_events("did:key:alice");
+        let result = produce_participation_profile(
+            &[0u8; 32],
+            "did:key:alice",
+            &events,
+            [0; 32],
+            true,
+            false, // not opted in
+            5000,
+        );
+        match result {
+            Err(TrustError::NotOptedIn { did }) => assert_eq!(did, "did:key:alice"),
+            other => panic!("expected NotOptedIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn produce_profile_different_contexts_produce_different_signers() {
+        let events = make_member_events("did:key:alice");
+
+        let profile_a = produce_participation_profile(
+            &[1u8; 32],
+            "did:key:alice",
+            &events,
+            [0; 32],
+            true,
+            true,
+            5000,
+        )
+        .unwrap();
+
+        let profile_b = produce_participation_profile(
+            &[2u8; 32],
+            "did:key:alice",
+            &events,
+            [0; 32],
+            true,
+            true,
+            5000,
+        )
+        .unwrap();
+
+        assert_ne!(
+            profile_a.signer_public_key, profile_b.signer_public_key,
+            "different context key materials must produce different signer keys"
+        );
+    }
+
+    #[test]
+    fn produce_profile_same_context_produces_same_signer() {
+        let key_material = [42u8; 32];
+        let events = make_member_events("did:key:alice");
+
+        let profile_a = produce_participation_profile(
+            &key_material,
+            "did:key:alice",
+            &events,
+            [0; 32],
+            true,
+            true,
+            5000,
+        )
+        .unwrap();
+
+        let profile_b = produce_participation_profile(
+            &key_material,
+            "did:key:alice",
+            &events,
+            [0; 32],
+            true,
+            true,
+            6000,
+        )
+        .unwrap();
+
+        assert_eq!(
+            profile_a.signer_public_key, profile_b.signer_public_key,
+            "same context key material must produce same signer key"
+        );
+    }
+
+    #[test]
+    fn produce_profile_replacement_yields_updated_values() {
+        let key_material = [42u8; 32];
+        let mut events = make_member_events("did:key:alice");
+
+        let profile_v1 = produce_participation_profile(
+            &key_material,
+            "did:key:alice",
+            &events,
+            [0; 32],
+            true,
+            true,
+            5000,
+        )
+        .unwrap();
+
+        // Add more tool invocations.
+        events.push(make_event(
+            EventType::ToolInvoked,
+            "did:key:alice",
+            1200,
+            10,
+            b"tool-c".to_vec(),
+        ));
+
+        let profile_v2 = produce_participation_profile(
+            &key_material,
+            "did:key:alice",
+            &events,
+            [1; 32],
+            true,
+            true,
+            6000,
+        )
+        .unwrap();
+
+        assert_eq!(profile_v1.tool_invocation_count, 3);
+        assert_eq!(profile_v2.tool_invocation_count, 4);
+        assert_eq!(profile_v2.updated_at, 6000);
+        assert_ne!(profile_v1.signature, profile_v2.signature);
+        // Signer key stays the same (same context).
+        assert_eq!(profile_v1.signer_public_key, profile_v2.signer_public_key);
+    }
+
+    #[test]
+    fn produce_profile_no_context_id_in_output() {
+        // ParticipationProfile has no context_id field — this is a compile-time
+        // guarantee via the struct definition. This test documents the intent.
+        let key_material = [42u8; 32];
+        let events = make_member_events("did:key:alice");
+
+        let profile = produce_participation_profile(
+            &key_material,
+            "did:key:alice",
+            &events,
+            [0; 32],
+            true,
+            true,
+            5000,
+        )
+        .unwrap();
+
+        let json = serde_json::to_string(&profile).unwrap();
+        assert!(
+            !json.contains("context_id"),
+            "serialized profile must not contain context_id"
+        );
     }
 
     #[test]
