@@ -67,6 +67,7 @@
 //! - [`RequireParticipation`] -- Participation admission requirement.
 //! - [`ParticipationProfile`] -- Context-hosted signed participation attestation.
 
+pub mod admission;
 pub mod aggregate;
 pub mod attestation;
 pub mod capability_registry;
@@ -84,6 +85,9 @@ use serde::{Deserialize, Serialize};
 use scp_identity::DID;
 
 // Re-export all public types from submodules.
+pub use admission::{
+    AdmissionError, CapabilityRequirement, VerificationLevel, check_capability_requirements,
+};
 pub use attestation::{
     Attestation, AttestationEvidence, AttestorInfo, DidPublicKeyResolver, FreshnessStatus,
     IdentityDidPublicKeyResolver, RevocationStatus, ThresholdRequirement, ThresholdResult,
