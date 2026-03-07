@@ -1407,6 +1407,7 @@ impl ContextManager {
             pruning_policy: None,
             governance_engine,
             economic_policy: params.economic_policy.clone(),
+            governance_timeout_task: GovernanceTimeoutTask::new(),
         };
 
         // Atomic duplicate check + insert under lock.
@@ -2963,6 +2964,7 @@ impl ContextManager {
                 GovernanceEvent::VoteCast { .. } => "GovernanceVoteCast",
                 GovernanceEvent::VoteWithdrawn { .. } => "GovernanceVoteWithdrawn",
                 GovernanceEvent::ProposalResolved { .. } => "GovernanceProposalResolved",
+                GovernanceEvent::DeadlockRecovery { .. } => "GovernanceDeadlockRecovery",
             };
             let _ = self
                 .event_log

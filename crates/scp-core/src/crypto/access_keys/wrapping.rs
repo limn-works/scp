@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn wrap_unwrap_cek_roundtrip() {
-        let access_key = generate_access_key();
+        let access_key = generate_access_key("ctx-test", "did:dht:test");
         let cek = ContentEncryptionKey::generate();
         let original_bytes = *cek.as_bytes();
 
@@ -353,8 +353,8 @@ mod tests {
 
     #[test]
     fn unwrap_cek_wrong_key_fails() {
-        let key1 = generate_access_key();
-        let key2 = generate_access_key();
+        let key1 = generate_access_key("ctx-test", "did:dht:test");
+        let key2 = generate_access_key("ctx-test", "did:dht:test");
         let cek = ContentEncryptionKey::generate();
 
         let wrapped = wrap_cek(&cek, &key1).unwrap();
@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn unwrap_cek_tampered_data_fails() {
-        let access_key = generate_access_key();
+        let access_key = generate_access_key("ctx-test", "did:dht:test");
         let cek = ContentEncryptionKey::generate();
 
         let mut wrapped = wrap_cek(&cek, &access_key).unwrap();
@@ -385,7 +385,7 @@ mod tests {
 
     #[test]
     fn wrap_unwrap_content_single_recipient() {
-        let access_key = generate_access_key();
+        let access_key = generate_access_key("ctx-test", "did:dht:test");
         let did = "did:dht:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
         let context_id = "ctx-test-123";
         let sender_did = "did:dht:z6MkSender";
@@ -409,9 +409,9 @@ mod tests {
 
     #[test]
     fn wrap_unwrap_content_multiple_recipients() {
-        let key_alice = generate_access_key();
-        let key_bob = generate_access_key();
-        let key_charlie = generate_access_key();
+        let key_alice = generate_access_key("ctx-test", "did:dht:test");
+        let key_bob = generate_access_key("ctx-test", "did:dht:test");
+        let key_charlie = generate_access_key("ctx-test", "did:dht:test");
         let did_alice = "did:dht:z6MkAlice";
         let did_bob = "did:dht:z6MkBob";
         let did_charlie = "did:dht:z6MkCharlie";
@@ -461,8 +461,8 @@ mod tests {
 
     #[test]
     fn unwrap_content_not_recipient() {
-        let key_alice = generate_access_key();
-        let key_eve = generate_access_key();
+        let key_alice = generate_access_key("ctx-test", "did:dht:test");
+        let key_eve = generate_access_key("ctx-test", "did:dht:test");
         let did_alice = "did:dht:z6MkAlice";
         let did_eve = "did:dht:z6MkEve";
         let context_id = "ctx-test";
@@ -487,8 +487,8 @@ mod tests {
 
     #[test]
     fn unwrap_content_wrong_access_key() {
-        let key_alice = generate_access_key();
-        let key_wrong = generate_access_key();
+        let key_alice = generate_access_key("ctx-test", "did:dht:test");
+        let key_wrong = generate_access_key("ctx-test", "did:dht:test");
         let did_alice = "did:dht:z6MkAlice";
         let context_id = "ctx-test";
         let sender_did = "did:dht:z6MkSender";
@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn unwrap_content_tampered_ciphertext() {
-        let access_key = generate_access_key();
+        let access_key = generate_access_key("ctx-test", "did:dht:test");
         let did = "did:dht:z6MkAlice";
         let context_id = "ctx-test";
         let sender_did = "did:dht:z6MkSender";
@@ -541,7 +541,7 @@ mod tests {
 
     #[test]
     fn unwrap_content_wrong_context_id_fails() {
-        let access_key = generate_access_key();
+        let access_key = generate_access_key("ctx-test", "did:dht:test");
         let did = "did:dht:z6MkAlice";
         let context_id = "ctx-original";
         let wrong_context_id = "ctx-relocated";
@@ -573,7 +573,7 @@ mod tests {
 
     #[test]
     fn unwrap_content_wrong_sender_did_fails() {
-        let access_key = generate_access_key();
+        let access_key = generate_access_key("ctx-test", "did:dht:test");
         let did = "did:dht:z6MkAlice";
         let context_id = "ctx-test";
         let sender_did = "did:dht:z6MkSender";
@@ -597,7 +597,7 @@ mod tests {
 
     #[test]
     fn unwrap_content_wrong_sequence_number_fails() {
-        let access_key = generate_access_key();
+        let access_key = generate_access_key("ctx-test", "did:dht:test");
         let did = "did:dht:z6MkAlice";
         let context_id = "ctx-test";
         let sender_did = "did:dht:z6MkSender";
@@ -628,9 +628,9 @@ mod tests {
 
     #[test]
     fn wrapped_ceks_sorted_by_member_id() {
-        let key_a = generate_access_key();
-        let key_b = generate_access_key();
-        let key_c = generate_access_key();
+        let key_a = generate_access_key("ctx-test", "did:dht:test");
+        let key_b = generate_access_key("ctx-test", "did:dht:test");
+        let key_c = generate_access_key("ctx-test", "did:dht:test");
         let context_id = "ctx-sort";
         let sender_did = "did:dht:z6MkSender";
         let seq = 1u64;
@@ -663,7 +663,7 @@ mod tests {
 
     #[test]
     fn wrapped_content_msgpack_roundtrip() {
-        let access_key = generate_access_key();
+        let access_key = generate_access_key("ctx-test", "did:dht:test");
         let did = "did:dht:z6MkAlice";
         let context_id = "ctx-msgpack";
         let sender_did = "did:dht:z6MkSender";
@@ -702,7 +702,7 @@ mod tests {
 
     #[test]
     fn wrap_content_empty_plaintext() {
-        let access_key = generate_access_key();
+        let access_key = generate_access_key("ctx-test", "did:dht:test");
         let did = "did:dht:z6MkAlice";
         let context_id = "ctx-empty";
         let sender_did = "did:dht:z6MkSender";
@@ -722,7 +722,7 @@ mod tests {
 
     #[test]
     fn wrap_content_large_plaintext() {
-        let access_key = generate_access_key();
+        let access_key = generate_access_key("ctx-test", "did:dht:test");
         let did = "did:dht:z6MkAlice";
         let context_id = "ctx-large";
         let sender_did = "did:dht:z6MkSender";
@@ -762,7 +762,7 @@ mod tests {
             0x1A, 0x99, 0xF4, 0x3B, 0xFB, 0x98, 0x8B, 0x9B, 0x7A, 0x02, 0xDD, 0x21,
         ];
 
-        let kek = AccessKey::from_bytes(kek_bytes);
+        let kek = AccessKey::from_parts(kek_bytes, "ctx-test".to_owned(), "did:dht:test".to_owned(), 0);
         let cek = ContentEncryptionKey::from_bytes(key_data);
 
         let wrapped = wrap_cek(&cek, &kek).unwrap();

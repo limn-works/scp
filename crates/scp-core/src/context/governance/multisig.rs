@@ -556,6 +556,8 @@ impl GovernanceEngine for ThresholdEngine {
 
     fn list_proposals(&self) -> Vec<GovernanceProposal> {
         self.proposals.values().cloned().collect()
+    }
+
     fn pending_proposal_ids(&self) -> Vec<ProposalId> {
         self.proposals
             .iter()

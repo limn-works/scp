@@ -322,6 +322,7 @@ mod serde_nonce {
             serde::de::Error::custom(format!("expected 12 bytes, got {}", v.len()))
         })
     }
+}
 
 // ---------------------------------------------------------------------------
 // Key generation

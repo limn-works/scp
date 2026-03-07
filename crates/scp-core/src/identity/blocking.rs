@@ -297,6 +297,7 @@ pub async fn block_did_in_context<S: BuildHasher + Send + Sync>(
         params.context_id,
         params.blocker_did,
         params.target_did,
+        params.signer_key_ref,
     )
     .await?;
 
