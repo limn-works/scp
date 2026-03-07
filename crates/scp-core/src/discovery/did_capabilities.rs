@@ -503,4 +503,82 @@ mod tests {
         assert!(matches!(caps[1], CapabilityUri::DidScoped { .. }));
         assert!(matches!(caps[2], CapabilityUri::System { .. }));
     }
+
+    // -----------------------------------------------------------------
+    // SCP-ACR-006: System capability declarations in DID documents
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_capability_endpoint_system_only() {
+        let caps = parse_capability_endpoint(
+            "scp:capabilities:scp:system:relay-operation,scp:system:bridge-operation",
+        )
+        .unwrap();
+        assert_eq!(caps.len(), 2);
+        assert_eq!(caps[0], cap("scp:system:relay-operation"));
+        assert_eq!(caps[1], cap("scp:system:bridge-operation"));
+        assert!(caps.iter().all(|c| c.is_system()));
+    }
+
+    #[test]
+    fn parse_capability_endpoint_all_system_capabilities() {
+        let caps = parse_capability_endpoint(
+            "scp:capabilities:scp:system:mls-group-management,scp:system:key-rotation,scp:system:governance-participation,scp:system:relay-operation,scp:system:bridge-operation",
+        )
+        .unwrap();
+        assert_eq!(caps.len(), 5);
+        assert_eq!(caps[0], cap("scp:system:mls-group-management"));
+        assert_eq!(caps[1], cap("scp:system:key-rotation"));
+        assert_eq!(caps[2], cap("scp:system:governance-participation"));
+        assert_eq!(caps[3], cap("scp:system:relay-operation"));
+        assert_eq!(caps[4], cap("scp:system:bridge-operation"));
+    }
+
+    #[test]
+    fn extract_capabilities_deduplicates_system_across_services() {
+        let did = "did:dht:zTestDid";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        // Two services both advertising relay-operation.
+        doc.service.push(scp_identity::document::Service {
+            id: format!("{did}#scp-capabilities-1"),
+            service_type: SCP_CAPABILITIES_SERVICE_TYPE.to_owned(),
+            service_endpoint: "scp:capabilities:scp:system:relay-operation,scp:capability:schema-validation/v1".to_owned(),
+        });
+        doc.service.push(scp_identity::document::Service {
+            id: format!("{did}#scp-capabilities-2"),
+            service_type: SCP_CAPABILITIES_SERVICE_TYPE.to_owned(),
+            service_endpoint: "scp:capabilities:scp:system:relay-operation,scp:system:bridge-operation".to_owned(),
+        });
+
+        let entry = extract_capabilities(did, &doc).unwrap();
+        // relay-operation appears in both but should be deduplicated.
+        assert_eq!(entry.capabilities.len(), 3);
+        assert_eq!(entry.capabilities[0], cap("scp:system:relay-operation"));
+        assert_eq!(entry.capabilities[1], cap("scp:capability:schema-validation/v1"));
+        assert_eq!(entry.capabilities[2], cap("scp:system:bridge-operation"));
+    }
+
+    #[test]
+    fn capability_entry_holds_mixed_variants() {
+        let entry = CapabilityEntry {
+            did: "did:dht:zTestDid".into(),
+            capabilities: vec![
+                cap("scp:capability:schema-validation/v1"),
+                cap("did:dht:z6Mk123:capability:custom/v1"),
+                cap("scp:system:relay-operation"),
+            ],
+            service_endpoints: vec!["scp:capabilities:test".into()],
+            resolved_at: 1_700_000_000,
+        };
+
+        assert!(entry.capabilities[0].is_protocol());
+        assert!(entry.capabilities[1].is_did_scoped());
+        assert!(entry.capabilities[2].is_system());
+
+        // Round-trip serialization preserves all variants.
+        let json = serde_json::to_value(&entry).unwrap();
+        let deserialized: CapabilityEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(entry, deserialized);
+    }
 }

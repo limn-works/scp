@@ -431,6 +431,13 @@ pub fn issue_challenge(
     // Validate the challenge type against the capability registry.
     let ChallengeType::Uri(ref uri) = challenge_type;
     let uri_str = uri.to_string();
+
+    // System capabilities (scp:system:*) are protocol feature flags, not
+    // challenge-testable. Reject them before registry validation.
+    if uri.is_system() {
+        return Err(TrustError::NotChallengeable { uri: uri_str });
+    }
+
     validate_capability_uri(&uri_str).map_err(|_| TrustError::UnknownChallengeCapability {
         uri: uri_str.clone(),
     })?;
@@ -1625,5 +1632,61 @@ mod tests {
             &signer,
         );
         assert!(result.is_ok(), "non-parameterized capability should accept any params, got {result:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // issue_challenge — system capability rejection (SCP-ACR-006)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn issue_challenge_rejects_system_capability() {
+        let (challenger_key, _) = test_keypair();
+        let signer = TestSigner::new(challenger_key);
+        let cap_uri: CapabilityUri = "scp:system:relay-operation".parse().unwrap();
+        let result = issue_challenge(
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
+            ChallengeType::Uri(cap_uri),
+            serde_json::json!({}),
+            Duration::from_secs(300),
+            &signer,
+        );
+        assert!(result.is_err());
+        match result {
+            Err(TrustError::NotChallengeable { uri }) => {
+                assert_eq!(uri, "scp:system:relay-operation");
+            }
+            other => panic!("expected NotChallengeable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issue_challenge_rejects_all_system_capabilities() {
+        let (challenger_key, _) = test_keypair();
+        let signer = TestSigner::new(challenger_key);
+
+        for system_uri in [
+            "scp:system:mls-group-management",
+            "scp:system:key-rotation",
+            "scp:system:governance-participation",
+            "scp:system:relay-operation",
+            "scp:system:bridge-operation",
+        ] {
+            let cap_uri: CapabilityUri = system_uri.parse().unwrap();
+            let result = issue_challenge(
+                "did:key:challenger".into(),
+                "did:key:subject".into(),
+                ChallengeType::Uri(cap_uri),
+                serde_json::json!({}),
+                Duration::from_secs(300),
+                &signer,
+            );
+            match result {
+                Err(TrustError::NotChallengeable { uri }) => {
+                    assert_eq!(uri, system_uri, "wrong URI in error for {system_uri}");
+                }
+                other => panic!("expected NotChallengeable for {system_uri}, got {other:?}"),
+            }
+        }
     }
 }

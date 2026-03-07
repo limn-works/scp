@@ -256,6 +256,14 @@ pub enum TrustError {
         /// Human-readable description of the validation failure.
         reason: String,
     },
+
+    /// The capability URI refers to a system capability (`scp:system:*`),
+    /// which is a protocol feature flag and not challenge-testable.
+    #[error("system capability '{uri}' is not challengeable — system capabilities are feature flags, not testable capabilities")]
+    NotChallengeable {
+        /// The system capability URI that was rejected.
+        uri: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
