@@ -452,9 +452,9 @@ Wire format and crypto fixes identified by spec review. All are code changes to 
 - #397 — ResetRequest: add nonce field, anti-replay validation (signature + 30s freshness + nonce dedup)
 - #398 — Envelope version field: add `version: u16` to InnerEnvelope, BroadcastEnvelope, OuterEnvelope + canonical hashes
 
-### Phase 12: Polish
+### Phase 12: Polish -- COMPLETE
 
-#291, #301, #303, #343, #344
+#291 (b3014487), #301 (cf3cc06), #303 (273ce70d), #343 (298666cd), #344 (7f45bcb1)
 
 ---
 
