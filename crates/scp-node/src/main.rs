@@ -280,7 +280,15 @@ impl<S: Storage + 'static> SequenceStore for StorageSequenceStore<S> {
                     buf.copy_from_slice(&bytes);
                     Ok(Some(u64::from_le_bytes(buf)))
                 }
-                _ => Ok(None), // Missing or corrupted; treat as absent.
+                Some(bytes) => {
+                    tracing::warn!(
+                        key = %key,
+                        len = bytes.len(),
+                        "BEP44 sequence data has unexpected length (expected 8), treating as absent"
+                    );
+                    Ok(None)
+                }
+                None => Ok(None),
             }
         })
     }

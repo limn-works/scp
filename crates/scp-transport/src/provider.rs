@@ -113,14 +113,14 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
             encrypted_blob: Vec::new(), // Context announcement: empty blob.
         };
 
-        let adapter = self
-            .adapter
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Clone the Arc so the mutex lock is acquired inside block_in_place,
+        // avoiding holding a std::sync::Mutex guard across async I/O which
+        // would block tokio worker threads on concurrent calls.
+        let adapter = Arc::clone(&self.adapter);
 
-        // Bridge async send to synchronous call.
         let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(adapter.send(&envelope))
+            let guard = adapter.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            tokio::runtime::Handle::current().block_on(guard.send(&envelope))
         });
 
         match result {
@@ -132,13 +132,12 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
     fn delete_published(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         let blob_id = BlobId::from_sha256(context_id);
 
-        let adapter = self
-            .adapter
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let adapter = Arc::clone(&self.adapter);
 
         let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(adapter.delete(&blob_id))
+            let guard = adapter.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            tokio::runtime::Handle::current().block_on(guard.delete(&blob_id))
+        });
         });
 
         match result {
@@ -159,13 +158,11 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
             encrypted_blob: encrypted_payload.to_vec(),
         };
 
-        let adapter = self
-            .adapter
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let adapter = Arc::clone(&self.adapter);
 
         let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(adapter.send(&envelope))
+            let guard = adapter.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            tokio::runtime::Handle::current().block_on(guard.send(&envelope))
         });
 
         match result {

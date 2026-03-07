@@ -128,6 +128,14 @@ impl SubscriberRegistration {
         context_id: &str,
         did_resolver: &D,
     ) -> Result<(), ContextError> {
+        // Validate X25519 wrapping public key length (must be exactly 32 bytes).
+        if self.wrapping_pubkey.len() != 32 {
+            return Err(ContextError::PermissionDenied(format!(
+                "invalid wrapping_pubkey length: expected 32, got {}",
+                self.wrapping_pubkey.len()
+            )));
+        }
+
         // Resolve the subscriber's Ed25519 public key.
         let pub_key_bytes = did_resolver
             .resolve_public_key(&self.subscriber_did.0)

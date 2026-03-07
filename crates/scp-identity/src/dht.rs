@@ -391,7 +391,9 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     ///
     /// 1. Load the last-persisted sequence from the [`SequenceStore`] (if
     ///    configured).
-    /// 2. Query the DHT for the current sequence of the DID's BEP44 record.
+    /// 2. Best-effort DHT query for the current sequence of the DID's BEP44
+    ///    record. If the DHT is unreachable, initialization proceeds with the
+    ///    locally-stored value and logs a warning.
     /// 3. Set the local sequence to `max(stored, remote)`. The next publish
     ///    will increment this to `max(stored, remote) + 1`.
     ///
@@ -400,8 +402,8 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityError::DhtResolveFailed`] if the DHT query fails.
-    /// Store load errors are propagated as-is.
+    /// Store load errors are propagated as-is. DHT query failures are
+    /// logged but not propagated (best-effort).
     pub async fn initialize_sequence(&self, did: &str) -> Result<(), IdentityError> {
         // Step 1: Load from persistent store.
         let mut best_seq: u64 = if let Some(store) = &self.sequence_store
@@ -412,10 +414,22 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             0
         };
 
-        // Step 2: Query DHT for the current remote sequence.
+        // Step 2: Best-effort DHT query for the current remote sequence.
+        // If the DHT is unreachable we proceed with the locally-stored value
+        // rather than failing the entire initialization.
         let public_key = extract_public_key(did)?;
-        if let Ok(Some(record)) = self.dht_client.resolve(&public_key).await {
-            best_seq = best_seq.max(record.seq);
+        match self.dht_client.resolve(&public_key).await {
+            Ok(Some(record)) => {
+                best_seq = best_seq.max(record.seq);
+            }
+            Ok(None) => {} // No record on DHT — first publish or expired.
+            Err(e) => {
+                tracing::warn!(
+                    did = %did,
+                    error = %e,
+                    "DHT query failed during sequence initialization, using local value"
+                );
+            }
         }
 
         // Step 3: Set to the maximum known sequence.

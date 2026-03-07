@@ -253,10 +253,12 @@ impl DhtClient for PkarrDhtClient {
                 None, // No salt — BEP44 mutable items for DID are unsalted.
             );
 
-            // Use compare-and-swap with the previous sequence number to
-            // prevent overwriting a newer record on the DHT. If seq > 0,
-            // CAS expects the prior sequence; if seq == 0, no CAS (first publish).
-            let cas = if seq_i64 > 0 { Some(seq_i64 - 1) } else { None };
+            // CAS (compare-and-swap) is a multi-writer coordination mechanism.
+            // SCP DIDs are single-writer — only the DID owner publishes records —
+            // so CAS is unnecessary. Worse, CAS assumes the DHT currently holds
+            // seq-1, which fails after DHT record expiry (e.g., 2hr offline).
+            // Setting cas = None avoids permanent publish failures after expiry.
+            let cas = None;
 
             debug!(
                 seq = seq,

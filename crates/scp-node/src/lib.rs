@@ -877,10 +877,17 @@ pub trait TlsProvider: Send + Sync {
 
     /// Returns the shared ACME challenge map (token → key authorization).
     ///
-    /// The default implementation returns an empty map, which is correct
-    /// for mock providers and `SelfSignedTlsProvider`. Production ACME
-    /// providers override this to return the map populated during
-    /// [`provision()`](Self::provision).
+    /// The default implementation returns a **new empty map on every call**,
+    /// which is correct for mock providers and `SelfSignedTlsProvider` that
+    /// never serve HTTP-01 challenges.
+    ///
+    /// # Important
+    ///
+    /// Implementors that override [`needs_challenge_listener()`](Self::needs_challenge_listener)
+    /// to return `true` **MUST** also override this method to return a
+    /// persistent, shared map. Failing to do so means the challenge listener
+    /// and the provisioning flow will operate on different maps, and ACME
+    /// validation will never succeed.
     fn challenges(&self) -> Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>> {
         Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()))
     }

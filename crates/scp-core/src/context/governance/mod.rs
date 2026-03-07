@@ -1495,9 +1495,18 @@ mod tests {
     // GovernanceAction serialization
     // -----------------------------------------------------------------------
 
-    /// Returns all 25 `GovernanceAction` variants (24 per ADR-031 + `BlockAuthor`)
-    /// for serialization testing.
+    /// Returns all 28 `GovernanceAction` variants (24 per ADR-031 + `BlockAuthor`
+    /// + 3 economic: `SetEconomicPolicy`, `ApproveSpend`, `LockEconomicPolicy`)
+    /// for serialization testing. Split into two helpers to stay within the
+    /// function line limit.
     fn all_governance_actions() -> Vec<GovernanceAction> {
+        let mut actions = governance_actions_core();
+        actions.extend(governance_actions_extended());
+        actions
+    }
+
+    /// Core governance actions (membership, tools, settings, access control).
+    fn governance_actions_core() -> Vec<GovernanceAction> {
         use crate::context::tools::interface::ToolInterface;
 
         vec![
@@ -1556,6 +1565,15 @@ mod tests {
             GovernanceAction::ModifyPruningPolicy {
                 new_policy: PruningPolicy::default(),
             },
+        ]
+    }
+
+    /// Extended governance actions (signers, interfaces, structural,
+    /// content access, economic).
+    fn governance_actions_extended() -> Vec<GovernanceAction> {
+        use crate::context::tools::interface::ToolInterface;
+
+        vec![
             GovernanceAction::AddSigner { did: carol() },
             GovernanceAction::RemoveSigner { did: carol() },
             GovernanceAction::ModifyThreshold { new_threshold: 2 },
@@ -1600,6 +1618,28 @@ mod tests {
                     detected_at: 1_700_000_000,
                 },
             },
+            GovernanceAction::SetEconomicPolicy {
+                policy: crate::economy::types::EconomicPolicy {
+                    locked: false,
+                    cost_schedule: crate::economy::types::CostSchedule {
+                        currency: crate::economy::types::CurrencyCode::from("USD"),
+                        per_message: Some(Amount::new(1)),
+                        per_tool_invoke: None,
+                        per_join: None,
+                        per_period: None,
+                        per_byte_stored: None,
+                    },
+                    payment_adapters: vec![],
+                    pricing_formula: None,
+                    payee: DID::from("did:dht:z6MkPayee"),
+                },
+            },
+            GovernanceAction::ApproveSpend {
+                spender: bob(),
+                amount: Amount::new(1000),
+                purpose: "tool costs".to_owned(),
+            },
+            GovernanceAction::LockEconomicPolicy,
         ]
     }
 
@@ -1607,10 +1647,10 @@ mod tests {
     fn governance_action_serialization_roundtrip() {
         let actions = all_governance_actions();
 
-        // Verify all 25 variants are covered (24 per ADR-031 + BlockAuthor).
+        // Verify all 28 variants are covered (24 per ADR-031 + BlockAuthor + 3 economic).
         assert_eq!(
             actions.len(),
-            25,
+            28,
             "all GovernanceAction variants must be tested"
         );
 
