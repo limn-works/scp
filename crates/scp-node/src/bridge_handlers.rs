@@ -25,10 +25,24 @@ use crate::error::ApiError;
 // Shared state for bridge operations
 // ---------------------------------------------------------------------------
 
+/// A stored platform identity attestation.
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredAttestation {
+    pub attestation_id: String,
+    pub status: String,
+    pub bridge_id: String,
+    pub platform_handle: String,
+    pub platform_user_id: String,
+    pub evidence: AttestationEvidence,
+    pub issued_at: u64,
+    pub expires_at: u64,
+}
+
 /// Shared state for bridge shadow operations.
 ///
-/// Holds per-context shadow registries and the sender key store, protected
-/// by an async `RwLock` for concurrent handler access.
+/// Holds per-context shadow registries, the sender key store, and
+/// platform identity attestations, protected by an async `RwLock`
+/// for concurrent handler access.
 #[derive(Debug)]
 pub struct BridgeState {
     /// Per-context shadow registries, keyed by context ID.
@@ -36,6 +50,9 @@ pub struct BridgeState {
 
     /// Sender key store for shadow identity encryption keys.
     pub sender_key_store: RwLock<SenderKeyStore>,
+
+    /// Platform identity attestations, keyed by attestation ID.
+    pub attestations: RwLock<HashMap<String, StoredAttestation>>,
 }
 
 impl BridgeState {
@@ -45,6 +62,7 @@ impl BridgeState {
         Self {
             registries: RwLock::new(HashMap::new()),
             sender_key_store: RwLock::new(SenderKeyStore::new()),
+            attestations: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -93,6 +111,61 @@ pub struct CreateShadowResponse {
     /// Unix timestamp (seconds) when the shadow was created.
     pub created_at: u64,
 }
+
+/// Request body for `POST /v1/scp/bridge/attest`.
+#[derive(Debug, Deserialize)]
+pub struct AttestRequest {
+    /// The user's handle on the external platform.
+    pub platform_handle: String,
+
+    /// The platform's internal user identifier.
+    pub platform_user_id: String,
+
+    /// Evidence supporting the identity assertion.
+    pub attestation_evidence: AttestationEvidence,
+}
+
+/// Evidence supporting a platform identity attestation.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AttestationEvidence {
+    /// Type of evidence (`platform-verified`, `oauth2`, `signed-challenge`).
+    pub evidence_type: String,
+
+    /// How the platform verified the user.
+    pub verification_method: String,
+
+    /// Unix timestamp (seconds) of verification.
+    pub verified_at: u64,
+
+    /// Confidence level: `"high"`, `"medium"`, or `"low"`.
+    pub platform_confidence: String,
+
+    /// Platform-specific trust signals.
+    #[serde(default)]
+    pub additional_signals: Option<serde_json::Value>,
+}
+
+/// Response body for `POST /v1/scp/bridge/attest`.
+#[derive(Debug, Serialize)]
+pub struct AttestResponse {
+    /// The unique attestation ID.
+    pub attestation_id: String,
+
+    /// Attestation status (always `"active"` on creation).
+    pub status: String,
+
+    /// The user's handle on the external platform.
+    pub platform_handle: String,
+
+    /// Unix timestamp (seconds) when the attestation was issued.
+    pub issued_at: u64,
+
+    /// Unix timestamp (seconds) when the attestation expires.
+    pub expires_at: u64,
+}
+
+/// Default attestation TTL: 24 hours in seconds.
+const ATTESTATION_TTL_SECS: u64 = 86_400;
 
 // ---------------------------------------------------------------------------
 // Handler
@@ -189,6 +262,81 @@ async fn create_shadow_handler(
     }
 }
 
+/// Validates the `platform_confidence` field value.
+fn is_valid_confidence(value: &str) -> bool {
+    matches!(value, "high" | "medium" | "low")
+}
+
+/// Handler for `POST /v1/scp/bridge/attest`.
+///
+/// Creates a platform identity attestation signed by the bridge operator.
+/// The attestation asserts the platform's confidence in the mapping between
+/// the platform handle and the user.
+///
+/// Requires bridge authentication via the `bridge_auth_middleware`.
+///
+/// See SCP-BCH-004 and spec section 12.10.
+async fn attest_handler(
+    State(bridge_state): State<Arc<BridgeState>>,
+    Extension(auth_ctx): Extension<crate::bridge_auth::BridgeAuthContext>,
+    Json(body): Json<AttestRequest>,
+) -> impl IntoResponse {
+    if body.platform_handle.is_empty() {
+        return ApiError::bad_request("platform_handle must not be empty").into_response();
+    }
+    if body.platform_user_id.is_empty() {
+        return ApiError::bad_request("platform_user_id must not be empty").into_response();
+    }
+    if body.attestation_evidence.evidence_type.is_empty() {
+        return ApiError::bad_request("attestation_evidence.evidence_type must not be empty")
+            .into_response();
+    }
+    if body.attestation_evidence.verification_method.is_empty() {
+        return ApiError::bad_request(
+            "attestation_evidence.verification_method must not be empty",
+        )
+        .into_response();
+    }
+    if !is_valid_confidence(&body.attestation_evidence.platform_confidence) {
+        return ApiError::bad_request(
+            "attestation_evidence.platform_confidence must be \"high\", \"medium\", or \"low\"",
+        )
+        .into_response();
+    }
+
+    let bridge_id = &auth_ctx.claims.scp_bridge_id;
+    let attestation_id = format!("attest:{bridge_id}:{}", body.platform_user_id);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let stored = StoredAttestation {
+        attestation_id: attestation_id.clone(),
+        status: "active".to_owned(),
+        bridge_id: bridge_id.clone(),
+        platform_handle: body.platform_handle.clone(),
+        platform_user_id: body.platform_user_id,
+        evidence: body.attestation_evidence,
+        issued_at: now,
+        expires_at: now + ATTESTATION_TTL_SECS,
+    };
+
+    let response = AttestResponse {
+        attestation_id: stored.attestation_id.clone(),
+        status: stored.status.clone(),
+        platform_handle: stored.platform_handle.clone(),
+        issued_at: stored.issued_at,
+        expires_at: stored.expires_at,
+    };
+
+    let mut attestations = bridge_state.attestations.write().await;
+    attestations.insert(attestation_id, stored);
+
+    (StatusCode::CREATED, Json(response)).into_response()
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -201,6 +349,7 @@ async fn create_shadow_handler(
 pub fn bridge_router(state: Arc<BridgeState>) -> Router {
     Router::new()
         .route("/v1/scp/bridge/shadow", post(create_shadow_handler))
+        .route("/v1/scp/bridge/attest", post(attest_handler))
         .with_state(state)
 }
 
@@ -209,6 +358,7 @@ pub fn bridge_router(state: Arc<BridgeState>) -> Router {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -252,6 +402,7 @@ mod tests {
         let auth_ctx = test_auth_ctx();
         Router::new()
             .route("/v1/scp/bridge/shadow", post(create_shadow_handler))
+            .route("/v1/scp/bridge/attest", post(attest_handler))
             .layer(axum::Extension(auth_ctx))
             .with_state(state)
     }
@@ -260,6 +411,15 @@ mod tests {
         Request::builder()
             .method("POST")
             .uri("/v1/scp/bridge/shadow")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).expect("test")))
+            .expect("test")
+    }
+
+    fn attest_request(body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/scp/bridge/attest")
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&body).expect("test")))
             .expect("test")
@@ -364,5 +524,168 @@ mod tests {
             resp.status() == StatusCode::BAD_REQUEST
                 || resp.status() == StatusCode::UNPROCESSABLE_ENTITY
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Attest endpoint tests
+    // -----------------------------------------------------------------------
+
+    fn valid_attest_body() -> serde_json::Value {
+        serde_json::json!({
+            "platform_handle": "@dave#1234",
+            "platform_user_id": "usr_abc123",
+            "attestation_evidence": {
+                "evidence_type": "platform-verified",
+                "verification_method": "oauth2",
+                "verified_at": 1_700_000_300,
+                "platform_confidence": "high",
+                "additional_signals": {
+                    "account_age_days": 730,
+                    "email_verified": true
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn attest_successful_returns_201() {
+        let state = Arc::new(BridgeState::new());
+        let app = test_app(state);
+
+        let req = attest_request(valid_attest_body());
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let json = response_json(resp).await;
+        assert_eq!(json["status"], "active");
+        assert_eq!(json["platform_handle"], "@dave#1234");
+        assert_eq!(
+            json["attestation_id"],
+            "attest:bridge-test-001:usr_abc123"
+        );
+        assert!(json["issued_at"].as_u64().is_some());
+        assert!(json["expires_at"].as_u64().is_some());
+
+        let issued = json["issued_at"].as_u64().unwrap();
+        let expires = json["expires_at"].as_u64().unwrap();
+        assert_eq!(expires - issued, 86_400);
+    }
+
+    #[tokio::test]
+    async fn attest_stores_attestation() {
+        let state = Arc::new(BridgeState::new());
+        let app = test_app(Arc::clone(&state));
+
+        let req = attest_request(valid_attest_body());
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let attestations = state.attestations.read().await;
+        let stored = attestations
+            .get("attest:bridge-test-001:usr_abc123")
+            .expect("attestation should be stored");
+        assert_eq!(stored.platform_handle, "@dave#1234");
+        assert_eq!(stored.evidence.evidence_type, "platform-verified");
+        assert_eq!(stored.evidence.platform_confidence, "high");
+    }
+
+    #[tokio::test]
+    async fn attest_empty_handle_returns_400() {
+        let state = Arc::new(BridgeState::new());
+        let app = test_app(state);
+
+        let req = attest_request(serde_json::json!({
+            "platform_handle": "",
+            "platform_user_id": "usr_abc123",
+            "attestation_evidence": {
+                "evidence_type": "platform-verified",
+                "verification_method": "oauth2",
+                "verified_at": 1_700_000_300,
+                "platform_confidence": "high"
+            }
+        }));
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn attest_empty_user_id_returns_400() {
+        let state = Arc::new(BridgeState::new());
+        let app = test_app(state);
+
+        let req = attest_request(serde_json::json!({
+            "platform_handle": "@dave#1234",
+            "platform_user_id": "",
+            "attestation_evidence": {
+                "evidence_type": "platform-verified",
+                "verification_method": "oauth2",
+                "verified_at": 1_700_000_300,
+                "platform_confidence": "high"
+            }
+        }));
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn attest_invalid_confidence_returns_400() {
+        let state = Arc::new(BridgeState::new());
+        let app = test_app(state);
+
+        let req = attest_request(serde_json::json!({
+            "platform_handle": "@dave#1234",
+            "platform_user_id": "usr_abc123",
+            "attestation_evidence": {
+                "evidence_type": "platform-verified",
+                "verification_method": "oauth2",
+                "verified_at": 1_700_000_300,
+                "platform_confidence": "very-high"
+            }
+        }));
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn attest_missing_evidence_returns_422() {
+        let state = Arc::new(BridgeState::new());
+        let app = test_app(state);
+
+        let req = attest_request(serde_json::json!({
+            "platform_handle": "@dave#1234",
+            "platform_user_id": "usr_abc123"
+        }));
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert!(
+            resp.status() == StatusCode::BAD_REQUEST
+                || resp.status() == StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[tokio::test]
+    async fn attest_without_additional_signals() {
+        let state = Arc::new(BridgeState::new());
+        let app = test_app(state);
+
+        let req = attest_request(serde_json::json!({
+            "platform_handle": "@dave#1234",
+            "platform_user_id": "usr_abc123",
+            "attestation_evidence": {
+                "evidence_type": "oauth2",
+                "verification_method": "oauth2-flow",
+                "verified_at": 1_700_000_300,
+                "platform_confidence": "medium"
+            }
+        }));
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let json = response_json(resp).await;
+        assert_eq!(json["status"], "active");
     }
 }
