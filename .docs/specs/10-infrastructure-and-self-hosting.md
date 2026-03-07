@@ -61,7 +61,88 @@ This is load-bearing. If protocol state is small, devices can be nodes. If proto
 
 Content storage is outside protocol scope — the protocol does not define where content lives, how it's stored, or how it's replicated. That is a client and app-layer decision (see §10.8). The protocol concerns itself with protocol state (membership, roles, tokens, governance, event logs). Content is whatever the context's participants produce and consume. The protocol delivers it through encrypted envelopes; storage is the app's responsibility.
 
-**Verifiable event logs (§7.3.1) add a storage requirement.** Each context maintains a Merkle tree of its event history. This is protocol state — it must be available for validation queries. The tree itself is append-only and grows with context activity. For active contexts, this could become significant. The protocol must define pruning rules (how old events are archived or summarized), checkpoint mechanisms (periodic Merkle roots that compress history), and availability requirements (does every device store the full tree, or can proofs be fetched on demand from relays or peers?). This is the primary tension between minimal state and verifiable history — the design must resolve it explicitly.
+**Verifiable event logs (§7.3.1) add a storage requirement.** Each context maintains a Merkle tree of its event history. This is protocol state — it must be available for validation queries. The tree itself is append-only and grows with context activity. For active contexts, this could become significant. The following subsections define pruning rules, checkpoint mechanisms, and availability requirements that resolve the tension between minimal state and verifiable history.
+
+### 10.3.1 Event Log Pruning Rules
+
+Event log pruning compresses historical event data while preserving verifiability. Pruning operates on completed checkpoint intervals — it never modifies un-checkpointed events.
+
+**Pruning tiers:**
+
+| Tier | Retention | What is retained | What is pruned |
+|------|-----------|------------------|----------------|
+| Full | All events | Complete event data + Merkle proofs | Nothing |
+| Summary | Checkpoint roots + event type counts per interval | Checkpoint Merkle root, aggregate statistics (event counts by type, membership delta) | Individual event payloads and intermediate Merkle nodes |
+| Root-only | Checkpoint roots only | Checkpoint Merkle root hash and sequence number | Everything except the root |
+
+**Pruning policy:** Each context declares a pruning policy at creation as part of its governance parameters:
+
+```
+EventLogPruningPolicy {
+  full_retention_checkpoints: u32,    // Number of recent checkpoints retained at Full tier (MUST >= 2, default: 10)
+  summary_retention_checkpoints: u32, // Number of checkpoints retained at Summary tier after Full expires (default: 100)
+  root_only_after: bool,              // Whether to prune to Root-only after Summary expires (default: true)
+}
+```
+
+- The most recent `full_retention_checkpoints` checkpoints are always retained at Full tier. This ensures recent history is always available for validation queries and dispute resolution.
+- The next `summary_retention_checkpoints` checkpoints are retained at Summary tier. This provides aggregate data for participation record computation (§7.3.2) without storing individual events.
+- Older checkpoints are retained at Root-only tier if `root_only_after` is true, otherwise deleted entirely. Root-only checkpoints form a verifiable chain of custody — any checkpoint root can be verified against its successor.
+
+**Maximum event log size:** The SDK MUST enforce a per-context event log size limit of 100MB at the Full tier. When the log exceeds this limit, the SDK MUST prune the oldest Full-tier checkpoint interval to Summary tier, regardless of the retention policy. This prevents unbounded state growth on resource-constrained devices.
+
+**Pruning execution:** Pruning is performed by the SDK locally. Each device prunes independently based on the context's policy. There is no coordination protocol — devices may hold different amounts of history based on when they joined and when they last pruned. The Merkle checkpoint chain ensures that devices with different pruning states can still verify each other's claims by comparing checkpoint roots.
+
+### 10.3.2 Checkpoint Mechanism
+
+Checkpoints compress the event log into periodic Merkle root snapshots that serve as trust anchors for pruned history.
+
+**Checkpoint interval:** A checkpoint is created every `checkpoint_interval` events (default: 1000, configurable per context via governance, minimum: 100, maximum: 100,000). The checkpoint interval is declared at context creation and MAY be changed via governance action.
+
+**Checkpoint format:**
+
+```
+EventLogCheckpoint {
+  context_id:       String,
+  sequence_number:  u64,          // Monotonic checkpoint number (0, 1, 2, ...)
+  event_range:      (u64, u64),   // (first_event_seq, last_event_seq) inclusive
+  merkle_root:      [u8; 32],     // SHA-256 Merkle root of events in this interval
+  previous_root:    [u8; 32],     // Merkle root of the previous checkpoint (zeros for first)
+  event_count:      u64,          // Total events in this checkpoint interval
+  membership_snapshot: MembershipDigest, // SHA-256 hash of the sorted membership list at checkpoint time
+  timestamp:        u64,          // Wall-clock time of checkpoint creation (best-effort)
+  creator_did:      DID,          // DID of the member who created this checkpoint
+  signature:        Ed25519Signature,  // Signed by creator's signing key
+}
+```
+
+**Checkpoint chain:** Each checkpoint includes `previous_root`, forming a hash chain. Any device can verify the integrity of the checkpoint chain by walking backward from the most recent checkpoint. A gap in the chain (missing checkpoint) is detectable by comparing `sequence_number` values.
+
+**Checkpoint creation:** The member whose event triggers the checkpoint interval boundary creates the checkpoint. If multiple members submit the boundary event concurrently, the first checkpoint received by a majority of members is canonical (determined by the Merkle event log ordering, §7.3.1). Duplicate checkpoints for the same interval are discarded.
+
+### 10.3.3 Event Log Availability
+
+**Storage tiers by device type:**
+
+| Device | Full tier | Summary tier | Root-only | Proof fetching |
+|--------|-----------|--------------|-----------|----------------|
+| Server/workstation | Unlimited | Unlimited | All | Serves proofs to peers |
+| Desktop | Policy-based | Policy-based | All | Serves and fetches |
+| Mobile | 2 checkpoints minimum | 10 checkpoints minimum | All | Fetches from relays/peers |
+
+**Proof-on-demand protocol:** Devices that have pruned Full-tier data can request Merkle proofs from peers or relays that still hold the full data. The request format is:
+
+```
+EventLogProofRequest {
+  context_id: String,
+  event_sequence: u64,         // Sequence number of the event to prove
+  checkpoint_sequence: u64,    // Checkpoint interval containing the event
+}
+```
+
+The response includes the Merkle inclusion proof (sibling hashes along the path from the event's leaf to the checkpoint's Merkle root). The requester verifies the proof against the checkpoint root they hold locally. If the checkpoint root is unavailable locally (pruned beyond Root-only), the proof cannot be verified — the requester MUST fetch the checkpoint from a peer first.
+
+**Relay caching:** Relays MAY cache event log checkpoints and serve them to members. Checkpoints are signed by their creator and verified by the recipient — the relay cannot forge checkpoints. Relay caching is opportunistic; the protocol does not require relays to store event log data.
 
 ## 10.4 Relay Architecture
 
@@ -492,7 +573,44 @@ For routers that do not support UPnP, STUN (Session Traversal Utilities for NAT,
 2. For full-cone NATs, this external address is immediately reachable by any host.
 3. For address-restricted and port-restricted NATs, the SDK must send an initial packet to a peer before the peer can send back. Connection coordination (step 5 below) handles this.
 4. The external address is published in the DID document as the relay's reachable address.
-5. **Connection coordination:** A peer resolving the self-hosted relay's DID document obtains the external address. For restricted NATs, the self-hosted relay must initiate a packet exchange with each connecting peer. The relay periodically sends keepalive packets to peers that have announced their intent to connect (via a coordination message through an intermediary relay). This creates the NAT pinhole that allows the peer to connect back.
+5. **Connection coordination:** A peer resolving the self-hosted relay's DID document obtains the external address. For restricted NATs, the self-hosted relay must initiate a packet exchange with each connecting peer. The coordination protocol below specifies how peers signal intent and exchange addresses.
+
+**STUN hole punching coordination protocol:**
+
+For address-restricted and port-restricted NATs, both the self-hosted relay and the connecting peer must send packets to each other's external addresses to create NAT pinholes. This requires a coordination exchange through an intermediary relay that both parties can reach:
+
+```
+HOLE_PUNCH_REQUEST (peer → intermediary relay → self-hosted relay) {
+  requester_did:     DID,              // DID of the connecting peer
+  requester_address: SocketAddr,       // Peer's STUN-discovered external address
+  target_routing_id: [u8; 32],         // DID routing ID of the self-hosted relay
+  nonce:             [u8; 16],         // Random nonce for replay prevention
+  timestamp:         u64,             // Unix timestamp (ms)
+  signature:         Ed25519Signature, // Signs "SCP-HOLE-PUNCH-V1:" || requester_address || target_routing_id || nonce || timestamp
+}
+```
+
+```
+HOLE_PUNCH_RESPONSE (self-hosted relay → intermediary relay → peer) {
+  responder_address: SocketAddr,       // Self-hosted relay's STUN-discovered external address
+  requester_did:     DID,              // Echo of requester DID
+  nonce:             [u8; 16],         // Echo of request nonce
+  timestamp:         u64,
+  signature:         Ed25519Signature, // Signs "SCP-HOLE-PUNCH-V1:" || responder_address || requester_did || nonce || timestamp
+}
+```
+
+**Protocol sequence:**
+
+1. The peer discovers the self-hosted relay's DID document, which lists an intermediary relay address (the relay the self-hosted relay maintains a persistent connection to).
+2. The peer performs a STUN binding request to discover its own external address.
+3. The peer sends `HOLE_PUNCH_REQUEST` to the intermediary relay, which forwards it to the self-hosted relay over the existing connection.
+4. The self-hosted relay sends `HOLE_PUNCH_RESPONSE` back through the intermediary.
+5. Both parties simultaneously begin sending UDP keepalive packets to each other's external addresses (3 attempts at 500ms intervals). The first packet from each side creates the NAT pinhole; subsequent packets traverse the pinhole.
+6. Once bidirectional UDP connectivity is established (verified by receiving a keepalive response), the peer upgrades to a WebSocket connection over the punched hole.
+7. If no response is received after 3 attempts (1.5 seconds total), the punch has failed. The peer falls through to Tier 3 (relay bridging).
+
+**Security:** The intermediary relay sees both external addresses but cannot inject itself into the connection — MLS handles all payload encryption. The signatures prevent address spoofing (an attacker cannot redirect a peer to a different address). The nonce prevents replay.
 
 **Keepalive:** NAT mappings expire if unused (typical timeout: 30-120 seconds). The SDK sends a 25-second UDP keepalive to maintain the mapping. The keepalive is a minimal STUN Binding Indication (no response expected) or a zero-length UDP packet, depending on the STUN server's capabilities.
 
@@ -558,6 +676,20 @@ The `source_routing_id` field is zeroed (`[0u8; 32]`) because the bridge operate
 1. The Ed25519 signature is valid for the provided `public_key`.
 2. The DID derived from `public_key` maps to the claimed `routing_id` via `SHA-256("scp:did:" || did_string)` (§3.10.2).
 3. The `timestamp` is within 60 seconds of the server's current time (replay window).
+
+#### 10.12.4.1 Routing ID Derivation Disambiguation
+
+The protocol uses two distinct routing ID derivation schemes for different purposes. Implementations MUST NOT conflate them:
+
+| Routing ID type | Derivation | Purpose | Used by |
+|----------------|------------|---------|---------|
+| **DID routing ID** | `SHA-256("scp:did:" \|\| did_string)` | Identity-level routing — locating a DID's relay presence. Used for bridge registration, directed messages outside context scope, and relay discovery. | `BRIDGE_REGISTER` (§10.12.4), relay SUBSCRIBE for DID-level messages |
+| **Context pseudonym** | `HMAC-SHA256(pseudonym_secret, context_id \|\| "scp-pseudonym")` | Context-level routing — routing messages within a specific context. Unlinkable across contexts. Never publicly derivable (§9.10.4.A). | Context message delivery, relay SUBSCRIBE for context messages |
+| **Metadata routing ID** | `HMAC-SHA256(context_metadata_key, context_id \|\| "scp-metadata-v2")` | Context metadata retrieval — pre-join inspection of context parameters. | Relay QUERY for context metadata (§9.10.4.B) |
+
+**Key distinction:** DID routing IDs are publicly derivable by design — any party that knows a DID can compute the routing ID to send messages to that DID. Context pseudonyms are NOT publicly derivable — they require the pseudonym secret (§9.10.4.A), which is private key material. These serve fundamentally different privacy goals.
+
+**Wire-level disambiguation:** The `routing_id` field in relay operations (`PUBLISH`, `SUBSCRIBE`, `BRIDGE_REGISTER`, etc.) is an opaque `[u8; 32]`. The relay does not know or care which derivation produced it. The SDK is responsible for using the correct derivation for each operation.
 
 **Bridge establishment:**
 

@@ -798,8 +798,58 @@ context_pseudonym = context_keypair.public_key
 - **Verification:** Sender includes full DID inside MLS-encrypted payload. Group members verify pseudonym-to-DID mapping on first encounter and cache the association.
 - **No ZK proofs** — unnecessary complexity since only group members need to verify the mapping.
 - The SDK handles derivation, caching, and verification transparently.
-- **HSM compatibility.** Pseudonym derivation is performed via `KeyCustody::derive_pseudonym(identity_key_handle, context_id)` (ADR-006). The HMAC-SHA256 computation happens inside the custody boundary — the private key never leaves the HSM. For hardware-backed keys, the HSM computes the HMAC internally using an associated symmetric key derived during `generate_keypair`. For software keys, the HMAC uses the raw Ed25519 public key bytes (ADR-027 amendment: public key bytes ensure cross-platform determinism with hardware TEE keys that cannot export private bytes). All implementations produce identical output for the same identity key and context_id, regardless of custody type. See ADR-002 criterion 1 for the full derivation specification.
-- **Pre-join context inspection.** Prospective members who know a `context_id` but have not joined the context can retrieve its publicly visible parameters (capability ceiling, governance model, roles, TTL, memory scope — see §5.7) from relays without joining. The relay indexes context metadata under a publicly derivable identifier: `metadata_routing_id = SHA-256(context_id || "scp-metadata")`. This identifier is distinct from the per-member pseudonyms used for message routing and does not reveal member identities or message content. It enables the "legibility before opt-in" tenet: any agent evaluating whether to join a context can inspect its parameters by querying the `metadata_routing_id` on the context's relays.
+- **HSM compatibility.** Pseudonym derivation is performed via `KeyCustody::derive_pseudonym(identity_key_handle, context_id)` (ADR-006). The HMAC-SHA256 computation happens inside the custody boundary — the private key never leaves the HSM. For hardware-backed keys, the HSM computes the HMAC internally using an associated symmetric key derived during `generate_keypair`. For software keys, the HMAC uses a symmetric pseudonym secret derived during key generation (see below). All implementations produce identical output for the same identity key and context_id, regardless of custody type. See ADR-002 criterion 1 for the full derivation specification.
+
+#### 9.10.4.A Pseudonym Derivation Privacy Model
+
+**Threat: publicly derivable pseudonyms enable membership enumeration.** If `identity_key_material` in the HMAC were the raw Ed25519 public key bytes (which are public by definition), any party knowing a `context_id` and a DID's public key could compute `HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym")` and test whether the resulting pseudonym appears as an active subscription on a relay. This constitutes a membership enumeration oracle.
+
+**Mitigation: pseudonym secret.** The `identity_key_material` used in pseudonym derivation MUST be a 32-byte symmetric secret that is NOT publicly derivable. The pseudonym secret is generated alongside the identity keypair and stored within the custody boundary:
+
+```
+pseudonym_secret = HKDF-SHA256(
+  ikm  = ed25519_private_key_bytes,
+  salt = "scp-pseudonym-secret-v1",
+  info = "",
+  len  = 32
+)
+```
+
+For **software custody**, the pseudonym secret is derived from the Ed25519 private key bytes during key generation and cached in the `KeyCustody` store. The private key bytes are the only input — the public key is never used.
+
+For **hardware custody** (Secure Enclave, Android Keystore, HSM), where private key bytes cannot be exported, the pseudonym secret is generated as a separate 32-byte random value during `generate_keypair` and stored as an associated symmetric key within the hardware boundary. The hardware computes the HMAC internally using this associated key.
+
+**Cross-platform determinism:** Software implementations derive the pseudonym secret deterministically from the private key, ensuring identical pseudonyms across platforms for the same identity. Hardware implementations use a stored random value — since hardware keys cannot be exported and re-imported, cross-platform identity migration uses the social/device recovery protocol (§3.3), which provisions a new pseudonym secret at the destination.
+
+**Migration from public-key-based derivation:** SDKs that previously used public key bytes MUST re-derive pseudonyms using the pseudonym secret on upgrade. The SDK:
+1. Derives the pseudonym secret from the private key (software) or generates one (hardware).
+2. Subscribes to both old and new routing IDs for a grace period (2x blob TTL).
+3. Announces the new pseudonym to group members via an MLS application message (same mechanism as §9.10.4.1 pseudonym rotation).
+4. After the grace period, unsubscribes from the old routing ID.
+
+- **Pre-join context inspection.** Prospective members who know a `context_id` but have not joined the context can retrieve its publicly visible parameters (capability ceiling, governance model, roles, TTL, memory scope — see §5.7) from relays without joining. The relay indexes context metadata under a keyed identifier (see §9.10.4.B below) that does not reveal member identities or message content. It enables the "legibility before opt-in" tenet: any agent evaluating whether to join a context can inspect its parameters by querying the metadata routing ID on the context's relays.
+
+#### 9.10.4.B Metadata Routing ID Privacy
+
+**Threat: publicly derivable metadata routing IDs enable context enumeration.** If `metadata_routing_id = SHA-256(context_id || "scp-metadata")`, any party who knows or guesses a `context_id` can compute the metadata routing ID and probe relays to determine whether the context exists, which relays host it, and (combined with pseudonym enumeration) who is a member.
+
+**Mitigation: keyed metadata routing ID.** The metadata routing ID is derived using a context-specific secret known only to context members and authorized prospective members:
+
+```
+metadata_routing_id = HMAC-SHA256(
+  key  = context_metadata_key,
+  data = context_id || "scp-metadata-v2"
+)
+```
+
+The `context_metadata_key` is a 32-byte symmetric key distributed as follows:
+
+- **At context creation:** The creator generates `context_metadata_key` and includes it in the context's initial parameters.
+- **In invitations:** The `context_metadata_key` is included in the invitation payload (which is encrypted to the invitee's public key). This allows prospective members to inspect context metadata before joining.
+- **In discovery contexts:** Public or discoverable contexts publish their `context_metadata_key` in their discovery context entry. This preserves the "legibility before opt-in" property for contexts that want to be found, while keeping non-discoverable contexts invisible to probing.
+- **Rotation:** The `context_metadata_key` MAY be rotated via a governance action. On rotation, the context re-publishes metadata under the new routing ID and maintains the old routing ID for a grace period (2x blob TTL).
+
+**Backward compatibility:** Contexts created before this change use the legacy `SHA-256(context_id || "scp-metadata")` derivation. SDKs MUST support both derivation schemes during the migration period. New contexts MUST use the keyed derivation.
 
 #### 9.10.4.1 Pseudonym Rotation (BLACK-001 Mitigation)
 
@@ -1254,11 +1304,22 @@ Because `WrappedContent` (including the `wrapped_ceks` entries) is inside the br
 
 **Full revocation (retroactive):**
 
-1. Delete the target's access key from all members' local stores.
-2. Notify all members via an `AccessKeyRevoked { did, scope: Full }` event.
-3. Each member's SDK purges the target's access key from their key store.
-4. The relay retains the ciphertext and wrapped CEKs, but the target's wrapped CEK is now useless — the target's access key (needed to unwrap it) no longer exists on any compliant client.
-5. The target cannot request the access key via the pull-based protocol — the key holder checks the revocation list and denies the request (same pattern as sender key block list check).
+1. The revoker publishes an `AccessKeyRevoked { did, scope: Full, revocation_id, timestamp, signature }` event as an MLS application message. The `revocation_id` is a unique identifier (`SHA-256(context_id || target_did || "access-key-revoke" || timestamp)`). The signature covers `context_id || target_did || scope || revocation_id || timestamp` using the revoker's signing key.
+2. Each member's SDK, upon receiving and verifying the `AccessKeyRevoked` event:
+   a. Deletes the target's access key from the local key store.
+   b. Adds the target's DID to the local access key revocation list.
+   c. Records a `AccessKeyDeletionAck { revocation_id, member_did, timestamp, signature }` in the context event log. The acknowledgment is signed by the member's signing key.
+3. The relay retains the ciphertext and wrapped CEKs, but the target's wrapped CEK is now useless — the target's access key (needed to unwrap it) no longer exists on any compliant client.
+4. The target cannot request the access key via the pull-based protocol — the key holder checks the revocation list and denies the request (same pattern as sender key block list check).
+
+**Coordinated deletion protocol:**
+
+Coordinated key deletion across a distributed system is fundamentally best-effort — the revoker cannot force deletion on a non-compliant client. The protocol provides the strongest coordination guarantees achievable:
+
+- **Offline members:** Members offline at revocation time receive the `AccessKeyRevoked` event upon reconnecting (MLS guarantees ordered delivery within the group). The SDK processes the deletion immediately on receipt. There is no separate "catch-up" protocol — MLS epoch synchronization (§9.7.2) handles delivery.
+- **Deletion verification:** The revoker MAY track `AccessKeyDeletionAck` events in the context log to determine which members have confirmed deletion. If a member has not acknowledged within 24 hours of coming online (observable via presence signals or message activity), the revoker MAY escalate to governance (e.g., request removal of the non-acknowledging member).
+- **Non-compliant clients:** A malicious or modified client can retain the key despite the deletion instruction. This is an inherent limitation of distributed key management — the protocol cannot enforce key destruction on adversarial hardware. The mitigation is defense in depth: (a) future messages do not include wrapped CEKs for the revoked target, (b) the revocation is recorded in the event log for auditability, (c) governance can remove persistently non-compliant members from the MLS group entirely.
+- **Confirmation timeout:** SDKs MUST publish `AccessKeyDeletionAck` within 30 seconds of processing an `AccessKeyRevoked` event. Failure to publish an ack is not a protocol violation (the member may be offline), but persistently active members who do not acknowledge are flagged for governance review.
 
 **FutureOnly revocation:**
 
