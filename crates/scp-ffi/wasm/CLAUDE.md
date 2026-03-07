@@ -14,40 +14,48 @@ All re-implementations must be algorithm-identical to scp-core. When scp-core ch
 
 | Module | Responsibility |
 |--------|---------------|
-| `manager.rs` | `WasmContextManager` — central coordinator for all context state. Mirrors `scp_core::context::manager::ContextManager` API surface. All bridge functions delegate here. |
-| `runtime.rs` | Pure algorithm implementations: `ToolRegistry`, `WasmEventLog`, Merkle proof functions, schema validation. No state management. |
-| `context.rs` | Context lifecycle bridge: create, join, leave, close, send, subscribe, membership queries, governance, broadcast, TTL, drain_events. All delegate to `manager.rs`. |
-| `tools.rs` | Tool registration, invocation, verification. Delegates to `manager.rs`. |
-| `ucan.rs` | UCAN token management: validate (full 11-step pipeline), mint, revoke. Validation algorithm is local; state ops (nonces, revocations) delegate to `manager.rs`. |
-| `event_log.rs` | Event log query, Merkle inclusion/absence proofs. Delegates to `manager.rs`. |
+| `runtime.rs` | WASM-local runtime registry: `WasmContextRuntime`, `ToolRegistry`, `WasmEventLog`, Merkle proof functions, schema validation, `with_context` |
+| `context.rs` | Context lifecycle: create, join, leave, close, send, subscribe |
+| `tools.rs` | Tool registration, invocation, verification |
+| `ucan.rs` | UCAN token management: validate, mint, revoke |
+| `event_log.rs` | Event log query, Merkle inclusion/absence proofs |
 | `identity.rs` | Identity create, load, resolve |
 | `transport.rs` | Transport connect/disconnect/status |
 | `custody.rs` | `JsKeyCustody` extern type (WebCrypto injection point) |
 | `storage.rs` | `JsStorage` extern type (OPFS/IndexedDB injection point) |
 | `error.rs` | `ScpWasmError` → `JsError` mapping with stable error codes |
 
-## WasmContextManager (manager.rs)
+## Runtime Registry
 
-Central coordinator for all context state. Mirrors `ContextManager` from scp-core. Uses `thread_local! { RefCell<WasmContextManager> }` for the singleton (WASM is single-threaded). Access via `with_manager(|mgr| { ... })`.
+WASM is single-threaded. The context registry uses `thread_local! { static CONTEXT_REGISTRY: RefCell<HashMap<String, WasmContextRuntime>> }` — no `Mutex` or `DashMap` needed. `with_context(id, closure)` is the access pattern, mirroring the PyO3 bridge's pattern.
 
-The manager owns all per-context state (`PerContextState`): lifecycle state, members, roles, tool registry, event log (Merkle tree), UCAN nonce/revocation tracking, event buffer, broadcast state, governance replay protection, write-revoked members, and TTL.
+`WasmContextRuntime` fields:
+- `tool_registry: ToolRegistry` — tool registration/invocation
+- `event_log: WasmEventLog` — Merkle tree (append-only, RFC 6962)
+- `revoked_tokens: HashSet<String>` — UCAN revocation set (CIDs)
+- `ceiling_strings: HashSet<String>` — capability ceiling for UCAN validation
+- `creator_did: String` — DID of the context creator
 
-All 24 `GovernanceAction` variants are dispatchable through `execute_governance_action`. Broadcast operations (subscribe, publish, unsubscribe, block) are direct methods. Membership queries (member_count, is_member, member_dids, member_role) mirror `ContextManager` exactly.
+## UCAN — Full Implementation (SCP-218)
 
-## UCAN Validation — Full 11-Step Pipeline
-
-`ucan_validate` performs the full 11-step UCAN validation pipeline from ADR-016:
-1. Parse JWT format (3 base64url segments)
+`ucan_validate` performs the full 11-step ADR-016 validation pipeline:
+1. Parse (JWT 3-segment decode)
 2. Ed25519 signature verification via `ed25519-dalek`
-3. Delegation chain verification (aud/iss linkage, recursive)
-4. Root issuer must be context creator
-5. Audience DID validation (with RED-105 trailing-slash protection)
-6. Capability match (fail-closed on unparseable URIs)
-7. Attenuation enforcement (child capabilities ⊆ parent)
+3. Delegation chain traversal with aud/iss linkage
+4. Root issuer verification (must be context creator)
+5. Audience DID validation
+6. Capability match with trailing-slash prefix-collision protection (RED-105)
+7. Attenuation enforcement (child <= parent)
 8. Capability ceiling check
-9. Nonce replay detection (delegated to `WasmContextManager`)
-10. Revocation check (delegated to `WasmContextManager`)
+9. Nonce replay detection (per-context `HashSet<String>`)
+10. Revocation check (CID in revocation set)
 11. Time bounds (exp, nbf, 24h max lifetime)
+
+`ucan_mint` generates Ed25519 keypair via `rand_core::OsRng`, builds and signs JWT, returns `WasmUcanToken` with `encoded` field. Uses `build_ucan_token` helper.
+
+`ucan_revoke` computes token CID (`SHA-256` of full JWT string) and adds to both per-context UCAN state (`WasmUcanContextState.revoked_cids`) and runtime revocation set (`WasmContextRuntime.revoked_tokens`).
+
+Per-context UCAN state lives in `static UCAN_STATE: Mutex<Option<HashMap<...>>>` (separate from the `thread_local` context registry) because it needs `Mutex` for `sync_context_state` cross-thread safety.
 
 ## UCAN Revocation — CID Consistency
 
@@ -67,6 +75,28 @@ has_capability = resource_matches && can_matches;
 ```
 
 A token granting `scp:ctx:A/*` must NOT pass validation for `scp:ctx:B/messages:write`.
+
+## Event Log — Dual Storage Pattern
+
+The event log uses two storage layers:
+1. **`WasmEventLog` in `runtime.rs`** — Merkle tree storing only leaf hashes (`[u8; 32]`). Used for cryptographic proofs (inclusion/absence).
+2. **`EVENT_METADATA` in `event_log.rs`** — `thread_local! { RefCell<HashMap<String, Vec<EventMetadata>>> }` storing full event metadata (type, actor, timestamp, payload, sequence). Used for queries with filtering.
+
+Both are keyed by context ID. `append_event()` writes to both atomically. `remove_event_metadata()` should be called on context close.
+
+The Merkle tree leaf hash is `SHA-256(0x00 || event_type || actor_did || payload_json)` with RFC 6962 domain separation.
+
+## Identity — WASM-Local Registry
+
+`identity_create` generates Ed25519 keypair via `rand_core::OsRng` (backed by `getrandom/js` → `crypto.getRandomValues`), derives `did:dht:z{zbase32(pubkey)}`, and stores in `thread_local! IDENTITY_REGISTRY`. `identity_resolve` returns a DID document with the Ed25519 verification method for locally-created identities, or a minimal document for unknown DIDs.
+
+The `zbase32_encode` function exists in both `identity.rs` and `ucan.rs` (duplicated to avoid coupling). If a third module needs it, extract to a shared `encoding.rs` module.
+
+## Tool Registration — Deterministic IDs
+
+`tool_register` generates tool IDs as `tool-{SHA-256(context_id:name)[..16]}`. This is deterministic — the same tool name in the same context always produces the same ID. Input/output schemas are validated via the `jsonschema` crate. Test vectors are optional.
+
+`tool_invoke` operates in echo mode (no external handler dispatch). Returns `{"status": "validated", "tool_id": ..., "input": ...}`. When JS-injected handlers are added, dispatch logic goes here.
 
 ## Tool Invocation — Capability Check
 
@@ -92,4 +122,6 @@ cargo check --target wasm32-unknown-unknown -p scp-ffi-wasm
 - All async bridge functions use `wasm_bindgen_futures::future_to_promise` — futures must be non-blocking (no blocking I/O inside futures).
 - `uuid::Uuid::new_v4()` requires the `getrandom/js` feature to use `crypto.getRandomValues` in the browser. Verify this is present in `Cargo.toml` when adding UUID usage.
 - `js_sys::Date::now()` returns milliseconds since epoch as `f64` — divide by 1000.0 for seconds. Do not use `std::time::SystemTime` (not available on wasm32).
-- **Close authorization**: `WasmContextManager::close_context` checks the `ContextClose` capability via `PerContextState::member_has_capability`, matching `ttl::close_context` in scp-core. Admin role members have all capabilities in the ceiling; regular members do not have `context_close` by default. Capability strings use WASM ceiling format (`"context_close:*"`) not scp-core format (`"context:close"`).
+- `rand_core = { version = "0.6", features = ["getrandom"] }` provides `OsRng` for Ed25519 key generation. Works via `getrandom` 0.2 with `js` feature → `crypto.getRandomValues`. Must match `ed25519-dalek`'s `rand_core` 0.6 version.
+- `zbase32_encode` is duplicated in `identity.rs` and `ucan.rs`. Extract to shared module if a third consumer appears.
+- `event_log.rs` `EVENT_METADATA` is separate from `runtime.rs` `CONTEXT_REGISTRY` — both must be cleaned up on context close. Call `remove_event_metadata(context_id)` alongside `remove_context(context_id)`.
