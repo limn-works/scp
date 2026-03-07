@@ -147,8 +147,14 @@ pub fn init_context_manager_with(
     transport: Box<dyn ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
 ) {
-    let _ =
-        CONTEXT_MANAGER.get_or_init(|| Arc::new(ContextManager::new(crypto, transport, event_log, noop_key_resolver())));
+    let _ = CONTEXT_MANAGER.get_or_init(|| {
+        Arc::new(ContextManager::new(
+            crypto,
+            transport,
+            event_log,
+            noop_key_resolver(),
+        ))
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -427,9 +433,7 @@ pub fn register_ffi_state(context_id: &str, creator_did: &str) -> Result<(), Scp
                 .map(std::string::ToString::to_string)
                 .collect::<HashSet<String>>();
             let role_state = ContextRoleState::new(context_id, creator_did, ceiling, vec![])
-                .map_err(|e| {
-                    ScpPyError::context(format!("failed to create role state: {e}"))
-                })?;
+                .map_err(|e| ScpPyError::context(format!("failed to create role state: {e}")))?;
             let revocation_list = RevocationList::new(context_id.to_owned());
             let nonce_tracker = NonceTracker::new(context_id.to_owned(), SystemClock);
 
@@ -533,6 +537,33 @@ pub fn register_tool_handler(
 pub fn remove_ffi_state(context_id: &str) {
     ffi_state_registry().remove(context_id);
     known_contexts_registry().remove(context_id);
+}
+
+/// Re-syncs the `FfiBridgeState.role_state` for a context from the shared
+/// `ContextManager`.
+///
+/// Must be called after any governance action that modifies role state
+/// (ChangeRole, ModifyCeiling, AddMember, RemoveMember, etc.) so that the
+/// FFI-side copy used by UCAN/tool capability checks stays current.
+///
+/// # Errors
+///
+/// Returns `ScpPyError` if the context manager is not initialized, the
+/// context is not registered in either the manager or the FFI state registry,
+/// or the tokio runtime is unavailable.
+pub fn sync_role_state_from_manager(context_id: &str) -> Result<(), ScpPyError> {
+    let mgr = context_manager()?;
+    let rt = super::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
+    let new_role_state = rt.block_on(mgr.get_role_state(context_id)).ok_or_else(|| {
+        ScpPyError::context(format!(
+            "context '{context_id}' not found in ContextManager"
+        ))
+    })?;
+
+    with_ffi_state(context_id, |st| {
+        st.role_state = new_role_state;
+        Ok(())
+    })
 }
 
 /// Closes the receive channel for a context by dropping the sender (SCP-216).
@@ -918,9 +949,9 @@ pub fn set_relay_connection(adapter: Arc<NativeRelayAdapter>) -> Result<(), ScpP
 ///
 /// Returns `ScpPyError::TransportError` if the relay state lock is poisoned.
 pub fn get_relay_connection() -> Result<Option<Arc<NativeRelayAdapter>>, ScpPyError> {
-    let guard = relay_state().read().map_err(|_| {
-        ScpPyError::transport("relay connection state lock is poisoned".to_owned())
-    })?;
+    let guard = relay_state()
+        .read()
+        .map_err(|_| ScpPyError::transport("relay connection state lock is poisoned".to_owned()))?;
     Ok(guard.clone())
 }
 
@@ -1017,9 +1048,7 @@ pub struct RegistryStats {
 pub fn registry_stats() -> Result<RegistryStats, ScpPyError> {
     let relay_connected = relay_state()
         .read()
-        .map_err(|_| {
-            ScpPyError::transport("relay connection state lock is poisoned".to_owned())
-        })?
+        .map_err(|_| ScpPyError::transport("relay connection state lock is poisoned".to_owned()))?
         .is_some();
 
     Ok(RegistryStats {

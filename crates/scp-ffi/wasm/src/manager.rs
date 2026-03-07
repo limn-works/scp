@@ -284,6 +284,39 @@ struct PerContextState {
     broadcast: Option<BroadcastState>,
 }
 
+impl PerContextState {
+    /// Returns `true` if the member has the given capability string.
+    ///
+    /// Mirrors `ContextRoleState::member_has_capability` in scp-core. In the
+    /// default role system:
+    /// - "admin" role members have all capabilities in the ceiling.
+    /// - "member" role members have `messages:read` and `messages:write` only.
+    ///
+    /// Capability strings use the format `"{resource}:{action}"` (e.g.
+    /// `"context:close"`, `"messages:write"`).
+    fn member_has_capability(&self, member_did: &str, capability: &str) -> bool {
+        let Some(member) = self.members.get(member_did) else {
+            return false;
+        };
+
+        match member.role.as_str() {
+            "admin" => {
+                // Admins have all capabilities in the ceiling.
+                // Check the ceiling_strings set for the capability or a wildcard.
+                let (resource, _action) = capability.rsplit_once(':').unwrap_or((capability, "*"));
+                let wildcard = format!("{resource}:*");
+                self.ceiling_strings.contains(capability)
+                    || self.ceiling_strings.contains(&wildcard)
+            }
+            "member" => {
+                // Default member capabilities: messages:read, messages:write.
+                matches!(capability, "messages:read" | "messages:write")
+            }
+            _ => false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WasmContextManager
 // ---------------------------------------------------------------------------
@@ -561,7 +594,7 @@ impl WasmContextManager {
     /// # Errors
     ///
     /// Returns an error if the context is not active or the initiator lacks
-    /// permission.
+    /// the `ContextClose` capability.
     pub fn close_context(
         &mut self,
         context_id: &str,
@@ -569,20 +602,16 @@ impl WasmContextManager {
     ) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
-        // Authorization: only creator or admin can close.
-        if initiator_did != ctx.creator_did {
-            let member = ctx.members.get(initiator_did);
-            let is_admin = member.is_some_and(|m| m.role == "admin");
-            if !is_admin {
-                return Err(ScpWasmError::Permission {
-                    message: format!(
-                        "identity '{initiator_did}' is not authorized to close this context \
-                         — only the context creator ('{0}') or an admin can close it",
-                        ctx.creator_did
-                    ),
-                    code: "SCP-PERM-3000".to_owned(),
-                });
-            }
+        // Authorization: check ContextClose capability, matching
+        // ttl::close_context in scp-core. Admin role members have all
+        // capabilities in the ceiling; regular members do not have
+        // context_close by default. Uses WASM ceiling format
+        // ("context_close:*") not scp-core format ("context:close").
+        if !ctx.member_has_capability(initiator_did, "context_close:*") {
+            return Err(ScpWasmError::Permission {
+                message: format!("member {initiator_did} does not have context:close capability"),
+                code: "SCP-PERM-3000".to_owned(),
+            });
         }
 
         "closed".clone_into(&mut ctx.state);

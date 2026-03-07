@@ -301,9 +301,10 @@ fn create_governance_engine(
     key_resolver: KeyResolver,
 ) -> Result<Box<dyn GovernanceEngine>, ContextCreationError> {
     match model {
-        GovernanceModel::SingleAdmin => {
-            Ok(Box::new(SingleAdminEngine::new(creator_did.clone(), key_resolver)))
-        }
+        GovernanceModel::SingleAdmin => Ok(Box::new(SingleAdminEngine::new(
+            creator_did.clone(),
+            key_resolver,
+        ))),
         GovernanceModel::Threshold { threshold, signers } => {
             let engine = ThresholdEngine::new(signers.clone(), *threshold, 86_400, key_resolver)
                 .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
@@ -359,9 +360,8 @@ fn restore_governance_engine_from_snapshot(
             threshold,
             voting_window_secs,
         } => {
-            let engine =
-                ThresholdEngine::new(signers, threshold, voting_window_secs, key_resolver)
-                    .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
+            let engine = ThresholdEngine::new(signers, threshold, voting_window_secs, key_resolver)
+                .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
             Ok(Box::new(engine))
         }
         GovernanceModelConfig::Majority {
@@ -381,9 +381,13 @@ fn restore_governance_engine_from_snapshot(
                         .collect()
                 }
             };
-            let engine =
-                MajorityVoteEngine::new(voters, voting_window_secs, min_participation_bps, key_resolver)
-                    .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
+            let engine = MajorityVoteEngine::new(
+                voters,
+                voting_window_secs,
+                min_participation_bps,
+                key_resolver,
+            )
+            .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
             Ok(Box::new(engine))
         }
         GovernanceModelConfig::Unanimity { voting_window_secs } => {
@@ -1409,6 +1413,19 @@ impl ContextManager {
             .await
             .get(context_id)
             .and_then(|ctx| ctx.role_state.assignments.get(did).cloned())
+    }
+
+    /// Returns a clone of the role state for a context, or `None` if the
+    /// context is not registered.
+    ///
+    /// Used by FFI bridges to re-sync their local role state copy after
+    /// governance actions that modify roles/capabilities.
+    pub async fn get_role_state(&self, context_id: &str) -> Option<ContextRoleState> {
+        self.contexts
+            .lock()
+            .await
+            .get(context_id)
+            .map(|ctx| ctx.role_state.clone())
     }
 
     /// Drains all events from the receive buffer for a context.
@@ -6137,10 +6154,7 @@ mod tests {
         manager.register_local_did("did:key:alice".into()).await;
         let params = ContextParams {
             mode: ContextMode::Broadcast,
-            ceiling: vec![
-                Capability::MessagesRead,
-                Capability::MessagesWrite,
-            ],
+            ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
             ..ContextParams::default()
         };
         let _handle = manager
@@ -7670,7 +7684,10 @@ mod tests {
             .execute_governance_action("test-ctx", &proposal)
             .await;
 
-        assert!(result.is_err(), "NoPromotion context must reject PromoteContext");
+        assert!(
+            result.is_err(),
+            "NoPromotion context must reject PromoteContext"
+        );
         let err = result.unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -7716,7 +7733,10 @@ mod tests {
 
         // Verify preconditions: TTL is set, memory scope is Ephemeral.
         assert_eq!(handle.params().memory_scope, MemoryScope::Ephemeral);
-        assert_eq!(handle.params().promotion_policy, PromotionPolicy::Promotable);
+        assert_eq!(
+            handle.params().promotion_policy,
+            PromotionPolicy::Promotable
+        );
 
         // Build an approved PromoteContext proposal with unanimous consent
         // (only the creator is a member).
@@ -7742,7 +7762,10 @@ mod tests {
             .execute_governance_action("promo-ctx", &proposal)
             .await;
 
-        assert!(result.is_ok(), "Promotable context should accept PromoteContext: {result:?}");
+        assert!(
+            result.is_ok(),
+            "Promotable context should accept PromoteContext: {result:?}"
+        );
 
         // Verify postconditions: memory scope is now Full.
         let contexts = manager.contexts.lock().await;
@@ -7777,9 +7800,7 @@ mod tests {
         let params = ContextParams {
             promotion_policy: PromotionPolicy::Promotable,
             memory_scope: MemoryScope::Ephemeral,
-            ceiling: vec![
-                crate::context::params::Capability::new("messages:read"),
-            ],
+            ceiling: vec![crate::context::params::Capability::new("messages:read")],
             ..ContextParams::default()
         };
 
@@ -7788,7 +7809,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(handle.params().promotion_policy, PromotionPolicy::Promotable);
+        assert_eq!(
+            handle.params().promotion_policy,
+            PromotionPolicy::Promotable
+        );
 
         let proposal = GovernanceProposal {
             proposal_id: [3u8; 32],

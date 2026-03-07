@@ -67,6 +67,8 @@ All I/O-bound functions are `async fn`. UniFFI generates Swift `async` functions
 - The tokio runtime (`RUNTIME` in `lib.rs`) must be initialized before any async bridge call. It is created as a `OnceLock<Runtime>` and exposed via `runtime()`.
 - **Shared ContextManager (post-#387):** All context lifecycle/membership/governance/broadcast/TTL operations delegate to `crate::runtime::context_manager()`. The old `ContextRuntime` struct and `DashMap` registry are deleted. Context state lives in the `ContextManager`, not in the bridge.
 - Bridge functions create ephemeral `scp_core::context::ContextHandle` instances to pass `context_id` to the manager. The FFI `ContextHandle` (in `bridge.rs`) remains a separate opaque object with its own state lock for handle counting and state queries.
+- **Close authorization**: `context_close` does NOT perform bridge-layer authorization. It delegates to `ContextManager::close_context`, which checks the `ContextClose` capability via `ttl::close_context`. The ContextManager is the authoritative auth layer.
+- **register_local_did**: `context_create` calls `manager.register_local_did(identity.did)` after creating the context, matching NAPI's behavior for defense-in-depth.
 - `ucan_mint` uses `InMemoryKeyCustody` for signing (feature-gated). Real `KeyCustody` wiring deferred to platform integration.
 - Opaque objects (`Identity`, `ContextHandle`, `UcanToken`, `TransportManager`) use `Arc<T>` wrapping and manual handle counting (`increment_handle_count`/`decrement_handle_count` in `lib.rs`). `Drop` impls decrement counts.
 - `OpaqueInMemoryKeyCustody` wrapper implements `Debug` with redacted output to prevent key material in logs.

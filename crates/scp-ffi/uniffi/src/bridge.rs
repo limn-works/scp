@@ -1522,6 +1522,12 @@ pub async fn context_create(
                 .await
                 .map_err(ScpError::from)?;
 
+            // Register the creator's DID as a local DID for defense-in-depth,
+            // matching NAPI's behavior.
+            manager
+                .register_local_did(identity.did.clone().into())
+                .await;
+
             // Extract key custody and signing key from the identity (RED-102).
             #[cfg(feature = "allow_in_memory_custody")]
             let in_memory_custody = identity.in_memory_custody.clone();
@@ -1683,18 +1689,10 @@ pub async fn context_close(
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            // Authorization: only the context creator can close the context.
+            // Authorization is enforced by the ContextManager (which delegates
+            // to ttl::close_context checking the ContextClose capability). No
+            // bridge-layer auth check — the ContextManager is authoritative.
             let identity_did = identity.did.clone();
-            if identity_did != handle.creator_did {
-                return Err(ScpError::Permission {
-                    message: format!(
-                        "identity '{identity_did}' is not authorized to close this context \
-                         — only the context creator ('{}') can close it",
-                        handle.creator_did
-                    ),
-                    code: "SCP-PERM-3000".to_owned(),
-                });
-            }
 
             let mut state = handle.state.lock().await;
             if !matches!(*state, ContextState::Active) {
@@ -2502,7 +2500,12 @@ pub async fn broadcast_publish(
             let manager = crate::runtime::context_manager();
             let did: scp_identity::DID = author_did.into();
             manager
-                .publish_broadcast(&handle.context_id, &did, &payload, &ed25519_dalek::SigningKey::from_bytes(&[0u8; 32]))
+                .publish_broadcast(
+                    &handle.context_id,
+                    &did,
+                    &payload,
+                    &ed25519_dalek::SigningKey::from_bytes(&[0u8; 32]),
+                )
                 .await
                 .map_err(ScpError::from)?;
             Ok(())

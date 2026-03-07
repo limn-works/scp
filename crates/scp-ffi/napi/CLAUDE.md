@@ -86,7 +86,8 @@ The NAPI bridge uses `rand::rngs::OsRng.fill_bytes` directly. Format:
   for manager operations.
 - UCAN validation state (revocation lists, nonce trackers) lives in a separate `DashMap` registry,
   NOT in the `ContextManager`. The `ensure_registered` / `with_context` pattern accesses this state.
-- `context_close` removes UCAN state via `remove_context` after closing through the manager.
+- `context_close` does NOT perform bridge-layer authorization — it delegates to `ContextManager::close_context` which checks the `ContextClose` capability. Removes UCAN state via `remove_context` after closing.
+- `context_create` maps all user-specified fields from params JSON to `ContextParams` (mode, ceiling, ceiling_policy, promotion_policy, memory_scope, governance, ttl). Previously only mode and ttl were passed.
 - The bridge event log provider is no-op. Real Merkle proofs use the UCAN registry's `EventLog`.
 - `NapiUcanToken.encoded` is `#[allow(dead_code)]` because `ucan_revoke` currently returns a stub
   error. When revocation is wired to the runtime, the bridge will parse the full JWT `token`

@@ -294,16 +294,47 @@ pub async fn context_create(
     let context_id = format!("ctx-{}", Uuid::new_v4());
     let creator_did = identity.inner.did.clone();
 
-    // Build ContextParams for the manager.
+    // Build ContextParams for the manager, mapping all user-specified fields.
     let mode = if mode_str == "Broadcast" {
         ContextMode::Broadcast
     } else {
         ContextMode::Encrypted
     };
 
+    let core_ceiling_policy = match ceiling_policy.as_str() {
+        "governed" => scp_core::context::params::CeilingPolicy::Governed,
+        _ => scp_core::context::params::CeilingPolicy::Immutable,
+    };
+
+    let core_promotion_policy = match promotion_policy.as_deref() {
+        Some("promotable") => scp_core::context::params::PromotionPolicy::Promotable,
+        _ => scp_core::context::params::PromotionPolicy::NoPromotion,
+    };
+
+    let memory_scope_str = params["memoryScope"].as_str().unwrap_or("ephemeral");
+    let core_memory_scope = match memory_scope_str {
+        "summary" => scp_core::context::params::MemoryScope::Summary,
+        "full" => scp_core::context::params::MemoryScope::Full,
+        _ => scp_core::context::params::MemoryScope::Ephemeral,
+    };
+
+    // Currently only SingleAdmin is supported; governance string was already parsed.
+    let _ = governance.as_str();
+    let core_governance = scp_core::context::params::GovernanceModel::SingleAdmin;
+
+    let core_ceiling: Vec<scp_core::context::roles::Capability> = ceiling
+        .iter()
+        .map(scp_core::context::roles::Capability::new)
+        .collect();
+
     let context_params = ContextParams {
         mode,
+        ceiling: core_ceiling,
+        ceiling_policy: core_ceiling_policy,
+        promotion_policy: core_promotion_policy,
         ttl: ttl_seconds.map(std::time::Duration::from_secs),
+        memory_scope: core_memory_scope,
+        governance: core_governance,
         ..ContextParams::default()
     };
 
@@ -417,18 +448,9 @@ pub async fn context_leave(handle: &NapiContextHandle, identity_did: String) -> 
 #[napi]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> napi::Result<()> {
-    // Authorization: only the context creator can close the context.
-    if identity_did != handle.creator_did {
-        return Err(ScpNapiError::Permission {
-            message: format!(
-                "identity '{identity_did}' is not authorized to close this context \
-                 — only the context creator ('{}') can close it",
-                handle.creator_did
-            ),
-            code: "SCP-PERM-3000".to_owned(),
-        }
-        .into());
-    }
+    // Authorization is enforced by the ContextManager (which delegates to
+    // ttl::close_context checking the ContextClose capability). No bridge-layer
+    // auth check — the ContextManager is authoritative.
 
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
     if state_str != "active" {

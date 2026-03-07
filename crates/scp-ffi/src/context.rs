@@ -31,7 +31,6 @@ use std::sync::{Arc, Mutex};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use scp_core::context::roles::Capability;
 use scp_platform::traits::KeyCustody;
 use tokio::sync::mpsc;
 
@@ -746,9 +745,15 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let mgr = mgr.clone();
         let ctx_id = context_id.clone();
+        let creator_did_for_register = scp_identity::DID(identity_did.to_owned());
         rt.block_on(async move {
             mgr.create_context(ctx_id, core_params, creator_did_owned)
                 .await
+                .map_err(|e| scp_core::context::ContextError::CreationFailed(e.to_string()))?;
+            // Register the creator's DID as a local DID for defense-in-depth,
+            // matching NAPI's behavior.
+            mgr.register_local_did(creator_did_for_register).await;
+            Ok::<(), scp_core::context::ContextError>(())
         })
         .map_err(|e| {
             // Clean up FFI state on ContextManager failure.
@@ -775,15 +780,11 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
             });
             let pk = pseudonym
                 .map_err(|e| {
-                    crate::error::ScpPyError::identity(format!(
-                        "pseudonym derivation failed: {e}"
-                    ))
+                    crate::error::ScpPyError::identity(format!("pseudonym derivation failed: {e}"))
                 })?
                 .public_key;
             let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
-                crate::error::ScpPyError::identity(
-                    "pseudonym public key must be 32 bytes",
-                )
+                crate::error::ScpPyError::identity("pseudonym public key must be 32 bytes")
             })?;
             Ok(bytes)
         })
@@ -985,26 +986,15 @@ fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
         )));
     }
 
-    // Verify the caller has the ContextClose capability before allowing
-    // the close operation. Without this check, any caller could close any
-    // context -- a privilege escalation vulnerability (black-hat finding).
+    // Authorization is enforced by the ContextManager (which delegates to
+    // ttl::close_context checking the ContextClose capability). No bridge-layer
+    // auth check — the ContextManager is authoritative.
     let context_id = handle.context_id.clone();
-    crate::runtime::with_ffi_state(&context_id, |st| {
-        if !st
-            .role_state
-            .member_has_capability(identity_did, &Capability::ContextClose)
-        {
-            return Err(crate::error::ScpPyError::context(format!(
-                "identity '{identity_did}' does not have the ContextClose capability \
-                 for context '{context_id}' -- only admins or members with the \
-                 context:close capability can close a context"
-            )));
-        }
-        Ok(())
-    })
-    .map_err(|e: crate::error::ScpPyError| -> PyErr { e.into() })?;
 
-    // Delegate close to the shared ContextManager.
+    // Delegate close to the shared ContextManager FIRST. If it fails with a
+    // real error (not "context not found" which is idempotent), propagate
+    // before cleaning up FFI state. This prevents the scenario where FFI
+    // state is destroyed but the ContextManager still holds the context.
     {
         let initiator_did = scp_identity::DID(identity_did.to_owned());
         let rt = crate::runtime()?;
@@ -1013,17 +1003,24 @@ fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
         let mgr = mgr.clone();
 
         let core_params = build_core_context_params(&handle.params);
-        let temp_handle = scp_core::context::ContextHandle::new(context_id, core_params);
+        let temp_handle = scp_core::context::ContextHandle::new(context_id.clone(), core_params);
         let close_result = rt.block_on(async {
             let _ = temp_handle
                 .transition_to(&scp_core::context::ContextState::Active)
                 .await;
             mgr.close_context(&temp_handle, &initiator_did).await
         });
-        // close_context may fail if the context was already removed from
-        // ContextManager (e.g., all members left). Proceed with FFI cleanup
-        // regardless, since the bridge-level state check passed.
-        let _ = close_result;
+        // Propagate errors unless the context was already removed from
+        // ContextManager (idempotent — e.g. all members left). The
+        // "not registered" error is safe to ignore.
+        if let Err(ref e) = close_result {
+            let msg = e.to_string();
+            if !msg.contains("not registered") && !msg.contains("context not found") {
+                return Err(PyRuntimeError::new_err(format!(
+                    "ContextManager close_context failed: {e}"
+                )));
+            }
+        }
     }
 
     // Transition directly to "closed" (skipping "closing" for the bridge

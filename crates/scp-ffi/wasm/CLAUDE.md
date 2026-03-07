@@ -92,3 +92,4 @@ cargo check --target wasm32-unknown-unknown -p scp-ffi-wasm
 - All async bridge functions use `wasm_bindgen_futures::future_to_promise` — futures must be non-blocking (no blocking I/O inside futures).
 - `uuid::Uuid::new_v4()` requires the `getrandom/js` feature to use `crypto.getRandomValues` in the browser. Verify this is present in `Cargo.toml` when adding UUID usage.
 - `js_sys::Date::now()` returns milliseconds since epoch as `f64` — divide by 1000.0 for seconds. Do not use `std::time::SystemTime` (not available on wasm32).
+- **Close authorization**: `WasmContextManager::close_context` checks the `ContextClose` capability via `PerContextState::member_has_capability`, matching `ttl::close_context` in scp-core. Admin role members have all capabilities in the ceiling; regular members do not have `context_close` by default. Capability strings use WASM ceiling format (`"context_close:*"`) not scp-core format (`"context:close"`).
