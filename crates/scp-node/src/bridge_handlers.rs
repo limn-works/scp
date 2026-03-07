@@ -6,15 +6,16 @@
 //!
 //! See spec section 12.10 and ADR-023 in `.docs/adrs/phase-5.md`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::{Extension, Json, Router, routing::post};
+use axum::{Extension, Json, Router, routing::{delete, get, post}};
 use scp_core::bridge::shadow::{CreateShadowParams, ShadowRegistry, create_shadow};
+use scp_core::bridge::{BridgeMode, ShadowProvenanceStatus};
 use scp_core::crypto::sender_keys::SenderKeyStore;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -40,9 +41,10 @@ pub struct StoredAttestation {
 
 /// Shared state for bridge shadow operations.
 ///
-/// Holds per-context shadow registries, the sender key store, and
-/// platform identity attestations, protected by an async `RwLock`
-/// for concurrent handler access.
+/// Holds per-context shadow registries, the sender key store,
+/// platform identity attestations, webhook event deduplication,
+/// and emitted messages, protected by async `RwLock`s for
+/// concurrent handler access.
 #[derive(Debug)]
 pub struct BridgeState {
     /// Per-context shadow registries, keyed by context ID.
@@ -53,6 +55,35 @@ pub struct BridgeState {
 
     /// Platform identity attestations, keyed by attestation ID.
     pub attestations: RwLock<HashMap<String, StoredAttestation>>,
+
+    /// Set of deleted shadow IDs (historical actions remain in event log).
+    pub deleted_shadows: RwLock<HashSet<String>>,
+
+    /// Set of webhook event IDs already processed (deduplication).
+    pub processed_event_ids: RwLock<HashSet<String>>,
+
+    /// Emitted messages, keyed by message ID.
+    pub messages: RwLock<Vec<EmittedMessage>>,
+
+    /// Monotonically increasing sequence counter for emitted messages.
+    pub message_sequence: RwLock<u64>,
+}
+
+/// A stored emitted message for tracking purposes.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmittedMessage {
+    /// Unique message ID.
+    pub message_id: String,
+    /// Shadow ID that emitted the message.
+    pub shadow_id: String,
+    /// Message content.
+    pub content: String,
+    /// Content type.
+    pub content_type: String,
+    /// Sequence number.
+    pub sequence: u64,
+    /// Bridge provenance metadata.
+    pub bridge_provenance: BridgeProvenanceResponse,
 }
 
 impl BridgeState {
@@ -63,6 +94,10 @@ impl BridgeState {
             registries: RwLock::new(HashMap::new()),
             sender_key_store: RwLock::new(SenderKeyStore::new()),
             attestations: RwLock::new(HashMap::new()),
+            deleted_shadows: RwLock::new(HashSet::new()),
+            processed_event_ids: RwLock::new(HashSet::new()),
+            messages: RwLock::new(Vec::new()),
+            message_sequence: RwLock::new(0),
         }
     }
 }
@@ -166,6 +201,134 @@ pub struct AttestResponse {
 
 /// Default attestation TTL: 24 hours in seconds.
 const ATTESTATION_TTL_SECS: u64 = 86_400;
+
+// ---------------------------------------------------------------------------
+// Message endpoint types (SCP-BCH-003)
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /v1/scp/bridge/message`.
+#[derive(Debug, Deserialize)]
+pub struct EmitMessageRequest {
+    /// The shadow identity emitting the message.
+    pub shadow_id: String,
+
+    /// Message content.
+    pub content: String,
+
+    /// MIME content type (e.g., `"text/plain"`).
+    pub content_type: String,
+
+    /// Optional platform-specific message ID for correlation.
+    #[serde(default)]
+    pub platform_message_id: Option<String>,
+
+    /// Optional platform-reported timestamp.
+    #[serde(default)]
+    pub platform_timestamp: Option<u64>,
+}
+
+/// Serializable bridge provenance in API responses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BridgeProvenanceResponse {
+    /// Originating platform name.
+    pub originating_platform: String,
+    /// Bridge operating mode.
+    pub bridge_mode: String,
+    /// Shadow provenance status.
+    pub shadow_status: String,
+    /// Operator DID string.
+    pub operator_did: String,
+}
+
+/// Response body for `POST /v1/scp/bridge/message`.
+#[derive(Debug, Serialize)]
+pub struct EmitMessageResponse {
+    /// The unique message ID.
+    pub message_id: String,
+    /// Sequence number of the message.
+    pub sequence: u64,
+    /// Bridge provenance metadata.
+    pub bridge_provenance: BridgeProvenanceResponse,
+}
+
+// ---------------------------------------------------------------------------
+// Status endpoint types (SCP-BCH-005)
+// ---------------------------------------------------------------------------
+
+/// Response body for `GET /v1/scp/bridge/status`.
+#[derive(Debug, Serialize)]
+pub struct BridgeStatusResponse {
+    /// Bridge instance ID.
+    pub bridge_id: String,
+    /// Current status (Active, Suspended, Revoked).
+    pub status: String,
+    /// External platform name.
+    pub platform: String,
+    /// Operating mode.
+    pub mode: String,
+    /// Operator DID.
+    pub operator_did: String,
+    /// Registration timestamp.
+    pub registered_at: u64,
+    /// Number of active shadows.
+    pub shadow_count: usize,
+    /// Shadows list.
+    pub shadows: Vec<ShadowSummary>,
+}
+
+/// Summary of a shadow identity in the status response.
+#[derive(Debug, Serialize)]
+pub struct ShadowSummary {
+    /// Shadow identity ID.
+    pub shadow_id: String,
+    /// Platform handle.
+    pub platform_handle: String,
+    /// Attributed role.
+    pub attributed_role: String,
+    /// Provenance status.
+    pub provenance_status: String,
+    /// Creation timestamp.
+    pub created_at: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Webhook endpoint types (SCP-BCH-006)
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /v1/scp/bridge/webhook`.
+#[derive(Debug, Deserialize)]
+pub struct WebhookRequest {
+    /// Event type.
+    pub event_type: String,
+    /// Unique event ID for deduplication.
+    pub event_id: String,
+    /// Event timestamp.
+    pub timestamp: u64,
+    /// Event-specific payload.
+    pub payload: serde_json::Value,
+}
+
+/// Response body for `POST /v1/scp/bridge/webhook`.
+#[derive(Debug, Serialize)]
+pub struct WebhookResponse {
+    /// Whether the event was accepted.
+    pub accepted: bool,
+    /// Event ID echo.
+    pub event_id: String,
+    /// Optional rejection reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Supported webhook event types.
+const VALID_EVENT_TYPES: &[&str] = &[
+    "message",
+    "presence",
+    "identity_update",
+    "user_departed",
+    "message_edit",
+    "message_delete",
+];
 
 // ---------------------------------------------------------------------------
 // Handler
@@ -338,6 +501,364 @@ async fn attest_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Message handler (SCP-BCH-003)
+// ---------------------------------------------------------------------------
+
+/// Finds a shadow identity across all registries and returns it with context info.
+async fn find_shadow(
+    registries: &HashMap<String, ShadowRegistry>,
+    shadow_id: &str,
+) -> Option<(String, scp_core::bridge::ShadowIdentity)> {
+    for (ctx_id, registry) in registries {
+        if let Some(shadow) = registry.shadows().iter().find(|s| s.shadow_id == shadow_id) {
+            return Some((ctx_id.clone(), shadow.clone()));
+        }
+    }
+    None
+}
+
+/// Handler for `POST /v1/scp/bridge/message`.
+///
+/// Emits a message on behalf of a shadow identity with full bridge
+/// provenance. Returns 202 Accepted with message ID, sequence, and
+/// provenance metadata.
+///
+/// See SCP-BCH-003 and spec section 12.10.4.
+async fn emit_message_handler(
+    State(bridge_state): State<Arc<BridgeState>>,
+    Extension(auth_ctx): Extension<crate::bridge_auth::BridgeAuthContext>,
+    Json(body): Json<EmitMessageRequest>,
+) -> impl IntoResponse {
+    if body.shadow_id.is_empty() {
+        return ApiError::bad_request("shadow_id must not be empty").into_response();
+    }
+    if body.content.is_empty() {
+        return ApiError::bad_request("content must not be empty").into_response();
+    }
+    if body.content_type.is_empty() {
+        return ApiError::bad_request("content_type must not be empty").into_response();
+    }
+
+    let registries = bridge_state.registries.read().await;
+    let deleted = bridge_state.deleted_shadows.read().await;
+
+    // Check if shadow was deleted.
+    if deleted.contains(&body.shadow_id) {
+        return ApiError::not_found("SHADOW_NOT_FOUND: shadow has been deleted").into_response();
+    }
+
+    let shadow_info = find_shadow(&registries, &body.shadow_id).await;
+    drop(registries);
+    drop(deleted);
+
+    let (_ctx_id, shadow) = match shadow_info {
+        Some(info) => info,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiError {
+                    error: "shadow not found".to_owned(),
+                    code: "SHADOW_NOT_FOUND".to_owned(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let shadow_status = match shadow.provenance_status {
+        ShadowProvenanceStatus::Shadow => "Shadow",
+        ShadowProvenanceStatus::Claimed => "Claimed",
+    };
+
+    let bridge_mode_str = match auth_ctx.bridge.mode {
+        BridgeMode::Relay => "Relay",
+        BridgeMode::Puppet => "Puppet",
+        BridgeMode::Api => "Api",
+        BridgeMode::Cooperative => "Cooperative",
+    };
+
+    let provenance_resp = BridgeProvenanceResponse {
+        originating_platform: auth_ctx.bridge.platform.clone(),
+        bridge_mode: bridge_mode_str.to_owned(),
+        shadow_status: shadow_status.to_owned(),
+        operator_did: auth_ctx.bridge.operator_did.0.clone(),
+    };
+
+    let mut seq = bridge_state.message_sequence.write().await;
+    *seq += 1;
+    let sequence = *seq;
+    drop(seq);
+
+    let message_id = format!("msg:{}:{sequence}", auth_ctx.claims.scp_bridge_id);
+
+    let emitted = EmittedMessage {
+        message_id: message_id.clone(),
+        shadow_id: body.shadow_id,
+        content: body.content,
+        content_type: body.content_type,
+        sequence,
+        bridge_provenance: provenance_resp.clone(),
+    };
+
+    bridge_state.messages.write().await.push(emitted);
+
+    (
+        StatusCode::ACCEPTED,
+        Json(EmitMessageResponse {
+            message_id,
+            sequence,
+            bridge_provenance: provenance_resp,
+        }),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Status handler (SCP-BCH-005)
+// ---------------------------------------------------------------------------
+
+/// Handler for `GET /v1/scp/bridge/status`.
+///
+/// Returns bridge status including shadow list, registration info, and
+/// rate limits.
+///
+/// See SCP-BCH-005 and spec section 12.10.4.
+async fn status_handler(
+    State(bridge_state): State<Arc<BridgeState>>,
+    Extension(auth_ctx): Extension<crate::bridge_auth::BridgeAuthContext>,
+) -> impl IntoResponse {
+    let registries = bridge_state.registries.read().await;
+    let deleted = bridge_state.deleted_shadows.read().await;
+
+    let mut shadows = Vec::new();
+    for registry in registries.values() {
+        for shadow in registry.shadows() {
+            if !deleted.contains(&shadow.shadow_id) {
+                let status_str = match shadow.provenance_status {
+                    ShadowProvenanceStatus::Shadow => "Shadow",
+                    ShadowProvenanceStatus::Claimed => "Claimed",
+                };
+                shadows.push(ShadowSummary {
+                    shadow_id: shadow.shadow_id.clone(),
+                    platform_handle: shadow.platform_handle.clone(),
+                    attributed_role: shadow.attributed_role.clone(),
+                    provenance_status: status_str.to_owned(),
+                    created_at: shadow.created_at,
+                });
+            }
+        }
+    }
+
+    let bridge_mode_str = match auth_ctx.bridge.mode {
+        BridgeMode::Relay => "Relay",
+        BridgeMode::Puppet => "Puppet",
+        BridgeMode::Api => "Api",
+        BridgeMode::Cooperative => "Cooperative",
+    };
+
+    let status_str = match auth_ctx.bridge.status {
+        scp_core::bridge::BridgeStatus::Active => "Active",
+        scp_core::bridge::BridgeStatus::Suspended => "Suspended",
+        scp_core::bridge::BridgeStatus::Revoked => "Revoked",
+    };
+
+    let shadow_count = shadows.len();
+
+    let resp = BridgeStatusResponse {
+        bridge_id: auth_ctx.bridge.bridge_id.clone(),
+        status: status_str.to_owned(),
+        platform: auth_ctx.bridge.platform.clone(),
+        mode: bridge_mode_str.to_owned(),
+        operator_did: auth_ctx.bridge.operator_did.0.clone(),
+        registered_at: auth_ctx.bridge.registered_at,
+        shadow_count,
+        shadows,
+    };
+
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Delete shadow handler (SCP-BCH-005)
+// ---------------------------------------------------------------------------
+
+/// Handler for `DELETE /v1/scp/bridge/shadow/{shadow_id}`.
+///
+/// Deletes a shadow identity. Historical actions remain in the event log.
+/// Returns 204 on success, 404 if not found, 409 if claimed.
+/// Deletion is idempotent (re-deleting returns 204).
+///
+/// See SCP-BCH-005 and spec section 12.10.4.
+async fn delete_shadow_handler(
+    State(bridge_state): State<Arc<BridgeState>>,
+    Extension(_auth_ctx): Extension<crate::bridge_auth::BridgeAuthContext>,
+    Path(shadow_id): Path<String>,
+) -> impl IntoResponse {
+    let deleted = bridge_state.deleted_shadows.read().await;
+
+    // Idempotent: already deleted returns 204.
+    if deleted.contains(&shadow_id) {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    drop(deleted);
+
+    let registries = bridge_state.registries.read().await;
+    let shadow_info = find_shadow(&registries, &shadow_id).await;
+    drop(registries);
+
+    match shadow_info {
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: "shadow not found".to_owned(),
+                code: "SHADOW_NOT_FOUND".to_owned(),
+            }),
+        )
+            .into_response(),
+        Some((_ctx_id, shadow)) => {
+            // Claimed shadows cannot be deleted.
+            if shadow.provenance_status == ShadowProvenanceStatus::Claimed {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(ApiError {
+                        error: "shadow has been claimed and cannot be deleted".to_owned(),
+                        code: "SHADOW_ALREADY_CLAIMED".to_owned(),
+                    }),
+                )
+                    .into_response();
+            }
+
+            bridge_state
+                .deleted_shadows
+                .write()
+                .await
+                .insert(shadow_id);
+
+            StatusCode::NO_CONTENT.into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Webhook handler (SCP-BCH-006)
+// ---------------------------------------------------------------------------
+
+/// Extracts the `shadow_id` field from a webhook event payload.
+fn extract_shadow_id(payload: &serde_json::Value) -> &str {
+    payload
+        .get("shadow_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+}
+
+/// Constructs a webhook rejection response (accepted: false).
+fn webhook_reject(event_id: String, reason: &str) -> axum::response::Response {
+    (
+        StatusCode::OK,
+        Json(WebhookResponse {
+            accepted: false,
+            event_id,
+            reason: Some(reason.to_owned()),
+        }),
+    )
+        .into_response()
+}
+
+/// Processes a single webhook event, returning `Some(response)` if the
+/// event should be rejected, or `None` if processing succeeded.
+async fn process_webhook_event(
+    bridge_state: &BridgeState,
+    event_type: &str,
+    event_id: &str,
+    payload: &serde_json::Value,
+) -> Option<String> {
+    match event_type {
+        "message" => {
+            let shadow_id = extract_shadow_id(payload);
+            if shadow_id.is_empty() {
+                return Some("payload.shadow_id is required for message events".to_owned());
+            }
+            let registries = bridge_state.registries.read().await;
+            let exists = find_shadow(&registries, shadow_id).await.is_some();
+            drop(registries);
+            if !exists {
+                return Some("shadow not found".to_owned());
+            }
+        }
+        "identity_update" => {
+            let shadow_id = extract_shadow_id(payload);
+            if !shadow_id.is_empty() {
+                let registries = bridge_state.registries.read().await;
+                let exists = find_shadow(&registries, shadow_id).await.is_some();
+                drop(registries);
+                if !exists {
+                    return Some("shadow not found for identity_update".to_owned());
+                }
+            }
+        }
+        "user_departed" => {
+            let shadow_id = extract_shadow_id(payload);
+            if !shadow_id.is_empty() {
+                bridge_state
+                    .deleted_shadows
+                    .write()
+                    .await
+                    .insert(shadow_id.to_owned());
+            }
+        }
+        // presence, message_edit, message_delete are accepted but
+        // don't require specific state changes in the current impl.
+        _ => {}
+    }
+    let _ = event_id; // used by callers for dedup tracking
+    None
+}
+
+/// Handler for `POST /v1/scp/bridge/webhook`.
+///
+/// Accepts platform-initiated events with deduplication by event_id.
+/// Supports event types: message, presence, identity_update,
+/// user_departed, message_edit, message_delete.
+///
+/// See SCP-BCH-006 and spec section 12.10.4.
+async fn webhook_handler(
+    State(bridge_state): State<Arc<BridgeState>>,
+    Extension(_auth_ctx): Extension<crate::bridge_auth::BridgeAuthContext>,
+    Json(body): Json<WebhookRequest>,
+) -> impl IntoResponse {
+    if !VALID_EVENT_TYPES.contains(&body.event_type.as_str()) {
+        return webhook_reject(body.event_id, &format!("unknown event_type: {}", body.event_type));
+    }
+    if body.event_id.is_empty() {
+        return ApiError::bad_request("event_id must not be empty").into_response();
+    }
+
+    // Deduplication: if event_id was already processed, return accepted.
+    {
+        let processed = bridge_state.processed_event_ids.read().await;
+        if processed.contains(&body.event_id) {
+            return (
+                StatusCode::OK,
+                Json(WebhookResponse { accepted: true, event_id: body.event_id, reason: None }),
+            )
+                .into_response();
+        }
+    }
+
+    if let Some(reason) = process_webhook_event(&bridge_state, &body.event_type, &body.event_id, &body.payload).await {
+        return webhook_reject(body.event_id, &reason);
+    }
+
+    bridge_state.processed_event_ids.write().await.insert(body.event_id.clone());
+
+    (
+        StatusCode::OK,
+        Json(WebhookResponse { accepted: true, event_id: body.event_id, reason: None }),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
@@ -349,7 +870,14 @@ async fn attest_handler(
 pub fn bridge_router(state: Arc<BridgeState>) -> Router {
     Router::new()
         .route("/v1/scp/bridge/shadow", post(create_shadow_handler))
+        .route(
+            "/v1/scp/bridge/shadow/{shadow_id}",
+            delete(delete_shadow_handler),
+        )
         .route("/v1/scp/bridge/attest", post(attest_handler))
+        .route("/v1/scp/bridge/message", post(emit_message_handler))
+        .route("/v1/scp/bridge/status", get(status_handler))
+        .route("/v1/scp/bridge/webhook", post(webhook_handler))
         .with_state(state)
 }
 
@@ -402,7 +930,14 @@ mod tests {
         let auth_ctx = test_auth_ctx();
         Router::new()
             .route("/v1/scp/bridge/shadow", post(create_shadow_handler))
+            .route(
+                "/v1/scp/bridge/shadow/{shadow_id}",
+                delete(delete_shadow_handler),
+            )
             .route("/v1/scp/bridge/attest", post(attest_handler))
+            .route("/v1/scp/bridge/message", post(emit_message_handler))
+            .route("/v1/scp/bridge/status", get(status_handler))
+            .route("/v1/scp/bridge/webhook", post(webhook_handler))
             .layer(axum::Extension(auth_ctx))
             .with_state(state)
     }
@@ -687,5 +1222,346 @@ mod tests {
 
         let json = response_json(resp).await;
         assert_eq!(json["status"], "active");
+    }
+
+    // -----------------------------------------------------------------------
+    // Message endpoint tests (SCP-BCH-003)
+    // -----------------------------------------------------------------------
+
+    fn message_request(body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/scp/bridge/message")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).expect("test")))
+            .expect("test")
+    }
+
+    /// Creates a shadow in the state and returns its shadow_id.
+    async fn create_test_shadow(state: &Arc<BridgeState>) -> String {
+        let app = test_app(Arc::clone(state));
+        let req = create_request(serde_json::json!({
+            "platform_handle": "@emitter#1234",
+            "platform_user_id": "user-emitter-001"
+        }));
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = response_json(resp).await;
+        json["shadow_id"].as_str().expect("shadow_id").to_owned()
+    }
+
+    #[tokio::test]
+    async fn emit_message_returns_202() {
+        let state = Arc::new(BridgeState::new());
+        let shadow_id = create_test_shadow(&state).await;
+
+        let app = test_app(Arc::clone(&state));
+        let req = message_request(serde_json::json!({
+            "shadow_id": shadow_id,
+            "content": "Hello from bridge!",
+            "content_type": "text/plain"
+        }));
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let json = response_json(resp).await;
+        assert!(json["message_id"].as_str().is_some());
+        assert_eq!(json["sequence"], 1);
+        assert_eq!(json["bridge_provenance"]["originating_platform"], "discord");
+        assert_eq!(json["bridge_provenance"]["bridge_mode"], "Relay");
+        assert_eq!(json["bridge_provenance"]["shadow_status"], "Shadow");
+        assert_eq!(
+            json["bridge_provenance"]["operator_did"],
+            "did:dht:z6MkTestOperator"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_message_shadow_not_found_returns_404() {
+        let state = Arc::new(BridgeState::new());
+        let app = test_app(state);
+
+        let req = message_request(serde_json::json!({
+            "shadow_id": "shadow:nonexistent",
+            "content": "Hello",
+            "content_type": "text/plain"
+        }));
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn emit_message_empty_content_returns_400() {
+        let state = Arc::new(BridgeState::new());
+        let shadow_id = create_test_shadow(&state).await;
+
+        let app = test_app(state);
+        let req = message_request(serde_json::json!({
+            "shadow_id": shadow_id,
+            "content": "",
+            "content_type": "text/plain"
+        }));
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // -----------------------------------------------------------------------
+    // Status endpoint tests (SCP-BCH-005)
+    // -----------------------------------------------------------------------
+
+    fn status_request() -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri("/v1/scp/bridge/status")
+            .body(Body::empty())
+            .expect("test")
+    }
+
+    #[tokio::test]
+    async fn status_returns_bridge_info() {
+        let state = Arc::new(BridgeState::new());
+        let _shadow_id = create_test_shadow(&state).await;
+
+        let app = test_app(state);
+        let req = status_request();
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = response_json(resp).await;
+        assert_eq!(json["bridge_id"], "bridge-test-001");
+        assert_eq!(json["status"], "Active");
+        assert_eq!(json["platform"], "discord");
+        assert_eq!(json["mode"], "Relay");
+        assert_eq!(json["operator_did"], "did:dht:z6MkTestOperator");
+        assert_eq!(json["shadow_count"], 1);
+        assert_eq!(json["shadows"].as_array().map(|a| a.len()), Some(1));
+    }
+
+    #[tokio::test]
+    async fn status_empty_returns_zero_shadows() {
+        let state = Arc::new(BridgeState::new());
+        let app = test_app(state);
+
+        let req = status_request();
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = response_json(resp).await;
+        assert_eq!(json["shadow_count"], 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Delete shadow endpoint tests (SCP-BCH-005)
+    // -----------------------------------------------------------------------
+
+    fn delete_shadow_request(shadow_id: &str) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/scp/bridge/shadow/{shadow_id}"))
+            .body(Body::empty())
+            .expect("test")
+    }
+
+    #[tokio::test]
+    async fn delete_shadow_returns_204() {
+        let state = Arc::new(BridgeState::new());
+        let shadow_id = create_test_shadow(&state).await;
+
+        let app = test_app(state);
+        let req = delete_shadow_request(&shadow_id);
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn delete_shadow_not_found_returns_404() {
+        let state = Arc::new(BridgeState::new());
+        let app = test_app(state);
+
+        let req = delete_shadow_request("shadow:nonexistent");
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn delete_shadow_idempotent_returns_204() {
+        let state = Arc::new(BridgeState::new());
+        let shadow_id = create_test_shadow(&state).await;
+
+        // First delete.
+        let app = test_app(Arc::clone(&state));
+        let req = delete_shadow_request(&shadow_id);
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Second delete — idempotent.
+        let app = test_app(state);
+        let req = delete_shadow_request(&shadow_id);
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    // -----------------------------------------------------------------------
+    // Webhook endpoint tests (SCP-BCH-006)
+    // -----------------------------------------------------------------------
+
+    fn webhook_request(body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/scp/bridge/webhook")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).expect("test")))
+            .expect("test")
+    }
+
+    #[tokio::test]
+    async fn webhook_message_event_accepted() {
+        let state = Arc::new(BridgeState::new());
+        let shadow_id = create_test_shadow(&state).await;
+
+        let app = test_app(state);
+        let req = webhook_request(serde_json::json!({
+            "event_type": "message",
+            "event_id": "evt-001",
+            "timestamp": 1_700_000_500,
+            "payload": {
+                "shadow_id": shadow_id,
+                "content": "Hello from webhook"
+            }
+        }));
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = response_json(resp).await;
+        assert_eq!(json["accepted"], true);
+        assert_eq!(json["event_id"], "evt-001");
+    }
+
+    #[tokio::test]
+    async fn webhook_deduplication() {
+        let state = Arc::new(BridgeState::new());
+
+        let app = test_app(Arc::clone(&state));
+        let req = webhook_request(serde_json::json!({
+            "event_type": "presence",
+            "event_id": "evt-dedup-001",
+            "timestamp": 1_700_000_500,
+            "payload": {}
+        }));
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = response_json(resp).await;
+        assert_eq!(json["accepted"], true);
+
+        // Re-send same event_id — should be accepted without reprocessing.
+        let app = test_app(state);
+        let req = webhook_request(serde_json::json!({
+            "event_type": "presence",
+            "event_id": "evt-dedup-001",
+            "timestamp": 1_700_000_600,
+            "payload": {}
+        }));
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = response_json(resp).await;
+        assert_eq!(json["accepted"], true);
+    }
+
+    #[tokio::test]
+    async fn webhook_unknown_event_type_rejected() {
+        let state = Arc::new(BridgeState::new());
+        let app = test_app(state);
+
+        let req = webhook_request(serde_json::json!({
+            "event_type": "unknown_type",
+            "event_id": "evt-002",
+            "timestamp": 1_700_000_500,
+            "payload": {}
+        }));
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = response_json(resp).await;
+        assert_eq!(json["accepted"], false);
+        assert!(json["reason"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn webhook_user_departed_triggers_shadow_deletion() {
+        let state = Arc::new(BridgeState::new());
+        let shadow_id = create_test_shadow(&state).await;
+
+        let app = test_app(Arc::clone(&state));
+        let req = webhook_request(serde_json::json!({
+            "event_type": "user_departed",
+            "event_id": "evt-depart-001",
+            "timestamp": 1_700_000_500,
+            "payload": {
+                "shadow_id": shadow_id
+            }
+        }));
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = response_json(resp).await;
+        assert_eq!(json["accepted"], true);
+
+        // Verify shadow was deleted.
+        let deleted = state.deleted_shadows.read().await;
+        assert!(deleted.contains(&shadow_id));
+    }
+
+    #[tokio::test]
+    async fn webhook_all_event_types_accepted() {
+        let state = Arc::new(BridgeState::new());
+
+        for (i, event_type) in [
+            "message",
+            "presence",
+            "identity_update",
+            "user_departed",
+            "message_edit",
+            "message_delete",
+        ]
+        .iter()
+        .enumerate()
+        {
+            // For message event, we need a shadow; for others, just empty payload.
+            let shadow_id = if *event_type == "message" {
+                create_test_shadow(&state).await
+            } else {
+                String::new()
+            };
+
+            let payload = if *event_type == "message" {
+                serde_json::json!({ "shadow_id": shadow_id, "content": "test" })
+            } else {
+                serde_json::json!({})
+            };
+
+            let app = test_app(Arc::clone(&state));
+            let req = webhook_request(serde_json::json!({
+                "event_type": event_type,
+                "event_id": format!("evt-type-{i}"),
+                "timestamp": 1_700_000_500,
+                "payload": payload
+            }));
+
+            let resp = app.oneshot(req).await.expect("test");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let json = response_json(resp).await;
+            assert_eq!(
+                json["accepted"], true,
+                "event type '{}' should be accepted",
+                event_type
+            );
+        }
     }
 }
