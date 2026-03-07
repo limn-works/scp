@@ -8,6 +8,7 @@
 //! and ADR-039 for the shared-DID human-agent identity model.
 
 pub mod block_list;
+pub mod blocking;
 
 // Re-export SigningKeyId from scp-identity — the single canonical definition.
 // All scp-core consumers should use this re-export via `crate::identity::SigningKeyId`.
