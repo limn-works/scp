@@ -48,6 +48,7 @@ use scp_mcp::allowlist;
 use scp_mcp::client::{McpClient, McpTransport, SystemTimestamp};
 use scp_mcp::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
 use scp_mcp::server::{ContextProvider, ContextToolInfo, McpServer, MemberInfo};
+use scp_platform::traits::Storage;
 
 use crate::error::ScpPyError;
 use crate::types::{json_to_py_dict, py_dict_to_json};
@@ -915,7 +916,9 @@ impl ContextProvider for FfiBridgeProvider {
             .map_or(0, |d| d.as_secs());
 
         // Re-acquire the DashMap lock briefly to append the event.
-        if let Err(e) = crate::runtime::with_context(context_id, |rt| {
+        // Returns (sequence, serialized_event_bytes) on success for
+        // ProtocolStore persistence (GitHub issue #303).
+        let append_result = crate::runtime::with_context(context_id, |rt| {
             let sequence = scp_event_log::tree::event_count(&rt.event_log);
             let prev_hash = if rt.event_log.leaves().is_empty() {
                 scp_event_log::tree::GENESIS_PREV_HASH
@@ -935,16 +938,52 @@ impl ContextProvider for FfiBridgeProvider {
                 signature: Vec::new(),
             };
 
+            // Serialize the event for ProtocolStore persistence.
+            let event_bytes = rmp_serde::to_vec(&event).map_err(|e| {
+                ScpPyError::ContextError(format!("event serialization failed: {e}"))
+            })?;
+
             scp_event_log::tree::append_unsigned_event(&mut rt.event_log, &event)
                 .map_err(|e| ScpPyError::context(e.to_string()))?;
-            Ok(())
-        }) {
-            tracing::warn!(
-                tool = %tool_name,
-                context = %context_id,
-                error = %e,
-                "failed to append ToolInvokedEvent to event log"
-            );
+
+            // Return the leaf hash (last appended leaf) for ProtocolStore.
+            let leaf_hash: [u8; 32] = rt.event_log.leaves()[rt.event_log.leaves().len() - 1];
+
+            Ok((sequence, event_bytes, leaf_hash))
+        });
+
+        match append_result {
+            Ok((sequence, event_bytes, _leaf_hash)) => {
+                // Persist the event payload to storage (best-effort).
+                // This enables py_event_log_query to return real events
+                // instead of just a LogSummary (GitHub issue #303).
+                //
+                // Uses the Storage trait directly because the global storage
+                // is Arc<InMemoryStorage> and ProtocolStore requires an owned
+                // Storage impl. The key convention matches ProtocolStore's
+                // event_data_key format.
+                if let Ok(storage) = crate::runtime::get_storage() {
+                    if let Ok(rt) = crate::runtime() {
+                        let key = format!("context/{context_id}/event_data/{sequence:020}");
+                        if let Err(e) = rt.block_on(storage.store(&key, &event_bytes)) {
+                            tracing::warn!(
+                                tool = %tool_name,
+                                context = %context_id,
+                                error = %e,
+                                "failed to persist event payload to storage"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    tool = %tool_name,
+                    context = %context_id,
+                    error = %e,
+                    "failed to append ToolInvokedEvent to event log"
+                );
+            }
         }
 
         Ok(output)
