@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use super::{
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
     GovernanceModelConfig, GovernanceProposal, KeyResolver, ProposalId, ProposalStatus,
-    RejectionReason, VoteType, compute_proposal_id, sign_vote, verify_vote,
+    RejectionReason, VoteType, compute_proposal_id, sign_vote, verify_vote, CheckpointAttestationStatus, CosignedCheckpoint,
 };
 use scp_identity::DID;
 
@@ -618,6 +618,52 @@ impl GovernanceEngine for ThresholdEngine {
             status: ProposalStatus::Invalidated { reason },
         }])
 
+    }
+
+    fn checkpoint_cosignature_requirements(&self) -> (Vec<DID>, usize) {
+        // Threshold: require threshold cosignatures from signer set (ADR-031 §9)
+        (self.signers.clone(), self.threshold as usize)
+    }
+
+    fn validate_checkpoint_cosignatures(
+        &self,
+        cosignatures: &[CosignedCheckpoint],
+        checkpoint_hash: &[u8; 32],
+    ) -> Result<CheckpointAttestationStatus, GovernanceError> {
+        use ed25519_dalek::{Signature, VerifyingKey};
+        
+        // Verify all cosignatures are from eligible signers and valid
+        let mut valid_cosignatures = 0;
+        for cosig in cosignatures {
+            if !self.signers.contains(&cosig.signer_did) {
+                return Err(GovernanceError::NotEligible(format!(
+                    "Cosigner {} not in threshold signer set", cosig.signer_did
+                )));
+            }
+            
+            // Get public key for this signer
+            let public_key = match self.key_resolver.resolve(&cosig.signer_did) {
+                Some(key) => key,
+                None => return Err(GovernanceError::NotEligible(format!(
+                    "Cannot resolve public key for cosigner {}", cosig.signer_did
+                ))),
+            };
+            
+            // Verify signature
+            let verifying_key = VerifyingKey::from_bytes(&public_key)
+                .map_err(|e| GovernanceError::VerificationFailed(e.to_string()))?;
+            verifying_key.verify_strict(checkpoint_hash, &cosig.signature)
+                .map_err(|e| GovernanceError::VerificationFailed(e.to_string()))?;
+                
+            valid_cosignatures += 1;
+        }
+        
+        // Check if we have enough valid cosignatures for full attestation
+        if valid_cosignatures >= self.threshold as usize {
+            Ok(CheckpointAttestationStatus::FullyAttested)
+        } else {
+            Ok(CheckpointAttestationStatus::PartiallyAttested)
+        }
     }
 }
 

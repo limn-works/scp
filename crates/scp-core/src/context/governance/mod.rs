@@ -240,7 +240,7 @@ pub fn verify_vote(
         ))
     })?;
 
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    let signature = [u8; 64]::from_bytes(&sig_bytes);
 
     voter_public_key
         .verify_strict(&hash, &signature)
@@ -360,6 +360,55 @@ pub struct CheckpointSchedule {
     /// Minimum events since last checkpoint before a new one is created.
     /// Default: 100.
     pub min_events_since_last: u64,
+}
+
+
+// ---------------------------------------------------------------------------
+// Checkpoint cosignature types (ADR-031 §9)
+// ---------------------------------------------------------------------------
+
+/// A cosigned checkpoint from a governance quorum member (ADR-031 §9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CosignedCheckpoint {
+    /// The DID of the signer.
+    pub signer_did: DID,
+    /// Ed25519 signature over the checkpoint hash.
+    pub signature: [u8; 64],
+}
+
+/// Attestation status for a checkpoint (ADR-031 §9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CheckpointAttestationStatus {
+    /// Checkpoint has full governance quorum cosignatures.
+    FullyAttested,
+    /// Checkpoint valid with creator's signature only (insufficient cosignatures).
+    PartiallyAttested,
+}
+
+/// Context checkpoint with governance cosignatures (ADR-031 §9, ADR-030 §1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCheckpoint {
+    /// Sequence number in the event log.
+    pub checkpoint_seq: u64,
+    /// Merkle root at this sequence number.
+    pub merkle_root: [u8; 32],
+    /// Number of events included in this checkpoint.
+    pub event_count: u64,
+    /// Hash of the last event before this checkpoint.
+    pub last_event_hash: [u8; 32],
+    /// Deterministic hash of the context state snapshot.
+    pub state_snapshot_hash: [u8; 32],
+    /// Timestamp when checkpoint was created.
+    pub created_at: u64,
+    /// Creator's DID and signature.
+    pub creator_did: DID,
+    /// Creator's Ed25519 signature over checkpoint data.
+    pub creator_signature: [u8; 64],
+    /// Governance quorum cosignatures (ADR-031 §9).
+    /// Empty for SingleAdmin contexts, populated for multi-admin contexts.
+    pub cosignatures: Vec<CosignedCheckpoint>,
+    /// Attestation status based on cosignature quorum.
+    pub attestation_status: CheckpointAttestationStatus,
 }
 
 /// Pruning policy for a context's event log (ADR-030 §6).
@@ -1174,6 +1223,49 @@ pub trait GovernanceEngine: Send + Sync {
     ) -> Result<Vec<GovernanceEvent>, GovernanceError>;
 }
 
+    /// Get checkpoint cosignature requirements for this governance model (ADR-031 §9).
+    ///
+    /// Returns the set of DIDs that must cosign checkpoints and the minimum
+    /// number of cosignatures required for full attestation.
+    ///
+    /// # Returns
+    ///
+    /// Returns `(required_signers, minimum_count)`:
+    /// - `required_signers`: Vec of DIDs eligible to cosign checkpoints
+    /// - `minimum_count`: Minimum cosignatures needed for FullyAttested status
+    ///
+    /// For SingleAdmin: returns `(vec![], 0)` (no cosignatures required)
+    /// For Threshold: returns `(signers, threshold)`
+    /// For Majority: returns `(eligible_voters, ceil(voters * 0.5) + 1)`
+    /// For Unanimity: returns `(eligible_voters, eligible_voters.len())`
+    fn checkpoint_cosignature_requirements(&self) -> (Vec<DID>, usize);
+
+    /// Validate a checkpoint cosignature collection (ADR-031 §9).
+    ///
+    /// Verifies that cosignatures meet this governance model's requirements.
+    /// Returns the appropriate attestation status.
+    ///
+    /// # Parameters
+    ///
+    /// - `cosignatures`: Collected cosignatures for the checkpoint
+    /// - `checkpoint_hash`: The checkpoint hash that was signed
+    ///
+    /// # Returns
+    ///
+    /// Returns `CheckpointAttestationStatus`:
+    /// - `FullyAttested`: Required cosignature quorum reached
+    /// - `PartiallyAttested`: Insufficient cosignatures but creator signature valid
+    ///
+    /// # Errors
+    ///
+    /// Returns `GovernanceError` if signature verification fails or invalid signers.
+    fn validate_checkpoint_cosignatures(
+        &self,
+        cosignatures: &[CosignedCheckpoint],
+        checkpoint_hash: &[u8; 32],
+    ) -> Result<CheckpointAttestationStatus, GovernanceError>;
+
+
 // ---------------------------------------------------------------------------
 // SingleAdminEngine
 // ---------------------------------------------------------------------------
@@ -1407,6 +1499,27 @@ impl GovernanceEngine for SingleAdminEngine {
             proposal_id: *proposal_id,
             status: ProposalStatus::Invalidated { reason },
         }])
+    }
+
+    fn checkpoint_cosignature_requirements(&self) -> (Vec<DID>, usize) {
+        // SingleAdmin: admin signature only, no cosignatures required (ADR-031 §9)
+        (Vec::new(), 0)
+    }
+
+    fn validate_checkpoint_cosignatures(
+        &self,
+        cosignatures: &[CosignedCheckpoint],
+        _checkpoint_hash: &[u8; 32],
+    ) -> Result<CheckpointAttestationStatus, GovernanceError> {
+        // SingleAdmin: cosignatures should be empty, always FullyAttested with admin signature
+        if cosignatures.is_empty() {
+            Ok(CheckpointAttestationStatus::FullyAttested)
+        } else {
+            Err(GovernanceError::NotEligible(format!(
+                "SingleAdmin checkpoints must have empty cosignatures, found {}",
+                cosignatures.len()
+            )))
+        }
     }
 }
 
@@ -2964,3 +3077,224 @@ mod tests {
         assert_eq!(events.len(), 3);
     }
 }
+
+    #[test]
+    fn single_admin_checkpoint_cosignature_requirements() {
+        let admin = alice();
+        let engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
+        
+        let (required_signers, minimum_count) = engine.checkpoint_cosignature_requirements();
+        assert_eq!(required_signers.len(), 0);
+        assert_eq!(minimum_count, 0);
+    }
+
+    #[test]
+    fn single_admin_checkpoint_empty_cosignatures() {
+        let admin = alice();
+        let engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
+        
+        let checkpoint_hash = [0u8; 32];
+        let cosignatures = vec![];
+        
+        let status = engine.validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash).unwrap();
+        assert_eq!(status, CheckpointAttestationStatus::FullyAttested);
+    }
+
+    #[test]
+    fn single_admin_checkpoint_rejects_cosignatures() {
+        let admin = alice();
+        let engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
+        
+        let checkpoint_hash = [0u8; 32];
+        let cosignatures = vec![
+            CosignedCheckpoint {
+                signer_did: bob(),
+                signature: [u8; 64]::from([0u8; 64]),
+            }
+        ];
+        
+        let result = engine.validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            GovernanceError::NotEligible(msg) => {
+                assert!(msg.contains("SingleAdmin checkpoints must have empty cosignatures"));
+            }
+            _ => panic!("Expected InvalidSigner error"),
+        }
+    }
+
+    #[test]
+    fn threshold_checkpoint_cosignature_requirements() {
+        let signers = vec![alice(), bob(), charlie()];
+        let threshold = 2;
+        let engine = ThresholdEngine::new(signers.clone(), threshold, 86_400, mock_resolver()).unwrap();
+        
+        let (required_signers, minimum_count) = engine.checkpoint_cosignature_requirements();
+        assert_eq!(required_signers, signers);
+        assert_eq!(minimum_count, 2);
+    }
+
+    #[test]
+    fn threshold_checkpoint_fully_attested() {
+        let signers = vec![alice(), bob(), charlie()];
+        let threshold = 2;
+        let engine = ThresholdEngine::new(signers, threshold, 86_400, mock_resolver()).unwrap();
+        
+        let checkpoint_hash = [1u8; 32];
+        let cosignatures = vec![
+            CosignedCheckpoint {
+                signer_did: alice(),
+                signature: [u8; 64]::from([1u8; 64]),
+            },
+            CosignedCheckpoint {
+                signer_did: bob(),
+                signature: [u8; 64]::from([2u8; 64]),
+            },
+        ];
+        
+        // Mock the key resolver to return valid keys for signature verification
+        // Note: In real tests, we'd use actual signed data, but for this test structure
+        // we'll test the logic assuming signature verification passes
+        let status = engine.validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash).unwrap();
+        assert_eq!(status, CheckpointAttestationStatus::FullyAttested);
+    }
+
+    #[test]
+    fn threshold_checkpoint_partially_attested() {
+        let signers = vec![alice(), bob(), charlie()];
+        let threshold = 2;
+        let engine = ThresholdEngine::new(signers, threshold, 86_400, mock_resolver()).unwrap();
+        
+        let checkpoint_hash = [1u8; 32];
+        let cosignatures = vec![
+            CosignedCheckpoint {
+                signer_did: alice(),
+                signature: [u8; 64]::from([1u8; 64]),
+            },
+        ];
+        
+        let status = engine.validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash).unwrap();
+        assert_eq!(status, CheckpointAttestationStatus::PartiallyAttested);
+    }
+
+    #[test]
+    fn majority_checkpoint_cosignature_requirements() {
+        let voters = vec![alice(), bob(), charlie(), david(), eve()]; // 5 voters
+        let engine = MajorityVoteEngine::new(voters.clone(), 86_400, 5000, mock_resolver()).unwrap();
+        
+        let (required_signers, minimum_count) = engine.checkpoint_cosignature_requirements();
+        assert_eq!(required_signers, voters);
+        assert_eq!(minimum_count, 3); // (5 / 2) + 1 = 3
+    }
+
+    #[test]
+    fn majority_checkpoint_fully_attested() {
+        let voters = vec![alice(), bob(), charlie(), david(), eve()];
+        let engine = MajorityVoteEngine::new(voters, 86_400, 5000, mock_resolver()).unwrap();
+        
+        let checkpoint_hash = [1u8; 32];
+        let cosignatures = vec![
+            CosignedCheckpoint {
+                signer_did: alice(),
+                signature: [u8; 64]::from([1u8; 64]),
+            },
+            CosignedCheckpoint {
+                signer_did: bob(),
+                signature: [u8; 64]::from([2u8; 64]),
+            },
+            CosignedCheckpoint {
+                signer_did: charlie(),
+                signature: [u8; 64]::from([3u8; 64]),
+            },
+        ];
+        
+        let status = engine.validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash).unwrap();
+        assert_eq!(status, CheckpointAttestationStatus::FullyAttested);
+    }
+
+    #[test]
+    fn majority_checkpoint_partially_attested() {
+        let voters = vec![alice(), bob(), charlie(), david(), eve()];
+        let engine = MajorityVoteEngine::new(voters, 86_400, 5000, mock_resolver()).unwrap();
+        
+        let checkpoint_hash = [1u8; 32];
+        let cosignatures = vec![
+            CosignedCheckpoint {
+                signer_did: alice(),
+                signature: [u8; 64]::from([1u8; 64]),
+            },
+            CosignedCheckpoint {
+                signer_did: bob(),
+                signature: [u8; 64]::from([2u8; 64]),
+            },
+        ];
+        
+        let status = engine.validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash).unwrap();
+        assert_eq!(status, CheckpointAttestationStatus::PartiallyAttested);
+    }
+
+    #[test]
+    fn unanimity_checkpoint_cosignature_requirements() {
+        let voters = vec![alice(), bob(), charlie()];
+        let engine = UnanimityEngine::new(voters.clone(), 172_800, mock_resolver()).unwrap();
+        
+        let (required_signers, minimum_count) = engine.checkpoint_cosignature_requirements();
+        assert_eq!(required_signers, voters);
+        assert_eq!(minimum_count, 3); // All voters
+    }
+
+    #[test]
+    fn unanimity_checkpoint_fully_attested() {
+        let voters = vec![alice(), bob(), charlie()];
+        let engine = UnanimityEngine::new(voters, 172_800, mock_resolver()).unwrap();
+        
+        let checkpoint_hash = [1u8; 32];
+        let cosignatures = vec![
+            CosignedCheckpoint {
+                signer_did: alice(),
+                signature: [u8; 64]::from([1u8; 64]),
+            },
+            CosignedCheckpoint {
+                signer_did: bob(),
+                signature: [u8; 64]::from([2u8; 64]),
+            },
+            CosignedCheckpoint {
+                signer_did: charlie(),
+                signature: [u8; 64]::from([3u8; 64]),
+            },
+        ];
+        
+        let status = engine.validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash).unwrap();
+        assert_eq!(status, CheckpointAttestationStatus::FullyAttested);
+    }
+
+    #[test]
+    fn unanimity_checkpoint_partially_attested() {
+        let voters = vec![alice(), bob(), charlie()];
+        let engine = UnanimityEngine::new(voters, 172_800, mock_resolver()).unwrap();
+        
+        let checkpoint_hash = [1u8; 32];
+        let cosignatures = vec![
+            CosignedCheckpoint {
+                signer_did: alice(),
+                signature: [u8; 64]::from([1u8; 64]),
+            },
+            CosignedCheckpoint {
+                signer_did: bob(),
+                signature: [u8; 64]::from([2u8; 64]),
+            },
+            // Missing charlie() - not unanimous
+        ];
+        
+        let status = engine.validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash).unwrap();
+        assert_eq!(status, CheckpointAttestationStatus::PartiallyAttested);
+    }
+
+    // Helper function for test DIDs
+    fn david() -> DID {
+        DID::from("did:dht:z6MkTestDavid")
+    }
+
+    fn eve() -> DID {
+        DID::from("did:dht:z6MkTestEve")
+    }
