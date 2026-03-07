@@ -14,7 +14,7 @@ path = "src/main.rs"
 scp-core = { path = "../scp-core" }
 scp-identity = { path = "../scp-identity", features = ["production-dht"] }
 scp-transport = { path = "../scp-transport" }
-scp-platform = { path = "../scp-platform", features = ["testing", "sqlite"] }
+scp-platform = { path = "../scp-platform", features = ["testing", "sqlite", "file"] }
 axum = { workspace = true, features = ["ws"] }
 instant-acme = "0.8"
 rcgen = "0.14"
