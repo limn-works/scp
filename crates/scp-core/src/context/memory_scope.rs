@@ -130,10 +130,10 @@ pub enum DeletionResponseStatus {
 }
 
 // ---------------------------------------------------------------------------
-// KeyDestructionAttestation
+// KeyDestructionAttestation (internal tracking)
 // ---------------------------------------------------------------------------
 
-/// Attestation of key destruction, recorded in the close event.
+/// Internal attestation of key destruction, recorded in the close event.
 ///
 /// See ADR-018 acceptance criterion 7: verification level is metadata
 /// recorded in the close event -- not a gate.
@@ -150,6 +150,146 @@ pub struct KeyDestructionAttestation {
     pub mls_group_destroyed: bool,
     /// Whether all sender keys for this context were destroyed.
     pub sender_keys_destroyed: bool,
+}
+
+// ---------------------------------------------------------------------------
+// DestructionMethod (§9.15)
+// ---------------------------------------------------------------------------
+
+/// Method used for key destruction, determining the trust level of the
+/// destruction claim.
+///
+/// See spec §9.15: hardware-backed provides high confidence; software-only
+/// provides moderate confidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DestructionMethod {
+    /// Key destruction is backed by a hardware security module (Secure
+    /// Enclave, Android Keystore). The hardware claims the key is gone.
+    HardwareBacked,
+    /// Key destruction is software-only (`memset(0)` on key material in
+    /// memory). Memory dumps, swap files, or crash logs may have retained
+    /// the key.
+    SoftwareOnly,
+}
+
+impl std::fmt::Display for DestructionMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HardwareBacked => write!(f, "HardwareBacked"),
+            Self::SoftwareOnly => write!(f, "SoftwareOnly"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PlatformAttestation (§9.15)
+// ---------------------------------------------------------------------------
+
+/// Platform-provided attestation for key destruction, if available.
+///
+/// Contains opaque attestation data from the platform's hardware security
+/// module (e.g., Secure Enclave attestation blob, Android Keystore
+/// attestation certificate chain).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlatformAttestation {
+    /// Opaque platform attestation data (format is platform-specific).
+    pub attestation_data: Vec<u8>,
+    /// Human-readable platform identifier (e.g., "apple-secure-enclave",
+    /// "android-keystore").
+    pub platform: String,
+}
+
+// ---------------------------------------------------------------------------
+// PublishableKeyDestructionAttestation (§9.15)
+// ---------------------------------------------------------------------------
+
+/// Publishable key destruction attestation per spec §9.15.
+///
+/// Published to relays after context key destruction. Signed by the
+/// member's Identity Key (`#0`) or Active Signing Key (`#active`) — NOT
+/// the Agent Signing Key (`#agent`, ADR-039). The signature remains
+/// verifiable after context keys are destroyed because it is bound to the
+/// identity key, not the context key material.
+///
+/// Trust levels:
+/// - **Hardware-attested:** High confidence (hardware claims key is gone).
+/// - **Software-only:** Moderate confidence (memory zeroed, no hardware
+///   guarantee).
+/// - **No attestation:** Member went offline before close (not represented
+///   here — the absence of an attestation IS the "no attestation" case).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishableKeyDestructionAttestation {
+    /// The context for which keys were destroyed.
+    pub context_id: ContextId,
+    /// The DID of the member who destroyed their keys.
+    pub member_did: String,
+    /// Unix timestamp (seconds) when keys were destroyed.
+    pub destroyed_at: u64,
+    /// Platform-provided attestation, if hardware-backed destruction was
+    /// used. `None` for software-only destruction.
+    pub platform_attestation: Option<PlatformAttestation>,
+    /// The destruction method used.
+    pub method: DestructionMethod,
+    /// Ed25519 signature over the attestation payload, signed by `#0`
+    /// (Identity Key) or `#active` (Active Signing Key). NOT `#agent`
+    /// per ADR-039 — agents cannot sign destruction attestations.
+    ///
+    /// Stored as `Vec<u8>` (always 64 bytes) because `[u8; 64]` does not
+    /// implement `Serialize`/`Deserialize` in serde without additional
+    /// configuration.
+    pub signature: Vec<u8>,
+}
+
+impl PublishableKeyDestructionAttestation {
+    /// Validates that the signature field is the correct length (64 bytes).
+    #[must_use]
+    pub fn has_valid_signature_length(&self) -> bool {
+        self.signature.len() == 64
+    }
+
+    /// Returns the signing payload for this attestation.
+    ///
+    /// The payload is: `context_id || member_did || destroyed_at (8 bytes
+    /// big-endian) || method ("HardwareBacked" or "SoftwareOnly")`.
+    #[must_use]
+    pub fn signing_payload(&self) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(self.context_id.as_bytes());
+        payload.extend_from_slice(self.member_did.as_bytes());
+        payload.extend_from_slice(&self.destroyed_at.to_be_bytes());
+        payload.extend_from_slice(self.method.to_string().as_bytes());
+        payload
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EphemeralContextMetadata (§5.11 durable metadata)
+// ---------------------------------------------------------------------------
+
+/// Durable metadata that persists after ephemeral context close.
+///
+/// Per spec §5.11: "Durable metadata persists: who participated, when, the
+/// declared purpose, participation contributions (participation counts,
+/// tool invocations), and discovery provenance."
+///
+/// Content and messages are NOT included — they are destroyed with the keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EphemeralContextMetadata {
+    /// The context identifier.
+    pub context_id: ContextId,
+    /// DIDs of all participants who were members during the context's
+    /// lifetime.
+    pub participants: Vec<String>,
+    /// Unix timestamp (seconds) when the context was created.
+    pub created_at: u64,
+    /// Unix timestamp (seconds) when the context was closed/expired.
+    pub closed_at: u64,
+    /// The declared purpose/description from context params.
+    pub purpose: Option<String>,
+    /// Per-participant message counts.
+    pub participation_counts: HashMap<String, u64>,
+    /// Memory scope at close time (always `Ephemeral` for this struct).
+    pub memory_scope: super::MemoryScope,
 }
 
 // ---------------------------------------------------------------------------
@@ -1096,5 +1236,183 @@ mod tests {
             let deserialized: DeletionResponseStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(&deserialized, status);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // DestructionMethod tests (§9.15)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn destruction_method_display() {
+        assert_eq!(
+            format!("{}", DestructionMethod::HardwareBacked),
+            "HardwareBacked"
+        );
+        assert_eq!(
+            format!("{}", DestructionMethod::SoftwareOnly),
+            "SoftwareOnly"
+        );
+    }
+
+    #[test]
+    fn destruction_method_variants_are_distinct() {
+        assert_ne!(
+            DestructionMethod::HardwareBacked,
+            DestructionMethod::SoftwareOnly
+        );
+    }
+
+    #[test]
+    fn destruction_method_serialization_roundtrip() {
+        let methods = [
+            DestructionMethod::HardwareBacked,
+            DestructionMethod::SoftwareOnly,
+        ];
+        for method in &methods {
+            let json = serde_json::to_string(method).unwrap();
+            let deserialized: DestructionMethod = serde_json::from_str(&json).unwrap();
+            assert_eq!(&deserialized, method);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PlatformAttestation tests (§9.15)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn platform_attestation_serialization_roundtrip() {
+        let attestation = PlatformAttestation {
+            attestation_data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            platform: "apple-secure-enclave".to_owned(),
+        };
+        let json = serde_json::to_string(&attestation).unwrap();
+        let deserialized: PlatformAttestation = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, attestation);
+    }
+
+    // -----------------------------------------------------------------------
+    // PublishableKeyDestructionAttestation tests (§9.15)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn publishable_attestation_serialization_roundtrip() {
+        let attestation = PublishableKeyDestructionAttestation {
+            context_id: "ctx-42".to_owned(),
+            member_did: "did:dht:alice".to_owned(),
+            destroyed_at: 1_700_000_000,
+            platform_attestation: Some(PlatformAttestation {
+                attestation_data: vec![0x01, 0x02],
+                platform: "android-keystore".to_owned(),
+            }),
+            method: DestructionMethod::HardwareBacked,
+            signature: vec![0xAA; 64],
+        };
+        let json = serde_json::to_string(&attestation).unwrap();
+        let deserialized: PublishableKeyDestructionAttestation =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, attestation);
+    }
+
+    #[test]
+    fn publishable_attestation_valid_signature_length() {
+        let attestation = PublishableKeyDestructionAttestation {
+            context_id: "ctx-1".to_owned(),
+            member_did: "did:dht:bob".to_owned(),
+            destroyed_at: 1_700_000_000,
+            platform_attestation: None,
+            method: DestructionMethod::SoftwareOnly,
+            signature: vec![0x00; 64],
+        };
+        assert!(attestation.has_valid_signature_length());
+    }
+
+    #[test]
+    fn publishable_attestation_invalid_signature_length() {
+        let attestation = PublishableKeyDestructionAttestation {
+            context_id: "ctx-1".to_owned(),
+            member_did: "did:dht:bob".to_owned(),
+            destroyed_at: 1_700_000_000,
+            platform_attestation: None,
+            method: DestructionMethod::SoftwareOnly,
+            signature: vec![0x00; 32], // Wrong length
+        };
+        assert!(!attestation.has_valid_signature_length());
+    }
+
+    #[test]
+    fn publishable_attestation_signing_payload_deterministic() {
+        let attestation = PublishableKeyDestructionAttestation {
+            context_id: "ctx-1".to_owned(),
+            member_did: "did:dht:alice".to_owned(),
+            destroyed_at: 1_700_000_000,
+            platform_attestation: None,
+            method: DestructionMethod::SoftwareOnly,
+            signature: vec![0x00; 64],
+        };
+        let payload1 = attestation.signing_payload();
+        let payload2 = attestation.signing_payload();
+        assert_eq!(payload1, payload2);
+        assert!(!payload1.is_empty());
+    }
+
+    #[test]
+    fn publishable_attestation_no_platform_attestation_for_software_only() {
+        let attestation = PublishableKeyDestructionAttestation {
+            context_id: "ctx-1".to_owned(),
+            member_did: "did:dht:carol".to_owned(),
+            destroyed_at: 1_700_000_000,
+            platform_attestation: None,
+            method: DestructionMethod::SoftwareOnly,
+            signature: vec![0xFF; 64],
+        };
+        assert!(attestation.platform_attestation.is_none());
+        assert_eq!(attestation.method, DestructionMethod::SoftwareOnly);
+    }
+
+    // -----------------------------------------------------------------------
+    // EphemeralContextMetadata tests (§5.11)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ephemeral_metadata_serialization_roundtrip() {
+        let mut counts = HashMap::new();
+        counts.insert("did:dht:alice".to_owned(), 15);
+        counts.insert("did:dht:bob".to_owned(), 8);
+        let metadata = EphemeralContextMetadata {
+            context_id: "ctx-ephemeral".to_owned(),
+            participants: vec!["did:dht:alice".to_owned(), "did:dht:bob".to_owned()],
+            created_at: 1_700_000_000,
+            closed_at: 1_700_001_000,
+            purpose: Some("Quick brainstorm".to_owned()),
+            participation_counts: counts,
+            memory_scope: crate::context::MemoryScope::Ephemeral,
+        };
+        let json = serde_json::to_string(&metadata).unwrap();
+        let deserialized: EphemeralContextMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, metadata);
+    }
+
+    #[test]
+    fn ephemeral_metadata_preserves_participants_after_creation() {
+        let metadata = EphemeralContextMetadata {
+            context_id: "ctx-1".to_owned(),
+            participants: vec![
+                "did:dht:alice".to_owned(),
+                "did:dht:bob".to_owned(),
+                "did:dht:carol".to_owned(),
+            ],
+            created_at: 1_700_000_000,
+            closed_at: 1_700_000_300,
+            purpose: None,
+            participation_counts: HashMap::new(),
+            memory_scope: crate::context::MemoryScope::Ephemeral,
+        };
+        // Verify all participants are preserved.
+        assert_eq!(metadata.participants.len(), 3);
+        assert!(metadata.participants.contains(&"did:dht:alice".to_owned()));
+        assert!(metadata.participants.contains(&"did:dht:bob".to_owned()));
+        assert!(metadata.participants.contains(&"did:dht:carol".to_owned()));
+        // Creation time is preserved.
+        assert_eq!(metadata.created_at, 1_700_000_000);
     }
 }

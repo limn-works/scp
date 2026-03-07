@@ -133,6 +133,15 @@ fn full_snapshot_key(context_id: &str) -> Result<String, super::StoreError> {
     Ok(format!("context/{ctx}/full_snapshot"))
 }
 
+/// Builds the storage key for ephemeral context durable metadata.
+///
+/// Format: `context/{context_id}/ephemeral_metadata`
+/// See spec section 5.11 — durable metadata persists after ephemeral close.
+fn ephemeral_metadata_key(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/ephemeral_metadata"))
+}
+
 /// Builds the prefix for all keys belonging to a context.
 ///
 /// Format: `context/{context_id}/`
@@ -644,6 +653,42 @@ impl<S: Storage> ProtocolStore<S> {
         author_did: &str,
     ) -> Result<Option<HashSet<String>>, StoreError> {
         let key = broadcast_block_key(context_id, author_did)?;
+        self.load_value(&key).await
+    }
+
+    /// Stores durable metadata for an ephemeral context after close.
+    ///
+    /// Per spec §5.11, durable metadata (participants, creation time,
+    /// purpose, participation counts) persists after ephemeral close even
+    /// though content and keys are destroyed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
+    pub async fn store_ephemeral_metadata(
+        &self,
+        context_id: &str,
+        metadata: &crate::context::memory_scope::EphemeralContextMetadata,
+    ) -> Result<(), StoreError> {
+        let key = ephemeral_metadata_key(context_id)?;
+        self.store_value(&key, metadata).await
+    }
+
+    /// Loads durable metadata for an ephemeral context.
+    ///
+    /// Returns `None` if no ephemeral metadata has been stored for this
+    /// context (either the context is not ephemeral or has not been closed).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage read fails.
+    pub async fn load_ephemeral_metadata(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<crate::context::memory_scope::EphemeralContextMetadata>, StoreError> {
+        let key = ephemeral_metadata_key(context_id)?;
         self.load_value(&key).await
     }
 }

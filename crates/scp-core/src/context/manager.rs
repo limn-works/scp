@@ -4080,18 +4080,27 @@ impl ContextManager {
     /// Handles automatic TTL expiry.
     ///
     /// Transitions from `Active` to `Expired`, destroys keys per memory
-    /// scope, and appends `ContextExpired` to the event log.
+    /// scope, issues relay deletion requests for ephemeral/summary scopes,
+    /// and appends `ContextExpired` to the event log.
     ///
-    /// See ADR-008 acceptance criterion 7.
+    /// See ADR-008 acceptance criterion 7 and spec §5.10/§5.11.
     ///
     /// # Errors
     ///
     /// Returns [`ContextError::ContextNotActive`] if the context is not
+    /// in `Active` state.
     pub async fn handle_ttl_expiry(&self, handle: &ContextHandle) -> Result<(), ContextError> {
         let context_id = handle.context_id().to_owned();
 
-        // Async TTL expiry logic -- no lock held.
-        ttl::handle_ttl_expiry(handle, self.crypto.as_ref(), self.event_log.as_ref()).await?;
+        // Async TTL expiry logic -- no lock held. Pass transport for
+        // best-effort relay ciphertext deletion (§5.11).
+        ttl::handle_ttl_expiry_with_transport(
+            handle,
+            self.crypto.as_ref(),
+            Some(self.transport.as_ref()),
+            self.event_log.as_ref(),
+        )
+        .await?;
 
         // Emit expiry notification (lock acquired, then dropped).
         {
@@ -4668,6 +4677,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ..ContextParams::default()
         };
 
@@ -4735,6 +4745,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ..ContextParams::default()
         };
 
@@ -5297,6 +5308,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ceiling: vec![
                 crate::context::params::Capability::new("messages:read"),
                 crate::context::params::Capability::new("messages:write"),
@@ -5880,6 +5892,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ceiling: vec![
                 crate::context::params::Capability::new("messages:read"),
                 crate::context::params::Capability::new("messages:write"),
@@ -6022,6 +6035,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ceiling: vec![
                 crate::context::params::Capability::new("messages:read"),
                 crate::context::params::Capability::new("messages:write"),
@@ -6435,6 +6449,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ceiling: vec![
                 crate::context::params::Capability::new("messages:read"),
                 crate::context::params::Capability::new("messages:write"),
@@ -6904,6 +6919,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ceiling: vec![
                 crate::context::params::Capability::new("messages:read"),
                 crate::context::params::Capability::new("messages:write"),
@@ -7001,6 +7017,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ceiling: vec![
                 crate::context::params::Capability::new("messages:read"),
                 crate::context::params::Capability::new("messages:write"),
@@ -7205,6 +7222,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ..ContextParams::default()
         };
 

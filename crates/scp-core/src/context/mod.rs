@@ -113,8 +113,9 @@ pub use membership::{
 
 // Re-export memory scope and key destruction types (SCP-067).
 pub use memory_scope::{
-    DeletionResponseStatus, KeyDestructionAttestation, KeyDestructionLevel,
-    KeyDestructionOrchestrator, RelayDeletionRequest, RelayDeletionTracker,
+    DeletionResponseStatus, DestructionMethod, EphemeralContextMetadata, KeyDestructionAttestation,
+    KeyDestructionLevel, KeyDestructionOrchestrator, PlatformAttestation,
+    PublishableKeyDestructionAttestation, RelayDeletionRequest, RelayDeletionTracker,
     validate_memory_scope_for_broadcast,
 };
 

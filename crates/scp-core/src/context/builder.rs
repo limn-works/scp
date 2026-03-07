@@ -447,6 +447,12 @@ fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
     // policy is Governed, that is technically valid (no capabilities to
     // narrow). No structural constraint to enforce here.
 
+    // Validate memory scope is permitted for the context mode (§5.11).
+    // Broadcast contexts only support MemoryScope::Full — Ephemeral and
+    // Summary require MLS group state destruction which broadcast mode lacks.
+    super::memory_scope::validate_memory_scope_for_broadcast(params.mode, params.memory_scope)
+        .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+
     // If a template is specified, validate all params match the template
     // definition exactly.
     if params.template_id.is_some() {
@@ -880,6 +886,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ..ContextParams::default()
         };
 
@@ -1035,6 +1042,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ..ContextParams::default()
         };
 
@@ -1234,6 +1242,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ..ContextParams::default()
         };
 
@@ -1438,6 +1447,10 @@ mod tests {
         let event_log = MockEventLogProvider::default();
 
         // BilateralEphemeral expects Encrypted mode; switch to Broadcast.
+        // This now fails at broadcast scope validation (§5.11) because
+        // BilateralEphemeral has Ephemeral memory scope, which is invalid
+        // for broadcast contexts. The scope validation runs before template
+        // validation, so CreationFailed is the expected error.
         let mut params = template_params(&TemplateId::BilateralEphemeral);
         params.ttl = Some(Duration::from_secs(300));
         params.mode = ContextMode::Broadcast;
@@ -1454,7 +1467,7 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            ContextCreationError::TemplateValidationFailed(_)
+            ContextCreationError::CreationFailed(msg) if msg.contains("MemoryScope::Full")
         ));
 
         // No side effects.
@@ -1474,6 +1487,102 @@ mod tests {
 
         let result = create_context(
             "ctx-no-template".into(),
+            params,
+            &crypto,
+            &transport,
+            &event_log,
+        )
+        .await;
+
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Broadcast context scope restriction (#337, §5.11)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn create_broadcast_context_with_ephemeral_scope_rejected() {
+        let crypto = MockCryptoProvider::default();
+        let transport = MockTransportProvider::connected();
+        let event_log = MockEventLogProvider::default();
+
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Ephemeral,
+            ..ContextParams::default()
+        };
+
+        let result =
+            create_context("ctx-bc-eph".into(), params, &crypto, &transport, &event_log).await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ContextCreationError::CreationFailed(msg) if msg.contains("MemoryScope::Full")
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_broadcast_context_with_summary_scope_rejected() {
+        let crypto = MockCryptoProvider::default();
+        let transport = MockTransportProvider::connected();
+        let event_log = MockEventLogProvider::default();
+
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Summary,
+            ..ContextParams::default()
+        };
+
+        let result =
+            create_context("ctx-bc-sum".into(), params, &crypto, &transport, &event_log).await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ContextCreationError::CreationFailed(msg) if msg.contains("MemoryScope::Full")
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_broadcast_context_with_full_scope_succeeds() {
+        let crypto = MockCryptoProvider::default();
+        let transport = MockTransportProvider::connected();
+        let event_log = MockEventLogProvider::default();
+
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
+            ..ContextParams::default()
+        };
+
+        let result = create_context(
+            "ctx-bc-full".into(),
+            params,
+            &crypto,
+            &transport,
+            &event_log,
+        )
+        .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn create_encrypted_context_with_ephemeral_scope_succeeds() {
+        let crypto = MockCryptoProvider::default();
+        let transport = MockTransportProvider::connected();
+        let event_log = MockEventLogProvider::default();
+
+        let params = ContextParams {
+            mode: ContextMode::Encrypted,
+            memory_scope: crate::context::MemoryScope::Ephemeral,
+            ..ContextParams::default()
+        };
+
+        let result = create_context(
+            "ctx-enc-eph".into(),
             params,
             &crypto,
             &transport,
