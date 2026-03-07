@@ -638,6 +638,7 @@ mod tests {
             connection_tracker: scp_transport::relay::rate_limit::new_connection_tracker(),
             subscription_registry: scp_transport::relay::subscription::new_registry(),
             acme_challenges: None,
+            bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
         })
     }
 

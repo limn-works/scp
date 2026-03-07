@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bridge_auth;
+pub mod bridge_handlers;
 pub mod dev_api;
 pub(crate) mod error;
 pub mod http;
@@ -2047,6 +2048,7 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         connection_tracker,
         subscription_registry,
         acme_challenges,
+        bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
     });
 
     Ok(ApplicationNode {
@@ -2175,6 +2177,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         connection_tracker,
         subscription_registry,
         acme_challenges: None,
+        bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
     });
 
     // Do NOT serve .well-known/scp — no domain to serve from (§10.12.8).

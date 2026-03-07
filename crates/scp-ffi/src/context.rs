@@ -1285,6 +1285,7 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
         economic_policy: None,
         metadata_visibility: scp_core::context::params::MetadataVisibilityPolicy::default(),
         projection_policy: None,
+        participation_requirements: Vec::new(),
     }
 }
 
