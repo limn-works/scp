@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bridge_auth;
 pub mod dev_api;
 pub(crate) mod error;
 pub mod http;

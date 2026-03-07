@@ -4898,6 +4898,8 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64",
+ "bs58",
+ "ed25519-dalek",
  "futures",
  "hex",
  "http-body-util",
