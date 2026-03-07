@@ -338,6 +338,208 @@ struct ToolsTests {
         #expect(definition.testVectorsJson!.contains("sum"))
     }
 
+    // MARK: - ToolSessionResult type shape
+
+    @Test("ToolSessionResult stores session ID")
+    func toolSessionResultFields() {
+        let result = ToolSessionResult(sessionId: "session-uuid-001")
+        #expect(result.sessionId == "session-uuid-001")
+    }
+
+    // MARK: - Cross-context tool invocation via injectable bridge
+
+    @Test("invokeToolCrossContext calls bridge with both handles")
+    func invokeToolCrossContextRoundtrip() async throws {
+        let sourceHandle = ContextHandle(noPointer: .init())
+        let targetHandle = ContextHandle(noPointer: .init())
+        let sendFn: ContextBridge.SendFn = { _, _ in }
+        let subscribeFn: ContextBridge.SubscribeFn = { _, _ in }
+        let leaveFn: ContextBridge.LeaveFn = { _ in }
+        let closeFn: ContextBridge.CloseFn = { _ in }
+
+        let sourceContext = Context(
+            handle: sourceHandle,
+            sendFn: sendFn,
+            subscribeFn: subscribeFn,
+            leaveFn: leaveFn,
+            closeFn: closeFn
+        )
+        let targetContext = Context(
+            handle: targetHandle,
+            sendFn: sendFn,
+            subscribeFn: subscribeFn,
+            leaveFn: leaveFn,
+            closeFn: closeFn
+        )
+
+        var receivedChainDepth: UInt8?
+        let mockInvokeCrossContext: ToolBridge.InvokeCrossContextFn = {
+            _, _, toolId, inputJson, _, chainDepth in
+            #expect(toolId == "remote-calc")
+            #expect(inputJson == "{\"x\":1}")
+            receivedChainDepth = chainDepth
+            return #"{"result": 99}"#
+        }
+
+        let result = try await sourceContext.invokeToolCrossContext(
+            "remote-calc",
+            input: Data("{\"x\":1}".utf8),
+            targetContext: targetContext,
+            chainDepth: 1,
+            invokeCrossContextFn: mockInvokeCrossContext
+        )
+
+        #expect(result.output == Data(#"{"result": 99}"#.utf8))
+        #expect(receivedChainDepth == 1)
+    }
+
+    @Test("invokeToolCrossContext throws when source context is closed")
+    func invokeToolCrossContextThrowsWhenClosed() async throws {
+        let sourceContext = makeTestContext()
+        let targetContext = makeTestContext(contextId: "target-ctx")
+        try await sourceContext.close()
+
+        do {
+            _ = try await sourceContext.invokeToolCrossContext(
+                "tool",
+                input: Data("{}".utf8),
+                targetContext: targetContext
+            )
+            Issue.record("Expected error for closed source context")
+        } catch let error as ScpError {
+            if case .Context(_, let code) = error {
+                #expect(code == "SCP-CTX-2001")
+            } else {
+                Issue.record("Expected ScpError.Context, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    // MARK: - Stateful tool session via injectable bridge
+
+    @Test("createToolSession calls bridge and returns session result")
+    func createToolSessionRoundtrip() async throws {
+        let handle = ContextHandle(noPointer: .init())
+        let sendFn: ContextBridge.SendFn = { _, _ in }
+        let subscribeFn: ContextBridge.SubscribeFn = { _, _ in }
+        let leaveFn: ContextBridge.LeaveFn = { _ in }
+        let closeFn: ContextBridge.CloseFn = { _ in }
+
+        let context = Context(
+            handle: handle,
+            sendFn: sendFn,
+            subscribeFn: subscribeFn,
+            leaveFn: leaveFn,
+            closeFn: closeFn
+        )
+
+        var receivedToolId: String?
+        var receivedTtl: UInt64?
+        let mockSessionCreate: ToolBridge.SessionCreateFn = { _, toolId, _, ttl in
+            receivedToolId = toolId
+            receivedTtl = ttl
+            return "session-abc-123"
+        }
+
+        let result = try await context.createToolSession(
+            toolId: "calc",
+            sourceContextId: "src-ctx",
+            ttlSeconds: 300,
+            sessionCreateFn: mockSessionCreate
+        )
+
+        #expect(result.sessionId == "session-abc-123")
+        #expect(receivedToolId == "calc")
+        #expect(receivedTtl == 300)
+    }
+
+    @Test("invokeToolSession calls bridge with session ID")
+    func invokeToolSessionRoundtrip() async throws {
+        let handle = ContextHandle(noPointer: .init())
+        let sendFn: ContextBridge.SendFn = { _, _ in }
+        let subscribeFn: ContextBridge.SubscribeFn = { _, _ in }
+        let leaveFn: ContextBridge.LeaveFn = { _ in }
+        let closeFn: ContextBridge.CloseFn = { _ in }
+
+        let context = Context(
+            handle: handle,
+            sendFn: sendFn,
+            subscribeFn: subscribeFn,
+            leaveFn: leaveFn,
+            closeFn: closeFn
+        )
+
+        var receivedSessionId: String?
+        let mockSessionInvoke: ToolBridge.SessionInvokeFn = { _, sessionId, inputJson, _ in
+            receivedSessionId = sessionId
+            #expect(inputJson == "{\"op\":\"add\"}")
+            return #"{"sum": 5}"#
+        }
+
+        let result = try await context.invokeToolSession(
+            sessionId: "session-abc-123",
+            input: Data("{\"op\":\"add\"}".utf8),
+            sessionInvokeFn: mockSessionInvoke
+        )
+
+        #expect(result.output == Data(#"{"sum": 5}"#.utf8))
+        #expect(receivedSessionId == "session-abc-123")
+    }
+
+    @Test("closeToolSession calls bridge with session ID")
+    func closeToolSessionRoundtrip() async throws {
+        let handle = ContextHandle(noPointer: .init())
+        let sendFn: ContextBridge.SendFn = { _, _ in }
+        let subscribeFn: ContextBridge.SubscribeFn = { _, _ in }
+        let leaveFn: ContextBridge.LeaveFn = { _ in }
+        let closeFn: ContextBridge.CloseFn = { _ in }
+
+        let context = Context(
+            handle: handle,
+            sendFn: sendFn,
+            subscribeFn: subscribeFn,
+            leaveFn: leaveFn,
+            closeFn: closeFn
+        )
+
+        var closedSessionId: String?
+        let mockSessionClose: ToolBridge.SessionCloseFn = { _, sessionId in
+            closedSessionId = sessionId
+        }
+
+        try await context.closeToolSession(
+            sessionId: "session-abc-123",
+            sessionCloseFn: mockSessionClose
+        )
+
+        #expect(closedSessionId == "session-abc-123")
+    }
+
+    @Test("createToolSession throws when context is closed")
+    func createToolSessionThrowsWhenClosed() async throws {
+        let context = makeTestContext()
+        try await context.close()
+
+        do {
+            _ = try await context.createToolSession(
+                toolId: "calc",
+                sourceContextId: "src",
+                ttlSeconds: 300
+            )
+            Issue.record("Expected error for closed context")
+        } catch let error as ScpError {
+            if case .Context(_, let code) = error {
+                #expect(code == "SCP-CTX-2001")
+            } else {
+                Issue.record("Expected ScpError.Context, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
 } // end ToolsTests
 
 // MARK: - Mock ContextHandle for Tool Tests

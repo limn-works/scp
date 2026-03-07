@@ -196,4 +196,163 @@ struct TrustTests {
         #expect(result.consequenceRuleCount == 0)
     }
 
+    // MARK: - TrustEvaluation from TrustScoreResult
+
+    @Test("TrustEvaluation initializes from TrustScoreResult")
+    func trustEvaluationFromScoreResult() {
+        let score = TrustScoreResult(
+            messageCount: 42,
+            governanceCount: 3,
+            compositeScore: 0.85
+        )
+
+        let eval = TrustEvaluation(from: score)
+
+        #expect(eval.tokensValid)
+        #expect(eval.signaturesValid)
+        #expect(eval.withinCeiling)
+        #expect(eval.notRevoked)
+        #expect(eval.behavioralRecord?.governanceActionsAgainst == 3)
+        #expect(eval.verifiedAttestationCount == 0)
+    }
+
+    // MARK: - queryTrustScore via injectable bridge
+
+    @Test("queryTrustScore calls bridge and returns score result")
+    func queryTrustScoreRoundtrip() throws {
+        var receivedDid: String?
+        var receivedContextId: String?
+
+        let mockQueryScore: TrustBridge.QueryScoreFn = { did, contextId in
+            receivedDid = did
+            receivedContextId = contextId
+            return TrustScoreResult(
+                messageCount: 100,
+                governanceCount: 5,
+                compositeScore: 0.75
+            )
+        }
+
+        let result = try queryTrustScore(
+            did: "did:dht:z6MkScorer",
+            contextId: "ctx-score-001",
+            queryScoreFn: mockQueryScore
+        )
+
+        #expect(receivedDid == "did:dht:z6MkScorer")
+        #expect(receivedContextId == "ctx-score-001")
+        #expect(result.messageCount == 100)
+        #expect(result.governanceCount == 5)
+        #expect(result.compositeScore == 0.75)
+    }
+
+    // MARK: - verifyAttestation via injectable bridge
+
+    @Test("verifyAttestation calls bridge with JSON and returns result")
+    func verifyAttestationRoundtrip() throws {
+        var receivedJson: String?
+
+        let mockVerify: TrustBridge.VerifyAttestationFn = { json in
+            receivedJson = json
+            return AttestationVerificationResult(
+                valid: true,
+                chainDepth: 1,
+                errorMessage: ""
+            )
+        }
+
+        let result = try verifyAttestation(
+            attestationJson: "{\"type\":\"test\"}",
+            verifyAttestationFn: mockVerify
+        )
+
+        #expect(receivedJson == "{\"type\":\"test\"}")
+        #expect(result.valid)
+        #expect(result.chainDepth == 1)
+        #expect(result.errorMessage == "")
+    }
+
+    @Test("verifyAttestation returns invalid result for bad attestation")
+    func verifyAttestationInvalid() throws {
+        let mockVerify: TrustBridge.VerifyAttestationFn = { _ in
+            return AttestationVerificationResult(
+                valid: false,
+                chainDepth: 0,
+                errorMessage: "signature verification failed"
+            )
+        }
+
+        let result = try verifyAttestation(
+            attestationJson: "{\"bad\":\"data\"}",
+            verifyAttestationFn: mockVerify
+        )
+
+        #expect(!result.valid)
+        #expect(result.chainDepth == 0)
+        #expect(result.errorMessage == "signature verification failed")
+    }
+
+    // MARK: - createChallenge via injectable bridge
+
+    @Test("createChallenge calls bridge and returns challenge result")
+    func createChallengeRoundtrip() throws {
+        var receivedTargetDid: String?
+
+        let mockCreate: TrustBridge.CreateChallengeFn = { targetDid in
+            receivedTargetDid = targetDid
+            return ChallengeResult(
+                challengeId: "challenge-uuid-001",
+                challengeJson: "{\"target\":\"did:dht:z6MkTarget\"}"
+            )
+        }
+
+        let result = try createChallenge(
+            targetDid: "did:dht:z6MkTarget",
+            createChallengeFn: mockCreate
+        )
+
+        #expect(receivedTargetDid == "did:dht:z6MkTarget")
+        #expect(result.challengeId == "challenge-uuid-001")
+        #expect(result.challengeJson.contains("did:dht:z6MkTarget"))
+    }
+
+    // MARK: - verifyChallengeResponse via injectable bridge
+
+    @Test("verifyChallengeResponse calls bridge and returns bool")
+    func verifyChallengeResponseRoundtrip() throws {
+        var receivedChallengeJson: String?
+        var receivedResponseJson: String?
+
+        let mockVerify: TrustBridge.VerifyResponseFn = { challengeJson, responseJson in
+            receivedChallengeJson = challengeJson
+            receivedResponseJson = responseJson
+            return true
+        }
+
+        let result = try verifyChallengeResponse(
+            challengeJson: "{\"challenge\":\"abc\"}",
+            responseJson: "{\"response\":\"xyz\"}",
+            verifyResponseFn: mockVerify
+        )
+
+        #expect(receivedChallengeJson == "{\"challenge\":\"abc\"}")
+        #expect(receivedResponseJson == "{\"response\":\"xyz\"}")
+        #expect(result)
+    }
+
+    @Test("verifyChallengeResponse returns false for invalid response")
+    func verifyChallengeResponseInvalid() throws {
+        let mockVerify: TrustBridge.VerifyResponseFn = { _, _ in
+            return false
+        }
+
+        let result = try verifyChallengeResponse(
+            challengeJson: "{\"challenge\":\"abc\"}",
+            responseJson: "{\"wrong\":\"data\"}",
+            verifyResponseFn: mockVerify
+        )
+
+        #expect(!result)
+    }
+
 } // end TrustTests
