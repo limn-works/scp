@@ -1,26 +1,126 @@
 //! SCP application node binary.
 //!
-//! Two modes of operation:
+//! Three modes of operation:
 //!
 //! 1. **Full node** (default): Starts an [`ApplicationNode`] with DID identity,
-//!    relay, and HTTP server (`.well-known/scp` + WebSocket upgrade).
+//!    relay, and HTTP server (`.well-known/scp` + WebSocket upgrade). Uses
+//!    persistent `SQLite` storage by default (`SQLCipher` encrypted).
 //! 2. **Relay-only** (`--relay-only`): Runs a bare [`RelayServer`], identical
 //!    to the standalone `scp-relay` binary.
+//! 3. **Ephemeral** (`--ephemeral`): Runs a full node with all in-memory
+//!    subsystems — nothing persists across restarts.
 //!
-//! Configuration is read from environment variables. See module-level
-//! constants for defaults.
+//! Configuration is read from CLI flags and environment variables.
 
 use std::env;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use scp_identity::cache::SystemClock;
-use scp_identity::{DidCache, DidDht, InMemoryDhtClient, InMemorySequenceStore, PkarrDhtClient};
+use scp_identity::dht::SequenceStore;
+use scp_identity::{
+    DidCache, DidDht, IdentityError, InMemoryDhtClient, InMemorySequenceStore, PkarrDhtClient,
+};
 use scp_node::{ApplicationNodeBuilder, TlsProvider};
+use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+use scp_platform::traits::Storage;
 use scp_transport::native::server::{RelayConfig, RelayServer};
 use scp_transport::native::storage::BlobStorageBackend;
 use tracing_subscriber::EnvFilter;
+
+// ---------------------------------------------------------------------------
+// CLI argument parsing
+// ---------------------------------------------------------------------------
+
+/// Parsed CLI configuration.
+#[allow(clippy::struct_excessive_bools)]
+struct CliConfig {
+    /// Run in relay-only mode.
+    relay_only: bool,
+    /// Run health check and exit.
+    health: bool,
+    /// Use all in-memory subsystems (no persistence).
+    ephemeral: bool,
+    /// Path to the `SQLite` database directory. `None` = use default XDG path.
+    storage_path: Option<PathBuf>,
+    /// Show help text and exit.
+    show_help: bool,
+}
+
+/// Parses CLI arguments.
+///
+/// Accepts:
+///   `--relay-only`       — relay-only mode
+///   `--health`           — TCP health probe
+///   `--ephemeral`        — all in-memory subsystems
+///   `--storage-path <p>` — `SQLite` database directory
+///   `--help`             — print usage and exit
+fn parse_args() -> CliConfig {
+    let args: Vec<String> = env::args().collect();
+
+    let relay_only = args.iter().any(|a| a == "--relay-only");
+    let health = args.iter().any(|a| a == "--health");
+    let ephemeral = args.iter().any(|a| a == "--ephemeral");
+    let show_help = args.iter().any(|a| a == "--help" || a == "-h");
+
+    let storage_path = args
+        .iter()
+        .position(|a| a == "--storage-path")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from)
+        .or_else(|| env::var("SCP_STORAGE_PATH").ok().map(PathBuf::from));
+
+    CliConfig {
+        relay_only,
+        health,
+        ephemeral,
+        storage_path,
+        show_help,
+    }
+}
+
+/// Prints usage information and exits with code 0.
+fn print_help() -> ! {
+    eprintln!(
+        "\
+scp-node — SCP application node
+
+USAGE:
+    scp-node [OPTIONS]
+
+OPTIONS:
+    --relay-only            Run as a bare relay server only (no identity, no HTTP)
+    --ephemeral             Use in-memory storage for all subsystems (no persistence)
+    --storage-path <PATH>   SQLite database directory (default: $XDG_DATA_HOME/scp/node)
+                            Also configurable via SCP_STORAGE_PATH env var
+    --health                TCP health probe (exit 0 on success, 1 on failure)
+    --help, -h              Show this help message
+
+ENVIRONMENT VARIABLES:
+    SCP_NODE_DOMAIN             Domain for full node mode (required unless --relay-only)
+    SCP_NODE_BIND_ADDR          HTTP bind address (default: 0.0.0.0:9000)
+    SCP_NODE_TLS_SELF_SIGNED    Set to '1' for self-signed TLS (development only)
+    SCP_NODE_PROJECTION_RATE_LIMIT  Per-IP rate limit for projection endpoints (default: 60)
+    SCP_NODE_DHT_MODE           DHT client: 'production' (default) or 'memory'
+    SCP_NODE_DHT_GATEWAYS       Comma-separated DHT HTTP gateway URLs
+    SCP_STORAGE_PATH            SQLite database directory (same as --storage-path)
+    SCP_STORAGE_KEY             Hex-encoded 32-byte SQLCipher encryption key
+                                (auto-generated and stored if not set)
+    SCP_RELAY_BIND_ADDR         Relay bind address (default: 0.0.0.0:9000)
+    SCP_RELAY_MAX_BLOB_SIZE     Max blob size in bytes (default: 262144)
+    SCP_RELAY_MAX_BLOB_TTL      Max blob TTL in seconds (default: 604800)
+    SCP_RELAY_MAX_CONNECTIONS   Max total connections (default: 1000)
+    SCP_RELAY_MAX_CONNECTIONS_PER_IP  Max connections per IP (default: 10)
+    SCP_RELAY_RATE_LIMIT        Publish rate limit per second (default: 100)
+    SCP_RELAY_LOG_LEVEL         Log level (default: info)
+    SCP_RELAY_LOG_FORMAT        Log format: 'json' or 'pretty' (default: pretty)
+    RUST_LOG                    Override log level (takes precedence over SCP_RELAY_LOG_LEVEL)"
+    );
+    std::process::exit(0);
+}
 
 // ---------------------------------------------------------------------------
 // Environment variable helpers
@@ -39,15 +139,153 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
 }
 
 // ---------------------------------------------------------------------------
+// Storage path resolution
+// ---------------------------------------------------------------------------
+
+/// Resolves the storage directory path from CLI args, env var, or XDG default.
+///
+/// Priority: `--storage-path` > `SCP_STORAGE_PATH` > `$XDG_DATA_HOME/scp/node`
+/// > `$HOME/.local/share/scp/node`.
+fn resolve_storage_path(cli_path: Option<&PathBuf>) -> PathBuf {
+    if let Some(path) = cli_path {
+        return path.clone();
+    }
+
+    // XDG Base Directory Specification: $XDG_DATA_HOME or $HOME/.local/share
+    #[allow(clippy::option_if_let_else)]
+    let data_home = env::var("XDG_DATA_HOME").map_or_else(
+        |_| {
+            let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned());
+            PathBuf::from(home).join(".local").join("share")
+        },
+        PathBuf::from,
+    );
+    data_home.join("scp").join("node")
+}
+
+/// Resolves or generates the `SQLCipher` encryption key.
+///
+/// Reads from `SCP_STORAGE_KEY` env var (hex-encoded 32 bytes). If not set,
+/// generates a random key and writes it to `{storage_dir}/.key` (mode 0600).
+/// On subsequent runs, reads the key from the file.
+fn resolve_storage_key(storage_dir: &std::path::Path) -> Result<[u8; 32], String> {
+    // Check env var first.
+    if let Ok(hex_key) = env::var("SCP_STORAGE_KEY") {
+        let bytes =
+            hex::decode(&hex_key).map_err(|e| format!("SCP_STORAGE_KEY is not valid hex: {e}"))?;
+        if bytes.len() != 32 {
+            return Err(format!(
+                "SCP_STORAGE_KEY must be 32 bytes (64 hex chars), got {} bytes",
+                bytes.len()
+            ));
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        return Ok(key);
+    }
+
+    // Check for existing key file.
+    let key_file = storage_dir.join(".key");
+    if key_file.exists() {
+        let data = std::fs::read(&key_file)
+            .map_err(|e| format!("failed to read key file {}: {e}", key_file.display()))?;
+        if data.len() != 32 {
+            return Err(format!(
+                "key file {} has invalid length {} (expected 32)",
+                key_file.display(),
+                data.len()
+            ));
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&data);
+        return Ok(key);
+    }
+
+    // Generate a new key and persist it.
+    std::fs::create_dir_all(storage_dir)
+        .map_err(|e| format!("failed to create storage directory: {e}"))?;
+
+    let mut key = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
+
+    std::fs::write(&key_file, key)
+        .map_err(|e| format!("failed to write key file {}: {e}", key_file.display()))?;
+
+    // Set permissions to owner-only (Unix).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&key_file, permissions)
+            .map_err(|e| format!("failed to set key file permissions: {e}"))?;
+    }
+
+    Ok(key)
+}
+
+// ---------------------------------------------------------------------------
+// Storage-backed SequenceStore
+// ---------------------------------------------------------------------------
+
+/// [`SequenceStore`] backed by a [`Storage`] implementation.
+///
+/// Persists BEP44 sequence numbers to the same storage backend as the rest of
+/// the node state. Key format: `bep44/seq/{did}`.
+struct StorageSequenceStore<S: Storage> {
+    storage: Arc<S>,
+}
+
+impl<S: Storage> StorageSequenceStore<S> {
+    const fn new(storage: Arc<S>) -> Self {
+        Self { storage }
+    }
+}
+
+impl<S: Storage + 'static> SequenceStore for StorageSequenceStore<S> {
+    fn load(
+        &self,
+        did: &str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<u64>, IdentityError>> + Send + '_>>
+    {
+        let key = format!("bep44/seq/{did}");
+        Box::pin(async move {
+            let data = self
+                .storage
+                .retrieve(&key)
+                .await
+                .map_err(IdentityError::Platform)?;
+            match data {
+                Some(bytes) if bytes.len() == 8 => {
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(&bytes);
+                    Ok(Some(u64::from_le_bytes(buf)))
+                }
+                _ => Ok(None), // Missing or corrupted; treat as absent.
+            }
+        })
+    }
+
+    fn store(
+        &self,
+        did: &str,
+        seq: u64,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), IdentityError>> + Send + '_>> {
+        let key = format!("bep44/seq/{did}");
+        let bytes = seq.to_le_bytes();
+        Box::pin(async move {
+            self.storage
+                .store(&key, &bytes)
+                .await
+                .map_err(IdentityError::Platform)
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tracing
 // ---------------------------------------------------------------------------
 
 /// Initializes the `tracing` subscriber.
-///
-/// Log level is determined by `RUST_LOG` (takes precedence) or
-/// `SCP_RELAY_LOG_LEVEL` (default: `info`). Output format is controlled
-/// by `SCP_RELAY_LOG_FORMAT`: `json` for structured JSON, anything else
-/// for human-readable pretty output.
 fn init_tracing() {
     let default_level = env::var("SCP_RELAY_LOG_LEVEL").unwrap_or_else(|_| "info".into());
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -102,7 +340,7 @@ struct SelfSignedTlsProvider {
 impl TlsProvider for SelfSignedTlsProvider {
     fn provision(
         &self,
-    ) -> std::pin::Pin<
+    ) -> Pin<
         Box<
             dyn std::future::Future<
                     Output = Result<scp_node::tls::CertificateData, scp_node::tls::TlsError>,
@@ -140,9 +378,6 @@ async fn shutdown_signal() {
     {
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .unwrap_or_else(|_| {
-                // If we cannot register SIGTERM, fall back to ctrl_c only.
-                // This is unreachable on any standard Unix system but
-                // satisfies the no-panic lint without process::exit.
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
                     .unwrap_or_else(|_| std::process::exit(1))
             });
@@ -193,38 +428,21 @@ async fn run_relay_only() {
 }
 
 // ---------------------------------------------------------------------------
-// Full node mode
+// Full node mode — ephemeral
 // ---------------------------------------------------------------------------
 
-/// Runs the full application node: identity + relay + HTTP.
-async fn run_full_node() {
-    let domain = match env::var("SCP_NODE_DOMAIN") {
-        Ok(d) if !d.is_empty() => d,
-        _ => {
-            tracing::error!("SCP_NODE_DOMAIN is required in full node mode");
-            std::process::exit(1);
-        }
-    };
-
-    let http_addr: SocketAddr =
-        env_or("SCP_NODE_BIND_ADDR", SocketAddr::from(([0, 0, 0, 0], 9000)));
+/// Runs the full node with all in-memory subsystems (no persistence).
+async fn run_full_node_ephemeral() {
+    let domain = require_domain();
+    let http_addr = node_http_addr();
 
     tracing::info!(
         domain = %domain,
         bind_addr = %http_addr,
-        "starting scp-node in full mode"
+        mode = "ephemeral",
+        "starting scp-node with in-memory storage"
     );
 
-    // Identity components.
-    //
-    // SCP_NODE_DHT_MODE controls the DHT client:
-    //   - "production" (default): PkarrDhtClient with Mainline DHT + optional
-    //     HTTP gateway fallback via SCP_NODE_DHT_GATEWAYS (comma-separated).
-    //   - "memory": InMemoryDhtClient for testing/development.
-    //
-    // Sequence persistence uses InMemorySequenceStore. A production deployment
-    // should replace this with a persistent SequenceStore backed by the
-    // Storage trait (see #327 for the pattern).
     let custody = Arc::new(InMemoryKeyCustody::new());
     let cache = Arc::new(DidCache::new());
     let sequence_store = Arc::new(InMemorySequenceStore::new());
@@ -245,26 +463,180 @@ async fn run_full_node() {
         ));
 
         let seq_init_method = Arc::clone(&did_method);
-        let seq_init: Box<
-            dyn FnOnce(
-                    String,
-                ) -> std::pin::Pin<
-                    Box<
-                        dyn std::future::Future<Output = Result<(), scp_identity::IdentityError>>
-                            + Send,
-                    >,
-                > + Send,
-        > = Box::new(move |did| {
-            Box::pin(async move { seq_init_method.initialize_sequence(&did).await })
-        });
-        run_full_node_with(domain, http_addr, custody, seq_init, did_method).await;
+        let seq_init = make_seq_init(seq_init_method);
+        run_node_with(
+            domain,
+            http_addr,
+            custody,
+            seq_init,
+            did_method,
+            InMemoryStorage::new(),
+        )
+        .await;
         return;
     }
 
-    // Production: PkarrDhtClient with Mainline DHT.
+    // Production DHT.
+    let dht_client = build_pkarr_client();
+    let sign_fn = DidDht::<PkarrDhtClient, SystemClock>::make_sign_fn(Arc::clone(&custody));
+    let did_method = Arc::new(DidDht::with_client_signer_and_store(
+        dht_client,
+        cache,
+        sign_fn,
+        sequence_store,
+    ));
+
+    let seq_init_method = Arc::clone(&did_method);
+    let seq_init = make_seq_init(seq_init_method);
+    run_node_with(
+        domain,
+        http_addr,
+        custody,
+        seq_init,
+        did_method,
+        InMemoryStorage::new(),
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// Full node mode — persistent (default)
+// ---------------------------------------------------------------------------
+
+/// Opens an encrypted `SQLite` database, exiting on failure.
+fn open_sqlite_or_exit(dir: &std::path::Path, key: &[u8; 32]) -> SqliteStorage {
+    match SqliteStorage::new(dir, key) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, path = %dir.display(), "failed to open SQLite storage");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Initializes storage path, encryption key, and `SQLite` databases for the
+/// persistent node. Returns `(storage_dir, storage_key, node_storage, custody)`.
+async fn init_persistent_storage(
+    storage_path: Option<&PathBuf>,
+) -> (PathBuf, [u8; 32], SqliteStorage, Arc<SqliteKeyCustody>) {
+    let storage_dir = resolve_storage_path(storage_path);
+
+    let storage_key = match resolve_storage_key(&storage_dir) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to resolve storage encryption key");
+            std::process::exit(1);
+        }
+    };
+
+    let node_storage = open_sqlite_or_exit(&storage_dir, &storage_key);
+    let custody_storage = open_sqlite_or_exit(&storage_dir.join("custody"), &storage_key);
+
+    let custody = match SqliteKeyCustody::new(custody_storage).await {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to initialize persistent key custody");
+            std::process::exit(1);
+        }
+    };
+
+    (storage_dir, storage_key, node_storage, custody)
+}
+
+/// Runs the full node with persistent `SQLite` storage (production default).
+async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
+    let domain = require_domain();
+    let http_addr = node_http_addr();
+
+    let (storage_dir, storage_key, node_storage, custody) =
+        init_persistent_storage(storage_path).await;
+
+    tracing::info!(
+        domain = %domain,
+        bind_addr = %http_addr,
+        storage_path = %storage_dir.display(),
+        mode = "persistent",
+        "starting scp-node with SQLite storage (SQLCipher encrypted)"
+    );
+
+    let node_storage_arc = Arc::new(node_storage);
+    let cache = Arc::new(DidCache::new());
+
+    // Use storage-backed sequence store for BEP44 sequence persistence.
+    let sequence_store: Arc<dyn SequenceStore> =
+        Arc::new(StorageSequenceStore::new(Arc::clone(&node_storage_arc)));
+
+    let dht_mode = env::var("SCP_NODE_DHT_MODE").unwrap_or_else(|_| "production".into());
+
+    if dht_mode == "memory" {
+        tracing::warn!(
+            "using InMemoryDhtClient — DID documents will NOT be published to the network"
+        );
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let sign_fn = DidDht::<InMemoryDhtClient, SystemClock>::make_sign_fn(Arc::clone(&custody));
+        let did_method = Arc::new(DidDht::with_client_signer_and_store(
+            dht_client,
+            cache,
+            sign_fn,
+            sequence_store,
+        ));
+
+        let seq_init_method = Arc::clone(&did_method);
+        let seq_init = make_seq_init(seq_init_method);
+        let storage = open_sqlite_or_exit(&storage_dir, &storage_key);
+        run_node_with(domain, http_addr, custody, seq_init, did_method, storage).await;
+        return;
+    }
+
+    // Production DHT.
+    let dht_client = build_pkarr_client();
+    let sign_fn = DidDht::<PkarrDhtClient, SystemClock>::make_sign_fn(Arc::clone(&custody));
+    let did_method = Arc::new(DidDht::with_client_signer_and_store(
+        dht_client,
+        cache,
+        sign_fn,
+        sequence_store,
+    ));
+
+    let seq_init_method = Arc::clone(&did_method);
+    let seq_init = make_seq_init(seq_init_method);
+    let builder_storage = open_sqlite_or_exit(&storage_dir, &storage_key);
+
+    run_node_with(
+        domain,
+        http_addr,
+        custody,
+        seq_init,
+        did_method,
+        builder_storage,
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+/// Reads `SCP_NODE_DOMAIN` or exits with an error.
+fn require_domain() -> String {
+    match env::var("SCP_NODE_DOMAIN") {
+        Ok(d) if !d.is_empty() => d,
+        _ => {
+            tracing::error!("SCP_NODE_DOMAIN is required in full node mode");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Reads the HTTP bind address from env or returns the default.
+fn node_http_addr() -> SocketAddr {
+    env_or("SCP_NODE_BIND_ADDR", SocketAddr::from(([0, 0, 0, 0], 9000)))
+}
+
+/// Builds a [`PkarrDhtClient`] from env configuration.
+fn build_pkarr_client() -> Arc<PkarrDhtClient> {
     let mut dht_builder = PkarrDhtClient::builder();
 
-    // Add HTTP gateway URLs from SCP_NODE_DHT_GATEWAYS (comma-separated).
     if let Ok(gateways) = env::var("SCP_NODE_DHT_GATEWAYS") {
         for gateway in gateways.split(',') {
             let gateway = gateway.trim();
@@ -275,80 +647,61 @@ async fn run_full_node() {
         }
     }
 
-    let dht_client = match dht_builder.build() {
+    match dht_builder.build() {
         Ok(c) => Arc::new(c),
         Err(e) => {
             tracing::error!(error = %e, "failed to create PkarrDhtClient");
             std::process::exit(1);
         }
-    };
-
-    let sign_fn = DidDht::<PkarrDhtClient, SystemClock>::make_sign_fn(Arc::clone(&custody));
-    let did_method = Arc::new(DidDht::with_client_signer_and_store(
-        dht_client,
-        cache,
-        sign_fn,
-        sequence_store,
-    ));
-
-    let seq_init_method = Arc::clone(&did_method);
-    let seq_init: Box<
-        dyn FnOnce(
-                String,
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = Result<(), scp_identity::IdentityError>>
-                        + Send,
-                >,
-            > + Send,
-    > = Box::new(move |did| {
-        Box::pin(async move { seq_init_method.initialize_sequence(&did).await })
-    });
-    run_full_node_with(domain, http_addr, custody, seq_init, did_method).await;
+    }
 }
 
-/// Shared implementation for `run_full_node`, parameterized over the DID method.
+/// Boxed callback for BEP44 sequence initialization.
+type SeqInitFn = Box<
+    dyn FnOnce(
+            String,
+        )
+            -> Pin<Box<dyn std::future::Future<Output = Result<(), IdentityError>> + Send>>
+        + Send,
+>;
+
+/// Creates a sequence initialization callback for `run_node_with`.
+fn make_seq_init<D: scp_identity::DhtClient + 'static>(
+    did_method: Arc<DidDht<D, SystemClock>>,
+) -> SeqInitFn {
+    Box::new(move |did| Box::pin(async move { did_method.initialize_sequence(&did).await }))
+}
+
+/// Shared implementation for `run_full_node`, parameterized over DID method
+/// and storage type.
 ///
-/// Builds and runs the `ApplicationNode` with the given identity components.
-/// The DID method type `D` is generic so both `DidDht<PkarrDhtClient>` (production)
-/// and `DidDht<InMemoryDhtClient>` (development) work without trait objects.
-///
-/// The `seq_init` callback is invoked with the node's DID string after `build()`
-/// completes, before any publish operation. It should call
-/// `DidDht::initialize_sequence` to recover the BEP44 sequence number from the
-/// persistent store and/or DHT. This prevents sequence number reuse on restart
-/// (which causes BEP44 CAS failures).
-async fn run_full_node_with<D: scp_identity::DidMethod + 'static>(
+/// The `seq_init` callback is invoked with the node's DID string after
+/// `build()` completes, before any publish operation. It calls
+/// `DidDht::initialize_sequence` to recover the BEP44 sequence number from
+/// the persistent store and/or DHT.
+async fn run_node_with<
+    K: scp_platform::KeyCustody + 'static,
+    D: scp_identity::DidMethod + 'static,
+    S: Storage + 'static,
+>(
     domain: String,
     http_addr: SocketAddr,
-    custody: Arc<InMemoryKeyCustody>,
-    seq_init: Box<
-        dyn FnOnce(
-                String,
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = Result<(), scp_identity::IdentityError>>
-                        + Send,
-                >,
-            > + Send,
-    >,
+    custody: Arc<K>,
+    seq_init: SeqInitFn,
     did_method: Arc<D>,
+    storage: S,
 ) {
-    // If SCP_NODE_TLS_SELF_SIGNED=1, use a self-signed certificate for
-    // development/testing. In production, the builder uses ACME by default.
     let use_self_signed = env::var("SCP_NODE_TLS_SELF_SIGNED")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
 
-    // The relay binds to an ephemeral port on localhost; the public HTTP
-    // server (serve()) binds separately on http_addr.
     let projection_rate: u32 = env_or(
         "SCP_NODE_PROJECTION_RATE_LIMIT",
         scp_node::DEFAULT_PROJECTION_RATE_LIMIT,
     );
 
     let mut builder = ApplicationNodeBuilder::new()
-        .storage(InMemoryStorage::new())
+        .storage(storage)
         .domain(&domain)
         .generate_identity_with(custody, did_method)
         .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -371,14 +724,10 @@ async fn run_full_node_with<D: scp_identity::DidMethod + 'static>(
     };
 
     // Initialize BEP44 sequence number from persistent store and/or DHT
-    // BEFORE any publish operation. Without this, a restarting node would
-    // begin from sequence 0, which fails BEP44 CAS against existing records.
+    // BEFORE any publish operation.
     let did = node.identity().did().to_owned();
     if let Err(e) = seq_init(did).await {
         tracing::error!(error = %e, "failed to initialize BEP44 sequence — publishing may fail");
-        // Non-fatal: a new identity has no prior sequence. For existing
-        // identities, the first publish will fail and the operator can
-        // investigate. We log but do not exit.
     }
 
     tracing::info!(
@@ -388,8 +737,6 @@ async fn run_full_node_with<D: scp_identity::DidMethod + 'static>(
         "application node identity ready"
     );
 
-    // serve() takes ownership of the node and handles graceful shutdown
-    // internally when the shutdown signal fires.
     if let Err(e) = node.serve(axum::Router::new(), shutdown_signal()).await {
         tracing::error!(error = %e, "application node exited with error");
         std::process::exit(1);
@@ -404,13 +751,15 @@ async fn run_full_node_with<D: scp_identity::DidMethod + 'static>(
 
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = env::args().collect();
+    let config = parse_args();
 
-    let relay_only = args.iter().any(|a| a == "--relay-only");
+    if config.show_help {
+        print_help();
+    }
 
     // --health: probe the appropriate bind address and exit.
-    if args.iter().any(|a| a == "--health") {
-        let addr: SocketAddr = if relay_only {
+    if config.health {
+        let addr: SocketAddr = if config.relay_only {
             env_or(
                 "SCP_RELAY_BIND_ADDR",
                 SocketAddr::from(([127, 0, 0, 1], 9000)),
@@ -427,9 +776,11 @@ async fn main() {
 
     init_tracing();
 
-    if relay_only {
+    if config.relay_only {
         run_relay_only().await;
+    } else if config.ephemeral {
+        run_full_node_ephemeral().await;
     } else {
-        run_full_node().await;
+        run_full_node_persistent(config.storage_path.as_ref()).await;
     }
 }

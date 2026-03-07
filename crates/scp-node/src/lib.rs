@@ -1629,7 +1629,7 @@ impl<S: Storage + 'static, Dom>
     }
 }
 
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'static>
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
     ApplicationNodeBuilder<K, D, S, HasDomain, HasIdentity>
 {
     /// Builds the [`ApplicationNode`].
@@ -1652,6 +1652,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
     ///
     /// # Errors
     ///
+    /// Returns [`NodeError::MissingField`] if `.storage()` was not called.
     /// Returns [`NodeError::Identity`] if identity creation or DID
     /// publication fails. Returns [`NodeError::Relay`] if the relay server
     /// fails to start.
@@ -1660,7 +1661,9 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
         let identity_source = self
             .identity_source
             .ok_or(NodeError::MissingField("identity"))?;
-        let protocol_store = Arc::new(ProtocolStore::new(self.storage.unwrap_or_default()));
+        let protocol_store = Arc::new(ProtocolStore::new(
+            self.storage.ok_or(NodeError::MissingField("storage"))?,
+        ));
 
         let (identity, document, did_method) = resolve_identity(identity_source).await?;
         let bridge_secret = generate_bridge_secret();
@@ -2071,7 +2074,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
 // Build for HasNoDomain — zero-config NAT-traversed mode (§10.12.8)
 // ---------------------------------------------------------------------------
 
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'static>
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
     ApplicationNodeBuilder<K, D, S, HasNoDomain, HasIdentity>
 {
     /// Builds the [`ApplicationNode`] in zero-config no-domain mode (§10.12.8).
@@ -2092,6 +2095,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
     ///
     /// # Errors
     ///
+    /// Returns [`NodeError::MissingField`] if `.storage()` was not called.
     /// Returns [`NodeError::Nat`] if all reachability tiers fail.
     /// Returns [`NodeError::Identity`] if identity creation or DID
     /// publication fails. Returns [`NodeError::Relay`] if the relay server
@@ -2101,7 +2105,9 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
             .identity_source
             .ok_or(NodeError::MissingField("identity"))?;
 
-        let protocol_store = Arc::new(ProtocolStore::new(self.storage.unwrap_or_default()));
+        let protocol_store = Arc::new(ProtocolStore::new(
+            self.storage.ok_or(NodeError::MissingField("storage"))?,
+        ));
         let (identity, document, did_method) = resolve_identity(identity_source).await?;
 
         // 3. Start relay server.
@@ -2546,6 +2552,7 @@ mod tests {
         let did_method = Arc::new(make_test_dht(&custody));
 
         let node = ApplicationNodeBuilder::new()
+            .storage(InMemoryStorage::new())
             .domain("explicit.example.com")
             .tls_provider(Arc::new(SucceedingTlsProvider {
                 domain: "explicit.example.com".to_owned(),
@@ -2627,6 +2634,7 @@ mod tests {
         });
 
         let _node = ApplicationNodeBuilder::new()
+            .storage(InMemoryStorage::new())
             .domain("counting.example.com")
             .tls_provider(Arc::new(SucceedingTlsProvider {
                 domain: "counting.example.com".to_owned(),
@@ -2774,6 +2782,7 @@ mod tests {
         });
 
         let _node = ApplicationNodeBuilder::new()
+            .storage(InMemoryStorage::new())
             .domain("relay-order.example.com")
             .tls_provider(Arc::new(SucceedingTlsProvider {
                 domain: "relay-order.example.com".to_owned(),
