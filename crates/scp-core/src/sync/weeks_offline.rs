@@ -109,6 +109,14 @@ pub const RESET_REQUEST_FRESHNESS_SECS: u64 = 30;
 /// See §23.5.2, ADR-029 section 4.
 pub const RESET_REQUEST_NONCE_TTL_SECS: u64 = 60;
 
+/// Maximum number of entries in the `ResetRequestNonceTracker` cache.
+///
+/// When exceeded, the oldest entry (by timestamp) is evicted first.
+///
+/// See §23.5.2: "Cache capacity: bounded at 10,000 entries with oldest-first
+/// eviction."
+pub const MAX_NONCE_CACHE_ENTRIES: usize = 10_000;
+
 // ---------------------------------------------------------------------------
 // ResetReason
 // ---------------------------------------------------------------------------
@@ -236,8 +244,12 @@ impl ResetRequest {
 
 /// In-memory nonce deduplication tracker for `ResetRequest` anti-replay.
 ///
-/// Tracks seen nonces with a configurable TTL. When a nonce is checked,
-/// expired entries are lazily evicted. Thread-safe via internal `Mutex`.
+/// Tracks seen `(member_did, nonce)` pairs with a configurable TTL. When a
+/// nonce is checked, expired entries are lazily evicted. Thread-safe via
+/// internal `Mutex`.
+///
+/// The cache is bounded at [`MAX_NONCE_CACHE_ENTRIES`] entries with
+/// oldest-first eviction to prevent unbounded memory growth.
 ///
 /// This is the primary, synchronous anti-replay defense. The persistent
 /// `ProtocolStore` nonce tracking is a defence-in-depth layer for crash
@@ -246,8 +258,8 @@ impl ResetRequest {
 /// See §23.5.2, ADR-029 section 4.
 #[derive(Debug)]
 pub struct ResetRequestNonceTracker {
-    /// Map of nonce bytes to the timestamp when they were first seen.
-    seen: Mutex<HashMap<[u8; 16], u64>>,
+    /// Map of `(member_did, nonce)` to the timestamp when first seen.
+    seen: Mutex<HashMap<(String, [u8; 16]), u64>>,
     /// TTL for nonce entries in seconds.
     ttl_secs: u64,
 }
@@ -269,32 +281,49 @@ impl ResetRequestNonceTracker {
         Self::new(RESET_REQUEST_NONCE_TTL_SECS)
     }
 
-    /// Checks if a nonce has been seen before and records it if new.
+    /// Checks if a `(member_did, nonce)` pair has been seen before and records
+    /// it if new.
     ///
-    /// Returns `true` if the nonce is new (not a replay).
-    /// Returns `false` if the nonce has been seen within the TTL window.
+    /// Returns `true` if the pair is new (not a replay).
+    /// Returns `false` if the pair has been seen within the TTL window.
     ///
-    /// Lazily evicts expired entries on each call.
+    /// Lazily evicts expired entries on each call. After insertion, if the
+    /// cache exceeds [`MAX_NONCE_CACHE_ENTRIES`], the oldest entry (by
+    /// timestamp) is evicted.
     ///
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned (another thread panicked
     /// while holding the lock). This is unrecoverable.
     #[must_use = "ignoring nonce check result is a security bug"]
-    pub fn check_and_record(&self, nonce: &[u8; 16], now: u64) -> bool {
+    pub fn check_and_record(&self, member_did: &str, nonce: &[u8; 16], now: u64) -> bool {
         #[allow(clippy::expect_used)]
         let mut seen = self.seen.lock().expect("nonce tracker lock poisoned");
 
         // Lazy eviction of expired entries.
         seen.retain(|_, first_seen| now.saturating_sub(*first_seen) < self.ttl_secs);
 
+        let key = (member_did.to_owned(), *nonce);
+
         // Check for replay.
-        if seen.contains_key(nonce) {
+        if seen.contains_key(&key) {
             return false;
         }
 
-        // Record the nonce.
-        seen.insert(*nonce, now);
+        // Record the entry.
+        seen.insert(key, now);
+
+        // Capacity bound: evict oldest entry if over limit.
+        if seen.len() > MAX_NONCE_CACHE_ENTRIES {
+            if let Some(oldest_key) = seen
+                .iter()
+                .min_by_key(|(_, ts)| **ts)
+                .map(|(k, _)| k.clone())
+            {
+                seen.remove(&oldest_key);
+            }
+        }
+
         true
     }
 }
@@ -325,8 +354,9 @@ pub struct ValidatedResetRequest {
 ///
 /// This function performs two checks:
 ///
-/// 1. **Freshness:** Rejects requests where `now - request.timestamp` exceeds
-///    [`RESET_REQUEST_FRESHNESS_SECS`] (30 seconds).
+/// 1. **Freshness:** Rejects requests where `|now - request.timestamp|` exceeds
+///    [`RESET_REQUEST_FRESHNESS_SECS`] (30 seconds). Both past and future
+///    timestamps are checked.
 /// 2. **Nonce dedup:** Rejects requests whose nonce has already been seen
 ///    within the tracker's TTL window (60 seconds).
 ///
@@ -344,18 +374,23 @@ pub fn validate_reset_request(
     now: u64,
     nonce_tracker: &ResetRequestNonceTracker,
 ) -> Result<ValidatedResetRequest, WeeksOfflineError> {
-    // Check 1: freshness (30-second window).
-    let age = now.saturating_sub(request.timestamp);
-    if age > RESET_REQUEST_FRESHNESS_SECS {
+    // Check 1: freshness — absolute difference (§23.5.2 requires
+    // |relay_clock - timestamp| <= 30s, rejecting both past and future).
+    let diff = if now >= request.timestamp {
+        now - request.timestamp
+    } else {
+        request.timestamp - now
+    };
+    if diff > RESET_REQUEST_FRESHNESS_SECS {
         return Err(WeeksOfflineError::StaleResetRequest {
             context_id: request.context_id.clone(),
-            age_secs: age,
+            age_secs: diff,
             max_age_secs: RESET_REQUEST_FRESHNESS_SECS,
         });
     }
 
-    // Check 2: nonce dedup (60-second TTL).
-    if !nonce_tracker.check_and_record(&request.nonce, now) {
+    // Check 2: nonce dedup (60-second TTL, keyed by (member_did, nonce)).
+    if !nonce_tracker.check_and_record(request.member_did.as_ref(), &request.nonce, now) {
         return Err(WeeksOfflineError::ReplayedResetRequest {
             context_id: request.context_id.clone(),
             nonce: request.nonce,
@@ -1807,33 +1842,75 @@ mod tests {
     fn nonce_tracker_accepts_new_nonce() {
         let tracker = ResetRequestNonceTracker::with_default_ttl();
         let nonce = [0x01; 16];
-        assert!(tracker.check_and_record(&nonce, BASE_TIMESTAMP));
+        assert!(tracker.check_and_record("did:dht:z6MkAlice", &nonce, BASE_TIMESTAMP));
     }
 
     #[test]
     fn nonce_tracker_rejects_duplicate_nonce() {
         let tracker = ResetRequestNonceTracker::with_default_ttl();
         let nonce = [0x01; 16];
-        assert!(tracker.check_and_record(&nonce, BASE_TIMESTAMP));
-        assert!(!tracker.check_and_record(&nonce, BASE_TIMESTAMP + 1));
+        let did = "did:dht:z6MkAlice";
+        assert!(tracker.check_and_record(did, &nonce, BASE_TIMESTAMP));
+        assert!(!tracker.check_and_record(did, &nonce, BASE_TIMESTAMP + 1));
+    }
+
+    #[test]
+    fn nonce_tracker_same_nonce_different_did_accepted() {
+        let tracker = ResetRequestNonceTracker::with_default_ttl();
+        let nonce = [0x01; 16];
+        // Same nonce from different DIDs should both be accepted.
+        assert!(tracker.check_and_record("did:dht:z6MkAlice", &nonce, BASE_TIMESTAMP));
+        assert!(tracker.check_and_record("did:dht:z6MkBob", &nonce, BASE_TIMESTAMP));
     }
 
     #[test]
     fn nonce_tracker_accepts_after_ttl_expires() {
         let tracker = ResetRequestNonceTracker::new(60);
         let nonce = [0x01; 16];
-        assert!(tracker.check_and_record(&nonce, BASE_TIMESTAMP));
+        let did = "did:dht:z6MkAlice";
+        assert!(tracker.check_and_record(did, &nonce, BASE_TIMESTAMP));
         // 61 seconds later — TTL expired, nonce evicted.
-        assert!(tracker.check_and_record(&nonce, BASE_TIMESTAMP + 61));
+        assert!(tracker.check_and_record(did, &nonce, BASE_TIMESTAMP + 61));
     }
 
     #[test]
     fn nonce_tracker_different_nonces_both_accepted() {
         let tracker = ResetRequestNonceTracker::with_default_ttl();
+        let did = "did:dht:z6MkAlice";
         let nonce_a = [0xAA; 16];
         let nonce_b = [0xBB; 16];
-        assert!(tracker.check_and_record(&nonce_a, BASE_TIMESTAMP));
-        assert!(tracker.check_and_record(&nonce_b, BASE_TIMESTAMP));
+        assert!(tracker.check_and_record(did, &nonce_a, BASE_TIMESTAMP));
+        assert!(tracker.check_and_record(did, &nonce_b, BASE_TIMESTAMP));
+    }
+
+    #[test]
+    fn nonce_tracker_capacity_bound_evicts_oldest() {
+        let tracker = ResetRequestNonceTracker::new(3600); // long TTL
+        let did = "did:dht:z6MkAlice";
+
+        // Fill to MAX_NONCE_CACHE_ENTRIES.
+        for i in 0..MAX_NONCE_CACHE_ENTRIES {
+            let mut nonce = [0u8; 16];
+            nonce[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            assert!(tracker.check_and_record(did, &nonce, BASE_TIMESTAMP + i as u64));
+        }
+
+        // Insert one more — should trigger eviction of the oldest (i=0).
+        let overflow_nonce = [0xFF; 16];
+        assert!(tracker.check_and_record(
+            did,
+            &overflow_nonce,
+            BASE_TIMESTAMP + MAX_NONCE_CACHE_ENTRIES as u64
+        ));
+
+        // The oldest entry (i=0, nonce=[0x00;16] with first 8 bytes = 0u64)
+        // should have been evicted, so re-inserting it should succeed.
+        let oldest_nonce = [0u8; 16]; // i=0 → all zeros
+        assert!(tracker.check_and_record(
+            did,
+            &oldest_nonce,
+            BASE_TIMESTAMP + MAX_NONCE_CACHE_ENTRIES as u64 + 1
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -1928,6 +2005,38 @@ mod tests {
             result,
             Err(WeeksOfflineError::StaleResetRequest { .. })
         ));
+    }
+
+    #[test]
+    fn validate_rejects_future_timestamp() {
+        // A request with a timestamp 31 seconds in the future should be
+        // rejected — §23.5.2 requires |relay_clock - timestamp| <= 30s.
+        let tracker = ResetRequestNonceTracker::with_default_ttl();
+        let future_ts = BASE_TIMESTAMP + 31;
+        let request = make_test_request([0xFE; 16], future_ts);
+        let result = validate_reset_request(&request, BASE_TIMESTAMP, &tracker);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WeeksOfflineError::StaleResetRequest {
+                age_secs,
+                max_age_secs,
+                ..
+            } => {
+                assert_eq!(age_secs, 31);
+                assert_eq!(max_age_secs, RESET_REQUEST_FRESHNESS_SECS);
+            }
+            other => panic!("expected StaleResetRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_slightly_future_timestamp() {
+        // A request 30 seconds in the future is at the boundary — should pass.
+        let tracker = ResetRequestNonceTracker::with_default_ttl();
+        let future_ts = BASE_TIMESTAMP + 30;
+        let request = make_test_request([0xFD; 16], future_ts);
+        let result = validate_reset_request(&request, BASE_TIMESTAMP, &tracker);
+        assert!(result.is_ok());
     }
 
     // -----------------------------------------------------------------------
