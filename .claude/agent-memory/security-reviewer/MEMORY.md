@@ -115,14 +115,30 @@
 - MEDIUM: validate_key_package only checks "did:" prefix -- no ciphersuite, signature, or credential validation
 - GOOD: PoisonError::into_inner consistent; lock scopes minimal; encrypt/decrypt round-trip test real crypto; Merkle chain verification tested
 
+### Iteration 17 (2026-03-07) -- SCP-270, SCP-CAC-001, SCP-CAC-004, SCP-ACR-001
+- HIGH: access_keys/wire.rs build_hpke_info lacks length separators -- boundary-shift collision on context_id||member_did
+- HIGH: AccessKeyRequest has no nonce/dedup -- replay within 30s freshness window (sender keys have NonceDedup, access keys don't)
+- HIGH: validate_request_freshness accepts future timestamps (saturating_sub returns 0)
+- MEDIUM: AccessKeyRequest/Response and BlockListEvent lack deny_unknown_fields
+- MEDIUM: execute_add_signer nonce fallback "gov-signer-add-0" static on clock failure
+- MEDIUM: RemoveSigner token revocation uses substring contains() not exact match
+- MEDIUM: BlockListState/event log unbounded growth; append_block_list_event load-modify-store race
+- GOOD: AccessKey Zeroize/ZeroizeOnDrop + Debug redacts; store_value_zeroize; CanonicalField::VarBytes in request hash
+- GOOD: Exhaustive match arms in governance dispatch (no wildcards)
+- GOOD: Unanimity check via set-difference pattern in ExtendTtl and PromoteContext
+
 ### General Patterns
 - clippy deny unwrap/expect in lib code; thiserror; Rust 2024; #![forbid(unsafe_code)] except scp-ffi
 - zeroize inconsistent: store layer yes, identity signing keys and MLS key pairs no
-- unwrap_or_default() on clock ops is recurring systemic pattern
+- unwrap_or_default() on clock ops is recurring systemic pattern (also unwrap_or_else with static fallback)
 - DashMap shard locks must not cross Python GIL; clone Arc first
 - Static DashMap registries lack eviction
 - validate_projection_ucan structural-only -- recurring UCAN validation gap
-- Signed wire types should have deny_unknown_fields (InnerEnvelope fixed; sender key types still missing)
+- Signed wire types should have deny_unknown_fields (InnerEnvelope fixed; sender key types + access key types + BlockListEvent still missing)
 - handle_sender_key_request has no timestamp freshness or NonceDedup integration
+- Access key request also lacks NonceDedup -- both key protocols need nonce replay protection
 - Multiple Mutex locks on same struct: enforce consistent acquisition order to prevent deadlock (crypto.rs broadcast_keys vs sender_keys)
 - Hash inputs with variable-length fields need length prefixes or domain separators to prevent boundary-shift collisions
+- HKDF info strings are NOT the same as canonical hashes -- build_hpke_info concatenates raw bytes without length prefixes (found in access keys; check sender keys too)
+- Future timestamp rejection: always check BOTH directions (past staleness AND future clock skew) in freshness validators
+- Load-modify-store on shared storage (append_block_list_event pattern) needs atomicity or caller-side serialization
