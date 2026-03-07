@@ -12,7 +12,7 @@ See ADR-019 in `.docs/adrs/phase-4.md` for the full architectural decision recor
 
 3. **Absence is a signal, not an error.** Data introduced without protocol-level origin tracking evaluates as `NoProvenance` -- the lowest quality tier, not an error condition. The protocol is honest about what it can and cannot track. Agents calibrate trust accordingly.
 
-4. **Chain depth bounds accountability.** Unlimited cross-context hops create accountability laundering -- data traverses enough contexts that its origin becomes meaningless. The protocol default maximum of 3 hops bounds this.
+4. **Chain depth bounds accountability.** Unlimited cross-context hops create accountability laundering -- data traverses enough contexts that its origin becomes meaningless. The protocol enforces a hard maximum of 5 hops (RECOMMENDED context default: 3) to bound this (§24.4).
 
 ## 24.2 Core Types
 
@@ -84,7 +84,7 @@ The `attach_provenance` operation constructs a `DataProvenance` record from the 
 
 - `source_context` -- populated from the source context's identifier.
 - `source_type` -- the source context's current data availability status.
-- `counterparties` -- the source context's current membership roster DIDs at the time of data flow. This captures who was present in the interaction, not who was present at context creation.
+- `counterparties` -- the source context's current membership roster DIDs at the time of data flow, subject to the source context's `counterparty_policy` (§7.7.1). When data crosses a context boundary, the sending SDK applies the policy: `full` passes real DIDs through, `pseudonymized` replaces them with context-scoped pseudonyms (§9.10.4), and `redacted` sets the field to an empty list. The default for cross-context export when no policy is set is `redacted`. This captures who was present in the interaction while respecting context membership privacy.
 - `purpose` -- optional human-readable purpose from the source context.
 - `discovery_method` -- how the source was discovered by the receiver.
 - `age` -- elapsed time since the source interaction.
@@ -110,12 +110,12 @@ When data has an associated production cost (section 19.6), the `payment_amount`
 
 The protocol enforces a maximum chain depth to prevent accountability laundering -- data traversing enough contexts that its origin becomes meaningless.
 
-- **Protocol default maximum:** 3 hops.
-- At the maximum depth, data cannot trigger further cross-context tool calls.
+- **Protocol hard maximum:** 5 hops. This is a protocol-level invariant that cannot be exceeded by any context configuration. It bounds the worst-case amplification factor for chained cross-context tool calls.
+- **Context-configurable maximum:** Contexts MAY configure a lower maximum via `max_chain_depth` in `ContextParams`. The RECOMMENDED default is 3 hops. Values above the protocol hard maximum (5) are rejected at context creation time.
+- At the effective maximum depth (the lower of the context's configured limit and the protocol hard maximum), data cannot trigger further cross-context tool calls.
 - Exceeding the maximum produces a `ChainDepthExceeded` error (not a degradation -- a hard rejection).
-- The maximum is configurable per context but defaults to 3.
 
-The `check_chain_depth` operation verifies that a provenance record's chain depth is within the allowed limit. It is called before any cross-context tool invocation to enforce the bound.
+The `check_chain_depth` operation verifies that a provenance record's chain depth is within the allowed limit. It is called before any cross-context tool invocation to enforce the bound. The effective limit is `min(context.max_chain_depth.unwrap_or(3), 5)`.
 
 ## 24.5 Provenance Quality Evaluation
 
