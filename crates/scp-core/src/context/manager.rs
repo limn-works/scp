@@ -1404,7 +1404,7 @@ impl ContextManager {
             threshold_value: 0,
             pruning_policy: None,
             governance_engine,
-            economic_policy: None,
+            economic_policy: params.economic_policy.clone(),
         };
 
         // Atomic duplicate check + insert under lock.
@@ -2223,7 +2223,7 @@ impl ContextManager {
     /// Dispatches an approved governance action to its implementation method.
     ///
     /// Separated from [`execute_governance_action`] to keep the public entry
-    /// point focused on validation while this method handles the 25-action
+    /// point focused on validation while this method handles the 28-action
     /// dispatch.
     async fn dispatch_governance_action(
         &self,
@@ -3298,7 +3298,7 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
             require_active(&ctx.handle)?;
 
-            ctx.registered_tools.retain(|t| t.name != tool_id);
+            ctx.registered_tools.retain(|t| t.tool_id != tool_id);
             Self::snapshot_context(ctx)
         };
 
@@ -3352,23 +3352,36 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
+        // Extract handle under lock, then drop lock before the async
+        // transition to avoid holding the global contexts mutex across .await.
+        let handle = {
+            let contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+            ctx.handle.clone()
+        };
+
+        // Transition to Closing via the state machine (no lock held).
+        handle
+            .transition_to(&ContextState::Closing)
+            .await
+            .map_err(|_| {
+                ContextError::PermissionDenied("cannot transition to Closing".to_owned())
+            })?;
+
+        // Re-acquire lock for cleanup and snapshot.
         let snapshot = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
-            require_active(&ctx.handle)?;
-
-            // Transition to Closing via the state machine.
-            ctx.handle
-                .transition_to(&ContextState::Closing)
-                .await
-                .map_err(|_| {
-                    ContextError::PermissionDenied("cannot transition to Closing".to_owned())
-                })?;
 
             // Cancel TTL timer if active.
             ctx.ttl_timer.cancel();
+            // Drop broadcast context state -- keys are zeroed by Zeroize.
+            ctx.broadcast_context = None;
 
             Self::snapshot_context(ctx)
         };
