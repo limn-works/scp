@@ -349,6 +349,7 @@ fn encrypted_params() -> ContextParams {
 fn broadcast_params() -> ContextParams {
     ContextParams {
         mode: ContextMode::Broadcast,
+        memory_scope: scp_core::context::params::MemoryScope::Full,
         ceiling: vec![
             Capability::new("messages:read"),
             Capability::new("messages:write"),
