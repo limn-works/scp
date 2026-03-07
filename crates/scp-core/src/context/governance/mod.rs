@@ -240,7 +240,7 @@ pub fn verify_vote(
         ))
     })?;
 
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    let signature = [u8; 64]::from_bytes(&sig_bytes);
 
     voter_public_key
         .verify_strict(&hash, &signature)
@@ -373,7 +373,7 @@ pub struct CosignedCheckpoint {
     /// The DID of the signer.
     pub signer_did: DID,
     /// Ed25519 signature over the checkpoint hash.
-    pub signature: ed25519_dalek::Signature,
+    pub signature: [u8; 64],
 }
 
 /// Attestation status for a checkpoint (ADR-031 §9).
@@ -403,7 +403,7 @@ pub struct ContextCheckpoint {
     /// Creator's DID and signature.
     pub creator_did: DID,
     /// Creator's Ed25519 signature over checkpoint data.
-    pub creator_signature: ed25519_dalek::Signature,
+    pub creator_signature: [u8; 64],
     /// Governance quorum cosignatures (ADR-031 §9).
     /// Empty for SingleAdmin contexts, populated for multi-admin contexts.
     pub cosignatures: Vec<CosignedCheckpoint>,
@@ -2997,7 +2997,7 @@ mod tests {
         let cosignatures = vec![
             CosignedCheckpoint {
                 signer_did: bob(),
-                signature: ed25519_dalek::Signature::from([0u8; 64]),
+                signature: [u8; 64]::from([0u8; 64]),
             }
         ];
         
@@ -3032,11 +3032,11 @@ mod tests {
         let cosignatures = vec![
             CosignedCheckpoint {
                 signer_did: alice(),
-                signature: ed25519_dalek::Signature::from([1u8; 64]),
+                signature: [u8; 64]::from([1u8; 64]),
             },
             CosignedCheckpoint {
                 signer_did: bob(),
-                signature: ed25519_dalek::Signature::from([2u8; 64]),
+                signature: [u8; 64]::from([2u8; 64]),
             },
         ];
         
@@ -3057,7 +3057,7 @@ mod tests {
         let cosignatures = vec![
             CosignedCheckpoint {
                 signer_did: alice(),
-                signature: ed25519_dalek::Signature::from([1u8; 64]),
+                signature: [u8; 64]::from([1u8; 64]),
             },
         ];
         
@@ -3084,15 +3084,15 @@ mod tests {
         let cosignatures = vec![
             CosignedCheckpoint {
                 signer_did: alice(),
-                signature: ed25519_dalek::Signature::from([1u8; 64]),
+                signature: [u8; 64]::from([1u8; 64]),
             },
             CosignedCheckpoint {
                 signer_did: bob(),
-                signature: ed25519_dalek::Signature::from([2u8; 64]),
+                signature: [u8; 64]::from([2u8; 64]),
             },
             CosignedCheckpoint {
                 signer_did: charlie(),
-                signature: ed25519_dalek::Signature::from([3u8; 64]),
+                signature: [u8; 64]::from([3u8; 64]),
             },
         ];
         
@@ -3109,11 +3109,11 @@ mod tests {
         let cosignatures = vec![
             CosignedCheckpoint {
                 signer_did: alice(),
-                signature: ed25519_dalek::Signature::from([1u8; 64]),
+                signature: [u8; 64]::from([1u8; 64]),
             },
             CosignedCheckpoint {
                 signer_did: bob(),
-                signature: ed25519_dalek::Signature::from([2u8; 64]),
+                signature: [u8; 64]::from([2u8; 64]),
             },
         ];
         
@@ -3140,15 +3140,15 @@ mod tests {
         let cosignatures = vec![
             CosignedCheckpoint {
                 signer_did: alice(),
-                signature: ed25519_dalek::Signature::from([1u8; 64]),
+                signature: [u8; 64]::from([1u8; 64]),
             },
             CosignedCheckpoint {
                 signer_did: bob(),
-                signature: ed25519_dalek::Signature::from([2u8; 64]),
+                signature: [u8; 64]::from([2u8; 64]),
             },
             CosignedCheckpoint {
                 signer_did: charlie(),
-                signature: ed25519_dalek::Signature::from([3u8; 64]),
+                signature: [u8; 64]::from([3u8; 64]),
             },
         ];
         
@@ -3165,11 +3165,11 @@ mod tests {
         let cosignatures = vec![
             CosignedCheckpoint {
                 signer_did: alice(),
-                signature: ed25519_dalek::Signature::from([1u8; 64]),
+                signature: [u8; 64]::from([1u8; 64]),
             },
             CosignedCheckpoint {
                 signer_did: bob(),
-                signature: ed25519_dalek::Signature::from([2u8; 64]),
+                signature: [u8; 64]::from([2u8; 64]),
             },
             // Missing charlie() - not unanimous
         ];
