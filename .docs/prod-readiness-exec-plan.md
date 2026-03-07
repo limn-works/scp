@@ -418,30 +418,30 @@ SCP-267 → SCP-268 → SCP-269 → SCP-270 → SCP-271 → SCP-272 → SCP-273 
 **Lane D:** #362, #363, #364, #365, #366, #367
 **Lane E:** SCP-038 (PyO3 identity bridge — in-progress), SCP-092 (signaling — in-progress, #290 done)
 
-### Phase 11: Spec Audit NEW HIGHs (parallel with Phase 8+)
+### Phase 11: Spec Audit NEW HIGHs (parallel with Phase 8+) — COMPLETE
 
-Spec-only fixes for the 37 NEW HIGH findings. Grouped by topic:
+Spec-only fixes for the 37 NEW HIGH findings. All lanes completed on `feat/phase-11-spec` branch.
 
-**Lane H-A** — Identity spec gaps (H-01 through H-06)
-- Key custody migration, private state event log, routing_id, earned capacity, KeyPackage signing key, Merkle hash chain
+**Lane H-A** — Identity spec gaps (H-01 through H-06) ✓
+- Key custody migration (§3.2.1), private state hash chain integrity, routing_id HKDF derivation, earned capacity defaults (10 params), KeyPackage signing key (#active per RFC 9420), Merkle tree RFC 6962 alignment
 
-**Lane H-B** — Context spec gaps (H-07 through H-12)
-- Creation failure states, metadata signing, multi-parent matching, group_context extension, TOCTOU, context migration
+**Lane H-B** — Context spec gaps (H-07 through H-12) ✓
+- Creation failure states (§5.2.1), metadata signing (§5.7.1), multi-parent matching (§5.13.2), group_context extension (§5.15), TOCTOU mitigation (§5.13.1), context migration (§5.16)
 
-**Lane H-C** — Trust spec gaps (H-13 through H-18)
-- Chain depth contradiction, self-service auth, proof-of-absence, attestation independence, revocation format, counterparties privacy
+**Lane H-C** — Trust spec gaps (H-13 through H-18) ✓
+- Chain depth 3-way contradiction resolved (default 5, max 10), self-service registry auth, proof-of-absence (sorted boundary proof), attestation independence criteria, revocation field format, counterparties privacy (counterparty_policy §7.7.1)
 
-**Lane H-D** — Security spec gaps (H-19 through H-26)
-- Equivocation response, chunking, AccessKeyRequest timing, push registration, multi-device sync, media keys, QUIC 0-RTT, UCAN CID
+**Lane H-D** — Security spec gaps (H-19 through H-26) ✓
+- Equivocation response protocol, chunking wire format, AccessKeyRequest 5min window + nonce cache, push registration protocol, multi-device MLS model, media key derivation (MLS exporter), QUIC 0-RTT anti-replay, UCAN CID spec (SHA-256 + DAG-CBOR + CIDv1)
 
 **Lane H-E** — Versioning spec gaps (H-28 through H-32)
 - Already covered by Phase 0 Lane S-C
 
-**Lane H-F** — Bridge spec gaps (H-27, H-33)
-- Bridge metadata in SS5.7, reverse bridge flow
+**Lane H-F** — Bridge spec gaps (H-27, H-33) ✓
+- Bridge metadata in context metadata (§5.7), SCP-to-platform reverse bridge flow (§12.10)
 
-**Lane H-G** — Sync/provenance spec gaps (H-34 through H-37)
-- Counterparties privacy, EpochGraceStore crash recovery, checkpoint verification, event log reconciliation trust
+**Lane H-G** — Sync/provenance spec gaps (H-34 through H-37) ✓
+- Counterparties provenance privacy (§24.3.5), EpochGraceStore crash recovery (§23.11), checkpoint signature verification (§23.12), event log reconciliation verification (§23.13)
 
 ### Spec-Code Alignment (parallel with Phase 6+)
 
