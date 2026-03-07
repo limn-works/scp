@@ -35,6 +35,7 @@ openmls = { workspace = true }
 openmls_traits = { workspace = true }
 serde_json = { workspace = true }
 rmp-serde = { workspace = true }
+ed25519-dalek = { workspace = true }
 tempfile = "3"
 
 [[test]]
@@ -52,6 +53,10 @@ path = "tests/integration/persistence_advanced.rs"
 [[test]]
 name = "protocol_store"
 path = "tests/integration/protocol_store.rs"
+
+[[test]]
+name = "e2e_context_manager"
+path = "tests/integration/e2e_context_manager.rs"
 
 [lints]
 workspace = true
