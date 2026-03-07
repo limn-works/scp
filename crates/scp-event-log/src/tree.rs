@@ -92,6 +92,9 @@ pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
     // 6. Insert into sorted index.
     log.sorted_leaves.insert((leaf_hash, leaf_index));
 
+    // 7. Store the full event payload for retrieval (#303, #330).
+    log.push_event(event.clone());
+
     Ok(leaf_index)
 }
 
@@ -197,6 +200,9 @@ pub fn append_unsigned_event(log: &mut EventLog, event: &Event) -> Result<u64, E
 
     // 5. Insert into sorted index.
     log.sorted_leaves.insert((leaf_hash, leaf_index));
+
+    // 6. Store the full event payload for retrieval (#303, #330).
+    log.push_event(event.clone());
 
     Ok(leaf_index)
 }

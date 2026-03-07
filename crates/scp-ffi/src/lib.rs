@@ -47,6 +47,7 @@ pub mod error;
 pub mod event_log;
 pub mod identity;
 pub mod mcp;
+pub mod provenance;
 pub mod runtime;
 pub mod tools;
 pub mod transport;
@@ -196,6 +197,7 @@ fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     transport::register_transport(m)?;
     ucan::register_ucan(m)?;
     event_log::register_event_log(m)?;
+    provenance::register_provenance(m)?;
     mcp::register_mcp(m)?;
 
     Ok(())

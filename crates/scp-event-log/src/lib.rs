@@ -272,6 +272,9 @@ pub enum EventLogError {
 /// A sorted index (`sorted_leaves`) is maintained alongside the append-order
 /// tree for future absence proof support.
 ///
+/// Event payloads are stored alongside hashes for retrieval and provenance
+/// verification. See issue #303.
+///
 /// See ADR-011 acceptance criterion 1.
 pub struct EventLog {
     /// SHA-256 hashes of serialized events, in append order.
@@ -283,6 +286,9 @@ pub struct EventLog {
     context_id: ContextId,
     /// Sorted index of `(leaf_hash, leaf_index)` for absence proof support.
     sorted_leaves: BTreeSet<([u8; 32], u64)>,
+    /// Full event payloads stored alongside leaf hashes, indexed by sequence.
+    /// Enables `get_event` and `query_events` retrieval (#303, #330).
+    events: Vec<Event>,
 }
 
 impl EventLog {
@@ -294,6 +300,7 @@ impl EventLog {
             tree: Vec::new(),
             context_id,
             sorted_leaves: BTreeSet::new(),
+            events: Vec::new(),
         }
     }
 
@@ -319,6 +326,43 @@ impl EventLog {
     #[must_use]
     pub const fn sorted_leaves(&self) -> &BTreeSet<([u8; 32], u64)> {
         &self.sorted_leaves
+    }
+
+    /// Returns the stored events.
+    #[must_use]
+    pub fn events(&self) -> &[Event] {
+        &self.events
+    }
+
+    /// Returns the full event at the given sequence number.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventLogError::LeafIndexOutOfBounds`] if `sequence` is
+    /// greater than or equal to the number of events.
+    /// Returns [`EventLogError::EmptyLog`] if the log has no events.
+    pub fn get_event(&self, sequence: u64) -> Result<&Event, EventLogError> {
+        if self.events.is_empty() {
+            return Err(EventLogError::EmptyLog);
+        }
+        let idx = usize::try_from(sequence).map_err(|_| EventLogError::LeafIndexOutOfBounds {
+            index: sequence,
+            count: self.events.len() as u64,
+        })?;
+        self.events
+            .get(idx)
+            .ok_or(EventLogError::LeafIndexOutOfBounds {
+                index: sequence,
+                count: self.events.len() as u64,
+            })
+    }
+
+    /// Stores a full event payload alongside the leaf hash.
+    ///
+    /// Called by [`tree::append`] and [`tree::append_unsigned_event`]
+    /// after the event passes verification.
+    pub(crate) fn push_event(&mut self, event: Event) {
+        self.events.push(event);
     }
 
     /// Pushes a pre-computed leaf hash into the log and rebuilds the tree.

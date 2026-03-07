@@ -2899,3 +2899,91 @@ pub(crate) fn parse_custody_method(custody: &str) -> Result<CustodyMethod, ScpEr
         }),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Provenance quality evaluation
+// ---------------------------------------------------------------------------
+
+/// Evaluates the provenance quality tier for data with the given parameters.
+///
+/// Returns an integer (0-3) representing the quality tier:
+/// - `0` = `NoProvenance`
+/// - `1` = `EphemeralKnownParties`
+/// - `2` = `SummaryVerified`
+/// - `3` = `PersistentVerifiable`
+///
+/// See spec §24.5 and ADR-019.
+///
+/// # Errors
+///
+/// Returns [`ScpError::Validation`] if `source_type` or `context_state`
+/// contain unrecognized values.
+#[uniffi::export]
+#[allow(clippy::needless_pass_by_value)] // UniFFI requires owned String parameters
+pub fn evaluate_provenance_quality(
+    source_context: Option<String>,
+    source_type: String,
+    context_state: String,
+    counterparties: Vec<String>,
+) -> Result<u32, ScpError> {
+    use scp_core::provenance::evaluate::{SourceContextState, evaluate_quality};
+    use scp_core::provenance::{DiscoveryMethod, SourceType};
+
+    let st = match source_type.as_str() {
+        "persistent" => SourceType::Persistent,
+        "ephemeral" => SourceType::Ephemeral,
+        "summary" => SourceType::Summary,
+        other => {
+            return Err(ScpError::Validation {
+                message: format!(
+                    "invalid source_type '{other}': expected 'persistent', 'ephemeral', or 'summary'"
+                ),
+                code: "SCP-VALID-7000".to_owned(),
+            });
+        }
+    };
+
+    let cs = match context_state.as_str() {
+        "active" => SourceContextState::Active,
+        "closed_with_summary_verified" => SourceContextState::ClosedWithSummary {
+            summary_verified: true,
+        },
+        "closed_with_summary_unverified" => SourceContextState::ClosedWithSummary {
+            summary_verified: false,
+        },
+        "closed_ephemeral" => SourceContextState::ClosedEphemeral,
+        "unknown" => SourceContextState::Unknown,
+        other => {
+            return Err(ScpError::Validation {
+                message: format!(
+                    "invalid context_state '{other}': expected 'active', \
+                     'closed_with_summary_verified', 'closed_with_summary_unverified', \
+                     'closed_ephemeral', or 'unknown'"
+                ),
+                code: "SCP-VALID-7000".to_owned(),
+            });
+        }
+    };
+
+    let provenance = source_context.map(|ctx| scp_core::provenance::DataProvenance {
+        source_context: ctx,
+        source_type: st,
+        counterparties: counterparties
+            .into_iter()
+            .map(scp_identity::DID::from)
+            .collect(),
+        purpose: None,
+        discovery_method: DiscoveryMethod::None,
+        age: std::time::Duration::from_secs(0),
+        memory_scope: scp_core::context::MemoryScope::Full,
+        chain_depth: 0,
+        chain_path: None,
+        payment_amount: None,
+        payment_adapter: None,
+        payment_receipt_id: None,
+    });
+
+    let quality = evaluate_quality(provenance.as_ref(), &cs);
+
+    Ok(quality as u32)
+}

@@ -107,6 +107,7 @@ pub use bridge::{
     context_reset_ttl_timer,
     context_send,
     context_subscribe,
+    evaluate_provenance_quality,
     // Free functions — event log
     event_log_query,
     event_log_verify,
