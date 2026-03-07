@@ -12,6 +12,12 @@
 //!
 //! See spec section 17.6 and ADR-006.
 
+#[cfg(feature = "software_platform")]
+pub mod key_custody;
+
+#[cfg(feature = "software_platform")]
+pub use key_custody::SqliteKeyCustody;
+
 use std::path::Path;
 use std::sync::Mutex;
 
