@@ -20,6 +20,32 @@ Contexts are created by accountable identities only. Anonymous or unbound entiti
 
 Context creation branches on `ContextMode` (§5.14). Encrypted contexts create an MLS group during the `Creating → Active` transition. Broadcast contexts skip MLS group creation and instead initialize the creator's broadcast key (epoch 0). Both modes produce a context with an event log, governance model, roles, and transport subscriptions — the mode determines the encryption pipeline, not the context's structural properties.
 
+### 5.2.1 Context Creation Failure Handling
+
+Context creation is a multi-step operation that can fail at any point. The protocol requires **atomic creation semantics** — a context either fully exists or does not exist at all. No partial contexts are observable by any participant.
+
+**Failure points and rollback behavior:**
+
+| Step | Operation | Failure rollback |
+|------|-----------|-----------------|
+| 1 | Governance validation (ceiling policy, roles, template conformance) | No state created. Return error to creator. |
+| 2 | Context ID generation and local state initialization | Destroy local state. Return error. |
+| 3 | MLS group creation (Encrypted mode) or broadcast key initialization (Broadcast mode) | Destroy MLS group state / broadcast key material. Destroy local state. Return error. |
+| 4 | Event log initialization (first entry: `Created`) | Destroy event log, MLS group state / broadcast key material, local state. Return error. |
+| 5 | UCAN minting for creator's initial capabilities | Destroy minted tokens, event log, MLS group state / broadcast key material, local state. Return error. |
+| 6 | Relay registration (transport subscription, metadata publication) | Issue best-effort DELETE for any published relay messages. Destroy all local state (UCANs, event log, MLS group / broadcast keys, context state). Return error. |
+| 7 | Initial member addition (if creation includes members beyond creator) | Issue MLS remove for added members, relay DELETE for membership messages. Destroy all local state. Return error. |
+
+**Rollback ordering.** Rollback proceeds in reverse creation order. Each step's rollback is idempotent — repeated rollback of the same step produces no additional side effects.
+
+**Relay cleanup is best-effort.** Relays are untrusted infrastructure and cannot be forced to delete published messages. However, any orphaned relay messages from a failed creation are encrypted with destroyed key material and cannot be decrypted. Orphaned blobs consume relay storage and expose routing metadata; the SDK SHOULD track failed creation cleanup attempts and retry on next relay connection. Relay compliance with deletion requests is tracked as part of relay reliability scoring (§9.9.2).
+
+**Creator observability.** On failure, the creator receives an error indicating the failure point (e.g., `ContextCreationFailed::RelayRegistration`). No `ContextCreated` event is emitted. No other participant observes any state from the failed creation — the context ID is not reusable (UUIDs are unique), but no context with that ID exists in the protocol.
+
+**Retry semantics.** Creation is safe to retry after failure. Each retry generates a new context ID and fresh key material. The failed creation's context ID is abandoned — there is no "resume" mechanism for partially created contexts.
+
+**Child context creation failure.** For child contexts (§5.13.3), creation failure after governance approval from one or more parents does not consume the approval. Parent governance proposals for the failed child are marked as expired (not executed), and new proposals are required for a retry. This prevents a failure in one parent's relay from silently consuming another parent's governance approval.
+
 ## 5.3 Capability Ceiling
 
 Every context declares a capability ceiling at creation: the maximum set of things that can happen in this space. This ceiling bounds what tools can do, what roles can grant, and what agents can exercise. Standard capability categories include:
@@ -40,7 +66,7 @@ Capability categories apply uniformly across context modes. `messagesRead` and `
 
 Every context also declares a **ceiling policy** at creation — whether the ceiling can change and how. The ceiling policy itself is immutable (locked at creation, cannot be changed). Two policies are available:
 
-- **`immutable`** (default for all well-known templates): Ceiling cannot change after creation. To expand capabilities, create a new context and migrate. Strongest security guarantee — members know the ceiling they opted into is permanent.
+- **`immutable`** (default for all well-known templates): Ceiling cannot change after creation. To expand capabilities, create a new context and migrate (§5.11A). Strongest security guarantee — members know the ceiling they opted into is permanent.
 - **`governed`**: Ceiling can be modified through the context's governance model (admin, multi-sig, consensus). Changes are logged in the event log and visible to all members before taking effect. Members who joined under a narrower ceiling are notified and may leave before the expansion takes effect.
 
 The ceiling policy is visible in context metadata (§5.7) before opt-in. A prospective member sees both the current ceiling and the policy governing changes.
@@ -156,6 +182,39 @@ Prospective members retrieve context parameters by subscribing to the `metadata_
 
 Metadata updates (e.g., governance-driven ceiling modifications in `governed` contexts) are republished to the same routing address. Relays treat metadata records as standard relay messages — no special relay-side logic is required.
 
+### 5.7.2 Metadata Signing, Freshness, and Replay Protection
+
+**Signing key.** Metadata records are signed by a current context admin's **Active Signing Key (`#active`)** from their DID document. The `#active` key is the human-controlled operational signing key (§3), consistent with its use for governance actions and context management operations. Agent Signing Keys (`#agent`) MUST NOT sign metadata records — metadata publication is a governance-adjacent operation that requires human-accountable authorization.
+
+**Metadata record format:**
+
+```
+MetadataRecord {
+    context_id:       ContextId,
+    sequence:         u64,            // Monotonically increasing, starts at 1
+    signer_did:       DID,            // Admin who signed this record
+    timestamp:        u64,            // Unix milliseconds, informational (not used for ordering)
+    structural:       StructuralMetadata,
+    operational:      FilteredOperationalMetadata,  // Filtered by MetadataVisibilityPolicy
+    signature:        Ed25519Signature,
+}
+
+Signature formula:
+Ed25519_sign(active_signing_key, SHA-256(
+    context_id || sequence || signer_did || timestamp || serialize(structural) || serialize(operational)
+))
+```
+
+**Monotonic sequence number.** Each metadata record carries a `sequence` number that increments by 1 on every metadata update. The sequence starts at 1 (the initial metadata record published at context creation). The sequence provides a total ordering of metadata states independent of wall-clock time.
+
+**Replay protection.** Consumers of metadata records (prospective members, relay caches, SDK metadata fetchers) MUST reject any metadata record with a `sequence` number less than or equal to the highest `sequence` they have previously observed for that `context_id`. This prevents a relay or network attacker from serving stale metadata to misrepresent a context's current state (e.g., showing a narrower ceiling that has since been expanded, or hiding a governance model change).
+
+**Signer verification.** A prospective member verifying a metadata record: (1) resolves the `signer_did` via DID resolution (§3), (2) extracts the `#active` verification method, (3) verifies the Ed25519 signature, (4) cannot independently verify that the signer is a current admin without joining (admin status is internal context state). The signature guarantees that the metadata was produced by the claimed DID; the `signer_did` being an admin is a social-layer assurance, not a cryptographic one. Once a member joins and has access to the membership roster and role assignments, they can retroactively verify that the signer held admin status at the time of signing.
+
+**Staleness.** The protocol does not define a hard metadata TTL — metadata validity is determined by the `sequence` number, not by age. However, SDKs SHOULD re-fetch metadata before presenting it to a user for a join decision if the cached record is older than 5 minutes, as a defense-in-depth measure against stale cache attacks.
+
+**Metadata update distribution.** Metadata updates originating from governance actions (e.g., `ModifyCeiling`, `ModifyRoles`) are distributed through two paths: (1) republished to the `metadata_routing_id` for external consumers, and (2) distributed to current members via MLS application messages (Encrypted mode) or relay messages (Broadcast mode) as a `MetadataUpdated` event in the event log. Internal distribution includes the full operational metadata (not filtered by visibility policy) since recipients are already members.
+
 ## 5.8 Context Identity
 
 Contexts are cryptographic entities. You opt into a key, not a name. Spoofing a cryptographic identity is hard; spoofing a name is a UI problem for clients to solve.
@@ -250,6 +309,76 @@ Relay deletion is best-effort — relays are untrusted infrastructure and cannot
 - Fragmented payloads can't reassemble undetected across interactions because each fragment's origin is traceable
 
 **Enforcement honesty.** The protocol enforces memory scope through cryptographic key destruction — specifically, MLS group state destruction (tree secrets, all epoch key schedules, application key material). This is verifiable and absolute for protocol-level data. Platform-attested destruction (§9.15) provides hardware-backed evidence that keys were deleted where available. However, the protocol cannot enforce memory scope above the protocol boundary. An agent's underlying model may retain information from an ephemeral interaction in its own memory. The spec is explicitly honest about this limitation: ephemeral memory scope destroys the protocol-level record and makes reproduction unverifiable, but does not guarantee the agent has forgotten. The absence of provenance on information an agent produces from memory is itself a signal — "this data has no verified origin." Participants in other contexts can evaluate unprovenanced information accordingly.
+
+## 5.11A Context Migration
+
+When a context with an `immutable` ceiling policy (§5.3) needs capabilities beyond its ceiling, or when any context needs to transition to fundamentally different parameters (different governance model, different mode), the protocol path is migration: create a new context and coordinate member transition. Migration is a governance-initiated, member-consented protocol — not an automatic operation.
+
+### 5.11A.1 Migration Initiation
+
+Migration is initiated through a governance proposal of type `ProposeContextMigration`:
+
+```
+ProposeContextMigration {
+    new_context_params: ContextParams,   // Parameters for the destination context
+    reason: String,                       // Human-readable migration rationale
+    grace_period: Duration,               // Read-only period for old context (RECOMMENDED: 7 days)
+    auto_invite: bool,                    // Whether to bulk-invite all current members
+}
+```
+
+The proposal follows the context's governance model (§5.9) — SingleAdmin auto-executes, Threshold/Majority/Unanimity require the configured quorum. Migration proposals are logged in the event log.
+
+### 5.11A.2 Destination Context Creation
+
+On proposal approval, the initiating admin creates a new context with the specified `new_context_params`. The destination context:
+
+- Is a fully independent context with its own context ID, MLS group (or broadcast keys), event log, and key material.
+- MAY have the same parameters as the source (e.g., same governance model, same roles) or different parameters (expanded ceiling, different governance, different mode).
+- Includes a `migration_source` field in its metadata: the source context ID and the governance proposal ID that authorized the migration. This provides provenance for why the destination exists.
+- Does NOT inherit the source context's event log, message history, or key material. The destination starts fresh. This is a deliberate security property: new key material means the destination has clean forward secrecy boundaries.
+
+### 5.11A.3 Member Migration
+
+If `auto_invite` is true, the initiating admin sends bulk invitations to all current members of the source context. Members accept or decline individually — migration does not force membership transfer.
+
+**Notification.** All source context members receive a `ContextMigrationProposed` event containing the destination context ID, the migration reason, the grace period, and the new context parameters. This allows members to evaluate the destination before accepting.
+
+**No automatic transfer.** Members are never automatically moved. Each member must individually accept the invitation and join the destination context through the standard join flow. This preserves the opt-in contract: the destination context may have different parameters (expanded ceiling, different governance), and members must consent to those parameters.
+
+### 5.11A.4 Grace Period
+
+After migration is approved, the source context enters a **read-only grace period**:
+
+- **Duration:** Configurable in the proposal. RECOMMENDED default: 7 days.
+- **Read-only semantics:** No new messages, tool invocations, or governance actions (except `ProposeContextMigration` cancellation) are accepted. Members can still read existing content and retrieve history.
+- **Purpose:** Gives all members time to discover the migration, evaluate the destination, join if desired, and retrieve any data they need from the source.
+- **Event log entry:** `ContextMigrationStarted { destination_id, grace_period_end }` is emitted when the grace period begins.
+
+### 5.11A.5 Source Context Tombstoning
+
+After the grace period expires:
+
+- The source context is **tombstoned** — permanently closed with a `ContextTombstoned { destination_id, migration_proposal_id }` event log entry.
+- A tombstoned context is closed (no new actions) and carries a permanent pointer to the destination context ID in its metadata. Any identity that resolves the source context's metadata sees the migration destination.
+- Key destruction follows the source context's memory scope (§5.11). A context with `Full` memory scope retains readable history after tombstoning. A context with `Ephemeral` scope destroys keys on tombstoning.
+- The tombstone record is published to the source context's `metadata_routing_id` so that late-arriving prospective members discover the migration.
+
+### 5.11A.6 Message History
+
+Message history is NOT transferred during migration. The destination context starts with an empty event log. This is intentional:
+
+- **Cryptographic boundary.** The source context's messages are encrypted with the source's MLS group keys (or broadcast keys). Transferring history would require either re-encrypting all messages with the destination's keys (expensive, breaks forward secrecy properties) or sharing source key material with the destination (security violation).
+- **Clean provenance.** The destination context's provenance chain starts fresh. Any data brought forward by members carries its own provenance ("sourced from context X").
+- **Source remains readable.** During the grace period (and after, if memory scope is `Full`), members can still read the source context's history. The source is not deleted — it is tombstoned.
+
+### 5.11A.7 Migration and Child Contexts
+
+If the source context has child contexts (§5.13):
+
+- Children are NOT automatically migrated. Each child's `on_sever` configuration (§5.13.4) governs what happens when the source context tombstones (which is equivalent to a parent close from the child's perspective).
+- If the destination context should parent the same children, new child contexts must be created with the destination as parent. The source context's children and the destination context's children are independent.
+- The migration proposal SHOULD document the intended child context disposition for operational clarity.
 
 ## 5.12 Context Templates and Lightweight Creation
 
@@ -642,6 +771,16 @@ Eligible pool for child: [Alice, Bob, Carol, Dave, Eve]
 
 2. **Relay-level validation.** Relay infrastructure independently validates eligibility constraints on child context creation messages and membership addition messages. The relay verifies that (a) the child's declared ceiling is a subset of the intersection of all parent ceilings, and (b) each member being added is present in at least one parent context's membership roster. Relay-side validation is independent of SDK behavior — a non-compliant SDK that attempts to create a child context violating parent ceiling constraints or add ineligible members will have its messages rejected by the relay. This makes eligibility enforcement a protocol-level guarantee, not an SDK honor system.
 
+**TOCTOU mitigation for eligibility checks.** A time-of-check-to-time-of-use race exists between SDK-side eligibility validation and relay-side validation: a member could be removed from their only parent between when the SDK checks eligibility and when the relay processes the child join message. The protocol mitigates this as follows:
+
+1. **Relay checks are authoritative.** The relay validates eligibility at message processing time, not at SDK submission time. If the parent membership roster has changed between SDK check and relay processing, the relay's check reflects the current state. The relay's accept/reject decision is final.
+
+2. **Eligibility proofs carry epoch binding.** When the SDK constructs a child context join or member-add message, the message includes an `eligibility_proof` containing the parent context ID(s) through which eligibility is claimed and the parent's current MLS epoch number (for Encrypted parents) or the parent's current membership sequence number (for Broadcast parents). This binds the eligibility claim to a specific point in the parent's membership state.
+
+3. **Epoch staleness bound.** The relay MUST reject an eligibility proof if the parent's current epoch (or membership sequence) has advanced more than 2 epochs beyond the epoch cited in the proof. This bounds the TOCTOU window: if the parent's membership has changed significantly (more than 2 MLS commits) since the proof was generated, the proof is stale and the SDK must regenerate it with current parent state. The value of 2 allows for normal concurrent MLS commits (e.g., key updates by other members) without forcing unnecessary proof regeneration.
+
+4. **In-flight MLS add rejection.** If the relay rejects an eligibility-bearing MLS add message, the MLS Commit containing the add is rejected entirely. The SDK receives an error and must re-evaluate eligibility before retrying. No partial MLS state change occurs — MLS Commits are atomic.
+
 **Distinction from parent sever.** Individual member removal from an active parent triggers continuous eligibility enforcement. When a parent itself severs (closes or is disconnected), the outcome is governed by the `on_sever` configuration agreed upon at creation (§5.13.4), which may differ from the continuous eligibility default.
 
 **Joining a child does not grant membership in any parent.** Bob joining child C (via eligibility through parent B) does not make Bob a member of parent A. Parent membership is independent. The child is a meeting point, not a gateway.
@@ -669,14 +808,53 @@ Alice (in A + B) → sdk.create_child_context(
 
 **B. Coordinated creation across contexts.** Alice is in A with creation rights. Bob is in B with creation rights. Neither is in the other's context. They coordinate (via a bilateral context, shared context, or out-of-band) to create child C.
 
-Coordination uses an intrinsic tool call available within each context's governance. Alice invokes the child-creation tool in A with the proposed child params and the list of co-parents. A's governance evaluates and, if approved, publishes a **child creation proposal** — a signed, content-addressed record of the approved params. Bob does the same in B. The protocol matches proposals by their content hash: when all proposed parents have published matching proposals (identical child params), the child is created. Proposals expire after a configurable timeout (suggested default: 1 hour).
+Coordination uses an intrinsic tool call available within each context's governance. Alice invokes the child-creation tool in A with the proposed child params and the list of co-parents. A's governance evaluates and, if approved, publishes a **child creation proposal** — a signed, content-addressed record of the approved params. Bob does the same in B. The protocol matches proposals by their content hash: when all proposed parents have published matching proposals (identical child params), the child is created.
+
+**Proposal format and matching algorithm:**
+
+```
+ChildCreationProposal {
+    proposal_id:        UUID,                // Unique per proposal
+    child_params:       ContextParams,       // Full child context parameters
+    parent_context_ids: Vec<ContextId>,       // Sorted lexicographically — all proposed parents
+    proposer_did:       DID,                  // The member who initiated in this parent
+    parent_context_id:  ContextId,            // The parent publishing this proposal
+    created_at:         u64,                  // Unix milliseconds
+    expires_at:         u64,                  // Unix milliseconds (created_at + timeout)
+    approval_signature: Ed25519Signature,     // Governance approval signature (admin #active key)
+}
+
+Matching hash (content-addressed):
+    match_hash = SHA-256(
+        canonical_msgpack(child_params) || sorted(parent_context_ids)
+    )
+```
+
+Proposals from different parents match when their `match_hash` values are identical — meaning they propose the same child parameters for the same set of parents. The `child_params` are serialized in canonical MessagePack (sorted map keys, no optional field omission) to ensure deterministic hashing across independent serialization by different SDKs.
+
+**Proposal publication.** Each approved proposal is published as a relay message to a coordination routing address derived from the match hash:
+
+```
+coordination_routing_id = SHA-256(match_hash || "scp-child-creation")
+```
+
+All parents' SDKs subscribe to this routing address. When an SDK observes proposals from all parents in the `parent_context_ids` list with the same `match_hash`, all proposals are matched and creation proceeds.
+
+**Timeout.** Proposals expire after a configurable timeout. RECOMMENDED default: 5 minutes. The timeout is declared in the proposal (`expires_at`). If not all parents have published matching proposals before any proposal's `expires_at`, the coordination fails. Expired proposals are discarded — they cannot be matched against later proposals.
+
+**Partial approval handling.** Coordination is all-or-nothing. If any parent's governance rejects the proposal, creation fails entirely. If some parents approve and others have not yet responded:
+
+- Approved proposals are published and wait for matching.
+- If the timeout elapses before all parents approve, all published proposals expire. No child is created.
+- Expired proposals are logged in their respective parent's event log as `ChildCreationProposalExpired { match_hash, reason: .timeout }`.
+- A new coordination attempt requires new governance proposals in all parents — expired approvals are not reusable.
 
 ```
 Alice (in A) → invokes child creation tool → A's governance approves
-             → A publishes proposal { hash(child_params), parent_list, approval_sig }
+             → A publishes proposal { match_hash, parent_list, approval_sig }
 Bob (in B)   → invokes child creation tool → B's governance approves
-             → B publishes proposal { hash(child_params), parent_list, approval_sig }
-Protocol matches proposals by content hash
+             → B publishes proposal { match_hash, parent_list, approval_sig }
+SDK observes matching proposals from all parents
 → Child C created
 → Both Alice and Bob are initial members
 ```
@@ -697,6 +875,39 @@ This reuses the existing tool call model — no new protocol primitive. The chil
 - **Lineage is unforgeable.** Claiming different parents after creation would require creating a new MLS group with a different `group_id`. Any member can verify the parent lineage by inspecting the `group_context` extensions — no trust in metadata required.
 - **Two independent verification paths.** The parent relationship is recorded in both the MLS `group_context` (cryptographic, part of the group identity) and the event log (Merkle tree, signed entries). Both would need to be compromised to forge lineage.
 - **Governance config is tamper-evident.** The content hash of the `ParentGovernanceConfig` in the `group_context` means any discrepancy between the claimed governance configuration and the cryptographically committed one is detectable.
+
+**MLS group_context extension format.** SCP defines a custom MLS extension for carrying context parameters in the `group_context`. The extension uses the IANA private-use range for MLS extension types:
+
+```
+Extension Type ID: 0xFF01 (SCP Context Parameters)
+
+ExtensionType: 0xFF01
+ExtensionData: MessagePack-serialized ScpContextExtension
+
+ScpContextExtension {
+    context_id:               ContextId,           // The SCP context ID
+    context_mode:             u8,                   // 0 = Encrypted, 1 = Broadcast
+    governance_policy_hash:   [u8; 32],            // SHA-256 of canonical_msgpack(governance_policy)
+    ceiling_policy:           u8,                   // 0 = Immutable, 1 = Governed
+    ceiling_hash:             [u8; 32],            // SHA-256 of canonical_msgpack(capability_ceiling)
+    parent_context_ids:       Vec<ContextId>,       // Sorted lexicographically; empty for root contexts
+    parent_governance_hash:   Option<[u8; 32]>,    // SHA-256 of canonical_msgpack(parent_governance_configs); None for root contexts
+}
+```
+
+**Serialization.** The `ScpContextExtension` is serialized using canonical MessagePack (sorted map keys, deterministic encoding), matching SCP's standard serialization format (§17). This ensures that independent implementations produce identical byte representations for the same extension contents.
+
+**Extension type ID.** `0xFF01` is in the IANA private-use range for MLS extension types (`0xFF00`-`0xFFFF`), as defined in RFC 9420 Section 17.3. If SCP registers with IANA in the future, the extension type ID will transition to an assigned value. SDKs MUST accept both the private-use ID and any future assigned ID during a transition period.
+
+**Validation rules:**
+
+1. The `ScpContextExtension` with type ID `0xFF01` MUST be present in the `group_context.extensions` of every SCP MLS group. MLS groups without this extension are not SCP contexts and MUST be rejected.
+2. The `context_id` in the extension MUST match the context ID in the context's metadata and event log.
+3. The `governance_policy_hash` MUST match `SHA-256(canonical_msgpack(governance_policy))` computed from the context's declared governance policy.
+4. The `ceiling_hash` MUST match `SHA-256(canonical_msgpack(capability_ceiling))` computed from the context's declared capability ceiling.
+5. For child contexts: `parent_context_ids` MUST be non-empty and sorted lexicographically. `parent_governance_hash` MUST be present and match `SHA-256(canonical_msgpack(parent_governance_configs))`.
+6. For root contexts: `parent_context_ids` MUST be empty. `parent_governance_hash` MUST be `None`.
+7. Any mismatch between the extension contents and the context's metadata is a protocol violation. The SDK MUST reject the MLS group and report the discrepancy.
 
 **Parent awareness.** When Context A's governance receives a child creation proposal that includes Context B as a co-parent, A's governance sees B's context metadata (§5.7) — ceiling, member count, governance model, age, etc. This is the same metadata visible to anyone inspecting a context before joining. A's governance can evaluate whether a relationship with B is acceptable based on this metadata.
 
