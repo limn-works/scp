@@ -556,6 +556,66 @@ impl GovernanceEngine for ThresholdEngine {
 
     fn list_proposals(&self) -> Vec<GovernanceProposal> {
         self.proposals.values().cloned().collect()
+    fn pending_proposal_ids(&self) -> Vec<ProposalId> {
+        self.proposals
+            .iter()
+            .filter(|(_, p)| p.status.is_pending())
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    fn remove_departed_voter(
+        &mut self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        context: &GovernanceContext,
+    ) -> Result<(Option<ProposalStatus>, Vec<GovernanceEvent>), GovernanceError> {
+        let proposal = self.proposals.get_mut(proposal_id).ok_or_else(|| {
+            GovernanceError::ProposalNotFound {
+                id: hex::encode(proposal_id),
+            }
+        })?;
+        if !proposal.status.is_pending() {
+            return Ok((None, Vec::new()));
+        }
+        let had_vote = proposal.approvals.iter().any(|v| v.voter_did == *voter)
+            || proposal.rejections.iter().any(|v| v.voter_did == *voter);
+        if had_vote {
+            proposal.approvals.retain(|v| v.voter_did != *voter);
+            proposal.rejections.retain(|v| v.voter_did != *voter);
+        }
+        // Re-resolve after vote removal.
+        let (status, events) = self.resolve_proposal(proposal_id, context.now)?;
+        if status.is_terminal() {
+            Ok((Some(status), events))
+        } else {
+            Ok((None, events))
+        }
+    }
+
+    fn invalidate_proposal(
+        &mut self,
+        proposal_id: &ProposalId,
+        reason: String,
+    ) -> Result<Vec<GovernanceEvent>, GovernanceError> {
+        let proposal = self.proposals.get_mut(proposal_id).ok_or_else(|| {
+            GovernanceError::ProposalNotFound {
+                id: hex::encode(proposal_id),
+            }
+        })?;
+        if !proposal.status.is_pending() {
+            return Err(GovernanceError::ProposalNotPending {
+                status: format!("{:?}", proposal.status),
+            });
+        }
+        proposal.status = ProposalStatus::Invalidated {
+            reason: reason.clone(),
+        };
+        Ok(vec![GovernanceEvent::ProposalResolved {
+            proposal_id: *proposal_id,
+            status: ProposalStatus::Invalidated { reason },
+        }])
+
     }
 }
 

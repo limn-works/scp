@@ -23,6 +23,7 @@ use super::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
     create_context as builder_create_context,
 };
+use super::governance::timeout::GovernanceTimeoutTask;
 use super::governance::{
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceEvent, GovernanceModelConfig,
     GovernanceProposal, KeyResolver, ProposalId, ProposalStatus, PruningPolicy, RevocationScope,
@@ -402,15 +403,12 @@ struct PerContextState {
     /// Pruning policy override (ADR-030 §6).
     pruning_policy: Option<PruningPolicy>,
     /// The governance engine for this context (ADR-031, spec §5.9).
-    ///
-    /// Initialized at context creation based on `GovernanceModel` in
-    /// `ContextParams`. Handles proposal creation, voting, and quorum
-    /// evaluation. The engine is restored from `GovernanceModelConfig` on
-    /// restart.
     governance_engine: Box<dyn GovernanceEngine>,
-    /// Mutable economic policy (§19.3, ADR-033). Updated via
-    /// `SetEconomicPolicy` / `LockEconomicPolicy` governance actions.
+    /// Mutable economic policy (§19.3, ADR-033).
     economic_policy: Option<EconomicPolicy>,
+    /// Governance timeout task (SCP-271, ADR-031 §5).
+    #[allow(dead_code)]
+    governance_timeout_task: GovernanceTimeoutTask,
 }
 
 /// Creates a governance engine from a [`GovernanceModel`] selector and
@@ -1025,6 +1023,7 @@ impl ContextManager {
             pruning_policy: ctx_snapshot.pruning_policy,
             governance_engine,
             economic_policy: ctx_snapshot.economic_policy,
+            governance_timeout_task: GovernanceTimeoutTask::new(),
         };
 
         {
@@ -1241,6 +1240,7 @@ impl ContextManager {
             pruning_policy: None,
             governance_engine,
             economic_policy: params.economic_policy.clone(),
+            governance_timeout_task: GovernanceTimeoutTask::new(),
         };
 
         // Atomic duplicate check + insert under lock -- no .await inside this scope.
