@@ -117,8 +117,8 @@ pub use custody_violation::{
 #[cfg(feature = "testing")]
 pub use participation::compute_participation_record;
 pub use participation::{
-    ParticipationFact, ParticipationProfile, ParticipationRecord, ParticipationThreshold,
-    RequireParticipation,
+    ParticipationAdmissionError, ParticipationFact, ParticipationProfile, ParticipationRecord,
+    ParticipationThreshold, RequireParticipation, verify_participation_requirements,
 };
 pub use renewal::{DefaultRenewalChecker, RenewalChecker, RenewalError, renew_attestation};
 
