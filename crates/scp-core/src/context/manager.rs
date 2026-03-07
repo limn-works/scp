@@ -190,12 +190,13 @@ pub enum GovernanceActionResult {
 // ---------------------------------------------------------------------------
 
 /// Result of submitting a governance proposal via
-/// [`ContextManager::propose_governance_action`].
+/// [`ContextManager::propose_governance_action_checked`].
 ///
 /// Contains the created proposal, its current status, and an optional
-/// execution result. The `execution_result` is always `None` in this
-/// implementation -- it exists so that SCP-270 (auto-execution on approval)
-/// can populate it without changing this struct.
+/// execution result. When the proposal is auto-approved (`SingleAdmin`),
+/// `execution_result` contains the result of the action execution.
+/// For multi-admin models, `execution_result` is `None` until the
+/// proposal is approved via votes.
 #[derive(Debug)]
 pub struct ProposalOutcome {
     /// The governance proposal created by the engine.
@@ -204,8 +205,9 @@ pub struct ProposalOutcome {
     /// `SingleAdmin`, this is always `Approved` (auto-approve per
     /// ADR-031 section 4a).
     pub status: ProposalStatus,
-    /// The result of executing the approved action, if auto-execution
-    /// is wired. Always `None` until SCP-270 is implemented.
+    /// The result of executing the approved action. `Some` when the
+    /// proposal was auto-approved and executed (SingleAdmin), `None`
+    /// when the proposal is pending votes (multi-admin models).
     pub execution_result: Option<GovernanceActionResult>,
 }
 
@@ -2261,6 +2263,13 @@ impl ContextManager {
                     .await?;
                 Ok(GovernanceActionResult::ContextPromoted)
             }
+            // ExtendTtl needs proposal.approvals for unanimity override
+            // (ADR-031 §4d, spec §5.10).
+            GovernanceAction::ExtendTtl { additional_secs } => {
+                self.execute_extend_ttl(context_id, *additional_secs, &proposal.approvals, pid)
+                    .await?;
+                Ok(GovernanceActionResult::TtlExtended)
+            }
             GovernanceAction::SetEconomicPolicy { policy } => {
                 self.execute_set_economic_policy(context_id, policy, pid)
                     .await?;
@@ -2279,7 +2288,27 @@ impl ContextManager {
                 self.execute_lock_economic_policy(context_id, pid).await?;
                 Ok(GovernanceActionResult::Executed)
             }
-            _ => {
+            // Remaining actions dispatched to context-level handler.
+            GovernanceAction::AddMember { .. }
+            | GovernanceAction::RemoveMember { .. }
+            | GovernanceAction::ChangeRole { .. }
+            | GovernanceAction::RegisterTool { .. }
+            | GovernanceAction::RemoveTool { .. }
+            | GovernanceAction::ModifyCeiling { .. }
+            | GovernanceAction::CloseContext { .. }
+            | GovernanceAction::TransferAdmin { .. }
+            | GovernanceAction::CreateChildContext { .. }
+            | GovernanceAction::ModifyPruningPolicy { .. }
+            | GovernanceAction::AddSigner { .. }
+            | GovernanceAction::RemoveSigner { .. }
+            | GovernanceAction::ModifyThreshold { .. }
+            | GovernanceAction::EstablishToolInterface { .. }
+            | GovernanceAction::ResetMember { .. }
+            | GovernanceAction::ResolveConflict { .. }
+            | GovernanceAction::RevokeWriteAccess { .. }
+            | GovernanceAction::RestoreWriteAccess { .. }
+            | GovernanceAction::RotateContentKeys { .. }
+            | GovernanceAction::ReconfigureGovernance { .. } => {
                 self.dispatch_context_governance_action(context_id, &proposal.action, pid)
                     .await
             }
@@ -2333,11 +2362,6 @@ impl ContextManager {
                     .await?;
                 Ok(GovernanceActionResult::ContextClosed)
             }
-            GovernanceAction::ExtendTtl { additional_secs } => {
-                self.execute_extend_ttl(context_id, *additional_secs, pid)
-                    .await?;
-                Ok(GovernanceActionResult::TtlExtended)
-            }
             GovernanceAction::TransferAdmin { new_admin } => {
                 self.execute_transfer_admin(context_id, new_admin, pid)
                     .await?;
@@ -2355,9 +2379,31 @@ impl ContextManager {
             }
             // Content access, structural, and reconfiguration actions
             // are dispatched by the companion method.
-            _ => {
+            GovernanceAction::AddSigner { .. }
+            | GovernanceAction::RemoveSigner { .. }
+            | GovernanceAction::ModifyThreshold { .. }
+            | GovernanceAction::EstablishToolInterface { .. }
+            | GovernanceAction::ResetMember { .. }
+            | GovernanceAction::ResolveConflict { .. }
+            | GovernanceAction::RevokeWriteAccess { .. }
+            | GovernanceAction::RestoreWriteAccess { .. }
+            | GovernanceAction::RotateContentKeys { .. }
+            | GovernanceAction::ReconfigureGovernance { .. } => {
                 self.dispatch_content_governance_action(context_id, action, pid)
                     .await
+            }
+            // PromoteContext, ExtendTtl, BlockAuthor, RevokeReadAccess,
+            // RestoreReadAccess, and economic actions are handled in
+            // dispatch_governance_action.
+            GovernanceAction::PromoteContext
+            | GovernanceAction::ExtendTtl { .. }
+            | GovernanceAction::BlockAuthor { .. }
+            | GovernanceAction::RevokeReadAccess { .. }
+            | GovernanceAction::RestoreReadAccess { .. }
+            | GovernanceAction::SetEconomicPolicy { .. }
+            | GovernanceAction::ApproveSpend { .. }
+            | GovernanceAction::LockEconomicPolicy => {
+                unreachable!("handled in dispatch_governance_action")
             }
         }
     }
@@ -2441,13 +2487,32 @@ impl ContextManager {
                     },
                 ))
             }
-            // PromoteContext, BlockAuthor, RevokeReadAccess, RestoreReadAccess
-            // are handled in dispatch_governance_action; membership/settings
-            // actions are handled in dispatch_context_governance_action.
-            _ => unreachable!(
-                "action variant should have been handled by dispatch_governance_action \
-                 or dispatch_context_governance_action"
-            ),
+            // Variants handled by dispatch_governance_action or
+            // dispatch_context_governance_action — exhaustive listing
+            // for compile-time coverage (no wildcard).
+            GovernanceAction::PromoteContext
+            | GovernanceAction::ExtendTtl { .. }
+            | GovernanceAction::BlockAuthor { .. }
+            | GovernanceAction::RevokeReadAccess { .. }
+            | GovernanceAction::RestoreReadAccess { .. }
+            | GovernanceAction::SetEconomicPolicy { .. }
+            | GovernanceAction::ApproveSpend { .. }
+            | GovernanceAction::LockEconomicPolicy
+            | GovernanceAction::AddMember { .. }
+            | GovernanceAction::RemoveMember { .. }
+            | GovernanceAction::ChangeRole { .. }
+            | GovernanceAction::RegisterTool { .. }
+            | GovernanceAction::RemoveTool { .. }
+            | GovernanceAction::ModifyCeiling { .. }
+            | GovernanceAction::CloseContext { .. }
+            | GovernanceAction::TransferAdmin { .. }
+            | GovernanceAction::CreateChildContext { .. }
+            | GovernanceAction::ModifyPruningPolicy { .. } => {
+                unreachable!(
+                    "action variant handled by dispatch_governance_action \
+                     or dispatch_context_governance_action"
+                )
+            }
         }
     }
 
@@ -2512,6 +2577,32 @@ impl ContextManager {
         action: GovernanceAction,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(GovernanceProposal, Vec<GovernanceEvent>), ContextError> {
+        let (proposal, events, execution_result) = self
+            .propose_governance_action_inner(context_id, proposer_did, action, signing_key)
+            .await?;
+        let _ = execution_result; // Callers of the old API don't use it.
+        Ok((proposal, events))
+    }
+
+    /// Inner implementation of proposal submission with auto-execution.
+    ///
+    /// Returns the proposal, events, and optional execution result. The
+    /// execution result is `Some` when the proposal was auto-approved
+    /// (`SingleAdmin`) and the action was successfully executed.
+    async fn propose_governance_action_inner(
+        &self,
+        context_id: &str,
+        proposer_did: &DID,
+        action: GovernanceAction,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<
+        (
+            GovernanceProposal,
+            Vec<GovernanceEvent>,
+            Option<GovernanceActionResult>,
+        ),
+        ContextError,
+    > {
         let (proposal, events, should_execute) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
@@ -2534,10 +2625,14 @@ impl ContextManager {
         // Lock dropped.
 
         // If the proposal was auto-approved (SingleAdmin), execute immediately.
-        if should_execute {
-            self.execute_governance_action(context_id, &proposal)
-                .await?;
-        }
+        let execution_result = if should_execute {
+            Some(
+                self.execute_governance_action(context_id, &proposal)
+                    .await?,
+            )
+        } else {
+            None
+        };
 
         // Persist context state after proposal creation.
         {
@@ -2549,7 +2644,7 @@ impl ContextManager {
             }
         }
 
-        Ok((proposal, events))
+        Ok((proposal, events, execution_result))
     }
 
     /// Casts a vote on a pending governance proposal.
@@ -2694,12 +2789,10 @@ impl ContextManager {
     /// optional execution result.
     ///
     /// For `SingleAdmin`, the proposal is simultaneously created and approved
-    /// (ADR-031 section 4a). The returned `ProposalOutcome::status` reflects this.
-    /// Auto-execution is NOT wired -- `execution_result` is always `None`
-    /// (SCP-270 responsibility). Use
-    /// [`propose_governance_action`](Self::propose_governance_action) followed
-    /// by [`execute_governance_action`](Self::execute_governance_action) for
-    /// auto-execution.
+    /// (ADR-031 section 4a). The action is auto-executed and the result is
+    /// returned in `ProposalOutcome::execution_result`. For multi-admin
+    /// models, the proposal enters `Pending` status and `execution_result`
+    /// is `None` until the proposal is approved via votes.
     ///
     /// # Errors
     ///
@@ -2732,15 +2825,15 @@ impl ContextManager {
         }
         // Lock dropped.
 
-        let (proposal, _events) = self
-            .propose_governance_action(context_id, proposer_did, action, signing_key)
+        let (proposal, _events, execution_result) = self
+            .propose_governance_action_inner(context_id, proposer_did, action, signing_key)
             .await?;
 
         let status = proposal.status.clone();
         Ok(ProposalOutcome {
             proposal,
             status,
-            execution_result: None, // SCP-270 wires auto-execution.
+            execution_result,
         })
     }
 
@@ -3392,10 +3485,14 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Extends the context's TTL. Requires unanimous consent from ALL
+    /// current members regardless of governance model — protocol-level
+    /// override per ADR-031 §4d and spec §5.10.
     async fn execute_extend_ttl(
         &self,
         context_id: &str,
         additional_secs: u64,
+        approvals: &[super::governance::SignedVote],
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
@@ -3406,6 +3503,23 @@ impl ContextManager {
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
             require_active(&ctx.handle)?;
+
+            // Unanimity check: TTL extension requires consent from ALL
+            // current members (§5.10) because unilateral extension would
+            // violate the ephemeral contract. This is a protocol-level
+            // override that applies regardless of governance model.
+            let member_dids: std::collections::HashSet<&str> =
+                ctx.membership.member_dids().map(|d| &**d).collect();
+            let approval_dids: std::collections::HashSet<&str> =
+                approvals.iter().map(|v| &*v.voter_did).collect();
+            let missing: Vec<&str> = member_dids.difference(&approval_dids).copied().collect();
+            if !missing.is_empty() {
+                return Err(ContextError::PermissionDenied(format!(
+                    "TTL extension requires unanimous consent — {} of {} members have not approved",
+                    missing.len(),
+                    member_dids.len()
+                )));
+            }
 
             // Extend the TTL deadline. If the timer has a deadline, push it forward.
             if let Some(ref mut deadline) = ctx.ttl_timer.deadline_unix_secs {
@@ -3575,6 +3689,8 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Adds a signer to the threshold set and mints `GovernanceVote` +
+    /// `GovernancePropose` UCANs for the new signer (ADR-031 §6).
     async fn execute_add_signer(
         &self,
         context_id: &str,
@@ -3604,6 +3720,36 @@ impl ContextManager {
                 )));
             }
             ctx.threshold_signers.push(did.clone());
+
+            // ADR-031 §6: mint GovernanceVote + GovernancePropose UCANs
+            // for the new signer so they can participate in governance.
+            let creator_did = ctx.role_state.creator_did.clone();
+            let capabilities = [Capability::GovernancePropose, Capability::GovernanceVote];
+            for cap in &capabilities {
+                let att = roles::UcanAttestation {
+                    with: format!("scp:ctx:{context_id}/{cap}"),
+                    can: "invoke".to_owned(),
+                };
+                let nonce = crate::crypto::ucan::nonce::generate_nonce()
+                    .unwrap_or_else(|_| "gov-signer-add-0".to_owned());
+                let token = roles::UcanToken {
+                    iss: creator_did.clone(),
+                    aud: did.to_string(),
+                    att: vec![att],
+                    nnc: nonce,
+                };
+                // Grant the capability to the new signer.
+                ctx.role_state
+                    .member_capabilities
+                    .entry(did.to_string())
+                    .or_default()
+                    .insert(cap.clone());
+                // Record the token in membership tracking.
+                if let Some(info) = ctx.membership.get_mut(did) {
+                    info.tokens.push(token);
+                }
+            }
+
             Self::snapshot_context(ctx)
         };
 
@@ -3613,6 +3759,8 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Removes a signer from the threshold set, revokes their governance
+    /// UCANs, and validates threshold <= remaining signers (ADR-031 §6).
     async fn execute_remove_signer(
         &self,
         context_id: &str,
@@ -3633,7 +3781,7 @@ impl ContextManager {
             if ctx.threshold_signers.len() == before {
                 return Err(ContextError::MemberNotFound(did.to_string()));
             }
-            // ADR-031: if removing would make threshold > signers.len(), reject.
+            // ADR-031 §6: if removing would make threshold > signers.len(), reject.
             if ctx.threshold_value > 0 {
                 let remaining = u32::try_from(ctx.threshold_signers.len()).unwrap_or(u32::MAX);
                 if ctx.threshold_value > remaining {
@@ -3645,6 +3793,27 @@ impl ContextManager {
                     )));
                 }
             }
+
+            // ADR-031 §6: revoke GovernanceVote + GovernancePropose
+            // capabilities from the removed signer. The DID remains a
+            // context member but loses governance authority.
+            if let Some(caps) = ctx.role_state.member_capabilities.get_mut(did.as_ref()) {
+                caps.retain(|c| {
+                    !matches!(
+                        c,
+                        Capability::GovernancePropose | Capability::GovernanceVote
+                    )
+                });
+            }
+            // Remove governance UCAN tokens from membership tracking.
+            if let Some(info) = ctx.membership.get_mut(did) {
+                info.tokens.retain(|t| {
+                    !t.att.iter().any(|a| {
+                        a.with.contains("governance:propose") || a.with.contains("governance:vote")
+                    })
+                });
+            }
+
             Self::snapshot_context(ctx)
         };
 
@@ -4318,16 +4487,25 @@ impl ContextManager {
 
     /// Initiates cooperative context closure.
     ///
-    /// Verifies the initiator has the `ContextClose` capability, transitions
-    /// from `Active` to `Closing`, and appends a `ContextClosing` event.
-    /// Cancels any active TTL timer for this context.
+    /// For `SingleAdmin` governance: verifies the initiator has the
+    /// `ContextClose` capability, transitions from `Active` to `Closing`,
+    /// and appends a `ContextClosing` event. Cancels any active TTL timer.
+    ///
+    /// For multi-admin governance models (`Threshold`, `Majority`,
+    /// `Unanimity`): returns `PermissionDenied`. Multi-admin contexts MUST
+    /// close through the governance path: `propose_governance_action` with
+    /// `GovernanceAction::CloseContext` -> vote -> auto-execute on approval
+    /// (SCP-270, ADR-031). This ensures all signers/voters can participate
+    /// in the close decision.
     ///
     /// See ADR-008 acceptance criterion 5.
     ///
     /// # Errors
     ///
     /// Returns [`ContextError::ContextNotActive`] if the context is not
-    /// `Active`. Returns [`ContextError::PermissionDenied`] if the
+    /// `Active`. Returns [`ContextError::PermissionDenied`] if the context
+    /// uses a multi-admin governance model (use governance proposal path
+    /// instead) or if the initiator lacks `ContextClose` capability.
     pub async fn close_context(
         &self,
         handle: &ContextHandle,
@@ -4335,7 +4513,9 @@ impl ContextManager {
     ) -> Result<CloseResult, ContextError> {
         let context_id = handle.context_id().to_owned();
 
-        // Atomic state check + role_state extraction within a single lock.
+        // Check governance model: multi-admin contexts must route through
+        // governance (SCP-270, ADR-031). Only SingleAdmin contexts can use
+        // the direct close_context path.
         let role_state = {
             let contexts = self.contexts.lock().await;
             let ctx = contexts
@@ -4344,6 +4524,18 @@ impl ContextManager {
 
             // State check inside lock -- eliminates TOCTOU race.
             require_active(&ctx.handle)?;
+
+            // Gate: multi-admin models must use governance path.
+            if !matches!(
+                ctx.governance_engine.model_config(),
+                GovernanceModelConfig::SingleAdmin { .. }
+            ) {
+                return Err(ContextError::PermissionDenied(
+                    "multi-admin contexts must close through governance \
+                     (propose GovernanceAction::CloseContext)"
+                        .to_owned(),
+                ));
+            }
 
             ctx.role_state.clone()
         };
@@ -9425,6 +9617,7 @@ mod tests {
                 crate::context::params::Capability::new("role:assign"),
                 crate::context::params::Capability::new("governance:propose"),
                 crate::context::params::Capability::new("governance:vote"),
+                crate::context::params::Capability::new("context:close"),
             ],
             ..ContextParams::default()
         };
@@ -9459,8 +9652,8 @@ mod tests {
             "SingleAdmin proposals should be auto-approved"
         );
         assert!(
-            outcome.execution_result.is_none(),
-            "execution_result must be None (SCP-270 responsibility)"
+            outcome.execution_result.is_some(),
+            "execution_result must be Some for auto-approved SingleAdmin proposals (SCP-270)"
         );
         assert_eq!(outcome.proposal.proposer_did, admin_did);
         assert_eq!(outcome.proposal.context_id, ctx_id);
@@ -9740,5 +9933,631 @@ mod tests {
             result.unwrap_err(),
             ContextError::PermissionDenied(_)
         ));
+    }
+
+    // -------------------------------------------------------------------
+    // SCP-270: auto-execution, unanimity overrides, governance bypass
+    // -------------------------------------------------------------------
+
+    /// Helper: ContextParams with governance-compatible ceiling.
+    fn governance_params() -> ContextParams {
+        ContextParams {
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+                crate::context::params::Capability::new("role:assign"),
+                crate::context::params::Capability::new("governance:propose"),
+                crate::context::params::Capability::new("governance:vote"),
+                crate::context::params::Capability::new("member:ban"),
+                crate::context::params::Capability::new("context:close"),
+            ],
+            ..ContextParams::default()
+        }
+    }
+
+    /// Helper: build an approved proposal with customizable approvals.
+    fn approved_proposal(
+        pid: [u8; 32],
+        context_id: &str,
+        action: GovernanceAction,
+        approver_dids: &[&str],
+    ) -> GovernanceProposal {
+        use crate::context::governance::{SignedVote, VoteType};
+        GovernanceProposal {
+            proposal_id: pid,
+            context_id: context_id.into(),
+            proposer_did: approver_dids
+                .first()
+                .unwrap_or(&"did:key:creator")
+                .to_string()
+                .into(),
+            action,
+            status: ProposalStatus::Approved,
+            created_at: 1000,
+            voting_deadline: 2000,
+            approvals: approver_dids
+                .iter()
+                .enumerate()
+                .map(|(i, did)| SignedVote {
+                    voter_did: (*did).to_owned().into(),
+                    vote: VoteType::Approve,
+                    timestamp: 1000 + i as u64,
+                    signature: vec![0u8; 64],
+                })
+                .collect(),
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        }
+    }
+
+    /// SCP-270 AC14: each GovernanceAction variant executes through governance.
+    /// Covered by the existing `single_admin_propose_auto_executes` and
+    /// per-action tests. This test verifies the dispatch returns typed results.
+    #[tokio::test]
+    async fn governance_dispatch_returns_typed_results() {
+        use crate::context::governance::{GovernanceProposal, SignedVote, VoteType};
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let params = governance_params();
+        let _handle = manager
+            .create_context("typed-result-ctx".into(), params, "did:key:creator".into())
+            .await
+            .unwrap();
+
+        // AddMember
+        let proposal = GovernanceProposal {
+            proposal_id: [10u8; 32],
+            context_id: "typed-result-ctx".into(),
+            proposer_did: "did:key:creator".into(),
+            action: GovernanceAction::AddMember {
+                did: "did:key:new".into(),
+                role: "member".to_owned(),
+            },
+            status: ProposalStatus::Approved,
+            created_at: 1000,
+            voting_deadline: 2000,
+            approvals: vec![SignedVote {
+                voter_did: "did:key:creator".into(),
+                vote: VoteType::Approve,
+                timestamp: 1000,
+                signature: vec![0u8; 64],
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+        let result = manager
+            .execute_governance_action("typed-result-ctx", &proposal)
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, GovernanceActionResult::MemberAdded),
+            "AddMember should return MemberAdded, got: {result:?}"
+        );
+
+        // RemoveMember
+        let proposal = GovernanceProposal {
+            proposal_id: [11u8; 32],
+            context_id: "typed-result-ctx".into(),
+            proposer_did: "did:key:creator".into(),
+            action: GovernanceAction::RemoveMember {
+                did: "did:key:new".into(),
+                reason: None,
+            },
+            status: ProposalStatus::Approved,
+            created_at: 1000,
+            voting_deadline: 2000,
+            approvals: vec![SignedVote {
+                voter_did: "did:key:creator".into(),
+                vote: VoteType::Approve,
+                timestamp: 1000,
+                signature: vec![0u8; 64],
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+        let result = manager
+            .execute_governance_action("typed-result-ctx", &proposal)
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, GovernanceActionResult::MemberRemoved),
+            "RemoveMember should return MemberRemoved, got: {result:?}"
+        );
+    }
+
+    /// SCP-270 AC15: auto-execution on Approved status for SingleAdmin.
+    #[tokio::test]
+    async fn governance_auto_execution_single_admin() {
+        let (manager, _handle, ctx_id) = setup_governance_context().await;
+        let admin_did: DID = "did:key:admin".into();
+        let signing_key = signing_key_for_did(&admin_did);
+
+        // propose_governance_action for SingleAdmin auto-executes.
+        let (proposal, _events) = manager
+            .propose_governance_action(
+                &ctx_id,
+                &admin_did,
+                GovernanceAction::AddMember {
+                    did: "did:key:newmember".into(),
+                    role: "member".to_owned(),
+                },
+                &signing_key,
+            )
+            .await
+            .unwrap();
+
+        // Proposal should be Approved (auto-approved by SingleAdmin).
+        assert_eq!(proposal.status, ProposalStatus::Approved);
+
+        // The member should already be added (auto-executed).
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&ctx_id).unwrap();
+        assert!(
+            ctx.membership.contains("did:key:newmember"),
+            "auto-execution should have added the member"
+        );
+    }
+
+    /// SCP-270 AC15: auto-execution on Approved status for Threshold model.
+    #[tokio::test]
+    async fn governance_auto_execution_threshold_on_approval() {
+        let creator: DID = "did:key:creator".into();
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let mut params = governance_params();
+        params.governance = GovernanceModel::Threshold {
+            threshold: 1,
+            signers: vec![creator.clone()],
+        };
+
+        let _handle = manager
+            .create_context("thresh-auto-ctx".into(), params, creator.clone())
+            .await
+            .unwrap();
+
+        let signing_key = signing_key_for_did(&creator);
+        // Threshold with 1-of-1: proposal auto-approved on propose.
+        let (proposal, _) = manager
+            .propose_governance_action(
+                "thresh-auto-ctx",
+                &creator,
+                GovernanceAction::AddMember {
+                    did: "did:key:bob".into(),
+                    role: "member".to_owned(),
+                },
+                &signing_key,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(proposal.status, ProposalStatus::Approved);
+
+        // Verify auto-execution happened.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("thresh-auto-ctx").unwrap();
+        assert!(
+            ctx.membership.contains("did:key:bob"),
+            "auto-execution should have added the member on threshold quorum"
+        );
+    }
+
+    /// SCP-270 AC16: close_context through governance for Threshold model.
+    #[tokio::test]
+    async fn close_context_through_governance_threshold() {
+        let creator: DID = "did:key:creator".into();
+        let signer2: DID = "did:key:signer2".into();
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let mut params = governance_params();
+        params.governance = GovernanceModel::Threshold {
+            threshold: 2,
+            signers: vec![creator.clone(), signer2.clone()],
+        };
+
+        let handle = manager
+            .create_context("close-thresh-ctx".into(), params, creator.clone())
+            .await
+            .unwrap();
+
+        // Direct close_context should fail for multi-admin.
+        let result = manager.close_context(&handle, &creator).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), ContextError::PermissionDenied(ref msg) if msg.contains("multi-admin")),
+            "close_context should reject multi-admin contexts"
+        );
+
+        // Verify context is still active.
+        assert_eq!(handle.state().await, ContextState::Active);
+    }
+
+    /// SCP-270 AC17: ExtendTtl unanimity override — partial approval rejected.
+    #[tokio::test]
+    async fn extend_ttl_rejects_without_unanimity() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let mut params = governance_params();
+        params.ttl = Some(std::time::Duration::from_secs(3600));
+        let _handle = manager
+            .create_context("ttl-unan-ctx".into(), params, "did:key:creator".into())
+            .await
+            .unwrap();
+
+        // Add a second member.
+        let add = approved_proposal(
+            [20u8; 32],
+            "ttl-unan-ctx",
+            GovernanceAction::AddMember {
+                did: "did:key:bob".into(),
+                role: "member".to_owned(),
+            },
+            &["did:key:creator"],
+        );
+        manager
+            .execute_governance_action("ttl-unan-ctx", &add)
+            .await
+            .unwrap();
+
+        // ExtendTtl with only creator's approval (bob hasn't approved).
+        let extend = approved_proposal(
+            [21u8; 32],
+            "ttl-unan-ctx",
+            GovernanceAction::ExtendTtl {
+                additional_secs: 3600,
+            },
+            &["did:key:creator"],
+        );
+        let result = manager
+            .execute_governance_action("ttl-unan-ctx", &extend)
+            .await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), ContextError::PermissionDenied(ref msg) if msg.contains("unanimous")),
+            "ExtendTtl should require unanimity"
+        );
+    }
+
+    /// SCP-270 AC17: ExtendTtl unanimity override — unanimous approval succeeds.
+    #[tokio::test]
+    async fn extend_ttl_succeeds_with_unanimity() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let mut params = governance_params();
+        params.ttl = Some(std::time::Duration::from_secs(3600));
+        let _handle = manager
+            .create_context("ttl-unan2-ctx".into(), params, "did:key:creator".into())
+            .await
+            .unwrap();
+
+        // Add a second member.
+        let add = approved_proposal(
+            [20u8; 32],
+            "ttl-unan2-ctx",
+            GovernanceAction::AddMember {
+                did: "did:key:bob".into(),
+                role: "member".to_owned(),
+            },
+            &["did:key:creator"],
+        );
+        manager
+            .execute_governance_action("ttl-unan2-ctx", &add)
+            .await
+            .unwrap();
+
+        // ExtendTtl with both members' approval.
+        let extend = approved_proposal(
+            [22u8; 32],
+            "ttl-unan2-ctx",
+            GovernanceAction::ExtendTtl {
+                additional_secs: 3600,
+            },
+            &["did:key:creator", "did:key:bob"],
+        );
+        let result = manager
+            .execute_governance_action("ttl-unan2-ctx", &extend)
+            .await;
+        assert!(
+            result.is_ok(),
+            "ExtendTtl with unanimity should succeed: {result:?}"
+        );
+        assert!(matches!(
+            result.unwrap(),
+            GovernanceActionResult::TtlExtended
+        ));
+    }
+
+    /// SCP-270 AC18: PromoteContext unanimity override.
+    #[tokio::test]
+    async fn promote_context_requires_unanimity() {
+        use crate::context::governance::{GovernanceProposal, SignedVote, VoteType};
+        use crate::context::params::{MemoryScope, PromotionPolicy};
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let mut params = governance_params();
+        params.promotion_policy = PromotionPolicy::Promotable;
+        params.memory_scope = MemoryScope::Ephemeral;
+        params.ttl = Some(std::time::Duration::from_secs(3600));
+
+        let _handle = manager
+            .create_context(
+                "promo-unanimity-ctx".into(),
+                params,
+                "did:key:creator".into(),
+            )
+            .await
+            .unwrap();
+
+        // Add a second member.
+        let add_proposal = GovernanceProposal {
+            proposal_id: [30u8; 32],
+            context_id: "promo-unanimity-ctx".into(),
+            proposer_did: "did:key:creator".into(),
+            action: GovernanceAction::AddMember {
+                did: "did:key:carol".into(),
+                role: "member".to_owned(),
+            },
+            status: ProposalStatus::Approved,
+            created_at: 1000,
+            voting_deadline: 2000,
+            approvals: vec![SignedVote {
+                voter_did: "did:key:creator".into(),
+                vote: VoteType::Approve,
+                timestamp: 1000,
+                signature: vec![0u8; 64],
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+        manager
+            .execute_governance_action("promo-unanimity-ctx", &add_proposal)
+            .await
+            .unwrap();
+
+        // PromoteContext with only creator's approval — should fail.
+        let promote_proposal = GovernanceProposal {
+            proposal_id: [31u8; 32],
+            context_id: "promo-unanimity-ctx".into(),
+            proposer_did: "did:key:creator".into(),
+            action: GovernanceAction::PromoteContext,
+            status: ProposalStatus::Approved,
+            created_at: 1000,
+            voting_deadline: 2000,
+            approvals: vec![SignedVote {
+                voter_did: "did:key:creator".into(),
+                vote: VoteType::Approve,
+                timestamp: 1000,
+                signature: vec![0u8; 64],
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+
+        let result = manager
+            .execute_governance_action("promo-unanimity-ctx", &promote_proposal)
+            .await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), ContextError::PermissionDenied(ref msg) if msg.contains("unanimous")),
+            "PromoteContext should require unanimity"
+        );
+    }
+
+    /// SCP-270 AC19: governance bypass prevention — standalone close_context
+    /// returns error for multi-admin models.
+    #[tokio::test]
+    async fn governance_bypass_prevented_for_multi_admin_close() {
+        let creator: DID = "did:key:creator".into();
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        // Create a Majority governance context.
+        let mut params = governance_params();
+        params.governance = GovernanceModel::Majority {
+            eligible_voters: vec![creator.clone()],
+        };
+        let handle = manager
+            .create_context("bypass-test-ctx".into(), params, creator.clone())
+            .await
+            .unwrap();
+
+        // Direct close_context should fail.
+        let result = manager.close_context(&handle, &creator).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), ContextError::PermissionDenied(ref msg) if msg.contains("multi-admin")),
+            "standalone close_context must reject multi-admin contexts"
+        );
+    }
+
+    /// SCP-270 AC5: close_context for SingleAdmin goes through engine (auto-approve).
+    #[tokio::test]
+    async fn close_context_single_admin_succeeds() {
+        let (manager, handle, _ctx_id) = setup_governance_context().await;
+        let admin_did: DID = "did:key:admin".into();
+
+        let result = manager.close_context(&handle, &admin_did).await;
+        assert!(
+            result.is_ok(),
+            "SingleAdmin close_context should succeed: {result:?}"
+        );
+    }
+
+    /// SCP-270 AC11: AddSigner mints GovernanceVote + GovernancePropose UCANs.
+    #[tokio::test]
+    async fn add_signer_mints_governance_ucans() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let mut params = governance_params();
+        params.governance = GovernanceModel::Threshold {
+            threshold: 1,
+            signers: vec!["did:key:creator".into()],
+        };
+        let _handle = manager
+            .create_context("signer-ucan-ctx".into(), params, "did:key:creator".into())
+            .await
+            .unwrap();
+
+        // Add member, then add as signer.
+        let add = approved_proposal(
+            [40u8; 32],
+            "signer-ucan-ctx",
+            GovernanceAction::AddMember {
+                did: "did:key:newsigner".into(),
+                role: "member".to_owned(),
+            },
+            &["did:key:creator"],
+        );
+        manager
+            .execute_governance_action("signer-ucan-ctx", &add)
+            .await
+            .unwrap();
+
+        let add_s = approved_proposal(
+            [41u8; 32],
+            "signer-ucan-ctx",
+            GovernanceAction::AddSigner {
+                did: "did:key:newsigner".into(),
+            },
+            &["did:key:creator"],
+        );
+        let result = manager
+            .execute_governance_action("signer-ucan-ctx", &add_s)
+            .await;
+        assert!(result.is_ok(), "AddSigner should succeed: {result:?}");
+
+        // Verify GovernanceVote + GovernancePropose capabilities were granted.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("signer-ucan-ctx").unwrap();
+        let caps = ctx
+            .role_state
+            .member_capabilities
+            .get("did:key:newsigner")
+            .expect("new signer should have capabilities");
+        assert!(caps.contains(&Capability::GovernancePropose));
+        assert!(caps.contains(&Capability::GovernanceVote));
+    }
+
+    /// SCP-270 AC12: RemoveSigner revokes governance UCANs and validates threshold.
+    #[tokio::test]
+    async fn remove_signer_revokes_governance_ucans() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let mut params = governance_params();
+        params.governance = GovernanceModel::Threshold {
+            threshold: 1,
+            signers: vec!["did:key:creator".into(), "did:key:signer2".into()],
+        };
+        let _handle = manager
+            .create_context("rm-signer-ctx".into(), params, "did:key:creator".into())
+            .await
+            .unwrap();
+
+        // Add signer2 as member, then grant signer role.
+        let add = approved_proposal(
+            [50u8; 32],
+            "rm-signer-ctx",
+            GovernanceAction::AddMember {
+                did: "did:key:signer2".into(),
+                role: "member".to_owned(),
+            },
+            &["did:key:creator"],
+        );
+        manager
+            .execute_governance_action("rm-signer-ctx", &add)
+            .await
+            .unwrap();
+
+        let add_s = approved_proposal(
+            [51u8; 32],
+            "rm-signer-ctx",
+            GovernanceAction::AddSigner {
+                did: "did:key:signer2".into(),
+            },
+            &["did:key:creator"],
+        );
+        manager
+            .execute_governance_action("rm-signer-ctx", &add_s)
+            .await
+            .unwrap();
+
+        // Verify signer2 has governance capabilities.
+        {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get("rm-signer-ctx").unwrap();
+            let caps = ctx
+                .role_state
+                .member_capabilities
+                .get("did:key:signer2")
+                .expect("signer2 should have capabilities");
+            assert!(caps.contains(&Capability::GovernanceVote));
+        }
+
+        // Remove signer2.
+        let rm = approved_proposal(
+            [52u8; 32],
+            "rm-signer-ctx",
+            GovernanceAction::RemoveSigner {
+                did: "did:key:signer2".into(),
+            },
+            &["did:key:creator"],
+        );
+        let result = manager
+            .execute_governance_action("rm-signer-ctx", &rm)
+            .await;
+        assert!(result.is_ok(), "RemoveSigner should succeed: {result:?}");
+
+        // Verify governance capabilities were revoked.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("rm-signer-ctx").unwrap();
+        if let Some(caps) = ctx.role_state.member_capabilities.get("did:key:signer2") {
+            assert!(!caps.contains(&Capability::GovernancePropose));
+            assert!(!caps.contains(&Capability::GovernanceVote));
+        }
+        assert!(
+            ctx.membership.contains("did:key:signer2"),
+            "should remain a member"
+        );
     }
 }
