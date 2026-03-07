@@ -238,6 +238,24 @@ pub enum TrustError {
         /// Human-readable description of the failure.
         reason: String,
     },
+
+    /// The challenge type URI is not a known protocol capability and is not
+    /// DID-scoped.
+    #[error("unknown challenge capability URI: {uri}")]
+    UnknownChallengeCapability {
+        /// The unrecognized URI string.
+        uri: String,
+    },
+
+    /// The challenge parameters do not conform to the capability's parameter
+    /// schema.
+    #[error("invalid challenge parameters for {uri}: {reason}")]
+    InvalidChallengeParameters {
+        /// The capability URI whose schema was violated.
+        uri: String,
+        /// Human-readable description of the validation failure.
+        reason: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

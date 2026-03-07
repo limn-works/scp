@@ -35,6 +35,7 @@ use scp_identity::cache::Clock;
 
 use super::TrustError;
 use super::attestation::DidPublicKeyResolver;
+use super::capability_registry::{lookup_protocol_capability, validate_capability_uri};
 use super::capability_uri::CapabilityUri;
 
 // ---------------------------------------------------------------------------
@@ -386,6 +387,21 @@ fn challenge_type_tag(ct: &ChallengeType) -> String {
 /// representation, signs it with the provided signer, and returns the
 /// complete [`ChallengeRequest`].
 ///
+/// # Validation
+///
+/// Before constructing the request, validates the challenge type against the
+/// protocol capability registry (§7.3.4.2):
+///
+/// - **Protocol capabilities** (`scp:capability:*`): must be registered in the
+///   protocol registry. Unknown protocol URIs are rejected with
+///   [`TrustError::UnknownChallengeCapability`].
+/// - **DID-scoped capabilities** (`did:*`): always accepted without registry
+///   lookup (authority is the definer's DID).
+/// - **Parameter validation**: if the capability has a registered parameter
+///   schema and parameters are non-null, validates the parameters against
+///   the schema. Invalid parameters are rejected with
+///   [`TrustError::InvalidChallengeParameters`].
+///
 /// # Parameters
 ///
 /// - `challenger_did`: DID of the entity issuing the challenge.
@@ -397,7 +413,11 @@ fn challenge_type_tag(ct: &ChallengeType) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`TrustError`] if signing fails.
+/// - [`TrustError::UnknownChallengeCapability`] if the challenge type is an
+///   unknown `scp:capability:*` URI.
+/// - [`TrustError::InvalidChallengeParameters`] if parameters fail schema
+///   validation.
+/// - [`TrustError`] if signing fails.
 ///
 /// See ADR-017 acceptance criterion 4.
 pub fn issue_challenge(
@@ -408,6 +428,33 @@ pub fn issue_challenge(
     timeout: Duration,
     signer: &impl ChallengeSigner,
 ) -> Result<ChallengeRequest, TrustError> {
+    // Validate the challenge type against the capability registry.
+    let ChallengeType::Uri(ref uri) = challenge_type;
+    let uri_str = uri.to_string();
+    validate_capability_uri(&uri_str).map_err(|_| TrustError::UnknownChallengeCapability {
+        uri: uri_str.clone(),
+    })?;
+
+    // If the capability has a parameter schema and parameters are non-null,
+    // validate the parameters against the schema.
+    if !params.is_null()
+        && let Some(entry) = lookup_protocol_capability(&uri_str)
+        && let Some(ref schema_value) = entry.parameter_schema
+    {
+        let validator = jsonschema::validator_for(schema_value).map_err(|e| {
+            TrustError::InvalidChallengeParameters {
+                uri: uri_str.clone(),
+                reason: format!("failed to compile parameter schema: {e}"),
+            }
+        })?;
+        if let Err(e) = validator.validate(&params) {
+            return Err(TrustError::InvalidChallengeParameters {
+                uri: uri_str,
+                reason: e.to_string(),
+            });
+        }
+    }
+
     let challenge_id = uuid::Uuid::new_v4().to_string();
 
     // Build the request with an empty signature first so we can compute
@@ -1340,5 +1387,243 @@ mod tests {
         assert_eq!(ct, cloned);
         let debug = format!("{ct:?}");
         assert!(debug.contains("Uri"));
+    }
+
+    // -----------------------------------------------------------------------
+    // issue_challenge — registry validation (SCP-ACR-004)
+    // -----------------------------------------------------------------------
+
+    /// Helper: issue a challenge with a given capability URI string and empty params.
+    fn issue_with_uri(uri: &str) -> Result<ChallengeRequest, TrustError> {
+        let (challenger_key, _) = test_keypair();
+        let signer = TestSigner::new(challenger_key);
+        let cap_uri: CapabilityUri = uri.parse().expect("test URI should parse");
+        issue_challenge(
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
+            ChallengeType::Uri(cap_uri),
+            serde_json::json!({}),
+            Duration::from_secs(300),
+            &signer,
+        )
+    }
+
+    #[test]
+    fn issue_challenge_accepts_safety_security_capability() {
+        // prompt-injection-resistance from safety-security category
+        let result = issue_with_uri("scp:capability:prompt-injection-resistance/v1");
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn issue_challenge_accepts_schema_compliance_capability() {
+        // schema-validation from schema-compliance category
+        let result = issue_with_uri("scp:capability:schema-validation/v1");
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn issue_challenge_accepts_behavioral_compliance_capability() {
+        // rate-limit-compliance from behavioral-compliance category
+        let result = issue_with_uri("scp:capability:rate-limit-compliance/v1");
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn issue_challenge_accepts_operational_capability() {
+        // latency-compliance from operational category (parameterized)
+        let (challenger_key, _) = test_keypair();
+        let signer = TestSigner::new(challenger_key);
+        let result = issue_challenge(
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
+            ChallengeType::Uri(
+                "scp:capability:latency-compliance/v1".parse().unwrap(),
+            ),
+            serde_json::json!({"max_ms": 500}),
+            Duration::from_secs(300),
+            &signer,
+        );
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn issue_challenge_accepts_spending_commerce_capability() {
+        // spending-compliance from spending-commerce category
+        let result = issue_with_uri("scp:capability:spending-compliance/v1");
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn issue_challenge_accepts_reasoning_logic_capability() {
+        // mathematical-reasoning from reasoning-logic category (parameterized)
+        let (challenger_key, _) = test_keypair();
+        let signer = TestSigner::new(challenger_key);
+        let result = issue_challenge(
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
+            ChallengeType::Uri(
+                "scp:capability:mathematical-reasoning/v1".parse().unwrap(),
+            ),
+            serde_json::json!({"difficulty": "intermediate"}),
+            Duration::from_secs(300),
+            &signer,
+        );
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn issue_challenge_accepts_code_capability() {
+        // code-generation from code category (parameterized)
+        let (challenger_key, _) = test_keypair();
+        let signer = TestSigner::new(challenger_key);
+        let result = issue_challenge(
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
+            ChallengeType::Uri(
+                "scp:capability:code-generation/v1".parse().unwrap(),
+            ),
+            serde_json::json!({"languages": ["rust", "python"]}),
+            Duration::from_secs(300),
+            &signer,
+        );
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn issue_challenge_accepts_recall_fidelity_capability() {
+        // instruction-retention from recall-fidelity category
+        let result = issue_with_uri("scp:capability:instruction-retention/v1");
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn issue_challenge_accepts_bias_fairness_capability() {
+        // bias-resistance from bias-fairness category
+        let result = issue_with_uri("scp:capability:bias-resistance/v1");
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn issue_challenge_accepts_factual_hallucination_capability() {
+        // source-attribution from factual-hallucination category
+        let result = issue_with_uri("scp:capability:source-attribution/v1");
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn issue_challenge_accepts_did_scoped_custom_capability() {
+        let result = issue_with_uri("did:dht:z6Mk123:capability:custom-skill/v1");
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn issue_challenge_rejects_unknown_protocol_capability() {
+        let (challenger_key, _) = test_keypair();
+        let signer = TestSigner::new(challenger_key);
+        let cap_uri: CapabilityUri = "scp:capability:fake/v1".parse().unwrap();
+        let result = issue_challenge(
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
+            ChallengeType::Uri(cap_uri),
+            serde_json::json!({}),
+            Duration::from_secs(300),
+            &signer,
+        );
+        assert!(result.is_err());
+        match result {
+            Err(TrustError::UnknownChallengeCapability { uri }) => {
+                assert_eq!(uri, "scp:capability:fake/v1");
+            }
+            other => panic!("expected UnknownChallengeCapability, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // issue_challenge — parameter schema validation (SCP-ACR-004)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn issue_challenge_rejects_invalid_parameters_for_latency_compliance() {
+        let (challenger_key, _) = test_keypair();
+        let signer = TestSigner::new(challenger_key);
+        // latency-compliance requires {"max_ms": integer}, provide wrong type
+        let result = issue_challenge(
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
+            ChallengeType::Uri(
+                "scp:capability:latency-compliance/v1".parse().unwrap(),
+            ),
+            serde_json::json!({"max_ms": "not-an-integer"}),
+            Duration::from_secs(300),
+            &signer,
+        );
+        assert!(result.is_err());
+        match result {
+            Err(TrustError::InvalidChallengeParameters { uri, .. }) => {
+                assert_eq!(uri, "scp:capability:latency-compliance/v1");
+            }
+            other => panic!("expected InvalidChallengeParameters, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issue_challenge_rejects_missing_required_parameter() {
+        let (challenger_key, _) = test_keypair();
+        let signer = TestSigner::new(challenger_key);
+        // mathematical-reasoning requires {"difficulty": enum}, provide empty object
+        let result = issue_challenge(
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
+            ChallengeType::Uri(
+                "scp:capability:mathematical-reasoning/v1".parse().unwrap(),
+            ),
+            serde_json::json!({"wrong_field": true}),
+            Duration::from_secs(300),
+            &signer,
+        );
+        assert!(result.is_err());
+        match result {
+            Err(TrustError::InvalidChallengeParameters { uri, .. }) => {
+                assert_eq!(uri, "scp:capability:mathematical-reasoning/v1");
+            }
+            other => panic!("expected InvalidChallengeParameters, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issue_challenge_accepts_null_params_for_parameterized_capability() {
+        // Null parameters should skip schema validation (no params provided).
+        let (challenger_key, _) = test_keypair();
+        let signer = TestSigner::new(challenger_key);
+        let result = issue_challenge(
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
+            ChallengeType::Uri(
+                "scp:capability:latency-compliance/v1".parse().unwrap(),
+            ),
+            serde_json::Value::Null,
+            Duration::from_secs(300),
+            &signer,
+        );
+        assert!(result.is_ok(), "null params should skip schema validation, got {result:?}");
+    }
+
+    #[test]
+    fn issue_challenge_accepts_empty_params_for_non_parameterized_capability() {
+        // Non-parameterized capabilities have no schema, so any params are fine.
+        let (challenger_key, _) = test_keypair();
+        let signer = TestSigner::new(challenger_key);
+        let result = issue_challenge(
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
+            ChallengeType::Uri(
+                "scp:capability:prompt-injection-resistance/v1".parse().unwrap(),
+            ),
+            serde_json::json!({"test_vectors": ["attack1", "attack2"]}),
+            Duration::from_secs(300),
+            &signer,
+        );
+        assert!(result.is_ok(), "non-parameterized capability should accept any params, got {result:?}");
     }
 }
