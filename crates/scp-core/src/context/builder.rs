@@ -132,17 +132,39 @@ pub trait ContextCryptoProvider: Send + Sync {
 
     /// Validates a joiner's key package.
     ///
+    /// # Arguments
+    ///
+    /// * `owner_did` - The DID of the key package owner.
+    /// * `key_package_bytes` - Optional TLS-serialized MLS `KeyPackage` bytes.
+    ///   `None` for mock providers; production providers require `Some`.
+    ///
     /// # Errors
     ///
     /// Returns [`ContextError::InvalidKeyPackage`] if the key package is invalid.
-    fn validate_key_package(&self, owner_did: &str) -> Result<(), ContextError>;
+    fn validate_key_package(
+        &self,
+        owner_did: &str,
+        key_package_bytes: Option<&[u8]>,
+    ) -> Result<(), ContextError>;
 
     /// Adds a member to the MLS group (ADR-001 `add_member()`).
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` - The 32-byte context identifier.
+    /// * `member_did` - The DID of the member to add.
+    /// * `key_package_bytes` - Optional TLS-serialized MLS `KeyPackage` bytes.
+    ///   `None` for mock providers; production providers require `Some`.
     ///
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if the MLS operation fails.
-    fn add_member(&self, context_id: &[u8; 32], member_did: &str) -> Result<(), ContextError>;
+    fn add_member(
+        &self,
+        context_id: &[u8; 32],
+        member_did: &str,
+        key_package_bytes: Option<&[u8]>,
+    ) -> Result<(), ContextError>;
 
     /// Removes a member from the MLS group (ADR-001 `remove_member()`).
     ///
@@ -663,7 +685,11 @@ mod tests {
             Ok(())
         }
 
-        fn validate_key_package(&self, _owner_did: &str) -> Result<(), ContextError> {
+        fn validate_key_package(
+            &self,
+            _owner_did: &str,
+            _key_package_bytes: Option<&[u8]>,
+        ) -> Result<(), ContextError> {
             Ok(())
         }
 
@@ -671,6 +697,7 @@ mod tests {
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
+            _key_package_bytes: Option<&[u8]>,
         ) -> Result<(), ContextError> {
             Ok(())
         }

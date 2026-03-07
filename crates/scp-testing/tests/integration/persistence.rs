@@ -975,10 +975,19 @@ mod mock_providers {
         fn destroy_sender_key(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn validate_key_package(&self, _owner_did: &str) -> Result<(), ContextError> {
+        fn validate_key_package(
+            &self,
+            _owner_did: &str,
+            _key_package_bytes: Option<&[u8]>,
+        ) -> Result<(), ContextError> {
             Ok(())
         }
-        fn add_member(&self, _ctx_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
+        fn add_member(
+            &self,
+            _ctx_id: &[u8; 32],
+            _member_did: &str,
+            _key_package_bytes: Option<&[u8]>,
+        ) -> Result<(), ContextError> {
             Ok(())
         }
         fn remove_member(&self, _ctx_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {

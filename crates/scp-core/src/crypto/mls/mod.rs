@@ -30,6 +30,7 @@ pub mod epoch_grace;
 pub mod error;
 pub mod group;
 pub mod key_package;
+pub mod provider;
 pub mod ratchet;
 pub mod storage;
 
@@ -40,6 +41,7 @@ pub use group::{
     AddMemberResult, RemoveMemberResult, SCP_CIPHERSUITE, ScpMlsGroup, add_member, create_group,
     destroy_group, generate_key_package, join_group, remove_member,
 };
+pub use provider::MlsCryptoProvider;
 pub use storage::{
     InMemoryMlsProvider, MlsStorageBridge, MlsStorageBridgeError, ScpMlsProvider, new_provider,
 };
