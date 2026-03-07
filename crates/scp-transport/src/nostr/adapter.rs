@@ -5,7 +5,7 @@
 //!
 //! | Transport method | Nostr primitive | Details |
 //! |------------------|-----------------|---------|
-//! | `send` | Event publish | Kind 29078, `r` tag = `routing_id` |
+//! | `send` | Event publish | Kind 9078, `r` tag = `routing_id` |
 //! | `subscribe` | REQ filter | Kind + `r` tag filter |
 //! | `unsubscribe` | CLOSE | Close subscription by ID |
 //! | `query` | REQ + EOSE | One-shot with `since` |
@@ -79,8 +79,8 @@ impl NostrConfig {
 
 /// Internal state for a WebSocket connection to a Nostr relay.
 struct NostrConnection {
-    /// WebSocket write half, protected by a mutex for concurrent sends.
-    writer: tokio_tungstenite::WebSocketStream<
+    /// Duplex WebSocket stream, protected by a mutex for concurrent access.
+    ws_stream: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
     /// Active subscriptions: `subscription_id` -> broadcast sender for events.
@@ -120,6 +120,9 @@ pub struct NostrAdapter {
     subscription_counter: AtomicU64,
     /// Maps `routing_id` hex -> `subscription_id` for tracking active subscriptions.
     routing_subscriptions: Arc<Mutex<HashMap<String, String>>>,
+    /// Maps `BlobId` hex -> Nostr event ID hex for NIP-09 deletion.
+    /// Populated by `send()` after successful event publication.
+    blob_to_event_id: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl NostrAdapter {
@@ -146,6 +149,7 @@ impl NostrAdapter {
             connection: Arc::new(Mutex::new(None)),
             subscription_counter: AtomicU64::new(0),
             routing_subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            blob_to_event_id: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -173,7 +177,7 @@ impl NostrAdapter {
                     "connected to Nostr relay"
                 );
                 *conn_guard = Some(NostrConnection {
-                    writer: ws_stream,
+                    ws_stream,
                     subscriptions: HashMap::new(),
                     reader_active: false,
                 });
@@ -204,7 +208,7 @@ impl NostrAdapter {
             ClientMessage::Close { .. } => "CLOSE",
         }, "sending Nostr message");
 
-        conn.writer
+        conn.ws_stream
             .send(Message::Text(json))
             .await
             .map_err(|e| TransportError::SendFailed(format!("Nostr WebSocket send failed: {e}")))?;
@@ -231,16 +235,13 @@ impl NostrAdapter {
         Ok(hex::encode(signature.to_bytes()))
     }
 
-    /// Create a Nostr event for an SCP envelope.
+    /// Create a Nostr event for an SCP envelope from pre-serialized wire bytes.
     fn create_envelope_event(
         &self,
-        envelope: &OuterEnvelope,
+        wire_bytes: &[u8],
         routing_id_hex: &str,
     ) -> Result<NostrEvent, TransportError> {
-        let wire_bytes = rmp_serde::to_vec_named(envelope).map_err(|e| {
-            TransportError::SendFailed(format!("envelope serialization failed: {e}"))
-        })?;
-        let content = base64_encode(&wire_bytes);
+        let content = base64_encode(wire_bytes);
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| {
@@ -316,7 +317,7 @@ impl NostrAdapter {
                     let Some(conn) = conn_guard.as_mut() else {
                         break;
                     };
-                    conn.writer.next().await
+                    conn.ws_stream.next().await
                 };
 
                 match msg {
@@ -443,12 +444,8 @@ impl TransportAdapter for NostrAdapter {
 
             self.ensure_connected().await?;
 
-            // Re-deserialize for event creation since we already have wire_bytes.
-            let envelope: OuterEnvelope = rmp_serde::from_slice(&wire_bytes).map_err(|e| {
-                TransportError::SendFailed(format!("envelope re-serialization failed: {e}"))
-            })?;
-
-            let event = self.create_envelope_event(&envelope, &routing_id_hex)?;
+            let event = self.create_envelope_event(&wire_bytes, &routing_id_hex)?;
+            let nostr_event_id = event.id.clone();
             let message = ClientMessage::Event(event);
 
             // Send the event and wait for OK response.
@@ -463,7 +460,7 @@ impl TransportAdapter for NostrAdapter {
 
                 // Read messages until we get an OK for our event.
                 loop {
-                    match conn.writer.next().await {
+                    match conn.ws_stream.next().await {
                         Some(Ok(Message::Text(text))) => {
                             if let Some(RelayMessage::Ok {
                                 accepted, message, ..
@@ -497,6 +494,12 @@ impl TransportAdapter for NostrAdapter {
             match ok_result {
                 Ok(Ok(())) => {
                     debug!("Nostr event published successfully");
+                    // Track blob_id -> nostr_event_id for NIP-09 deletion.
+                    let blob_id_hex = hex::encode(blob_id.as_bytes());
+                    self.blob_to_event_id
+                        .lock()
+                        .await
+                        .insert(blob_id_hex, nostr_event_id);
                     Ok(blob_id)
                 }
                 Ok(Err(e)) => Err(e),
@@ -529,13 +532,17 @@ impl TransportAdapter for NostrAdapter {
 
             // Register the subscription and create a broadcast channel.
             let (tx, rx) = broadcast::channel(256);
+            let should_spawn_reader;
             {
                 let mut conn_guard = self.connection.lock().await;
                 if let Some(conn) = conn_guard.as_mut() {
                     conn.subscriptions.insert(sub_id.clone(), tx);
-                    if !conn.reader_active {
+                    should_spawn_reader = !conn.reader_active;
+                    if should_spawn_reader {
                         conn.reader_active = true;
                     }
+                } else {
+                    should_spawn_reader = false;
                 }
             }
 
@@ -547,8 +554,10 @@ impl TransportAdapter for NostrAdapter {
 
             self.send_message(&req).await?;
 
-            // Spawn background reader to dispatch relay messages.
-            Self::spawn_reader_task(Arc::clone(&self.connection));
+            // Spawn background reader only if one isn't already active.
+            if should_spawn_reader {
+                Self::spawn_reader_task(Arc::clone(&self.connection));
+            }
 
             Ok(Self::create_subscription_stream(rx))
         })
@@ -624,7 +633,7 @@ impl TransportAdapter for NostrAdapter {
                 let conn = conn_guard.as_mut().ok_or(TransportError::NotConnected)?;
 
                 loop {
-                    match conn.writer.next().await {
+                    match conn.ws_stream.next().await {
                         Some(Ok(Message::Text(text))) => {
                             match RelayMessage::from_json(&text) {
                                 Some(RelayMessage::Event {
@@ -680,13 +689,24 @@ impl TransportAdapter for NostrAdapter {
     }
 
     fn delete(&self, blob_id: &BlobId) -> BoxFuture<'_, Result<(), TransportError>> {
-        // NIP-09: deletion event referencing the original event by its ID.
-        // We use the blob_id hex as the event ID reference since we don't
-        // independently track Nostr event IDs. This is best-effort -- relays
-        // MAY ignore deletion requests.
-        let event_id = hex::encode(blob_id.as_bytes());
+        // NIP-09: deletion event referencing the original event by its Nostr
+        // event ID (SHA-256 of canonical form), NOT the BlobId (SHA-256 of
+        // wire bytes). The mapping is recorded by `send()`.
+        let blob_id_hex = hex::encode(blob_id.as_bytes());
 
         Box::pin(async move {
+            let event_id = {
+                let mapping = self.blob_to_event_id.lock().await;
+                mapping.get(&blob_id_hex).cloned()
+            };
+
+            let event_id = event_id.ok_or_else(|| {
+                TransportError::ProtocolError(format!(
+                    "no Nostr event ID found for blob_id {blob_id_hex} -- \
+                     event was not published through this adapter instance"
+                ))
+            })?;
+
             self.ensure_connected().await?;
 
             let deletion_event = self.create_deletion_event(&event_id)?;

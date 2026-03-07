@@ -11,10 +11,12 @@ use crate::error::TransportError;
 
 /// Custom Nostr event kind for SCP envelopes.
 ///
-/// Kind 29078 is in the regular event range (1000-9999), ensuring relays
-/// store all events (not just the latest). Avoids parameterized-replaceable
-/// kinds (30000-39999) which would silently discard prior messages.
-pub const SCP_EVENT_KIND: u64 = 29078;
+/// Kind 9078 is in the regular event range (1000-9999), ensuring relays
+/// store all events (not just the latest). Avoids the ephemeral range
+/// (20000-29999) where relays do NOT store events and cannot serve them
+/// via REQ. Also avoids parameterized-replaceable kinds (30000-39999)
+/// which would silently discard prior messages.
+pub const SCP_EVENT_KIND: u64 = 9078;
 
 /// NIP-09 deletion event kind.
 pub const DELETION_EVENT_KIND: u64 = 5;
@@ -24,7 +26,7 @@ pub const ROUTING_TAG: &str = "r";
 
 /// A Nostr event (NIP-01).
 ///
-/// Events are the fundamental data type in Nostr. SCP uses custom kind 29078
+/// Events are the fundamental data type in Nostr. SCP uses custom kind 9078
 /// events with the outer envelope base64-encoded in `.content` and the
 /// `routing_id` in an `r` tag for relay-side filtering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,11 +37,11 @@ pub struct NostrEvent {
     pub pubkey: String,
     /// Unix timestamp (seconds).
     pub created_at: u64,
-    /// Event kind (29078 for SCP envelopes, 5 for NIP-09 deletions).
+    /// Event kind (9078 for SCP envelopes, 5 for NIP-09 deletions).
     pub kind: u64,
     /// Array of tag arrays. SCP uses `["r", "<hex(routing_id)>"]`.
     pub tags: Vec<Vec<String>>,
-    /// Event content. Base64-encoded SCP outer envelope for kind 29078.
+    /// Event content. Base64-encoded SCP outer envelope for kind 9078.
     pub content: String,
     /// 64-byte hex-encoded Schnorr signature (NIP-01).
     pub sig: String,
@@ -313,7 +315,7 @@ mod tests {
 
     #[test]
     fn relay_event_message_parses() {
-        let json = r#"["EVENT","sub1",{"id":"abc","pubkey":"def","created_at":1000,"kind":29078,"tags":[],"content":"test","sig":"sig"}]"#;
+        let json = r#"["EVENT","sub1",{"id":"abc","pubkey":"def","created_at":1000,"kind":9078,"tags":[],"content":"test","sig":"sig"}]"#;
         let msg = RelayMessage::from_json(json).unwrap();
         match msg {
             RelayMessage::Event {

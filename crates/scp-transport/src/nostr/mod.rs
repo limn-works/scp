@@ -8,7 +8,7 @@
 //!
 //! | SCP operation | Nostr primitive | Details |
 //! |---------------|-----------------|---------|
-//! | `send` | Event publish | Custom kind 29078, `routing_id` in `r` tag |
+//! | `send` | Event publish | Custom kind 9078, `routing_id` in `r` tag |
 //! | `subscribe` | `REQ` filter | Filter on kind + `r` tag, stream of `EVENT`s |
 //! | `unsubscribe` | `CLOSE` | Close subscription by ID |
 //! | `query` | `REQ` + `EOSE` | One-shot query with `since` filter |

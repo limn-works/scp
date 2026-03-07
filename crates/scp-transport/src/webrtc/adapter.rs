@@ -119,22 +119,27 @@ impl WebRtcAdapter {
         }
     }
 
-    /// Ensure a peer connection is established via ICE.
+    /// Ensure a peer connection is established.
     ///
-    /// Performs ICE connectivity checks if no connection exists. Uses the
-    /// signaling channel to exchange SDP offers/answers.
+    /// Actual SDP negotiation and ICE connectivity are delegated to the
+    /// [`DataChannelProvider`] implementation, which owns the platform WebRTC
+    /// stack. This method uses [`DataChannelProvider::open_channel`] with a
+    /// control label as a connectivity probe, then records peer state.
+    ///
+    /// On the first call the adapter also exchanges signaling messages with
+    /// the remote peer via the [`SignalingChannel`] so that both sides are
+    /// aware of the connection intent.
     async fn ensure_connected(&self) -> Result<(), TransportError> {
         let mut peer_guard = self.peer.lock().await;
         if peer_guard.is_some() {
             return Ok(());
         }
 
-        debug!("initiating WebRTC peer connection via ICE");
+        debug!("initiating WebRTC peer connection");
 
-        // Exchange signaling messages with timeout.
         let timeout = std::time::Duration::from_secs(self.config.ice_timeout_secs);
 
-        // Send SDP offer.
+        // Notify the remote peer via signaling that we want to connect.
         let offer_sdp = create_sdp_offer(&self.config);
         self.signaling
             .send_signal(SignalingMessage::Offer {
@@ -167,8 +172,18 @@ impl WebRtcAdapter {
         debug!(
             offer_len = offer_sdp.len(),
             answer_len = answer_sdp.len(),
-            "SDP exchange complete"
+            "signaling exchange complete"
         );
+
+        // Use the provider's open_channel as a connectivity probe.
+        self.provider
+            .open_channel("__scp_control")
+            .await
+            .map_err(|e| {
+                TransportError::ConnectionFailed(format!(
+                    "data channel provider connectivity check failed: {e}"
+                ))
+            })?;
 
         *peer_guard = Some(PeerConnectionState {
             ice_state: IceConnectionState::Connected,
@@ -320,6 +335,8 @@ impl TransportAdapter for WebRtcAdapter {
         // The caller should use subscribe() for live message delivery.
 
         Box::pin(async move {
+            self.ensure_connected().await?;
+
             debug!("WebRTC query returns empty -- P2P has no durable storage");
             Ok(Vec::new())
         })
@@ -335,11 +352,12 @@ impl TransportAdapter for WebRtcAdapter {
     }
 }
 
-/// Create an SDP offer string.
+/// Create a signaling SDP offer template.
 ///
-/// In a full deployment, the platform's WebRTC API generates the actual SDP.
-/// This function creates a minimal SDP template for the signaling protocol
-/// handshake. The real media negotiation happens in the `DataChannelProvider`.
+/// This is **not** a real SDP offer for WebRTC media negotiation -- actual SDP
+/// generation and ICE processing are handled by the platform's
+/// [`DataChannelProvider`]. This template communicates SCP transport parameters
+/// (ICE servers, max message size) to the remote peer during signaling setup.
 fn create_sdp_offer(config: &WebRtcConfig) -> String {
     let ice_servers: Vec<String> = config
         .ice_servers
