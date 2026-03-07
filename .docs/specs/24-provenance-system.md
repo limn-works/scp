@@ -84,7 +84,7 @@ The `attach_provenance` operation constructs a `DataProvenance` record from the 
 
 - `source_context` -- populated from the source context's identifier.
 - `source_type` -- the source context's current data availability status.
-- `counterparties` -- the source context's current membership roster DIDs at the time of data flow, subject to the source context's `counterparty_policy` (§7.7.1). When data crosses a context boundary, the sending SDK applies the policy: `full` passes real DIDs through, `pseudonymized` replaces them with context-scoped pseudonyms (§9.10.4), and `redacted` sets the field to an empty list. The default for cross-context export when no policy is set is `redacted`. This captures who was present in the interaction while respecting context membership privacy.
+- `counterparties` -- the source context's current membership roster DIDs at the time of data flow, subject to the source context's `counterparty_policy` (section 7.7.1). When data crosses a context boundary, the sending SDK applies the policy: `full` passes real DIDs through, `pseudonymized` replaces them with context-scoped pseudonyms (section 9.10.4), and `redacted` sets the field to an empty list. The default for cross-context export when no policy is set is `redacted`. See section 24.3.5 for the full counterparty privacy requirements across the provenance lifecycle.
 - `purpose` -- optional human-readable purpose from the source context.
 - `discovery_method` -- how the source was discovered by the receiver.
 - `age` -- elapsed time since the source interaction.
@@ -105,6 +105,26 @@ Provenance is recorded in both the source and target contexts' event logs. The r
 ### 24.3.4 Economic Provenance
 
 When data has an associated production cost (section 19.6), the `payment_amount`, `payment_adapter`, and `payment_receipt_id` fields carry economic provenance. Receiving contexts see what data cost to produce -- expensive computations carry economic provenance. These fields are populated when the cross-context data flow involves a payment, and `None` otherwise.
+
+### 24.3.5 Counterparty Privacy in Provenance
+
+The `counterparties` field in `DataProvenance` reveals context membership -- a privacy-sensitive signal that violates context isolation if leaked without controls. Section 24.3.1 specifies that the sending SDK applies the source context's `counterparty_policy` (section 7.7.1) at attachment time. This section specifies the additional provenance-specific requirements for counterparty privacy across the provenance lifecycle.
+
+**Provenance store redaction support.** The provenance store MUST support counterparty redaction as a first-class operation:
+
+1. **`redact_counterparties(provenance_id) -> Result<(), ProvenanceError>`** -- replaces the `counterparties` field with an empty list in the stored provenance record. This is a destructive, irreversible operation. It is used when a context's `counterparty_policy` changes to `redacted` and existing provenance records must be retroactively updated.
+
+2. **`pseudonymize_counterparties(provenance_id, pseudonym_key) -> Result<(), ProvenanceError>`** -- replaces real DIDs in the `counterparties` field with context-scoped pseudonyms derived using the provided pseudonym derivation key (per section 9.10.4). This is a one-way operation -- the pseudonym key is held only by the source context.
+
+**Cross-context provenance queries.** When provenance data is queried across context boundaries (e.g., a receiving context queries the provenance chain of imported data):
+
+1. The provenance store MUST apply the source context's `counterparty_policy` to any counterparty data returned in query results. A query from outside the source context MUST NOT return raw DIDs unless the source context's policy is `full`.
+2. If the querier does not have membership in the source context, counterparties MUST be returned as either pseudonymized or redacted, depending on the source context's policy. The querier MUST NOT receive raw counterparty DIDs for contexts they are not a member of, regardless of policy.
+3. Cross-context provenance chain queries (following `chain_path` through multiple contexts) MUST apply each intermediary context's `counterparty_policy` independently. A chain that passes through a `redacted` context produces empty counterparties for that hop, even if earlier and later hops use `full`.
+
+**Provenance export.** When provenance records are exported (e.g., for external audit, cross-system transfer, or backup), counterparties MUST be pseudonymized using context-scoped pseudonyms before export. Raw DIDs MUST NOT appear in exported provenance data. This applies regardless of the source context's `counterparty_policy` -- export is always pseudonymized at minimum. Contexts with `redacted` policy produce empty counterparties in exports.
+
+**Quality evaluation interaction.** The `counterparty_policy` interacts with provenance quality evaluation (section 24.5.1). When counterparties are `redacted` (empty list), the "Non-empty" condition in the evaluation table is not satisfied, which may cause quality degradation to `NoProvenance` for ephemeral contexts. This is intentional -- the context chose privacy over provenance quality. When counterparties are `pseudonymized`, the non-empty condition IS satisfied (pseudonyms are present), preserving the `EphemeralKnownParties` tier. The pseudonyms attest that known parties exist without revealing their identity.
 
 ## 24.4 Chain Depth Enforcement
 
@@ -187,4 +207,6 @@ The protocol is honest about this. Provenanced data is the norm; unprovenanced d
 | Economic provenance (payment receipts) | Section 19.6 |
 | Provenance in discovery results | Section 6.2.2B |
 | Context infection and provenance as mitigation | Section 9.2 |
+| Counterparty privacy policy (`counterparty_policy`) | Section 7.7.1 |
+| Routing pseudonyms (context-scoped pseudonym derivation) | Section 9.10.4 |
 | Architectural decision | ADR-019 (`.docs/adrs/phase-4.md`) |
