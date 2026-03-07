@@ -586,9 +586,7 @@ fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
                 .retrieve(&key)
                 .await
                 .map_err(|e| {
-                    ScpPyError::identity(format!(
-                        "failed to read identity state from storage: {e}"
-                    ))
+                    ScpPyError::identity(format!("failed to read identity state from storage: {e}"))
                 })?
                 .ok_or_else(|| {
                     ScpPyError::identity(format!(
@@ -972,8 +970,8 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
                 .await
                 .map_err(|e| ScpPyError::identity(format!("key generation failed: {e}")))?;
 
-            let rotated_at = scp_core::time::now_secs()
-                .map_err(|e| ScpPyError::identity(format!("{e}")))?;
+            let rotated_at =
+                scp_core::time::now_secs().map_err(|e| ScpPyError::identity(format!("{e}")))?;
 
             let old_identity = ScpIdentity {
                 identity_key: old_identity_key,

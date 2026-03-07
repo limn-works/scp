@@ -249,8 +249,9 @@ fn validate_tool_ucan(
 
     crate::runtime::with_context(context_id, |rt| {
         let production_resolver = crate::runtime::did_resolver();
-        let did_resolver =
-            crate::bridge_adapters::DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
+        let did_resolver = crate::bridge_adapters::DispatchDidResolver::new(
+            production_resolver.map(std::convert::AsRef::as_ref),
+        );
         let revocation_checker = crate::bridge_adapters::BridgeRevocationChecker {
             revocation_list: &rt.revocation_list,
         };
@@ -566,9 +567,9 @@ fn extract_economic_metadata(
         _ => return Ok(None),
     };
 
-    let dict = meta_obj.downcast::<PyDict>().map_err(|_| {
-        ScpPyError::validation("'economic_metadata' must be a dict".to_owned())
-    })?;
+    let dict = meta_obj
+        .downcast::<PyDict>()
+        .map_err(|_| ScpPyError::validation("'economic_metadata' must be a dict".to_owned()))?;
 
     let cost_per_invoke: u64 = dict
         .get_item("cost_per_invoke")?
@@ -613,9 +614,9 @@ fn extract_test_vectors(
 
     let mut result = Vec::with_capacity(vectors_list.len());
     for item in vectors_list.iter() {
-        let dict = item.downcast::<PyDict>().map_err(|_| {
-            ScpPyError::validation("each test vector must be a dict".to_owned())
-        })?;
+        let dict = item
+            .downcast::<PyDict>()
+            .map_err(|_| ScpPyError::validation("each test vector must be a dict".to_owned()))?;
         let tv_json = py_dict_to_json(dict)?;
 
         let input = tv_json
