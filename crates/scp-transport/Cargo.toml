@@ -19,7 +19,7 @@ udp = ["dep:openssl", "dep:socket2"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:rustls", "dep:http"]
 webtransport-wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:web-sys", "dep:wasm-bindgen-futures", "dep:getrandom_02", "dep:getrandom_03"]
 coap = ["dep:coap-lite", "dep:openssl"]
-nostr = ["dep:base64"]
+nostr = ["dep:base64", "dep:k256"]
 webrtc = []
 
 [dependencies]
@@ -67,6 +67,7 @@ getrandom_02 = { package = "getrandom", version = "0.2", optional = true, featur
 getrandom_03 = { package = "getrandom", version = "0.3", optional = true, features = ["wasm_js"] }
 coap-lite = { version = "0.13", optional = true }
 base64 = { workspace = true, optional = true }
+k256 = { version = "0.13", optional = true, features = ["schnorr"] }
 
 [dev-dependencies]
 scp-core = { path = "../scp-core" }
@@ -80,6 +81,8 @@ rmpv = { version = "1", features = ["with-serde"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 rcgen = "0.13"
+k256 = { version = "0.13", features = ["schnorr"] }
+base64 = { workspace = true }
 
 [[test]]
 name = "combined_conformance"
@@ -90,6 +93,16 @@ required-features = ["combined"]
 name = "local_cache_conformance"
 path = "tests/local_cache_conformance.rs"
 required-features = ["local-cache"]
+
+[[test]]
+name = "nostr_roundtrip"
+path = "tests/nostr_roundtrip.rs"
+required-features = ["nostr"]
+
+[[test]]
+name = "webrtc_roundtrip"
+path = "tests/webrtc_roundtrip.rs"
+required-features = ["webrtc"]
 
 [lints]
 workspace = true

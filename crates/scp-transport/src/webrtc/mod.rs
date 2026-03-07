@@ -4,6 +4,19 @@
 //! WebRTC data channels provide peer-to-peer transport with NAT traversal
 //! via ICE (STUN/TURN), enabling direct communication between SCP participants.
 //!
+//! # Architecture
+//!
+//! The adapter uses an injected [`DataChannelProvider`] trait for the actual
+//! data channel transport. Platform code implements the provider with the
+//! platform-specific WebRTC stack:
+//!
+//! - **Native**: `webrtc-rs` crate wrapping `RTCDataChannel`
+//! - **WASM**: `web_sys::RtcDataChannel`
+//! - **Testing**: in-memory mock provider
+//!
+//! The adapter orchestrates SCP message framing (MessagePack serialization)
+//! over whatever data channel implementation the provider gives.
+//!
 //! # Operation Mapping (section 10.5.2)
 //!
 //! | SCP operation | WebRTC primitive | Details |
@@ -35,3 +48,4 @@ pub mod adapter;
 pub mod signaling;
 
 pub use adapter::WebRtcAdapter;
+pub use signaling::DataChannelProvider;

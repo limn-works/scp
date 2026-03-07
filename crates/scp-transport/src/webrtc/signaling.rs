@@ -1,14 +1,20 @@
-//! WebRTC signaling types for SCP.
+//! WebRTC signaling and data channel abstraction types for SCP.
 //!
 //! WebRTC requires a signaling channel to exchange SDP offers/answers and
 //! ICE candidates before a peer connection can be established. In SCP, the
 //! signaling channel is the native relay transport -- SDP messages flow as
 //! standard SCP messages through an existing context.
 //!
-//! This module defines the signaling message types. The actual signaling
-//! transport is pluggable via the [`SignalingChannel`] trait.
+//! The [`DataChannelProvider`] trait abstracts the platform-specific WebRTC
+//! data channel implementation. Platform code (webrtc-rs, web_sys, etc.)
+//! implements this trait; the adapter orchestrates SCP message framing over
+//! whatever data channel implementation is provided.
+
+use std::pin::Pin;
 
 use serde::{Deserialize, Serialize};
+
+use crate::error::TransportError;
 
 /// A WebRTC signaling message exchanged during connection setup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,20 +50,79 @@ pub trait SignalingChannel: Send + Sync {
     fn send_signal(
         &self,
         message: SignalingMessage,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), crate::error::TransportError>> + Send + '_>,
-    >;
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>>;
 
     /// Receive the next signaling message from the remote peer.
     fn recv_signal(
         &self,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<SignalingMessage, crate::error::TransportError>>
-                + Send
-                + '_,
-        >,
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = Result<SignalingMessage, TransportError>> + Send + '_>,
     >;
+}
+
+/// Trait for WebRTC data channel implementations.
+///
+/// Platform code implements this trait to provide the actual data channel
+/// transport. The adapter uses this trait to send and receive binary
+/// messages over WebRTC data channels. Each instance represents a single
+/// data channel identified by a label (the routing ID hex).
+///
+/// # Implementors
+///
+/// - Native platforms: `webrtc-rs` crate wrapping `RTCDataChannel`
+/// - WASM: `web_sys::RtcDataChannel`
+/// - Testing: in-memory mock (see tests)
+pub trait DataChannelProvider: Send + Sync {
+    /// Open or create a data channel with the given label.
+    ///
+    /// If the channel already exists, this should return successfully.
+    /// The label is the hex-encoded routing ID.
+    fn open_channel(
+        &self,
+        label: &str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>>;
+
+    /// Send binary data on the channel with the given label.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::SendFailed`] if the channel does not exist
+    /// or the send operation fails.
+    /// Returns [`TransportError::PayloadTooLarge`] if the data exceeds the
+    /// maximum message size.
+    fn send_data(
+        &self,
+        label: &str,
+        data: Vec<u8>,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>>;
+
+    /// Receive the next binary message from the channel with the given label.
+    ///
+    /// Returns `None` if the channel is closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::NotConnected`] if the channel does not exist.
+    fn recv_data(
+        &self,
+        label: &str,
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = Result<Option<Vec<u8>>, TransportError>> + Send + '_>,
+    >;
+
+    /// Close the data channel with the given label.
+    ///
+    /// If the channel does not exist, this should return successfully.
+    fn close_channel(
+        &self,
+        label: &str,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>>;
+
+    /// Check whether a channel with the given label is open.
+    fn is_channel_open(
+        &self,
+        label: &str,
+    ) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>;
 }
 
 /// Configuration for ICE servers (STUN/TURN).

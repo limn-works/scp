@@ -11,6 +11,13 @@
 //! | `query` | Request/response | Application-level over `DataChannel` |
 //! | `delete` | Not applicable | P2P, no central store |
 //!
+//! # Architecture
+//!
+//! The adapter orchestrates SCP message framing over a pluggable
+//! [`DataChannelProvider`]. Platform code implements the provider trait
+//! with the actual WebRTC stack (webrtc-rs, web_sys, etc.). The adapter
+//! handles serialization, routing, and the `TransportAdapter` contract.
+//!
 //! # Connection Model
 //!
 //! Peer-to-peer via ICE (STUN/TURN). Signaling uses an external channel
@@ -19,16 +26,15 @@
 //!
 //! See `.docs/specs/10-infrastructure-and-self-hosting.md` section 10.5.2.
 
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use scp_core::envelope::OuterEnvelope;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use super::signaling::{
-    DataChannelState, IceConnectionState, IceServerConfig, SignalingChannel, SignalingMessage,
+    DataChannelProvider, IceConnectionState, IceServerConfig, SignalingChannel, SignalingMessage,
 };
 use crate::error::TransportError;
 use crate::traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};
@@ -47,8 +53,6 @@ pub struct WebRtcConfig {
     pub max_message_size: usize,
     /// ICE connection timeout in seconds.
     pub ice_timeout_secs: u64,
-    /// Data channel buffer size (number of envelopes).
-    pub channel_buffer_size: usize,
 }
 
 impl Default for WebRtcConfig {
@@ -59,41 +63,30 @@ impl Default for WebRtcConfig {
             )],
             max_message_size: 262_144, // 256 KiB
             ice_timeout_secs: 30,
-            channel_buffer_size: 256,
         }
     }
 }
 
-/// State of a single data channel mapped to a routing ID.
-struct DataChannelEntry {
-    /// Channel for sending outbound messages.
-    outbound_tx: mpsc::Sender<Vec<u8>>,
-    /// Current state of the data channel.
-    state: DataChannelState,
-}
-
-/// Peer connection state.
-struct PeerConnection {
+/// Peer connection state tracked by the adapter.
+struct PeerConnectionState {
     /// ICE connection state.
     ice_state: IceConnectionState,
-    /// Active data channels keyed by `routing_id` hex.
-    channels: HashMap<String, DataChannelEntry>,
-    /// Inbound message receivers keyed by `routing_id` hex.
-    /// Each receiver yields raw binary messages from the peer.
-    inbound_receivers: HashMap<String, mpsc::Receiver<Vec<u8>>>,
 }
 
 /// Transport adapter for WebRTC data channels.
 ///
 /// Implements [`TransportAdapter`] by mapping SCP operations to WebRTC data
-/// channel operations. Provides peer-to-peer transport with NAT traversal
-/// via ICE.
+/// channel operations via an injected [`DataChannelProvider`]. The adapter
+/// handles SCP message framing (MessagePack serialization) and delegates
+/// actual data transport to the provider.
 ///
 /// # Lifecycle
 ///
-/// 1. Create adapter with [`WebRtcConfig`] and a [`SignalingChannel`].
-/// 2. The first `send` or `subscribe` triggers ICE connectivity checks.
-/// 3. Data channels are created per routing ID.
+/// 1. Create adapter with [`WebRtcConfig`], a [`SignalingChannel`], and a
+///    [`DataChannelProvider`].
+/// 2. The first `send` or `subscribe` triggers ICE connectivity checks
+///    via the signaling channel.
+/// 3. Data channels are created per routing ID via the provider.
 /// 4. `delete` returns [`TransportError::NotSupported`] -- P2P has no central store.
 ///
 /// # Thread Safety
@@ -103,18 +96,25 @@ struct PeerConnection {
 pub struct WebRtcAdapter {
     config: WebRtcConfig,
     signaling: Arc<dyn SignalingChannel>,
-    peer: Arc<Mutex<Option<PeerConnection>>>,
+    provider: Arc<dyn DataChannelProvider>,
+    peer: Arc<Mutex<Option<PeerConnectionState>>>,
 }
 
 impl WebRtcAdapter {
-    /// Create a new WebRTC adapter with the given configuration and signaling channel.
+    /// Create a new WebRTC adapter with the given configuration, signaling
+    /// channel, and data channel provider.
     ///
     /// The adapter does not initiate a connection immediately -- the first
     /// transport operation triggers ICE connectivity checks.
-    pub fn new(config: WebRtcConfig, signaling: Arc<dyn SignalingChannel>) -> Self {
+    pub fn new(
+        config: WebRtcConfig,
+        signaling: Arc<dyn SignalingChannel>,
+        provider: Arc<dyn DataChannelProvider>,
+    ) -> Self {
         Self {
             config,
             signaling,
+            provider,
             peer: Arc::new(Mutex::new(None)),
         }
     }
@@ -122,7 +122,7 @@ impl WebRtcAdapter {
     /// Ensure a peer connection is established via ICE.
     ///
     /// Performs ICE connectivity checks if no connection exists. Uses the
-    /// signaling channel to exchange SDP offers/answers and ICE candidates.
+    /// signaling channel to exchange SDP offers/answers.
     async fn ensure_connected(&self) -> Result<(), TransportError> {
         let mut peer_guard = self.peer.lock().await;
         if peer_guard.is_some() {
@@ -130,23 +130,6 @@ impl WebRtcAdapter {
         }
 
         debug!("initiating WebRTC peer connection via ICE");
-
-        // Create a new peer connection state.
-        // In a full implementation, this would:
-        // 1. Create RTCPeerConnection with ICE servers
-        // 2. Create SDP offer
-        // 3. Send offer via signaling channel
-        // 4. Receive SDP answer via signaling channel
-        // 5. Exchange ICE candidates
-        // 6. Wait for ICE connected state
-        //
-        // The actual WebRTC API interaction depends on the platform:
-        // - Native: webrtc-rs crate
-        // - WASM: web_sys::RtcPeerConnection
-        //
-        // This adapter provides the TransportAdapter interface and signaling
-        // protocol. The platform-specific WebRTC implementation is injected
-        // via the signaling channel and platform bindings.
 
         // Exchange signaling messages with timeout.
         let timeout = std::time::Duration::from_secs(self.config.ice_timeout_secs);
@@ -187,84 +170,37 @@ impl WebRtcAdapter {
             "SDP exchange complete"
         );
 
-        // ICE candidate exchange would happen here in parallel with the
-        // SDP exchange. For the adapter implementation, we model the
-        // connection as established after SDP exchange.
-
-        *peer_guard = Some(PeerConnection {
+        *peer_guard = Some(PeerConnectionState {
             ice_state: IceConnectionState::Connected,
-            channels: HashMap::new(),
-            inbound_receivers: HashMap::new(),
         });
 
         Ok(())
     }
 
-    /// Get or create a data channel for the given routing ID.
-    async fn ensure_channel(&self, routing_id_hex: &str) -> Result<(), TransportError> {
-        let mut peer_guard = self.peer.lock().await;
-        let peer = peer_guard.as_mut().ok_or(TransportError::NotConnected)?;
+    /// Check that the peer connection is in a usable ICE state.
+    async fn check_ice_state(&self) -> Result<(), TransportError> {
+        let peer_guard = self.peer.lock().await;
+        let peer = peer_guard.as_ref().ok_or(TransportError::NotConnected)?;
 
-        // Verify the ICE connection is in a usable state.
         match peer.ice_state {
-            IceConnectionState::Connected | IceConnectionState::Completed => {}
-            _ => {
-                return Err(TransportError::NotConnected);
-            }
+            IceConnectionState::Connected | IceConnectionState::Completed => Ok(()),
+            _ => Err(TransportError::NotConnected),
         }
-
-        if peer.channels.contains_key(routing_id_hex) {
-            return Ok(());
-        }
-
-        // Create a new data channel pair (outbound + inbound).
-        let (outbound_tx, _outbound_rx) = mpsc::channel(self.config.channel_buffer_size);
-        let (inbound_tx, inbound_rx) = mpsc::channel(self.config.channel_buffer_size);
-
-        // In a full implementation, this would:
-        // 1. Call RTCPeerConnection.createDataChannel(routing_id_hex)
-        // 2. Set up onmessage handler to forward to inbound_tx
-        // 3. Set up the outbound_rx consumer to call channel.send()
-        //
-        // For now, we wire up the channel state. The platform-specific
-        // WebRTC binding fills in the actual data channel plumbing.
-
-        // In production, a task would read from `outbound_rx` and write
-        // to the RTCDataChannel. The platform binding manages this.
-
-        // The platform binding receives raw bytes from RTCDataChannel.onmessage
-        // and forwards them via `inbound_tx`. We drop it here because the
-        // actual platform WebRTC binding would hold the sender.
-        drop(inbound_tx);
-
-        peer.channels.insert(
-            routing_id_hex.to_owned(),
-            DataChannelEntry {
-                outbound_tx,
-                state: DataChannelState::Open,
-            },
-        );
-        peer.inbound_receivers
-            .insert(routing_id_hex.to_owned(), inbound_rx);
-
-        debug!(
-            routing_id = %routing_id_hex,
-            "WebRTC data channel created"
-        );
-
-        Ok(())
     }
 }
 
 impl TransportAdapter for WebRtcAdapter {
     fn send(&self, envelope: &OuterEnvelope) -> BoxFuture<'_, Result<BlobId, TransportError>> {
-        let wire_bytes = rmp_serde::to_vec(envelope).unwrap_or_default();
-        let blob_id = BlobId::from_sha256(&wire_bytes);
+        let wire_result = rmp_serde::to_vec_named(envelope)
+            .map_err(|e| TransportError::SendFailed(format!("envelope serialization failed: {e}")));
         let routing_id_hex = hex::encode(&envelope.routing_id);
 
         Box::pin(async move {
+            let wire_bytes = wire_result?;
+            let blob_id = BlobId::from_sha256(&wire_bytes);
+
             self.ensure_connected().await?;
-            self.ensure_channel(&routing_id_hex).await?;
+            self.check_ice_state().await?;
 
             // Check message size.
             if wire_bytes.len() > self.config.max_message_size {
@@ -275,22 +211,11 @@ impl TransportAdapter for WebRtcAdapter {
                 )));
             }
 
-            // Send via the data channel.
-            let peer_guard = self.peer.lock().await;
-            let peer = peer_guard.as_ref().ok_or(TransportError::NotConnected)?;
-            let channel = peer.channels.get(&routing_id_hex).ok_or_else(|| {
-                TransportError::SendFailed(format!(
-                    "data channel not found for routing_id {routing_id_hex}"
-                ))
-            })?;
+            // Ensure the data channel is open.
+            self.provider.open_channel(&routing_id_hex).await?;
 
-            if channel.state != DataChannelState::Open {
-                return Err(TransportError::NotConnected);
-            }
-
-            channel.outbound_tx.send(wire_bytes).await.map_err(|e| {
-                TransportError::SendFailed(format!("data channel send failed: {e}"))
-            })?;
+            // Send via the data channel provider.
+            self.provider.send_data(&routing_id_hex, wire_bytes).await?;
 
             debug!(
                 routing_id = %routing_id_hex,
@@ -314,44 +239,51 @@ impl TransportAdapter for WebRtcAdapter {
 
         Box::pin(async move {
             self.ensure_connected().await?;
-            self.ensure_channel(&routing_id_hex).await?;
+            self.check_ice_state().await?;
 
-            // Take the inbound receiver for this channel.
-            let inbound_rx = {
-                let mut peer_guard = self.peer.lock().await;
-                let peer = peer_guard.as_mut().ok_or(TransportError::NotConnected)?;
-                peer.inbound_receivers
-                    .remove(&routing_id_hex)
-                    .ok_or_else(|| {
-                        TransportError::SubscriptionFailed(format!(
-                            "no inbound channel for routing_id {routing_id_hex}"
-                        ))
-                    })?
-            };
+            // Ensure the data channel is open.
+            self.provider.open_channel(&routing_id_hex).await?;
 
-            // Convert the mpsc receiver into a TransportEvent stream.
-            let stream = futures::stream::unfold(inbound_rx, |mut rx| async move {
-                match rx.recv().await {
-                    Some(raw_bytes) => {
-                        let event = match rmp_serde::from_slice::<OuterEnvelope>(&raw_bytes) {
-                            Ok(envelope) => TransportEvent::Envelope(envelope),
-                            Err(e) => {
-                                warn!(error = %e, "failed to deserialize envelope from WebRTC data channel");
-                                TransportEvent::Error(TransportError::ProtocolError(format!(
-                                    "invalid MessagePack in data channel message: {e}"
-                                )))
-                            }
-                        };
-                        Some((event, rx))
+            let provider = Arc::clone(&self.provider);
+            let label = routing_id_hex.clone();
+
+            // Convert the data channel into a TransportEvent stream.
+            let stream = futures::stream::unfold(
+                (provider, label, false),
+                |(provider, label, terminated)| async move {
+                    if terminated {
+                        return None;
                     }
-                    None => Some((
-                        TransportEvent::Terminated {
-                            reason: "WebRTC data channel closed".to_owned(),
-                        },
-                        rx,
-                    )),
-                }
-            });
+
+                    match provider.recv_data(&label).await {
+                        Ok(Some(raw_bytes)) => {
+                            let event = match rmp_serde::from_slice::<OuterEnvelope>(&raw_bytes) {
+                                Ok(envelope) => TransportEvent::Envelope(envelope),
+                                Err(e) => {
+                                    warn!(error = %e, "failed to deserialize envelope from WebRTC data channel");
+                                    TransportEvent::Error(TransportError::ProtocolError(format!(
+                                        "invalid MessagePack in data channel message: {e}"
+                                    )))
+                                }
+                            };
+                            Some((event, (provider, label, false)))
+                        }
+                        Ok(None) => {
+                            // Channel closed.
+                            Some((
+                                TransportEvent::Terminated {
+                                    reason: "WebRTC data channel closed".to_owned(),
+                                },
+                                (provider, label, true),
+                            ))
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "WebRTC data channel recv error");
+                            Some((TransportEvent::Error(e), (provider, label, false)))
+                        }
+                    }
+                },
+            );
 
             debug!(
                 routing_id = %routing_id_hex,
@@ -366,18 +298,7 @@ impl TransportAdapter for WebRtcAdapter {
         let routing_id_hex = hex::encode(routing_id.as_bytes());
 
         Box::pin(async move {
-            let mut peer_guard = self.peer.lock().await;
-            let peer = peer_guard.as_mut().ok_or(TransportError::NotConnected)?;
-
-            // Remove and close the data channel.
-            if let Some(mut entry) = peer.channels.remove(&routing_id_hex) {
-                entry.state = DataChannelState::Closed;
-                // Drop the sender to signal channel closure.
-                drop(entry.outbound_tx);
-            }
-
-            // Remove any pending inbound receiver.
-            peer.inbound_receivers.remove(&routing_id_hex);
+            self.provider.close_channel(&routing_id_hex).await?;
 
             debug!(
                 routing_id = %routing_id_hex,
@@ -393,20 +314,12 @@ impl TransportAdapter for WebRtcAdapter {
         _routing_id: &RoutingId,
         _since: Option<u64>,
     ) -> BoxFuture<'_, Result<Vec<OuterEnvelope>, TransportError>> {
-        // WebRTC is P2P with no durable storage. Query is application-level
-        // and requires the remote peer to respond with stored envelopes.
+        // WebRTC is P2P with no durable storage. Query returns empty results.
         // Per spec section 10.5.2: "Request/response over DataChannel
         // (application-level, no native query)."
-        //
-        // We implement a basic request/response protocol: send a query
-        // request message and collect responses. However, since the remote
-        // peer may not support this, we return an empty vec if the channel
-        // has no pending messages.
+        // The caller should use subscribe() for live message delivery.
 
         Box::pin(async move {
-            // P2P has no server-side storage. Return empty results.
-            // The caller should use subscribe() for live message delivery.
-            // This matches the spec constraint: "no durable storage, no backfill."
             debug!("WebRTC query returns empty -- P2P has no durable storage");
             Ok(Vec::new())
         })
@@ -424,12 +337,10 @@ impl TransportAdapter for WebRtcAdapter {
 
 /// Create an SDP offer string.
 ///
-/// In a full implementation, this would use the platform's WebRTC API to
-/// generate a proper SDP offer. This function creates a minimal SDP
-/// template for the signaling protocol.
+/// In a full deployment, the platform's WebRTC API generates the actual SDP.
+/// This function creates a minimal SDP template for the signaling protocol
+/// handshake. The real media negotiation happens in the `DataChannelProvider`.
 fn create_sdp_offer(config: &WebRtcConfig) -> String {
-    // A real SDP offer would be generated by the WebRTC implementation.
-    // This provides the structure for the signaling protocol.
     let ice_servers: Vec<String> = config
         .ice_servers
         .iter()
@@ -454,21 +365,25 @@ fn create_sdp_offer(config: &WebRtcConfig) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use std::collections::HashMap;
+
+    use tokio::sync::Mutex as TokioMutex;
+
     use super::*;
 
     /// A mock signaling channel for testing.
     struct MockSignalingChannel {
-        outbound: Mutex<Vec<super::super::signaling::SignalingMessage>>,
-        inbound: Mutex<Vec<super::super::signaling::SignalingMessage>>,
+        outbound: TokioMutex<Vec<SignalingMessage>>,
+        inbound: TokioMutex<Vec<SignalingMessage>>,
     }
 
     impl MockSignalingChannel {
         fn new() -> Self {
             Self {
-                outbound: Mutex::new(Vec::new()),
-                inbound: Mutex::new(vec![
+                outbound: TokioMutex::new(Vec::new()),
+                inbound: TokioMutex::new(vec![
                     // Pre-load an SDP answer for connection setup.
-                    super::super::signaling::SignalingMessage::Answer {
+                    SignalingMessage::Answer {
                         sdp: "v=0\r\no=remote 0 0 IN IP4 0.0.0.0\r\n".to_owned(),
                     },
                 ]),
@@ -479,7 +394,7 @@ mod tests {
     impl SignalingChannel for MockSignalingChannel {
         fn send_signal(
             &self,
-            message: super::super::signaling::SignalingMessage,
+            message: SignalingMessage,
         ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>>
         {
             Box::pin(async move {
@@ -492,9 +407,8 @@ mod tests {
             &self,
         ) -> Pin<
             Box<
-                dyn std::future::Future<
-                        Output = Result<super::super::signaling::SignalingMessage, TransportError>,
-                    > + Send
+                dyn std::future::Future<Output = Result<SignalingMessage, TransportError>>
+                    + Send
                     + '_,
             >,
         > {
@@ -509,10 +423,135 @@ mod tests {
         }
     }
 
+    /// A mock data channel provider for testing.
+    /// Channels are in-memory mpsc queues keyed by label.
+    pub(crate) struct MockDataChannelProvider {
+        channels: TokioMutex<HashMap<String, MockChannel>>,
+    }
+
+    struct MockChannel {
+        buffer: std::collections::VecDeque<Vec<u8>>,
+        open: bool,
+    }
+
+    impl MockDataChannelProvider {
+        pub(crate) fn new() -> Self {
+            Self {
+                channels: TokioMutex::new(HashMap::new()),
+            }
+        }
+
+        /// Inject data into a channel (simulates remote peer sending).
+        pub(crate) async fn inject_data(&self, label: &str, data: Vec<u8>) {
+            let mut channels = self.channels.lock().await;
+            if let Some(ch) = channels.get_mut(label) {
+                ch.buffer.push_back(data);
+            }
+        }
+    }
+
+    impl DataChannelProvider for MockDataChannelProvider {
+        fn open_channel(
+            &self,
+            label: &str,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>>
+        {
+            let label = label.to_owned();
+            Box::pin(async move {
+                let mut channels = self.channels.lock().await;
+                channels.entry(label).or_insert_with(|| MockChannel {
+                    buffer: std::collections::VecDeque::new(),
+                    open: true,
+                });
+                Ok(())
+            })
+        }
+
+        fn send_data(
+            &self,
+            label: &str,
+            data: Vec<u8>,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>>
+        {
+            let label = label.to_owned();
+            Box::pin(async move {
+                let mut channels = self.channels.lock().await;
+                let ch = channels.get_mut(&label).ok_or_else(|| {
+                    TransportError::SendFailed(format!("no channel for label {label}"))
+                })?;
+                if !ch.open {
+                    return Err(TransportError::NotConnected);
+                }
+                ch.buffer.push_back(data);
+                Ok(())
+            })
+        }
+
+        fn recv_data(
+            &self,
+            label: &str,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Option<Vec<u8>>, TransportError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let label = label.to_owned();
+            Box::pin(async move {
+                let mut channels = self.channels.lock().await;
+                let ch = channels
+                    .get_mut(&label)
+                    .ok_or(TransportError::NotConnected)?;
+                if !ch.open && ch.buffer.is_empty() {
+                    return Ok(None);
+                }
+                Ok(ch.buffer.pop_front())
+            })
+        }
+
+        fn close_channel(
+            &self,
+            label: &str,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>>
+        {
+            let label = label.to_owned();
+            Box::pin(async move {
+                let mut channels = self.channels.lock().await;
+                if let Some(ch) = channels.get_mut(&label) {
+                    ch.open = false;
+                }
+                Ok(())
+            })
+        }
+
+        fn is_channel_open(
+            &self,
+            label: &str,
+        ) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+            let label = label.to_owned();
+            Box::pin(async move {
+                let channels = self.channels.lock().await;
+                channels.get(&label).is_some_and(|ch| ch.open)
+            })
+        }
+    }
+
+    fn make_adapter() -> (
+        WebRtcAdapter,
+        Arc<MockSignalingChannel>,
+        Arc<MockDataChannelProvider>,
+    ) {
+        let signaling = Arc::new(MockSignalingChannel::new());
+        let provider = Arc::new(MockDataChannelProvider::new());
+        let adapter =
+            WebRtcAdapter::new(WebRtcConfig::default(), signaling.clone(), provider.clone());
+        (adapter, signaling, provider)
+    }
+
     #[tokio::test]
     async fn webrtc_adapter_creation() {
-        let signaling = Arc::new(MockSignalingChannel::new());
-        let adapter = WebRtcAdapter::new(WebRtcConfig::default(), signaling);
+        let (adapter, _, _) = make_adapter();
         // Adapter created without connecting.
         let peer = adapter.peer.lock().await;
         assert!(peer.is_none());
@@ -520,8 +559,7 @@ mod tests {
 
     #[tokio::test]
     async fn webrtc_ensure_connected_exchanges_sdp() {
-        let signaling = Arc::new(MockSignalingChannel::new());
-        let adapter = WebRtcAdapter::new(WebRtcConfig::default(), signaling.clone());
+        let (adapter, signaling, _) = make_adapter();
 
         adapter.ensure_connected().await.unwrap();
 
@@ -529,7 +567,7 @@ mod tests {
         let outbound = signaling.outbound.lock().await;
         assert_eq!(outbound.len(), 1);
         match &outbound[0] {
-            super::super::signaling::SignalingMessage::Offer { sdp } => {
+            SignalingMessage::Offer { sdp } => {
                 assert!(sdp.contains("SCP WebRTC Transport"));
             }
             other => panic!("expected Offer, got {other:?}"),
@@ -546,8 +584,7 @@ mod tests {
 
     #[tokio::test]
     async fn webrtc_delete_returns_not_supported() {
-        let signaling = Arc::new(MockSignalingChannel::new());
-        let adapter = WebRtcAdapter::new(WebRtcConfig::default(), signaling);
+        let (adapter, _, _) = make_adapter();
 
         let blob_id = BlobId::new([0xAA; 32]);
         let result = adapter.delete(&blob_id).await;
@@ -562,8 +599,7 @@ mod tests {
 
     #[tokio::test]
     async fn webrtc_query_returns_empty() {
-        let signaling = Arc::new(MockSignalingChannel::new());
-        let adapter = WebRtcAdapter::new(WebRtcConfig::default(), signaling);
+        let (adapter, _, _) = make_adapter();
 
         let routing_id = RoutingId::new([0xBB; 32]);
         let result = adapter.query(&routing_id, None).await.unwrap();
@@ -575,7 +611,6 @@ mod tests {
         let config = WebRtcConfig::default();
         assert_eq!(config.max_message_size, 262_144);
         assert_eq!(config.ice_timeout_secs, 30);
-        assert_eq!(config.channel_buffer_size, 256);
         assert_eq!(config.ice_servers.len(), 1);
     }
 
@@ -589,24 +624,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webrtc_unsubscribe_without_connection_fails() {
-        let signaling = Arc::new(MockSignalingChannel::new());
-        let adapter = WebRtcAdapter::new(WebRtcConfig::default(), signaling);
+    async fn webrtc_send_transports_data_through_provider() {
+        let (adapter, _, provider) = make_adapter();
 
-        let routing_id = RoutingId::new([0xCC; 32]);
-        let result = adapter.unsubscribe(&routing_id).await;
-        assert!(result.is_err());
+        adapter.ensure_connected().await.unwrap();
+
+        // Create a minimal outer envelope.
+        let envelope = OuterEnvelope {
+            routing_id: vec![0xAA; 32],
+            recipient_hint: None,
+            blob_ttl: 3600,
+            encrypted_blob: vec![0x01, 0x02, 0x03],
+        };
+
+        let blob_id = adapter.send(&envelope).await.unwrap();
+
+        // Verify data was sent through the provider.
+        let routing_id_hex = hex::encode(&envelope.routing_id);
+        assert!(provider.is_channel_open(&routing_id_hex).await);
+
+        // The provider should have the serialized envelope in its buffer.
+        let channels = provider.channels.lock().await;
+        let ch = channels.get(&routing_id_hex).unwrap();
+        assert_eq!(ch.buffer.len(), 1);
+
+        // Verify the blob ID is correct.
+        let wire_bytes = rmp_serde::to_vec_named(&envelope).unwrap();
+        assert_eq!(blob_id, BlobId::from_sha256(&wire_bytes));
     }
 
     #[tokio::test]
-    async fn webrtc_ensure_channel_creates_entry() {
-        let signaling = Arc::new(MockSignalingChannel::new());
-        let adapter = WebRtcAdapter::new(WebRtcConfig::default(), signaling);
+    async fn webrtc_unsubscribe_closes_channel() {
+        let (adapter, _, provider) = make_adapter();
 
         adapter.ensure_connected().await.unwrap();
-        adapter.ensure_channel("deadbeef").await.unwrap();
 
-        let peer = adapter.peer.lock().await;
-        assert!(peer.as_ref().unwrap().channels.contains_key("deadbeef"));
+        let routing_id = RoutingId::new([0xCC; 32]);
+        let routing_id_hex = hex::encode(routing_id.as_bytes());
+
+        // Open the channel first.
+        provider.open_channel(&routing_id_hex).await.unwrap();
+        assert!(provider.is_channel_open(&routing_id_hex).await);
+
+        // Unsubscribe should close it.
+        adapter.unsubscribe(&routing_id).await.unwrap();
+        assert!(!provider.is_channel_open(&routing_id_hex).await);
     }
 }

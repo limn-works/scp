@@ -7,6 +7,8 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::error::TransportError;
+
 /// Custom Nostr event kind for SCP envelopes.
 ///
 /// Kind 29078 is in the regular event range (1000-9999), ensuring relays
@@ -48,18 +50,50 @@ impl NostrEvent {
     ///
     /// The canonical form is:
     /// `[0, pubkey, created_at, kind, tags, content]`
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::ProtocolError`] if the canonical form
+    /// cannot be serialized to JSON (should not happen with valid inputs).
     pub fn compute_id(
         pubkey: &str,
         created_at: u64,
         kind: u64,
         tags: &[Vec<String>],
         content: &str,
-    ) -> String {
+    ) -> Result<String, TransportError> {
         let canonical = serde_json::json!([0, pubkey, created_at, kind, tags, content]);
-        let serialized = serde_json::to_string(&canonical).unwrap_or_default();
+        let serialized = serde_json::to_string(&canonical).map_err(|e| {
+            TransportError::ProtocolError(format!(
+                "failed to serialize Nostr event canonical form: {e}"
+            ))
+        })?;
         let hash = Sha256::digest(serialized.as_bytes());
-        hex::encode(hash)
+        Ok(hex::encode(hash))
+    }
+
+    /// Compute the raw SHA-256 hash of the event ID (for signing).
+    ///
+    /// BIP-340 Schnorr signatures sign the 32-byte message hash directly.
+    /// The event ID is already the hex-encoded SHA-256, so we decode it
+    /// back to 32 bytes for signing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::ProtocolError`] if the event ID is not
+    /// valid 32-byte hex.
+    pub fn id_bytes(&self) -> Result<[u8; 32], TransportError> {
+        let bytes = hex::decode(&self.id)
+            .map_err(|e| TransportError::ProtocolError(format!("invalid event ID hex: {e}")))?;
+        let mut arr = [0u8; 32];
+        if bytes.len() != 32 {
+            return Err(TransportError::ProtocolError(format!(
+                "event ID must be 32 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        arr.copy_from_slice(&bytes);
+        Ok(arr)
     }
 }
 
@@ -101,12 +135,19 @@ pub enum ClientMessage {
 
 impl ClientMessage {
     /// Serialize to JSON wire format.
-    #[must_use]
-    pub fn to_json(&self) -> String {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::ProtocolError`] if JSON serialization fails.
+    pub fn to_json(&self) -> Result<String, TransportError> {
         match self {
             Self::Event(event) => {
-                let event_json = serde_json::to_value(event).unwrap_or_default();
-                serde_json::json!(["EVENT", event_json]).to_string()
+                let event_json = serde_json::to_value(event).map_err(|e| {
+                    TransportError::ProtocolError(format!(
+                        "failed to serialize Nostr event to JSON: {e}"
+                    ))
+                })?;
+                Ok(serde_json::json!(["EVENT", event_json]).to_string())
             }
             Self::Req {
                 subscription_id,
@@ -115,12 +156,17 @@ impl ClientMessage {
                 let mut arr: Vec<serde_json::Value> =
                     vec![serde_json::json!("REQ"), serde_json::json!(subscription_id)];
                 for filter in filters {
-                    arr.push(serde_json::to_value(filter).unwrap_or_default());
+                    let val = serde_json::to_value(filter).map_err(|e| {
+                        TransportError::ProtocolError(format!(
+                            "failed to serialize Nostr filter to JSON: {e}"
+                        ))
+                    })?;
+                    arr.push(val);
                 }
-                serde_json::Value::Array(arr).to_string()
+                Ok(serde_json::Value::Array(arr).to_string())
             }
             Self::Close { subscription_id } => {
-                serde_json::json!(["CLOSE", subscription_id]).to_string()
+                Ok(serde_json::json!(["CLOSE", subscription_id]).to_string())
             }
         }
     }
@@ -209,8 +255,8 @@ mod tests {
     fn event_id_computation_is_deterministic() {
         let pubkey = "a".repeat(64);
         let tags = vec![vec!["r".to_owned(), "deadbeef".to_owned()]];
-        let id1 = NostrEvent::compute_id(&pubkey, 1000, SCP_EVENT_KIND, &tags, "hello");
-        let id2 = NostrEvent::compute_id(&pubkey, 1000, SCP_EVENT_KIND, &tags, "hello");
+        let id1 = NostrEvent::compute_id(&pubkey, 1000, SCP_EVENT_KIND, &tags, "hello").unwrap();
+        let id2 = NostrEvent::compute_id(&pubkey, 1000, SCP_EVENT_KIND, &tags, "hello").unwrap();
         assert_eq!(id1, id2);
         assert_eq!(id1.len(), 64); // hex-encoded SHA-256
     }
@@ -219,8 +265,8 @@ mod tests {
     fn event_id_differs_for_different_content() {
         let pubkey = "a".repeat(64);
         let tags = vec![vec!["r".to_owned(), "deadbeef".to_owned()]];
-        let id1 = NostrEvent::compute_id(&pubkey, 1000, SCP_EVENT_KIND, &tags, "hello");
-        let id2 = NostrEvent::compute_id(&pubkey, 1000, SCP_EVENT_KIND, &tags, "world");
+        let id1 = NostrEvent::compute_id(&pubkey, 1000, SCP_EVENT_KIND, &tags, "hello").unwrap();
+        let id2 = NostrEvent::compute_id(&pubkey, 1000, SCP_EVENT_KIND, &tags, "world").unwrap();
         assert_ne!(id1, id2);
     }
 
@@ -236,7 +282,7 @@ mod tests {
             sig: "sig".to_owned(),
         };
         let msg = ClientMessage::Event(event);
-        let json = msg.to_json();
+        let json = msg.to_json().unwrap();
         assert!(json.starts_with("[\"EVENT\""));
     }
 
@@ -251,7 +297,7 @@ mod tests {
                 limit: None,
             }],
         };
-        let json = msg.to_json();
+        let json = msg.to_json().unwrap();
         assert!(json.contains("\"REQ\""));
         assert!(json.contains("sub1"));
     }
@@ -261,7 +307,7 @@ mod tests {
         let msg = ClientMessage::Close {
             subscription_id: "sub1".to_owned(),
         };
-        let json = msg.to_json();
+        let json = msg.to_json().unwrap();
         assert_eq!(json, r#"["CLOSE","sub1"]"#);
     }
 

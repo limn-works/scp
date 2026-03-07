@@ -2761,7 +2761,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6e3919bbaa2945715f0bb6d3934a173d1e9a59ac23767fbaaef277265a7411b"
 dependencies = [
  "cfg-if",
+ "ecdsa 0.16.9",
  "elliptic-curve 0.13.8",
+ "once_cell",
+ "sha2 0.10.9",
+ "signature 2.2.0",
 ]
 
 [[package]]
@@ -5148,6 +5152,7 @@ dependencies = [
  "http 1.4.0",
  "http-body 1.0.1",
  "js-sys",
+ "k256",
  "lru 0.12.5",
  "openssl",
  "quinn",

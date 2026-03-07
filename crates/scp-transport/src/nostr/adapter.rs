@@ -16,6 +16,12 @@
 //! Nostr events are JSON-only. SCP outer envelopes (`MessagePack`) are
 //! base64-encoded in the `.content` field (~33% overhead).
 //!
+//! # Schnorr Signing
+//!
+//! Events are signed with BIP-340 Schnorr signatures using the secp256k1
+//! curve. The signing key is injected at construction time. The public key
+//! is derived from the signing key (x-only, per BIP-340).
+//!
 //! See `.docs/specs/10-infrastructure-and-self-hosting.md` section 10.5.2.
 
 use std::collections::HashMap;
@@ -26,6 +32,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::SinkExt;
 use futures::stream::StreamExt;
+use k256::schnorr::signature::Signer;
+use k256::schnorr::{SigningKey, VerifyingKey};
 use scp_core::envelope::OuterEnvelope;
 use tokio::sync::{Mutex, broadcast};
 use tokio_tungstenite::tungstenite::Message;
@@ -47,10 +55,9 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 pub struct NostrConfig {
     /// WebSocket URL of the Nostr relay (e.g., `wss://relay.example.com`).
     pub relay_url: String,
-    /// Hex-encoded 32-byte public key for signing events.
-    /// In production this would come from a key manager; for the adapter
-    /// we accept it as configuration.
-    pub pubkey: String,
+    /// 32-byte secret key for BIP-340 Schnorr signing.
+    /// The public key is derived from this automatically.
+    pub signing_key: [u8; 32],
     /// Connection timeout in seconds.
     pub connect_timeout_secs: u64,
     /// Query timeout in seconds (for `query` and `send` operations).
@@ -58,12 +65,12 @@ pub struct NostrConfig {
 }
 
 impl NostrConfig {
-    /// Create a new configuration with the given relay URL and public key.
+    /// Create a new configuration with the given relay URL and signing key.
     #[must_use]
-    pub const fn new(relay_url: String, pubkey: String) -> Self {
+    pub const fn new(relay_url: String, signing_key: [u8; 32]) -> Self {
         Self {
             relay_url,
-            pubkey,
+            signing_key,
             connect_timeout_secs: 10,
             operation_timeout_secs: 30,
         }
@@ -92,6 +99,11 @@ struct NostrConnection {
 /// Connects via WebSocket to a single Nostr relay. The adapter manages the
 /// connection lifecycle including reconnection on failure.
 ///
+/// # Signing
+///
+/// Events are signed with BIP-340 Schnorr signatures. The signing key is
+/// provided at construction time; the x-only public key is derived from it.
+///
 /// # Constraints
 ///
 /// - Nostr events are JSON -- SCP envelopes are base64-encoded (~33% overhead)
@@ -100,6 +112,10 @@ struct NostrConnection {
 /// - NIP-09 deletion is best-effort (relays MAY ignore)
 pub struct NostrAdapter {
     config: NostrConfig,
+    /// BIP-340 Schnorr signing key for event signatures.
+    signing_key: SigningKey,
+    /// Hex-encoded x-only public key (BIP-340 format, 32 bytes = 64 hex chars).
+    pubkey_hex: String,
     connection: Arc<Mutex<Option<NostrConnection>>>,
     subscription_counter: AtomicU64,
     /// Maps `routing_id` hex -> `subscription_id` for tracking active subscriptions.
@@ -111,14 +127,26 @@ impl NostrAdapter {
     ///
     /// The adapter does not connect immediately -- the first operation will
     /// establish the WebSocket connection.
-    #[must_use]
-    pub fn new(config: NostrConfig) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::ProtocolError`] if the signing key bytes
+    /// are not a valid secp256k1 secret key.
+    pub fn new(config: NostrConfig) -> Result<Self, TransportError> {
+        let signing_key = SigningKey::from_bytes(&config.signing_key).map_err(|e| {
+            TransportError::ProtocolError(format!("invalid Nostr signing key: {e}"))
+        })?;
+        let verifying_key: &VerifyingKey = signing_key.verifying_key();
+        let pubkey_hex = hex::encode(verifying_key.to_bytes());
+
+        Ok(Self {
             config,
+            signing_key,
+            pubkey_hex,
             connection: Arc::new(Mutex::new(None)),
             subscription_counter: AtomicU64::new(0),
             routing_subscriptions: Arc::new(Mutex::new(HashMap::new())),
-        }
+        })
     }
 
     /// Ensure a WebSocket connection is established to the Nostr relay.
@@ -169,7 +197,7 @@ impl NostrAdapter {
         let mut conn_guard = self.connection.lock().await;
         let conn = conn_guard.as_mut().ok_or(TransportError::NotConnected)?;
 
-        let json = message.to_json();
+        let json = message.to_json()?;
         trace!(msg_type = %match message {
             ClientMessage::Event(_) => "EVENT",
             ClientMessage::Req { .. } => "REQ",
@@ -184,69 +212,98 @@ impl NostrAdapter {
         Ok(())
     }
 
+    /// Returns the hex-encoded x-only public key (BIP-340, 32 bytes = 64 hex chars).
+    #[must_use]
+    pub fn pubkey_hex(&self) -> &str {
+        &self.pubkey_hex
+    }
+
+    /// Returns a reference to the BIP-340 verifying key for signature verification.
+    #[must_use]
+    pub fn verifying_key(&self) -> &VerifyingKey {
+        self.signing_key.verifying_key()
+    }
+
+    /// Sign an event with BIP-340 Schnorr and return the hex-encoded signature.
+    pub fn sign_event(&self, event: &NostrEvent) -> Result<String, TransportError> {
+        let id_bytes = event.id_bytes()?;
+        let signature: k256::schnorr::Signature = self.signing_key.sign(&id_bytes);
+        Ok(hex::encode(signature.to_bytes()))
+    }
+
     /// Create a Nostr event for an SCP envelope.
-    fn create_envelope_event(&self, envelope: &OuterEnvelope, routing_id_hex: &str) -> NostrEvent {
-        let wire_bytes = rmp_serde::to_vec(envelope).unwrap_or_default();
+    fn create_envelope_event(
+        &self,
+        envelope: &OuterEnvelope,
+        routing_id_hex: &str,
+    ) -> Result<NostrEvent, TransportError> {
+        let wire_bytes = rmp_serde::to_vec_named(envelope).map_err(|e| {
+            TransportError::SendFailed(format!("envelope serialization failed: {e}"))
+        })?;
         let content = base64_encode(&wire_bytes);
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
+            .map_err(|e| {
+                TransportError::ProtocolError(format!("system time before UNIX epoch: {e}"))
+            })?
             .as_secs();
         let tags = vec![vec![ROUTING_TAG.to_owned(), routing_id_hex.to_owned()]];
 
         let id = NostrEvent::compute_id(
-            &self.config.pubkey,
+            &self.pubkey_hex,
             created_at,
             SCP_EVENT_KIND,
             &tags,
             &content,
-        );
+        )?;
 
-        // Signature is a placeholder -- in production, the adapter would use
-        // a Nostr-compatible signing key. The relay validates signatures, but
-        // SCP's security does not depend on Nostr signatures (SCP envelopes
-        // are independently authenticated via MLS).
-        let sig = "0".repeat(128);
-
-        NostrEvent {
+        let mut event = NostrEvent {
             id,
-            pubkey: self.config.pubkey.clone(),
+            pubkey: self.pubkey_hex.clone(),
             created_at,
             kind: SCP_EVENT_KIND,
             tags,
             content,
-            sig,
-        }
+            sig: String::new(),
+        };
+
+        event.sig = self.sign_event(&event)?;
+
+        Ok(event)
     }
 
     /// Create a NIP-09 deletion event referencing the given event ID.
-    fn create_deletion_event(&self, event_id: &str) -> NostrEvent {
+    pub fn create_deletion_event(&self, event_id: &str) -> Result<NostrEvent, TransportError> {
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
+            .map_err(|e| {
+                TransportError::ProtocolError(format!("system time before UNIX epoch: {e}"))
+            })?
             .as_secs();
         let tags = vec![vec!["e".to_owned(), event_id.to_owned()]];
         let content = "SCP envelope deletion".to_owned();
 
         let id = NostrEvent::compute_id(
-            &self.config.pubkey,
+            &self.pubkey_hex,
             created_at,
             DELETION_EVENT_KIND,
             &tags,
             &content,
-        );
+        )?;
 
-        let sig = "0".repeat(128);
-
-        NostrEvent {
+        let mut event = NostrEvent {
             id,
-            pubkey: self.config.pubkey.clone(),
+            pubkey: self.pubkey_hex.clone(),
             created_at,
             kind: DELETION_EVENT_KIND,
             tags,
             content,
-            sig,
-        }
+            sig: String::new(),
+        };
+
+        event.sig = self.sign_event(&event)?;
+
+        Ok(event)
     }
 
     /// Spawn a background reader task that dispatches incoming relay messages
@@ -376,13 +433,14 @@ impl NostrAdapter {
 
 impl TransportAdapter for NostrAdapter {
     fn send(&self, envelope: &OuterEnvelope) -> BoxFuture<'_, Result<BlobId, TransportError>> {
-        // Clone envelope for the async block since OuterEnvelope doesn't impl Clone.
-        // We serialize first and compute the blob ID from the wire bytes.
-        let wire_bytes = rmp_serde::to_vec(envelope).unwrap_or_default();
-        let blob_id = BlobId::from_sha256(&wire_bytes);
+        let wire_result = rmp_serde::to_vec_named(envelope)
+            .map_err(|e| TransportError::SendFailed(format!("envelope serialization failed: {e}")));
         let routing_id_hex = hex::encode(&envelope.routing_id);
 
         Box::pin(async move {
+            let wire_bytes = wire_result?;
+            let blob_id = BlobId::from_sha256(&wire_bytes);
+
             self.ensure_connected().await?;
 
             // Re-deserialize for event creation since we already have wire_bytes.
@@ -390,7 +448,7 @@ impl TransportAdapter for NostrAdapter {
                 TransportError::SendFailed(format!("envelope re-serialization failed: {e}"))
             })?;
 
-            let event = self.create_envelope_event(&envelope, &routing_id_hex);
+            let event = self.create_envelope_event(&envelope, &routing_id_hex)?;
             let message = ClientMessage::Event(event);
 
             // Send the event and wait for OK response.
@@ -631,7 +689,7 @@ impl TransportAdapter for NostrAdapter {
         Box::pin(async move {
             self.ensure_connected().await?;
 
-            let deletion_event = self.create_deletion_event(&event_id);
+            let deletion_event = self.create_deletion_event(&event_id)?;
             let message = ClientMessage::Event(deletion_event);
             self.send_message(&message).await?;
 
@@ -662,17 +720,34 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
 
+    /// Generate a valid test signing key.
+    fn test_signing_key() -> [u8; 32] {
+        // A known-valid secp256k1 secret key (non-zero, less than curve order).
+        let mut key = [0u8; 32];
+        key[31] = 1; // smallest valid key
+        key
+    }
+
     #[test]
     fn nostr_adapter_creation() {
-        let config = NostrConfig::new("wss://relay.example.com".to_owned(), "a".repeat(64));
-        let adapter = NostrAdapter::new(config);
+        let config = NostrConfig::new("wss://relay.example.com".to_owned(), test_signing_key());
+        let adapter = NostrAdapter::new(config).unwrap();
         assert_eq!(adapter.config.relay_url, "wss://relay.example.com");
+        // Public key should be 64 hex chars (32 bytes x-only).
+        assert_eq!(adapter.pubkey_hex.len(), 64);
+    }
+
+    #[test]
+    fn nostr_adapter_invalid_key_rejected() {
+        let config = NostrConfig::new("wss://relay.example.com".to_owned(), [0u8; 32]);
+        let result = NostrAdapter::new(config);
+        assert!(result.is_err());
     }
 
     #[test]
     fn subscription_id_is_unique() {
-        let config = NostrConfig::new("wss://relay.example.com".to_owned(), "a".repeat(64));
-        let adapter = NostrAdapter::new(config);
+        let config = NostrConfig::new("wss://relay.example.com".to_owned(), test_signing_key());
+        let adapter = NostrAdapter::new(config).unwrap();
         let id1 = adapter.next_subscription_id();
         let id2 = adapter.next_subscription_id();
         assert_ne!(id1, id2);
@@ -680,43 +755,58 @@ mod tests {
     }
 
     #[test]
-    fn create_envelope_event_has_correct_kind_and_tags() {
-        let config = NostrConfig::new("wss://relay.example.com".to_owned(), "a".repeat(64));
-        let adapter = NostrAdapter::new(config);
-        let routing_id_hex = "deadbeef";
+    fn schnorr_signature_is_valid() {
+        let config = NostrConfig::new("wss://relay.example.com".to_owned(), test_signing_key());
+        let adapter = NostrAdapter::new(config).unwrap();
 
-        // Create a minimal outer envelope for testing.
-        let envelope_bytes = vec![0x92, 0x01, 0x02]; // minimal msgpack
-        let content = base64_encode(&envelope_bytes);
+        // Create a test event and verify it gets a real signature.
+        let tags = vec![vec![ROUTING_TAG.to_owned(), "deadbeef".to_owned()]];
+        let content = "test content";
+        let id = NostrEvent::compute_id(&adapter.pubkey_hex, 1000, SCP_EVENT_KIND, &tags, content)
+            .unwrap();
 
-        // We can't easily create a real OuterEnvelope in a unit test,
-        // so we test the event structure indirectly via protocol types.
-        let event = NostrEvent {
-            id: "test".to_owned(),
-            pubkey: "a".repeat(64),
+        let mut event = NostrEvent {
+            id,
+            pubkey: adapter.pubkey_hex.clone(),
             created_at: 1000,
             kind: SCP_EVENT_KIND,
-            tags: vec![vec![ROUTING_TAG.to_owned(), routing_id_hex.to_owned()]],
-            content,
-            sig: "0".repeat(128),
+            tags,
+            content: content.to_owned(),
+            sig: String::new(),
         };
 
-        assert_eq!(event.kind, 29078);
-        assert_eq!(event.tags.len(), 1);
-        assert_eq!(event.tags[0][0], "r");
-        assert_eq!(event.tags[0][1], routing_id_hex);
+        event.sig = adapter.sign_event(&event).unwrap();
+
+        // Signature should be 128 hex chars (64 bytes).
+        assert_eq!(event.sig.len(), 128);
+        // Signature should NOT be all zeros (the old placeholder).
+        assert_ne!(event.sig, "0".repeat(128));
+
+        // Verify the signature with the verifying key.
+        use k256::schnorr::signature::Verifier;
+        let sig_bytes = hex::decode(&event.sig).unwrap();
+        let signature = k256::schnorr::Signature::try_from(sig_bytes.as_slice()).unwrap();
+        let id_bytes = event.id_bytes().unwrap();
+        let verifying_key = adapter.signing_key.verifying_key();
+        verifying_key.verify(&id_bytes, &signature).unwrap();
     }
 
     #[test]
     fn deletion_event_has_correct_kind() {
-        let config = NostrConfig::new("wss://relay.example.com".to_owned(), "a".repeat(64));
-        let adapter = NostrAdapter::new(config);
-        let event = adapter.create_deletion_event("abc123");
+        let config = NostrConfig::new("wss://relay.example.com".to_owned(), test_signing_key());
+        let adapter = NostrAdapter::new(config).unwrap();
+        let event = adapter
+            .create_deletion_event(
+                "abc123def456abc123def456abc123def456abc123def456abc123def456abcd1234",
+            )
+            .unwrap();
 
         assert_eq!(event.kind, DELETION_EVENT_KIND);
         assert_eq!(event.tags.len(), 1);
         assert_eq!(event.tags[0][0], "e");
-        assert_eq!(event.tags[0][1], "abc123");
+        // Signature should be real, not placeholder.
+        assert_eq!(event.sig.len(), 128);
+        assert_ne!(event.sig, "0".repeat(128));
     }
 
     #[test]
@@ -729,7 +819,7 @@ mod tests {
 
     #[test]
     fn config_defaults() {
-        let config = NostrConfig::new("wss://relay.example.com".to_owned(), "pk".to_owned());
+        let config = NostrConfig::new("wss://relay.example.com".to_owned(), test_signing_key());
         assert_eq!(config.connect_timeout_secs, 10);
         assert_eq!(config.operation_timeout_secs, 30);
     }
