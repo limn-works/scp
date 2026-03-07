@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 
 use scp_identity::DID;
 
+use crate::identity::block_list::{BlockListEvent, BlockListState};
+
 use super::{ProtocolStore, StoreError};
 
 // ---------------------------------------------------------------------------
@@ -81,6 +83,15 @@ fn tofu_key(did: &DID) -> Result<String, super::StoreError> {
 /// Used by `store::tofu` to avoid duplicating the key convention.
 pub(super) fn tofu_key_for_store(did: &DID) -> Result<String, super::StoreError> {
     tofu_key(did)
+}
+
+/// Builds the storage key for the block list event log.
+///
+/// Format: `identity/{did}/block_list_events`
+/// See spec §3.7.1.
+fn block_list_events_key(did: &DID) -> Result<String, super::StoreError> {
+    let did_str = super::sanitize_key_component(did.as_ref())?;
+    Ok(format!("identity/{did_str}/block_list_events"))
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +309,123 @@ impl<S: Storage> ProtocolStore<S> {
     pub async fn delete_identity(&self, did: &DID) -> Result<u64, StoreError> {
         let prefix = identity_prefix(did)?;
         Ok(self.storage.delete_prefix(&prefix).await?)
+    }
+
+    // -----------------------------------------------------------------------
+    // Block list methods (SCP-CAC-001, spec §3.7.1)
+    // -----------------------------------------------------------------------
+
+    /// Appends a block list event to the identity's event log.
+    ///
+    /// Events are persisted as an append-only log under identity private
+    /// state. Current block list state is derived by replaying the log.
+    ///
+    /// See spec §3.7.1.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
+    pub async fn append_block_list_event(
+        &self,
+        did: &DID,
+        event: &BlockListEvent,
+    ) -> Result<(), StoreError> {
+        let key = block_list_events_key(did)?;
+        let mut events: Vec<BlockListEvent> = self.load_value(&key).await?.unwrap_or_default();
+        events.push(event.clone());
+        self.store_value(&key, &events).await
+    }
+
+    /// Loads the full block list event log for an identity.
+    ///
+    /// Returns an empty `Vec` if no events have been recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage read fails.
+    pub async fn load_block_list_events(
+        &self,
+        did: &DID,
+    ) -> Result<Vec<BlockListEvent>, StoreError> {
+        let key = block_list_events_key(did)?;
+        Ok(self.load_value(&key).await?.unwrap_or_default())
+    }
+
+    /// Returns all globally blocked DIDs for an identity (Tier 2).
+    ///
+    /// Derives state by replaying the identity's block list event log.
+    ///
+    /// See spec §3.7.1.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the event log cannot be loaded.
+    pub async fn get_global_block_list(&self, did: &DID) -> Result<Vec<DID>, StoreError> {
+        let events = self.load_block_list_events(did).await?;
+        let state = BlockListState::from_events(&events);
+        Ok(state.global_block_list())
+    }
+
+    /// Returns whether a target DID is globally blocked by a blocker (Tier 2).
+    ///
+    /// Derives state by replaying the blocker's block list event log.
+    ///
+    /// See spec §3.7.1.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the event log cannot be loaded.
+    pub async fn is_globally_blocked(
+        &self,
+        blocker: &DID,
+        target: &DID,
+    ) -> Result<bool, StoreError> {
+        let events = self.load_block_list_events(blocker).await?;
+        let state = BlockListState::from_events(&events);
+        Ok(state.is_globally_blocked(target))
+    }
+
+    /// Returns all DIDs blocked in a specific context by an identity (Tier 1).
+    ///
+    /// Derives state by replaying the identity's block list event log
+    /// and filtering for the given context.
+    ///
+    /// See spec §3.7.1.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the event log cannot be loaded.
+    pub async fn get_context_block_list(
+        &self,
+        did: &DID,
+        context_id: &str,
+    ) -> Result<Vec<DID>, StoreError> {
+        let events = self.load_block_list_events(did).await?;
+        let state = BlockListState::from_events(&events);
+        Ok(state.context_block_list(context_id))
+    }
+
+    /// Returns whether a target DID is blocked in a specific context (Tier 1).
+    ///
+    /// Derives state by replaying the blocker's block list event log
+    /// and checking the given context.
+    ///
+    /// See spec §3.7.1.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the event log cannot be loaded.
+    pub async fn is_blocked_in_context(
+        &self,
+        blocker: &DID,
+        target: &DID,
+        context_id: &str,
+    ) -> Result<bool, StoreError> {
+        let events = self.load_block_list_events(blocker).await?;
+        let state = BlockListState::from_events(&events);
+        Ok(state.is_blocked_in_context(target, context_id))
     }
 }
 
@@ -550,5 +678,331 @@ mod tests {
             identity_private_state_key(&did, 42).unwrap(),
             "identity/did:dht:z6MkTest/private_state/00000000000000000042"
         );
+    }
+
+    #[test]
+    fn block_list_events_key_follows_convention() {
+        let did = DID::from("did:dht:z6MkTest");
+        assert_eq!(
+            block_list_events_key(&did).unwrap(),
+            "identity/did:dht:z6MkTest/block_list_events"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Block list persistence (SCP-CAC-001, spec §3.7.1)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn append_and_load_block_list_events_roundtrip() {
+        let store = make_store();
+        let did = test_did();
+
+        store
+            .append_block_list_event(
+                &did,
+                &BlockListEvent::BlockDID {
+                    target_did: DID::from("did:dht:z6MkDave"),
+                    timestamp: 1000,
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .append_block_list_event(
+                &did,
+                &BlockListEvent::BlockDIDInContext {
+                    target_did: DID::from("did:dht:z6MkEve"),
+                    context_id: "ctx-1".to_owned(),
+                    timestamp: 2000,
+                },
+            )
+            .await
+            .unwrap();
+
+        let events = store.load_block_list_events(&did).await.unwrap();
+        assert_eq!(events.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn load_block_list_events_returns_empty_for_missing() {
+        let store = make_store();
+        let did = test_did();
+        let events = store.load_block_list_events(&did).await.unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_global_block_list_derives_from_events() {
+        let store = make_store();
+        let did = test_did();
+        let dave = DID::from("did:dht:z6MkDave");
+        let eve = DID::from("did:dht:z6MkEve");
+
+        store
+            .append_block_list_event(
+                &did,
+                &BlockListEvent::BlockDID {
+                    target_did: dave.clone(),
+                    timestamp: 1000,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .append_block_list_event(
+                &did,
+                &BlockListEvent::BlockDID {
+                    target_did: eve.clone(),
+                    timestamp: 2000,
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut blocked = store.get_global_block_list(&did).await.unwrap();
+        blocked.sort();
+        assert_eq!(blocked.len(), 2);
+        assert!(blocked.contains(&dave));
+        assert!(blocked.contains(&eve));
+    }
+
+    #[tokio::test]
+    async fn is_globally_blocked_returns_correct_state() {
+        let store = make_store();
+        let did = test_did();
+        let dave = DID::from("did:dht:z6MkDave");
+        let eve = DID::from("did:dht:z6MkEve");
+
+        store
+            .append_block_list_event(
+                &did,
+                &BlockListEvent::BlockDID {
+                    target_did: dave.clone(),
+                    timestamp: 1000,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(store.is_globally_blocked(&did, &dave).await.unwrap());
+        assert!(!store.is_globally_blocked(&did, &eve).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn global_block_then_unblock_lifecycle() {
+        let store = make_store();
+        let did = test_did();
+        let dave = DID::from("did:dht:z6MkDave");
+
+        store
+            .append_block_list_event(
+                &did,
+                &BlockListEvent::BlockDID {
+                    target_did: dave.clone(),
+                    timestamp: 1000,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(store.is_globally_blocked(&did, &dave).await.unwrap());
+
+        store
+            .append_block_list_event(
+                &did,
+                &BlockListEvent::UnblockDID {
+                    target_did: dave.clone(),
+                    timestamp: 2000,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!store.is_globally_blocked(&did, &dave).await.unwrap());
+        assert!(store.get_global_block_list(&did).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_context_block_list_derives_from_events() {
+        let store = make_store();
+        let did = test_did();
+        let dave = DID::from("did:dht:z6MkDave");
+
+        store
+            .append_block_list_event(
+                &did,
+                &BlockListEvent::BlockDIDInContext {
+                    target_did: dave.clone(),
+                    context_id: "ctx-1".to_owned(),
+                    timestamp: 1000,
+                },
+            )
+            .await
+            .unwrap();
+
+        let blocked = store.get_context_block_list(&did, "ctx-1").await.unwrap();
+        assert_eq!(blocked, vec![dave.clone()]);
+
+        // Different context returns empty.
+        let blocked = store.get_context_block_list(&did, "ctx-2").await.unwrap();
+        assert!(blocked.is_empty());
+    }
+
+    #[tokio::test]
+    async fn is_blocked_in_context_returns_correct_state() {
+        let store = make_store();
+        let did = test_did();
+        let dave = DID::from("did:dht:z6MkDave");
+
+        store
+            .append_block_list_event(
+                &did,
+                &BlockListEvent::BlockDIDInContext {
+                    target_did: dave.clone(),
+                    context_id: "ctx-1".to_owned(),
+                    timestamp: 1000,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .is_blocked_in_context(&did, &dave, "ctx-1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .is_blocked_in_context(&did, &dave, "ctx-2")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn context_block_then_unblock_lifecycle() {
+        let store = make_store();
+        let did = test_did();
+        let dave = DID::from("did:dht:z6MkDave");
+
+        store
+            .append_block_list_event(
+                &did,
+                &BlockListEvent::BlockDIDInContext {
+                    target_did: dave.clone(),
+                    context_id: "ctx-1".to_owned(),
+                    timestamp: 1000,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .is_blocked_in_context(&did, &dave, "ctx-1")
+                .await
+                .unwrap()
+        );
+
+        store
+            .append_block_list_event(
+                &did,
+                &BlockListEvent::UnblockDIDInContext {
+                    target_did: dave.clone(),
+                    context_id: "ctx-1".to_owned(),
+                    timestamp: 2000,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .is_blocked_in_context(&did, &dave, "ctx-1")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_identity_removes_block_list_events() {
+        let store = make_store();
+        let did = test_did();
+
+        store
+            .append_block_list_event(
+                &did,
+                &BlockListEvent::BlockDID {
+                    target_did: DID::from("did:dht:z6MkDave"),
+                    timestamp: 1000,
+                },
+            )
+            .await
+            .unwrap();
+
+        store.delete_identity(&did).await.unwrap();
+
+        let events = store.load_block_list_events(&did).await.unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn block_list_commutativity_via_store() {
+        // Verify that appending events in different orders produces the
+        // same derived state when queried through ProtocolStore.
+        let store_a = make_store();
+        let store_b = make_store();
+        let did = test_did();
+        let dave = DID::from("did:dht:z6MkDave");
+        let eve = DID::from("did:dht:z6MkEve");
+
+        // Store A: block Dave then Eve
+        store_a
+            .append_block_list_event(
+                &did,
+                &BlockListEvent::BlockDID {
+                    target_did: dave.clone(),
+                    timestamp: 1000,
+                },
+            )
+            .await
+            .unwrap();
+        store_a
+            .append_block_list_event(
+                &did,
+                &BlockListEvent::BlockDID {
+                    target_did: eve.clone(),
+                    timestamp: 2000,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Store B: block Eve then Dave
+        store_b
+            .append_block_list_event(
+                &did,
+                &BlockListEvent::BlockDID {
+                    target_did: eve.clone(),
+                    timestamp: 2000,
+                },
+            )
+            .await
+            .unwrap();
+        store_b
+            .append_block_list_event(
+                &did,
+                &BlockListEvent::BlockDID {
+                    target_did: dave.clone(),
+                    timestamp: 1000,
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut list_a = store_a.get_global_block_list(&did).await.unwrap();
+        let mut list_b = store_b.get_global_block_list(&did).await.unwrap();
+        list_a.sort();
+        list_b.sort();
+        assert_eq!(list_a, list_b);
     }
 }
