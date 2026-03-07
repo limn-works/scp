@@ -60,7 +60,7 @@ These are interleaved within the same sections, sometimes within the same paragr
 10. **Architecture.md §1.2 message lifecycle:** Contains protocol-level security checkpoint annotations that ARE normative. But they're embedded in a document that is otherwise entirely implementation architecture. These need to be extracted to the protocol spec.
 11. **DID document serialization divergence from did:dht.** Standard did:dht specifies DNS packet encoding (TXT/SRV records) for DID documents. SCP uses JSON-LD serialization on the relay layer, with DNS packet encoding only for the DHT layer (BEP44 compatibility). The protocol spec must explicitly define both serialization formats: JSON-LD for relay-stored documents and DNS packets for DHT-stored documents. This divergence is intentional (JSON-LD removes the 1000-byte payload limit), but it needs formal specification — currently §3.10 describes the dual-layer architecture without specifying the serialization difference between layers.
 12. **Multi-key architecture underspecified and scattered.** §3.9 mentions key generation, distribution, rotation, and destruction at a high level and references §9.7.4 for the full lifecycle. The multi-key separation (Identity `#0` / Human Signing `#active` / Pre-Rotation / Agent Signing `#agent`) is described across §3.9, §3.10, §4.2, §4.5 (ADR-039), §9.7.4, §9.8.1 (updated preimage), and §11.2.3 (prior art) but not formally specified in a single authoritative section. The protocol spec must consolidate this with wire formats, not scattered across 6+ locations.
-13. **Signature preimage mismatch.** ADR-039 updates the inner signature preimage to include `signing_key_id` (`context_id || sender_did || signing_key_id || epoch || ...`), but §9.8.1 as currently written does not include this field. The ADR-039 version is normative. Must be reconciled before extraction.
+13. ~~**Signature preimage mismatch.**~~ ✅ **Resolved.** §9.8.1 now includes all 9 fields in the inner signature preimage: `context_id || sender_did || signing_key_id || epoch || generation_number || sequence_number || timestamp || payload_hash || provenance_hash`. Matches ADR-039.
 
 ---
 
@@ -478,10 +478,10 @@ The 38 ADRs across 6 phase files contain both protocol-level and implementation-
 | ADR-010 | Tool Registration | Tool registration protocol |
 | ADR-011 | Verifiable Event Log | Merkle tree specification — **critical** |
 | ADR-012 | Multi-Transport Routing | Routing strategy, dedup |
-| ADR-016 | Discovery Contexts | Two-tier model, bootstrap |
+| ADR-016 | UCAN Validation | UCAN validation checks |
 | ADR-019 | Provenance | Provenance types and attachment |
-| ADR-027 | Context Nesting | Parent-child protocol |
-| ADR-029 | Broadcast Contexts | Broadcast mode protocol |
+| ADR-027 | Android Platform Adapter | Android platform adapter |
+| ADR-029 | Offline/Sync Strategy | Offline/sync protocol |
 | ADR-031 | Governance Actions | 24 action types |
 | ADR-038 | Content Access Control | Access key layer, CEK wrapping |
 | ADR-039 | Shared-DID Human-Agent Identity | Shared-DID model, `#agent` verification method, signing_key_id, self-delegation UCAN, Category A/B/C permissions, 5-layer enforcement stack, custody attestation — **critical** |
@@ -489,16 +489,16 @@ The 38 ADRs across 6 phase files contain both protocol-level and implementation-
 ### Implementation-Level ADRs (stay in current docs)
 | ADR | Topic | Why Implementation |
 |-----|-------|--------------------|
-| ADR-006 | Storage Trait | Rust trait design |
-| ADR-013 | Testing Framework | Test infrastructure design |
-| ADR-014 | Attestation Conformance | Conformance macro design |
-| ADR-020 | Tool Interface Transport | SDK-level bridging implementation |
-| ADR-032 | ProtocolStore | Thick layer implementation |
-| ADR-033 | FFI Strategy | Language binding approach |
+| ADR-006 | In-Memory Platform Adapter (Testing) | Test infrastructure design |
+| ADR-013 | PyO3 Bridge Layer | PyO3 bridge implementation |
+| ADR-014 | Python SDK Wrappers | Python wrapper layer design |
+| ADR-020 | Tool-Interface Discovery | Tool-interface discovery implementation |
+| ADR-032 | Addressability and Deployment | Addressability and deployment |
+| ADR-033 | Economic Governance | Economic governance model |
 | ADR-034 | WASM Architecture | wasm-bindgen specifics |
-| ADR-035 | HTTP Dev API | scp-node implementation feature |
-| ADR-036 | Platform Adapters | scp-platform trait design |
-| ADR-037 | Key Custody | Platform-specific custody |
+| ADR-035 | Local HTTP Control API and Broadcast Projection | scp-node implementation feature |
+| ADR-036 | Transport Profiles and Adaptive Resource Management | Transport profile implementation |
+| ADR-037 | Alternative Transport Bindings | Alternative transport bindings (QUIC, WebTransport, UDP/DTLS) |
 
 **Action:** Protocol-level ADR content gets absorbed into the relevant protocol spec sections (the ADR provides the rationale and alternatives; the spec provides the normative requirement). Implementation-level ADRs stay as-is.
 

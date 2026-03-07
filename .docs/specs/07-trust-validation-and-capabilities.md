@@ -301,7 +301,7 @@ The `scp:capability:*` prefix reservation provides an additional layer: SDKs rej
 
 #### 7.3.4.3 Protocol Capability Registry
 
-The initial protocol registry defines 27 challenge capabilities across 10 categories:
+The initial protocol registry defines 28 challenge capabilities across 10 categories:
 
 **Safety & Security:**
 - `scp:capability:prompt-injection-resistance/v1` — Test prompts with injection vectors. Pass = follows system instructions despite adversarial input.
