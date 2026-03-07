@@ -77,9 +77,9 @@ Every context maintains a verifiable event log — a Merkle tree (or equivalent 
 
 Any participant can verify claims about context history against the Merkle root:
 
-- "Carol has never had a governance action taken against her in Context A" — verifiable via proof-of-absence against Context A's log.
 - "This tool was registered on date X by DID Y" — verifiable via proof-of-inclusion.
 - "The context's capability ceiling has not changed since creation" — verifiable via the log's mutation history.
+- "Carol has never had a governance action taken against her in Context A" — verifiable by querying the log for governance actions with `subject == Carol's DID` and receiving an empty result set. Note: this is an exhaustive query against the log, not a cryptographic proof-of-absence. Standard append-only Merkle trees support proof-of-inclusion (a leaf exists) but do NOT support proof-of-absence (a leaf does not exist). A negative claim ("no governance action exists") is verified by the querier scanning the log and confirming no matching events are found. The Merkle root ensures the log has not been tampered with — if an event was recorded, it cannot be removed — but the protocol does not provide a single compact proof that a specific event type was never recorded. Consumers who require cryptographic proof-of-absence (rather than query-and-verify) SHOULD use a sparse Merkle tree or sorted Merkle tree with boundary proofs; the protocol does not mandate a specific authenticated data structure beyond the general requirement of Merkle-based integrity (§7.3.1 header: "Merkle tree (or equivalent authenticated data structure)").
 
 This transforms claims about the past from trust-dependent to validation-dependent. You don't need to trust a context admin's account of what happened — you verify it against a cryptographic data structure.
 
@@ -372,7 +372,17 @@ Admission checks are mechanical: the protocol verifies capability URIs and verif
 
 A single attestation requires trust in one party. Multiple independent attestations for the same claim approach validation.
 
-The protocol supports threshold requirements: "this claim is considered validated when N-of-M independent attestors confirm it." Independence is verifiable — the protocol can check whether attestors share context memberships, have mutual endorsement relationships, or exhibit other correlation patterns that would reduce independence.
+The protocol supports threshold requirements: "this claim is considered validated when N-of-M independent attestors confirm it."
+
+**Independence criteria.** Independence is defined by the following rules, verified by the consuming agent (not enforced by the protocol):
+
+1. **Distinct DIDs (REQUIRED).** Attestors MUST have distinct DIDs. Multiple attestations from the same DID count as one attestation regardless of quantity.
+2. **Relay diversity (RECOMMENDED).** Attestors SHOULD NOT share the same relay endpoint. Shared relay infrastructure increases the risk of coordinated manipulation. Consumers MAY require attestors to use at least N distinct relays.
+3. **No mutual endorsement cycles (RECOMMENDED).** Attestors that have mutual endorsement relationships (A endorsed B AND B endorsed A) have reduced independence. Consumers MAY discount or reject attestations from mutually-endorsing pairs.
+
+**Verification model.** Independence is verified by the consumer, not enforced by the protocol. The protocol provides the attestation chain — issuer DIDs, relay endpoints, endorsement graphs — and consumers decide their own trust policy for what constitutes sufficient independence. This is a Layer 4 (trust evaluation) decision informed by Layer 2 (participation validation) data.
+
+**Sybil resistance.** Threshold attestations are vulnerable to Sybil attacks where a single entity creates multiple DIDs to meet the threshold. The primary Sybil resistance mechanism is the DeviceAttestation (§9.3), which binds DIDs to hardware-attested devices. Consumers requiring strong Sybil resistance SHOULD require attestors to have valid DeviceAttestations. Additional Sybil signals include: participation history depth (new DIDs with no history are suspect), attestation timing correlation (multiple attestations arriving simultaneously suggest coordination), and shared behavioral patterns detectable via participation records (§7.3.2).
 
 Threshold attestations are useful for:
 
@@ -380,7 +390,7 @@ Threshold attestations are useful for:
 - Tool integrity ("5 agents independently verified this tool's test vectors")
 - Identity claims ("2 unrelated parties confirm this identity link")
 
-The threshold count, independence requirements, and verification are all mechanical. The trust component shrinks as the threshold increases.
+The threshold count and verification are mechanical. The trust component shrinks as the threshold increases and as attestors' independence strengthens.
 
 ### 7.3.6 Time-Locked Attestation Renewal
 
@@ -423,23 +433,40 @@ All attestations use a common envelope format:
 
 ```
 Attestation {
-  id:          unique identifier
-  type:        identity_link | capability_delegation | tool_integrity |
-               endorsement | role_assignment | agent_capability |
-               context_endorsement | participation_witness
-  issuer:      DID of the entity making the claim
-  subject:     what the claim is about (DID, tool_id, context_id, etc.)
-  claim:       structured content (type-specific)
-  evidence:    supporting proof (type-specific, optional)
-  issued_at:   timestamp
-  expires:     optional TTL
-  renewed_at:  timestamp of last renewal (if renewable)
-  revocation:  how to check if revoked
-  signature:   issuer's cryptographic signature
+  id:                unique identifier (UUID v4)
+  type:              identity_link | capability_delegation | tool_integrity |
+                     endorsement | role_assignment | agent_capability |
+                     context_endorsement | participation_witness
+  issuer:            DID of the entity making the claim
+  subject:           what the claim is about (DID, tool_id, context_id, etc.)
+  claim:             structured content (type-specific)
+  evidence:          supporting proof (type-specific, optional)
+  issued_at:         u64 (Unix timestamp seconds)
+  expires:           u64? (optional Unix timestamp seconds)
+  renewed_at:        u64? (timestamp of last renewal, if renewable)
+  revocation_status: RevocationStatus
+  signature:         Ed25519Signature (issuer's cryptographic signature over all fields except itself)
 }
 ```
 
-The envelope is the same regardless of attestation type. Verification of the envelope (signature, expiry, revocation) is automated and mechanical. Interpretation of the claim content depends on the type.
+**`RevocationStatus` wire format:**
+
+```
+RevocationStatus = Active
+                 | Revoked {
+                     reason:     String,    // human-readable revocation reason
+                     revoked_at: u64,       // Unix timestamp seconds when revocation occurred
+                     revoked_by: DID        // DID that performed the revocation (must be the issuer)
+                   }
+```
+
+- All attestations are created with `revocation_status: Active`.
+- Revocation is performed by the issuer by publishing an updated attestation with `revocation_status: Revoked { ... }` to the same location as the original attestation (DID document entry, Merkle log, or revocation endpoint).
+- Validators MUST reject any attestation with `revocation_status: Revoked`. A revoked attestation provides no trust signal — it is treated as if it does not exist for validation purposes.
+- Serialization: MessagePack, matching the SCP standard serialization format. The `RevocationStatus` enum is serialized as a tagged variant: `Active` as `{"Active": {}}`, `Revoked` as `{"Revoked": {"reason": "...", "revoked_at": ..., "revoked_by": "did:..."}}`.
+- The `revoked_by` field MUST equal the attestation's `issuer`. Only the issuer can revoke their own attestation. Context governance can request revocation but cannot unilaterally revoke another issuer's attestation — the governance mechanism is to remove the attestation from the context's accepted set, not to modify the attestation itself.
+
+The envelope is the same regardless of attestation type. Verification of the envelope (signature, expiry, revocation status) is automated and mechanical. Interpretation of the claim content depends on the type.
 
 ### 7.4.2 Attestation Types
 
@@ -469,7 +496,7 @@ Attestations are solicited and presented through several patterns:
 
 ### 7.4.4 Revocation
 
-All attestations are independently revocable by their issuer. Revocation is published and checkable — the attestation format includes a revocation reference (endpoint, DID document entry, or Merkle log reference) that any verifier can check. Revocation is immediate for new verifications; agents that cached a previous verification should re-check on a defined interval.
+All attestations are independently revocable by their issuer. The issuer revokes an attestation by updating its `revocation_status` field from `Active` to `Revoked { reason, revoked_at, revoked_by }` (§7.4.1) and publishing the updated attestation to the same location as the original (DID document entry, Merkle log, or revocation endpoint). Only the issuer (`revoked_by == issuer`) can revoke an attestation. Revocation is immediate for new verifications — validators MUST check `revocation_status` on every attestation evaluation. Agents that cached a previous verification SHOULD re-check on a defined interval (RECOMMENDED: at least once per hour for security-critical attestations, once per day for others). A revoked attestation MUST NOT be accepted by validators for any purpose.
 
 ## 7.5 Layer 4: Trust Evaluation
 
@@ -510,22 +537,32 @@ Data provenance is a structured record attached to data at the protocol level:
 
 ```
 DataProvenance {
-  sourceContext:     contextID               // where the data originated
-  sourceType:        .persistent | .ephemeral | .summary   // source data availability
-  counterparties:    [DID]                   // who was in the source interaction
-  purpose:           String                  // declared purpose of source context
-  discoveryMethod:   .sharedContext(contextID)
-                   | .registry(registryContextID)
-                   | .none                   // no discovery provenance
-  age:               Duration                // how long ago the source interaction occurred
-  memoryScope:       MemoryScope             // what memory scope the source context had
-  chainDepth:        uint                    // number of context boundaries crossed (0 = originated here, 1 = one hop, etc.)
-  chainPath:         [contextID]?            // optional: ordered list of intermediary context IDs in the chain
-  paymentAmount:     Amount?                 // optional: cost of producing this data (§19.6)
-  paymentAdapter:    String?                 // optional: adapter used for payment
-  paymentReceiptId:  [u8; 32]?              // optional: receipt ID for verification
+  sourceContext:       contextID               // where the data originated
+  sourceType:          .persistent | .ephemeral | .summary   // source data availability
+  counterparties:      [DID]                   // who was in the source interaction (subject to counterparty_policy)
+  purpose:             String                  // declared purpose of source context
+  discoveryMethod:     .sharedContext(contextID)
+                     | .registry(registryContextID)
+                     | .none                   // no discovery provenance
+  age:                 Duration                // how long ago the source interaction occurred
+  memoryScope:         MemoryScope             // what memory scope the source context had
+  chainDepth:          uint                    // number of context boundaries crossed (0 = originated here, 1 = one hop, etc.)
+  chainPath:           [contextID]?            // optional: ordered list of intermediary context IDs in the chain
+  paymentAmount:       Amount?                 // optional: cost of producing this data (§19.6)
+  paymentAdapter:      String?                 // optional: adapter used for payment
+  paymentReceiptId:    [u8; 32]?              // optional: receipt ID for verification
 }
 ```
+
+**Counterparty privacy controls.** The `counterparties` field lists DIDs of participants in the source interaction. Because this reveals context membership, the field is subject to privacy controls when provenance crosses context boundaries:
+
+1. **`counterparty_policy` context parameter.** Each context declares a `counterparty_policy` in `ContextParams` that governs how counterparty information is handled in outbound provenance:
+   - `full` — Include real DIDs. Appropriate for intra-context provenance or contexts where membership is public. This is the default for intra-context use.
+   - `pseudonymized` — Replace real DIDs with context-scoped pseudonyms (per §9.10.4) before exporting. Receiving contexts see stable pseudonyms but cannot correlate them to real DIDs without the source context's pseudonym derivation key.
+   - `redacted` — Always empty. No counterparty information is exported. This is the most privacy-preserving option.
+2. **SDK enforcement.** The sending SDK MUST apply the source context's `counterparty_policy` before attaching provenance to outbound data. When data crosses a context boundary, the SDK checks the source context's policy and strips, pseudonymizes, or passes through the counterparties accordingly. This is not optional — the SDK enforces it mechanically.
+3. **Default for cross-context export.** When provenance crosses a context boundary and no explicit `counterparty_policy` is set, the default is `redacted`. This is a privacy-safe default — contexts that want to share counterparty information must opt in explicitly.
+4. **Intra-context provenance.** Within a context (no boundary crossing), counterparties are always `full` regardless of policy. The policy governs only what is exported.
 
 Note: `sourceType` describes the current availability of the source data, not the context's creation-time memory scope setting. A context created with `memoryScope: .full` that is still open has `sourceType: .persistent` (data is still accessible and verifiable). A context that used `memoryScope: .ephemeral` has `sourceType: .ephemeral` (keys destroyed, data unrecoverable). The distinction is operational: "can the source data be independently verified right now?"
 
@@ -536,9 +573,11 @@ Provenance is attached automatically by the protocol when data crosses context b
 Other participants in the receiving context see the provenance and use it for trust evaluation. Provenance quality varies:
 
 - Data from a persistent context with known counterparties — **highest provenance quality**. Source material is verifiable against the source context's event log.
-- Data from a summary-scope context — **medium provenance quality**. Source content is destroyed, but the summary was verified before destruction. Counterparties are known.
-- Data from an ephemeral context — **lower provenance quality**. Source content is destroyed. Counterparties are known, but the data cannot be verified against a source log.
+- Data from a summary-scope context — **medium provenance quality**. Source content is destroyed, but the summary was verified before destruction. Counterparties may be known (depending on `counterparty_policy`).
+- Data from an ephemeral context — **lower provenance quality**. Source content is destroyed. Counterparties may be known, but the data cannot be verified against a source log.
 - Data with no provenance — **lowest quality signal**. The data was introduced without protocol-level origin tracking. This could be data the agent recalled from local memory, data from above the protocol boundary, or data from an unknown source.
+
+Note: counterparty availability in cross-context provenance depends on the source context's `counterparty_policy` (§7.7.1). When counterparties are `redacted` or `pseudonymized`, provenance quality evaluation proceeds normally — the counterparty field affects trust granularity but not the quality tier determination.
 
 The protocol does not prescribe how agents should weight provenance — this is agent-level evaluation (Layer 4). The protocol ensures provenance is available for evaluation.
 
