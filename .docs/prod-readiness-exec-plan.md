@@ -443,6 +443,15 @@ Spec-only fixes for the 37 NEW HIGH findings. Grouped by topic:
 **Lane H-G** — Sync/provenance spec gaps (H-34 through H-37)
 - Counterparties privacy, EpochGraceStore crash recovery, checkpoint verification, event log reconciliation trust
 
+### Spec-Code Alignment (parallel with Phase 6+)
+
+Wire format and crypto fixes identified by spec review. All are code changes to match prescriptive spec:
+
+- #395 — HPKE sender key wrapping: add context_id/sender_did/epoch to info + AAD
+- #396 — BroadcastEnvelope: add top-level nonce field, expand AAD with context_id + sequence
+- #397 — ResetRequest: add nonce field, anti-replay validation (signature + 30s freshness + nonce dedup)
+- #398 — Envelope version field: add `version: u16` to InnerEnvelope, BroadcastEnvelope, OuterEnvelope + canonical hashes
+
 ### Phase 12: Polish
 
 #291, #301, #303, #343, #344
