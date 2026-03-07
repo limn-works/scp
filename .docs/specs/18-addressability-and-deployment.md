@@ -66,6 +66,91 @@ SCP uses multiple DID document service endpoint types, each serving a distinct p
 
 A relay operator's DID document contains `SCPRelay` entries (where to connect). An agent's DID document may contain both `SCPRelay` entries (how to reach the agent) and `SCPCapabilities` entries (what the agent can do).
 
+### 18.2.2A DID Document Field-Level Schema
+
+SCP DID documents follow the W3C DID Core specification (v1.0) with SCP-specific verification methods and service endpoints. The canonical serialization is JSON (per did:dht spec). Two SDKs MUST produce byte-identical DID documents for the same identity state to ensure BEP44 signature verification.
+
+**Canonical DID document structure:**
+
+```json
+{
+  "@context": [
+    "https://www.w3.org/ns/did/v1",
+    "https://w3id.org/security/suites/ed25519-2020/v1"
+  ],
+  "id": "did:dht:<z-base-32-encoded-public-key>",
+  "verificationMethod": [
+    {
+      "id": "did:dht:<key>#0",
+      "type": "Ed25519VerificationKey2020",
+      "controller": "did:dht:<key>",
+      "publicKeyMultibase": "z<multibase-encoded-ed25519-public-key>"
+    },
+    {
+      "id": "did:dht:<key>#active",
+      "type": "Ed25519VerificationKey2020",
+      "controller": "did:dht:<key>",
+      "publicKeyMultibase": "z<multibase-encoded-ed25519-public-key>"
+    },
+    {
+      "id": "did:dht:<key>#agent",
+      "type": "Ed25519VerificationKey2020",
+      "controller": "did:dht:<key>",
+      "publicKeyMultibase": "z<multibase-encoded-ed25519-public-key>"
+    }
+  ],
+  "authentication": ["did:dht:<key>#active", "did:dht:<key>#agent"],
+  "assertionMethod": ["did:dht:<key>#active", "did:dht:<key>#agent"],
+  "capabilityDelegation": ["did:dht:<key>#0"],
+  "capabilityInvocation": ["did:dht:<key>#0", "did:dht:<key>#active"],
+  "service": [
+    {
+      "id": "#scp-relay-1",
+      "type": "SCPRelay",
+      "serviceEndpoint": "wss://relay.example.com/scp/v1"
+    },
+    {
+      "id": "#scp-private-state",
+      "type": "IdentityPrivateState",
+      "serviceEndpoint": ["wss://relay1.example.com/scp/v1", "wss://relay2.example.com/scp/v1"]
+    },
+    {
+      "id": "#scp-prerotation",
+      "type": "PreRotationCommitment",
+      "serviceEndpoint": "<sha256-hex-of-prerotation-public-key>"
+    },
+    {
+      "id": "#scp-participation",
+      "type": "ParticipationStatements",
+      "serviceEndpoint": "https://relay.example.com/scp/v1/participation/<did>"
+    },
+    {
+      "id": "#scp-attestation-revocations",
+      "type": "AttestationRevocations",
+      "serviceEndpoint": "https://relay.example.com/scp/v1/revocations/<did>"
+    }
+  ]
+}
+```
+
+**Field constraints:**
+
+| Field | Required | Constraints |
+|-------|----------|-------------|
+| `@context` | Yes | MUST include the two URIs shown above, in order. |
+| `id` | Yes | MUST match `did:dht:<z-base-32(#0 public key)>`. |
+| `verificationMethod` | Yes | MUST include `#0` (Identity Key). MUST include `#active` (Active Signing Key). MAY include `#agent` (Agent Signing Key, optional per ADR-039). No other verification methods permitted. |
+| `verificationMethod[].publicKeyMultibase` | Yes | Multibase-encoded Ed25519 public key (prefix `z` for base58btc). |
+| `authentication` | Yes | MUST reference `#active`. MAY reference `#agent`. MUST NOT reference `#0`. |
+| `assertionMethod` | Yes | Same as `authentication`. |
+| `capabilityDelegation` | Yes | MUST reference only `#0`. |
+| `capabilityInvocation` | Yes | MUST reference `#0` and `#active`. |
+| `service` | Yes | At least one `SCPRelay` entry required. Other types optional. |
+| `service[].id` | Yes | Fragment identifier (e.g., `#scp-relay-1`). Unique within the document. |
+| `service[].type` | Yes | One of the types in §18.2.2. |
+
+**Canonical serialization rules:** JSON keys MUST be sorted lexicographically at every nesting level (RFC 8785 JSON Canonicalization Scheme). This ensures deterministic serialization for BEP44 signature computation. Whitespace: no extra whitespace (minified JSON). Unicode: NFC normalization.
+
 ### 18.2.3 Multiple Relay Entries
 
 An identity SHOULD publish at least 3 `SCPRelay` entries for suppression resistance (§9.9.2). `TransportManager` reads all `SCPRelay` entries from a resolved DID document and routes to all of them. The relay set partitioning logic (ADR-012) operates on top of the published relay list.

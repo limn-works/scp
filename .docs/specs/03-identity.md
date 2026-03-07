@@ -110,8 +110,120 @@ Properties of identity attestations:
 Identity attestations enable three critical flows:
 
 1. **Social graph import.** A user exports their follower list from X. Their local agent resolves each handle against known attestations. Contacts who have also joined SCP are automatically discoverable.
-2. **Shadow identity claiming.** When a bridge connector creates a shadow identity for an external participant (see §12), a user can claim it by presenting a matching attestation. The shadow identity merges with their real DID.
+2. **Shadow identity claiming.** When a bridge connector creates a shadow identity for an external participant (see §12), a user can claim it by presenting a matching attestation. The shadow identity merges with their real DID (see §3.5.3 for the claiming protocol).
 3. **Cross-platform reputation continuity.** Trust judgments about a person can follow them across platforms — not because platforms share data, but because the human has cryptographically proven they're the same person.
+
+### 3.5.1 Identity Attestation Wire Format
+
+Identity attestations use the attestation envelope defined in §7.4.1, with identity-link-specific fields. The canonical serialization is MessagePack (§17), consistent with all other SCP wire formats. The signature scope covers the canonical MessagePack serialization of all fields except the `signature` field itself.
+
+```
+IdentityLinkAttestation {
+  id:           String,          // SHA-256(issuer_did || platform || platform_handle || created_at), hex-encoded
+  type:         "identity_link",
+  issuer:       DID,             // The DID claiming the external identity
+  subject:      DID,             // Same as issuer (self-attestation)
+  issued_at:    u64,             // Unix timestamp (ms)
+  expires_at:   Option<u64>,     // Optional expiry (ms). If absent, valid until revoked.
+  claim: {
+    platform:       String,      // Platform identifier: "x.com", "github.com", "discord.com", etc.
+    platform_handle: String,     // Handle on the platform: "@alice", "alice123", etc.
+    platform_id:    Option<String>, // Platform-specific immutable user ID (e.g., Twitter user ID)
+    link_type:      "self_attestation",
+  },
+  evidence: {
+    method:         String,      // Verification method: "oauth", "signed_post", "dns_record", "challenge_response"
+    proof:          String,      // Method-specific proof data (see §3.5.2)
+    verified_at:    u64,         // Timestamp of last verification
+    verifier_did:   Option<DID>, // DID of the verifier, if third-party verified
+  },
+  revocation: {
+    method:         "did_document", // Revocation check method
+    endpoint:       String,        // DID document service endpoint path for revocation status
+  },
+  signature:    Ed25519Signature,  // Signs MessagePack(all fields except signature), using issuer's #active or #agent key
+}
+```
+
+**Signature scope:** The signature covers `MessagePack_canonical(id, type, issuer, subject, issued_at, expires_at, claim, evidence, revocation)` where `MessagePack_canonical` uses sorted-key encoding (keys in lexicographic order within each map) per §17.1. The signature is computed using the issuer's Active Signing Key (`#active`) or Agent Signing Key (`#agent`).
+
+**Revocation check:** Verifiers check revocation by resolving the issuer's DID document and looking for an `AttestationRevocations` service endpoint (§18.2.2). The endpoint returns a list of revoked attestation IDs. If the attestation's `id` appears in the list, it is revoked.
+
+### 3.5.2 Identity Attestation Verification Protocol
+
+Each platform verification method has a defined verification protocol:
+
+**OAuth verification (`method: "oauth"`):**
+1. The attesting SDK initiates an OAuth 2.0 authorization code flow with the target platform.
+2. On success, the SDK receives an access token and uses it to query the platform's user info endpoint.
+3. The `proof` field contains the OAuth provider's signed ID token (JWT) OR a JSON object `{ "provider": "<platform>", "subject": "<platform_user_id>", "issued_at": <unix_ts> }` signed by the attesting SDK.
+4. **Verification:** The verifier validates the JWT signature against the platform's published JWKS, confirms the `subject` matches `platform_id`, and confirms `issued_at` is within the attestation's validity period.
+5. **Platforms:** Google (`accounts.google.com`), Apple (`appleid.apple.com`), GitHub (`github.com`), Discord (`discord.com`).
+
+**Signed post verification (`method: "signed_post"`):**
+1. The attesting user posts a message on the target platform containing their DID string and a nonce.
+2. The `proof` field contains `{ "post_url": "<url>", "nonce": "<random_hex>", "posted_at": <unix_ts> }`.
+3. **Verification:** The verifier fetches the post at `post_url`, confirms the post body contains the DID string and nonce, and confirms the post is authored by the claimed `platform_handle`. The verifier MUST use the platform's official API (not HTML scraping) where available.
+4. **Platforms:** X/Twitter, Mastodon, Bluesky, Reddit, any platform with public posts and API access.
+
+**DNS record verification (`method: "dns_record"`):**
+1. The attesting user adds a TXT record at `_scp-verify.<domain>` containing their DID string.
+2. The `proof` field contains `{ "domain": "<domain>", "record_name": "_scp-verify" }`.
+3. **Verification:** The verifier performs a DNS TXT lookup for `_scp-verify.<domain>` and confirms the record contains the DID string. DNSSEC validation is RECOMMENDED where the domain supports it.
+4. **Platforms:** Any domain the user controls.
+
+**Challenge-response verification (`method: "challenge_response"`):**
+1. A third-party verifier (another SCP agent) sends a challenge to the claimed external identity through the platform.
+2. The user signs the challenge with their SCP identity key and returns the signature through the platform.
+3. The `proof` field contains `{ "challenge": "<hex>", "response_signature": "<hex>", "verifier_did": "<did>" }`.
+4. **Verification:** The verifier confirms the response signature is valid for the challenge under the claimed DID's signing key.
+
+**Renewal:** Identity link attestations SHOULD be re-verified at the following intervals:
+
+| Method | Renewal interval | Rationale |
+|--------|-----------------|-----------|
+| OAuth | 30 days | Tokens expire; account may be revoked |
+| Signed post | 90 days | Posts may be deleted; account may be suspended |
+| DNS record | 180 days | DNS records are stable; domain ownership changes slowly |
+| Challenge-response | 60 days | No persistent proof; freshness matters |
+
+### 3.5.3 Shadow Identity Claiming Protocol
+
+When a bridge connector creates a shadow identity for an external platform participant (§12.3), the following protocol governs claiming:
+
+**Claiming sequence:**
+
+1. **Eligibility check.** The claimant presents an `IdentityLinkAttestation` (§3.5.1) for the same platform and handle as the shadow identity. The bridge verifies:
+   a. The attestation is valid (signature verifies, not expired, not revoked).
+   b. The `platform` and `platform_handle` (or `platform_id` if available) match the shadow identity's external identity.
+   c. The attestation's `evidence` has been verified within the last renewal interval (§3.5.2).
+
+2. **Claim request.** The claimant sends a `ShadowClaimRequest` to the bridge context:
+   ```
+   ShadowClaimRequest {
+     claimant_did:      DID,
+     shadow_did:        DID,            // The shadow identity's DID
+     attestation_id:    String,         // ID of the IdentityLinkAttestation
+     attestation:       IdentityLinkAttestation, // Full attestation for verification
+     timestamp:         u64,
+     signature:         Ed25519Signature, // Signs claimant_did || shadow_did || attestation_id || timestamp
+   }
+   ```
+
+3. **Bridge verification.** The bridge operator verifies:
+   a. The attestation links the claimant's DID to the shadow identity's external identity.
+   b. No other DID has already claimed this shadow identity.
+   c. The claimant's DID is not on any block list relevant to the context.
+
+4. **Merge execution.** On successful verification:
+   a. The shadow identity's membership records in all bridge contexts are updated to reference the claimant's DID.
+   b. Historical messages from the shadow identity are re-attributed to the claimant's DID in the context event log via a `ShadowClaimed { shadow_did, claimant_did, attestation_id, timestamp }` event.
+   c. The shadow DID is deactivated — it cannot send new messages or be claimed by another party.
+   d. The claimant inherits the shadow identity's role in the context (typically `member`; never higher than the context's default role for new members unless governance explicitly grants an upgrade).
+
+5. **Conflict resolution.** If two claimants present valid attestations for the same shadow identity simultaneously, the first `ShadowClaimRequest` processed by the bridge wins. The second claimant receives a `SHADOW_ALREADY_CLAIMED` error (code 4040). The losing claimant MAY dispute via the bridge context's governance mechanism.
+
+**Participation record handling.** The shadow identity's participation history (message counts, duration, event log entries) is NOT merged into the claimant's participation profile. Shadow participation is recorded under the shadow DID — the `ShadowClaimed` event establishes the link for auditing, but participation records remain separate to prevent Sybil amplification (creating shadow identities to inflate participation).
 
 ## 3.6 Social Graph
 
@@ -288,6 +400,93 @@ Propagation is best-effort and idempotent — if the SDK is offline for some con
 - `is_blocked_in_context(blocker: &DID, target: &DID, context_id: &ContextId) -> Result<bool>`
 
 These methods derive current state from the identity private state event log. Implementations MAY maintain materialized views for query performance.
+
+**Write operations.** Block list mutations are performed through identity private state events. The SDK provides:
+
+- `add_global_block(blocker: &DID, target: &DID) -> Result<()>` — Appends `BlockDID` event, then propagates to all shared contexts (§9.16.3).
+- `remove_global_block(blocker: &DID, target: &DID) -> Result<()>` — Appends `UnblockDID` event, then propagates forward-only restoration to shared contexts.
+- `add_context_block(blocker: &DID, target: &DID, context_id: &ContextId) -> Result<()>` — Appends `BlockDIDInContext` event, then executes Tier 1 block protocol.
+- `remove_context_block(blocker: &DID, target: &DID, context_id: &ContextId) -> Result<()>` — Appends `UnblockDIDInContext` event, then executes forward-only restoration.
+
+Each write triggers sender key rotation (§9.16.3), access key operations (§9.17.5), and SDK-mandated state destruction (§9.16.7) as side effects.
+
+**Conflict resolution for same-target block/unblock.** If two devices simultaneously block and unblock the same target DID, the operations are NOT commutative. Resolution rule: **block wins.** When replaying the event log, if both `BlockDID { target: X }` and `UnblockDID { target: X }` exist with the same timestamp (within 1-second tolerance), the block takes precedence. For events with different timestamps, the later timestamp determines the current state.
+
+### 3.7.1.1 Exhaustive Private State Event Types
+
+All identity private state event types, organized by category:
+
+**Block/Mute events:**
+
+| Event type | Fields | Commutative | Notes |
+|-----------|--------|-------------|-------|
+| `BlockDID` | `target_did: DID, timestamp: u64` | Yes (different targets) | Global block (Tier 2) |
+| `UnblockDID` | `target_did: DID, timestamp: u64` | Yes (different targets) | Global unblock |
+| `BlockDIDInContext` | `target_did: DID, context_id: ContextId, timestamp: u64` | Yes | Per-context block (Tier 1) |
+| `UnblockDIDInContext` | `target_did: DID, context_id: ContextId, timestamp: u64` | Yes | Per-context unblock |
+| `MuteDID` | `target_did: DID, timestamp: u64` | Yes | Global mute |
+| `UnmuteDID` | `target_did: DID, timestamp: u64` | Yes | Global unmute |
+| `MuteDIDInContext` | `target_did: DID, context_id: ContextId, timestamp: u64` | Yes | Per-context mute |
+| `UnmuteDIDInContext` | `target_did: DID, context_id: ContextId, timestamp: u64` | Yes | Per-context unmute |
+
+**Graph visibility events:**
+
+| Event type | Fields | Commutative | Notes |
+|-----------|--------|-------------|-------|
+| `SetDefaultGraphVisibility` | `visibility: GraphVisibility, timestamp: u64` | No | Default visibility for all DIDs |
+| `GrantGraphVisibility` | `target_did: DID, scope: VisibilityScope, timestamp: u64` | Yes (different targets) | Per-DID override |
+| `RevokeGraphVisibility` | `target_did: DID, timestamp: u64` | Yes | Remove per-DID override |
+
+**Agent configuration events:**
+
+| Event type | Fields | Commutative | Notes |
+|-----------|--------|-------------|-------|
+| `SetAgentConfig` | `key: String, value: MessagePackValue, timestamp: u64` | No (same key) | Key-value agent preferences |
+| `DeleteAgentConfig` | `key: String, timestamp: u64` | No (same key) | Remove a preference |
+
+**Annotation events:**
+
+| Event type | Fields | Commutative | Notes |
+|-----------|--------|-------------|-------|
+| `SetAnnotation` | `target_did: DID, key: String, value: String, timestamp: u64` | No (same target+key) | Personal note on a DID |
+| `DeleteAnnotation` | `target_did: DID, key: String, timestamp: u64` | No (same target+key) | Remove annotation |
+
+**Petname events (§22.4):**
+
+| Event type | Fields | Commutative | Notes |
+|-----------|--------|-------------|-------|
+| `SetPetname` | `target: PetnameTarget, name: String, timestamp: u64` | No (same target) | `PetnameTarget` = DID or ContextId |
+| `DeletePetname` | `target: PetnameTarget, timestamp: u64` | No (same target) | Remove petname |
+
+**Notification events:**
+
+| Event type | Fields | Commutative | Notes |
+|-----------|--------|-------------|-------|
+| `SetNotificationPreference` | `scope: NotificationScope, level: NotificationLevel, timestamp: u64` | No (same scope) | `NotificationScope` = Global, PerContext(id), PerDID(did) |
+
+**Attestation draft events:**
+
+| Event type | Fields | Commutative | Notes |
+|-----------|--------|-------------|-------|
+| `SaveDraftAttestation` | `draft_id: String, attestation: IdentityLinkAttestation, timestamp: u64` | Yes (different drafts) | Draft not yet published |
+| `DeleteDraftAttestation` | `draft_id: String, timestamp: u64` | Yes | Remove draft |
+| `PublishDraftAttestation` | `draft_id: String, timestamp: u64` | Yes | Mark draft as published |
+
+**Device registry events:**
+
+| Event type | Fields | Commutative | Notes |
+|-----------|--------|-------------|-------|
+| `EnrollDevice` | `device_id: String, device_x25519_pubkey: [u8; 32], device_name: String, enrolled_at: u64` | Yes | New device enrollment |
+| `UnenrollDevice` | `device_id: String, timestamp: u64` | Yes | Device removal |
+
+**Recovery contact events:**
+
+| Event type | Fields | Commutative | Notes |
+|-----------|--------|-------------|-------|
+| `AddRecoveryContact` | `contact_did: DID, timestamp: u64` | Yes | Designate recovery contact |
+| `RemoveRecoveryContact` | `contact_did: DID, timestamp: u64` | Yes | Remove recovery contact |
+
+For non-commutative events (same key/target modified from multiple devices), conflict resolution is **last-timestamp-wins** with tie-breaking by lexicographic comparison of the event hash.
 
 ### 3.7.2 Multi-Device Private State Key Distribution
 
@@ -493,6 +692,18 @@ The full resolution sequence:
 ```
 
 The relay query in step 3a targets relays in priority order: the identity's own relays (from a previously cached DID document), then bootstrap relays. If the resolver has no prior knowledge of the identity's relays, only bootstrap relays are queried for the relay layer — the DHT layer provides the backup.
+
+**Cancellation and contradiction semantics:**
+
+The parallel query model (step 3) requires clear rules for when queries are cancelled, how contradictions are resolved, and what happens on failure:
+
+- **First-response optimization.** When the first valid response arrives, the resolver SHOULD continue waiting for the second layer's response for up to 2 seconds (not cancel immediately). This allows the resolver to detect stale documents: if both layers return valid documents, the higher sequence number is authoritative (step 5). Cancelling the slower query immediately would miss a fresher document on the slower layer.
+- **Both layers succeed, same sequence number.** The documents MUST be byte-identical (same key signs both, same content). If they differ despite identical sequence numbers, this indicates a bug in the publishing implementation. The resolver MUST log a warning and accept either document (they should be identical; if not, neither is more authoritative).
+- **Both layers succeed, different sequence numbers.** The higher sequence number is authoritative. The resolver MAY re-publish the fresher document to the layer that returned the stale one (protocol-level healing, §3.10.7).
+- **One layer fails, one succeeds.** The successful response is accepted. The failed layer's error is logged but does not prevent resolution. The resolver does NOT retry the failed layer synchronously — the next resolution cycle (24h for active contacts, 7d for inactive) will attempt both layers again.
+- **Both layers fail.** If a cached document exists and is less than 7 days old, the cached document is returned with a `resolution_source: "cache"` indicator. If no cache exists or the cache is older than 7 days, resolution fails with error `DID_RESOLUTION_FAILED` (code 5010). The resolver MUST NOT fabricate a document.
+- **One layer returns invalid signature.** The response is discarded as if the layer had failed. An invalid signature is logged at WARN level (it may indicate relay tampering). The resolver does not fall back to the invalid document under any circumstances.
+- **Timeout.** Each layer query has a 5-second timeout. If a layer does not respond within 5 seconds, it is treated as a failure for that resolution attempt.
 
 ### 3.10.5 Publishing Protocol
 
