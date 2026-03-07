@@ -3,6 +3,7 @@
 //! This module contains the cryptographic primitives and protocol wrappers
 //! used by SCP:
 //!
+//! - [`access_keys`] — Per-member AES-256 access key layer for content access control (ADR-038).
 //! - [`ed25519`] — Shared Ed25519 signature verification helpers.
 //! - [`key_continuity`] — Key continuity fingerprint computation (spec section 9.11, ADR-039).
 //! - [`mls`] — MLS (Messaging Layer Security, RFC 9420) group encryption.
@@ -11,6 +12,7 @@
 //! - [`ucan`] — UCAN token types and capability enforcement (ADR-016).
 //! - [`canonical`] — Canonical hash construction for signed structures (§9.5.1).
 
+pub mod access_keys;
 pub mod canonical;
 pub mod ed25519;
 pub mod key_continuity;
