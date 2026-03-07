@@ -18,6 +18,8 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use zeroize::Zeroizing;
+
 use scp_identity::cache::SystemClock;
 use scp_identity::dht::SequenceStore;
 use scp_identity::{
@@ -168,18 +170,23 @@ fn resolve_storage_path(cli_path: Option<&PathBuf>) -> PathBuf {
 /// Reads from `SCP_STORAGE_KEY` env var (hex-encoded 32 bytes). If not set,
 /// generates a random key and writes it to `{storage_dir}/.key` (mode 0600).
 /// On subsequent runs, reads the key from the file.
-fn resolve_storage_key(storage_dir: &std::path::Path) -> Result<[u8; 32], String> {
+///
+/// All intermediate key buffers are wrapped in [`Zeroizing`] so they are
+/// zeroed on drop, consistent with `key_custody.rs` and `tls.rs`.
+fn resolve_storage_key(storage_dir: &std::path::Path) -> Result<Zeroizing<[u8; 32]>, String> {
     // Check env var first.
     if let Ok(hex_key) = env::var("SCP_STORAGE_KEY") {
-        let bytes =
-            hex::decode(&hex_key).map_err(|e| format!("SCP_STORAGE_KEY is not valid hex: {e}"))?;
+        let bytes = Zeroizing::new(
+            hex::decode(&hex_key)
+                .map_err(|e| format!("SCP_STORAGE_KEY is not valid hex: {e}"))?,
+        );
         if bytes.len() != 32 {
             return Err(format!(
                 "SCP_STORAGE_KEY must be 32 bytes (64 hex chars), got {} bytes",
                 bytes.len()
             ));
         }
-        let mut key = [0u8; 32];
+        let mut key = Zeroizing::new([0u8; 32]);
         key.copy_from_slice(&bytes);
         return Ok(key);
     }
@@ -187,8 +194,10 @@ fn resolve_storage_key(storage_dir: &std::path::Path) -> Result<[u8; 32], String
     // Check for existing key file.
     let key_file = storage_dir.join(".key");
     if key_file.exists() {
-        let data = std::fs::read(&key_file)
-            .map_err(|e| format!("failed to read key file {}: {e}", key_file.display()))?;
+        let data = Zeroizing::new(
+            std::fs::read(&key_file)
+                .map_err(|e| format!("failed to read key file {}: {e}", key_file.display()))?,
+        );
         if data.len() != 32 {
             return Err(format!(
                 "key file {} has invalid length {} (expected 32)",
@@ -196,7 +205,7 @@ fn resolve_storage_key(storage_dir: &std::path::Path) -> Result<[u8; 32], String
                 data.len()
             ));
         }
-        let mut key = [0u8; 32];
+        let mut key = Zeroizing::new([0u8; 32]);
         key.copy_from_slice(&data);
         return Ok(key);
     }
@@ -205,19 +214,30 @@ fn resolve_storage_key(storage_dir: &std::path::Path) -> Result<[u8; 32], String
     std::fs::create_dir_all(storage_dir)
         .map_err(|e| format!("failed to create storage directory: {e}"))?;
 
-    let mut key = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
+    let mut key = Zeroizing::new([0u8; 32]);
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *key);
 
-    std::fs::write(&key_file, key)
-        .map_err(|e| format!("failed to write key file {}: {e}", key_file.display()))?;
-
-    // Set permissions to owner-only (Unix).
+    // On Unix, create the key file with mode 0600 atomically to prevent a
+    // TOCTOU window where the file is briefly world-readable.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(&key_file, permissions)
-            .map_err(|e| format!("failed to set key file permissions: {e}"))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&key_file)
+            .map_err(|e| format!("failed to create key file {}: {e}", key_file.display()))?;
+        file.write_all(&*key)
+            .map_err(|e| format!("failed to write key file {}: {e}", key_file.display()))?;
+    }
+
+    // On non-Unix, fall back to write + set_permissions (no TOCTOU guarantee).
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&key_file, &*key)
+            .map_err(|e| format!("failed to write key file {}: {e}", key_file.display()))?;
     }
 
     Ok(key)
@@ -504,8 +524,8 @@ async fn run_full_node_ephemeral() {
 // ---------------------------------------------------------------------------
 
 /// Opens an encrypted `SQLite` database, exiting on failure.
-fn open_sqlite_or_exit(dir: &std::path::Path, key: &[u8; 32]) -> SqliteStorage {
-    match SqliteStorage::new(dir, key) {
+fn open_sqlite_or_exit(dir: &std::path::Path, key: &Zeroizing<[u8; 32]>) -> SqliteStorage {
+    match SqliteStorage::new(dir, key.as_ref()) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, path = %dir.display(), "failed to open SQLite storage");
@@ -518,7 +538,7 @@ fn open_sqlite_or_exit(dir: &std::path::Path, key: &[u8; 32]) -> SqliteStorage {
 /// persistent node. Returns `(storage_dir, storage_key, node_storage, custody)`.
 async fn init_persistent_storage(
     storage_path: Option<&PathBuf>,
-) -> (PathBuf, [u8; 32], SqliteStorage, Arc<SqliteKeyCustody>) {
+) -> (PathBuf, Zeroizing<[u8; 32]>, SqliteStorage, Arc<SqliteKeyCustody>) {
     let storage_dir = resolve_storage_path(storage_path);
 
     let storage_key = match resolve_storage_key(&storage_dir) {

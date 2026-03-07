@@ -236,10 +236,16 @@ pub fn build_reloadable_tls_config(
 /// Implements [`ResolvesServerCert`] so it can be used with `rustls::ServerConfig`.
 /// The inner `RwLock` allows updating the certificate without restarting the
 /// TLS acceptor.
+///
+/// Uses [`std::sync::RwLock`] (not `tokio::sync::RwLock`) because
+/// [`ResolvesServerCert::resolve`] is synchronous. A tokio `RwLock` required
+/// `try_read()` which returns `None` during certificate updates, causing TLS
+/// handshake failures. A std `RwLock` blocks briefly during the (very fast)
+/// pointer swap, so `resolve` never returns `None`.
 #[derive(Debug)]
 pub struct CertResolver {
     /// The current certified key, behind a read-write lock for hot-reload.
-    pub(crate) inner: RwLock<Arc<CertifiedKey>>,
+    pub(crate) inner: std::sync::RwLock<Arc<CertifiedKey>>,
 }
 
 impl CertResolver {
@@ -247,25 +253,34 @@ impl CertResolver {
     #[must_use]
     pub fn new(key: CertifiedKey) -> Self {
         Self {
-            inner: RwLock::new(Arc::new(key)),
+            inner: std::sync::RwLock::new(Arc::new(key)),
         }
     }
 
     /// Update the certificate. Subsequent TLS handshakes will use the new
     /// certificate.
-    pub async fn update(&self, key: CertifiedKey) {
-        let mut guard = self.inner.write().await;
+    ///
+    /// This acquires a std `RwLock` write guard, which blocks briefly but is
+    /// safe because the critical section is a single pointer swap.
+    ///
+    /// If the lock is poisoned (prior panic during a write), we recover by
+    /// clearing the poison — the old `Arc<CertifiedKey>` is still valid and
+    /// we are replacing it with a fresh one anyway.
+    pub fn update(&self, key: CertifiedKey) {
+        let mut guard = match self.inner.write() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                tracing::warn!("CertResolver RwLock was poisoned, clearing poison");
+                poisoned.into_inner()
+            }
+        };
         *guard = Arc::new(key);
     }
 }
 
 impl ResolvesServerCert for CertResolver {
     fn resolve(&self, _client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        // `try_read()` is non-blocking and appropriate for the synchronous
-        // `resolve` callback. If a write is in progress (certificate update),
-        // this returns `None` and rustls will reject the handshake — the next
-        // attempt will succeed after the update completes.
-        self.inner.try_read().ok().map(|guard| Arc::clone(&*guard))
+        self.inner.read().ok().map(|guard| Arc::clone(&*guard))
     }
 }
 
@@ -566,7 +581,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
                                             rustls::crypto::ring::sign::any_supported_type(&key)
                                     {
                                         let certified = CertifiedKey::new(certs, signing_key);
-                                        resolver.update(certified).await;
+                                        resolver.update(certified);
                                         tracing::info!(
                                             domain = %self.domain,
                                             "TLS certificate renewed and hot-reloaded"
@@ -973,14 +988,14 @@ mod tests {
 
         // Before update: should have cert1.
         {
-            let guard = resolver.inner.read().await;
+            let guard = resolver.inner.read().unwrap();
             assert_eq!(guard.cert.len(), certs1.len());
         }
 
         // After update: should have cert2.
-        resolver.update(ck2).await;
+        resolver.update(ck2);
         {
-            let guard = resolver.inner.read().await;
+            let guard = resolver.inner.read().unwrap();
             assert_eq!(guard.cert.len(), certs2.len());
         }
     }
