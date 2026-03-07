@@ -1467,9 +1467,12 @@ mod tests {
     // GovernanceAction serialization
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn governance_action_serialization_roundtrip() {
-        let actions = vec![
+    /// Returns all 25 `GovernanceAction` variants (24 per ADR-031 + `BlockAuthor`)
+    /// for serialization testing.
+    fn all_governance_actions() -> Vec<GovernanceAction> {
+        use crate::context::tools::interface::ToolInterface;
+
+        vec![
             GovernanceAction::AddMember {
                 did: bob(),
                 role: "member".to_owned(),
@@ -1510,16 +1513,84 @@ mod tests {
                 additional_secs: 3600,
             },
             GovernanceAction::TransferAdmin { new_admin: bob() },
+            GovernanceAction::CreateChildContext {
+                params: Box::new(ContextParams::default()),
+            },
             GovernanceAction::BlockAuthor {
                 did: bob(),
                 reason: Some("spam".to_owned()),
             },
-        ];
+            GovernanceAction::RevokeReadAccess {
+                did: bob(),
+                scope: RevocationScope::Full,
+            },
+            GovernanceAction::RestoreReadAccess { did: bob() },
+            GovernanceAction::ModifyPruningPolicy {
+                new_policy: PruningPolicy::default(),
+            },
+            GovernanceAction::AddSigner { did: carol() },
+            GovernanceAction::RemoveSigner { did: carol() },
+            GovernanceAction::ModifyThreshold { new_threshold: 2 },
+            GovernanceAction::EstablishToolInterface {
+                interface: ToolInterface {
+                    source_context: "ctx-src".to_owned(),
+                    target_context: "ctx-tgt".to_owned(),
+                    tool_id: "tool-1".to_owned(),
+                    rate_limit: None,
+                    approved_by_source: true,
+                    approved_by_target: false,
+                },
+            },
+            GovernanceAction::ResetMember {
+                did: bob(),
+                reason: "group state corruption".to_owned(),
+            },
+            GovernanceAction::ResolveConflict {
+                proposal_a: [1u8; 32],
+                proposal_b: [2u8; 32],
+                resolution: ConflictResolution::AcceptProposal {
+                    winner_id: [1u8; 32],
+                },
+            },
+            GovernanceAction::PromoteContext,
+            GovernanceAction::RevokeWriteAccess {
+                did: bob(),
+                scope: RevocationScope::FutureOnly,
+            },
+            GovernanceAction::RestoreWriteAccess { did: bob() },
+            GovernanceAction::RotateContentKeys {
+                reason: Some("periodic hygiene".to_owned()),
+            },
+            GovernanceAction::ReconfigureGovernance {
+                changes: vec![
+                    GovernanceReconfigAction::RemoveInactiveSigner { did: carol() },
+                    GovernanceReconfigAction::ReduceThreshold { new_threshold: 1 },
+                ],
+                justification: DeadlockJustification {
+                    unavailable_dids: vec![carol()],
+                    missed_windows: vec![(carol(), 5)],
+                    detected_at: 1_700_000_000,
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn governance_action_serialization_roundtrip() {
+        let actions = all_governance_actions();
+
+        // Verify all 25 variants are covered (24 per ADR-031 + BlockAuthor).
+        assert_eq!(
+            actions.len(),
+            25,
+            "all GovernanceAction variants must be tested"
+        );
 
         for action in &actions {
             let json = serde_json::to_string(action).expect("serialize");
-            // Verify it deserializes without error (round-trip validates serde).
-            let _deserialized: GovernanceAction = serde_json::from_str(&json).expect("deserialize");
+            let deserialized: GovernanceAction = serde_json::from_str(&json).expect("deserialize");
+            let json2 = serde_json::to_string(&deserialized).expect("re-serialize");
+            assert_eq!(json, json2, "round-trip mismatch for action");
         }
     }
 

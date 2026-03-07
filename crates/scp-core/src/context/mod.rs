@@ -102,7 +102,10 @@ pub use builder::{
     CreationReceipt, EventLogHandle, MlsGroupHandle, SenderKeyHandle, create_context,
 };
 pub use manager::{
-    ContextManager, ContextPersistence, ContextSnapshot, GovernanceActionResult, ProposalOutcome,
+    ContentKeysRotatedResult, ContextManager, ContextPersistence, ContextSnapshot,
+    GovernanceActionResult, GovernanceReconfiguredResult, ProposalOutcome,
+    ReadAccessRestoredResult, ReadAccessRevokedResult, WriteAccessRestoredResult,
+    WriteAccessRevokedResult,
 };
 
 // Re-export membership types.
@@ -144,9 +147,10 @@ pub use standing::{StandingChannelError, StandingChannelManager};
 
 // Re-export governance types (SCP-129, ADR-031).
 pub use governance::{
-    GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
-    GovernanceModelConfig, GovernanceProposal, ProposalId, ProposalStatus, RejectionReason,
-    RevocationScope, SignedVote, SingleAdminEngine, VoteType, majority::MajorityVoteEngine,
+    ConflictResolution, DeadlockJustification, GovernanceAction, GovernanceContext,
+    GovernanceEngine, GovernanceError, GovernanceEvent, GovernanceModelConfig, GovernanceProposal,
+    GovernanceReconfigAction, ProposalId, ProposalStatus, RejectionReason, RevocationScope,
+    SignedVote, SingleAdminEngine, VoteType, majority::MajorityVoteEngine,
     multisig::ThresholdEngine, sign_vote, unanimity::UnanimityEngine, verify_vote,
 };
 

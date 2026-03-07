@@ -14,6 +14,7 @@
 
 use std::collections::HashSet;
 
+use hex;
 use scp_platform::traits::Storage;
 use zeroize::Zeroize;
 
@@ -148,6 +149,84 @@ fn ephemeral_metadata_key(context_id: &str) -> Result<String, super::StoreError>
 fn context_prefix(context_id: &str) -> Result<String, super::StoreError> {
     let ctx = super::sanitize_key_component(context_id)?;
     Ok(format!("context/{ctx}/"))
+}
+
+// ---------------------------------------------------------------------------
+// Governance persistence key helpers (ADR-031 §8)
+// ---------------------------------------------------------------------------
+
+/// Builds the storage key for a context's governance configuration.
+///
+/// Format: `context/{context_id}/governance/config`
+/// See ADR-031 §4.
+///
+/// # Errors
+///
+/// Returns [`StoreError::InvalidKey`](super::StoreError::InvalidKey) if `context_id`
+/// contains invalid key characters.
+pub fn governance_config_key(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/governance/config"))
+}
+
+/// Builds the storage key for a specific governance proposal.
+///
+/// Format: `context/{context_id}/governance/proposal/{proposal_id_hex}`
+/// See ADR-031 §8.
+///
+/// # Errors
+///
+/// Returns [`StoreError::InvalidKey`](super::StoreError::InvalidKey) if `context_id`
+/// contains invalid key characters.
+pub fn governance_proposal_key(
+    context_id: &str,
+    proposal_id: &[u8; 32],
+) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    let pid_hex = hex::encode(proposal_id);
+    Ok(format!("context/{ctx}/governance/proposal/{pid_hex}"))
+}
+
+/// Builds the storage key for the pending proposal index.
+///
+/// Format: `context/{context_id}/governance/proposal_index/pending`
+/// See ADR-031 §8.
+///
+/// # Errors
+///
+/// Returns [`StoreError::InvalidKey`](super::StoreError::InvalidKey) if `context_id`
+/// contains invalid key characters.
+pub fn governance_pending_index_key(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/governance/proposal_index/pending"))
+}
+
+/// Builds the storage key for the resolved proposal index.
+///
+/// Format: `context/{context_id}/governance/proposal_index/resolved`
+/// See ADR-031 §8.
+///
+/// # Errors
+///
+/// Returns [`StoreError::InvalidKey`](super::StoreError::InvalidKey) if `context_id`
+/// contains invalid key characters.
+pub fn governance_resolved_index_key(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/governance/proposal_index/resolved"))
+}
+
+/// Builds the storage key for governance deadlock state.
+///
+/// Format: `context/{context_id}/governance/deadlock_state`
+/// See ADR-031 §10.
+///
+/// # Errors
+///
+/// Returns [`StoreError::InvalidKey`](super::StoreError::InvalidKey) if `context_id`
+/// contains invalid key characters.
+pub fn governance_deadlock_state_key(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/governance/deadlock_state"))
 }
 
 // ---------------------------------------------------------------------------

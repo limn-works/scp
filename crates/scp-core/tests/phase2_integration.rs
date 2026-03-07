@@ -123,6 +123,15 @@ const fn event_type_tag(event_type: &EventType) -> u16 {
         EventType::EconomicPolicyChanged => 22,
         EventType::SpendingUcanGranted => 23,
         EventType::SpendingUcanRevoked => 24,
+        // Governance event types (ADR-031 §8)
+        EventType::GovernanceProposalCreated => 25,
+        EventType::GovernanceVoteCast => 26,
+        EventType::GovernanceVoteWithdrawn => 27,
+        EventType::GovernanceProposalResolved => 28,
+        EventType::GovernanceConflictDetected => 29,
+        EventType::GovernanceConflictResolved => 30,
+        EventType::GovernanceDeadlockRecovery => 31,
+        EventType::GovernanceActionExecuted => 32,
     }
 }
 

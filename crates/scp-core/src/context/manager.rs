@@ -59,36 +59,114 @@ const MAX_THRESHOLD_SIGNERS: usize = 64;
 // GovernanceActionResult
 // ---------------------------------------------------------------------------
 
+/// Result of revoking a member's read access (§5.9, ADR-031).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadAccessRevokedResult {
+    /// The DID whose read access was revoked.
+    pub did: DID,
+    /// The revocation scope applied.
+    pub scope: RevocationScope,
+    /// Number of authors whose keys were rotated (broadcast contexts).
+    pub rotated_author_count: usize,
+}
+
+/// Result of restoring a member's read access (§5.9, ADR-031).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadAccessRestoredResult {
+    /// The DID whose read access was restored.
+    pub did: DID,
+}
+
+/// Result of revoking a member's write access (§9.17, ADR-038).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteAccessRevokedResult {
+    /// The DID whose write access was revoked.
+    pub did: DID,
+    /// The revocation scope applied.
+    pub scope: RevocationScope,
+}
+
+/// Result of restoring a member's write access (§9.17, ADR-038).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteAccessRestoredResult {
+    /// The DID whose write access was restored.
+    pub did: DID,
+}
+
+/// Result of a context-wide content key rotation (§9.17, ADR-038).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentKeysRotatedResult {
+    /// Optional reason that triggered the rotation.
+    pub reason: Option<String>,
+}
+
+/// Result of a governance reconfiguration via deadlock recovery (ADR-031 §10).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernanceReconfiguredResult {
+    /// The reconfiguration actions that were applied.
+    pub changes_applied: usize,
+}
+
 /// Result of executing an approved governance action via
 /// [`ContextManager::execute_governance_action`].
 ///
-/// Each variant wraps the result type from the underlying operation. This
-/// allows callers to pattern-match on the specific action that was executed
-/// and access its result.
+/// Each variant maps 1:1 to a [`GovernanceAction`] variant (ADR-031 §2).
+/// Variants that carry action-specific result data wrap a result struct;
+/// others are unit variants indicating successful execution.
 #[derive(Debug)]
 pub enum GovernanceActionResult {
+    /// A member was added to the context.
+    MemberAdded,
+    /// A member was removed from the context.
+    MemberRemoved,
+    /// A member's role was changed.
+    RoleChanged,
+    /// A tool was registered in the context.
+    ToolRegistered,
+    /// A tool was removed from the context.
+    ToolRemoved,
+    /// The capability ceiling was modified.
+    CeilingModified,
+    /// The context was closed.
+    ContextClosed,
+    /// The context TTL was extended.
+    TtlExtended,
+    /// The pruning policy was modified.
+    PruningPolicyModified,
+    /// Single-admin authority was transferred.
+    AdminTransferred,
+    /// A signer was added to the threshold set.
+    SignerAdded,
+    /// A signer was removed from the threshold set.
+    SignerRemoved,
+    /// The threshold value was modified.
+    ThresholdModified,
+    /// A child context was created.
+    ChildContextCreated,
+    /// A tool interface was established.
+    ToolInterfaceEstablished,
+    /// A member was reset (ADR-029, Tier 3).
+    MemberReset,
+    /// A governance conflict was resolved (ADR-031 §7).
+    ConflictResolved,
+    /// The context was promoted from ephemeral to persistent.
+    ContextPromoted,
+    /// A member's read access was revoked (§5.9, ADR-031).
+    ReadAccessRevoked(ReadAccessRevokedResult),
+    /// A member's read access was restored (§5.9, ADR-031).
+    ReadAccessRestored(ReadAccessRestoredResult),
+    /// A member's write access was revoked (§9.17, ADR-038).
+    WriteAccessRevoked(WriteAccessRevokedResult),
+    /// A member's write access was restored (§9.17, ADR-038).
+    WriteAccessRestored(WriteAccessRestoredResult),
+    /// Context-wide content keys were rotated (§9.17, ADR-038).
+    ContentKeysRotated(ContentKeysRotatedResult),
+    /// Governance was reconfigured via deadlock recovery (ADR-031 §10).
+    GovernanceReconfigured(GovernanceReconfiguredResult),
     /// An author was blocked from a broadcast context (spec section 5.14.8).
+    /// Legacy variant — new code should use `WriteAccessRevoked` with
+    /// `RevocationScope::Full`.
     AuthorBlocked(AuthorBlockResult),
-    /// A subscriber's read access was revoked in a broadcast context
-    /// (ADR-031, §5.9). The subscriber was removed from the registry and
-    /// added to all authors' block lists; all author keys were rotated.
-    SubscriberBanned(GovernanceBanResult),
-    /// A subscriber's read access was restored in a broadcast context
-    /// (ADR-031, §5.9). The DID was removed from all authors' block lists.
-    /// The subscriber must re-subscribe to regain access.
-    SubscriberUnbanned {
-        /// The DID whose read access was restored.
-        did: DID,
-    },
-    /// A governance action was executed successfully with no action-specific
-    /// result payload. Maps to: `ChangeRole`, `ModifyCeiling`, `CloseContext`,
-    /// `ExtendTtl`, `ChangeMemoryScope`, `AddMember`, `RemoveMember`,
-    /// `RegisterTool`, `DeregisterTool`, `ModifyThreshold`, `AddSigner`,
-    /// `RemoveSigner`, `EstablishToolInterface`, `ResetMember`,
-    /// `ResolveConflict`, `PromoteContext`, `RotateContentKeys`,
-    /// `RevokeWriteAccess`, `RestoreWriteAccess`, `ModifyPruningPolicy`,
-    /// `ReconfigureGovernance`.
-    Executed,
 }
 
 // ---------------------------------------------------------------------------
@@ -2136,91 +2214,139 @@ impl ContextManager {
                 let r = self
                     .revoke_read_access_internal(context_id, did, *scope)
                     .await?;
-                Ok(GovernanceActionResult::SubscriberBanned(r))
+                Ok(GovernanceActionResult::ReadAccessRevoked(
+                    ReadAccessRevokedResult {
+                        did: did.clone(),
+                        scope: *scope,
+                        rotated_author_count: r.rotated_authors.len(),
+                    },
+                ))
             }
             GovernanceAction::RestoreReadAccess { did } => {
                 self.restore_read_access_internal(context_id, did).await?;
-                Ok(GovernanceActionResult::SubscriberUnbanned { did: did.clone() })
+                Ok(GovernanceActionResult::ReadAccessRestored(
+                    ReadAccessRestoredResult { did: did.clone() },
+                ))
             }
             GovernanceAction::PromoteContext => {
                 self.execute_promote_context(context_id, &proposal.approvals, pid)
                     .await?;
-                Ok(GovernanceActionResult::Executed)
+                Ok(GovernanceActionResult::ContextPromoted)
             }
             _ => {
                 self.dispatch_context_governance_action(context_id, &proposal.action, pid)
-                    .await?;
-                Ok(GovernanceActionResult::Executed)
+                    .await
             }
         }
     }
 
-    /// Dispatches context-level governance actions that return `Executed`.
+    /// Dispatches context-level governance actions to their implementation
+    /// methods, returning typed [`GovernanceActionResult`] variants.
+    ///
+    /// Split into two methods to stay within the line limit:
+    /// - This method handles membership, roles, settings, and structural
+    ///   actions (13 variants).
+    /// - [`dispatch_content_governance_action`] handles content access,
+    ///   key rotation, conflict resolution, and reconfiguration (9 variants).
     async fn dispatch_context_governance_action(
         &self,
         context_id: &str,
         action: &GovernanceAction,
         pid: ProposalId,
-    ) -> Result<(), ContextError> {
+    ) -> Result<GovernanceActionResult, ContextError> {
         match action {
             GovernanceAction::AddMember { did, role } => {
-                self.execute_add_member(context_id, did, role, pid).await
+                self.execute_add_member(context_id, did, role, pid).await?;
+                Ok(GovernanceActionResult::MemberAdded)
             }
             GovernanceAction::RemoveMember { did, .. } => {
-                self.execute_remove_member(context_id, did, pid).await
+                self.execute_remove_member(context_id, did, pid).await?;
+                Ok(GovernanceActionResult::MemberRemoved)
             }
             GovernanceAction::ChangeRole { did, new_role } => {
                 self.execute_change_role(context_id, did, new_role, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::RoleChanged)
             }
             GovernanceAction::RegisterTool { registration } => {
                 self.execute_register_tool(context_id, registration, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::ToolRegistered)
             }
             GovernanceAction::RemoveTool { tool_id } => {
-                self.execute_remove_tool(context_id, tool_id, pid).await
+                self.execute_remove_tool(context_id, tool_id, pid).await?;
+                Ok(GovernanceActionResult::ToolRemoved)
             }
             GovernanceAction::ModifyCeiling { new_ceiling } => {
                 self.execute_modify_ceiling(context_id, new_ceiling, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::CeilingModified)
             }
             GovernanceAction::CloseContext { reason } => {
                 self.execute_close_context(context_id, reason.as_deref(), pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::ContextClosed)
             }
             GovernanceAction::ExtendTtl { additional_secs } => {
                 self.execute_extend_ttl(context_id, *additional_secs, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::TtlExtended)
             }
             GovernanceAction::TransferAdmin { new_admin } => {
                 self.execute_transfer_admin(context_id, new_admin, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::AdminTransferred)
             }
             GovernanceAction::CreateChildContext { params } => {
                 self.execute_create_child_context(context_id, params, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::ChildContextCreated)
             }
             GovernanceAction::ModifyPruningPolicy { new_policy } => {
                 self.execute_modify_pruning_policy(context_id, new_policy, pid)
+                    .await?;
+                Ok(GovernanceActionResult::PruningPolicyModified)
+            }
+            // Content access, structural, and reconfiguration actions
+            // are dispatched by the companion method.
+            _ => {
+                self.dispatch_content_governance_action(context_id, action, pid)
                     .await
             }
+        }
+    }
+
+    /// Dispatches content access, structural, and reconfiguration governance
+    /// actions. Companion to [`dispatch_context_governance_action`].
+    async fn dispatch_content_governance_action(
+        &self,
+        context_id: &str,
+        action: &GovernanceAction,
+        pid: ProposalId,
+    ) -> Result<GovernanceActionResult, ContextError> {
+        match action {
             GovernanceAction::AddSigner { did } => {
-                self.execute_add_signer(context_id, did, pid).await
+                self.execute_add_signer(context_id, did, pid).await?;
+                Ok(GovernanceActionResult::SignerAdded)
             }
             GovernanceAction::RemoveSigner { did } => {
-                self.execute_remove_signer(context_id, did, pid).await
+                self.execute_remove_signer(context_id, did, pid).await?;
+                Ok(GovernanceActionResult::SignerRemoved)
             }
             GovernanceAction::ModifyThreshold { new_threshold } => {
                 self.execute_modify_threshold(context_id, *new_threshold, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::ThresholdModified)
             }
             GovernanceAction::EstablishToolInterface { interface } => {
                 self.execute_establish_tool_interface(context_id, interface, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::ToolInterfaceEstablished)
             }
             GovernanceAction::ResetMember { did, reason } => {
                 self.execute_reset_member(context_id, did, reason, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::MemberReset)
             }
             GovernanceAction::ResolveConflict {
                 proposal_a,
@@ -2228,38 +2354,54 @@ impl ContextManager {
                 resolution,
             } => {
                 self.execute_resolve_conflict(context_id, proposal_a, proposal_b, resolution, pid)
-                    .await
-            }
-            // PromoteContext is handled in dispatch_governance_action (needs
-            // proposal.approvals for unanimity check).
-            GovernanceAction::PromoteContext => {
-                unreachable!("PromoteContext is dispatched directly by dispatch_governance_action")
+                    .await?;
+                Ok(GovernanceActionResult::ConflictResolved)
             }
             GovernanceAction::RevokeWriteAccess { did, scope } => {
                 self.execute_revoke_write_access(context_id, did, *scope, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::WriteAccessRevoked(
+                    WriteAccessRevokedResult {
+                        did: did.clone(),
+                        scope: *scope,
+                    },
+                ))
             }
             GovernanceAction::RestoreWriteAccess { did } => {
                 self.execute_restore_write_access(context_id, did, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::WriteAccessRestored(
+                    WriteAccessRestoredResult { did: did.clone() },
+                ))
             }
             GovernanceAction::RotateContentKeys { reason } => {
                 self.execute_rotate_content_keys(context_id, reason.as_deref(), pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::ContentKeysRotated(
+                    ContentKeysRotatedResult {
+                        reason: reason.clone(),
+                    },
+                ))
             }
             GovernanceAction::ReconfigureGovernance {
                 changes,
                 justification,
             } => {
                 self.execute_reconfigure_governance(context_id, changes, justification, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::GovernanceReconfigured(
+                    GovernanceReconfiguredResult {
+                        changes_applied: changes.len(),
+                    },
+                ))
             }
-            // BlockAuthor, RevokeReadAccess, RestoreReadAccess handled in dispatch_governance_action
-            GovernanceAction::BlockAuthor { .. }
-            | GovernanceAction::RevokeReadAccess { .. }
-            | GovernanceAction::RestoreReadAccess { .. } => {
-                unreachable!("handled in dispatch_governance_action")
-            }
+            // PromoteContext, BlockAuthor, RevokeReadAccess, RestoreReadAccess
+            // are handled in dispatch_governance_action; membership/settings
+            // actions are handled in dispatch_context_governance_action.
+            _ => unreachable!(
+                "action variant should have been handled by dispatch_governance_action \
+                 or dispatch_context_governance_action"
+            ),
         }
     }
 
@@ -6558,15 +6700,15 @@ mod tests {
 
         let result = result.unwrap();
         match result {
-            super::GovernanceActionResult::SubscriberBanned(ban_result) => {
-                assert_eq!(ban_result.banned_did, "did:key:sub1");
+            super::GovernanceActionResult::ReadAccessRevoked(revoke_result) => {
+                assert_eq!(revoke_result.did.0, "did:key:sub1");
                 // At least one author should have rotated keys.
                 assert!(
-                    !ban_result.rotated_authors.is_empty(),
-                    "key rotation should occur on ban"
+                    revoke_result.rotated_author_count > 0,
+                    "key rotation should occur on revoke"
                 );
             }
-            other => panic!("expected SubscriberBanned, got {other:?}"),
+            other => panic!("expected ReadAccessRevoked, got {other:?}"),
         }
 
         // Subscriber should no longer be tracked.
@@ -6716,10 +6858,10 @@ mod tests {
         assert!(result.is_ok(), "RestoreReadAccess should succeed");
 
         match result.unwrap() {
-            super::GovernanceActionResult::SubscriberUnbanned { did } => {
-                assert_eq!(did.0, "did:key:sub1");
+            super::GovernanceActionResult::ReadAccessRestored(restore_result) => {
+                assert_eq!(restore_result.did.0, "did:key:sub1");
             }
-            other => panic!("expected SubscriberUnbanned, got {other:?}"),
+            other => panic!("expected ReadAccessRestored, got {other:?}"),
         }
 
         // Verify ReadAccessRestored event was emitted.

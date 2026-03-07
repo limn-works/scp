@@ -468,7 +468,7 @@ impl<S: Storage> ApplicationNode<S> {
     /// governance ban.
     ///
     /// After [`ContextManager::execute_governance_action`] returns
-    /// [`GovernanceActionResult::SubscriberBanned`], call this method with
+    /// [`GovernanceActionResult::ReadAccessRevoked`], call this method with
     /// the `context_id` and the [`GovernanceBanResult`] to ensure the
     /// projection endpoint can decrypt content encrypted under the new
     /// post-rotation keys.
