@@ -240,6 +240,14 @@ impl ContextCryptoProvider for MlsCryptoProvider {
     fn remove_member(&self, context_id: &[u8; 32], member_did: &str) -> Result<(), ContextError> {
         use crate::crypto::mls::group::remove_member as mls_remove_member;
 
+        // Reject self-removal: the local member cannot remove themselves via
+        // this method — they should leave the group instead.
+        if member_did == self.creator_did {
+            return Err(ContextError::CryptoFailed(
+                "cannot remove self from MLS group — use leave instead".to_string(),
+            ));
+        }
+
         let mut groups = self
             .groups
             .lock()
@@ -279,15 +287,28 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         context_id: &[u8; 32],
         member_did: &str,
     ) -> Result<(), ContextError> {
-        // Generate a sender key for the new member and store it.
-        let key = generate_sender_key();
         let ctx_str = Self::context_id_str(context_id);
 
+        // Distribute the local member's actual sender key. Retrieve
+        // the key we generated for ourselves in this context, then
+        // record it under *our* DID so recipients can look it up.
         let mut store = self
             .sender_keys
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        store.set(&ctx_str, member_did, key);
+        let key = store
+            .get(&ctx_str, &self.creator_did)
+            .cloned()
+            .ok_or_else(|| {
+                ContextError::CryptoFailed(
+                    "no sender key for local DID in this context".to_string(),
+                )
+            })?;
+        // In a full transport implementation, the key bytes would be
+        // encrypted to `member_did`'s public key and sent over the wire.
+        // For now, ensure our key is in the store for local operations.
+        store.set(&ctx_str, &self.creator_did, key);
+        let _ = member_did;
         Ok(())
     }
 
@@ -312,6 +333,26 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         _sender_did: &str,
         payload: &[u8],
     ) -> Result<Vec<u8>, ContextError> {
+        // Step 1: Encrypt payload with sender key (AES-256-GCM, ADR-007).
+        let ctx_str = Self::context_id_str(context_id);
+        let sender_encrypted = {
+            let store = self
+                .sender_keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let sender_key =
+                store
+                    .get(&ctx_str, &self.creator_did)
+                    .ok_or_else(|| {
+                        ContextError::CryptoFailed(
+                            "no sender key for local DID in this context".to_string(),
+                        )
+                    })?;
+            crate::crypto::sender_keys::encrypt::encrypt_sender_layer(sender_key, payload)
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?
+        };
+
+        // Step 2: Encrypt via MLS application message (ADR-001).
         let mut groups = self
             .groups
             .lock()
@@ -320,8 +361,8 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             .get_mut(context_id)
             .ok_or_else(|| ContextError::CryptoFailed("no MLS group for context".into()))?;
 
-        let ciphertext =
-            encrypt(group, payload).map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        let ciphertext = encrypt(group, &sender_encrypted)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
         serialize_ciphertext(&ciphertext).map_err(|e| ContextError::CryptoFailed(e.to_string()))
     }
@@ -428,6 +469,8 @@ mod tests {
 
         // Create MLS group for Alice.
         alice.create_mls_group(&ctx_id).unwrap();
+        // Generate Alice's sender key so encrypt_message can use it.
+        alice.generate_sender_key(&ctx_id).unwrap();
 
         // Generate Bob's key package and add him to Alice's group.
         let bob_did = "did:dht:z6MkBobRoundtrip";
@@ -448,7 +491,7 @@ mod tests {
         // Bob joins the group using the Welcome.
         let mut bob_group = join_group(&welcome, bob_provider, bob_signer).unwrap();
 
-        // Alice encrypts a message.
+        // Alice encrypts a message (sender key layer + MLS layer).
         let plaintext = b"hello from Alice";
         let ciphertext = alice
             .encrypt_message(&ctx_id, &alice_did, plaintext)
@@ -457,32 +500,56 @@ mod tests {
         // Verify ciphertext is different from plaintext.
         assert_ne!(ciphertext, plaintext);
 
-        // Bob decrypts the message.
-        let decrypted = decrypt(&mut bob_group, &ciphertext).unwrap();
-        assert_eq!(decrypted, plaintext);
+        // Bob decrypts the MLS layer. The result will be the sender-key-
+        // encrypted payload, not the original plaintext, because Bob
+        // would need Alice's sender key to decrypt the inner layer.
+        let mls_decrypted = decrypt(&mut bob_group, &ciphertext).unwrap();
+        // The MLS-decrypted output should differ from plaintext (it's
+        // still sender-key encrypted).
+        assert_ne!(mls_decrypted.as_slice(), plaintext.as_slice());
+
+        // Decrypt the sender key layer using Alice's sender key.
+        let alice_sender_key = {
+            let store = alice.sender_keys.lock().unwrap();
+            let ctx_str = MlsCryptoProvider::context_id_str(&ctx_id);
+            store.get(&ctx_str, &alice_did).unwrap().clone()
+        };
+        let fully_decrypted =
+            crate::crypto::sender_keys::encrypt::decrypt_sender_layer(
+                &alice_sender_key,
+                &mls_decrypted,
+            )
+            .unwrap();
+        assert_eq!(fully_decrypted, plaintext);
     }
 
     #[test]
     fn distribute_and_remove_member_sender_key() {
         let provider = MlsCryptoProvider::new(test_did());
         let ctx_id = [5u8; 32];
-        let member_did = "did:dht:z6MkMember";
 
+        // Must generate a sender key first so distribute has something
+        // to distribute.
+        provider.generate_sender_key(&ctx_id).unwrap();
+
+        // distribute_sender_key stores our key under the local DID.
+        let member_did = "did:dht:z6MkMember";
         assert!(provider.distribute_sender_key(&ctx_id, member_did).is_ok());
 
         let store = provider.sender_keys.lock().unwrap();
         let ctx_str = MlsCryptoProvider::context_id_str(&ctx_id);
-        assert!(store.get(&ctx_str, member_did).is_some());
+        assert!(store.get(&ctx_str, &provider.creator_did).is_some());
         drop(store);
 
+        // remove_member_sender_key removes by the given DID.
         assert!(
             provider
-                .remove_member_sender_key(&ctx_id, member_did)
+                .remove_member_sender_key(&ctx_id, &provider.creator_did.clone())
                 .is_ok()
         );
 
         let store = provider.sender_keys.lock().unwrap();
-        assert!(store.get(&ctx_str, member_did).is_none());
+        assert!(store.get(&ctx_str, &provider.creator_did).is_none());
     }
 
     #[test]

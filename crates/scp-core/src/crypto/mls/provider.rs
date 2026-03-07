@@ -115,10 +115,9 @@ impl ContextCryptoProvider for MlsCryptoProvider {
     fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
         // Validate that the local DID is a valid did:dht:z... format.
         if !self.local_did.starts_with("did:dht:z") {
-            return Err(ContextCreationError::IdentityValidationFailed(format!(
-                "invalid DID format: {}",
-                self.local_did
-            )));
+            return Err(ContextCreationError::IdentityValidationFailed(
+                "invalid DID format".to_string(),
+            ));
         }
         Ok(())
     }
@@ -146,17 +145,17 @@ impl ContextCryptoProvider for MlsCryptoProvider {
     }
 
     fn generate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        // Sender key is already generated in create_mls_group. This is a no-op
-        // if the group already exists, or generates a standalone key if called
-        // separately.
         let mut contexts = self
             .contexts
             .lock()
             .map_err(|e| ContextCreationError::CryptoFailed(format!("lock poisoned: {e}")))?;
-        if let Some(state) = contexts.get_mut(context_id) {
-            // Already has a sender key from create_mls_group.
-            let _ = state;
-        }
+        let state = contexts.get_mut(context_id).ok_or_else(|| {
+            ContextCreationError::CryptoFailed(
+                "no MLS group for this context — cannot generate sender key".to_string(),
+            )
+        })?;
+        // Rotate the sender key to a fresh random value.
+        state.sender_key = generate_sender_key();
         Ok(())
     }
 
@@ -182,7 +181,30 @@ impl ContextCryptoProvider for MlsCryptoProvider {
     }
 
     fn destroy_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        // Sender key is destroyed when the context state is removed.
+        // Zeroize the sender key in context state (if present).
+        {
+            let mut contexts = self
+                .contexts
+                .lock()
+                .map_err(|e| ContextCreationError::CryptoFailed(format!("lock poisoned: {e}")))?;
+            if let Some(state) = contexts.get_mut(context_id) {
+                // Overwrite with a fresh key then drop — ensures old key
+                // material doesn't linger. The fresh key is immediately
+                // discarded when the context is later destroyed.
+                state.sender_key = generate_sender_key();
+                // Clear all stored member sender keys for this context.
+                let ctx_id_hex = hex::encode(context_id);
+                let member_dids: Vec<String> = state
+                    .sender_key_store
+                    .get_all(&ctx_id_hex)
+                    .keys()
+                    .cloned()
+                    .collect();
+                for did in &member_dids {
+                    state.sender_key_store.remove(&ctx_id_hex, did);
+                }
+            }
+        }
         // Also clean up broadcast keys.
         let mut broadcast_keys = self
             .broadcast_keys
@@ -194,7 +216,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
 
     fn validate_key_package(
         &self,
-        _owner_did: &str,
+        owner_did: &str,
         key_package_bytes: Option<&[u8]>,
     ) -> Result<(), ContextError> {
         let bytes = key_package_bytes.ok_or_else(|| {
@@ -211,7 +233,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         let body = kp_in.extract();
         match body {
             MlsMessageBodyIn::KeyPackage(kp) => {
-                // Validate ciphersuite.
+                // Validate ciphersuite and signature.
                 let provider = super::storage::InMemoryMlsProvider::default();
                 let verified = kp
                     .validate(provider.crypto(), ProtocolVersion::Mls10)
@@ -226,6 +248,30 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                         verified.ciphersuite()
                     )));
                 }
+
+                // Bind credential to owner_did: extract the ScpCredential
+                // from the key package's leaf node and verify the DID matches.
+                let leaf_node = verified.leaf_node();
+                if let Ok(basic_cred) =
+                    BasicCredential::try_from(leaf_node.credential().clone())
+                {
+                    let scp_cred =
+                        ScpCredential::from_bytes(basic_cred.identity()).map_err(|e| {
+                            ContextError::InvalidKeyPackage(format!(
+                                "credential deserialization failed: {e}"
+                            ))
+                        })?;
+                    if scp_cred.did != owner_did {
+                        return Err(ContextError::InvalidKeyPackage(
+                            "key package credential DID does not match owner_did".to_string(),
+                        ));
+                    }
+                } else {
+                    return Err(ContextError::InvalidKeyPackage(
+                        "key package does not contain a BasicCredential".to_string(),
+                    ));
+                }
+
                 Ok(())
             }
             _ => Err(ContextError::InvalidKeyPackage(
@@ -259,6 +305,14 @@ impl ContextCryptoProvider for MlsCryptoProvider {
     }
 
     fn remove_member(&self, context_id: &[u8; 32], member_did: &str) -> Result<(), ContextError> {
+        // Reject self-removal: the local member cannot remove themselves via
+        // this method — they should leave the group instead.
+        if member_did == self.local_did {
+            return Err(ContextError::CryptoFailed(
+                "cannot remove self from MLS group — use leave instead".to_string(),
+            ));
+        }
+
         self.with_context(context_id, |state| {
             // Find the member's leaf index by matching their DID in the
             // SCP credential embedded in each member's MLS leaf node.
@@ -306,12 +360,20 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             .contexts
             .lock()
             .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
-        if let Some(state) = contexts.get_mut(context_id) {
-            // Store the member's sender key in the per-context store.
-            state
-                .sender_key_store
-                .set(&ctx_id_hex, member_did, generate_sender_key());
-        }
+        let state = contexts.get_mut(context_id).ok_or_else(|| {
+            ContextError::CryptoFailed("no MLS group for this context".to_string())
+        })?;
+        // Distribute the local member's actual sender key to the target
+        // member. Store it under *our* DID — the recipient needs to know
+        // which sender key belongs to us so they can decrypt our messages.
+        state
+            .sender_key_store
+            .set(&ctx_id_hex, &self.local_did, state.sender_key.clone());
+        // Acknowledge that the distribution targets `member_did` — in a
+        // full transport implementation, the key bytes would be encrypted
+        // to `member_did`'s public key and sent over the wire. For now,
+        // the store records our key so local encrypt/decrypt can find it.
+        let _ = member_did;
         Ok(())
     }
 
@@ -325,9 +387,10 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             .contexts
             .lock()
             .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
-        if let Some(state) = contexts.get_mut(context_id) {
-            state.sender_key_store.remove(&ctx_id_hex, member_did);
-        }
+        let state = contexts.get_mut(context_id).ok_or_else(|| {
+            ContextError::CryptoFailed("no MLS group for this context".to_string())
+        })?;
+        state.sender_key_store.remove(&ctx_id_hex, member_did);
         Ok(())
     }
 
@@ -752,15 +815,68 @@ mod tests {
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
 
+        // distribute_sender_key stores the local member's sender key under
+        // the local DID (not the target member_did).
         assert!(
             provider
                 .distribute_sender_key(&ctx_id, "did:dht:z6MkBob")
                 .is_ok()
         );
+        // Verify the key is stored under the local DID.
+        {
+            let contexts = provider.contexts.lock().unwrap();
+            let state = contexts.get(&ctx_id).unwrap();
+            let ctx_hex = hex::encode(ctx_id);
+            assert!(state.sender_key_store.get(&ctx_hex, TEST_DID).is_some());
+        }
+
+        // remove_member_sender_key removes by the given DID.
+        assert!(
+            provider
+                .remove_member_sender_key(&ctx_id, TEST_DID)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn distribute_sender_key_errors_without_context() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        // No group created — should error.
+        assert!(
+            provider
+                .distribute_sender_key(&ctx_id, "did:dht:z6MkBob")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn remove_member_sender_key_errors_without_context() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        // No group created — should error.
         assert!(
             provider
                 .remove_member_sender_key(&ctx_id, "did:dht:z6MkBob")
-                .is_ok()
+                .is_err()
         );
+    }
+
+    #[test]
+    fn generate_sender_key_errors_without_context() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        // No group created — should error.
+        assert!(provider.generate_sender_key(&ctx_id).is_err());
+    }
+
+    #[test]
+    fn self_removal_rejected() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+        // Attempting to remove self should fail.
+        let result = provider.remove_member(&ctx_id, TEST_DID);
+        assert!(result.is_err());
     }
 }
