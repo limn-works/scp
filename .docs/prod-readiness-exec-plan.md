@@ -364,8 +364,8 @@ Blocking chain: `#385 → (#386 + #387 + #388 + #389 parallel) → #390` — **A
 
 ### Phase 6: MLS, Encryption & Content Access (depends on Phase 5)
 
-**Step 1:** #333 (MLS integration) — **requires S-H merged**
-**Step 2:** #324 (MLS epoch conflict) — **requires S-G merged**
+**Step 1:** #333 (MLS integration) — **COMPLETE** → 723ec9e
+**Step 2:** #324 (MLS epoch conflict) — **COMPLETE** → d57a7f8
 **Step 3:** #314 (MLS LeafNode extension)
 **Step 4:** #309 (ADR-038 content access control) — unlocks SCP-CAC-*
 **Step 5:** #317 (SDK-mandated state destruction) — **DONE** (closed)
@@ -378,6 +378,8 @@ SCP-CAC-001 → SCP-CAC-002 → SCP-CAC-003 → SCP-CAC-004 → SCP-CAC-005 → 
 Governance PRD (serial — each builds on prior, all touch `manager.rs`):
 SCP-267 → SCP-268 → SCP-269 → SCP-270 → SCP-271 → SCP-272 → SCP-273 → SCP-274
 
+- SCP-267 — **COMPLETE** → bfe5245
+- SCP-268 — **COMPLETE** → 3df2cd7
 - SCP-267–268 need #356 (ContextManager wiring)
 - SCP-269–270 need #320 (GovernanceModel enum expansion + proposal lifecycle — all 24 actions already dispatched per PR #296)
 - SCP-272 needs #354 (conflict detection)
@@ -386,10 +388,10 @@ SCP-267 → SCP-268 → SCP-269 → SCP-270 → SCP-271 → SCP-272 → SCP-273 
 ### Phase 8: Feature Completions (parallel, depends on Phase 5)
 
 **Lane A:** SCP-227 (subscriber registration — in-progress). Note: #335 closed by Phase 5 bridge rewrites.
-**Lane B:** #337, #334 (context features). Note: #336 closed by Phase 5 bridge rewrites.
-**Lane C:** #318, #330 (trust/provenance wiring)
+**Lane B:** #337 — **COMPLETE** → 9180dd5. #334 remaining.
+**Lane C:** #318 — **COMPLETE** → 91317fc. #330 — **COMPLETE** → 032cb41.
 **Lane D:** #316, #323 (identity features — decomposed: #391 file custody → #392+#393+#394 parallel)
-**Lane E:** #302, #305, #342 (node/relay production)
+**Lane E:** #302 — **COMPLETE** → bf53ec5. #305 — **COMPLETE** → 1dc533b. #342 — **COMPLETE** → 254ed89.
 
 ### Phase 9: SDK Bindings (depends on Phase 5)
 
