@@ -1062,8 +1062,10 @@ impl ContextManager {
 
         // Crypto operations -- no lock held, no TOCTOU concern for these
         // provider calls since they are idempotent or externally consistent.
-        self.crypto.validate_key_package(&member_did)?;
-        self.crypto.add_member(&context_id_bytes, &member_did)?;
+        let kp_bytes = key_package.mls_key_package_bytes.as_deref();
+        self.crypto.validate_key_package(&member_did, kp_bytes)?;
+        self.crypto
+            .add_member(&context_id_bytes, &member_did, kp_bytes)?;
         self.crypto
             .distribute_sender_key(&context_id_bytes, &member_did)?;
 
@@ -2435,7 +2437,7 @@ impl ContextManager {
             // Crypto: add to MLS group under lock to prevent partial-failure
             // window (phantom MLS member if state mutation fails).
             self.crypto
-                .add_member(&context_id_bytes, did)
+                .add_member(&context_id_bytes, did, None)
                 .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
             // Add to role state.
@@ -3041,7 +3043,7 @@ impl ContextManager {
             .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
         // Step 2: Re-add to MLS group with fresh key material.
         self.crypto
-            .add_member(&context_id_bytes, did)
+            .add_member(&context_id_bytes, did, None)
             .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
         self.event_log
             .append_context_event(&context_id_bytes, "MemberReset")?;
@@ -3869,14 +3871,23 @@ mod tests {
             Ok(())
         }
 
-        fn validate_key_package(&self, _owner_did: &str) -> Result<(), ContextError> {
+        fn validate_key_package(
+            &self,
+            _owner_did: &str,
+            _key_package_bytes: Option<&[u8]>,
+        ) -> Result<(), ContextError> {
             if self.fail_validate_key_package.load(Ordering::Relaxed) {
                 return Err(ContextError::InvalidKeyPackage("mock invalid".into()));
             }
             Ok(())
         }
 
-        fn add_member(&self, _context_id: &[u8; 32], member_did: &str) -> Result<(), ContextError> {
+        fn add_member(
+            &self,
+            _context_id: &[u8; 32],
+            member_did: &str,
+            _key_package_bytes: Option<&[u8]>,
+        ) -> Result<(), ContextError> {
             self.members_added
                 .lock()
                 .unwrap()
@@ -4162,9 +4173,7 @@ mod tests {
     async fn join_adds_member_to_mls_group_and_issues_ucan_tokens() {
         let (manager, handle) = setup_active_context().await;
 
-        let kp = KeyPackage {
-            owner_did: "did:key:bob".into(),
-        };
+        let kp = KeyPackage::mock("did:key:bob".into());
 
         let result = manager.join_context(&handle, kp).await;
         assert!(result.is_ok());
@@ -4196,9 +4205,7 @@ mod tests {
         // Transition to Closing.
         handle.transition_to(&ContextState::Closing).await.unwrap();
 
-        let kp = KeyPackage {
-            owner_did: "did:key:bob".into(),
-        };
+        let kp = KeyPackage::mock("did:key:bob".into());
 
         let result = manager.join_context(&handle, kp).await;
         assert!(result.is_err());
@@ -4249,9 +4256,7 @@ mod tests {
         let (manager, handle) = setup_active_context().await;
 
         // Add a second member.
-        let kp = KeyPackage {
-            owner_did: "did:key:bob".into(),
-        };
+        let kp = KeyPackage::mock("did:key:bob".into());
         manager.join_context(&handle, kp).await.unwrap();
         assert_eq!(manager.member_count("test-ctx").await, Some(2));
 
@@ -4318,9 +4323,7 @@ mod tests {
             .unwrap();
 
         // Add an observer member.
-        let kp = KeyPackage {
-            owner_did: "did:key:observer".into(),
-        };
+        let kp = KeyPackage::mock("did:key:observer".into());
         manager.join_context(&handle, kp).await.unwrap();
 
         // Reassign to observer role (joined members default to "member").
@@ -4526,9 +4529,7 @@ mod tests {
 
         // Add members.
         for name in &["alice", "bob", "charlie"] {
-            let kp = KeyPackage {
-                owner_did: format!("did:key:{name}").into(),
-            };
+            let kp = KeyPackage::mock(format!("did:key:{name}").into());
             manager.join_context(&handle, kp).await.unwrap();
         }
 
@@ -4560,9 +4561,7 @@ mod tests {
         assert_eq!(role.unwrap().role_name, "admin");
 
         // Add a member.
-        let kp = KeyPackage {
-            owner_did: "did:key:alice".into(),
-        };
+        let kp = KeyPackage::mock("did:key:alice".into());
         manager.join_context(&handle, kp).await.unwrap();
 
         let role = manager.member_role("test-ctx", "did:key:alice").await;
@@ -4609,9 +4608,7 @@ mod tests {
             let mgr = std::sync::Arc::clone(&manager);
             let h = std::sync::Arc::clone(&handle);
             join_handles.push(tokio::spawn(async move {
-                let kp = KeyPackage {
-                    owner_did: format!("did:key:member-{i}").into(),
-                };
+                let kp = KeyPackage::mock(format!("did:key:member-{i}").into());
                 mgr.join_context(&h, kp).await
             }));
         }
@@ -4689,9 +4686,7 @@ mod tests {
         assert_eq!(count, Some(1), "mutex should not be poisoned");
 
         // Further operations should succeed.
-        let kp = KeyPackage {
-            owner_did: "did:key:after-panic".into(),
-        };
+        let kp = KeyPackage::mock("did:key:after-panic".into());
         let join_result = manager.join_context(&handle_clone, kp).await;
         assert!(join_result.is_ok(), "join after panic should succeed");
         assert_eq!(manager.member_count("panic-ctx").await, Some(2));

@@ -534,7 +534,11 @@ mod tests {
             Ok(())
         }
 
-        fn validate_key_package(&self, _owner_did: &str) -> Result<(), ContextError> {
+        fn validate_key_package(
+            &self,
+            _owner_did: &str,
+            _key_package_bytes: Option<&[u8]>,
+        ) -> Result<(), ContextError> {
             Ok(())
         }
 
@@ -542,6 +546,7 @@ mod tests {
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
+            _key_package_bytes: Option<&[u8]>,
         ) -> Result<(), ContextError> {
             Ok(())
         }

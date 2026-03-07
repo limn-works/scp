@@ -46,15 +46,57 @@ use scp_identity::DID;
 // KeyPackage (stub)
 // ---------------------------------------------------------------------------
 
-/// Stub key package for membership operations — see SCP-003 for MLS wiring.
+/// Key package wrapper for membership operations (ADR-001, §9.7).
 ///
-/// Phase 2 placeholder: in production, this wraps the MLS `KeyPackage` type
-/// from ADR-001. The stub carries only the member's DID for testing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Wraps an optional TLS-serialized MLS `KeyPackage` from `OpenMLS` alongside
+/// the member's DID. The `mls_key_package_bytes` field is `None` when using
+/// mock crypto providers in tests; the production `MlsCryptoProvider` requires
+/// real MLS key package bytes.
+///
+/// The MLS key package is stored as TLS-serialized bytes rather than the
+/// `OpenMLS` `KeyPackage` type directly because:
+/// 1. `openmls::prelude::KeyPackage` does not implement `Eq` or `Serialize`.
+/// 2. Byte representation is the canonical wire format for key packages.
+/// 3. Deserialization to `KeyPackageIn` is done lazily by the crypto provider.
+#[derive(Debug, Clone)]
 pub struct KeyPackage {
     /// The DID of the member this key package belongs to.
     pub owner_did: DID,
+    /// TLS-serialized MLS `KeyPackage` bytes, or `None` for mock/test usage.
+    pub mls_key_package_bytes: Option<Vec<u8>>,
 }
+
+impl KeyPackage {
+    /// Creates a new key package with both the owner DID and MLS key package bytes.
+    #[must_use]
+    pub const fn new(owner_did: DID, mls_key_package_bytes: Vec<u8>) -> Self {
+        Self {
+            owner_did,
+            mls_key_package_bytes: Some(mls_key_package_bytes),
+        }
+    }
+
+    /// Creates a key package with only the owner DID (no MLS key package).
+    ///
+    /// Used by mock crypto providers in tests where real MLS key packages
+    /// are not needed.
+    #[must_use]
+    pub const fn mock(owner_did: DID) -> Self {
+        Self {
+            owner_did,
+            mls_key_package_bytes: None,
+        }
+    }
+}
+
+impl PartialEq for KeyPackage {
+    fn eq(&self, other: &Self) -> bool {
+        self.owner_did == other.owner_did
+            && self.mls_key_package_bytes == other.mls_key_package_bytes
+    }
+}
+
+impl Eq for KeyPackage {}
 
 // ---------------------------------------------------------------------------
 // MemberInfo
