@@ -941,7 +941,7 @@ impl ContextProvider for FfiBridgeProvider {
 
             // Serialize the event for ProtocolStore persistence.
             let event_bytes = rmp_serde::to_vec(&event).map_err(|e| {
-                ScpPyError::ContextError(format!("event serialization failed: {e}"))
+                ScpPyError::context(format!("event serialization failed: {e}"))
             })?;
 
             scp_event_log::tree::append_unsigned_event(&mut rt.event_log, &event)
