@@ -1350,7 +1350,7 @@ impl Drop for Identity {
 /// Generated as `class ContextHandle` in both Swift and Kotlin.
 ///
 /// See ADR-008 (Context Lifecycle) and ADR-013 §3 (bridge pattern).
-#[derive(Debug, uniffi::Object)]
+#[derive(uniffi::Object)]
 pub struct ContextHandle {
     /// Unique identifier for this context.
     pub(crate) context_id: String,
@@ -1376,8 +1376,29 @@ pub struct ContextHandle {
     pub(crate) signing_key: Option<KeyHandle>,
     /// Capability ceiling strings for UCAN mint-time enforcement (#339).
     pub(crate) ceiling_strings: Vec<String>,
+    /// Tool registry for this context.
+    pub(crate) tool_registry: tokio::sync::Mutex<scp_core::context::tools::ToolRegistry>,
+    /// Registered tool handlers keyed by tool ID.
+    pub(crate) tool_handlers: tokio::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<
+                dyn Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync,
+            >,
+        >,
+    >,
     /// Session store for stateful tool sessions (spec section 6.2.1).
     pub(crate) session_store: tokio::sync::Mutex<scp_core::context::tools::SessionStore>,
+}
+
+impl std::fmt::Debug for ContextHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContextHandle")
+            .field("context_id", &self.context_id)
+            .field("creator_did", &self.creator_did)
+            .field("ceiling_strings", &self.ceiling_strings)
+            .finish_non_exhaustive()
+    }
 }
 
 #[uniffi::export]
@@ -1905,6 +1926,10 @@ pub async fn context_create(
                 callback_custody,
                 signing_key,
                 ceiling_strings: params.ceiling.clone(),
+                tool_registry: tokio::sync::Mutex::new(
+                    scp_core::context::tools::ToolRegistry::new(),
+                ),
+                tool_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
                 session_store: tokio::sync::Mutex::new(
                     scp_core::context::tools::SessionStore::new(),
                 ),
@@ -2298,9 +2323,69 @@ pub async fn tool_register(
             }
             drop(state);
 
-            let tool_id = format!("tool-{}", Uuid::new_v4());
-            let _ = definition;
-            Ok(tool_id)
+            let input_schema: serde_json::Value =
+                serde_json::from_str(&definition.input_schema_json)
+                    .unwrap_or_else(|_| serde_json::json!({"type": "object"}));
+            let output_schema: serde_json::Value =
+                serde_json::from_str(&definition.output_schema_json)
+                    .unwrap_or_else(|_| serde_json::json!({"type": "object"}));
+
+            let test_vectors: Vec<scp_core::context::tools::TestVector> = definition
+                .test_vectors_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok())
+                .unwrap_or_default();
+
+            let implementation_hash: [u8; 32] = definition
+                .implementation_hash
+                .as_deref()
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                .unwrap_or([0u8; 32]);
+
+            let tool_id = format!("tool-{}", definition.name.replace(' ', "-").to_lowercase());
+
+            let core_registration = scp_core::context::tools::ToolRegistration {
+                tool_id: tool_id.clone(),
+                name: definition.name,
+                description: definition.description,
+                schema: scp_core::context::tools::ToolSchema {
+                    input_schema,
+                    output_schema,
+                },
+                implementation_hash,
+                test_vectors,
+                operator_did: definition.operator_did.into(),
+                economic_metadata: None,
+                registered_at: 0,
+                signature: Vec::new(),
+            };
+
+            // Build a role state for capability checking.
+            let ceiling = scp_core::context::roles::default_ceiling();
+            let role_state = scp_core::context::roles::ContextRoleState::new(
+                &handle.context_id,
+                &handle.creator_did,
+                ceiling,
+                vec![],
+            )
+            .map_err(|e| ScpError::Tool {
+                message: format!("failed to create role state: {e}"),
+                code: "SCP-TOOL-6003".to_owned(),
+            })?;
+
+            let mut registry = handle.tool_registry.lock().await;
+            let (registered_id, _event) = scp_core::context::tools::register_tool(
+                &mut registry,
+                &role_state,
+                core_registration,
+                &handle.creator_did,
+            )
+            .map_err(|e| ScpError::Tool {
+                message: format!("tool registration failed: {e}"),
+                code: "SCP-TOOL-6001".to_owned(),
+            })?;
+
+            Ok(registered_id)
         })
         .await
         .map_err(|e| ScpError::Tool {
@@ -2348,8 +2433,59 @@ pub async fn tool_invoke(
             }
             drop(state);
 
-            let _ = (tool_id, input_json, identity);
-            Ok("{}".to_owned())
+            let registry = handle.tool_registry.lock().await;
+            let registration = registry.get(&tool_id).ok_or_else(|| ScpError::Tool {
+                message: format!(
+                    "tool '{tool_id}' not found in context '{}'",
+                    handle.context_id
+                ),
+                code: "SCP-TOOL-6002".to_owned(),
+            })?;
+
+            let input_value: serde_json::Value =
+                serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
+            scp_core::context::tools::validate_value_against_schema(
+                &input_value,
+                &registration.schema.input_schema,
+            )
+            .map_err(|e| ScpError::Tool {
+                message: format!("input validation failed for tool '{tool_id}': {e}"),
+                code: "SCP-TOOL-6002".to_owned(),
+            })?;
+
+            let output_schema = registration.schema.output_schema.clone();
+            drop(registry);
+
+            let handlers = handle.tool_handlers.lock().await;
+            let output = if let Some(handler) = handlers.get(&tool_id) {
+                let handler = handler.clone();
+                drop(handlers);
+                let out = handler(input_value.clone()).map_err(|e| ScpError::Tool {
+                    message: format!("tool handler for '{tool_id}' failed: {e}"),
+                    code: "SCP-TOOL-6002".to_owned(),
+                })?;
+                scp_core::context::tools::validate_value_against_schema(&out, &output_schema)
+                    .map_err(|msg| ScpError::Tool {
+                        message: format!("output validation failed for tool '{tool_id}': {msg}"),
+                        code: "SCP-TOOL-6002".to_owned(),
+                    })?;
+                out
+            } else {
+                drop(handlers);
+                serde_json::json!({
+                    "tool": tool_id,
+                    "context": handle.context_id,
+                    "status": "validated",
+                    "input_valid": true,
+                    "invoker_did": identity.did,
+                    "validated_input": input_value,
+                })
+            };
+
+            serde_json::to_string(&output).map_err(|e| ScpError::Tool {
+                message: format!("failed to serialize tool output: {e}"),
+                code: "SCP-TOOL-6006".to_owned(),
+            })
         })
         .await
         .map_err(|e| ScpError::Tool {
@@ -2473,16 +2609,56 @@ pub async fn tool_invoke_cross_context(
                 });
             }
 
-            let output = serde_json::json!({
-                "tool": tool_id,
-                "source_context": source_handle.context_id,
-                "target_context": target_handle.context_id,
-                "status": "validated",
-                "chain_depth": chain_depth,
-                "invoker_did": identity.did,
-                "validated_input": serde_json::from_str::<serde_json::Value>(&input_json)
-                    .unwrap_or(serde_json::Value::Null),
-            });
+            let input_value: serde_json::Value =
+                serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
+
+            let registry = target_handle.tool_registry.lock().await;
+            let registration = registry.get(&tool_id).ok_or_else(|| ScpError::Tool {
+                message: format!(
+                    "tool '{tool_id}' not found in target context '{}'",
+                    target_handle.context_id
+                ),
+                code: "SCP-TOOL-6002".to_owned(),
+            })?;
+
+            scp_core::context::tools::validate_value_against_schema(
+                &input_value,
+                &registration.schema.input_schema,
+            )
+            .map_err(|e| ScpError::Tool {
+                message: format!("input validation failed: {e}"),
+                code: "SCP-TOOL-6002".to_owned(),
+            })?;
+
+            let output_schema = registration.schema.output_schema.clone();
+            drop(registry);
+
+            let handlers = target_handle.tool_handlers.lock().await;
+            let output = if let Some(handler) = handlers.get(&tool_id) {
+                let handler = handler.clone();
+                drop(handlers);
+                let out = handler(input_value.clone()).map_err(|e| ScpError::Tool {
+                    message: format!("cross-context tool handler for '{tool_id}' failed: {e}"),
+                    code: "SCP-TOOL-6002".to_owned(),
+                })?;
+                scp_core::context::tools::validate_value_against_schema(&out, &output_schema)
+                    .map_err(|msg| ScpError::Tool {
+                        message: format!("output validation failed for tool '{tool_id}': {msg}"),
+                        code: "SCP-TOOL-6002".to_owned(),
+                    })?;
+                out
+            } else {
+                drop(handlers);
+                serde_json::json!({
+                    "tool": tool_id,
+                    "source_context": source_handle.context_id,
+                    "target_context": target_handle.context_id,
+                    "status": "validated",
+                    "chain_depth": chain_depth,
+                    "invoker_did": identity.did,
+                    "validated_input": input_value,
+                })
+            };
 
             serde_json::to_string(&output).map_err(|e| ScpError::Tool {
                 message: format!("failed to serialize cross-context output: {e}"),
@@ -2621,22 +2797,56 @@ pub async fn tool_session_invoke(
             }
 
             let tool_id = session.tool_id.clone();
+            let current_state = session.state.clone();
             let call_count = session.call_count;
+            drop(store);
 
-            // Increment call count.
+            let input_value: serde_json::Value =
+                serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
+
+            // Validate input against tool's input schema if tool is registered.
+            let registry = handle.tool_registry.lock().await;
+            if let Some(registration) = registry.get(&tool_id) {
+                scp_core::context::tools::validate_value_against_schema(
+                    &input_value,
+                    &registration.schema.input_schema,
+                )
+                .map_err(|e| ScpError::Tool {
+                    message: format!("input validation failed: {e}"),
+                    code: "SCP-TOOL-6002".to_owned(),
+                })?;
+            }
+            drop(registry);
+
+            // Execute via handler or echo mode.
+            let handlers = handle.tool_handlers.lock().await;
+            let (new_state, output) = if let Some(handler) = handlers.get(&tool_id) {
+                let handler = handler.clone();
+                drop(handlers);
+                let out = handler(input_value.clone()).map_err(|e| ScpError::Tool {
+                    message: format!("tool handler for '{tool_id}' failed: {e}"),
+                    code: "SCP-TOOL-6002".to_owned(),
+                })?;
+                (current_state, out)
+            } else {
+                drop(handlers);
+                let out = serde_json::json!({
+                    "tool": tool_id,
+                    "session_id": session_id,
+                    "status": "validated",
+                    "call_count": call_count + 1,
+                    "invoker_did": identity.did,
+                    "validated_input": input_value,
+                });
+                (current_state, out)
+            };
+
+            // Update session state and increment call count.
+            let mut store = handle.session_store.lock().await;
             if let Some(session) = store.get_mut(&session_id) {
+                session.state = new_state;
                 session.call_count = session.call_count.saturating_add(1);
             }
-
-            let output = serde_json::json!({
-                "tool": tool_id,
-                "session_id": session_id,
-                "status": "validated",
-                "call_count": call_count + 1,
-                "invoker_did": identity.did,
-                "validated_input": serde_json::from_str::<serde_json::Value>(&input_json)
-                    .unwrap_or(serde_json::Value::Null),
-            });
 
             serde_json::to_string(&output).map_err(|e| ScpError::Tool {
                 message: format!("failed to serialize session invoke output: {e}"),

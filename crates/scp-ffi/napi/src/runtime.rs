@@ -18,7 +18,7 @@
 //!
 //! See issue #388 and `.docs/adrs/phase-4.md` (ADR-022).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
@@ -27,14 +27,20 @@ use scp_core::context::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
 };
 use scp_core::context::manager::{ContextManager, ContextPersistence, ContextSnapshot};
+use scp_core::context::roles::{ContextRoleState, default_ceiling};
+use scp_core::context::tools::{SessionStore, ToolRegistry};
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
-use scp_core::context::tools::{SessionStore, ToolRegistry};
 use scp_event_log::EventLog;
 use scp_identity::cache::SystemClock;
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
+
+/// A tool handler is a closure that takes validated JSON input and returns
+/// JSON output or an error string. Registered via [`register_tool_handler`].
+pub type ToolHandler =
+    Arc<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // Global ContextManager instance
@@ -113,8 +119,16 @@ pub struct UcanContextState {
     pub creator_did: String,
     /// Event log (Merkle tree) for this context.
     pub event_log: EventLog,
+    /// Role state for capability checking (tool registration, invocation).
+    pub role_state: ContextRoleState,
     /// Tool registry for this context (cross-context + session support).
     pub tool_registry: ToolRegistry,
+    /// Registered tool handlers keyed by tool ID.
+    ///
+    /// When a tool is invoked, the handler is looked up here and called with
+    /// the validated JSON input. If no handler is registered, the invocation
+    /// falls back to echoing the validated input (echo mode).
+    pub tool_handlers: HashMap<String, ToolHandler>,
     /// Session store for stateful tool sessions (spec section 6.2.1).
     pub session_store: SessionStore,
 }
@@ -160,13 +174,31 @@ pub fn ensure_registered(handle: &NapiContextHandle) -> Result<(), ScpNapiError>
     let revocation_list = RevocationList::new(context_id.clone());
     let nonce_tracker = NonceTracker::new(context_id.clone(), SystemClock);
 
+    // No custom roles and default ceiling cannot fail validation.
+    let role_state = match ContextRoleState::new(
+        context_id.clone(),
+        creator_did.clone(),
+        default_ceiling(),
+        Vec::new(),
+    ) {
+        Ok(rs) => rs,
+        Err(e) => {
+            return Err(ScpNapiError::Context {
+                message: format!("failed to create role state: {e}"),
+                code: "SCP-CTX-2023".to_owned(),
+            });
+        }
+    };
+
     let state = UcanContextState {
         revocation_list,
         nonce_tracker,
         ceiling_strings,
         creator_did,
         event_log,
+        role_state,
         tool_registry: ToolRegistry::new(),
+        tool_handlers: HashMap::new(),
         session_store: SessionStore::new(),
     };
 
@@ -205,6 +237,35 @@ pub fn remove_context(context_id: &str) {
     ucan_registry().remove(context_id);
 }
 
+/// Registers a tool handler for a tool in a context.
+///
+/// The handler will be called when the tool is invoked. The tool must already
+/// be registered in the context's tool registry.
+///
+/// # Errors
+///
+/// Returns `ScpNapiError::Context` if the context is not found or the tool
+/// is not registered.
+pub fn register_tool_handler(
+    context_id: &str,
+    tool_id: &str,
+    handler: ToolHandler,
+) -> Result<(), ScpNapiError> {
+    with_context(context_id, |st| {
+        if st.tool_registry.get(tool_id).is_none() {
+            return Err(ScpNapiError::Context {
+                message: format!(
+                    "tool '{tool_id}' not found in context '{context_id}' \
+                     -- register the tool before adding a handler"
+                ),
+                code: "SCP-CTX-2023".to_owned(),
+            });
+        }
+        st.tool_handlers.insert(tool_id.to_owned(), handler);
+        Ok(())
+    })
+}
+
 /// Queries event counts for trust scoring within a context.
 ///
 /// Returns `(message_count, governance_count)` derived from the context's
@@ -223,6 +284,7 @@ pub fn query_trust_event_counts(context_id: &str, _did: &str) -> (u64, u64) {
 
 /// Registers a test context in the UCAN state registry.
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 pub fn register_test_context(context_id: &str, creator_did: &str) {
     let map = ucan_registry();
 
@@ -232,13 +294,19 @@ pub fn register_test_context(context_id: &str, creator_did: &str) {
         .map(std::string::ToString::to_string)
         .collect::<HashSet<String>>();
 
+    // Default ceiling + no custom roles: infallible in practice.
+    let role_state = ContextRoleState::new(context_id, creator_did, default_ceiling(), Vec::new())
+        .expect("ContextRoleState::new with default ceiling and no custom roles cannot fail");
+
     let state = UcanContextState {
         event_log: EventLog::new(context_id.to_owned()),
         revocation_list: RevocationList::new(context_id.to_owned()),
         nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
         ceiling_strings,
         creator_did: creator_did.to_owned(),
+        role_state,
         tool_registry: ToolRegistry::new(),
+        tool_handlers: HashMap::new(),
         session_store: SessionStore::new(),
     };
 

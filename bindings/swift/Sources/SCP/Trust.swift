@@ -95,8 +95,11 @@ public nonisolated struct TrustEvaluation: Sendable {
         self.notRevoked = true
         self.behavioralRecord = BehavioralRecord(
             contextsParticipated: Int(input.participationCount),
+            // TrustInput provides participation count and consequence count only.
+            // Duration, tool invocations, and role transitions require event log
+            // queries not exposed in the current UniFFI bridge.
             totalDurationSecs: 0,
-            governanceActionsAgainst: 0,
+            governanceActionsAgainst: Int(input.triggeredConsequences),
             toolInvocations: 0,
             roleTransitions: 0
         )
@@ -116,6 +119,9 @@ public nonisolated struct TrustEvaluation: Sendable {
         self.withinCeiling = true
         self.notRevoked = true
         self.behavioralRecord = BehavioralRecord(
+            // TrustScoreResult provides message_count and governance_count only.
+            // Context participation count requires cross-context event log queries
+            // not exposed in the current UniFFI bridge.
             contextsParticipated: 0,
             totalDurationSecs: 0,
             governanceActionsAgainst: Int(score.governanceCount),

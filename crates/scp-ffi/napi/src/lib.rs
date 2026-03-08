@@ -70,6 +70,7 @@ pub mod context;
 pub mod error;
 pub mod event_log;
 pub mod identity;
+pub mod mcp;
 pub mod provenance;
 pub mod runtime;
 pub mod tools;
