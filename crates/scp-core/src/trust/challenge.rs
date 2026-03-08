@@ -331,28 +331,43 @@ fn canonical_challenge_response_bytes(response: &ChallengeResponse) -> Vec<u8> {
 ///
 /// The canonical form is: `"SCP-CHALLENGE-VERIFY-V1:" || verification_id
 /// || verifier_did || subject_did || capability_uri || challenge_type
-/// || passed || test_count || pass_count || verified_at || expires_at`.
+/// || passed || score || test_count || pass_count || verified_at
+/// || expires_at || context_id`.
 /// The domain separator prevents cross-protocol signature confusion.
+/// All fields including `score` and `context_id` are bound into the
+/// signature to prevent post-signing modification.
 fn canonical_challenge_verification_bytes(verification: &ChallengeVerification) -> Vec<u8> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash_bytes};
 
     let type_tag = challenge_type_tag(&verification.challenge_type);
 
-    canonical_hash_bytes(
-        DOMAIN_CHALLENGE_VERIFY_V1,
-        &[
-            CanonicalField::VarBytes(verification.verification_id.as_bytes()),
-            CanonicalField::VarBytes(verification.verifier_did.as_bytes()),
-            CanonicalField::VarBytes(verification.subject_did.as_bytes()),
-            CanonicalField::VarBytes(verification.capability_uri.as_bytes()),
-            CanonicalField::VarBytes(type_tag.as_bytes()),
-            CanonicalField::U8(u8::from(verification.passed)),
-            CanonicalField::U32(verification.test_count),
-            CanonicalField::U32(verification.pass_count),
-            CanonicalField::U64(verification.verified_at),
-            CanonicalField::U64(verification.expires_at),
-        ],
-    )
+    let mut fields: Vec<CanonicalField<'_>> = vec![
+        CanonicalField::VarBytes(verification.verification_id.as_bytes()),
+        CanonicalField::VarBytes(verification.verifier_did.as_bytes()),
+        CanonicalField::VarBytes(verification.subject_did.as_bytes()),
+        CanonicalField::VarBytes(verification.capability_uri.as_bytes()),
+        CanonicalField::VarBytes(type_tag.as_bytes()),
+        CanonicalField::U8(u8::from(verification.passed)),
+    ];
+
+    // Score: present as U32, absent as sentinel.
+    match verification.score {
+        Some(s) => fields.push(CanonicalField::U32(s)),
+        None => fields.push(CanonicalField::Absent),
+    }
+
+    fields.push(CanonicalField::U32(verification.test_count));
+    fields.push(CanonicalField::U32(verification.pass_count));
+    fields.push(CanonicalField::U64(verification.verified_at));
+    fields.push(CanonicalField::U64(verification.expires_at));
+
+    // Context ID: present as VarBytes, absent as sentinel.
+    match &verification.context_id {
+        Some(ctx) => fields.push(CanonicalField::VarBytes(ctx.as_bytes())),
+        None => fields.push(CanonicalField::Absent),
+    }
+
+    canonical_hash_bytes(DOMAIN_CHALLENGE_VERIFY_V1, &fields)
 }
 
 /// Returns a deterministic string tag for a challenge type.

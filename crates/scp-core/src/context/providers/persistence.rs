@@ -185,6 +185,7 @@ mod tests {
             economic_policy: None,
             approved_proposals: std::collections::HashMap::new(),
             governance_freeze: None,
+            pending_ceiling_modification: None,
         }
     }
 

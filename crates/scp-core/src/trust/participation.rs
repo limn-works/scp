@@ -409,10 +409,17 @@ impl ParticipationProfile {
     /// with a 4-byte big-endian length.
     #[must_use]
     pub fn signable_bytes(&self) -> Vec<u8> {
+        /// Domain separator for participation profile signing (prevents
+        /// cross-protocol signature confusion).
+        const DOMAIN: &[u8] = b"SCP-PARTICIPATION-PROFILE-V1:";
+
         let did_bytes = self.subject_did.as_bytes();
-        // 4 (len) + did_bytes + 7*8 (u64s) + 8 (updated_at) + 32 (root) + 32 (pubkey)
-        let capacity = 4 + did_bytes.len() + 8 * 8 + 32 + 32;
+        // domain + 4 (len) + did_bytes + 7*8 (u64s) + 8 (updated_at) + 32 (root) + 32 (pubkey)
+        let capacity = DOMAIN.len() + 4 + did_bytes.len() + 8 * 8 + 32 + 32;
         let mut buf = Vec::with_capacity(capacity);
+
+        // Domain separator.
+        buf.extend_from_slice(DOMAIN);
 
         // Length-prefixed DID.
         #[allow(clippy::cast_possible_truncation)]
@@ -478,17 +485,14 @@ pub fn derive_participation_signing_key(
     use sha2::Sha256;
 
     let hk = Hkdf::<Sha256>::new(Some(context_id.as_bytes()), context_seed);
-    let mut okm = [0u8; 32];
-    hk.expand(PARTICIPATION_KEY_DOMAIN, &mut okm)
+    let mut okm = zeroize::Zeroizing::new([0u8; 32]);
+    hk.expand(PARTICIPATION_KEY_DOMAIN, okm.as_mut())
         .map_err(|e| TrustError::InvalidEventData {
             sequence: 0,
             reason: format!("HKDF expansion failed for participation key: {e}"),
         })?;
 
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&okm);
-
-    // Zeroize the intermediate key material.
-    okm.fill(0);
 
     Ok(signing_key)
 }

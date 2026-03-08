@@ -74,9 +74,10 @@ pub fn derive_private_state_routing_id(identity_key_material: &[u8], did_string:
     let mut routing_id = [0u8; 32];
     // HKDF-Expand cannot fail when output length <= 255 * HashLen (= 8160 for SHA-256).
     // 32 <= 8160, so this is infallible by construction.
-    if hk.expand(&info, &mut routing_id).is_err() {
-        routing_id.fill(0);
-    }
+    assert!(
+        hk.expand(&info, &mut routing_id).is_ok(),
+        "HKDF-Expand with 32-byte output is infallible"
+    );
 
     routing_id
 }

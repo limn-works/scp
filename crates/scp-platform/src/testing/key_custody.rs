@@ -183,11 +183,10 @@ fn derive_pseudonym_secret(signing_key: &SigningKey) -> Zeroizing<[u8; 32]> {
     let hk = Hkdf::<Sha256>::new(Some(PSEUDONYM_SECRET_SALT), signing_key.as_bytes());
     let mut secret = Zeroizing::new([0u8; 32]);
     // HKDF-Expand with 32-byte output cannot fail (32 <= 255 * HashLen).
-    // 32 <= 255 * 32, so this is infallible by construction.
-    if hk.expand(b"", secret.as_mut()).is_err() {
-        // Unreachable: HKDF-Expand only fails when output length > 255 * HashLen.
-        secret.fill(0);
-    }
+    assert!(
+        hk.expand(b"", secret.as_mut()).is_ok(),
+        "HKDF-Expand with 32-byte output is infallible"
+    );
     secret
 }
 

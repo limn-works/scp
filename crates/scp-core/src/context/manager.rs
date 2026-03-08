@@ -59,6 +59,44 @@ const MAX_TOOL_INTERFACES: usize = 256;
 /// Maximum number of governance threshold signers per context.
 const MAX_THRESHOLD_SIGNERS: usize = 64;
 
+/// Default ceiling change notification period in seconds (M7, §5.3).
+///
+/// When a governed context's ceiling is modified, the change is pending
+/// for this duration before taking effect. Members joined under the previous
+/// ceiling are notified and may leave before the expansion applies.
+const CEILING_CHANGE_NOTIFICATION_PERIOD_SECS: u64 = 86400; // 24 hours
+
+// ---------------------------------------------------------------------------
+// PendingCeilingModification (M7)
+// ---------------------------------------------------------------------------
+
+/// A pending ceiling modification awaiting notification period expiry (M7, §5.3).
+///
+/// When a `ModifyCeiling` governance action is approved, the new ceiling
+/// is not applied immediately. Instead, it enters a notification period
+/// during which members may leave before the expansion takes effect.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingCeilingModification {
+    /// The capabilities in the proposed new ceiling.
+    pub new_capabilities: Vec<Capability>,
+    /// Unix timestamp (seconds) when the notification period started.
+    pub notified_at: u64,
+    /// Unix timestamp (seconds) when the notification period expires and
+    /// the new ceiling can be applied.
+    pub effective_at: u64,
+    /// The governance proposal ID that approved this modification.
+    pub proposal_id: ProposalId,
+}
+
+impl PendingCeilingModification {
+    /// Returns `true` if the notification period has expired and the
+    /// modification can be applied.
+    #[must_use]
+    pub const fn is_effective(&self, current_timestamp: u64) -> bool {
+        current_timestamp >= self.effective_at
+    }
+}
+
 // GovernanceActionResult
 // ---------------------------------------------------------------------------
 
@@ -288,6 +326,16 @@ pub struct ContextSnapshot {
     /// Contains the conflicting proposal IDs and freeze start timestamp.
     #[serde(default)]
     pub governance_freeze: Option<(ProposalId, ProposalId, u64)>,
+    /// Pending ceiling modification (M7, §5.3 notification period).
+    ///
+    /// When a `ModifyCeiling` governance action is approved, the new ceiling
+    /// is stored here with the notification timestamp. Members are notified
+    /// and may leave before the ceiling expansion takes effect. The pending
+    /// ceiling is applied after the notification period expires.
+    ///
+    /// Format: `(new_ceiling_capabilities, notification_timestamp, proposal_id)`.
+    #[serde(default)]
+    pub pending_ceiling_modification: Option<PendingCeilingModification>,
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +485,8 @@ struct PerContextState {
     /// Governance timeout task (SCP-271, ADR-031 §5).
     #[allow(dead_code)]
     governance_timeout_task: GovernanceTimeoutTask,
+    /// Pending ceiling modification awaiting notification period (M7, §5.3).
+    pending_ceiling_modification: Option<PendingCeilingModification>,
 }
 
 /// Creates a governance engine from a [`GovernanceModel`] selector and
@@ -961,6 +1011,7 @@ impl ContextManager {
             economic_policy: ctx.economic_policy.clone(),
             approved_proposals: ctx.approved_proposals.clone(),
             governance_freeze: ctx.governance_freeze,
+            pending_ceiling_modification: ctx.pending_ceiling_modification.clone(),
         }
     }
 
@@ -1060,6 +1111,7 @@ impl ContextManager {
             governance_engine,
             economic_policy: ctx_snapshot.economic_policy,
             governance_timeout_task: GovernanceTimeoutTask::new(),
+            pending_ceiling_modification: ctx_snapshot.pending_ceiling_modification,
         };
 
         {
@@ -1281,6 +1333,7 @@ impl ContextManager {
             governance_engine,
             economic_policy: params.economic_policy.clone(),
             governance_timeout_task: GovernanceTimeoutTask::new(),
+            pending_ceiling_modification: None,
         };
 
         // Atomic duplicate check + insert under lock -- no .await inside this scope.
@@ -1452,6 +1505,7 @@ impl ContextManager {
             governance_engine,
             economic_policy: params.economic_policy.clone(),
             governance_timeout_task: GovernanceTimeoutTask::new(),
+            pending_ceiling_modification: None,
         };
 
         // Atomic duplicate check + insert under lock.
@@ -3607,7 +3661,7 @@ impl ContextManager {
         &self,
         context_id: &str,
         new_ceiling: &[Capability],
-        _proposal_id: ProposalId,
+        proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -3627,16 +3681,79 @@ impl ContextManager {
                 ));
             }
 
-            // Replace the ceiling in role_state (the mutable copy).
-            ctx.role_state.ceiling = CapabilityCeiling::new(new_ceiling.iter().cloned());
+            // Check for existing pending modification.
+            if ctx.pending_ceiling_modification.is_some() {
+                return Err(ContextError::PermissionDenied(
+                    "a ceiling modification is already pending notification period".to_owned(),
+                ));
+            }
+
+            // M7: Instead of applying immediately, enter notification period.
+            // Members are notified and may leave before the expansion takes effect.
+            let now = crate::time::now_secs().map_err(|e| {
+                ContextError::PermissionDenied(format!("clock error: {e}"))
+            })?;
+            ctx.pending_ceiling_modification = Some(PendingCeilingModification {
+                new_capabilities: new_ceiling.to_vec(),
+                notified_at: now,
+                effective_at: now + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS,
+                proposal_id,
+            });
 
             Self::snapshot_context(ctx)
         };
 
         self.persist_context_snapshot(context_id, &snapshot);
         self.event_log
-            .append_context_event(&context_id_bytes, "CeilingModified")?;
+            .append_context_event(&context_id_bytes, "CeilingModificationPending")?;
         Ok(())
+    }
+
+    /// Applies a pending ceiling modification after the notification period.
+    ///
+    /// Called periodically or on demand to check if the notification period
+    /// has expired and apply the pending ceiling change (M7, §5.3).
+    ///
+    /// Returns `true` if a pending modification was applied, `false` if there
+    /// was no pending modification or the notification period has not yet expired.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ContextError` if the context is not found or is not active.
+    pub async fn apply_pending_ceiling_modification(
+        &self,
+        context_id: &str,
+        current_timestamp: u64,
+    ) -> Result<bool, ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let (applied, snapshot) = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            let pending = match &ctx.pending_ceiling_modification {
+                Some(p) if p.is_effective(current_timestamp) => p.clone(),
+                _ => return Ok(false),
+            };
+
+            // Apply the pending ceiling.
+            ctx.role_state.ceiling =
+                CapabilityCeiling::new(pending.new_capabilities.iter().cloned());
+            ctx.pending_ceiling_modification = None;
+
+            (true, Self::snapshot_context(ctx))
+        };
+
+        if applied {
+            self.persist_context_snapshot(context_id, &snapshot);
+            self.event_log
+                .append_context_event(&context_id_bytes, "CeilingModified")?;
+        }
+
+        Ok(applied)
     }
 
     async fn execute_close_context(
@@ -8626,6 +8743,7 @@ mod tests {
             economic_policy: None,
             approved_proposals: HashMap::new(),
             governance_freeze: None,
+            pending_ceiling_modification: None,
         };
 
         let bc_snapshot = test_broadcast_snapshot("persist-ctx-2");
@@ -8722,6 +8840,7 @@ mod tests {
             economic_policy: None,
             approved_proposals: HashMap::new(),
             governance_freeze: None,
+            pending_ceiling_modification: None,
         };
 
         persistence
@@ -8806,6 +8925,7 @@ mod tests {
             economic_policy: None,
             approved_proposals: HashMap::new(),
             governance_freeze: None,
+            pending_ceiling_modification: None,
         };
 
         persistence.persist_context("ttl-ctx", &snapshot).unwrap();
@@ -8869,6 +8989,7 @@ mod tests {
                 economic_policy: None,
                 approved_proposals: HashMap::new(),
                 governance_freeze: None,
+                pending_ceiling_modification: None,
             };
             persistence.persist_context(ctx_name, &snapshot).unwrap();
         }
@@ -8931,6 +9052,7 @@ mod tests {
             economic_policy: None,
             approved_proposals: HashMap::new(),
             governance_freeze: None,
+            pending_ceiling_modification: None,
         };
 
         let bc_snapshot = test_broadcast_snapshot("dup-ctx");
@@ -9923,6 +10045,7 @@ mod tests {
             economic_policy: None,
             approved_proposals: HashMap::new(),
             governance_freeze: None,
+            pending_ceiling_modification: None,
         };
 
         let json = serde_json::to_string(&snapshot).expect("serialize");

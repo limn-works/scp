@@ -713,6 +713,48 @@ pub fn verify_checkpointed_proof(proof: &CheckpointedProof) -> bool {
     verify_pruned_inclusion(&proof.pruned_proof)
 }
 
+/// Verifies the Ed25519 signature on a consistency checkpoint (M17).
+///
+/// Recomputes the canonical hash from the checkpoint fields (same computation
+/// used during creation in [`generate_checkpoint_at`]) and verifies the
+/// signature against the provided public key. The public key should be the
+/// signing key of the checkpoint's `sender_did`.
+///
+/// # Errors
+///
+/// Returns `Err` with a human-readable reason if:
+/// - The signature is not 64 bytes.
+/// - The Ed25519 signature does not verify against the public key.
+pub fn verify_checkpoint_signature(
+    checkpoint: &ConsistencyCheckpoint,
+    signer_public_key: &ed25519_dalek::VerifyingKey,
+) -> Result<(), String> {
+    let sig_bytes: [u8; 64] = checkpoint
+        .signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            format!(
+                "checkpoint signature must be 64 bytes, got {}",
+                checkpoint.signature.len()
+            )
+        })?;
+
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    let canonical = compute_checkpoint_canonical_hash(
+        &checkpoint.context_id,
+        &checkpoint.sender_did,
+        checkpoint.event_count,
+        &checkpoint.merkle_root,
+        checkpoint.epoch,
+        checkpoint.timestamp,
+    );
+
+    signer_public_key
+        .verify_strict(&canonical, &signature)
+        .map_err(|e| format!("Ed25519 verification failed: {e}"))
+}
+
 /// Verifies consistency between two checkpoints.
 ///
 /// Two checkpoints are consistent if they cover the same context and the

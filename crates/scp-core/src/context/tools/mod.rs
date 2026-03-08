@@ -283,6 +283,17 @@ pub enum ToolError {
         min_fields: usize,
     },
 
+    /// Tool registration signature verification failed (M15).
+    ///
+    /// The `signature` field on a [`ToolRegistration`] is a Ed25519 signature
+    /// over the canonical registration bytes. If the signature is non-empty,
+    /// it MUST verify against the registrant's signing key.
+    #[error("tool registration signature verification failed: {reason}")]
+    SignatureVerificationFailed {
+        /// Human-readable description of the failure.
+        reason: String,
+    },
+
     /// The system clock is unavailable or before the Unix epoch.
     #[error("clock error: {0}")]
     ClockError(#[from] crate::time::ClockError),

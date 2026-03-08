@@ -332,6 +332,7 @@ impl RoleDefinition {
         ceiling: &CapabilityCeiling,
     ) -> Result<Self, RoleError> {
         let name = name.into();
+        validate_role_name(&name)?;
         for cap in &capabilities {
             if !ceiling.contains(cap) {
                 return Err(RoleError::CapabilityOutsideCeiling {
@@ -564,6 +565,11 @@ pub enum RoleError {
     #[error("member \"{0}\" is not in the context")]
     MemberNotInContext(String),
 
+    /// A custom role name is invalid (empty, too long, uses reserved name,
+    /// or contains invalid characters).
+    #[error("invalid role name: {0}")]
+    InvalidRoleName(String),
+
     /// A context lifecycle error occurred during role assignment.
     #[error("context error: {0}")]
     Context(#[from] ContextError),
@@ -638,8 +644,9 @@ impl ContextRoleState {
         let context_id = context_id.into();
         let creator_did = creator_did.into();
 
-        // Validate custom roles against ceiling.
+        // Validate custom roles: name format + capabilities against ceiling.
         for role in &custom_roles {
+            validate_role_name(&role.name)?;
             for cap in &role.capabilities {
                 if !ceiling.contains(cap) {
                     return Err(RoleError::CapabilityOutsideCeiling {
@@ -812,6 +819,90 @@ pub fn assign_role(
         .insert(member_did.to_owned(), role_def.capabilities);
 
     Ok(tokens)
+}
+
+// ---------------------------------------------------------------------------
+// Role name validation (M3)
+// ---------------------------------------------------------------------------
+
+/// Maximum length of a custom role name in bytes.
+///
+/// Role names are stored in `ContextSnapshot` and serialized into event log
+/// entries. 64 bytes is generous for any practical role name while preventing
+/// unbounded growth.
+pub const MAX_ROLE_NAME_LENGTH: usize = 64;
+
+/// Built-in role names that custom roles MUST NOT shadow.
+///
+/// These are the protocol-defined role names from §5.5 and §5.14. Custom
+/// roles using these names would collide with built-in role constructors,
+/// causing ambiguous role resolution.
+const RESERVED_ROLE_NAMES: &[&str] = &[
+    "admin",
+    "moderator",
+    "member",
+    "observer",
+    "author",
+    "subscriber",
+];
+
+/// Validates a custom role name.
+///
+/// Role names MUST:
+/// - Be non-empty.
+/// - Not exceed [`MAX_ROLE_NAME_LENGTH`] bytes.
+/// - Not collide with reserved built-in role names.
+/// - Contain only lowercase ASCII letters, digits, hyphens, and underscores
+///   (`[a-z0-9_-]`), and not start or end with a hyphen or underscore.
+///
+/// # Errors
+///
+/// Returns [`RoleError::InvalidRoleName`] on validation failure.
+pub fn validate_role_name(name: &str) -> Result<(), RoleError> {
+    if name.is_empty() {
+        return Err(RoleError::InvalidRoleName(
+            "role name must not be empty".into(),
+        ));
+    }
+
+    if name.len() > MAX_ROLE_NAME_LENGTH {
+        return Err(RoleError::InvalidRoleName(format!(
+            "role name exceeds maximum length of {MAX_ROLE_NAME_LENGTH} bytes (got {} bytes)",
+            name.len()
+        )));
+    }
+
+    if RESERVED_ROLE_NAMES.contains(&name) {
+        return Err(RoleError::InvalidRoleName(format!(
+            "'{name}' is a reserved built-in role name"
+        )));
+    }
+
+    // Format: lowercase ASCII letters, digits, hyphens, underscores.
+    // Must not start or end with hyphen/underscore.
+    let first = name.as_bytes()[0];
+    if first == b'-' || first == b'_' {
+        return Err(RoleError::InvalidRoleName(format!(
+            "'{name}' must not start with a hyphen or underscore"
+        )));
+    }
+
+    let last = name.as_bytes()[name.len() - 1];
+    if last == b'-' || last == b'_' {
+        return Err(RoleError::InvalidRoleName(format!(
+            "'{name}' must not end with a hyphen or underscore"
+        )));
+    }
+
+    for ch in name.chars() {
+        if !matches!(ch, 'a'..='z' | '0'..='9' | '-' | '_') {
+            return Err(RoleError::InvalidRoleName(format!(
+                "'{name}' contains invalid character '{ch}' (only lowercase ASCII letters, digits, hyphens, and underscores allowed)"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1321,7 +1412,7 @@ mod tests {
     fn context_role_state_new_with_custom_role() {
         let ceiling = test_ceiling();
         let custom = RoleDefinition::new(
-            "moderator",
+            "content-mod",
             HashSet::from([
                 Capability::MessagesRead,
                 Capability::MessagesWrite,
@@ -1333,8 +1424,8 @@ mod tests {
 
         let state =
             ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![custom]).unwrap();
-        assert!(state.role_definitions.contains_key("moderator"));
-        let mod_role = state.role_definitions.get("moderator").unwrap();
+        assert!(state.role_definitions.contains_key("content-mod"));
+        let mod_role = state.role_definitions.get("content-mod").unwrap();
         assert_eq!(mod_role.capabilities.len(), 3);
     }
 
@@ -1518,7 +1609,7 @@ mod tests {
     fn assign_role_custom_role() {
         let ceiling = test_ceiling();
         let custom = RoleDefinition::new(
-            "moderator",
+            "content-mod",
             HashSet::from([
                 Capability::MessagesRead,
                 Capability::MessagesWrite,
@@ -1534,7 +1625,7 @@ mod tests {
         state.members.insert("did:dht:alice".to_owned());
 
         let tokens =
-            assign_role(&mut state, "did:dht:alice", "moderator", "did:dht:creator").unwrap();
+            assign_role(&mut state, "did:dht:alice", "content-mod", "did:dht:creator").unwrap();
         assert_eq!(tokens.len(), 3);
         assert!(state.member_has_capability("did:dht:alice", &Capability::MemberRemove));
     }
@@ -1728,7 +1819,7 @@ mod tests {
     fn context_role_state_msgpack_roundtrip() {
         let ceiling = test_ceiling();
         let custom = RoleDefinition::new(
-            "moderator",
+            "content-mod",
             HashSet::from([
                 Capability::MessagesRead,
                 Capability::MessagesWrite,
@@ -1743,7 +1834,7 @@ mod tests {
 
         // Add a second member with a non-admin role.
         state.members.insert("did:dht:alice".to_owned());
-        assign_role(&mut state, "did:dht:alice", "moderator", "did:dht:creator").unwrap();
+        assign_role(&mut state, "did:dht:alice", "content-mod", "did:dht:creator").unwrap();
 
         // Serialize to MessagePack.
         let bytes = rmp_serde::to_vec(&state).expect("ContextRoleState serialization failed");
@@ -1754,5 +1845,100 @@ mod tests {
             rmp_serde::from_slice(&bytes).expect("ContextRoleState deserialization failed");
 
         assert_eq!(state, decoded);
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_role_name (M3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_role_name_accepts_valid_names() {
+        assert!(validate_role_name("custom-role").is_ok());
+        assert!(validate_role_name("my-role-1").is_ok());
+        assert!(validate_role_name("role123").is_ok());
+        assert!(validate_role_name("a").is_ok());
+        assert!(validate_role_name("role_with_underscores").is_ok());
+    }
+
+    #[test]
+    fn validate_role_name_rejects_empty() {
+        let err = validate_role_name("").unwrap_err();
+        assert!(matches!(err, RoleError::InvalidRoleName(_)));
+    }
+
+    #[test]
+    fn validate_role_name_rejects_too_long() {
+        let long_name = "a".repeat(MAX_ROLE_NAME_LENGTH + 1);
+        let err = validate_role_name(&long_name).unwrap_err();
+        assert!(
+            matches!(&err, RoleError::InvalidRoleName(msg) if msg.contains("maximum length")),
+            "expected max length error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_role_name_rejects_reserved_names() {
+        for name in &[
+            "admin",
+            "moderator",
+            "member",
+            "observer",
+            "author",
+            "subscriber",
+        ] {
+            let err = validate_role_name(name).unwrap_err();
+            assert!(
+                matches!(&err, RoleError::InvalidRoleName(msg) if msg.contains("reserved")),
+                "expected reserved name error for '{name}', got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_role_name_rejects_uppercase() {
+        let err = validate_role_name("Admin").unwrap_err();
+        assert!(matches!(err, RoleError::InvalidRoleName(_)));
+    }
+
+    #[test]
+    fn validate_role_name_rejects_leading_hyphen() {
+        let err = validate_role_name("-leading").unwrap_err();
+        assert!(matches!(err, RoleError::InvalidRoleName(_)));
+    }
+
+    #[test]
+    fn validate_role_name_rejects_trailing_underscore() {
+        let err = validate_role_name("trailing_").unwrap_err();
+        assert!(matches!(err, RoleError::InvalidRoleName(_)));
+    }
+
+    #[test]
+    fn validate_role_name_rejects_spaces() {
+        let err = validate_role_name("has space").unwrap_err();
+        assert!(matches!(err, RoleError::InvalidRoleName(_)));
+    }
+
+    #[test]
+    fn role_definition_new_validates_name() {
+        let ceiling = test_ceiling();
+        let caps = HashSet::from([Capability::MessagesRead]);
+        let err = RoleDefinition::new("admin", caps, &ceiling).unwrap_err();
+        assert!(
+            matches!(&err, RoleError::InvalidRoleName(msg) if msg.contains("reserved")),
+            "expected reserved name error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn context_role_state_rejects_reserved_custom_role() {
+        let ceiling = test_ceiling();
+        let custom =
+            RoleDefinition::new_unchecked("member", HashSet::from([Capability::MessagesRead]));
+        let err =
+            ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![custom]).unwrap_err();
+        assert!(
+            matches!(&err, RoleError::InvalidRoleName(msg) if msg.contains("reserved")),
+            "expected reserved name error, got: {err}"
+        );
     }
 }

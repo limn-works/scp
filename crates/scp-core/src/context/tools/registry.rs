@@ -479,6 +479,127 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Tool registration signature verification (M15)
+// ---------------------------------------------------------------------------
+
+/// Computes the canonical bytes for tool registration signature verification.
+///
+/// The signed payload is the MessagePack encoding of a canonical struct
+/// containing all `ToolRegistration` fields except `signature` itself,
+/// in a deterministic order. This ensures independent verification that
+/// the registration was created by the claimed registrant.
+///
+/// The canonical representation includes:
+/// - `tool_id`, `name`, `description`
+/// - `input_schema`, `output_schema` (JSON bytes)
+/// - `implementation_hash` (32 bytes)
+/// - `test_vectors` (count + hashes)
+/// - `operator_did`
+/// - `registered_at` (timestamp)
+/// - `economic_metadata` (if present)
+#[must_use]
+pub fn compute_tool_registration_canonical_bytes(registration: &ToolRegistration) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"SCP-TOOL-REGISTRATION-V1:");
+    // Length-prefix helper for variable-length fields.
+    #[allow(clippy::cast_possible_truncation)]
+    let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
+        hasher.update((bytes.len() as u32).to_be_bytes());
+        hasher.update(bytes);
+    };
+
+    length_prefix(&mut hasher, registration.tool_id.as_bytes());
+    length_prefix(&mut hasher, registration.name.as_bytes());
+    length_prefix(&mut hasher, registration.description.as_bytes());
+
+    // Schema as canonical JSON bytes.
+    let input_json = serde_json::to_vec(&registration.schema.input_schema).unwrap_or_default();
+    length_prefix(&mut hasher, &input_json);
+    let output_json = serde_json::to_vec(&registration.schema.output_schema).unwrap_or_default();
+    length_prefix(&mut hasher, &output_json);
+
+    hasher.update(registration.implementation_hash);
+
+    // Test vectors: count + hash of each vector's canonical form.
+    #[allow(clippy::cast_possible_truncation)]
+    hasher.update((registration.test_vectors.len() as u32).to_be_bytes());
+    for tv in &registration.test_vectors {
+        let input_bytes = serde_json::to_vec(&tv.input).unwrap_or_default();
+        length_prefix(&mut hasher, &input_bytes);
+        let output_bytes = serde_json::to_vec(&tv.expected_output).unwrap_or_default();
+        length_prefix(&mut hasher, &output_bytes);
+        length_prefix(&mut hasher, tv.description.as_bytes());
+    }
+
+    length_prefix(&mut hasher, registration.operator_did.as_bytes());
+    hasher.update(registration.registered_at.to_be_bytes());
+
+    // Economic metadata presence flag + contents.
+    match &registration.economic_metadata {
+        Some(em) => {
+            hasher.update([0x01]);
+            hasher.update(em.cost_per_invoke.to_be_bytes());
+            match &em.cost_formula {
+                Some(formula) => {
+                    hasher.update([0x01]);
+                    length_prefix(&mut hasher, formula.as_bytes());
+                }
+                None => hasher.update([0x00]),
+            }
+            length_prefix(&mut hasher, em.payee.as_bytes());
+        }
+        None => hasher.update([0x00]),
+    }
+
+    hasher.finalize().to_vec()
+}
+
+/// Verifies the Ed25519 signature on a tool registration.
+///
+/// If the `signature` field is empty (backward compatibility with pre-signature
+/// registrations), verification is skipped. If non-empty, it MUST be a valid
+/// 64-byte Ed25519 signature over the canonical registration bytes, verifiable
+/// against the provided `registrant_public_key`.
+///
+/// # Errors
+///
+/// Returns [`ToolError::SignatureVerificationFailed`] if:
+/// - The signature is non-empty but not 64 bytes.
+/// - The signature does not verify against the public key.
+pub fn verify_tool_registration_signature(
+    registration: &ToolRegistration,
+    registrant_public_key: &ed25519_dalek::VerifyingKey,
+) -> Result<(), ToolError> {
+    // Empty signature = backward-compatible registration without provenance.
+    if registration.signature.is_empty() {
+        return Ok(());
+    }
+
+    let sig_bytes: [u8; 64] =
+        registration
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| ToolError::SignatureVerificationFailed {
+                reason: format!(
+                    "signature must be 64 bytes, got {}",
+                    registration.signature.len()
+                ),
+            })?;
+
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    let canonical = compute_tool_registration_canonical_bytes(registration);
+
+    registrant_public_key
+        .verify_strict(&canonical, &signature)
+        .map_err(|e| ToolError::SignatureVerificationFailed {
+            reason: format!("Ed25519 verification failed: {e}"),
+        })
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
