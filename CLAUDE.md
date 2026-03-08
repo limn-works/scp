@@ -136,11 +136,20 @@ Default review agents: @"black-hat (agent)", @"red-hat (agent)", @"white-hat (ag
 
 **Take every finding seriously.** Only dismiss things that are categorically, objectively false or truly non-issues. Even slight suggestions — defense in depth, cleanup, clarity, incorrect comments, spec gaps, learnings — if there's any merit to them at all, whether in literal content or in spirit, take them seriously and use them to improve the code. Don't dismiss things because they seem out of scope, are nits, or appear generally not actionable. Only dismiss things that are absolutely not actionable because they are wrong.
 
+## Scope discipline
+
+**When asked to verify, audit, or review "everything," enumerate the full scope FIRST:**
+1. `ls` the repo root. Every top-level directory is in scope unless explicitly excluded.
+2. List what you're going to check BEFORE you start checking it. Show the list. If a directory exists and you're not planning to check it, that's a gap — flag it or justify the exclusion.
+3. The system has layers. Rust core (`crates/`) is one layer. FFI bridges (`crates/scp-ffi/`) are another. Language SDK wrappers (`bindings/`) are a third. Tests, specs, and CI are more. Never audit one layer and call it complete.
+4. When comparing coverage across implementations (bridges, SDKs, platforms), build a MATRIX first — all operations × all targets. Fill every cell. Empty cells are findings.
+5. "Done" means done at every layer. A Rust function without an FFI export is half-done. An FFI export without a language wrapper is half-done. A wrapper without tests is half-done.
+
 ## Project Map
 
 ```
 .claude/             # Operating instructions and tools
-├── agents/          # 21 agent definitions (see agents/README.md)
+├── agents/          # Agent definitions (see agents/README.md)
 ├── agent-memory/    # Per-agent persistent memory
 └── skills/          # /-commands
 
@@ -153,4 +162,26 @@ Default review agents: @"black-hat (agent)", @"red-hat (agent)", @"white-hat (ag
 ├── scaffold/        # Per-language SDK build blueprints
 ├── specs/           # Product specs — what to build
 └── standards/       # Coding and workflow standards. NON-NEGOTIABLE
+
+crates/              # Rust workspace — the protocol core
+├── scp-core/        # Protocol logic (context, crypto, governance, trust, sync, etc.)
+├── scp-ffi/         # FFI bridges — 4 targets, one codebase
+│   ├── src/         #   PyO3 (Python) — the REFERENCE bridge (100% coverage target)
+│   ├── uniffi/      #   UniFFI (Swift, Kotlin)
+│   ├── napi/        #   napi-rs (Node.js/Bun → TypeScript)
+│   └── wasm/        #   wasm-bindgen (browser TypeScript) — constrained per ADR-034
+├── scp-identity/    # DID, DHT, document, key management
+├── scp-transport/   # Relay, adapters, blob storage
+├── scp-node/        # Application node binary (relay + HTTP + identity)
+├── scp-platform/    # Platform abstractions (KeyCustody, Storage, DeviceAttestation)
+├── scp-media/       # Media key derivation, signaling
+├── scp-event-log/   # Merkle event log
+├── scp-testing/     # Conformance macros, E2E tests, test adapters
+└── scp-relay/       # Standalone relay binary
+
+bindings/            # Language SDK wrappers — the developer-facing API
+├── python/          # scp_sdk package (wraps PyO3 bridge)
+├── typescript/      # @scp/sdk package (wraps NAPI bridge + WASM fallback)
+├── swift/           # SCP Swift package (wraps UniFFI bridge)
+└── kotlin/          # scp-sdk-kotlin (wraps UniFFI bridge) — Android extensions
 ```
