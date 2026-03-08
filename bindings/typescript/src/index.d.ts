@@ -248,6 +248,13 @@ export declare class McpServer {
   stop(): Promise<void>;
 }
 
+export declare function connectMcp(config: McpClientConfig): Promise<McpClient>;
+
+export declare function connectMcpStdio(
+  command: string,
+  args?: readonly string[],
+): Promise<McpClient>;
+
 export declare class McpClient {
   static connect(url: string): Promise<McpClient>;
   listTools(): Promise<ToolDefinition[]>;
