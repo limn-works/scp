@@ -1729,12 +1729,14 @@ fn py_broadcast_unsubscribe(
 
 /// Publishes a message to a broadcast context.
 ///
-/// The payload is encrypted with the author's broadcast key.
+/// The payload is encrypted with the author's broadcast key. The author's
+/// identity must have been previously created via `py_identity_create` so
+/// that the key custody provider and signing key handle are available.
 ///
 /// # Errors
 ///
 /// Returns `RuntimeError` if the context is not active, not broadcast,
-/// or the sender is not an author.
+/// the sender is not an author, or the identity is not registered.
 #[pyfunction]
 #[pyo3(signature = (handle, author_did, payload))]
 fn py_broadcast_publish(
@@ -1748,19 +1750,29 @@ fn py_broadcast_publish(
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let mgr = mgr.clone();
     let context_id = handle.context_id.clone();
-    let did: scp_identity::DID = author_did.to_owned().into();
+    let author_did_owned = author_did.to_owned();
 
-    rt.block_on(async move {
-        mgr.publish_broadcast(
-            &context_id,
-            &did,
-            &payload,
-            &ed25519_dalek::SigningKey::from_bytes(&[0u8; 32]),
-        )
-        .await
-        .map_err(|e| PyRuntimeError::new_err(format!("broadcast publish failed: {e}")))?;
-        Ok(())
+    crate::runtime::with_identity(&author_did_owned, |entry| {
+        let custody = entry.custody.clone();
+        let signing_key_handle = entry.identity.active_signing_key;
+        let did: scp_identity::DID = author_did_owned.clone().into();
+
+        rt.block_on(async move {
+            mgr.publish_broadcast(
+                &context_id,
+                &did,
+                &payload,
+                custody.as_ref(),
+                &signing_key_handle,
+            )
+            .await
+            .map_err(|e| {
+                crate::error::ScpPyError::context(format!("broadcast publish failed: {e}"))
+            })?;
+            Ok(())
+        })
     })
+    .map_err(|e: crate::error::ScpPyError| -> PyErr { e.into() })
 }
 
 /// Blocks a subscriber's read access in a broadcast context.

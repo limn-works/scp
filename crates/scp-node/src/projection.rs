@@ -1129,21 +1129,36 @@ async fn projection_rate_limit_middleware(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use ed25519_dalek::Signer;
     use scp_core::crypto::sender_keys::{
-        SealBroadcastParams, generate_broadcast_key, rotate_broadcast_key, seal_broadcast,
+        SealBroadcastParams, SigningPayloadFields, build_broadcast_signing_payload,
+        compute_provenance_hash, generate_broadcast_key, generate_broadcast_nonce,
+        rotate_broadcast_key, seal_broadcast,
     };
 
     /// Seals a broadcast envelope with test defaults for projection tests.
     fn test_seal(key: &BroadcastKey, payload: &[u8]) -> BroadcastEnvelope {
         let sk = ed25519_dalek::SigningKey::from_bytes(&[0xAA; 32]);
+        let nonce = generate_broadcast_nonce();
+        let provenance_hash = compute_provenance_hash(None).unwrap();
+        let signature = sk.sign(&build_broadcast_signing_payload(&SigningPayloadFields {
+            version: scp_core::envelope::SCP_PROTOCOL_VERSION,
+            context_id: "test-ctx",
+            author_did: &key.author_did(),
+            sequence: 1,
+            key_epoch: key.epoch(),
+            timestamp: 1_700_000_000_000,
+            nonce: &nonce,
+            provenance_hash: &provenance_hash,
+        }));
         let params = SealBroadcastParams {
             context_id: "test-ctx",
             sequence: 1,
             timestamp: 1_700_000_000_000,
             provenance: None,
-            signing_key: &sk,
+            signature,
         };
-        seal_broadcast(key, payload, &params).unwrap()
+        seal_broadcast(key, payload, &nonce, &params).unwrap()
     }
 
     // -----------------------------------------------------------------------

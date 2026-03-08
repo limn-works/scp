@@ -38,7 +38,6 @@
 
 use aes_gcm::aead::Payload;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
-use ed25519_dalek::Signer;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -337,8 +336,12 @@ pub struct SealBroadcastParams<'a> {
     pub timestamp: u64,
     /// Optional provenance metadata (§7.7.1).
     pub provenance: Option<crate::provenance::DataProvenance>,
-    /// The author's Ed25519 signing key for the envelope signature.
-    pub signing_key: &'a ed25519_dalek::SigningKey,
+    /// Pre-computed Ed25519 signature over the canonical signing payload.
+    ///
+    /// Callers must compute this externally via [`build_broadcast_signing_payload`]
+    /// and their key custody provider. This design keeps `seal_broadcast`
+    /// synchronous while allowing async custody-based signing in the caller.
+    pub signature: ed25519_dalek::Signature,
 }
 
 /// Computes `SHA-256(serialize(provenance))` if present, or `SHA-256(0x00)` if
@@ -347,7 +350,16 @@ pub struct SealBroadcastParams<'a> {
 /// This mirrors [`compute_provenance_hash`](crate::envelope::inner) and uses
 /// the same serialization format (`MessagePack` via `rmp_serde::to_vec`) to ensure
 /// cross-envelope consistency.
-fn compute_provenance_hash(
+///
+/// Public so callers can compute the provenance hash externally for use in
+/// [`SigningPayloadFields::provenance_hash`] when constructing the signing
+/// payload via [`build_broadcast_signing_payload`].
+///
+/// # Errors
+///
+/// Returns [`SenderKeyError::EncryptionFailed`] if provenance serialization
+/// fails.
+pub fn compute_provenance_hash(
     provenance: Option<&crate::provenance::DataProvenance>,
 ) -> Result<[u8; 32], SenderKeyError> {
     use sha2::{Digest, Sha256};
@@ -364,15 +376,27 @@ fn compute_provenance_hash(
 
 /// Fields for constructing the canonical signing payload of a
 /// `BroadcastEnvelope`. Avoids exceeding clippy's argument limit.
-struct SigningPayloadFields<'a> {
-    version: u16,
-    context_id: &'a str,
-    author_did: &'a str,
-    sequence: u64,
-    key_epoch: u64,
-    timestamp: u64,
-    nonce: &'a [u8; 12],
-    provenance_hash: &'a [u8; 32],
+///
+/// Public so callers can compute the signing payload externally and sign
+/// it via their key custody provider before passing the signature to
+/// [`seal_broadcast`] via [`SealBroadcastParams::signature`].
+pub struct SigningPayloadFields<'a> {
+    /// Protocol version (§13.2.2). SCP/1.0 = `0x0100`.
+    pub version: u16,
+    /// The context ID for this broadcast message.
+    pub context_id: &'a str,
+    /// The DID of the author who is signing.
+    pub author_did: &'a str,
+    /// Per-author monotonic sequence number.
+    pub sequence: u64,
+    /// Broadcast key epoch.
+    pub key_epoch: u64,
+    /// Unix timestamp in milliseconds.
+    pub timestamp: u64,
+    /// AES-256-GCM nonce (12 bytes).
+    pub nonce: &'a [u8; 12],
+    /// SHA-256 hash of the provenance metadata (or `SHA-256(0x00)` if absent).
+    pub provenance_hash: &'a [u8; 32],
 }
 
 /// Constructs the canonical signing payload for a `BroadcastEnvelope`.
@@ -394,7 +418,11 @@ struct SigningPayloadFields<'a> {
 /// `content_hash` is intentionally omitted per ADR-038 (confirmation oracle).
 ///
 /// Used by both [`seal_broadcast`] (sign) and [`open_broadcast`] (verify).
-fn build_signing_payload(fields: &SigningPayloadFields<'_>) -> [u8; 32] {
+///
+/// Public so callers can compute the payload, sign it via key custody, and
+/// pass the resulting signature to [`SealBroadcastParams`].
+#[must_use]
+pub fn build_broadcast_signing_payload(fields: &SigningPayloadFields<'_>) -> [u8; 32] {
     use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
     canonical_hash(
@@ -425,33 +453,46 @@ fn build_signing_payload(fields: &SigningPayloadFields<'_>) -> [u8; 32] {
 /// preventing attribution forgery and context/sequence confusion. See issue
 /// #228, #396.
 ///
-/// The envelope is signed with the author's Ed25519 key over the canonical
-/// concatenation of metadata fields. The signature is verified BEFORE
-/// decryption in [`open_broadcast`] to reject forgeries early (issue #352).
+/// The `params.signature` field must be a pre-computed Ed25519 signature
+/// over the canonical signing payload (see [`build_broadcast_signing_payload`]).
+/// The signature is verified BEFORE decryption in [`open_broadcast`] to reject
+/// forgeries early (issue #352).
+///
+/// # Signing workflow
+///
+/// Because `seal_broadcast` is synchronous but key custody signing is async,
+/// callers must:
+/// 1. Generate a 12-byte nonce via [`generate_broadcast_nonce`].
+/// 2. Compute the provenance hash via [`compute_provenance_hash`].
+/// 3. Build the signing payload via [`build_broadcast_signing_payload`].
+/// 4. Sign the payload via their async key custody provider.
+/// 5. Pass the nonce and signature to `seal_broadcast` via `SealBroadcastParams`.
+///
+/// For convenience, callers who hold an `ed25519_dalek::SigningKey` directly
+/// (e.g., tests) can sign the payload inline.
 ///
 /// # Arguments
 ///
 /// * `key` — The author's current broadcast key.
 /// * `payload` — The plaintext content to encrypt.
-/// * `params` — Metadata and signing key for the expanded envelope fields.
+/// * `nonce_bytes` — A random 12-byte AES-256-GCM nonce (from [`generate_broadcast_nonce`]).
+/// * `params` — Metadata and pre-computed signature for the expanded envelope fields.
 ///
 /// # Errors
 ///
 /// - [`SenderKeyError::EncryptionFailed`] if AES-256-GCM fails.
-/// - [`SenderKeyError::SigningFailed`] if Ed25519 signing fails.
 ///
 /// [`encrypt_sender_layer`]: super::encrypt::encrypt_sender_layer
 pub fn seal_broadcast(
     key: &BroadcastKey,
     payload: &[u8],
+    nonce_bytes: &[u8; NONCE_SIZE],
     params: &SealBroadcastParams<'_>,
 ) -> Result<BroadcastEnvelope, SenderKeyError> {
     let cipher = Aes256Gcm::new_from_slice(key.key.as_bytes())
         .map_err(|e| SenderKeyError::EncryptionFailed(e.to_string()))?;
 
-    let mut nonce_bytes = [0u8; NONCE_SIZE];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::from_slice(nonce_bytes);
 
     let aad = build_broadcast_aad(
         params.context_id,
@@ -469,29 +510,6 @@ pub fn seal_broadcast(
         )
         .map_err(|e| SenderKeyError::EncryptionFailed(e.to_string()))?;
 
-    // Compute provenance hash for signature commitment.
-    let provenance_hash = compute_provenance_hash(params.provenance.as_ref())?;
-
-    // Sign over canonical field concatenation (§5.14.5).
-    // Field order: version, context_id, author_did, sequence, key_epoch,
-    // timestamp, nonce, provenance_hash.
-    // The nonce MUST be included to prevent content substitution attacks
-    // by broadcast key holders who could re-encrypt under a fresh nonce.
-    let signing_payload = build_signing_payload(&SigningPayloadFields {
-        version: crate::envelope::SCP_PROTOCOL_VERSION,
-        context_id: params.context_id,
-        author_did: &key.author_did,
-        sequence: params.sequence,
-        key_epoch: key.epoch,
-        timestamp: params.timestamp,
-        nonce: &nonce_bytes,
-        provenance_hash: &provenance_hash,
-    });
-    let signature = params
-        .signing_key
-        .try_sign(&signing_payload)
-        .map_err(|e| SenderKeyError::SigningFailed(e.to_string()))?;
-
     Ok(BroadcastEnvelope {
         version: crate::envelope::SCP_PROTOCOL_VERSION,
         context_id: params.context_id.to_owned(),
@@ -500,10 +518,22 @@ pub fn seal_broadcast(
         timestamp: params.timestamp,
         key_epoch: key.epoch,
         provenance: params.provenance.clone(),
-        signature: signature.to_bytes(),
-        nonce: nonce_bytes,
+        signature: params.signature.to_bytes(),
+        nonce: *nonce_bytes,
         encrypted_content,
     })
+}
+
+/// Generates a random 12-byte AES-256-GCM nonce for use with [`seal_broadcast`].
+///
+/// Uses the platform's cryptographically secure RNG. The nonce is included
+/// in the signing payload (via [`build_broadcast_signing_payload`]) to bind
+/// the signature to the specific ciphertext operation.
+#[must_use]
+pub fn generate_broadcast_nonce() -> [u8; NONCE_SIZE] {
+    let mut nonce_bytes = [0u8; NONCE_SIZE];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    nonce_bytes
 }
 
 /// Internal: decrypts a `BroadcastEnvelope` without signature verification.
@@ -578,7 +608,7 @@ pub fn open_broadcast(
     // the version field causes verification to fail (§13.2.2).
     let provenance_hash = compute_provenance_hash(envelope.provenance.as_ref())
         .map_err(|e| SenderKeyError::VerificationFailed(format!("provenance hash failed: {e}")))?;
-    let signing_payload = build_signing_payload(&SigningPayloadFields {
+    let signing_payload = build_broadcast_signing_payload(&SigningPayloadFields {
         version: envelope.version,
         context_id: &envelope.context_id,
         author_did: &envelope.author_did,
@@ -724,6 +754,7 @@ impl BroadcastReplayDetector {
 )]
 mod tests {
     use super::*;
+    use ed25519_dalek::Signer;
     use proptest::prelude::*;
 
     /// Test signing key (deterministic for reproducible tests).
@@ -731,17 +762,42 @@ mod tests {
         ed25519_dalek::SigningKey::from_bytes(&[0xAA; 32])
     }
 
+    /// Computes a signature over the broadcast signing payload using a test
+    /// signing key. This is the test equivalent of calling `KeyCustody::sign`.
+    fn test_sign_with_fields(
+        sk: &ed25519_dalek::SigningKey,
+        fields: &SigningPayloadFields<'_>,
+    ) -> ed25519_dalek::Signature {
+        let payload = build_broadcast_signing_payload(fields);
+        sk.sign(&payload)
+    }
+
     /// Seals a broadcast envelope with test defaults.
     fn test_seal(key: &BroadcastKey, payload: &[u8]) -> BroadcastEnvelope {
         let sk = test_signing_key();
+        let nonce = generate_broadcast_nonce();
+        let provenance_hash = compute_provenance_hash(None).unwrap();
+        let signature = test_sign_with_fields(
+            &sk,
+            &SigningPayloadFields {
+                version: crate::envelope::SCP_PROTOCOL_VERSION,
+                context_id: "test-ctx",
+                author_did: &key.author_did,
+                sequence: 1,
+                key_epoch: key.epoch,
+                timestamp: 1_700_000_000_000,
+                nonce: &nonce,
+                provenance_hash: &provenance_hash,
+            },
+        );
         let params = SealBroadcastParams {
             context_id: "test-ctx",
             sequence: 1,
             timestamp: 1_700_000_000_000,
             provenance: None,
-            signing_key: &sk,
+            signature,
         };
-        seal_broadcast(key, payload, &params).unwrap()
+        seal_broadcast(key, payload, &nonce, &params).unwrap()
     }
 
     /// Opens a broadcast envelope using the trusted (no signature check) path.
@@ -991,14 +1047,29 @@ mod tests {
         let (key1, _advance) = rotate_broadcast_key(&key0, 1_000).unwrap();
 
         let sk = test_signing_key();
+        let nonce = generate_broadcast_nonce();
+        let provenance_hash = compute_provenance_hash(None).unwrap();
+        let signature = test_sign_with_fields(
+            &sk,
+            &SigningPayloadFields {
+                version: crate::envelope::SCP_PROTOCOL_VERSION,
+                context_id: "test-ctx",
+                author_did: &key1.author_did,
+                sequence: 1,
+                key_epoch: key1.epoch,
+                timestamp: 1_700_000_000_000,
+                nonce: &nonce,
+                provenance_hash: &provenance_hash,
+            },
+        );
         let params = SealBroadcastParams {
             context_id: "test-ctx",
             sequence: 1,
             timestamp: 1_700_000_000_000,
             provenance: None,
-            signing_key: &sk,
+            signature,
         };
-        let envelope = seal_broadcast(&key1, b"post-rotation", &params).unwrap();
+        let envelope = seal_broadcast(&key1, b"post-rotation", &nonce, &params).unwrap();
         assert_eq!(envelope.key_epoch, 1);
 
         let decrypted = test_open(&key1, &envelope).unwrap();
@@ -1201,14 +1272,29 @@ mod tests {
         let key = generate_broadcast_key("did:dht:alice");
         let sk = test_signing_key();
         let vk = sk.verifying_key();
+        let nonce = generate_broadcast_nonce();
+        let provenance_hash = compute_provenance_hash(None).unwrap();
+        let signature = test_sign_with_fields(
+            &sk,
+            &SigningPayloadFields {
+                version: crate::envelope::SCP_PROTOCOL_VERSION,
+                context_id: "test-ctx",
+                author_did: &key.author_did,
+                sequence: 1,
+                key_epoch: key.epoch,
+                timestamp: 1_700_000_000_000,
+                nonce: &nonce,
+                provenance_hash: &provenance_hash,
+            },
+        );
         let params = SealBroadcastParams {
             context_id: "test-ctx",
             sequence: 1,
             timestamp: 1_700_000_000_000,
             provenance: None,
-            signing_key: &sk,
+            signature,
         };
-        let envelope = seal_broadcast(&key, b"signed message", &params).unwrap();
+        let envelope = seal_broadcast(&key, b"signed message", &nonce, &params).unwrap();
         let decrypted = open_broadcast(&key, &envelope, &vk).unwrap();
         assert_eq!(decrypted, b"signed message");
     }
@@ -1334,6 +1420,7 @@ mod tests {
             plaintext in proptest::collection::vec(any::<u8>(), 0..2048)
         ) {
             let key = generate_broadcast_key("did:dht:proptest");
+            // test_seal handles nonce generation and signing internally
             let envelope = test_seal(&key, &plaintext);
             let decrypted = test_open(&key, &envelope).unwrap();
             prop_assert_eq!(plaintext, decrypted);

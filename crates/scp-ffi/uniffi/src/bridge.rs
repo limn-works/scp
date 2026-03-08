@@ -3960,31 +3960,90 @@ pub async fn broadcast_unsubscribe(
 
 /// Publishes a message to a broadcast context.
 ///
-/// The payload is encrypted with the author's broadcast key.
+/// The payload is encrypted with the author's broadcast key. The author's
+/// identity must have been previously created via `identity_create` so
+/// that the key custody provider and signing key handle are available.
+///
+/// # Arguments
+///
+/// * `handle` — The context to publish to.
+/// * `identity` — The identity of the author publishing the message.
+/// * `payload` — The raw message payload bytes to encrypt and publish.
 ///
 /// # Errors
 ///
 /// Returns `ScpError::Context` if the context is not active, not broadcast,
 /// or the sender is not an author.
+/// Returns `ScpError::Crypto` if custody signing fails.
+/// Returns `ScpError::Permission` if no custody provider is available.
 #[uniffi::export]
 pub async fn broadcast_publish(
     handle: Arc<ContextHandle>,
-    author_did: String,
+    identity: Arc<Identity>,
     payload: Vec<u8>,
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager();
-            let did: scp_identity::DID = author_did.into();
-            manager
-                .publish_broadcast(
-                    &handle.context_id,
-                    &did,
-                    &payload,
-                    &ed25519_dalek::SigningKey::from_bytes(&[0u8; 32]),
-                )
-                .await
-                .map_err(ScpError::from)?;
+            let did: scp_identity::DID = identity.did.clone().into();
+
+            let core_id = identity
+                .core_id
+                .as_ref()
+                .ok_or_else(|| ScpError::Permission {
+                    message: "broadcast publish requires a fully created identity with key handles"
+                        .to_owned(),
+                    code: "SCP-PERM-3020".to_owned(),
+                })?;
+            let signing_key_handle = &core_id.active_signing_key;
+
+            // Dispatch to the correct custody path (callback > in-memory).
+            if let Some(ref cb) = identity.callback_custody {
+                manager
+                    .publish_broadcast(
+                        &handle.context_id,
+                        &did,
+                        &payload,
+                        cb.as_ref(),
+                        signing_key_handle,
+                    )
+                    .await
+                    .map_err(ScpError::from)?;
+            } else {
+                #[cfg(feature = "allow_in_memory_custody")]
+                {
+                    let imc = identity.in_memory_custody.as_ref().ok_or_else(|| {
+                        ScpError::Permission {
+                            message: "broadcast publish requires key custody — create the \
+                                      identity with identity_create(\"in_memory\") or \
+                                      identity_create_with_custody()"
+                                .to_owned(),
+                            code: "SCP-PERM-3021".to_owned(),
+                        }
+                    })?;
+                    manager
+                        .publish_broadcast(
+                            &handle.context_id,
+                            &did,
+                            &payload,
+                            &imc.0,
+                            signing_key_handle,
+                        )
+                        .await
+                        .map_err(ScpError::from)?;
+                }
+                #[cfg(not(feature = "allow_in_memory_custody"))]
+                {
+                    return Err(ScpError::Permission {
+                        message: "broadcast publish requires key custody — use \
+                                  identity_create_with_custody() to inject a platform \
+                                  custody provider"
+                            .to_owned(),
+                        code: "SCP-PERM-3022".to_owned(),
+                    });
+                }
+            }
+
             Ok(())
         })
         .await

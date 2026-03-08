@@ -407,6 +407,31 @@ impl std::fmt::Debug for KeyRequestDecision {
 }
 
 // ---------------------------------------------------------------------------
+// BroadcastPublishMetadata
+// ---------------------------------------------------------------------------
+
+/// Metadata needed to construct the broadcast signing payload for a message.
+///
+/// Returned by [`BroadcastContext::publish_metadata`]. Callers use these
+/// fields with [`build_broadcast_signing_payload`] and [`compute_provenance_hash`]
+/// to produce the signing payload, sign it via their key custody provider,
+/// and then pass the signature to [`BroadcastContext::publish`].
+///
+/// [`build_broadcast_signing_payload`]: crate::crypto::sender_keys::build_broadcast_signing_payload
+/// [`compute_provenance_hash`]: crate::crypto::sender_keys::compute_provenance_hash
+#[derive(Debug)]
+pub struct BroadcastPublishMetadata<'a> {
+    /// The context ID for this broadcast message.
+    pub context_id: &'a str,
+    /// The DID of the author.
+    pub author_did: &'a str,
+    /// The next sequence number that will be used by [`BroadcastContext::publish`].
+    pub next_sequence: u64,
+    /// The current broadcast key epoch for this author.
+    pub key_epoch: u64,
+}
+
+// ---------------------------------------------------------------------------
 // BroadcastContext
 // ---------------------------------------------------------------------------
 
@@ -1014,6 +1039,44 @@ impl BroadcastContext {
     }
 
     // -----------------------------------------------------------------------
+    // Publish metadata (for external signing)
+    // -----------------------------------------------------------------------
+
+    /// Returns the metadata needed to construct the broadcast signing payload
+    /// for the next message by the given author.
+    ///
+    /// This does NOT consume the sequence number — it peeks at the next value.
+    /// The caller should use this to build the signing payload, sign it via
+    /// key custody, and then call [`publish`](Self::publish) with the resulting
+    /// signature.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::PermissionDenied`] if `author_did` is not an author.
+    /// - [`ContextError::MemberNotFound`] if the author entry is missing.
+    pub fn publish_metadata(
+        &self,
+        author_did: &str,
+    ) -> Result<BroadcastPublishMetadata<'_>, ContextError> {
+        if !self.can_write(author_did) {
+            return Err(ContextError::PermissionDenied(format!(
+                "{author_did} is not an author (messagesWrite required)"
+            )));
+        }
+
+        let author = self.authors.get(author_did).ok_or_else(|| {
+            ContextError::MemberNotFound(format!("author not found: {author_did}"))
+        })?;
+
+        Ok(BroadcastPublishMetadata {
+            context_id: &self.context_id,
+            author_did: &author.author_did,
+            next_sequence: author.next_sequence,
+            key_epoch: author.epoch,
+        })
+    }
+
+    // -----------------------------------------------------------------------
     // Publish (capability-enforced seal)
     // -----------------------------------------------------------------------
 
@@ -1035,15 +1098,18 @@ impl BroadcastContext {
     /// * `author_did` -- The DID of the author publishing the message.
     /// * `payload` -- The plaintext content to encrypt.
     /// * `timestamp` -- Unix timestamp in milliseconds.
-    /// * `signing_key` -- The author's Ed25519 signing key.
+    /// * `signature` -- Pre-computed Ed25519 signature over the canonical
+    ///   signing payload (see [`build_broadcast_signing_payload`]).
+    /// * `nonce` -- Random 12-byte AES-256-GCM nonce (from
+    ///   [`generate_broadcast_nonce`]).
     /// * `provenance` -- Optional provenance metadata (§7.7.1).
     ///
     /// # Errors
     ///
     /// - [`ContextError::PermissionDenied`] if `author_did` is not a
     ///   registered author (does not hold `messagesWrite`).
-    /// - [`ContextError::CryptoFailed`] if the AES-256-GCM seal or signing
-    ///   operation fails.
+    /// - [`ContextError::CryptoFailed`] if the AES-256-GCM seal operation
+    ///   fails.
     ///
     /// [`seal_broadcast`]: crate::crypto::sender_keys::seal_broadcast
     pub fn publish(
@@ -1051,7 +1117,8 @@ impl BroadcastContext {
         author_did: &str,
         payload: &[u8],
         timestamp: u64,
-        signing_key: &ed25519_dalek::SigningKey,
+        signature: ed25519_dalek::Signature,
+        nonce: &[u8; 12],
         provenance: Option<crate::provenance::DataProvenance>,
     ) -> Result<BroadcastEnvelope, ContextError> {
         if !self.can_write(author_did) {
@@ -1080,10 +1147,10 @@ impl BroadcastContext {
             sequence,
             timestamp,
             provenance,
-            signing_key,
+            signature,
         };
 
-        seal_broadcast(&broadcast_key, payload, &params)
+        seal_broadcast(&broadcast_key, payload, nonce, &params)
             .map_err(|e| ContextError::CryptoFailed(format!("seal_broadcast failed: {e}")))
     }
 
@@ -1437,13 +1504,41 @@ mod tests {
     }
 
     /// Helper that calls `BroadcastContext::publish` with test defaults.
+    ///
+    /// Computes the signing payload and signature externally, matching the
+    /// production pattern where key custody signs asynchronously.
     fn test_publish(
         ctx: &mut BroadcastContext,
         author_did: &str,
         payload: &[u8],
     ) -> Result<BroadcastEnvelope, ContextError> {
+        use crate::crypto::sender_keys::{
+            SigningPayloadFields, build_broadcast_signing_payload, compute_provenance_hash,
+            generate_broadcast_nonce,
+        };
+        use ed25519_dalek::Signer;
+
         let sk = test_broadcast_signing_key();
-        ctx.publish(author_did, payload, 1_700_000_000_000, &sk, None)
+        let timestamp = 1_700_000_000_000;
+        let nonce = generate_broadcast_nonce();
+
+        // Peek at the metadata to construct the signing payload.
+        let meta = ctx.publish_metadata(author_did)?;
+        let provenance_hash =
+            compute_provenance_hash(None).map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        let signing_payload = build_broadcast_signing_payload(&SigningPayloadFields {
+            version: crate::envelope::SCP_PROTOCOL_VERSION,
+            context_id: meta.context_id,
+            author_did: meta.author_did,
+            sequence: meta.next_sequence,
+            key_epoch: meta.key_epoch,
+            timestamp,
+            nonce: &nonce,
+            provenance_hash: &provenance_hash,
+        });
+        let signature = sk.sign(&signing_payload);
+
+        ctx.publish(author_did, payload, timestamp, signature, &nonce, None)
     }
 
     /// Creates a properly signed UCAN token for testing gated subscription.

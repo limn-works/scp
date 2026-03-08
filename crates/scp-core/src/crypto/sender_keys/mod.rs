@@ -32,8 +32,9 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub use broadcast::{
     BroadcastEnvelope, BroadcastKey, BroadcastKeyEpochAdvance, BroadcastReplayDetector,
-    SealBroadcastParams, generate_broadcast_key, open_broadcast, open_broadcast_trusted,
-    rotate_broadcast_key, seal_broadcast, validate_broadcast_version,
+    SealBroadcastParams, SigningPayloadFields, build_broadcast_signing_payload,
+    compute_provenance_hash, generate_broadcast_key, generate_broadcast_nonce, open_broadcast,
+    open_broadcast_trusted, rotate_broadcast_key, seal_broadcast, validate_broadcast_version,
 };
 pub use encrypt::{decrypt_sender_layer, encrypt_sender_layer};
 pub use key_protocol::{

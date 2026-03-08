@@ -1973,7 +1973,29 @@ impl ContextManager {
                 })?;
                 let timestamp = crate::time::now_millis()
                     .map_err(|e| ContextError::CryptoFailed(format!("clock error: {e}")))?;
-                let envelope = bc.publish(sender_did, payload, timestamp, sk, None)?;
+
+                // Compute signing payload and sign externally, matching the
+                // pattern used by publish_broadcast (custody-based signing).
+                let meta = bc.publish_metadata(sender_did)?;
+                let nonce = crate::crypto::sender_keys::generate_broadcast_nonce();
+                let provenance_hash = crate::crypto::sender_keys::compute_provenance_hash(None)
+                    .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+                let signing_payload = crate::crypto::sender_keys::build_broadcast_signing_payload(
+                    &crate::crypto::sender_keys::SigningPayloadFields {
+                        version: crate::envelope::SCP_PROTOCOL_VERSION,
+                        context_id: meta.context_id,
+                        author_did: meta.author_did,
+                        sequence: meta.next_sequence,
+                        key_epoch: meta.key_epoch,
+                        timestamp,
+                        nonce: &nonce,
+                        provenance_hash: &provenance_hash,
+                    },
+                );
+                let signature = ed25519_dalek::Signer::sign(sk, &signing_payload);
+
+                let envelope =
+                    bc.publish(sender_did, payload, timestamp, signature, &nonce, None)?;
 
                 // Assign per-sender monotonic sequence number.
                 let seq = ctx
@@ -2288,7 +2310,8 @@ impl ContextManager {
         context_id: &str,
         author_did: &DID,
         payload: &[u8],
-        signing_key: &ed25519_dalek::SigningKey,
+        custody: &impl scp_platform::KeyCustody,
+        signing_key_handle: &scp_platform::KeyHandle,
     ) -> Result<BroadcastEnvelope, ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -2314,7 +2337,40 @@ impl ContextManager {
 
             let timestamp = crate::time::now_millis()
                 .map_err(|e| ContextError::CryptoFailed(format!("clock error: {e}")))?;
-            let envelope = bc.publish(author_did, payload, timestamp, signing_key, None)?;
+
+            // Compute the signing payload externally so we can sign via
+            // key custody (async) while keeping seal_broadcast synchronous.
+            let meta = bc.publish_metadata(author_did)?;
+            let nonce = crate::crypto::sender_keys::generate_broadcast_nonce();
+            let provenance_hash = crate::crypto::sender_keys::compute_provenance_hash(None)
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+            let signing_payload = crate::crypto::sender_keys::build_broadcast_signing_payload(
+                &crate::crypto::sender_keys::SigningPayloadFields {
+                    version: crate::envelope::SCP_PROTOCOL_VERSION,
+                    context_id: meta.context_id,
+                    author_did: meta.author_did,
+                    sequence: meta.next_sequence,
+                    key_epoch: meta.key_epoch,
+                    timestamp,
+                    nonce: &nonce,
+                    provenance_hash: &provenance_hash,
+                },
+            );
+
+            // Sign via key custody (async).
+            let platform_sig = custody
+                .sign(signing_key_handle, &signing_payload)
+                .await
+                .map_err(|e| ContextError::CryptoFailed(format!("custody signing failed: {e}")))?;
+            let sig_bytes: [u8; 64] = platform_sig.as_bytes().try_into().map_err(|_| {
+                ContextError::CryptoFailed(format!(
+                    "custody signature has wrong length: expected 64, got {}",
+                    platform_sig.as_bytes().len()
+                ))
+            })?;
+            let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+            let envelope = bc.publish(author_did, payload, timestamp, signature, &nonce, None)?;
 
             // Assign per-sender monotonic sequence number.
             let seq = ctx
@@ -5751,6 +5807,22 @@ mod tests {
         ed25519_dalek::SigningKey::from_bytes(&did_to_seed(did))
     }
 
+    /// Creates an [`InMemoryKeyCustody`] and imports an Ed25519 signing key
+    /// from seed bytes, returning both the custody and the key handle.
+    ///
+    /// Used by broadcast publish tests that need to pass custody + handle
+    /// to [`ContextManager::publish_broadcast`].
+    async fn test_custody_from_seed(
+        seed: &[u8; 32],
+    ) -> (
+        scp_platform::testing::InMemoryKeyCustody,
+        scp_platform::KeyHandle,
+    ) {
+        let custody = scp_platform::testing::InMemoryKeyCustody::new();
+        let handle = custody.import_ed25519_key(seed).await;
+        (custody, handle)
+    }
+
     // -----------------------------------------------------------------------
     // Reusable mock providers
     // -----------------------------------------------------------------------
@@ -6882,6 +6954,7 @@ mod tests {
         let (manager, _handle, ctx_id) = setup_broadcast_context().await;
         let author_signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
         let author_verifying_key = author_signing_key.verifying_key();
+        let (author_custody, author_key_handle) = test_custody_from_seed(&[42u8; 32]).await;
 
         // Subscribe 3 subscribers.
         for name in &["sub1", "sub2", "sub3"] {
@@ -6912,7 +6985,8 @@ mod tests {
                 &ctx_id,
                 &"did:key:author1".into(),
                 plaintext,
-                &author_signing_key,
+                &author_custody,
+                &author_key_handle,
             )
             .await
             .unwrap();
@@ -6975,6 +7049,7 @@ mod tests {
         let (manager, _handle, ctx_id) = setup_broadcast_context().await;
         let author_signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
         let author_verifying_key = author_signing_key.verifying_key();
+        let (author_custody, author_key_handle) = test_custody_from_seed(&[42u8; 32]).await;
 
         // Subscribe 2 subscribers.
         for name in &["good-sub", "bad-sub"] {
@@ -7003,7 +7078,8 @@ mod tests {
                 &ctx_id,
                 &"did:key:author1".into(),
                 msg1,
-                &author_signing_key,
+                &author_custody,
+                &author_key_handle,
             )
             .await
             .unwrap();
@@ -7052,7 +7128,8 @@ mod tests {
                 &ctx_id,
                 &"did:key:author1".into(),
                 msg2,
-                &author_signing_key,
+                &author_custody,
+                &author_key_handle,
             )
             .await
             .unwrap();
@@ -7139,9 +7216,15 @@ mod tests {
             .unwrap();
 
         // Subscriber tries to publish -- should fail.
-        let sub_signing_key = ed25519_dalek::SigningKey::from_bytes(&[43u8; 32]);
+        let (sub_custody, sub_key_handle) = test_custody_from_seed(&[43u8; 32]).await;
         let result = manager
-            .publish_broadcast(&ctx_id, &"did:key:sub1".into(), b"nope", &sub_signing_key)
+            .publish_broadcast(
+                &ctx_id,
+                &"did:key:sub1".into(),
+                b"nope",
+                &sub_custody,
+                &sub_key_handle,
+            )
             .await;
         assert!(result.is_err());
         assert!(matches!(
@@ -7165,9 +7248,15 @@ mod tests {
         assert_eq!(manager.broadcast_subscriber_count(&ctx_id).await, Some(0));
 
         // Author should be able to publish.
-        let author_sk = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let (author_custody, author_key_handle) = test_custody_from_seed(&[42u8; 32]).await;
         let result = manager
-            .publish_broadcast(&ctx_id, &"did:key:author1".into(), b"test", &author_sk)
+            .publish_broadcast(
+                &ctx_id,
+                &"did:key:author1".into(),
+                b"test",
+                &author_custody,
+                &author_key_handle,
+            )
             .await;
         assert!(result.is_ok());
     }
@@ -7410,6 +7499,9 @@ mod tests {
     /// SCP-227 AC4: governance-approved `BlockAuthor` proposal revokes sender
     /// key, preventing the blocked author from publishing.
     #[tokio::test]
+    // Integration test exercises full governance + broadcast lifecycle; splitting
+    // would fragment a sequential scenario that must be verified end-to-end.
+    #[allow(clippy::too_many_lines)]
     async fn broadcast_block_author_via_governance_revokes_publish() {
         use crate::crypto::ucan::validate::{
             InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
@@ -7439,19 +7531,31 @@ mod tests {
                 .unwrap();
         }
 
-        let alice_sk = ed25519_dalek::SigningKey::from_bytes(&[0xAA; 32]);
-        let bob_sk = ed25519_dalek::SigningKey::from_bytes(&[0xBB; 32]);
+        let (alice_custody, alice_key_handle) = test_custody_from_seed(&[0xAA; 32]).await;
+        let (bob_custody, bob_key_handle) = test_custody_from_seed(&[0xBB; 32]).await;
 
         // Both authors can publish before blocking.
         assert!(
             manager
-                .publish_broadcast(&ctx_id, &"did:key:alice".into(), b"alice msg", &alice_sk)
+                .publish_broadcast(
+                    &ctx_id,
+                    &"did:key:alice".into(),
+                    b"alice msg",
+                    &alice_custody,
+                    &alice_key_handle,
+                )
                 .await
                 .is_ok()
         );
         assert!(
             manager
-                .publish_broadcast(&ctx_id, &"did:key:bob".into(), b"bob msg", &bob_sk)
+                .publish_broadcast(
+                    &ctx_id,
+                    &"did:key:bob".into(),
+                    b"bob msg",
+                    &bob_custody,
+                    &bob_key_handle,
+                )
                 .await
                 .is_ok()
         );
@@ -7475,7 +7579,8 @@ mod tests {
                     &ctx_id,
                     &"did:key:alice".into(),
                     b"alice still ok",
-                    &alice_sk
+                    &alice_custody,
+                    &alice_key_handle,
                 )
                 .await
                 .is_ok(),
@@ -7484,7 +7589,13 @@ mod tests {
 
         // Bob cannot publish (PermissionDenied).
         let bob_result = manager
-            .publish_broadcast(&ctx_id, &"did:key:bob".into(), b"bob tries", &bob_sk)
+            .publish_broadcast(
+                &ctx_id,
+                &"did:key:bob".into(),
+                b"bob tries",
+                &bob_custody,
+                &bob_key_handle,
+            )
             .await;
         assert!(
             bob_result.is_err(),
@@ -7570,6 +7681,8 @@ mod tests {
         let alice_verifying_key = alice_signing_key.verifying_key();
         let bob_signing_key = ed25519_dalek::SigningKey::from_bytes(&[43u8; 32]);
         let bob_verifying_key = bob_signing_key.verifying_key();
+        let (alice_custody, alice_key_handle) = test_custody_from_seed(&[42u8; 32]).await;
+        let (bob_custody, bob_key_handle) = test_custody_from_seed(&[43u8; 32]).await;
 
         // Subscribe 2 subscribers.
         for name in &["sub1", "sub2"] {
@@ -7598,7 +7711,8 @@ mod tests {
                 &ctx_id,
                 &"did:key:alice".into(),
                 alice_msg1,
-                &alice_signing_key,
+                &alice_custody,
+                &alice_key_handle,
             )
             .await
             .unwrap();
@@ -7606,7 +7720,13 @@ mod tests {
         // Bob publishes — both subscribers can get key and decrypt.
         let bob_msg1 = b"Bob before block";
         let bob_envelope1 = manager
-            .publish_broadcast(&ctx_id, &"did:key:bob".into(), bob_msg1, &bob_signing_key)
+            .publish_broadcast(
+                &ctx_id,
+                &"did:key:bob".into(),
+                bob_msg1,
+                &bob_custody,
+                &bob_key_handle,
+            )
             .await
             .unwrap();
 
@@ -7647,7 +7767,8 @@ mod tests {
                 &ctx_id,
                 &"did:key:bob".into(),
                 b"bob after block",
-                &bob_signing_key,
+                &bob_custody,
+                &bob_key_handle,
             )
             .await;
         assert!(
@@ -7662,7 +7783,8 @@ mod tests {
                 &ctx_id,
                 &"did:key:alice".into(),
                 alice_msg2,
-                &alice_signing_key,
+                &alice_custody,
+                &alice_key_handle,
             )
             .await
             .unwrap();
@@ -12692,10 +12814,16 @@ mod tests {
             .execute_governance_action(&ctx_id, &revoke)
             .await
             .unwrap();
-        let bob_sk = ed25519_dalek::SigningKey::from_bytes(&[0xBB; 32]);
+        let (bob_custody, bob_key_handle) = test_custody_from_seed(&[0xBB; 32]).await;
         assert!(
             manager
-                .publish_broadcast(&ctx_id, &"did:key:bob".into(), b"blocked", &bob_sk)
+                .publish_broadcast(
+                    &ctx_id,
+                    &"did:key:bob".into(),
+                    b"blocked",
+                    &bob_custody,
+                    &bob_key_handle,
+                )
                 .await
                 .is_err(),
             "revoked author should not publish"
@@ -13109,10 +13237,16 @@ mod tests {
             .execute_governance_action(&ctx_id, &revoke)
             .await
             .unwrap();
-        let bob_sk = ed25519_dalek::SigningKey::from_bytes(&[0xBB; 32]);
+        let (bob_custody, bob_key_handle) = test_custody_from_seed(&[0xBB; 32]).await;
         assert!(
             manager
-                .publish_broadcast(&ctx_id, &"did:key:bob".into(), b"nope", &bob_sk)
+                .publish_broadcast(
+                    &ctx_id,
+                    &"did:key:bob".into(),
+                    b"nope",
+                    &bob_custody,
+                    &bob_key_handle,
+                )
                 .await
                 .is_err()
         );
