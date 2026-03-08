@@ -163,6 +163,9 @@ pub struct BroadcastKeyEpochAdvance {
 /// [`encrypt_sender_layer`]: super::encrypt::encrypt_sender_layer
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BroadcastEnvelope {
+    /// Protocol version (§13.2.2). SCP/1.0 = `0x0100`.
+    /// Part of the signature commitment.
+    pub version: u16,
     /// The context ID this envelope belongs to.
     pub context_id: String,
     /// The DID of the author who sealed this envelope.
@@ -340,10 +343,12 @@ pub struct SealBroadcastParams<'a> {
 /// and length-prefixed variable-length fields, matching the pattern used by
 /// [`compute_block_notification_hash`] in `key_protocol.rs`.
 ///
-/// Field order: `context_id`, `author_did`, `sequence`, `timestamp`, `key_epoch`.
+/// Field order per §13.2.2: `version`, `context_id`, `author_did`, `sequence`,
+/// `timestamp`, `key_epoch`.
 ///
 /// Used by both [`seal_broadcast`] (sign) and [`open_broadcast`] (verify).
 fn build_signing_payload(
+    version: u16,
     context_id: &str,
     author_did: &str,
     sequence: u64,
@@ -355,6 +360,7 @@ fn build_signing_payload(
     canonical_hash(
         "SCP-BROADCAST-ENVELOPE-V1:",
         &[
+            CanonicalField::U16(version),
             CanonicalField::VarBytes(context_id.as_bytes()),
             CanonicalField::VarBytes(author_did.as_bytes()),
             CanonicalField::U64(sequence),
@@ -423,6 +429,7 @@ pub fn seal_broadcast(
 
     // Sign over canonical field concatenation.
     let signing_payload = build_signing_payload(
+        crate::envelope::SCP_PROTOCOL_VERSION,
         params.context_id,
         &key.author_did,
         params.sequence,
@@ -435,6 +442,7 @@ pub fn seal_broadcast(
         .map_err(|e| SenderKeyError::SigningFailed(e.to_string()))?;
 
     Ok(BroadcastEnvelope {
+        version: crate::envelope::SCP_PROTOCOL_VERSION,
         context_id: params.context_id.to_owned(),
         author_did: key.author_did.clone(),
         sequence: params.sequence,
@@ -515,7 +523,10 @@ pub fn open_broadcast(
     verifying_key: &ed25519_dalek::VerifyingKey,
 ) -> Result<Vec<u8>, SenderKeyError> {
     // Step 1: Verify signature BEFORE decryption (issue #352).
+    // Use the envelope's version (not the constant) so that tampering with
+    // the version field causes verification to fail (§13.2.2).
     let signing_payload = build_signing_payload(
+        envelope.version,
         &envelope.context_id,
         &envelope.author_did,
         envelope.sequence,
@@ -554,6 +565,24 @@ pub fn open_broadcast_trusted(
     envelope: &BroadcastEnvelope,
 ) -> Result<Vec<u8>, SenderKeyError> {
     decrypt_envelope(key, envelope)
+}
+
+/// Validates that a broadcast envelope's version field is supported (§13.2.2).
+///
+/// Currently only SCP/1.0 (`0x0100`) is recognized. Call this after
+/// deserialization to reject envelopes from incompatible protocol versions.
+///
+/// # Errors
+///
+/// Returns [`SenderKeyError::UnsupportedVersion`] if `envelope.version` is not
+/// `SCP_PROTOCOL_VERSION`.
+pub fn validate_broadcast_version(envelope: &BroadcastEnvelope) -> Result<(), SenderKeyError> {
+    if envelope.version != crate::envelope::SCP_PROTOCOL_VERSION {
+        return Err(SenderKeyError::UnsupportedVersion {
+            version: envelope.version,
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -875,6 +904,7 @@ mod tests {
         // but decryption will still fail due to AEAD tag verification.
         let key = generate_broadcast_key("did:dht:alice");
         let envelope = BroadcastEnvelope {
+            version: crate::envelope::SCP_PROTOCOL_VERSION,
             context_id: "test-ctx".to_owned(),
             author_did: "did:dht:alice".to_owned(),
             sequence: 1,

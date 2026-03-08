@@ -37,6 +37,12 @@ use crate::crypto::sender_keys::encrypt::{decrypt_sender_layer, encrypt_sender_l
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OuterEnvelope {
+    /// Protocol version (§13.2.3). SCP/1.0 = `0x0100`.
+    /// Used for deserialization routing — tells the recipient which version's
+    /// deserializer to use. Since the outer envelope is unsigned, this is
+    /// purely informational.
+    pub version: u16,
+
     /// Per-context pseudonym derived via `HMAC-SHA256`. Used as the routing
     /// key by relays. 32 bytes.
     #[serde(with = "serde_bytes")]
@@ -91,6 +97,7 @@ pub fn create_outer_envelope(
     }
 
     Ok(OuterEnvelope {
+        version: super::SCP_PROTOCOL_VERSION,
         routing_id: routing_id.to_vec(),
         recipient_hint: recipient_hint.map(<[u8]>::to_vec),
         blob_ttl,
@@ -117,6 +124,24 @@ impl OuterEnvelope {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, EnvelopeError> {
         rmp_serde::from_slice(bytes)
             .map_err(|e| EnvelopeError::DeserializationFailed(e.to_string()))
+    }
+
+    /// Validates that this outer envelope's version field is supported (§13.2.3).
+    ///
+    /// Currently only SCP/1.0 (`0x0100`) is recognized. Call this after
+    /// deserialization to reject envelopes from incompatible protocol versions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvelopeError::UnsupportedVersion`] if `self.version` is not
+    /// `SCP_PROTOCOL_VERSION`.
+    pub fn validate_version(&self) -> Result<(), EnvelopeError> {
+        if self.version != super::SCP_PROTOCOL_VERSION {
+            return Err(EnvelopeError::UnsupportedVersion {
+                version: self.version,
+            });
+        }
+        Ok(())
     }
 }
 

@@ -33,7 +33,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub use broadcast::{
     BroadcastEnvelope, BroadcastKey, BroadcastKeyEpochAdvance, BroadcastReplayDetector,
     SealBroadcastParams, generate_broadcast_key, open_broadcast, open_broadcast_trusted,
-    rotate_broadcast_key, seal_broadcast,
+    rotate_broadcast_key, seal_broadcast, validate_broadcast_version,
 };
 pub use encrypt::{decrypt_sender_layer, encrypt_sender_layer};
 pub use key_protocol::{
@@ -213,6 +213,17 @@ pub enum SenderKeyError {
     /// See ADR-039 and SCP-AB-020.
     #[error("Category A violation: {0}")]
     CategoryAViolation(String),
+
+    /// The envelope's `version` field is not supported by this implementation.
+    ///
+    /// Currently only version `0x0100` (SCP/1.0) is supported. Returned by
+    /// [`broadcast::validate_broadcast_version`] when the version doesn't
+    /// match (§13.2.2).
+    #[error("unsupported broadcast envelope version: {version:#06x}")]
+    UnsupportedVersion {
+        /// The version value from the wire.
+        version: u16,
+    },
 }
 
 // ---------------------------------------------------------------------------
