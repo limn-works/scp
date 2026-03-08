@@ -829,6 +829,7 @@ mod tests {
         let adapter = CoapAdapter::new(addr).unwrap();
 
         let envelope = OuterEnvelope {
+            version: scp_core::envelope::SCP_PROTOCOL_VERSION,
             routing_id: vec![0xCC; 32],
             recipient_hint: None,
             blob_ttl: 3600,

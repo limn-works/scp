@@ -621,7 +621,7 @@ impl GovernanceEngine for ThresholdEngine {
     }
 
     fn checkpoint_cosignature_requirements(&self) -> (Vec<DID>, usize) {
-        // Threshold: require threshold cosignatures from signer set (ADR-031 §9)
+        // Threshold: require M-of-N cosignatures from designated signers (ADR-031 §9)
         (self.signers.clone(), self.threshold as usize)
     }
 
@@ -630,12 +630,12 @@ impl GovernanceEngine for ThresholdEngine {
         cosignatures: &[CosignedCheckpoint],
         checkpoint_hash: &[u8; 32],
     ) -> Result<CheckpointAttestationStatus, GovernanceError> {
-        // Verify all cosignatures are from eligible signers and valid
+        // Verify all cosignatures are from designated signers and valid
         let mut valid_cosignatures = 0;
         for cosig in cosignatures {
             if !self.signers.contains(&cosig.signer_did) {
                 return Err(GovernanceError::NotEligible(format!(
-                    "Cosigner {} not in threshold signer set",
+                    "Cosigner {} not in signer set",
                     cosig.signer_did
                 )));
             }
@@ -663,7 +663,7 @@ impl GovernanceEngine for ThresholdEngine {
             valid_cosignatures += 1;
         }
 
-        // Check if we have enough valid cosignatures for full attestation
+        // Check if we have threshold for full attestation
         if valid_cosignatures >= self.threshold as usize {
             Ok(CheckpointAttestationStatus::FullyAttested)
         } else {

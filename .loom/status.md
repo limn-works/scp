@@ -1,12 +1,17 @@
 # Loom Status
 
 ## Failing Tests
+<<<<<<< HEAD
 None. All 3423+ tests pass (excluding pre-existing scp-ffi-napi linker error).
+=======
+None — full workspace test suite green (5228 tests, 0 failures). Clippy clean. NAPI linkage pre-existing (needs Node.js napi symbols).
+>>>>>>> feat/spec-code-alignment
 
 ## Uncommitted Changes
 None on the main worktree.
 
 ## Fixed This Iteration
+<<<<<<< HEAD
 - 36+ compilation errors from SCP-272/273 subagent merge (trait methods outside block, KeyResolver calling convention, signature serialization, missing ContextSnapshot fields)
 - 6 checkpoint cosignature test failures (fake signatures replaced with real Ed25519 signatures, mock_resolver extended)
 - Conflict detection wiring into vote submission path (was in subagent working copy but not properly merged)
@@ -63,3 +68,32 @@ Review deferred — Phase 6 not yet complete (CAC-009, CAC-010 remaining).
 
 **After Phase 8:**
 - Issue #398 (envelope version field)
+=======
+- #395: HPKE sender key wrapping missing context binding — added context_id/sender_did/epoch to info + AAD
+- #396: BroadcastEnvelope missing top-level nonce and expanded AAD — added nonce field, expanded AAD with context_id + sequence
+- Formatting: cargo fmt applied across workspace (21 files)
+- scp-node too_many_lines clippy error from cargo fmt expansion — reverted to HEAD (original formatting was within limit)
+
+## Tests Added / Updated
+- **#395**: 3 new tests (hpke_rejects_wrong_context_id, hpke_rejects_wrong_sender_did, hpke_rejects_wrong_epoch) + updated 2 existing call sites
+- **#396**: 2 new tests (open_with_tampered_context_id_fails, open_with_tampered_sequence_fails) + nonce separation tests
+
+## Work Summary
+
+### Issues Completed (from prior subagent runs, merged this iteration)
+
+| Issue | Description | Commit | Tests |
+|-------|-------------|--------|-------|
+| #395 | HPKE sender key wrapping context binding (info + AAD) | 1fe28a47 | 3 new + 2 updated |
+| #396 | BroadcastEnvelope top-level nonce + expanded AAD | b4b9161c | 2 new |
+| #397 | ResetRequest nonce + anti-replay validation | d6146a16 (prior iteration) | existing |
+
+### Spec-Code Alignment Status
+- **#395**: COMPLETE
+- **#396**: COMPLETE
+- **#397**: COMPLETE (merged prior iteration)
+- **#398**: NOT STARTED (envelope version field — assigned to different loom)
+
+## Next Iteration
+Spec-Code Alignment scope (#395, #396, #397) is COMPLETE. No further work in this worktree.
+>>>>>>> feat/spec-code-alignment

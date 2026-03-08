@@ -1142,7 +1142,6 @@ mod tests {
             timestamp: 1_700_000_000_000,
             provenance: None,
             signing_key: &sk,
-            signing_key_id: "#active",
         };
         seal_broadcast(key, payload, &params).unwrap()
     }

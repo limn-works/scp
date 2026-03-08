@@ -463,11 +463,22 @@ Phase 11 spec→code gap audit COMPLETE — found 3 CRITICAL, 25 HIGH, 19 MEDIUM
 
 ### Phase 12: Polish — COMPLETE
 
+<<<<<<< HEAD
 - #291 — **COMPLETE** → 69cdf557 (stub policy fixes)
 - #301 — **COMPLETE** (node dev API metrics)
 - #303 — **COMPLETE** (event log payload persistence)
 - #343 — **COMPLETE** → 298666cd + 9507d032 (Nostr BIP-340 + WebRTC DataChannelProvider)
 - #344 — **COMPLETE** → 7f45bcb1 (artifact health findings)
+=======
+- #395 — HPKE sender key wrapping: add context_id/sender_did/epoch to info + AAD ✅ (1fe28a47)
+- #396 — BroadcastEnvelope: add top-level nonce field, expand AAD with context_id + sequence ✅ (b4b9161c)
+- #397 — ResetRequest: add nonce field, anti-replay validation (signature + 30s freshness + nonce dedup) ✅ (d6146a16)
+- #398 — Envelope version field: add `version: u16` to InnerEnvelope, BroadcastEnvelope, OuterEnvelope + canonical hashes
+
+### Phase 12: Polish
+
+#291, #301, #303, #343, #344
+>>>>>>> feat/spec-code-alignment
 
 ---
 

@@ -1807,7 +1807,7 @@ impl ContextManager {
                 })?;
                 let timestamp = crate::time::now_millis()
                     .map_err(|e| ContextError::CryptoFailed(format!("clock error: {e}")))?;
-                let envelope = bc.publish(sender_did, payload, timestamp, sk, "#active", None)?;
+                let envelope = bc.publish(sender_did, payload, timestamp, sk, None)?;
 
                 // Assign per-sender monotonic sequence number.
                 let seq = ctx
@@ -2149,7 +2149,7 @@ impl ContextManager {
             let timestamp = crate::time::now_millis()
                 .map_err(|e| ContextError::CryptoFailed(format!("clock error: {e}")))?;
             let envelope =
-                bc.publish(author_did, payload, timestamp, signing_key, "#active", None)?;
+                bc.publish(author_did, payload, timestamp, signing_key, None)?;
 
             // Assign per-sender monotonic sequence number.
             let seq = ctx

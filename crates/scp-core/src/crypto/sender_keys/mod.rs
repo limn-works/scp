@@ -33,7 +33,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub use broadcast::{
     BroadcastEnvelope, BroadcastKey, BroadcastKeyEpochAdvance, BroadcastReplayDetector,
     SealBroadcastParams, generate_broadcast_key, open_broadcast, open_broadcast_trusted,
-    rotate_broadcast_key, seal_broadcast,
+    rotate_broadcast_key, seal_broadcast, validate_broadcast_version,
 };
 pub use encrypt::{decrypt_sender_layer, encrypt_sender_layer};
 pub use key_protocol::{
@@ -172,13 +172,15 @@ pub enum SenderKeyError {
     #[error("stale sender key request: timestamp outside freshness window")]
     StaleSenderKeyRequest,
 
-    /// The envelope's protocol version is not supported by this implementation.
-    #[error("unsupported broadcast envelope version: {version}, expected {expected}")]
+    /// The envelope's `version` field is not supported by this implementation.
+    ///
+    /// Currently only version `0x0100` (SCP/1.0) is supported. Returned by
+    /// [`broadcast::validate_broadcast_version`] when the version doesn't
+    /// match (§13.2.2).
+    #[error("unsupported broadcast envelope version: {version:#06x}")]
     UnsupportedVersion {
-        /// The version found in the envelope.
+        /// The version value from the wire.
         version: u16,
-        /// The version this implementation supports.
-        expected: u16,
     },
 
     /// The epoch counter overflowed (reached `u64::MAX`).

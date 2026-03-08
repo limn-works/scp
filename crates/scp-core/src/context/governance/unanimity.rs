@@ -603,7 +603,7 @@ impl GovernanceEngine for UnanimityEngine {
     }
 
     fn checkpoint_cosignature_requirements(&self) -> (Vec<DID>, usize) {
-        // Unanimity: require ALL eligible voters to cosign (ADR-031 §9)
+        // Unanimity: all voters must cosign for full attestation (ADR-031 §9)
         (self.voters.clone(), self.voters.len())
     }
 
@@ -612,12 +612,12 @@ impl GovernanceEngine for UnanimityEngine {
         cosignatures: &[CosignedCheckpoint],
         checkpoint_hash: &[u8; 32],
     ) -> Result<CheckpointAttestationStatus, GovernanceError> {
-        // Verify all cosignatures are from eligible voters and valid
+        // Verify all cosignatures are from required voters and valid
         let mut valid_cosignatures = 0;
         for cosig in cosignatures {
             if !self.voters.contains(&cosig.signer_did) {
                 return Err(GovernanceError::NotEligible(format!(
-                    "Cosigner {} not in eligible voter set",
+                    "Cosigner {} not in voter set",
                     cosig.signer_did
                 )));
             }
@@ -645,8 +645,8 @@ impl GovernanceEngine for UnanimityEngine {
             valid_cosignatures += 1;
         }
 
-        // Unanimity requires ALL eligible voters to cosign for full attestation
-        if valid_cosignatures == self.voters.len() {
+        // Unanimity: all voters must cosign for full attestation
+        if valid_cosignatures >= self.voters.len() {
             Ok(CheckpointAttestationStatus::FullyAttested)
         } else {
             Ok(CheckpointAttestationStatus::PartiallyAttested)

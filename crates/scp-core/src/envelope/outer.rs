@@ -37,18 +37,20 @@ use crate::crypto::sender_keys::encrypt::{decrypt_sender_layer, encrypt_sender_l
 /// The current SCP protocol version for outer envelopes.
 ///
 /// See spec §13.2.3 for outer envelope versioning.
-pub const SCP_OUTER_ENVELOPE_VERSION: u16 = 1;
+pub const SCP_OUTER_ENVELOPE_VERSION: u16 = super::SCP_PROTOCOL_VERSION;
 
 /// Serde default for the `version` field on [`OuterEnvelope`].
 const fn default_outer_version() -> u16 {
-    SCP_OUTER_ENVELOPE_VERSION
+    super::SCP_PROTOCOL_VERSION
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OuterEnvelope {
-    /// Protocol version (§13.2.3). Used for deserialization routing — tells
-    /// the recipient which version's deserializer to use.
+    /// Protocol version (§13.2.3). SCP/1.0 = `0x0100`.
+    /// Used for deserialization routing — tells the recipient which version's
+    /// deserializer to use. Since the outer envelope is unsigned, this is
+    /// purely informational.
     #[serde(default = "default_outer_version")]
     pub version: u16,
 
@@ -106,7 +108,7 @@ pub fn create_outer_envelope(
     }
 
     Ok(OuterEnvelope {
-        version: SCP_OUTER_ENVELOPE_VERSION,
+        version: super::SCP_PROTOCOL_VERSION,
         routing_id: routing_id.to_vec(),
         recipient_hint: recipient_hint.map(<[u8]>::to_vec),
         blob_ttl,
@@ -136,10 +138,27 @@ impl OuterEnvelope {
         if envelope.version != SCP_OUTER_ENVELOPE_VERSION {
             return Err(EnvelopeError::UnsupportedVersion {
                 version: envelope.version,
-                expected: SCP_OUTER_ENVELOPE_VERSION,
             });
         }
         Ok(envelope)
+    }
+
+    /// Validates that this outer envelope's version field is supported (§13.2.3).
+    ///
+    /// Currently only SCP/1.0 (`0x0100`) is recognized. Call this after
+    /// deserialization to reject envelopes from incompatible protocol versions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvelopeError::UnsupportedVersion`] if `self.version` is not
+    /// `SCP_PROTOCOL_VERSION`.
+    pub fn validate_version(&self) -> Result<(), EnvelopeError> {
+        if self.version != super::SCP_PROTOCOL_VERSION {
+            return Err(EnvelopeError::UnsupportedVersion {
+                version: self.version,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -293,7 +312,6 @@ pub fn open_envelope(
     if inner.version != super::inner::SCP_INNER_ENVELOPE_VERSION {
         return Err(EnvelopeError::UnsupportedVersion {
             version: inner.version,
-            expected: super::inner::SCP_INNER_ENVELOPE_VERSION,
         });
     }
 

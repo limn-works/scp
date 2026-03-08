@@ -473,6 +473,7 @@ mod tests {
             bob_pubkey.as_bytes(),
             &HandleRequestParams {
                 sender_key: &sender_key,
+                context_id: "ctx-roundtrip",
                 sender_did: "did:dht:alice",
                 epoch: 1,
                 block_list: &block_list,
@@ -489,10 +490,14 @@ mod tests {
             rmp_serde::from_slice(&response_bytes).unwrap();
 
         // Bob decrypts the response using his ephemeral wrapping key handle.
-        let recovered =
-            open_sender_key_response(&custody, &request_result.wrapping_key_handle, &response)
-                .await
-                .unwrap();
+        let recovered = open_sender_key_response(
+            &custody,
+            &request_result.wrapping_key_handle,
+            "ctx-roundtrip",
+            &response,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             recovered.as_bytes(),
@@ -544,6 +549,7 @@ mod tests {
             bob_pubkey.as_bytes(),
             &HandleRequestParams {
                 sender_key: &sender_key,
+                context_id: "ctx-roundtrip",
                 sender_did: "did:dht:alice",
                 epoch: 1,
                 block_list: &block_list,
