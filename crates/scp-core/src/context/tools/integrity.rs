@@ -273,7 +273,11 @@ impl VerificationScheduler {
             next_verification_at: now,
         };
         self.schedules.insert(tool_id.to_owned(), schedule);
-        Ok(self.schedules.get(tool_id).expect("just inserted"))
+        self.schedules
+            .get(tool_id)
+            .ok_or_else(|| ToolError::ToolNotFound {
+                tool_id: tool_id.to_owned(),
+            })
     }
 
     /// Removes the verification schedule for a tool.
