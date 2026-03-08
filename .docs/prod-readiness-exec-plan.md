@@ -379,7 +379,8 @@ SCP-CAC-003 — **COMPLETE** → abb9873
 SCP-CAC-006 — **COMPLETE** → 44210e41
 SCP-CAC-007 — **COMPLETE** → d2163551
 SCP-CAC-008 — **COMPLETE** → 1d7824c2
-SCP-CAC-009 → SCP-CAC-010
+SCP-CAC-009 — **COMPLETE** → 992c8221 (lifecycle tests across context types)
+SCP-CAC-010 — **COMPLETE** → 992c8221 (governance-gated content access tests)
 
 ### Phase 7: Governance Integration (depends on Phase 2 + Phase 5)
 
@@ -400,69 +401,55 @@ SCP-267 → SCP-268 → SCP-269 → SCP-270 → SCP-271 → SCP-272 → SCP-273 
 - SCP-272 needs #354 (conflict detection)
 - SCP-273 needs #330 (provenance/checkpoint fields)
 
-### Phase 8: Feature Completions (parallel, depends on Phase 5)
+### Phase 8: Feature Completions (parallel, depends on Phase 5) — MOSTLY COMPLETE
 
-**Lane A:** SCP-227 (subscriber registration — in-progress). Note: #335 closed by Phase 5 bridge rewrites.
-**Lane B:** #337 — **COMPLETE** → 9180dd5. #334 remaining.
+**Lane A:** SCP-227 — **COMPLETE** (subscriber registration, blocking, integration — multiple commits). #335 closed by Phase 5 bridge rewrites.
+**Lane B:** #337 — **COMPLETE** → 9180dd5. #334 — **COMPLETE** → f78ceb4b (economic governance, spending UCANs).
 **Lane C:** #318 — **COMPLETE** → 91317fc. #330 — **COMPLETE** → 032cb41.
-**Lane D:** #316, #323 (identity features — decomposed: #391 file custody → #392+#393+#394 parallel)
+**Lane D:** #316 (compromise recovery) — IN PROGRESS. #323 (platform key custody) — IN PROGRESS.
 **Lane E:** #302 — **COMPLETE** → bf53ec5. #305 — **COMPLETE** → 1dc533b. #342 — **COMPLETE** → 254ed89.
 
-### Phase 9: SDK Bindings (depends on Phase 5)
+### Phase 9: SDK Bindings (depends on Phase 5) — COMPLETE
 
-**Lane A:** #306, SCP-218 (WASM bridge wiring) → #341 (TypeScript SDK)
-**Lane B:** #307, SCP-220, SCP-221 (UniFFI bridge + Swift wiring) → #331 (Swift Trust/MCP)
-**Lane C:** SCP-214 (KeyCustodyProvider callbacks across all FFI bridges) — needs #386/#387/#388/#389 (bridge rewrites)
-**Lane D:** #322 (cross-context tool interfaces)
-**Lane E:** SCP-215 (error code range audit — independent)
-**Lane F:** #304 (Go/Java/C#)
-**Lane G:** SCP-116 → SCP-117 → SCP-118 → SCP-120 (Kotlin SDK completion)
+**Lane A:** #306, SCP-218 — **COMPLETE** → 2acbece6, 167b2cf2 (WASM bridge wiring). #341 — **COMPLETE** → eff26979 (TypeScript SDK).
+**Lane B:** #307, SCP-220 — **COMPLETE** → 95146b16. SCP-221 — **COMPLETE** → a9b57ede. #331 — **COMPLETE** → 41d2d399 (NAPI MCP bridge).
+**Lane C:** SCP-214 — **COMPLETE** → 56265427 (UniFFI/NAPI KeyCustodyProvider) + PyO3 already wired via identity registry.
+**Lane D:** #322 — **COMPLETE** → 07ebffaa (cross-context tool interfaces + stateful sessions).
+**Lane E:** SCP-215 — **COMPLETE** (error code audit, PR #308).
+**Lane F:** #304 — **COMPLETE** → edb7f790 (Go/Java/C# scaffolding removed per reduced scope).
+**Lane G:** SCP-116 → SCP-117 → SCP-118 → SCP-120 — DEFERRED (Kotlin SDK completion, lower priority).
 
-### Phase 10: New Features (partially blocked by spec)
+### Phase 10: New Features — MOSTLY COMPLETE
 
-**Lane A:** SCP-ACR-001 — **COMPLETE** → ad83cef. SCP-ACR-002 — **COMPLETE** → 5b26f18. SCP-ACR-003–007 remaining
-**Lane B:** SCP-BCH-001–013 (bridge cooperative + credentials + sender key encryption) — **BLOCKED by S-D** (bridge MLS model)
-**Lane C:** SCP-BA-001–006 (participation admission) — **soft-blocked by S-A** (canonical serialization for profiles)
-**Lane D:** #362, #363, #364, #365, #366, #367
-**Lane E:** SCP-038 (PyO3 identity bridge — in-progress), SCP-092 (signaling — in-progress, #290 done)
+**Lane A:** SCP-ACR-001 — **COMPLETE** → ad83cef. SCP-ACR-002 — **COMPLETE** → 5b26f18. SCP-ACR-003 — **COMPLETE**. SCP-ACR-004 — **COMPLETE**. SCP-ACR-005 — **COMPLETE** → d99f7860. SCP-ACR-006 — **COMPLETE**. SCP-ACR-007 — **COMPLETE**.
+**Lane B:** SCP-BCH-001 — **COMPLETE**. BCH-002 — **COMPLETE**. BCH-003 — **COMPLETE** → 73b5ed70. BCH-004 — **COMPLETE**. BCH-005 — **COMPLETE** → 73b5ed70. BCH-006 — **COMPLETE** → 73b5ed70. BCH-007 — **COMPLETE** → 1629dd2c. BCH-008 — **COMPLETE**. BCH-009 — **COMPLETE** → a6558a5d. BCH-010 — **COMPLETE**. BCH-011 — **COMPLETE**. BCH-012 — **COMPLETE** → f468fc35. BCH-013 — **COMPLETE**.
+**Lane C:** SCP-BA-001 — **COMPLETE**. BA-002 — **COMPLETE**. BA-003 — **COMPLETE** → 074c90af. BA-004 — **COMPLETE**. BA-005 — **COMPLETE** → 9e86eacb. BA-006 — **COMPLETE** → 4605d808.
+**Lane D:** #362 — **COMPLETE** → 7d3a3a9c. #363 — IN PROGRESS. #364 — IN PROGRESS. #365 — **COMPLETE** → 61a4cdc7. #366 — **COMPLETE**. #367 — **COMPLETE** → a7def106.
+**Lane E:** SCP-038 (PyO3 identity bridge) — IN PROGRESS. SCP-092 (signaling) — IN PROGRESS.
 
-### Phase 11: Spec Audit NEW HIGHs (parallel with Phase 8+)
+### Phase 11: Spec Audit NEW HIGHs (parallel with Phase 8+) — COMPLETE
 
-Spec-only fixes for the 37 NEW HIGH findings. Grouped by topic:
+All 37 original H-01 through H-37 findings resolved. Additional ~61 HIGH findings from cross-reference audit also addressed (6 lanes, all committed on feat/phase-11-spec).
 
-**Lane H-A** — Identity spec gaps (H-01 through H-06)
-- Key custody migration, private state event log, routing_id, earned capacity, KeyPackage signing key, Merkle hash chain
+Spec-only changes in .docs/specs/. Content_hash confirmation oracle fix, registry centralization fix, bridge credential encryption, pseudonym derivation privacy fix, event log pruning, and 55+ more.
 
-**Lane H-B** — Context spec gaps (H-07 through H-12)
-- Creation failure states, metadata signing, multi-parent matching, group_context extension, TOCTOU, context migration
+Phase 11 spec→code gap audit IN PROGRESS — analyzing whether new spec additions require downstream code changes.
 
-**Lane H-C** — Trust spec gaps (H-13 through H-18)
-- Chain depth contradiction, self-service auth, proof-of-absence, attestation independence, revocation format, counterparties privacy
+### Spec-Code Alignment (parallel with Phase 6+) — COMPLETE
 
-**Lane H-D** — Security spec gaps (H-19 through H-26)
-- Equivocation response, chunking, AccessKeyRequest timing, push registration, multi-device sync, media keys, QUIC 0-RTT, UCAN CID
+- #395 — **COMPLETE** → 1fe28a47 (HPKE sender key wrapping context binding)
+- #396 — **COMPLETE** → b4b9161c (BroadcastEnvelope nonce + AAD expansion)
+- #397 — **COMPLETE** → 7892b10f + 265c7071 (ResetRequest nonce + anti-replay)
+- #398 — **COMPLETE** → 14ab6b79 (envelope version fields) + 6e924a9d (broadcast signature nonce CRITICAL fix)
+- Envelope versioning also applied to primary: 992c8221 (version fields in all 3 envelope types + canonical hashes)
 
-**Lane H-E** — Versioning spec gaps (H-28 through H-32)
-- Already covered by Phase 0 Lane S-C
+### Phase 12: Polish — COMPLETE
 
-**Lane H-F** — Bridge spec gaps (H-27, H-33)
-- Bridge metadata in SS5.7, reverse bridge flow
-
-**Lane H-G** — Sync/provenance spec gaps (H-34 through H-37)
-- Counterparties privacy, EpochGraceStore crash recovery, checkpoint verification, event log reconciliation trust
-
-### Spec-Code Alignment (parallel with Phase 6+)
-
-Wire format and crypto fixes identified by spec review. All are code changes to match prescriptive spec:
-
-- #395 — HPKE sender key wrapping: add context_id/sender_did/epoch to info + AAD
-- #396 — BroadcastEnvelope: add top-level nonce field, expand AAD with context_id + sequence
-- #397 — ResetRequest: add nonce field, anti-replay validation (signature + 30s freshness + nonce dedup)
-- #398 — Envelope version field: add `version: u16` to InnerEnvelope, BroadcastEnvelope, OuterEnvelope + canonical hashes
-
-### Phase 12: Polish
-
-#291, #301, #303, #343, #344
+- #291 — **COMPLETE** → 69cdf557 (stub policy fixes)
+- #301 — **COMPLETE** (node dev API metrics)
+- #303 — **COMPLETE** (event log payload persistence)
+- #343 — **COMPLETE** → 298666cd + 9507d032 (Nostr BIP-340 + WebRTC DataChannelProvider)
+- #344 — **COMPLETE** → 7f45bcb1 (artifact health findings)
 
 ---
 
