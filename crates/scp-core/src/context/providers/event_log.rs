@@ -24,12 +24,13 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::context::builder::{ContextCreationError, ContextEventLogProvider};
 
 /// A single entry in a Merkle-chained event log.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventLogEntry {
     /// The event name (e.g., `"ContextCreated"`, `"MemberJoined"`).
     pub event: String,
@@ -129,6 +130,99 @@ impl MerkleEventLogProvider {
         logs.get(context_id).map(|log| log.entries.clone())
     }
 
+    /// Returns the Merkle root hash (the hash of the last entry) for a
+    /// context's event log.
+    ///
+    /// Returns all zeros if the log is empty. Returns `None` if no log
+    /// exists for the context.
+    #[must_use]
+    pub fn merkle_root(&self, context_id: &[u8; 32]) -> Option<[u8; 32]> {
+        let logs = self
+            .logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let log = logs.get(context_id)?;
+        Some(log.entries.last().map_or([0u8; 32], |e| e.hash))
+    }
+
+    /// Serializes the event log entries for a context into MessagePack bytes.
+    ///
+    /// Used by [`ContextExport`](crate::context::export_import::ContextExport)
+    /// to include the full event log in a portable export.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::EventLogFailed`] if no log exists for
+    /// the context or serialization fails.
+    pub fn export_event_log_entries(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<Vec<u8>, ContextCreationError> {
+        let entries = self.entries(context_id).ok_or_else(|| {
+            ContextCreationError::EventLogFailed(format!(
+                "no event log for context {}",
+                hex::encode(context_id)
+            ))
+        })?;
+        rmp_serde::to_vec_named(&entries).map_err(|e| {
+            ContextCreationError::EventLogFailed(format!(
+                "failed to serialize event log entries: {e}"
+            ))
+        })
+    }
+
+    /// Imports serialized event log entries (MessagePack) into this provider,
+    /// replacing any existing log for the context.
+    ///
+    /// The imported entries are verified for Merkle chain integrity before
+    /// being accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::EventLogFailed`] if deserialization
+    /// fails or the Merkle chain is broken.
+    pub fn import_event_log_entries(
+        &self,
+        context_id: &[u8; 32],
+        data: &[u8],
+    ) -> Result<(), ContextCreationError> {
+        let entries: Vec<EventLogEntry> = rmp_serde::from_slice(data).map_err(|e| {
+            ContextCreationError::EventLogFailed(format!(
+                "failed to deserialize event log entries: {e}"
+            ))
+        })?;
+
+        // Verify Merkle chain integrity before accepting.
+        for (i, entry) in entries.iter().enumerate() {
+            let expected_prev = if i == 0 {
+                [0u8; 32]
+            } else {
+                entries[i - 1].hash
+            };
+            if entry.prev_hash != expected_prev {
+                return Err(ContextCreationError::EventLogFailed(format!(
+                    "Merkle chain broken at entry {i}: prev_hash mismatch"
+                )));
+            }
+            let expected_hash =
+                compute_entry_hash(&entry.event, entry.timestamp, &entry.prev_hash);
+            if entry.hash != expected_hash {
+                return Err(ContextCreationError::EventLogFailed(format!(
+                    "Merkle chain broken at entry {i}: hash mismatch"
+                )));
+            }
+        }
+
+        let mut logs = self
+            .logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut log = ContextLog::default();
+        log.entries = entries;
+        logs.insert(*context_id, log);
+        Ok(())
+    }
+
     /// Verifies the Merkle chain integrity of a context's event log.
     ///
     /// Returns `true` if every entry's `prev_hash` matches the preceding
@@ -207,6 +301,35 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         logs.remove(context_id);
         Ok(())
+    }
+
+    fn export_event_log_data(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<Vec<u8>, crate::context::ContextError> {
+        self.export_event_log_entries(context_id)
+            .map_err(|e| crate::context::ContextError::EventLogFailed(e.to_string()))
+    }
+
+    fn import_event_log_data(
+        &self,
+        context_id: &[u8; 32],
+        data: &[u8],
+    ) -> Result<(), crate::context::ContextError> {
+        self.import_event_log_entries(context_id, data)
+            .map_err(|e| crate::context::ContextError::EventLogFailed(e.to_string()))
+    }
+
+    fn event_log_merkle_root(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<[u8; 32], crate::context::ContextError> {
+        self.merkle_root(context_id).ok_or_else(|| {
+            crate::context::ContextError::EventLogFailed(format!(
+                "no event log for context {}",
+                hex::encode(context_id)
+            ))
+        })
     }
 }
 

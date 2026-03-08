@@ -1134,6 +1134,171 @@ impl ContextManager {
         Ok(restored)
     }
 
+    // -------------------------------------------------------------------
+    // Context export/import (#363)
+    // -------------------------------------------------------------------
+
+    /// Exports the full state of a context for backup or migration.
+    ///
+    /// Returns a [`ContextExport`] containing the context snapshot, serialized
+    /// event log entries, and an opaque MLS state blob (empty until MLS
+    /// integration lands via #333).
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` -- The context to export.
+    /// * `exporter_did` -- The DID of the identity performing the export.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError`] if the context does not exist or event log
+    /// export fails.
+    pub async fn export_context(
+        &self,
+        context_id: &str,
+        exporter_did: DID,
+    ) -> Result<super::export_import::ContextExport, ContextError> {
+        let ctx_id_bytes = super::context_id_bytes(context_id);
+
+        let snapshot = {
+            let contexts = self.contexts.lock().await;
+            let ctx = contexts.get(context_id).ok_or_else(|| {
+                ContextError::MembershipFailed(format!(
+                    "context '{context_id}' not found — cannot export"
+                ))
+            })?;
+            Self::snapshot_context(ctx)
+        };
+
+        let event_log_data = self
+            .event_log
+            .export_event_log_data(&ctx_id_bytes)
+            .unwrap_or_default();
+
+        // MLS state is empty until #333 (MLS integration) lands.
+        let mls_state = Vec::new();
+
+        super::export_import::create_export(
+            snapshot,
+            event_log_data,
+            mls_state,
+            exporter_did,
+            super::export_import::ExportScope::Full,
+        )
+    }
+
+    /// Imports a previously exported context into this manager.
+    ///
+    /// Validates the export (version check, Merkle chain integrity, root
+    /// hash match) and restores the context state. The imported context
+    /// becomes active and available for operations.
+    ///
+    /// # Arguments
+    ///
+    /// * `export` -- The exported context data to import.
+    ///
+    /// # Returns
+    ///
+    /// A [`ContextHandle`] for the imported context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError`] if validation fails (unsupported version,
+    /// Merkle mismatch, tampered events) or the context already exists.
+    pub async fn import_context(
+        &self,
+        export: super::export_import::ContextExport,
+    ) -> Result<ContextHandle, ContextError> {
+        // 1. Validate export.
+        super::export_import::validate_export_for_import(&export)?;
+
+        let context_id = export.snapshot.context_id.clone();
+        let ctx_id_bytes = super::context_id_bytes(&context_id);
+
+        // 2. Import event log data if present.
+        if !export.event_log_data.is_empty() {
+            self.event_log
+                .import_event_log_data(&ctx_id_bytes, &export.event_log_data)?;
+        }
+
+        // 3. Reconstruct the ContextHandle.
+        let handle =
+            ContextHandle::new(context_id.clone(), export.snapshot.context_params.clone());
+
+        // Transition to the state from the snapshot.
+        match &export.snapshot.state {
+            ContextState::Active => {
+                handle.transition_to(&ContextState::Active).await?;
+            }
+            ContextState::Creating => {
+                // Already in Creating state, nothing to do.
+            }
+            other => {
+                return Err(ContextError::InvalidState(format!(
+                    "cannot import context in {other} state — only Active and Creating are supported"
+                )));
+            }
+        }
+
+        // 4. Reconstruct governance engine from snapshot.
+        let governance_engine = restore_governance_engine_from_snapshot(
+            &export.snapshot,
+            self.key_resolver.clone(),
+        )?;
+
+        // 5. Build PerContextState from the snapshot.
+        let per_context = PerContextState {
+            handle: handle.clone(),
+            membership: export.snapshot.membership,
+            role_state: export.snapshot.role_state,
+            receive_buffer: ReceiveBuffer::new(),
+            ttl_timer: TtlTimer::new(),
+            ttl_extension: None,
+            broadcast_context: None,
+            executed_proposals: export.snapshot.executed_proposals,
+            registered_tools: export.snapshot.registered_tools,
+            write_revoked_members: export.snapshot.write_revoked_members,
+            tool_interfaces: export.snapshot.tool_interfaces,
+            threshold_signers: export.snapshot.threshold_signers,
+            threshold_value: export.snapshot.threshold_value,
+            pruning_policy: export.snapshot.pruning_policy,
+            governance_engine,
+            economic_policy: export.snapshot.economic_policy,
+            governance_timeout_task: GovernanceTimeoutTask::new(),
+        };
+
+        // 6. Register the context.
+        {
+            let mut contexts = self.contexts.lock().await;
+            if contexts.contains_key(&context_id) {
+                return Err(ContextError::MembershipFailed(format!(
+                    "context '{context_id}' already exists — cannot import"
+                )));
+            }
+            contexts.insert(context_id.clone(), per_context);
+        }
+
+        // 7. Persist if persistence is configured.
+        let snapshot_for_persist = {
+            let contexts = self.contexts.lock().await;
+            contexts
+                .get(&context_id)
+                .map(|ctx| Self::snapshot_context(ctx))
+        };
+        if let Some(snap) = snapshot_for_persist {
+            self.persist_context_snapshot(&context_id, &snap);
+        }
+
+        // 8. Re-spawn TTL timer if there was remaining TTL.
+        if let Some(remaining_secs) = export.snapshot.ttl_remaining_secs {
+            let duration = std::time::Duration::from_secs(remaining_secs);
+            self.spawn_ttl_timer(&context_id, duration, handle.clone())
+                .await;
+        }
+
+        Ok(handle)
+    }
+
     /// Creates a new SCP context with the two-phase commit pattern.
     ///
     /// Delegates to [`builder::create_context`] which validates all

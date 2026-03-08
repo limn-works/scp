@@ -3193,3 +3193,75 @@ pub fn trust_verify_response(
 
     Ok(scp_core::trust::verify_challenge_response(&request, &response, &resolver, &clock).is_ok())
 }
+
+// ---------------------------------------------------------------------------
+// Context export/import (#363)
+// ---------------------------------------------------------------------------
+
+/// Exports a context's full state as serialized MessagePack bytes.
+///
+/// Returns the serialized bytes of a `StoredValue<ContextExport>` envelope
+/// (§17.5), suitable for backup, migration, or transfer to another node.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` if the context does not exist, export fails,
+/// or serialization fails.
+#[uniffi::export]
+pub async fn context_export(handle: Arc<ContextHandle>) -> Result<Vec<u8>, ScpError> {
+    let ctx_id = handle.context_id.clone();
+    let creator_did = handle.creator_did.clone();
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager();
+            let export = manager
+                .export_context(&ctx_id, scp_identity::DID::from(creator_did))
+                .await
+                .map_err(ScpError::from)?;
+            scp_core::context::export_import::serialize_export(&export).map_err(|e| {
+                ScpError::Context {
+                    message: format!("export serialization failed: {e}"),
+                    code: "SCP-CTX-2030".to_owned(),
+                }
+            })
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            message: format!("tokio task join error during context export: {e}"),
+            code: "SCP-CTX-2031".to_owned(),
+        })?
+}
+
+/// Imports a context from serialized MessagePack bytes.
+///
+/// The bytes must be a `StoredValue<ContextExport>` envelope (§17.5), as
+/// produced by [`context_export`].
+///
+/// Returns the context ID of the imported context.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` if deserialization, validation, or import
+/// fails.
+#[uniffi::export]
+pub async fn context_import(data: Vec<u8>) -> Result<String, ScpError> {
+    runtime()
+        .spawn(async move {
+            let export =
+                scp_core::context::export_import::deserialize_export(&data).map_err(|e| {
+                    ScpError::Context {
+                        message: format!("invalid export data: {e}"),
+                        code: "SCP-CTX-2032".to_owned(),
+                    }
+                })?;
+            let context_id = export.snapshot.context_id.clone();
+            let manager = crate::runtime::context_manager();
+            manager.import_context(export).await.map_err(ScpError::from)?;
+            Ok(context_id)
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            message: format!("tokio task join error during context import: {e}"),
+            code: "SCP-CTX-2033".to_owned(),
+        })?
+}

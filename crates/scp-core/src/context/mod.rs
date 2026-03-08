@@ -29,6 +29,7 @@
 pub mod broadcast;
 pub mod builder;
 pub mod close;
+pub mod export_import;
 pub mod governance;
 pub mod invitation;
 pub mod manager;
@@ -159,6 +160,12 @@ pub use broadcast::{
     AuthorBlockResult, AuthorState, AuthorStateSnapshot, BlockResult, BroadcastAdmission,
     BroadcastContext, BroadcastContextSnapshot, KeyRequestDecision, SubscriberRecord,
     SubscriberRegistration, SubscriptionResult, UnsubscribeResult,
+};
+
+// Re-export context export/import types (issue #363).
+pub use export_import::{
+    ContextExport, ExportScope, CURRENT_EXPORT_VERSION, create_export, deserialize_export,
+    serialize_export, validate_export_for_import, verify_merkle_chain,
 };
 
 // Re-export TTL management types (SCP-021, SCP-066).
