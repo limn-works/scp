@@ -158,7 +158,9 @@ pub struct BroadcastKeyEpochAdvance {
 /// `SHA-256("SCP-BROADCAST-ENVELOPE-V1:" || version || len(context_id) || context_id || len(author_did) || author_did || sequence || key_epoch || timestamp || nonce || provenance_hash)`.
 /// The nonce is included to prevent content substitution by broadcast key
 /// holders. The `provenance_hash` binds provenance metadata to the signature.
-/// `content_hash` is intentionally omitted per ADR-038 (confirmation oracle).
+/// `content_hash` is intentionally omitted. Content integrity is provided by the
+/// AES-256-GCM authentication tag, and omitting it allows signature verification
+/// before decryption (reject forgeries without touching the key material).
 /// Verified BEFORE decryption in [`open_broadcast`] to reject forgeries early.
 /// See issue #352, §5.14.5.
 ///
@@ -415,7 +417,9 @@ pub struct SigningPayloadFields<'a> {
 /// succeeds because they hold the key). Including the nonce binds the signature
 /// to the specific ciphertext operation.
 ///
-/// `content_hash` is intentionally omitted per ADR-038 (confirmation oracle).
+/// `content_hash` is intentionally omitted. Content integrity is provided by the
+/// AES-256-GCM authentication tag, and omitting it allows signature verification
+/// before decryption (reject forgeries without touching the key material).
 ///
 /// Used by both [`seal_broadcast`] (sign) and [`open_broadcast`] (verify).
 ///

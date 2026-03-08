@@ -1428,18 +1428,20 @@ The open/gated distinction governs all access paths to context content, not just
 
 ```rust
 pub struct BroadcastEnvelope {
+    pub version: u16,                   // Protocol version (§13.2.2). SCP/1.0 = 0x0100
     pub context_id: ContextId,
-    pub sender_did: DID,
+    pub author_did: DID,
     pub sequence: u64,
     pub key_epoch: u64,
     pub timestamp: u64,
-    pub nonce: [u8; 12],         // AES-256-GCM nonce (random 12 bytes per message)
-    pub content_hash: [u8; 32],  // SHA-256 of plaintext content
-    pub content: Vec<u8>,        // AES-256-GCM ciphertext + auth tag (no embedded nonce)
+    pub nonce: [u8; 12],                // AES-256-GCM nonce (random 12 bytes per message)
+    pub encrypted_content: Vec<u8>,     // AES-256-GCM ciphertext || auth_tag
     pub provenance: Option<DataProvenance>,
     pub signature: Ed25519Signature,
 }
 ```
+
+**No `content_hash` field.** Content integrity is provided by the AES-256-GCM authentication tag. A cleartext `content_hash` would create a confirmation oracle for low-entropy messages (ADR-038). Omitting it from the signature also enables pre-decryption signature verification — receivers can reject forgeries without touching key material.
 
 **Nonce generation.** The `nonce` field is a random 12-byte value generated via `OsRng` (CSPRNG) per message. Each invocation of `seal_broadcast` generates a fresh nonce. The nonce is a top-level field (not embedded in `content`) so that it participates in the signature and is authenticated independently of AEAD verification. Random nonces are safe because: (1) each broadcast key encrypts at most 2^32 messages before rotation (key epoch advance on block events), well below the 2^48 birthday bound for AES-256-GCM with 96-bit random nonces; (2) no state synchronization is required between sender and receiver; (3) the construction matches the sender key layer (§9.16.1) and the WrappedContent nonce (§9.17.3).
 
@@ -1454,19 +1456,25 @@ Where `context_id` and `sender_did` are UTF-8 bytes (4-byte BE length prefix + b
 **Signature formula:**
 ```
 Ed25519_sign(active_signing_key_or_agent_signing_key, SHA-256(
-    context_id || sender_did || sequence || key_epoch || timestamp || nonce || content_hash || provenance_hash
+    "SCP-BROADCAST-ENVELOPE-V1:" || version || len(context_id) || context_id || len(author_did) || author_did || sequence || key_epoch || timestamp || nonce || provenance_hash
 ))
 ```
 
-Where `nonce` is the raw 12 bytes (fixed-size, no length prefix) and `provenance_hash = SHA256(serialize(provenance))` if present, or `SHA256(0x00)` if absent (same sentinel as InnerEnvelope, ADR-002). The nonce is included in the signed hash to prevent nonce substitution attacks — without it, an attacker who possesses the broadcast key could replace the nonce and re-encrypt different content under the same signature.
+Where:
+- `provenance_hash = SHA256(serialize(provenance))` if present, or `SHA256(0x00)` if absent (same sentinel as InnerEnvelope, ADR-002).
+- Variable-length fields (`context_id`, `author_did`) are 4-byte big-endian length-prefixed.
+- `version` is 2 bytes big-endian.
+- `sequence`, `key_epoch`, `timestamp` are 8 bytes big-endian.
+- `nonce` is 12 bytes raw (fixed-size, no length prefix).
+- `provenance_hash` is 32 bytes raw.
 
-**Send path:** validate UCAN (`messagesWrite`) → assign sequence number → generate random 12-byte nonce → compute `content_hash = SHA-256(plaintext)` → hash provenance → sign (including `content_hash` and nonce in hash) → construct inner payload (`plaintext || content_hash || provenance`) → AES-256-GCM encrypt inner payload with author broadcast key using nonce and AAD → serialize BroadcastEnvelope (cleartext metadata + encrypted payload, NO cleartext `content_hash`) → wrap in OuterEnvelope → relay PUBLISH.
+The domain separator `"SCP-BROADCAST-ENVELOPE-V1:"` prevents cross-protocol payload confusion. The nonce MUST be included in the signature to bind it to the specific encryption operation — without it, any broadcast key holder could re-encrypt different content under a new nonce while reusing the original author's valid signature.
 
-**Receive path:** transport receive → dedup by blob hash → deserialize → verify signature against author's Active Signing Key or Agent Signing Key from sender's DID document → decrypt with cached author broadcast key for this epoch using envelope nonce and reconstructed AAD → extract `content_hash` from decrypted inner payload → verify `content_hash == SHA-256(decrypted_content)` → verify author UCAN → replay check (sequence number) → deliver to application layer.
+**Send path:** validate UCAN (`messagesWrite`) → assign sequence number → generate random 12-byte nonce → hash provenance → sign (domain-separated hash of version, context_id, author_did, sequence, key_epoch, timestamp, nonce, provenance_hash) → AES-256-GCM encrypt plaintext with author broadcast key using nonce and AAD → serialize BroadcastEnvelope (cleartext metadata + encrypted payload) → wrap in OuterEnvelope → relay PUBLISH.
 
-**`content_hash` placement: inside encrypted payload only.** The `content_hash` field (`SHA-256(plaintext)`) MUST NOT appear in the top-level BroadcastEnvelope or in any cleartext metadata. Placing a plaintext hash alongside ciphertext creates a confirmation oracle: an observer who does not possess the broadcast key but suspects the plaintext is one of a small set of values can compute `SHA-256(candidate)` and compare against `content_hash` to confirm. This applies even to gated broadcast contexts where membership is restricted — the relay is untrusted and MUST NOT be able to confirm plaintext content. This is consistent with ADR-038, which explicitly rejected `content_hash` in WrappedContent for the same reason (AEAD tags provide integrity; SHA-256(plaintext) alongside ciphertext is a confirmation oracle).
+**Receive path:** transport receive → dedup by blob hash → deserialize → verify signature against author's Active Signing Key or Agent Signing Key from sender's DID document (pre-decryption rejection of forgeries) → decrypt with cached author broadcast key for this epoch using envelope nonce and reconstructed AAD → verify author UCAN → replay check (sequence number) → deliver to application layer.
 
-Instead, `content_hash` is computed by the sender and included *inside* the encrypted payload. Recipients verify `content_hash == SHA-256(decrypted_content)` after decryption as a defense-in-depth integrity check alongside the AEAD tag. The top-level signature formula (above) includes `content_hash` because the signature is computed before encryption — but `content_hash` is then encrypted along with the content and is NOT transmitted in cleartext. The cleartext BroadcastEnvelope contains only: `context_id`, `sender_did`, `sequence`, `key_epoch`, `timestamp`, `nonce`, `encrypted_content` (which contains the plaintext + `content_hash` + provenance), `signature`, and `provenance_hash`.
+**No `content_hash` in envelope or signature.** The BroadcastEnvelope does not contain a `content_hash` field, and `content_hash` is not part of the signature formula. Content integrity is provided by the AES-256-GCM authentication tag — a separate `content_hash` is redundant. More importantly, omitting `content_hash` from the signature enables **pre-decryption signature verification**: receivers can reject forged envelopes without accessing the broadcast key, since the signature covers only cleartext metadata fields. Placing a plaintext hash alongside ciphertext would also create a confirmation oracle for low-entropy messages (ADR-038). The cleartext BroadcastEnvelope contains only: `version`, `context_id`, `author_did`, `sequence`, `key_epoch`, `timestamp`, `nonce`, `encrypted_content`, `provenance`, and `signature`.
 
 ### 5.14.6 Routing
 
