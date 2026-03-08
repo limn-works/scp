@@ -156,9 +156,12 @@ pub struct BroadcastKeyEpochAdvance {
 /// decryption. See issue #228, #396.
 ///
 /// The `signature` field is an Ed25519 signature over the canonical hash
-/// `SHA-256("SCP-BROADCAST-ENVELOPE-V1:" || len(context_id) || context_id || len(author_did) || author_did || sequence || timestamp || key_epoch)`.
+/// `SHA-256("SCP-BROADCAST-ENVELOPE-V1:" || version || len(context_id) || context_id || len(author_did) || author_did || sequence || key_epoch || timestamp || nonce || provenance_hash)`.
+/// The nonce is included to prevent content substitution by broadcast key
+/// holders. The provenance_hash binds provenance metadata to the signature.
+/// `content_hash` is intentionally omitted per ADR-038 (confirmation oracle).
 /// Verified BEFORE decryption in [`open_broadcast`] to reject forgeries early.
-/// See issue #352.
+/// See issue #352, §5.14.5.
 ///
 /// [`encrypt_sender_layer`]: super::encrypt::encrypt_sender_layer
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,7 +183,8 @@ pub struct BroadcastEnvelope {
     /// Optional provenance metadata for cross-context data flows (§7.7.1).
     pub provenance: Option<crate::provenance::DataProvenance>,
     /// Ed25519 signature over `canonical_hash("SCP-BROADCAST-ENVELOPE-V1:", ...)`
-    /// with fields: `context_id`, `author_did`, `sequence`, `timestamp`, `key_epoch`.
+    /// with fields: `version`, `context_id`, `author_did`, `sequence`,
+    /// `key_epoch`, `timestamp`, `nonce`, `provenance_hash`.
     #[serde(with = "crate::serde_util::serde_signature_64")]
     pub signature: [u8; 64],
     /// AES-256-GCM nonce (12 bytes), stored as a top-level field per §5.14.5.
@@ -337,35 +341,73 @@ pub struct SealBroadcastParams<'a> {
     pub signing_key: &'a ed25519_dalek::SigningKey,
 }
 
+/// Computes `SHA-256(serialize(provenance))` if present, or `SHA-256(0x00)` if
+/// absent. Returns a fixed-size 32-byte array (SHA-256 output).
+///
+/// This mirrors [`compute_provenance_hash`](crate::envelope::inner) and uses
+/// the same serialization format (MessagePack via `rmp_serde::to_vec`) to ensure
+/// cross-envelope consistency.
+fn compute_provenance_hash(
+    provenance: Option<&crate::provenance::DataProvenance>,
+) -> Result<[u8; 32], SenderKeyError> {
+    use sha2::{Digest, Sha256};
+    match provenance {
+        Some(p) => {
+            let serialized = rmp_serde::to_vec(p).map_err(|e| {
+                SenderKeyError::EncryptionFailed(format!("provenance serialization failed: {e}"))
+            })?;
+            Ok(Sha256::digest(&serialized).into())
+        }
+        None => Ok(Sha256::digest([0x00]).into()),
+    }
+}
+
+/// Fields for constructing the canonical signing payload of a
+/// `BroadcastEnvelope`. Avoids exceeding clippy's argument limit.
+struct SigningPayloadFields<'a> {
+    version: u16,
+    context_id: &'a str,
+    author_did: &'a str,
+    sequence: u64,
+    key_epoch: u64,
+    timestamp: u64,
+    nonce: &'a [u8; 12],
+    provenance_hash: &'a [u8; 32],
+}
+
 /// Constructs the canonical signing payload for a `BroadcastEnvelope`.
 ///
 /// Uses [`canonical_hash`] with domain separator `"SCP-BROADCAST-ENVELOPE-V1:"`
 /// and length-prefixed variable-length fields, matching the pattern used by
 /// [`compute_block_notification_hash`] in `key_protocol.rs`.
 ///
-/// Field order per §13.2.2: `version`, `context_id`, `author_did`, `sequence`,
-/// `timestamp`, `key_epoch`.
+/// Field order per §5.14.5 (lines 987-988):
+/// `version`, `context_id`, `author_did`, `sequence`, `key_epoch`, `timestamp`,
+/// `nonce`, `provenance_hash`.
+///
+/// **Security:** The nonce MUST be included in the signature commitment.
+/// Without it, any broadcast key holder can re-encrypt different content under
+/// a fresh nonce and reuse the original author's valid signature (the AEAD
+/// succeeds because they hold the key). Including the nonce binds the signature
+/// to the specific ciphertext operation.
+///
+/// `content_hash` is intentionally omitted per ADR-038 (confirmation oracle).
 ///
 /// Used by both [`seal_broadcast`] (sign) and [`open_broadcast`] (verify).
-fn build_signing_payload(
-    version: u16,
-    context_id: &str,
-    author_did: &str,
-    sequence: u64,
-    timestamp: u64,
-    key_epoch: u64,
-) -> [u8; 32] {
+fn build_signing_payload(fields: &SigningPayloadFields<'_>) -> [u8; 32] {
     use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
     canonical_hash(
         "SCP-BROADCAST-ENVELOPE-V1:",
         &[
-            CanonicalField::U16(version),
-            CanonicalField::VarBytes(context_id.as_bytes()),
-            CanonicalField::VarBytes(author_did.as_bytes()),
-            CanonicalField::U64(sequence),
-            CanonicalField::U64(timestamp),
-            CanonicalField::U64(key_epoch),
+            CanonicalField::U16(fields.version),
+            CanonicalField::VarBytes(fields.context_id.as_bytes()),
+            CanonicalField::VarBytes(fields.author_did.as_bytes()),
+            CanonicalField::U64(fields.sequence),
+            CanonicalField::U64(fields.key_epoch),
+            CanonicalField::U64(fields.timestamp),
+            CanonicalField::RawBytes(fields.nonce),
+            CanonicalField::Fixed32(fields.provenance_hash),
         ],
     )
 }
@@ -427,15 +469,24 @@ pub fn seal_broadcast(
         )
         .map_err(|e| SenderKeyError::EncryptionFailed(e.to_string()))?;
 
-    // Sign over canonical field concatenation.
-    let signing_payload = build_signing_payload(
-        crate::envelope::SCP_PROTOCOL_VERSION,
-        params.context_id,
-        &key.author_did,
-        params.sequence,
-        params.timestamp,
-        key.epoch,
-    );
+    // Compute provenance hash for signature commitment.
+    let provenance_hash = compute_provenance_hash(params.provenance.as_ref())?;
+
+    // Sign over canonical field concatenation (§5.14.5).
+    // Field order: version, context_id, author_did, sequence, key_epoch,
+    // timestamp, nonce, provenance_hash.
+    // The nonce MUST be included to prevent content substitution attacks
+    // by broadcast key holders who could re-encrypt under a fresh nonce.
+    let signing_payload = build_signing_payload(&SigningPayloadFields {
+        version: crate::envelope::SCP_PROTOCOL_VERSION,
+        context_id: params.context_id,
+        author_did: &key.author_did,
+        sequence: params.sequence,
+        key_epoch: key.epoch,
+        timestamp: params.timestamp,
+        nonce: &nonce_bytes,
+        provenance_hash: &provenance_hash,
+    });
     let signature = params
         .signing_key
         .try_sign(&signing_payload)
@@ -525,14 +576,18 @@ pub fn open_broadcast(
     // Step 1: Verify signature BEFORE decryption (issue #352).
     // Use the envelope's version (not the constant) so that tampering with
     // the version field causes verification to fail (§13.2.2).
-    let signing_payload = build_signing_payload(
-        envelope.version,
-        &envelope.context_id,
-        &envelope.author_did,
-        envelope.sequence,
-        envelope.timestamp,
-        envelope.key_epoch,
-    );
+    let provenance_hash = compute_provenance_hash(envelope.provenance.as_ref())
+        .map_err(|e| SenderKeyError::VerificationFailed(format!("provenance hash failed: {e}")))?;
+    let signing_payload = build_signing_payload(&SigningPayloadFields {
+        version: envelope.version,
+        context_id: &envelope.context_id,
+        author_did: &envelope.author_did,
+        sequence: envelope.sequence,
+        key_epoch: envelope.key_epoch,
+        timestamp: envelope.timestamp,
+        nonce: &envelope.nonce,
+        provenance_hash: &provenance_hash,
+    });
     let signature = ed25519_dalek::Signature::from_bytes(&envelope.signature);
     verifying_key
         .verify_strict(&signing_payload, &signature)

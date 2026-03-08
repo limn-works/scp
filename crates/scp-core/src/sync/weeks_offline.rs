@@ -208,6 +208,33 @@ pub struct ResetRequest {
 }
 
 impl ResetRequest {
+    /// Creates a new `ResetRequest` with a cryptographically random nonce.
+    ///
+    /// The nonce is generated from `OsRng` (CSPRNG). The `signature` field is
+    /// left empty — the caller must sign `self.canonical_hash()` and set
+    /// `self.signature` before transmitting.
+    #[must_use]
+    pub fn new(
+        context_id: ContextId,
+        member_did: DID,
+        last_known_epoch: u64,
+        reason: ResetReason,
+        timestamp: u64,
+    ) -> Self {
+        use rand::RngCore;
+        let mut nonce = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        Self {
+            context_id,
+            member_did,
+            last_known_epoch,
+            reason,
+            nonce,
+            timestamp,
+            signature: Vec::new(),
+        }
+    }
+
     /// Computes the canonical hash for this `ResetRequest`.
     ///
     /// The hash covers all fields except `signature` using the domain separator
@@ -291,6 +318,9 @@ impl ResetRequestNonceTracker {
     /// cache exceeds [`MAX_NONCE_CACHE_ENTRIES`], the oldest entry (by
     /// timestamp) is evicted.
     ///
+    /// **Note:** For new code, prefer [`check_nonce`] + [`record_nonce`] to
+    /// avoid recording a nonce before signature verification passes.
+    ///
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned (another thread panicked
@@ -326,6 +356,58 @@ impl ResetRequestNonceTracker {
 
         true
     }
+
+    /// Checks whether a `(member_did, nonce)` pair has been seen before,
+    /// **without recording it**.
+    ///
+    /// Returns `true` if the pair is new (not a replay).
+    /// Returns `false` if the pair has been seen within the TTL window.
+    ///
+    /// Use this before signature verification. After signature verification
+    /// passes, call [`record_nonce`] to record the nonce. This prevents an
+    /// attacker from poisoning the nonce cache with forged requests.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use = "ignoring nonce check result is a security bug"]
+    pub fn check_nonce(&self, member_did: &str, nonce: &[u8; 16], now: u64) -> bool {
+        #[allow(clippy::expect_used)]
+        let mut seen = self.seen.lock().expect("nonce tracker lock poisoned");
+
+        // Lazy eviction of expired entries.
+        seen.retain(|_, first_seen| now.saturating_sub(*first_seen) < self.ttl_secs);
+
+        let key = (member_did.to_owned(), *nonce);
+        !seen.contains_key(&key)
+    }
+
+    /// Records a `(member_did, nonce)` pair as seen.
+    ///
+    /// Call this **only after** signature verification passes. The nonce is
+    /// recorded with the given timestamp for TTL-based eviction.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn record_nonce(&self, member_did: &str, nonce: &[u8; 16], now: u64) {
+        #[allow(clippy::expect_used)]
+        let mut seen = self.seen.lock().expect("nonce tracker lock poisoned");
+
+        let key = (member_did.to_owned(), *nonce);
+        seen.insert(key, now);
+
+        // Capacity bound: evict oldest entry if over limit.
+        if seen.len() > MAX_NONCE_CACHE_ENTRIES {
+            if let Some(oldest_key) = seen
+                .iter()
+                .min_by_key(|(_, ts)| **ts)
+                .map(|(k, _)| k.clone())
+            {
+                seen.remove(&oldest_key);
+            }
+        }
+    }
 }
 
 impl Default for ResetRequestNonceTracker {
@@ -358,12 +440,23 @@ pub struct ValidatedResetRequest {
 ///    [`RESET_REQUEST_FRESHNESS_SECS`] (30 seconds). Both past and future
 ///    timestamps are checked.
 /// 2. **Nonce dedup:** Rejects requests whose nonce has already been seen
-///    within the tracker's TTL window (60 seconds).
+///    within the tracker's TTL window (60 seconds). The nonce is **not**
+///    recorded by this function — the caller MUST call
+///    [`ResetRequestNonceTracker::record_nonce`] after signature verification
+///    passes. This prevents an attacker from poisoning the nonce cache with
+///    forged (unsigned or mis-signed) requests.
 ///
-/// Signature verification is NOT performed here — the caller must verify
-/// the Ed25519 signature over the returned `canonical_hash` using the
-/// member's DID verification method. This separation allows the validation
-/// logic to remain transport- and identity-layer agnostic.
+/// Signature verification is NOT performed here — the caller must:
+/// 1. Call this function to get the `canonical_hash`.
+/// 2. Verify the Ed25519 signature over `canonical_hash` using the member's
+///    DID verification method (`#active` or `#agent`).
+/// 3. Only after signature verification passes, call
+///    `nonce_tracker.record_nonce(member_did, nonce, now)` to mark the nonce
+///    as consumed.
+///
+/// This separation prevents nonce-poisoning attacks where an attacker sends
+/// forged requests to exhaust legitimate nonces before the real request
+/// arrives.
 ///
 /// # Errors
 ///
@@ -389,8 +482,10 @@ pub fn validate_reset_request(
         });
     }
 
-    // Check 2: nonce dedup (60-second TTL, keyed by (member_did, nonce)).
-    if !nonce_tracker.check_and_record(request.member_did.as_ref(), &request.nonce, now) {
+    // Check 2: nonce dedup (read-only check — no recording).
+    // Recording happens after the caller verifies the signature, to prevent
+    // nonce-poisoning by forged requests.
+    if !nonce_tracker.check_nonce(request.member_did.as_ref(), &request.nonce, now) {
         return Err(WeeksOfflineError::ReplayedResetRequest {
             context_id: request.context_id.clone(),
             nonce: request.nonce,
@@ -1976,9 +2071,16 @@ mod tests {
         let nonce = [0x42; 16];
         let request = make_test_request(nonce, BASE_TIMESTAMP);
 
-        // First submission succeeds.
+        // First submission succeeds (validate checks nonce without recording).
         let result = validate_reset_request(&request, BASE_TIMESTAMP + 1, &tracker);
         assert!(result.is_ok());
+
+        // Simulate caller recording nonce after signature verification passes.
+        tracker.record_nonce(
+            request.member_did.as_ref(),
+            &request.nonce,
+            BASE_TIMESTAMP + 1,
+        );
 
         // Second submission with same nonce is rejected.
         let result = validate_reset_request(&request, BASE_TIMESTAMP + 2, &tracker);
@@ -2037,6 +2139,82 @@ mod tests {
         let request = make_test_request([0xFD; 16], future_ts);
         let result = validate_reset_request(&request, BASE_TIMESTAMP, &tracker);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_does_not_record_nonce() {
+        // validate_reset_request must NOT record the nonce — only check it.
+        // This prevents nonce-poisoning by forged (unsigned) requests.
+        let tracker = ResetRequestNonceTracker::with_default_ttl();
+        let nonce = [0xCC; 16];
+        let request = make_test_request(nonce, BASE_TIMESTAMP);
+
+        // First validation succeeds.
+        let result = validate_reset_request(&request, BASE_TIMESTAMP + 1, &tracker);
+        assert!(result.is_ok());
+
+        // Second validation with same nonce also succeeds (because the first
+        // did not record the nonce).
+        let result = validate_reset_request(&request, BASE_TIMESTAMP + 2, &tracker);
+        assert!(result.is_ok());
+
+        // After explicit recording, the nonce is rejected.
+        tracker.record_nonce(
+            request.member_did.as_ref(),
+            &request.nonce,
+            BASE_TIMESTAMP + 2,
+        );
+        let result = validate_reset_request(&request, BASE_TIMESTAMP + 3, &tracker);
+        assert!(matches!(
+            result,
+            Err(WeeksOfflineError::ReplayedResetRequest { .. })
+        ));
+    }
+
+    #[test]
+    fn reset_request_new_generates_random_nonce() {
+        let r1 = ResetRequest::new(
+            "ctx-test".to_owned(),
+            DID::from("did:dht:z6MkBob"),
+            100,
+            ResetReason::ExtendedOffline {
+                offline_duration_secs: EIGHT_DAYS_SECS,
+            },
+            BASE_TIMESTAMP,
+        );
+        let r2 = ResetRequest::new(
+            "ctx-test".to_owned(),
+            DID::from("did:dht:z6MkBob"),
+            100,
+            ResetReason::ExtendedOffline {
+                offline_duration_secs: EIGHT_DAYS_SECS,
+            },
+            BASE_TIMESTAMP,
+        );
+        // Nonces must differ (CSPRNG).
+        assert_ne!(r1.nonce, r2.nonce);
+        // Signature must be empty (caller signs after construction).
+        assert!(r1.signature.is_empty());
+        // Other fields match inputs.
+        assert_eq!(r1.context_id, "ctx-test");
+        assert_eq!(r1.member_did.as_ref(), "did:dht:z6MkBob");
+        assert_eq!(r1.last_known_epoch, 100);
+        assert_eq!(r1.timestamp, BASE_TIMESTAMP);
+    }
+
+    #[test]
+    fn check_nonce_does_not_record() {
+        let tracker = ResetRequestNonceTracker::with_default_ttl();
+        let nonce = [0xDD; 16];
+        let did = "did:dht:z6MkAlice";
+
+        // check_nonce returns true (new) but does not record.
+        assert!(tracker.check_nonce(did, &nonce, BASE_TIMESTAMP));
+        assert!(tracker.check_nonce(did, &nonce, BASE_TIMESTAMP + 1));
+
+        // record_nonce makes subsequent checks return false.
+        tracker.record_nonce(did, &nonce, BASE_TIMESTAMP + 1);
+        assert!(!tracker.check_nonce(did, &nonce, BASE_TIMESTAMP + 2));
     }
 
     // -----------------------------------------------------------------------
