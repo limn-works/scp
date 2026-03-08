@@ -124,7 +124,7 @@ pub struct ToolRegistration {
     /// the registrant's signing key.
     ///
     /// Enables independent verification that the registration was created by
-    /// the claimed registrant. The signed payload is the MessagePack encoding
+    /// the claimed registrant. The signed payload is the `MessagePack` encoding
     /// of all fields except `signature` itself. Defaults to empty for backward
     /// compatibility.
     #[serde(default)]
@@ -484,7 +484,7 @@ where
 
 /// Computes the canonical bytes for tool registration signature verification.
 ///
-/// The signed payload is the MessagePack encoding of a canonical struct
+/// The signed payload is the `MessagePack` encoding of a canonical struct
 /// containing all `ToolRegistration` fields except `signature` itself,
 /// in a deterministic order. This ensures independent verification that
 /// the registration was created by the claimed registrant.
@@ -577,17 +577,14 @@ pub fn verify_tool_registration_signature(
         return Ok(());
     }
 
-    let sig_bytes: [u8; 64] =
-        registration
-            .signature
-            .as_slice()
-            .try_into()
-            .map_err(|_| ToolError::SignatureVerificationFailed {
-                reason: format!(
-                    "signature must be 64 bytes, got {}",
-                    registration.signature.len()
-                ),
-            })?;
+    let sig_bytes: [u8; 64] = registration.signature.as_slice().try_into().map_err(|_| {
+        ToolError::SignatureVerificationFailed {
+            reason: format!(
+                "signature must be 64 bytes, got {}",
+                registration.signature.len()
+            ),
+        }
+    })?;
 
     let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
     let canonical = compute_tool_registration_canonical_bytes(registration);

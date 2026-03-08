@@ -9,11 +9,11 @@
 //! SCP-274: Full governance lifecycle integration test.
 //!
 //! Exercises the governance lifecycle through `ContextManager` for all four
-//! governance models: SingleAdmin, Threshold, Majority, Unanimity.
+//! governance models: `SingleAdmin`, Threshold, Majority, Unanimity.
 //!
 //! Covers all 15 acceptance criteria:
 //! 1.  Context creation with each governance model
-//! 2.  SingleAdmin auto-approve + auto-execute
+//! 2.  `SingleAdmin` auto-approve + auto-execute
 //! 3.  Threshold: propose -> collect M approvals -> execute
 //! 4.  Majority: propose -> collect majority votes -> execute
 //! 5.  Unanimity: propose -> all approve -> execute
@@ -21,9 +21,9 @@
 //! 7.  Expired proposals do not execute
 //! 8.  All 8 governance event types
 //! 9.  Governance bypass prevention
-//! 10. 7+ GovernanceAction variants exercised
-//! 11. ExtendTtl unanimity override in Threshold context
-//! 12. PromoteContext unanimity override in Majority context
+//! 10. 7+ `GovernanceAction` variants exercised
+//! 11. `ExtendTtl` unanimity override in Threshold context
+//! 12. `PromoteContext` unanimity override in Majority context
 //! 13. Conflict detection and resolution
 //! 14. Deadlock detection for Threshold model
 //! 15. Checkpoint cosignature quorum for Threshold model
@@ -129,7 +129,7 @@ struct MockTransport {
 }
 
 impl MockTransport {
-    fn connected() -> Self {
+    const fn connected() -> Self {
         Self {
             connected: AtomicBool::new(true),
         }
@@ -222,7 +222,7 @@ fn new_manager() -> ContextManager {
     ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
+        Box::new(MockEventLog),
         mock_key_resolver(),
     )
 }
@@ -669,8 +669,7 @@ async fn ac6_rejected_threshold_proposal() {
     };
     assert!(
         matches!(final_status, ProposalStatus::Rejected { .. }),
-        "expected Rejected, got {:?}",
-        final_status
+        "expected Rejected, got {final_status:?}"
     );
 }
 
@@ -751,7 +750,7 @@ async fn ac8_all_governance_event_types() {
     let event = GovernanceEvent::ProposalCreated {
         proposal_id: [0u8; 32],
         proposer_did: alice(),
-        action: GovernanceAction::CloseContext { reason: None },
+        action: Box::new(GovernanceAction::CloseContext { reason: None }),
         voting_deadline: 1_000_300,
     };
     assert!(matches!(event, GovernanceEvent::ProposalCreated { .. }));
@@ -805,7 +804,7 @@ async fn ac8_all_governance_event_types() {
     assert!(matches!(event, GovernanceEvent::ConflictResolved { .. }));
 }
 
-/// Verify that VoteWithdrawn events are produced by the manager's withdraw method.
+/// Verify that `VoteWithdrawn` events are produced by the manager's withdraw method.
 #[tokio::test]
 async fn ac8_vote_withdrawn_event_via_manager() {
     let manager = new_manager();
@@ -1537,7 +1536,7 @@ fn ac14_threshold_deadlock_insufficient_active_signers() {
             assert!(unavailable.contains(&bob()));
             assert!(unavailable.contains(&carol()));
         }
-        other => panic!("expected ThresholdInsufficient, got {:?}", other),
+        other => panic!("expected ThresholdInsufficient, got {other:?}"),
     }
 }
 
@@ -1640,7 +1639,7 @@ fn ac14_unanimity_deadlock_voter_offline_7_days() {
             assert_eq!(*offline_did, bob());
             assert!(*offline_duration_secs >= 7 * 24 * 60 * 60);
         }
-        other => panic!("expected UnanimityOffline, got {:?}", other),
+        other => panic!("expected UnanimityOffline, got {other:?}"),
     }
 }
 

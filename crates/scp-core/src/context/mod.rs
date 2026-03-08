@@ -165,7 +165,7 @@ pub use broadcast::{
 
 // Re-export context export/import types (issue #363).
 pub use export_import::{
-    ContextExport, ExportScope, CURRENT_EXPORT_VERSION, create_export, deserialize_export,
+    CURRENT_EXPORT_VERSION, ContextExport, ExportScope, create_export, deserialize_export,
     serialize_export, validate_export_for_import, verify_merkle_chain,
 };
 

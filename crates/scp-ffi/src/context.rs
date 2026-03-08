@@ -1406,7 +1406,8 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
         discoverable: false,
         max_chain_depth: None,
         participation_requirements: Vec::new(),
-        incomplete_verification_policy: scp_core::context::params::IncompleteVerificationPolicy::default(),
+        incomplete_verification_policy:
+            scp_core::context::params::IncompleteVerificationPolicy::default(),
     }
 }
 
@@ -1449,7 +1450,7 @@ fn py_get_economic_policy(handle: &PyContextHandle) -> Option<String> {
 // Context export/import bridge (#363)
 // ---------------------------------------------------------------------------
 
-/// Exports a context's full state as serialized MessagePack bytes.
+/// Exports a context's full state as serialized `MessagePack` bytes.
 ///
 /// The returned bytes are a [`StoredValue<ContextExport>`] envelope per §17.5,
 /// suitable for backup, migration, or transfer to another node.
@@ -1469,8 +1470,8 @@ fn py_get_economic_policy(handle: &PyContextHandle) -> Option<String> {
 #[pyo3(signature = (context_id,))]
 fn py_context_export(context_id: &str) -> PyResult<Vec<u8>> {
     let rt = crate::runtime()?;
-    let mgr = crate::runtime::context_manager()
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let mgr = mgr.clone();
     let ctx_id = context_id.to_owned();
 
@@ -1481,8 +1482,10 @@ fn py_context_export(context_id: &str) -> PyResult<Vec<u8>> {
             let contexts = mgr.member_dids(&ctx_id).await;
             contexts.into_iter().next()
         })
-        .map(scp_identity::DID::from)
-        .unwrap_or_else(|| scp_identity::DID::from("did:key:unknown-exporter"));
+        .map_or_else(
+            || scp_identity::DID::from("did:key:unknown-exporter"),
+            scp_identity::DID::from,
+        );
 
     let export = rt
         .block_on(mgr.export_context(&ctx_id, exporter_did))
@@ -1492,7 +1495,7 @@ fn py_context_export(context_id: &str) -> PyResult<Vec<u8>> {
         .map_err(|e| PyRuntimeError::new_err(format!("export serialization failed: {e}")))
 }
 
-/// Imports a context from serialized MessagePack bytes.
+/// Imports a context from serialized `MessagePack` bytes.
 ///
 /// The bytes must be a [`StoredValue<ContextExport>`] envelope per §17.5,
 /// as produced by [`py_context_export`].
@@ -1512,14 +1515,15 @@ fn py_context_export(context_id: &str) -> PyResult<Vec<u8>> {
 #[pyfunction]
 #[pyo3(signature = (data,))]
 fn py_context_import(data: &[u8]) -> PyResult<String> {
-    let export = scp_core::context::export_import::deserialize_export(data)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid export data: {e}")))?;
+    let export = scp_core::context::export_import::deserialize_export(data).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("invalid export data: {e}"))
+    })?;
 
     let context_id = export.snapshot.context_id.clone();
 
     let rt = crate::runtime()?;
-    let mgr = crate::runtime::context_manager()
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let mgr = mgr.clone();
 
     rt.block_on(mgr.import_context(export))

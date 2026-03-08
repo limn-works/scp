@@ -100,7 +100,7 @@ fn event_data_prefix(context_id: &str) -> Result<String, StoreError> {
 /// Filter criteria for querying stored events.
 ///
 /// All fields are optional. When `None`, the filter does not constrain
-/// that dimension. Multiple filters are ANDed together.
+/// that dimension. Multiple filters are `ANDed` together.
 #[derive(Debug, Clone, Default)]
 pub struct EventQueryFilter {
     /// Match events with this exact event type (e.g., `"ToolInvoked"`).
@@ -121,8 +121,8 @@ pub struct EventQueryFilter {
 
 impl EventQueryFilter {
     /// Returns `true` if any filter field requires deserializing the event
-    /// payload to check (i.e., event_type, actor_did, or timestamp filters).
-    fn needs_deserialized_check(&self) -> bool {
+    /// payload to check (i.e., `event_type`, `actor_did`, or timestamp filters).
+    const fn needs_deserialized_check(&self) -> bool {
         self.event_type.is_some()
             || self.actor_did.is_some()
             || self.timestamp_start.is_some()
@@ -138,20 +138,20 @@ impl EventQueryFilter {
                 return false;
             }
         }
-        if let Some(ref actor) = self.actor_did {
-            if event.actor_did.0 != *actor {
-                return false;
-            }
+        if let Some(ref actor) = self.actor_did
+            && event.actor_did.0 != *actor
+        {
+            return false;
         }
-        if let Some(ts_start) = self.timestamp_start {
-            if event.timestamp < ts_start {
-                return false;
-            }
+        if let Some(ts_start) = self.timestamp_start
+            && event.timestamp < ts_start
+        {
+            return false;
         }
-        if let Some(ts_end) = self.timestamp_end {
-            if event.timestamp >= ts_end {
-                return false;
-            }
+        if let Some(ts_end) = self.timestamp_end
+            && event.timestamp >= ts_end
+        {
+            return false;
         }
         true
     }
@@ -378,12 +378,12 @@ impl<S: Storage> ProtocolStore<S> {
                 if seq_str >= end_suffix.as_str() {
                     break;
                 }
-                if seq_str >= start_suffix.as_str() {
-                    if let Some(data) = self.load_value::<Vec<u8>>(&key).await? {
-                        // Parse the sequence number from the key suffix.
-                        if let Ok(seq) = seq_str.parse::<u64>() {
-                            results.push((seq, data));
-                        }
+                if seq_str >= start_suffix.as_str()
+                    && let Some(data) = self.load_value::<Vec<u8>>(&key).await?
+                {
+                    // Parse the sequence number from the key suffix.
+                    if let Ok(seq) = seq_str.parse::<u64>() {
+                        results.push((seq, data));
                     }
                 }
             }
@@ -474,10 +474,10 @@ impl<S: Storage> ProtocolStore<S> {
 
             results.push(data);
 
-            if let Some(limit) = filter.limit {
-                if results.len() >= limit {
-                    break;
-                }
+            if let Some(limit) = filter.limit
+                && results.len() >= limit
+            {
+                break;
             }
         }
 
@@ -589,7 +589,12 @@ impl<S: Storage> ProtocolStore<S> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::cast_possible_truncation
+)]
 mod tests {
     use scp_platform::testing::InMemoryStorage;
 

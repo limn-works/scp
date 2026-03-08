@@ -322,7 +322,8 @@ pub fn detect_deadlock(
             // Convert basis points to integer ceiling count.
             // Voter count * basis points fits comfortably in u64; result fits in usize on 64-bit.
             #[allow(clippy::cast_possible_truncation)]
-            let min_participants = (eligible.len() as u64 * u64::from(min_participation_bps)).div_ceil(10000) as usize;
+            let min_participants =
+                (eligible.len() as u64 * u64::from(min_participation_bps)).div_ceil(10000) as usize;
             let unresponsive: Vec<(DID, u32)> = eligible
                 .iter()
                 .filter_map(|did| {

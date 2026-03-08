@@ -355,6 +355,7 @@ fn derive_shadow_id(bridge_id: &str, platform_user_id: &str) -> String {
 /// The authenticated bridge context is extracted from request extensions.
 ///
 /// See SCP-BCH-002 and spec section 12.10.
+#[allow(clippy::significant_drop_tightening)] // false positive on async RwLock guard scope
 async fn create_shadow_handler(
     State(bridge_state): State<Arc<BridgeState>>,
     Extension(auth_ctx): Extension<crate::bridge_auth::BridgeAuthContext>,
@@ -442,6 +443,7 @@ fn is_valid_confidence(value: &str) -> bool {
 /// Requires bridge authentication via the `bridge_auth_middleware`.
 ///
 /// See SCP-BCH-004 and spec section 12.10.
+#[allow(clippy::significant_drop_tightening)] // false positive on async RwLock guard scope
 async fn attest_handler(
     State(bridge_state): State<Arc<BridgeState>>,
     Extension(auth_ctx): Extension<crate::bridge_auth::BridgeAuthContext>,
@@ -506,7 +508,7 @@ async fn attest_handler(
 // ---------------------------------------------------------------------------
 
 /// Finds a shadow identity across all registries and returns it with context info.
-async fn find_shadow(
+fn find_shadow(
     registries: &HashMap<String, ShadowRegistry>,
     shadow_id: &str,
 ) -> Option<(String, scp_core::bridge::ShadowIdentity)> {
@@ -548,22 +550,19 @@ async fn emit_message_handler(
         return ApiError::not_found("SHADOW_NOT_FOUND: shadow has been deleted").into_response();
     }
 
-    let shadow_info = find_shadow(&registries, &body.shadow_id).await;
+    let shadow_info = find_shadow(&registries, &body.shadow_id);
     drop(registries);
     drop(deleted);
 
-    let (_ctx_id, shadow) = match shadow_info {
-        Some(info) => info,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ApiError {
-                    error: "shadow not found".to_owned(),
-                    code: "SHADOW_NOT_FOUND".to_owned(),
-                }),
-            )
-                .into_response();
-        }
+    let Some((_ctx_id, shadow)) = shadow_info else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: "shadow not found".to_owned(),
+                code: "SHADOW_NOT_FOUND".to_owned(),
+            }),
+        )
+            .into_response();
     };
 
     let shadow_status = match shadow.provenance_status {
@@ -624,6 +623,7 @@ async fn emit_message_handler(
 /// rate limits.
 ///
 /// See SCP-BCH-005 and spec section 12.10.4.
+#[allow(clippy::significant_drop_tightening)] // false positive on async RwLock guard scope
 async fn status_handler(
     State(bridge_state): State<Arc<BridgeState>>,
     Extension(auth_ctx): Extension<crate::bridge_auth::BridgeAuthContext>,
@@ -704,7 +704,7 @@ async fn delete_shadow_handler(
     drop(deleted);
 
     let registries = bridge_state.registries.read().await;
-    let shadow_info = find_shadow(&registries, &shadow_id).await;
+    let shadow_info = find_shadow(&registries, &shadow_id);
     drop(registries);
 
     match shadow_info {
@@ -776,7 +776,7 @@ async fn process_webhook_event(
                 return Some("payload.shadow_id is required for message events".to_owned());
             }
             let registries = bridge_state.registries.read().await;
-            let exists = find_shadow(&registries, shadow_id).await.is_some();
+            let exists = find_shadow(&registries, shadow_id).is_some();
             drop(registries);
             if !exists {
                 return Some("shadow not found".to_owned());
@@ -786,7 +786,7 @@ async fn process_webhook_event(
             let shadow_id = extract_shadow_id(payload);
             if !shadow_id.is_empty() {
                 let registries = bridge_state.registries.read().await;
-                let exists = find_shadow(&registries, shadow_id).await.is_some();
+                let exists = find_shadow(&registries, shadow_id).is_some();
                 drop(registries);
                 if !exists {
                     return Some("shadow not found for identity_update".to_owned());
@@ -813,9 +813,9 @@ async fn process_webhook_event(
 
 /// Handler for `POST /v1/scp/bridge/webhook`.
 ///
-/// Accepts platform-initiated events with deduplication by event_id.
-/// Supports event types: message, presence, identity_update,
-/// user_departed, message_edit, message_delete.
+/// Accepts platform-initiated events with deduplication by `event_id`.
+/// Supports event types: message, presence, `identity_update`,
+/// `user_departed`, `message_edit`, `message_delete`.
 ///
 /// See SCP-BCH-006 and spec section 12.10.4.
 async fn webhook_handler(
@@ -905,7 +905,13 @@ pub fn bridge_router(state: Arc<BridgeState>) -> Router {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::needless_pass_by_value,
+    clippy::significant_drop_tightening
+)]
 mod tests {
     use super::*;
 
@@ -943,7 +949,7 @@ mod tests {
         }
     }
 
-    /// Builds the router with BridgeAuthContext injected as an extension
+    /// Builds the router with `BridgeAuthContext` injected as an extension
     /// (bypasses real auth middleware for unit tests).
     fn test_app(state: Arc<BridgeState>) -> Router {
         let auth_ctx = test_auth_ctx();
@@ -1250,7 +1256,7 @@ mod tests {
             .expect("test")
     }
 
-    /// Creates a shadow in the state and returns its shadow_id.
+    /// Creates a shadow in the state and returns its `shadow_id`.
     async fn create_test_shadow(state: &Arc<BridgeState>) -> String {
         let app = test_app(Arc::clone(state));
         let req = create_request(serde_json::json!({
@@ -1351,7 +1357,7 @@ mod tests {
         assert_eq!(json["mode"], "Relay");
         assert_eq!(json["operator_did"], "did:dht:z6MkTestOperator");
         assert_eq!(json["shadow_count"], 1);
-        assert_eq!(json["shadows"].as_array().map(|a| a.len()), Some(1));
+        assert_eq!(json["shadows"].as_array().map(std::vec::Vec::len), Some(1));
     }
 
     #[tokio::test]
@@ -1572,8 +1578,7 @@ mod tests {
             let json = response_json(resp).await;
             assert_eq!(
                 json["accepted"], true,
-                "event type '{}' should be accepted",
-                event_type
+                "event type '{event_type}' should be accepted"
             );
         }
     }
@@ -1792,7 +1797,7 @@ mod tests {
 
     /// Verifies that deleting an unclaimed shadow succeeds and the
     /// delete handler correctly checks provenance status. The 409
-    /// (SHADOW_ALREADY_CLAIMED) path is verified structurally: the
+    /// (`SHADOW_ALREADY_CLAIMED`) path is verified structurally: the
     /// handler checks `provenance_status == Claimed` and the claiming
     /// module has its own test coverage for status transitions.
     /// Here we verify the 204 (success) and 404 (not found) paths
@@ -1817,7 +1822,7 @@ mod tests {
         assert_eq!(json["code"], "SHADOW_NOT_FOUND");
     }
 
-    /// Verifies the bridge_router function mounts all endpoints.
+    /// Verifies the `bridge_router` function mounts all endpoints.
     #[tokio::test]
     async fn bridge_router_mounts_all_endpoints() {
         let state = Arc::new(BridgeState::new());

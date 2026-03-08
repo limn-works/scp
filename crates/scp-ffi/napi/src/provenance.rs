@@ -131,7 +131,7 @@ pub fn provenance_attach(
 ///
 /// Returns `true` if within limit, `false` otherwise.
 #[napi]
-#[must_use] 
+#[must_use]
 pub fn provenance_check_chain_depth(chain_depth: u32, max_depth: Option<u32>) -> bool {
     #[allow(clippy::cast_possible_truncation)]
     let depth = chain_depth as u8;

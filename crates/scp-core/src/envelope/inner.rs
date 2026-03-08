@@ -417,7 +417,7 @@ pub fn enforce_inner_envelope_category_a(
 ///
 /// Returns [`EnvelopeError::UnsupportedVersion`] if `inner.version` is not
 /// `SCP_INNER_ENVELOPE_VERSION`.
-pub fn validate_inner_version(inner: &InnerEnvelope) -> Result<(), EnvelopeError> {
+pub const fn validate_inner_version(inner: &InnerEnvelope) -> Result<(), EnvelopeError> {
     if inner.version != SCP_INNER_ENVELOPE_VERSION {
         return Err(EnvelopeError::UnsupportedVersion {
             version: inner.version,
@@ -504,7 +504,12 @@ fn compute_canonical_hash(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::match_same_arms
+)]
 mod tests {
     use scp_platform::testing::InMemoryKeyCustody;
     use scp_platform::traits::KeyType;
@@ -1459,8 +1464,7 @@ mod tests {
             .unwrap();
 
             assert_eq!(
-                envelope.version,
-                SCP_INNER_ENVELOPE_VERSION,
+                envelope.version, SCP_INNER_ENVELOPE_VERSION,
                 "version must match SCP_INNER_ENVELOPE_VERSION"
             );
         }
@@ -1562,9 +1566,9 @@ mod tests {
 
             let result = verify_inner_signature(&envelope, pubkey.as_bytes());
             let rejected = match result {
-                Err(_) => true,     // UnsupportedVersion error
-                Ok(false) => true,  // signature mismatch
-                Ok(true) => false,  // should not happen
+                Err(_) => true,    // UnsupportedVersion error
+                Ok(false) => true, // signature mismatch
+                Ok(true) => false, // should not happen
             };
             assert!(
                 rejected,

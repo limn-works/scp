@@ -719,12 +719,13 @@ pub fn evaluate_sybil_resistance(
 
     // 2. Check signal breadth.
     if let Some(min_breadth) = policy.min_signal_breadth
-        && assessment.signal_breadth < min_breadth {
-            return Err(SybilResistanceError::InsufficientSignalBreadth {
-                required: min_breadth,
-                found: assessment.signal_breadth,
-            });
-        }
+        && assessment.signal_breadth < min_breadth
+    {
+        return Err(SybilResistanceError::InsufficientSignalBreadth {
+            required: min_breadth,
+            found: assessment.signal_breadth,
+        });
+    }
 
     // 3. Check total freshness-weighted strength.
     if let Some(min_strength) = policy.min_weighted_strength {

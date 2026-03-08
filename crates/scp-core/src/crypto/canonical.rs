@@ -96,6 +96,10 @@ pub fn canonical_hash(domain: &str, fields: &[CanonicalField<'_>]) -> [u8; 32] {
 /// instead of their SHA-256 digest. Used when the caller needs signable
 /// bytes rather than a fixed-size hash (e.g., Ed25519 signs arbitrary
 /// messages).
+///
+/// # Panics
+///
+/// Panics if any [`CanonicalField::VarBytes`] field exceeds `u32::MAX` bytes.
 #[must_use]
 pub fn canonical_hash_bytes(domain: &[u8], fields: &[CanonicalField<'_>]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(256);

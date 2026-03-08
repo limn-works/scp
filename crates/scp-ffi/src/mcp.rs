@@ -940,9 +940,8 @@ impl ContextProvider for FfiBridgeProvider {
             };
 
             // Serialize the event for ProtocolStore persistence.
-            let event_bytes = rmp_serde::to_vec(&event).map_err(|e| {
-                ScpPyError::context(format!("event serialization failed: {e}"))
-            })?;
+            let event_bytes = rmp_serde::to_vec(&event)
+                .map_err(|e| ScpPyError::context(format!("event serialization failed: {e}")))?;
 
             scp_event_log::tree::append_unsigned_event(&mut rt.event_log, &event)
                 .map_err(|e| ScpPyError::context(e.to_string()))?;
@@ -963,17 +962,17 @@ impl ContextProvider for FfiBridgeProvider {
                 // is Arc<InMemoryStorage> and ProtocolStore requires an owned
                 // Storage impl. The key convention matches ProtocolStore's
                 // event_data_key format.
-                if let Ok(storage) = crate::runtime::get_storage() {
-                    if let Ok(rt) = crate::runtime() {
-                        let key = format!("context/{context_id}/event_data/{sequence:020}");
-                        if let Err(e) = rt.block_on(storage.store(&key, &event_bytes)) {
-                            tracing::warn!(
-                                tool = %tool_name,
-                                context = %context_id,
-                                error = %e,
-                                "failed to persist event payload to storage"
-                            );
-                        }
+                if let Ok(storage) = crate::runtime::get_storage()
+                    && let Ok(rt) = crate::runtime()
+                {
+                    let key = format!("context/{context_id}/event_data/{sequence:020}");
+                    if let Err(e) = rt.block_on(storage.store(&key, &event_bytes)) {
+                        tracing::warn!(
+                            tool = %tool_name,
+                            context = %context_id,
+                            error = %e,
+                            "failed to persist event payload to storage"
+                        );
                     }
                 }
             }

@@ -533,10 +533,10 @@ impl DidDocument {
         let service = Service {
             id: format!("{}#{DEVICE_ATTESTATION_FRAGMENT}", self.id),
             service_type: DEVICE_ATTESTATION_SERVICE_TYPE.to_owned(),
-            service_endpoint: format!(
-                "data:application/octet-stream;hex,{}",
-                hex::encode(token_bytes)
-            ),
+            service_endpoint: {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.encode(token_bytes)
+            },
         };
         self.service.push(service);
     }
@@ -2056,13 +2056,13 @@ mod tests {
         let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
         doc.add_device_attestation(&[0x01]);
 
-        // Tamper with the service endpoint to have invalid hex.
+        // Tamper with the service endpoint to have invalid base64.
         let svc = doc
             .service
             .iter_mut()
             .find(|s| s.service_type == "ScpDeviceAttestation")
             .unwrap();
-        svc.service_endpoint = "data:application/octet-stream;hex,ZZZZ".to_owned();
+        svc.service_endpoint = "!!!not-valid-base64!!!".to_owned();
 
         let result = doc.device_attestation_token();
         assert!(result.is_err());

@@ -331,6 +331,11 @@ pub trait ContextEventLogProvider: Send + Sync {
     ///
     /// Returns all zeros if the log is empty. Returns an error if no log
     /// exists for the context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if the provider does not
+    /// support Merkle root computation.
     fn event_log_merkle_root(&self, context_id: &[u8; 32]) -> Result<[u8; 32], ContextError> {
         let _ = context_id;
         Err(ContextError::EventLogFailed(

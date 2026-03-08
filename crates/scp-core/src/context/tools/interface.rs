@@ -23,9 +23,7 @@ use super::registry::ToolRegistry;
 use super::{DID, ToolError, ToolId, has_admin_role};
 use crate::context::ContextHandle;
 use crate::context::roles::ContextRoleState;
-use crate::provenance::attach::{
-    DEFAULT_MAX_CHAIN_DEPTH, PROTOCOL_HARD_MAX_CHAIN_DEPTH, effective_max_chain_depth,
-};
+use crate::provenance::attach::DEFAULT_MAX_CHAIN_DEPTH;
 
 // ---------------------------------------------------------------------------
 // ContextId

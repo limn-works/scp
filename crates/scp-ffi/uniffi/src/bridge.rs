@@ -43,6 +43,12 @@ use scp_core::context::membership::KeyPackage;
 
 use crate::{decrement_handle_count, increment_handle_count, runtime};
 
+/// Tool handler function type: maps JSON input to JSON output (or error string).
+type ToolHandlerMap = std::collections::HashMap<
+    String,
+    std::sync::Arc<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync>,
+>;
+
 /// Wrapper for [`InMemoryKeyCustody`] that implements [`Debug`] with a
 /// redacted representation, preventing key material from appearing in logs.
 ///
@@ -1379,14 +1385,7 @@ pub struct ContextHandle {
     /// Tool registry for this context.
     pub(crate) tool_registry: tokio::sync::Mutex<scp_core::context::tools::ToolRegistry>,
     /// Registered tool handlers keyed by tool ID.
-    pub(crate) tool_handlers: tokio::sync::Mutex<
-        std::collections::HashMap<
-            String,
-            std::sync::Arc<
-                dyn Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync,
-            >,
-        >,
-    >,
+    pub(crate) tool_handlers: tokio::sync::Mutex<ToolHandlerMap>,
     /// Session store for stateful tool sessions (spec section 6.2.1).
     pub(crate) session_store: tokio::sync::Mutex<scp_core::context::tools::SessionStore>,
 }
@@ -4105,14 +4104,67 @@ pub fn trust_verify_response(
     let verify_signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let verify_signer = EphemeralVerifySigner(verify_signing_key);
 
-    Ok(scp_core::trust::verify_challenge_response(&request, &response, &resolver, &clock, &verify_signer, None).is_ok())
+    Ok(scp_core::trust::verify_challenge_response(
+        &request,
+        &response,
+        &resolver,
+        &clock,
+        &verify_signer,
+        None,
+    )
+    .is_ok())
+}
+
+// ---------------------------------------------------------------------------
+// verify_participation_requirements (SCP-BA-004)
+// ---------------------------------------------------------------------------
+
+/// Verifies participation profiles against admission requirements.
+///
+/// Both inputs are JSON strings:
+/// - `profile_json`: JSON array of [`ParticipationProfile`] objects.
+/// - `requirements_json`: JSON array of [`RequireParticipation`] objects.
+///
+/// Uses the current system time for freshness checks. Returns `true` if all
+/// requirements are satisfied, throws `ScpError` with a diagnostic message
+/// if any requirement fails or if the JSON is malformed.
+///
+/// See §7.3.2.1.
+#[uniffi::export]
+pub fn verify_participation_requirements(
+    profile_json: String,
+    requirements_json: String,
+) -> Result<bool, ScpError> {
+    let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(&profile_json)
+        .map_err(|e| ScpError::Validation {
+            message: format!("failed to parse participation profiles JSON: {e}"),
+            code: "SCP-VALID-7030".to_owned(),
+        })?;
+
+    let requirements: Vec<scp_core::trust::RequireParticipation> =
+        serde_json::from_str(&requirements_json).map_err(|e| ScpError::Validation {
+            message: format!("failed to parse participation requirements JSON: {e}"),
+            code: "SCP-VALID-7031".to_owned(),
+        })?;
+
+    let current_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+
+    scp_core::trust::verify_participation_requirements(current_time, &requirements, &profiles)
+        .map_err(|e| ScpError::Validation {
+            message: format!("participation admission verification failed: {e}"),
+            code: "SCP-VALID-7032".to_owned(),
+        })?;
+
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
 // Context export/import (#363)
 // ---------------------------------------------------------------------------
 
-/// Exports a context's full state as serialized MessagePack bytes.
+/// Exports a context's full state as serialized `MessagePack` bytes.
 ///
 /// Returns the serialized bytes of a `StoredValue<ContextExport>` envelope
 /// (§17.5), suitable for backup, migration, or transfer to another node.
@@ -4146,7 +4198,7 @@ pub async fn context_export(handle: Arc<ContextHandle>) -> Result<Vec<u8>, ScpEr
         })?
 }
 
-/// Imports a context from serialized MessagePack bytes.
+/// Imports a context from serialized `MessagePack` bytes.
 ///
 /// The bytes must be a `StoredValue<ContextExport>` envelope (§17.5), as
 /// produced by [`context_export`].
@@ -4170,7 +4222,10 @@ pub async fn context_import(data: Vec<u8>) -> Result<String, ScpError> {
                 })?;
             let context_id = export.snapshot.context_id.clone();
             let manager = crate::runtime::context_manager();
-            manager.import_context(export).await.map_err(ScpError::from)?;
+            manager
+                .import_context(export)
+                .await
+                .map_err(ScpError::from)?;
             Ok(context_id)
         })
         .await
@@ -4271,7 +4326,7 @@ pub fn provenance_attach(
 
 /// Checks whether the provenance chain depth is within the allowed limit.
 #[uniffi::export]
-#[must_use] 
+#[must_use]
 pub fn provenance_check_chain_depth(chain_depth: u8, max_depth: Option<u8>) -> bool {
     let max = max_depth.unwrap_or(scp_core::provenance::attach::DEFAULT_MAX_CHAIN_DEPTH);
     let prov = scp_core::provenance::DataProvenance {
@@ -4367,7 +4422,7 @@ pub fn bridge_evaluate_trust(
 ///
 /// Returns `"short"`, `"extended"`, or `"long"`.
 #[uniffi::export]
-#[must_use] 
+#[must_use]
 pub fn sync_classify_offline(last_relay_contact: u64, now: u64) -> String {
     match scp_core::sync::classify_offline_duration(last_relay_contact, now) {
         scp_core::sync::OfflineTier::Short => "short".to_string(),
@@ -4380,7 +4435,7 @@ pub fn sync_classify_offline(last_relay_contact: u64, now: u64) -> String {
 ///
 /// Returns `"short"`, `"extended"`, or `"long"`.
 #[uniffi::export]
-#[must_use] 
+#[must_use]
 pub fn sync_classify_offline_custom(
     last_relay_contact: u64,
     now: u64,
@@ -4472,7 +4527,7 @@ pub fn discovery_create_query(
 ///
 /// Lowercases and trims whitespace.
 #[uniffi::export]
-#[must_use] 
+#[must_use]
 pub fn discovery_normalize_address(address: String) -> String {
     scp_core::discovery::normalize_address(&address)
 }

@@ -61,6 +61,12 @@ const HASH_CHAIN_DOMAIN: &[u8] = b"SCP-PRIVATE-LOG-V1:";
 /// # Returns
 ///
 /// A 32-byte routing ID suitable for relay PUBLISH/QUERY operations.
+///
+/// # Panics
+///
+/// Panics if HKDF-Expand fails, which cannot happen for a 32-byte output
+/// (well within the 8160-byte HKDF-SHA-256 limit).
+#[must_use]
 pub fn derive_private_state_routing_id(identity_key_material: &[u8], did_string: &str) -> [u8; 32] {
     // Salt = SHA-256("scp-private-state-salt-v1")
     let salt = Sha256::digest(ROUTING_ID_SALT_DOMAIN);
@@ -99,6 +105,7 @@ pub fn derive_private_state_routing_id(identity_key_material: &[u8], did_string:
 /// # Returns
 ///
 /// A 32-byte SHA-256 hash that becomes the chain head.
+#[must_use]
 pub fn hash_chain_first(event_data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(HASH_CHAIN_DOMAIN);
@@ -121,6 +128,7 @@ pub fn hash_chain_first(event_data: &[u8]) -> [u8; 32] {
 /// # Returns
 ///
 /// A 32-byte SHA-256 hash that becomes the new chain head.
+#[must_use]
 pub fn hash_chain_extend(previous_hash: &[u8; 32], event_data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(HASH_CHAIN_DOMAIN);
@@ -143,6 +151,7 @@ pub fn hash_chain_extend(previous_hash: &[u8; 32], event_data: &[u8]) -> [u8; 32
 ///
 /// `true` if recomputing the chain from `events` produces `expected_head`.
 /// `false` if the chain is empty or does not match.
+#[must_use]
 pub fn verify_hash_chain(events: &[&[u8]], expected_head: &[u8; 32]) -> bool {
     if events.is_empty() {
         return false;
@@ -161,7 +170,12 @@ pub fn verify_hash_chain(events: &[&[u8]], expected_head: &[u8; 32]) -> bool {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::similar_names
+)]
 mod tests {
     use super::*;
 

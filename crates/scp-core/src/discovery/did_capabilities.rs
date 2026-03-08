@@ -163,7 +163,7 @@ fn parse_capability_endpoint(endpoint: &str) -> Result<Vec<CapabilityUri>, Disco
 
     let raw_caps: Vec<&str> = capability_str
         .split(',')
-        .map(|s| s.trim())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
 
@@ -206,7 +206,7 @@ mod tests {
     }
 
     /// Helper: creates a DID identity and publishes a document with
-    /// `SCPCapabilities` service entries containing valid CapabilityUri strings.
+    /// `SCPCapabilities` service entries containing valid `CapabilityUri` strings.
     async fn create_identity_with_capabilities(
         did_dht: &DidDht<InMemoryDhtClient>,
         key_custody: &InMemoryKeyCustody,
@@ -229,7 +229,7 @@ mod tests {
         (identity.did, document)
     }
 
-    /// Helper: parses a string to CapabilityUri for test assertions.
+    /// Helper: parses a string to `CapabilityUri` for test assertions.
     fn cap(s: &str) -> CapabilityUri {
         s.parse().unwrap()
     }
@@ -515,7 +515,10 @@ mod tests {
         assert_eq!(caps.len(), 2);
         assert_eq!(caps[0], cap("scp:system:relay-operation"));
         assert_eq!(caps[1], cap("scp:system:bridge-operation"));
-        assert!(caps.iter().all(|c| c.is_system()));
+        assert!(
+            caps.iter()
+                .all(crate::trust::capability_uri::CapabilityUri::is_system)
+        );
     }
 
     #[test]

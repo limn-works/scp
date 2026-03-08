@@ -179,6 +179,7 @@ pub struct FileKeyCustody {
     pseudonym_keys: Mutex<HashMap<u64, SigningKey>>,
     /// Serializes file read-modify-write operations to prevent data races
     /// when multiple tasks call `append_entry` concurrently.
+    #[allow(dead_code)] // Reserved for future concurrent write serialization
     file_write_lock: Mutex<()>,
 }
 

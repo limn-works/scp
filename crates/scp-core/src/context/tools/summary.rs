@@ -47,7 +47,7 @@ pub struct ContextSummary {
 ///
 /// # Arguments
 ///
-/// * `events` - Slice of event entries with (event_name, timestamp).
+/// * `events` - Slice of event entries with (`event_name`, timestamp).
 ///
 /// # Returns
 ///
@@ -254,10 +254,10 @@ mod tests {
         let events: Vec<(String, u64)> = (0..10)
             .map(|i| {
                 let name = match i % 4 {
-                    0 => format!("MemberJoined:did:dht:user{}", i),
-                    1 => format!("MessageSent:did:dht:user{}", i),
-                    2 => format!("ToolInvoked:tool{}", i),
-                    _ => format!("GovernanceAction:action{}", i),
+                    0 => format!("MemberJoined:did:dht:user{i}"),
+                    1 => format!("MessageSent:did:dht:user{i}"),
+                    2 => format!("ToolInvoked:tool{i}"),
+                    _ => format!("GovernanceAction:action{i}"),
                 };
                 (name, 1000 + i)
             })
@@ -266,7 +266,8 @@ mod tests {
         let json = summary_to_json(&summary);
         assert!(json.is_object());
         assert_eq!(
-            json.get("total_event_count").and_then(|v| v.as_u64()),
+            json.get("total_event_count")
+                .and_then(serde_json::Value::as_u64),
             Some(10)
         );
         assert!(json.get("participant_dids").unwrap().is_array());

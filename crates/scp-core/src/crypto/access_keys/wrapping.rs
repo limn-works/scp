@@ -192,8 +192,8 @@ pub fn unwrap_cek(
 /// prefixes, `key_epoch_bytes` is 8-byte big-endian, and `sequence_bytes` is
 /// 8-byte big-endian.
 ///
-/// Length prefixes prevent field-boundary ambiguity (e.g., a context_id
-/// "ab" + sender_did "cd" would otherwise collide with "abc" + "d").
+/// Length prefixes prevent field-boundary ambiguity (e.g., a `context_id`
+/// "ab" + `sender_did` "cd" would otherwise collide with "abc" + "d").
 ///
 /// This prevents cross-context ciphertext relocation, epoch substitution,
 /// and message reordering. See ADR-038 and spec section 9.17.1.
@@ -202,9 +202,11 @@ fn build_aad(context_id: &str, sender_did: &str, key_epoch: u64, sequence_number
     let did_bytes = sender_did.as_bytes();
     let mut aad = Vec::with_capacity(4 + ctx_bytes.len() + 4 + did_bytes.len() + 8 + 8);
     // context_id with u32 BE length prefix
+    #[allow(clippy::cast_possible_truncation)] // DID/context strings are well under u32::MAX bytes
     aad.extend_from_slice(&(ctx_bytes.len() as u32).to_be_bytes());
     aad.extend_from_slice(ctx_bytes);
     // sender_did with u32 BE length prefix
+    #[allow(clippy::cast_possible_truncation)] // DID/context strings are well under u32::MAX bytes
     aad.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
     aad.extend_from_slice(did_bytes);
     // key_epoch as 8-byte big-endian
@@ -234,7 +236,7 @@ pub struct Recipient<'a> {
 ///
 /// 1. Generates a fresh random CEK (32 bytes).
 /// 2. Encrypts the plaintext with AES-256-GCM using the CEK.
-///    AAD per spec section 05-contexts.md line 979 (length-prefixed fields + key_epoch).
+///    AAD per spec section 05-contexts.md line 979 (length-prefixed fields + `key_epoch`).
 /// 3. Wraps the CEK with each recipient's access key using AES-256-KW.
 /// 4. Returns a `WrappedContent` containing ciphertext, nonce, and wrapped CEKs.
 ///
@@ -300,7 +302,7 @@ pub fn wrap_content(
 /// 2. Finds the corresponding `WrappedCek` in the `wrapped_ceks` list.
 /// 3. Unwraps the CEK using the member's access key (AES-256-KW).
 /// 4. Decrypts the ciphertext with AES-256-GCM using the unwrapped CEK.
-///    AAD per spec section 05-contexts.md line 979 (length-prefixed fields + key_epoch).
+///    AAD per spec section 05-contexts.md line 979 (length-prefixed fields + `key_epoch`).
 ///
 /// # Errors
 ///

@@ -11,7 +11,7 @@
 //! - [`mcp_client_invoke`] — Invoke an external MCP tool with SCP provenance.
 //!
 //! The MCP bridge uses opaque string handles to track server and client
-//! instances in global registries (matching the UniFFI bridge pattern).
+//! instances in global registries (matching the `UniFFI` bridge pattern).
 //!
 //! See ADR-015 in `.docs/adrs/phase-3.md`.
 
@@ -88,6 +88,7 @@ pub struct NapiMcpServerHandle {
 impl NapiMcpServerHandle {
     /// Returns the opaque handle ID.
     #[napi(getter)]
+    #[must_use]
     pub fn handle_id(&self) -> String {
         self.handle_id.clone()
     }
@@ -109,6 +110,7 @@ pub struct NapiMcpClientHandle {
 impl NapiMcpClientHandle {
     /// Returns the opaque handle ID.
     #[napi(getter)]
+    #[must_use]
     pub fn handle_id(&self) -> String {
         self.handle_id.clone()
     }
@@ -295,10 +297,10 @@ struct SseMcpTransport {
 }
 
 impl SseMcpTransport {
-    fn connect(url: &str) -> Result<Self, String> {
-        Ok(Self {
+    fn connect(url: &str) -> Self {
+        Self {
             _url: url.to_owned(),
-        })
+        }
     }
 }
 
@@ -350,8 +352,10 @@ impl ContextProvider for McpNapiBridgeProvider {
         _tool_name: &str,
         _arguments: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        Err("tool invocation through MCP server requires ContextManager tool registry integration"
-            .to_owned())
+        Err(
+            "tool invocation through MCP server requires ContextManager tool registry integration"
+                .to_owned(),
+        )
     }
 
     fn context_members(&self, _context_id: &str) -> Vec<scp_mcp::server::MemberInfo> {
@@ -422,13 +426,12 @@ async fn run_mcp_stdio_server(
                     }
                 };
 
-                if let Some(resp) = response {
-                    if let Ok(json) = serde_json::to_string(&resp) {
+                if let Some(resp) = response
+                    && let Ok(json) = serde_json::to_string(&resp) {
                         let _ = stdout.write_all(json.as_bytes()).await;
                         let _ = stdout.write_all(b"\n").await;
                         let _ = stdout.flush().await;
                     }
-                }
             }
         } => {}
     }
@@ -445,9 +448,7 @@ async fn run_mcp_stdio_server(
 /// A `Promise<NapiMcpServerHandle>` for stopping the server.
 #[napi]
 #[allow(clippy::unused_async)]
-pub async fn mcp_server_create(
-    config: NapiMcpServerConfig,
-) -> napi::Result<NapiMcpServerHandle> {
+pub async fn mcp_server_create(config: NapiMcpServerConfig) -> napi::Result<NapiMcpServerHandle> {
     if config.transport != "stdio" && config.transport != "sse" {
         return Err(ScpNapiError::Transport {
             message: format!(
@@ -490,10 +491,8 @@ pub async fn mcp_server_create(
                     context_ids: config.context_ids,
                 };
                 let sse_server = scp_mcp::server::McpServer::new(provider);
-                let sse_config = scp_mcp::sse::SseConfig::new(std::net::SocketAddr::from((
-                    [127, 0, 0, 1],
-                    0,
-                )));
+                let sse_config =
+                    scp_mcp::sse::SseConfig::new(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
                 let sse_shutdown = scp_mcp::sse::ShutdownHandle::new();
                 let sse_shutdown_trigger = sse_shutdown.clone();
                 tokio::spawn(async move {
@@ -557,9 +556,7 @@ pub async fn mcp_server_stop(handle: &NapiMcpServerHandle) -> napi::Result<()> {
 /// JSON over stdin/stdout, and performs the MCP initialize handshake.
 #[napi]
 #[allow(clippy::unused_async)]
-pub async fn mcp_client_connect_stdio(
-    command: Vec<String>,
-) -> napi::Result<NapiMcpClientHandle> {
+pub async fn mcp_client_connect_stdio(command: Vec<String>) -> napi::Result<NapiMcpClientHandle> {
     if command.is_empty() {
         return Err(ScpNapiError::Transport {
             message: "command must be a non-empty list".to_owned(),
@@ -598,12 +595,7 @@ pub async fn mcp_client_connect_stdio(
 #[napi]
 #[allow(clippy::unused_async)]
 pub async fn mcp_client_connect_sse(url: String) -> napi::Result<NapiMcpClientHandle> {
-    let transport = SseMcpTransport::connect(&url).map_err(|e| {
-        napi::Error::from(ScpNapiError::Transport {
-            message: format!("failed to connect SSE MCP client: {e}"),
-            code: "SCP-TRANS-5017".to_owned(),
-        })
-    })?;
+    let transport = SseMcpTransport::connect(&url);
 
     let mut client = McpClient::new(McpClientTransportWrapper::Sse(transport));
     client.initialize().map_err(|e| {
@@ -732,6 +724,7 @@ pub async fn mcp_client_invoke(
         context_id: result.provenance.context,
         // napi-rs uses f64 for numeric fields when crossing the JS boundary.
         // u64 timestamps must be cast to f64 — safe up to 2^53 (year 287396).
+        #[allow(clippy::cast_precision_loss)]
         timestamp: result.provenance.timestamp as f64,
     })
 }

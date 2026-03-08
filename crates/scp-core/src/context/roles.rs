@@ -742,18 +742,19 @@ impl ContextRoleState {
             .map(|def| def.capabilities.clone());
 
         if let Some(role_caps) = role_caps
-            && let Some(caps) = self.member_capabilities.get_mut(did_str) {
-                if role_caps.contains(&Capability::GovernanceVote)
-                    && self.ceiling.contains(&Capability::GovernanceVote)
-                {
-                    caps.insert(Capability::GovernanceVote);
-                }
-                if role_caps.contains(&Capability::GovernancePropose)
-                    && self.ceiling.contains(&Capability::GovernancePropose)
-                {
-                    caps.insert(Capability::GovernancePropose);
-                }
+            && let Some(caps) = self.member_capabilities.get_mut(did_str)
+        {
+            if role_caps.contains(&Capability::GovernanceVote)
+                && self.ceiling.contains(&Capability::GovernanceVote)
+            {
+                caps.insert(Capability::GovernanceVote);
             }
+            if role_caps.contains(&Capability::GovernancePropose)
+                && self.ceiling.contains(&Capability::GovernancePropose)
+            {
+                caps.insert(Capability::GovernancePropose);
+            }
+        }
     }
 }
 
@@ -1623,8 +1624,13 @@ mod tests {
 
         state.members.insert("did:dht:alice".to_owned());
 
-        let tokens =
-            assign_role(&mut state, "did:dht:alice", "content-mod", "did:dht:creator").unwrap();
+        let tokens = assign_role(
+            &mut state,
+            "did:dht:alice",
+            "content-mod",
+            "did:dht:creator",
+        )
+        .unwrap();
         assert_eq!(tokens.len(), 3);
         assert!(state.member_has_capability("did:dht:alice", &Capability::MemberRemove));
     }
@@ -1833,7 +1839,13 @@ mod tests {
 
         // Add a second member with a non-admin role.
         state.members.insert("did:dht:alice".to_owned());
-        assign_role(&mut state, "did:dht:alice", "content-mod", "did:dht:creator").unwrap();
+        assign_role(
+            &mut state,
+            "did:dht:alice",
+            "content-mod",
+            "did:dht:creator",
+        )
+        .unwrap();
 
         // Serialize to MessagePack.
         let bytes = rmp_serde::to_vec(&state).expect("ContextRoleState serialization failed");

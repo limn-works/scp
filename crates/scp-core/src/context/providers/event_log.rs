@@ -145,7 +145,7 @@ impl MerkleEventLogProvider {
         Some(log.entries.last().map_or([0u8; 32], |e| e.hash))
     }
 
-    /// Serializes the event log entries for a context into MessagePack bytes.
+    /// Serializes the event log entries for a context into `MessagePack` bytes.
     ///
     /// Used by [`ContextExport`](crate::context::export_import::ContextExport)
     /// to include the full event log in a portable export.
@@ -171,7 +171,7 @@ impl MerkleEventLogProvider {
         })
     }
 
-    /// Imports serialized event log entries (MessagePack) into this provider,
+    /// Imports serialized event log entries (`MessagePack`) into this provider,
     /// replacing any existing log for the context.
     ///
     /// The imported entries are verified for Merkle chain integrity before
@@ -204,8 +204,7 @@ impl MerkleEventLogProvider {
                     "Merkle chain broken at entry {i}: prev_hash mismatch"
                 )));
             }
-            let expected_hash =
-                compute_entry_hash(&entry.event, entry.timestamp, &entry.prev_hash);
+            let expected_hash = compute_entry_hash(&entry.event, entry.timestamp, &entry.prev_hash);
             if entry.hash != expected_hash {
                 return Err(ContextCreationError::EventLogFailed(format!(
                     "Merkle chain broken at entry {i}: hash mismatch"
@@ -217,8 +216,7 @@ impl MerkleEventLogProvider {
             .logs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut log = ContextLog::default();
-        log.entries = entries;
+        let log = ContextLog { entries };
         logs.insert(*context_id, log);
         Ok(())
     }

@@ -26,8 +26,10 @@ use super::{ContextId, DID, DataProvenance, DiscoveryMethod, ProvenanceError, So
 /// See spec §24.4 and ADR-019.
 pub const DEFAULT_MAX_CHAIN_DEPTH: u8 = 3;
 
-/// Protocol hard maximum chain depth (5 hops). No context may configure a
-/// `max_chain_depth` higher than this value. The effective limit is always
+/// Protocol hard maximum chain depth (5 hops).
+///
+/// No context may configure a `max_chain_depth` higher than this value.
+/// The effective limit is always
 /// `min(context.max_chain_depth.unwrap_or(DEFAULT_MAX_CHAIN_DEPTH), PROTOCOL_HARD_MAX_CHAIN_DEPTH)`.
 ///
 /// This bounds the worst-case amplification factor for cross-context tool
@@ -217,7 +219,12 @@ fn compute_chain(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::assertions_on_constants
+)]
 mod tests {
     use super::*;
 

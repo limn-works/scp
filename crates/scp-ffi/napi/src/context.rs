@@ -930,7 +930,7 @@ pub async fn context_reset_ttl_timer(
 // Context export/import (#363)
 // ---------------------------------------------------------------------------
 
-/// Exports a context's full state as serialized MessagePack bytes.
+/// Exports a context's full state as serialized `MessagePack` bytes.
 ///
 /// Returns serialized `StoredValue<ContextExport>` bytes (§17.5) suitable for
 /// backup, migration, or transfer to another node.
@@ -947,14 +947,15 @@ pub async fn context_export(handle: &NapiContextHandle) -> napi::Result<Vec<u8>>
         .export_context(&handle.context_id, exporter_did)
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-    scp_core::context::export_import::serialize_export(&export)
-        .map_err(|e| NapiError::from(ScpNapiError::Context {
+    scp_core::context::export_import::serialize_export(&export).map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
             message: format!("export serialization failed: {e}"),
             code: "SCP-CTX-2030".to_owned(),
-        }))
+        })
+    })
 }
 
-/// Imports a context from serialized MessagePack bytes.
+/// Imports a context from serialized `MessagePack` bytes.
 ///
 /// The bytes must be a `StoredValue<ContextExport>` envelope (§17.5), as
 /// produced by [`context_export`].
@@ -966,11 +967,12 @@ pub async fn context_export(handle: &NapiContextHandle) -> napi::Result<Vec<u8>>
 /// Returns NAPI error if deserialization, validation, or import fails.
 #[napi(js_name = "contextImport")]
 pub async fn context_import(data: Vec<u8>) -> napi::Result<String> {
-    let export = scp_core::context::export_import::deserialize_export(&data)
-        .map_err(|e| NapiError::from(ScpNapiError::Context {
+    let export = scp_core::context::export_import::deserialize_export(&data).map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
             message: format!("invalid export data: {e}"),
             code: "SCP-CTX-2032".to_owned(),
-        }))?;
+        })
+    })?;
     let context_id = export.snapshot.context_id.clone();
     let manager = context_manager();
     manager

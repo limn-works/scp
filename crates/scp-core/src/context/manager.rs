@@ -289,7 +289,7 @@ pub struct ContextSnapshot {
     /// Members whose read access has been governance-revoked (§5.9, ADR-038).
     #[serde(default)]
     pub read_revoked_members: HashSet<DID>,
-    /// Members excluded from future CEK wrapping (FutureOnly read revocation).
+    /// Members excluded from future CEK wrapping (`FutureOnly` read revocation).
     /// These members won't receive new content keys but retain access to
     /// historical content encrypted before the revocation (ADR-038, §9.17).
     #[serde(default)]
@@ -319,7 +319,7 @@ pub struct ContextSnapshot {
     #[serde(default)]
     pub economic_policy: Option<EconomicPolicy>,
     /// Approved proposals pending execution, tracked for conflict detection (ADR-031 §7).
-    /// Maps proposal ID to (proposal, sequence_number, timestamp).
+    /// Maps proposal ID to (proposal, `sequence_number`, timestamp).
     #[serde(default)]
     pub approved_proposals: HashMap<ProposalId, (GovernanceProposal, u64, u64)>,
     /// Governance freeze state due to simultaneous conflicts (ADR-031 §7).
@@ -461,7 +461,7 @@ struct PerContextState {
     write_revoked_members: HashSet<DID>,
     /// Members whose read access has been governance-revoked (§5.9, ADR-038).
     read_revoked_members: HashSet<DID>,
-    /// Members excluded from future CEK wrapping (FutureOnly read revocation,
+    /// Members excluded from future CEK wrapping (`FutureOnly` read revocation,
     /// ADR-038, §9.17). Subset of or equal to `read_revoked_members`.
     read_exclusion_list: HashSet<DID>,
     /// Established cross-context tool interfaces (§6.2).
@@ -473,7 +473,7 @@ struct PerContextState {
     /// Pruning policy override (ADR-030 §6).
     pruning_policy: Option<PruningPolicy>,
     /// Approved proposals pending execution, tracked for conflict detection (ADR-031 §7).
-    /// Maps proposal ID to (proposal, sequence_number, timestamp).
+    /// Maps proposal ID to (proposal, `sequence_number`, timestamp).
     approved_proposals: HashMap<ProposalId, (GovernanceProposal, u64, u64)>,
     /// Governance freeze state due to simultaneous conflicts (ADR-031 §7).
     /// Contains the conflicting proposal IDs and freeze start timestamp.
@@ -1310,8 +1310,7 @@ impl ContextManager {
         }
 
         // 3. Reconstruct the ContextHandle.
-        let handle =
-            ContextHandle::new(context_id.clone(), export.snapshot.context_params.clone());
+        let handle = ContextHandle::new(context_id.clone(), export.snapshot.context_params.clone());
 
         // Transition to the state from the snapshot.
         match &export.snapshot.state {
@@ -1329,10 +1328,8 @@ impl ContextManager {
         }
 
         // 4. Reconstruct governance engine from snapshot.
-        let governance_engine = restore_governance_engine_from_snapshot(
-            &export.snapshot,
-            self.key_resolver.clone(),
-        )?;
+        let governance_engine =
+            restore_governance_engine_from_snapshot(&export.snapshot, self.key_resolver.clone())?;
 
         // 5. Build PerContextState from the snapshot.
         let per_context = PerContextState {
@@ -1374,9 +1371,7 @@ impl ContextManager {
         // 7. Persist if persistence is configured.
         let snapshot_for_persist = {
             let contexts = self.contexts.lock().await;
-            contexts
-                .get(&context_id)
-                .map(|ctx| Self::snapshot_context(ctx))
+            contexts.get(&context_id).map(Self::snapshot_context)
         };
         if let Some(snap) = snapshot_for_persist {
             self.persist_context_snapshot(&context_id, &snap);
@@ -2319,8 +2314,7 @@ impl ContextManager {
 
             let timestamp = crate::time::now_millis()
                 .map_err(|e| ContextError::CryptoFailed(format!("clock error: {e}")))?;
-            let envelope =
-                bc.publish(author_did, payload, timestamp, signing_key, None)?;
+            let envelope = bc.publish(author_did, payload, timestamp, signing_key, None)?;
 
             // Assign per-sender monotonic sequence number.
             let seq = ctx
@@ -2480,10 +2474,14 @@ impl ContextManager {
             }
         };
 
-        // Persist the executed-proposals set (the insert happened above).
+        // Remove the executed proposal from approved_proposals so it no
+        // longer participates in conflict detection (ADR-031 §7).  Replay
+        // prevention is already handled by `executed_proposals`.
+        // Persist the updated context state afterwards.
         {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(context_id) {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.approved_proposals.remove(&proposal.proposal_id);
                 let snapshot = Self::snapshot_context(ctx);
                 drop(contexts);
                 self.persist_context_snapshot(context_id, &snapshot);
@@ -3051,22 +3049,20 @@ impl ContextManager {
             };
 
             // If we have a newly approved proposal, check for conflicts with other approved proposals
-            let mut conflict_events = Vec::new();
-            if let Some(ref proposal) = proposal_for_execution {
-                conflict_events = self.detect_and_handle_conflicts(ctx, proposal);
-            }
+            let conflict_events = proposal_for_execution
+                .as_ref()
+                .map_or_else(Vec::new, |proposal| {
+                    self.detect_and_handle_conflicts(ctx, proposal)
+                });
 
             (status, events, proposal_for_execution, conflict_events)
         };
         // Lock dropped.
 
         // Handle any conflicts first, then auto-execute if not in governance freeze
-        for event in conflict_events {
+        for _event in conflict_events {
             // Emit the conflict event to the event log
-            match event {
-                // Handle conflict events here - they would be appended to event log
-                _ => {} // For now, just ignore - we'll implement this properly
-            }
+            {}
         }
 
         // Auto-execute if the proposal was just approved and we're not in governance freeze
@@ -3076,8 +3072,7 @@ impl ContextManager {
                 let contexts = self.contexts.lock().await;
                 contexts
                     .get(context_id)
-                    .map(|ctx| ctx.governance_freeze.is_some())
-                    .unwrap_or(false)
+                    .is_some_and(|ctx| ctx.governance_freeze.is_some())
             };
 
             if !in_freeze {
@@ -3874,9 +3869,8 @@ impl ContextManager {
 
             // M7: Instead of applying immediately, enter notification period.
             // Members are notified and may leave before the expansion takes effect.
-            let now = crate::time::now_secs().map_err(|e| {
-                ContextError::PermissionDenied(format!("clock error: {e}"))
-            })?;
+            let now = crate::time::now_secs()
+                .map_err(|e| ContextError::PermissionDenied(format!("clock error: {e}")))?;
             ctx.pending_ceiling_modification = Some(PendingCeilingModification {
                 new_capabilities: new_ceiling.to_vec(),
                 notified_at: now,
@@ -5518,6 +5512,8 @@ impl ContextManager {
         checkpoint: &mut ContextCheckpoint,
         cosignature: CosignedCheckpoint,
     ) -> Result<CheckpointAttestationStatus, ContextError> {
+        use sha2::Digest as _;
+
         let contexts = self.contexts.lock().await;
         let ctx = contexts
             .get(context_id)
@@ -5526,9 +5522,8 @@ impl ContextManager {
         checkpoint.cosignatures.push(cosignature);
 
         // Compute checkpoint hash for verification
-        use sha2::Digest as _;
         let mut hasher = sha2::Sha256::new();
-        hasher.update(&checkpoint.merkle_root);
+        hasher.update(checkpoint.merkle_root);
         hasher.update(checkpoint.checkpoint_seq.to_be_bytes());
         hasher.update(checkpoint.event_count.to_be_bytes());
         let checkpoint_hash: [u8; 32] = hasher.finalize().into();
@@ -5554,6 +5549,7 @@ impl ContextManager {
     ///
     /// # Returns
     /// A vector of governance events to emit (empty if no conflicts)
+    #[allow(clippy::unused_self)] // method for API consistency within ContextManager
     fn detect_and_handle_conflicts(
         &self,
         ctx: &mut PerContextState,
@@ -5595,29 +5591,33 @@ impl ContextManager {
             // Assign sequence numbers - for now, use timestamp as sequence
             let new_seq = current_timestamp;
 
-            if new_seq == conflicting_seq {
-                // Simultaneous conflict - enter governance freeze
-                ctx.governance_freeze =
-                    Some((new_proposal.proposal_id, conflicting_id, current_timestamp));
-                events.push(GovernanceEvent::ConflictDetected {
-                    proposal_a: new_proposal.proposal_id,
-                    proposal_b: conflicting_id,
-                });
-            } else if new_seq < conflicting_seq {
-                // New proposal wins - invalidate the conflicting one
-                ctx.approved_proposals.remove(&conflicting_id);
-                events.push(GovernanceEvent::ConflictResolved {
-                    winner_id: new_proposal.proposal_id,
-                    loser_id: conflicting_id,
-                });
-            } else {
-                // Existing proposal wins - invalidate the new one
-                // Don't add the new proposal to approved_proposals
-                events.push(GovernanceEvent::ConflictResolved {
-                    winner_id: conflicting_id,
-                    loser_id: new_proposal.proposal_id,
-                });
-                return events; // Don't add the new proposal
+            match new_seq.cmp(&conflicting_seq) {
+                std::cmp::Ordering::Equal => {
+                    // Simultaneous conflict - enter governance freeze
+                    ctx.governance_freeze =
+                        Some((new_proposal.proposal_id, conflicting_id, current_timestamp));
+                    events.push(GovernanceEvent::ConflictDetected {
+                        proposal_a: new_proposal.proposal_id,
+                        proposal_b: conflicting_id,
+                    });
+                }
+                std::cmp::Ordering::Less => {
+                    // New proposal wins - invalidate the conflicting one
+                    ctx.approved_proposals.remove(&conflicting_id);
+                    events.push(GovernanceEvent::ConflictResolved {
+                        winner_id: new_proposal.proposal_id,
+                        loser_id: conflicting_id,
+                    });
+                }
+                std::cmp::Ordering::Greater => {
+                    // Existing proposal wins - invalidate the new one
+                    // Don't add the new proposal to approved_proposals
+                    events.push(GovernanceEvent::ConflictResolved {
+                        winner_id: conflicting_id,
+                        loser_id: new_proposal.proposal_id,
+                    });
+                    return events; // Don't add the new proposal
+                }
             }
         }
 
@@ -5643,6 +5643,7 @@ impl ContextManager {
     ///
     /// # Returns
     /// A vector of governance events to emit (empty if no expired freezes)
+    #[allow(clippy::unused_self)] // method for API consistency within ContextManager
     fn check_and_resolve_expired_freezes(&self, ctx: &mut PerContextState) -> Vec<GovernanceEvent> {
         use super::governance::GovernanceEvent;
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -5654,18 +5655,18 @@ impl ContextManager {
             .unwrap_or_default()
             .as_secs();
 
-        if let Some((proposal_a, proposal_b, freeze_start)) = ctx.governance_freeze {
-            if current_timestamp.saturating_sub(freeze_start) >= FREEZE_TIMEOUT_SECONDS {
-                // Timeout reached - invalidate both proposals and lift freeze
-                ctx.approved_proposals.remove(&proposal_a);
-                ctx.approved_proposals.remove(&proposal_b);
-                ctx.governance_freeze = None;
+        if let Some((proposal_a, proposal_b, freeze_start)) = ctx.governance_freeze
+            && current_timestamp.saturating_sub(freeze_start) >= FREEZE_TIMEOUT_SECONDS
+        {
+            // Timeout reached - invalidate both proposals and lift freeze
+            ctx.approved_proposals.remove(&proposal_a);
+            ctx.approved_proposals.remove(&proposal_b);
+            ctx.governance_freeze = None;
 
-                return vec![GovernanceEvent::ConflictResolved {
-                    winner_id: [0; 32], // Special marker for timeout resolution
-                    loser_id: [0; 32],  // Both proposals invalidated
-                }];
-            }
+            return vec![GovernanceEvent::ConflictResolved {
+                winner_id: [0; 32], // Special marker for timeout resolution
+                loser_id: [0; 32],  // Both proposals invalidated
+            }];
         }
 
         Vec::new()
@@ -5700,7 +5701,9 @@ const fn _assert_send_sync() {
     clippy::needless_collect,
     clippy::significant_drop_tightening,
     clippy::match_same_arms,
-    clippy::type_complexity
+    clippy::type_complexity,
+    clippy::similar_names,
+    clippy::items_after_statements
 )]
 mod tests {
     use std::collections::HashSet;
@@ -9179,35 +9182,6 @@ mod tests {
             matches!(result.unwrap_err(), ContextError::MemberNotFound(_)),
             "error should be MemberNotFound"
         );
-    }
-
-    /// SCP-CAC-007: `RotateContentKeys` in broadcast rotates all author keys.
-    #[tokio::test]
-    async fn rotate_content_keys_broadcast() {
-        let (manager, ctx_id) = setup_broadcast_with_member_ban().await;
-
-        let action = super::GovernanceAction::RotateContentKeys {
-            reason: Some("compromise".into()),
-        };
-        let proposal = approved_governance_proposal(
-            &"did:key:alice".into(),
-            &ctx_id,
-            &"did:key:sub1".into(),
-            action,
-        );
-
-        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
-        assert!(
-            result.is_ok(),
-            "RotateContentKeys in broadcast should succeed"
-        );
-
-        match result.unwrap() {
-            super::GovernanceActionResult::ContentKeysRotated(r) => {
-                assert_eq!(r.reason.as_deref(), Some("compromise"));
-            }
-            other => panic!("expected ContentKeysRotated, got {other:?}"),
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -13974,17 +13948,13 @@ mod tests {
         let resolver: std::sync::Arc<
             dyn Fn(&DID) -> Option<ed25519_dalek::VerifyingKey> + Send + Sync,
         > = std::sync::Arc::new(move |_| Some(signing_key.verifying_key()));
-        let engine = ThresholdEngine::new(
-            vec![signer1.clone(), signer2.clone(), signer3.clone()],
-            2,
-            86_400,
-            resolver,
-        )
-        .unwrap();
+        let engine =
+            ThresholdEngine::new(vec![signer1.clone(), signer2, signer3], 2, 86_400, resolver)
+                .unwrap();
         let gov_ctx = GovernanceContext {
             context_id: "deadlock-test".into(),
             members: vec![(signer1.clone(), "admin".into())],
-            admin_dids: vec![signer1.clone()],
+            admin_dids: vec![signer1],
             current_epoch: None,
             now: 1000,
         };

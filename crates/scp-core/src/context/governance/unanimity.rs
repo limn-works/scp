@@ -623,14 +623,11 @@ impl GovernanceEngine for UnanimityEngine {
             }
 
             // Get public key for this voter
-            let verifying_key = match (self.key_resolver)(&cosig.signer_did) {
-                Some(key) => key,
-                None => {
-                    return Err(GovernanceError::NotEligible(format!(
-                        "Cannot resolve public key for cosigner {}",
-                        cosig.signer_did
-                    )));
-                }
+            let Some(verifying_key) = (self.key_resolver)(&cosig.signer_did) else {
+                return Err(GovernanceError::NotEligible(format!(
+                    "Cannot resolve public key for cosigner {}",
+                    cosig.signer_did
+                )));
             };
 
             // Verify signature

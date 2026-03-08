@@ -729,16 +729,12 @@ pub fn verify_checkpoint_signature(
     checkpoint: &ConsistencyCheckpoint,
     signer_public_key: &ed25519_dalek::VerifyingKey,
 ) -> Result<(), String> {
-    let sig_bytes: [u8; 64] = checkpoint
-        .signature
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            format!(
-                "checkpoint signature must be 64 bytes, got {}",
-                checkpoint.signature.len()
-            )
-        })?;
+    let sig_bytes: [u8; 64] = checkpoint.signature.as_slice().try_into().map_err(|_| {
+        format!(
+            "checkpoint signature must be 64 bytes, got {}",
+            checkpoint.signature.len()
+        )
+    })?;
 
     let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
     let canonical = compute_checkpoint_canonical_hash(

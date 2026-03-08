@@ -161,7 +161,7 @@ pub async fn tool_register(
         .unwrap_or([0u8; 32]);
 
     let core_registration = scp_core::context::tools::ToolRegistration {
-        tool_id: tool_id.clone(),
+        tool_id,
         name: definition.name,
         description: definition.description,
         schema: scp_core::context::tools::ToolSchema {
@@ -291,7 +291,7 @@ pub async fn tool_invoke(
         // Dispatch to registered handler if available.
         let output = if let Some(handler) = rt.tool_handlers.get(&tool_id) {
             let handler = handler.clone();
-            let out = handler(input_value.clone()).map_err(|e| ScpNapiError::Tool {
+            let out = handler(input_value).map_err(|e| ScpNapiError::Tool {
                 message: format!("tool handler for '{tool_id}' failed: {e}"),
                 code: "SCP-TOOL-6002".to_owned(),
             })?;

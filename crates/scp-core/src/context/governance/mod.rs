@@ -406,7 +406,7 @@ pub struct ContextCheckpoint {
     #[serde(with = "serde_bytes")]
     pub creator_signature: Vec<u8>,
     /// Governance quorum cosignatures (ADR-031 §9).
-    /// Empty for SingleAdmin contexts, populated for multi-admin contexts.
+    /// Empty for `SingleAdmin` contexts, populated for multi-admin contexts.
     pub cosignatures: Vec<CosignedCheckpoint>,
     /// Attestation status based on cosignature quorum.
     pub attestation_status: CheckpointAttestationStatus,
@@ -1038,7 +1038,7 @@ pub enum GovernanceEvent {
     /// A governance conflict was resolved (ADR-031 §7).
     ///
     /// Logged when a sequential conflict is resolved (lower sequence wins)
-    /// or when a ResolveConflict action is executed.
+    /// or when a `ResolveConflict` action is executed.
     ConflictResolved {
         winner_id: ProposalId,
         loser_id: ProposalId,
@@ -1242,9 +1242,9 @@ pub trait GovernanceEngine: Send + Sync {
     ///
     /// Returns `(required_signers, minimum_count)`:
     /// - `required_signers`: Vec of DIDs eligible to cosign checkpoints
-    /// - `minimum_count`: Minimum cosignatures needed for FullyAttested status
+    /// - `minimum_count`: Minimum cosignatures needed for `FullyAttested` status
     ///
-    /// For SingleAdmin: returns `(vec![], 0)` (no cosignatures required)
+    /// For `SingleAdmin`: returns `(vec![], 0)` (no cosignatures required)
     /// For Threshold: returns `(signers, threshold)`
     /// For Majority: returns `(eligible_voters, ceil(voters * 0.5) + 1)`
     /// For Unanimity: returns `(eligible_voters, eligible_voters.len())`
@@ -1555,19 +1555,23 @@ impl GovernanceEngine for SingleAdminEngine {
 ///
 /// # Arguments
 /// * `action_a` - The first governance action
-/// * `proposer_a` - The DID of the proposer of action_a
+/// * `proposer_a` - The DID of the proposer of `action_a`
 /// * `action_b` - The second governance action
-/// * `proposer_b` - The DID of the proposer of action_b
+/// * `proposer_b` - The DID of the proposer of `action_b`
 ///
 /// # Returns
 /// `true` if the actions conflict, `false` otherwise.
+#[must_use]
 pub fn actions_conflict(
     action_a: &GovernanceAction,
     proposer_a: &DID,
     action_b: &GovernanceAction,
     proposer_b: &DID,
 ) -> bool {
-    use GovernanceAction::*;
+    use GovernanceAction::{
+        ChangeRole, ModifyCeiling, RemoveMember, RestoreReadAccess, RestoreWriteAccess,
+        RevokeReadAccess, RevokeWriteAccess,
+    };
 
     match (action_a, action_b) {
         // Mutual RemoveMember (each targeting the other's proposer)
@@ -1599,19 +1603,17 @@ pub fn actions_conflict(
 
         // RemoveMember + ChangeRole for the same DID
         (RemoveMember { did: did_a, .. }, ChangeRole { did: did_b, .. })
-        | (ChangeRole { did: did_a, .. }, RemoveMember { did: did_b, .. }) => did_a == did_b,
-
+        | (ChangeRole { did: did_a, .. }, RemoveMember { did: did_b, .. })
         // RevokeReadAccess + RestoreReadAccess for the same DID (mutually contradictory)
-        (RevokeReadAccess { did: did_a, .. }, RestoreReadAccess { did: did_b })
-        | (RestoreReadAccess { did: did_a }, RevokeReadAccess { did: did_b, .. }) => did_a == did_b,
-
+        | (RevokeReadAccess { did: did_a, .. }, RestoreReadAccess { did: did_b })
+        | (RestoreReadAccess { did: did_a }, RevokeReadAccess { did: did_b, .. })
         // RevokeWriteAccess + RestoreWriteAccess for the same DID (mutually contradictory)
-        (RevokeWriteAccess { did: did_a, .. }, RestoreWriteAccess { did: did_b })
+        | (RevokeWriteAccess { did: did_a, .. }, RestoreWriteAccess { did: did_b })
         | (RestoreWriteAccess { did: did_a }, RevokeWriteAccess { did: did_b, .. }) => {
             did_a == did_b
         }
 
-        // Two RevokeReadAccess for same DID with different scopes
+        // Two RevokeReadAccess or RevokeWriteAccess for same DID with different scopes
         (
             RevokeReadAccess {
                 did: did_a,
@@ -1621,10 +1623,8 @@ pub fn actions_conflict(
                 did: did_b,
                 scope: scope_b,
             },
-        ) => did_a == did_b && scope_a != scope_b,
-
-        // Two RevokeWriteAccess for same DID with different scopes
-        (
+        )
+        | (
             RevokeWriteAccess {
                 did: did_a,
                 scope: scope_a,
@@ -3120,7 +3120,7 @@ mod tests {
     #[test]
     fn single_admin_checkpoint_cosignature_requirements() {
         let admin = alice();
-        let engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
+        let engine = SingleAdminEngine::new(admin, mock_resolver());
 
         let (required_signers, minimum_count) = engine.checkpoint_cosignature_requirements();
         assert_eq!(required_signers.len(), 0);
@@ -3130,7 +3130,7 @@ mod tests {
     #[test]
     fn single_admin_checkpoint_empty_cosignatures() {
         let admin = alice();
-        let engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
+        let engine = SingleAdminEngine::new(admin, mock_resolver());
 
         let checkpoint_hash = [0u8; 32];
         let cosignatures = vec![];
@@ -3144,7 +3144,7 @@ mod tests {
     #[test]
     fn single_admin_checkpoint_rejects_cosignatures() {
         let admin = alice();
-        let engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
+        let engine = SingleAdminEngine::new(admin, mock_resolver());
 
         let checkpoint_hash = [0u8; 32];
         let cosignatures = vec![CosignedCheckpoint {

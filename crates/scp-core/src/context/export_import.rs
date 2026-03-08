@@ -1,7 +1,7 @@
-//! Context export/import with MessagePack serialization and Merkle verification.
+//! Context export/import with `MessagePack` serialization and Merkle verification.
 //!
 //! Provides [`ContextExport`] for serializing context state (snapshot, event log,
-//! opaque MLS blob) into a portable, versioned format using MessagePack with
+//! opaque MLS blob) into a portable, versioned format using `MessagePack` with
 //! [`StoredValue<T>`](crate::store::StoredValue) envelopes (spec §17.5).
 //!
 //! Import verifies Merkle chain integrity of the event log entries before
@@ -12,8 +12,8 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::manager::ContextSnapshot;
 use super::ContextError;
+use super::manager::ContextSnapshot;
 use crate::store::StoredValue;
 use scp_identity::DID;
 
@@ -33,7 +33,7 @@ pub const CURRENT_EXPORT_VERSION: u32 = 1;
 
 /// Portable representation of a context's full state.
 ///
-/// Serialized as MessagePack with a [`StoredValue<T>`] version envelope per
+/// Serialized as `MessagePack` with a [`StoredValue<T>`] version envelope per
 /// spec §17.5. Contains the context snapshot (membership, roles, governance,
 /// TTL, broadcast state), serialized event log entries, and an opaque MLS
 /// state blob (empty until MLS integration lands via #333).
@@ -96,7 +96,7 @@ pub enum ExportScope {
 // Serialization (MessagePack + StoredValue envelope)
 // ---------------------------------------------------------------------------
 
-/// Serializes a [`ContextExport`] into MessagePack bytes wrapped in a
+/// Serializes a [`ContextExport`] into `MessagePack` bytes wrapped in a
 /// [`StoredValue<T>`] version envelope per spec §17.5.
 ///
 /// # Errors
@@ -111,7 +111,7 @@ pub fn serialize_export(export: &ContextExport) -> Result<Vec<u8>, ContextError>
         .map_err(|e| ContextError::EventLogFailed(format!("export serialization failed: {e}")))
 }
 
-/// Deserializes a [`ContextExport`] from MessagePack bytes wrapped in a
+/// Deserializes a [`ContextExport`] from `MessagePack` bytes wrapped in a
 /// [`StoredValue<T>`] version envelope per spec §17.5.
 ///
 /// # Errors
@@ -142,7 +142,7 @@ pub fn deserialize_export(bytes: &[u8]) -> Result<ContextExport, ContextError> {
 /// # Errors
 ///
 /// Returns [`ContextError::EventLogFailed`] if deserialization fails or
-/// the Merkle chain is broken (prev_hash mismatch or hash mismatch).
+/// the Merkle chain is broken (`prev_hash` mismatch or hash mismatch).
 pub fn verify_merkle_chain(event_log_data: &[u8]) -> Result<[u8; 32], ContextError> {
     use super::providers::event_log::EventLogEntry;
 
@@ -245,8 +245,8 @@ pub fn validate_export_for_import(export: &ContextExport) -> Result<(), ContextE
 /// Strips sensitive data from a [`ContextSnapshot`] for a public export.
 ///
 /// Retains only structural fields visible to pre-join observers (spec §5.7):
-/// context_id, state, context_params, and empty/default values for
-/// membership, role_state, and governance fields.
+/// `context_id`, state, `context_params`, and empty/default values for
+/// membership, `role_state`, and governance fields.
 fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
     use super::membership::MembershipState;
     use super::roles::{ContextRoleState, default_ceiling};
@@ -255,13 +255,8 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
     // Build a minimal role state with only the default ceiling.
     // Use the snapshot's context_id and an empty creator DID.
     let ceiling = default_ceiling();
-    let role_state = ContextRoleState::new(
-        &snapshot.context_id,
-        "",
-        ceiling,
-        Vec::new(),
-    )
-    .unwrap_or_else(|_| snapshot.role_state.clone());
+    let role_state = ContextRoleState::new(&snapshot.context_id, "", ceiling, Vec::new())
+        .unwrap_or_else(|_| snapshot.role_state.clone());
 
     ContextSnapshot {
         context_id: snapshot.context_id.clone(),
@@ -344,12 +339,12 @@ pub fn create_export(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::context::membership::MembershipState;
-    use crate::context::params::{ContextMode, ContextParams};
-    use crate::context::providers::event_log::MerkleEventLogProvider;
-    use crate::context::roles::{ContextRoleState, default_ceiling};
     use crate::context::ContextState;
     use crate::context::builder::ContextEventLogProvider;
+    use crate::context::membership::MembershipState;
+    use crate::context::params::ContextParams;
+    use crate::context::providers::event_log::MerkleEventLogProvider;
+    use crate::context::roles::{ContextRoleState, default_ceiling};
     use std::collections::{HashMap, HashSet};
 
     /// Helper to build a test snapshot.
@@ -383,10 +378,7 @@ mod tests {
     }
 
     /// Helper to create event log entries via the provider.
-    fn create_event_log_data(
-        context_id_bytes: &[u8; 32],
-        event_names: &[&str],
-    ) -> Vec<u8> {
+    fn create_event_log_data(context_id_bytes: &[u8; 32], event_names: &[&str]) -> Vec<u8> {
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(context_id_bytes).unwrap();
         for name in event_names {
@@ -403,7 +395,7 @@ mod tests {
     fn roundtrip_export_empty_events() {
         let snapshot = test_snapshot("ctx-roundtrip-1");
         let export = create_export(
-            snapshot.clone(),
+            snapshot,
             Vec::new(),
             Vec::new(),
             DID::from("did:key:exporter-1"),
@@ -455,10 +447,7 @@ mod tests {
     #[test]
     fn roundtrip_preserves_all_fields() {
         let ctx_id_bytes = crate::context::context_id_bytes("ctx-roundtrip-3");
-        let event_log_data = create_event_log_data(
-            &ctx_id_bytes,
-            &["E1", "E2", "E3", "E4", "E5"],
-        );
+        let event_log_data = create_event_log_data(&ctx_id_bytes, &["E1", "E2", "E3", "E4", "E5"]);
 
         let mut snapshot = test_snapshot("ctx-roundtrip-3");
         snapshot.ttl_remaining_secs = Some(3600);
@@ -548,10 +537,8 @@ mod tests {
     #[test]
     fn validate_export_succeeds_for_valid_export() {
         let ctx_id_bytes = crate::context::context_id_bytes("ctx-validate-1");
-        let event_log_data = create_event_log_data(
-            &ctx_id_bytes,
-            &["ContextCreated", "MemberJoined"],
-        );
+        let event_log_data =
+            create_event_log_data(&ctx_id_bytes, &["ContextCreated", "MemberJoined"]);
 
         let snapshot = test_snapshot("ctx-validate-1");
         let export = create_export(
@@ -589,10 +576,8 @@ mod tests {
     #[test]
     fn validate_export_rejects_merkle_root_mismatch() {
         let ctx_id_bytes = crate::context::context_id_bytes("ctx-validate-3");
-        let event_log_data = create_event_log_data(
-            &ctx_id_bytes,
-            &["ContextCreated", "MemberJoined"],
-        );
+        let event_log_data =
+            create_event_log_data(&ctx_id_bytes, &["ContextCreated", "MemberJoined"]);
 
         let snapshot = test_snapshot("ctx-validate-3");
         let mut export = create_export(
@@ -622,7 +607,7 @@ mod tests {
         provider.append_event(&ctx_id_bytes, "Event2").unwrap();
         provider.append_event(&ctx_id_bytes, "Event3").unwrap();
 
-        let original_data = provider.export_event_log_entries(&ctx_id_bytes).unwrap();
+        let _original_data = provider.export_event_log_entries(&ctx_id_bytes).unwrap();
         let merkle_root = provider.merkle_root(&ctx_id_bytes).unwrap();
 
         // Tamper: remove one event from the entries.
@@ -674,10 +659,7 @@ mod tests {
     #[test]
     fn full_export_includes_all_data() {
         let ctx_id_bytes = crate::context::context_id_bytes("ctx-full-1");
-        let event_log_data = create_event_log_data(
-            &ctx_id_bytes,
-            &["ContextCreated"],
-        );
+        let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]);
 
         let snapshot = test_snapshot("ctx-full-1");
         let export = create_export(
@@ -704,7 +686,13 @@ mod tests {
         let ctx_id_bytes = crate::context::context_id_bytes("ctx-pipeline-1");
         let event_log_data = create_event_log_data(
             &ctx_id_bytes,
-            &["ContextCreated", "MemberJoined", "RoleAssigned", "MessageSent", "ToolInvoked"],
+            &[
+                "ContextCreated",
+                "MemberJoined",
+                "RoleAssigned",
+                "MessageSent",
+                "ToolInvoked",
+            ],
         );
 
         let snapshot = test_snapshot("ctx-pipeline-1");

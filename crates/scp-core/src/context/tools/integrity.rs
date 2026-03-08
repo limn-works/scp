@@ -172,7 +172,9 @@ where
         },
         passed: integrity_ok,
         score: None,
+        #[allow(clippy::cast_possible_truncation)] // vector count bounded well below u32::MAX
         test_count: vector_results.len() as u32,
+        #[allow(clippy::cast_possible_truncation)] // subset of vector count, bounded well below u32::MAX
         pass_count: passed_count as u32,
         result: serde_json::json!({
             "tool_id": tool_id,

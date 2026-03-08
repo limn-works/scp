@@ -81,6 +81,12 @@ pub enum AdmissionError {
 ///
 /// Returns `Ok(())` if all requirements are met, or the first unmet
 /// requirement as an [`AdmissionError`].
+///
+/// # Errors
+///
+/// Returns [`AdmissionError::MissingCapability`] if a self-attested capability
+/// is not declared, or [`AdmissionError::VerificationRequired`] if a
+/// challenge-verified capability lacks a matching verification record.
 pub fn check_capability_requirements(
     requirements: &[CapabilityRequirement],
     agent_capabilities: &[CapabilityUri],

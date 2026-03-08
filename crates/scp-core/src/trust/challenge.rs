@@ -678,11 +678,15 @@ pub fn verify_challenge_response(
     )?;
 
     // Extract test_count/pass_count from result if present (sketch §7.3.4).
+    #[allow(clippy::cast_possible_truncation)]
+    // test/pass counts are small integers, safe to truncate
     let test_count = response
         .result
         .get("test_count")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0) as u32;
+    #[allow(clippy::cast_possible_truncation)]
+    // test/pass counts are small integers, safe to truncate
     let pass_count = response
         .result
         .get("pass_count")
@@ -709,7 +713,11 @@ pub fn verify_challenge_response(
             .result
             .get("score")
             .and_then(serde_json::Value::as_u64)
-            .map(|s| s as u32),
+            .map(|s| {
+                #[allow(clippy::cast_possible_truncation)] // score values are small integers
+                let truncated = s as u32;
+                truncated
+            }),
         test_count,
         pass_count,
         result: response.result.clone(),

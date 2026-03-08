@@ -313,7 +313,7 @@ pub struct PskRotationParams {
 /// Backend trait for platform-specific recovery operations.
 ///
 /// The orchestrator defines step ordering and failure isolation; the backend
-/// provides the concrete MLS, UCAN, KeyPackage, notification, and PSK
+/// provides the concrete MLS, UCAN, `KeyPackage`, notification, and PSK
 /// operations. Each method corresponds to one recovery step (2–6).
 ///
 /// SDK integration layers implement this trait to wire the orchestrator into
@@ -329,6 +329,12 @@ pub trait RecoveryBackend {
     ///
     /// If the member has been offline too long (Tier 3 per ADR-029), return
     /// a `RecoveryStepError` with `description` containing "requires rejoin".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecoveryStepError`] if the MLS update proposal cannot be
+    /// issued (e.g., the member requires rejoin or the MLS group is
+    /// unavailable).
     fn mls_update(
         &self,
         context_id: &str,
@@ -344,6 +350,10 @@ pub trait RecoveryBackend {
     /// Adds revocations to the context's `RevocationList` and distributes
     /// via MLS application messages (§9.5). Issues new tokens signed by the
     /// new key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecoveryStepError`] if UCAN revocation or re-issuance fails.
     fn revoke_ucans(
         &self,
         context_id: &str,
@@ -353,6 +363,11 @@ pub trait RecoveryBackend {
     /// Step 4: Delete old `KeyPackages` and publish new ones.
     ///
     /// Prevents new group additions using old key material.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecoveryStepError`] if old key packages cannot be deleted
+    /// or new ones cannot be published.
     fn rotate_key_packages(&self, context_id: &str) -> Result<(), RecoveryStepError>;
 
     /// Step 5: Send key-change notification to contacts.
@@ -456,6 +471,7 @@ impl CompromiseRecoveryOrchestrator {
     /// Per-context failures are recorded in `RecoveryResult::failed_contexts`,
     /// NOT as errors from this method.
     #[allow(clippy::unused_async)] // async by design: SDK integration layer adds await points
+    #[allow(clippy::future_not_send)] // backend trait object is not Sync by design
     pub async fn execute_recovery(
         &self,
         tier: CompromiseTier,
@@ -677,10 +693,10 @@ mod tests {
             context_id: &str,
             _key_rotation: &KeyRotationOutcome,
         ) -> Result<(), RecoveryStepError> {
-            if let Some((ref ctx, ref err)) = self.mls_update_error {
-                if ctx == context_id {
-                    return Err(err.clone());
-                }
+            if let Some((ref ctx, ref err)) = self.mls_update_error
+                && ctx == context_id
+            {
+                return Err(err.clone());
             }
             Ok(())
         }
@@ -690,19 +706,19 @@ mod tests {
             context_id: &str,
             _key_rotation: &KeyRotationOutcome,
         ) -> Result<(), RecoveryStepError> {
-            if let Some((ref ctx, ref err)) = self.revoke_ucans_error {
-                if ctx == context_id {
-                    return Err(err.clone());
-                }
+            if let Some((ref ctx, ref err)) = self.revoke_ucans_error
+                && ctx == context_id
+            {
+                return Err(err.clone());
             }
             Ok(())
         }
 
         fn rotate_key_packages(&self, context_id: &str) -> Result<(), RecoveryStepError> {
-            if let Some((ref ctx, ref err)) = self.rotate_key_packages_error {
-                if ctx == context_id {
-                    return Err(err.clone());
-                }
+            if let Some((ref ctx, ref err)) = self.rotate_key_packages_error
+                && ctx == context_id
+            {
+                return Err(err.clone());
             }
             Ok(())
         }

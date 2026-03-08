@@ -236,6 +236,61 @@ pub fn py_trust_verify_response(challenge_json: &str, response_json: &str) -> Py
 }
 
 // ---------------------------------------------------------------------------
+// verify_participation_requirements (SCP-BA-004)
+// ---------------------------------------------------------------------------
+
+/// Verifies participation profiles against admission requirements.
+///
+/// Both inputs are JSON strings:
+/// - `profile_json`: JSON array of [`ParticipationProfile`] objects.
+/// - `requirements_json`: JSON array of [`RequireParticipation`] objects.
+///
+/// Uses the current system time for freshness checks. Returns `True` if all
+/// requirements are satisfied, raises `ScpError` with a diagnostic message
+/// if any requirement fails or if the JSON is malformed.
+///
+/// See §7.3.2.1.
+///
+/// # Errors
+///
+/// Returns `PyValueError` if JSON parsing fails, or `PyRuntimeError` if
+/// participation admission verification fails (with the specific failure
+/// reason from [`ParticipationAdmissionError`]).
+#[pyfunction]
+#[pyo3(name = "verify_participation_requirements")]
+pub fn py_verify_participation_requirements(
+    profile_json: &str,
+    requirements_json: &str,
+) -> PyResult<bool> {
+    let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(profile_json)
+        .map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "failed to parse participation profiles JSON: {e}"
+        ))
+    })?;
+
+    let requirements: Vec<scp_core::trust::RequireParticipation> =
+        serde_json::from_str(requirements_json).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "failed to parse participation requirements JSON: {e}"
+            ))
+        })?;
+
+    let current_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+
+    scp_core::trust::verify_participation_requirements(current_time, &requirements, &profiles)
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "participation admission verification failed: {e}"
+            ))
+        })?;
+
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
@@ -245,6 +300,7 @@ pub fn register_trust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_trust_verify_attestation, m)?)?;
     m.add_function(wrap_pyfunction!(py_trust_create_challenge, m)?)?;
     m.add_function(wrap_pyfunction!(py_trust_verify_response, m)?)?;
+    m.add_function(wrap_pyfunction!(py_verify_participation_requirements, m)?)?;
     Ok(())
 }
 
@@ -326,5 +382,25 @@ mod tests {
     fn trust_verify_response_rejects_invalid_json() {
         let result = py_trust_verify_response("bad", "bad");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_participation_requirements_rejects_invalid_profile_json() {
+        let result = py_verify_participation_requirements("not json", "[]");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_participation_requirements_rejects_invalid_requirements_json() {
+        let result = py_verify_participation_requirements("[]", "not json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_participation_requirements_empty_inputs_succeeds() {
+        // Empty requirements = no constraints = always passes.
+        let result = py_verify_participation_requirements("[]", "[]");
+        assert!(result.is_ok());
+        assert!(result.unwrap());
     }
 }

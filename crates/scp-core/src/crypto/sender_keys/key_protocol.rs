@@ -1343,7 +1343,7 @@ fn current_timestamp_ms() -> Result<u64, crate::time::ClockError> {
 /// Parameters for handling a sender key request for a shadow identity
 /// routed to the bridge operator.
 pub struct BridgeShadowKeyParams<'a> {
-    /// The shadow's sender key to distribute (from SenderKeyStore).
+    /// The shadow's sender key to distribute (from `SenderKeyStore`).
     pub shadow_sender_key: &'a SenderKey,
     /// The bridge operator's DID.
     pub bridge_operator_did: &'a str,
@@ -1412,6 +1412,7 @@ pub fn handle_bridge_shadow_key_request(
 /// # Returns
 ///
 /// A list of shadow DIDs in the context that have sender keys.
+#[must_use]
 pub fn list_shadow_sender_key_dids(
     store: &super::SenderKeyStore,
     context_id: &str,

@@ -43,14 +43,14 @@ use serde::{Deserialize, Serialize};
 ///
 /// This mirrors the custody model described in the spec:
 /// - Platform-managed (Apple/Google) — delegated to OS keychain/keystore
-/// - Hardware security keys — dedicated hardware (YubiKey, etc.)
+/// - Hardware security keys — dedicated hardware (`YubiKey`, etc.)
 /// - Self-managed keys — user controls raw key material
-/// - Software — encrypted file on disk (e.g., SQLCipher)
+/// - Software — encrypted file on disk (e.g., `SQLCipher`)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CustodyMigrationTarget {
     /// Platform-managed custody (Apple Keychain, Google Keystore).
     PlatformManaged,
-    /// Hardware security module (Secure Enclave, HSM, YubiKey).
+    /// Hardware security module (Secure Enclave, HSM, `YubiKey`).
     Hardware,
     /// Software-based custody (encrypted key file on disk).
     Software,

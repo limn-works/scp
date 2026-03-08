@@ -170,7 +170,7 @@ impl OuterEnvelope {
     ///
     /// Returns [`EnvelopeError::UnsupportedVersion`] if `self.version` is not
     /// `SCP_PROTOCOL_VERSION`.
-    pub fn validate_version(&self) -> Result<(), EnvelopeError> {
+    pub const fn validate_version(&self) -> Result<(), EnvelopeError> {
         if self.version != super::SCP_PROTOCOL_VERSION {
             return Err(EnvelopeError::UnsupportedVersion {
                 version: self.version,

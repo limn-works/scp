@@ -254,49 +254,49 @@ pub fn py_event_log_query(
                     if seq_str < start_suffix.as_str() {
                         continue;
                     }
-                    if let Ok(Some(data)) = rt.block_on(storage.retrieve(key)) {
-                        if let Ok(event) = rmp_serde::from_slice::<scp_event_log::Event>(&data) {
-                            // Apply additional filters.
-                            if let Some(ref et) = query_filter.event_type {
-                                if format!("{:?}", event.event_type) != *et {
-                                    continue;
-                                }
-                            }
-                            if let Some(ref actor) = query_filter.actor_did {
-                                if event.actor_did.0 != *actor {
-                                    continue;
-                                }
-                            }
-                            if let Some(ts_start) = query_filter.timestamp_start {
-                                if event.timestamp < ts_start {
-                                    continue;
-                                }
-                            }
-                            if let Some(ts_end) = query_filter.timestamp_end {
-                                if event.timestamp >= ts_end {
-                                    continue;
-                                }
-                            }
+                    if let Ok(Some(data)) = rt.block_on(storage.retrieve(key))
+                        && let Ok(event) = rmp_serde::from_slice::<scp_event_log::Event>(&data)
+                    {
+                        // Apply additional filters.
+                        if let Some(ref et) = query_filter.event_type
+                            && format!("{:?}", event.event_type) != *et
+                        {
+                            continue;
+                        }
+                        if let Some(ref actor) = query_filter.actor_did
+                            && event.actor_did.0 != *actor
+                        {
+                            continue;
+                        }
+                        if let Some(ts_start) = query_filter.timestamp_start
+                            && event.timestamp < ts_start
+                        {
+                            continue;
+                        }
+                        if let Some(ts_end) = query_filter.timestamp_end
+                            && event.timestamp >= ts_end
+                        {
+                            continue;
+                        }
 
-                            let payload_json = serde_json::json!({
-                                "data": serde_json::to_value(&event.payload.data).unwrap_or_default(),
-                            });
-                            let payload = json_to_py_dict(py, &payload_json)?;
+                        let payload_json = serde_json::json!({
+                            "data": serde_json::to_value(&event.payload.data).unwrap_or_default(),
+                        });
+                        let payload = json_to_py_dict(py, &payload_json)?;
 
-                            #[allow(clippy::cast_precision_loss)]
-                            py_events.push(PyEvent {
-                                event_type: format!("{:?}", event.event_type),
-                                actor_did: event.actor_did.0.clone(),
-                                timestamp: event.timestamp as f64,
-                                payload,
-                                sequence: event.sequence,
-                            });
+                        #[allow(clippy::cast_precision_loss)]
+                        py_events.push(PyEvent {
+                            event_type: format!("{:?}", event.event_type),
+                            actor_did: event.actor_did.0.clone(),
+                            timestamp: event.timestamp as f64,
+                            payload,
+                            sequence: event.sequence,
+                        });
 
-                            if let Some(limit) = query_filter.limit {
-                                if py_events.len() >= limit {
-                                    break;
-                                }
-                            }
+                        if let Some(limit) = query_filter.limit
+                            && py_events.len() >= limit
+                        {
+                            break;
                         }
                     }
                 }

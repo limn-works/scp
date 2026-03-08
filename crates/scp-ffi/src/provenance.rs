@@ -128,7 +128,7 @@ pub fn py_provenance_attach<'py>(
 #[pyfunction]
 #[pyo3(name = "provenance_check_chain_depth")]
 #[pyo3(signature = (chain_depth, max_depth=None))]
-#[must_use] 
+#[must_use]
 pub fn py_provenance_check_chain_depth(chain_depth: u8, max_depth: Option<u8>) -> bool {
     let max = max_depth.unwrap_or(DEFAULT_MAX_CHAIN_DEPTH);
     let prov = DataProvenance {

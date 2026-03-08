@@ -126,7 +126,7 @@ pub fn py_discovery_create_query(
 /// The normalized address string.
 #[pyfunction]
 #[pyo3(name = "discovery_normalize_address")]
-#[must_use] 
+#[must_use]
 pub fn py_discovery_normalize_address(address: &str) -> String {
     normalize_address(address)
 }
@@ -204,14 +204,10 @@ fn discovery_result_to_dict<'py>(
 /// See §5.14.11, §18.2.2, §18.4.
 #[pyfunction]
 #[pyo3(name = "context_discover")]
-pub fn py_context_discover<'py>(
-    py: Python<'py>,
-    query: &str,
-) -> PyResult<Bound<'py, PyList>> {
+pub fn py_context_discover<'py>(py: Python<'py>, query: &str) -> PyResult<Bound<'py, PyList>> {
     if query.starts_with("scp://") {
         // Parse scp:// URI — synchronous, no network I/O.
-        let result =
-            scp_core::discovery::resolve_context_uri(query).map_err(ScpPyError::from)?;
+        let result = scp_core::discovery::resolve_context_uri(query).map_err(ScpPyError::from)?;
 
         let list = PyList::empty(py);
         list.append(discovery_result_to_dict(py, &result)?)?;
@@ -277,8 +273,7 @@ mod tests {
 
     #[test]
     fn create_query_with_capabilities() {
-        let result =
-            py_discovery_create_query(Some(vec!["code_review".to_string()]), None, None);
+        let result = py_discovery_create_query(Some(vec!["code_review".to_string()]), None, None);
         assert!(result.is_ok());
         let json = result.unwrap();
         assert!(json.contains("code_review"));

@@ -115,9 +115,7 @@ fn discovery_result_to_json(
     let source_str = match &result.discovery_source {
         scp_core::discovery::ContextDiscoverySource::DhtDidDocument => "dht_did_document",
         scp_core::discovery::ContextDiscoverySource::WellKnown => "well_known",
-        scp_core::discovery::ContextDiscoverySource::DiscoveryContext { .. } => {
-            "discovery_context"
-        }
+        scp_core::discovery::ContextDiscoverySource::DiscoveryContext { .. } => "discovery_context",
         scp_core::discovery::ContextDiscoverySource::ContextUri => "context_uri",
     };
 
@@ -210,8 +208,7 @@ mod tests {
 
     #[test]
     fn create_query_with_capabilities() {
-        let result =
-            discovery_create_query(Some(vec!["code_review".to_string()]), None, None);
+        let result = discovery_create_query(Some(vec!["code_review".to_string()]), None, None);
         assert!(result.is_ok());
         assert!(result.unwrap().contains("code_review"));
     }

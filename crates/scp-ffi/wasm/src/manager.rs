@@ -36,6 +36,10 @@ use crate::runtime::{
     validate_value_against_schema, verify_inclusion,
 };
 
+/// Type alias for tool handler closures stored per-context.
+type ToolHandlerMap =
+    HashMap<String, Box<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String>>>;
+
 // ---------------------------------------------------------------------------
 // Thread-local singleton (WASM is single-threaded)
 // ---------------------------------------------------------------------------
@@ -267,8 +271,7 @@ struct PerContextState {
     /// Tool registry.
     tool_registry: ToolRegistry,
     /// Registered tool handlers keyed by tool ID.
-    tool_handlers:
-        HashMap<String, Box<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String>>>,
+    tool_handlers: ToolHandlerMap,
     /// Event log (Merkle tree).
     event_log: WasmEventLog,
     /// UCAN revocation set (token CIDs).
@@ -285,7 +288,7 @@ struct PerContextState {
     write_revoked_members: HashSet<String>,
     /// Read-revoked member DIDs (ADR-038, §9.17).
     read_revoked_members: HashSet<String>,
-    /// Members excluded from future CEK wrapping (FutureOnly read revocation).
+    /// Members excluded from future CEK wrapping (`FutureOnly` read revocation).
     read_exclusion_list: HashSet<String>,
     /// Broadcast context state (only for Broadcast mode).
     broadcast: Option<BroadcastState>,

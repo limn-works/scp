@@ -216,6 +216,7 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
         test_vectors,
         operator_did: operator_did.into(),
         economic_metadata,
+        #[allow(clippy::cast_possible_truncation)] // millis since epoch fits u64 for millennia
         registered_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -361,7 +362,13 @@ pub fn py_tool_invoke(
 
     // Primary authorization: UCAN token validation via the full 11-step
     // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
-    validate_tool_ucan(context_id, tool_id, ucan_token, identity_did, proof_tokens.as_ref())?;
+    validate_tool_ucan(
+        context_id,
+        tool_id,
+        ucan_token,
+        identity_did,
+        proof_tokens.as_ref(),
+    )?;
 
     // Validates tool existence, input schema, capability, dispatches to handler,
     // validates output schema, and builds a ToolInvokedEvent for provenance.

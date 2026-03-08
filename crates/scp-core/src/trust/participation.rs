@@ -286,7 +286,7 @@ pub enum ParticipationFact {
 impl ParticipationFact {
     /// Extracts the corresponding value from a [`ParticipationProfile`].
     #[must_use]
-    pub fn extract_value(&self, profile: &ParticipationProfile) -> u64 {
+    pub const fn extract_value(&self, profile: &ParticipationProfile) -> u64 {
         match self {
             Self::ParticipationDuration => profile.participation_duration_secs,
             Self::GovernanceActionsAgainst => profile.governance_actions_against,
@@ -320,7 +320,7 @@ pub enum ParticipationThreshold {
 impl ParticipationThreshold {
     /// Returns `true` if `value` satisfies this threshold.
     #[must_use]
-    pub fn is_satisfied(&self, value: u64) -> bool {
+    pub const fn is_satisfied(&self, value: u64) -> bool {
         match self {
             Self::GreaterThan(threshold) => value > *threshold,
             Self::LessThan(threshold) => value < *threshold,
@@ -408,17 +408,17 @@ impl ParticipationProfile {
     /// Returns the deterministic signable bytes for this profile.
     ///
     /// Covers all fields except `signature`. The byte layout is:
-    /// - subject_did UTF-8 bytes (length-prefixed as u32 big-endian)
-    /// - participation_duration_secs (u64 big-endian)
-    /// - governance_actions_against (u64 big-endian)
-    /// - governance_actions_by (u64 big-endian)
-    /// - tool_invocation_count (u64 big-endian)
-    /// - context_creation_count (u64 big-endian)
-    /// - role_progression_count (u64 big-endian)
-    /// - attestation_count (u64 big-endian)
-    /// - updated_at (u64 big-endian)
-    /// - event_log_root (32 bytes)
-    /// - signer_public_key (32 bytes)
+    /// - `subject_did` UTF-8 bytes (length-prefixed as u32 big-endian)
+    /// - `participation_duration_secs` (u64 big-endian)
+    /// - `governance_actions_against` (u64 big-endian)
+    /// - `governance_actions_by` (u64 big-endian)
+    /// - `tool_invocation_count` (u64 big-endian)
+    /// - `context_creation_count` (u64 big-endian)
+    /// - `role_progression_count` (u64 big-endian)
+    /// - `attestation_count` (u64 big-endian)
+    /// - `updated_at` (u64 big-endian)
+    /// - `event_log_root` (32 bytes)
+    /// - `signer_public_key` (32 bytes)
     #[must_use]
     pub fn signable_bytes(&self) -> Vec<u8> {
         let did_bytes = self.subject_did.as_bytes();
@@ -427,6 +427,7 @@ impl ParticipationProfile {
         let mut buf = Vec::with_capacity(capacity);
 
         // Length-prefixed DID string.
+        #[allow(clippy::cast_possible_truncation)] // DID strings are well under u32::MAX bytes
         buf.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
         buf.extend_from_slice(did_bytes);
 
@@ -585,6 +586,12 @@ pub enum ParticipationAdmissionError {
 /// means no constraints).
 ///
 /// See §7.3.2.1.
+///
+/// # Errors
+///
+/// Returns [`ParticipationAdmissionError`] if any requirement is unmet:
+/// signature verification failure, insufficient threshold values, expired
+/// statements, or too few distinct context attestations.
 pub fn verify_participation_requirements(
     current_time: u64,
     requirements: &[RequireParticipation],
@@ -657,6 +664,7 @@ pub fn verify_participation_requirements(
         }
 
         // Check min_contexts.
+        #[allow(clippy::cast_possible_truncation)] // signer count bounded by context membership
         let found = distinct_signers.len() as u32;
         if found < req.min_contexts {
             return Err(ParticipationAdmissionError::InsufficientContexts {

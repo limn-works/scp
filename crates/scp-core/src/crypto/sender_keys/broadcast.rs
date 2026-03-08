@@ -158,7 +158,7 @@ pub struct BroadcastKeyEpochAdvance {
 /// The `signature` field is an Ed25519 signature over the canonical hash
 /// `SHA-256("SCP-BROADCAST-ENVELOPE-V1:" || version || len(context_id) || context_id || len(author_did) || author_did || sequence || key_epoch || timestamp || nonce || provenance_hash)`.
 /// The nonce is included to prevent content substitution by broadcast key
-/// holders. The provenance_hash binds provenance metadata to the signature.
+/// holders. The `provenance_hash` binds provenance metadata to the signature.
 /// `content_hash` is intentionally omitted per ADR-038 (confirmation oracle).
 /// Verified BEFORE decryption in [`open_broadcast`] to reject forgeries early.
 /// See issue #352, §5.14.5.
@@ -345,7 +345,7 @@ pub struct SealBroadcastParams<'a> {
 /// absent. Returns a fixed-size 32-byte array (SHA-256 output).
 ///
 /// This mirrors [`compute_provenance_hash`](crate::envelope::inner) and uses
-/// the same serialization format (MessagePack via `rmp_serde::to_vec`) to ensure
+/// the same serialization format (`MessagePack` via `rmp_serde::to_vec`) to ensure
 /// cross-envelope consistency.
 fn compute_provenance_hash(
     provenance: Option<&crate::provenance::DataProvenance>,
@@ -631,7 +631,9 @@ pub fn open_broadcast_trusted(
 ///
 /// Returns [`SenderKeyError::UnsupportedVersion`] if `envelope.version` is not
 /// `SCP_PROTOCOL_VERSION`.
-pub fn validate_broadcast_version(envelope: &BroadcastEnvelope) -> Result<(), SenderKeyError> {
+pub const fn validate_broadcast_version(
+    envelope: &BroadcastEnvelope,
+) -> Result<(), SenderKeyError> {
     if envelope.version != crate::envelope::SCP_PROTOCOL_VERSION {
         return Err(SenderKeyError::UnsupportedVersion {
             version: envelope.version,
@@ -694,9 +696,9 @@ impl BroadcastReplayDetector {
                 .iter()
                 .min_by_key(|(_, (_, ts))| *ts)
                 .map(|(k, _)| k.clone())
-            {
-                self.last_seen.remove(&oldest_key);
-            }
+        {
+            self.last_seen.remove(&oldest_key);
+        }
 
         self.last_seen
             .insert(author_did.to_owned(), (sequence, timestamp));

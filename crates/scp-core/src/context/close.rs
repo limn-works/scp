@@ -47,21 +47,16 @@ use scp_identity::DID;
 /// if not specified.
 ///
 /// See spec §5.11 and issue #365.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum IncompleteVerificationPolicy {
     /// Proceed with close even if not all members verified.
+    #[default]
     Proceed,
     /// Extend the verification window by the specified number of seconds.
     ExtendWindow {
         /// Number of seconds to extend the deadline by.
         duration_secs: u64,
     },
-}
-
-impl Default for IncompleteVerificationPolicy {
-    fn default() -> Self {
-        Self::Proceed
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -334,7 +329,7 @@ impl SummaryVerificationWindow {
     /// Resolves a dispute, either proceeding with the current summary or
     /// replacing it with a revised version.
     ///
-    /// For `DisputeAction::Revise`, the window resets: verified_by is cleared,
+    /// For `DisputeAction::Revise`, the window resets: `verified_by` is cleared,
     /// the deadline is extended by the original window duration, and the state
     /// returns to `Verifying` so members can verify the new summary.
     ///
@@ -349,11 +344,9 @@ impl SummaryVerificationWindow {
                 self.state
             )));
         }
-        match &action {
-            DisputeAction::Proceed => {
-                self.state = VerificationState::Resolved {
-                    action: action.clone(),
-                };
+        match action {
+            action @ DisputeAction::Proceed => {
+                self.state = VerificationState::Resolved { action };
             }
             DisputeAction::Revise { .. } => {
                 // Re-open verification: clear votes, extend deadline, return to Verifying.
@@ -372,7 +365,7 @@ impl SummaryVerificationWindow {
     /// Returns `true` if the window should proceed to close (policy is
     /// `Proceed`). Returns `false` if the window was extended (policy is
     /// `ExtendWindow`).
-    pub fn handle_ttl_expiry(&mut self, now: u64) -> bool {
+    pub const fn handle_ttl_expiry(&mut self, now: u64) -> bool {
         if !self.is_window_closed(now) {
             return false;
         }

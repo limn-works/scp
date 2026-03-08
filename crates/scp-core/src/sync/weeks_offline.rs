@@ -344,14 +344,13 @@ impl ResetRequestNonceTracker {
         seen.insert(key, now);
 
         // Capacity bound: evict oldest entry if over limit.
-        if seen.len() > MAX_NONCE_CACHE_ENTRIES {
-            if let Some(oldest_key) = seen
+        if seen.len() > MAX_NONCE_CACHE_ENTRIES
+            && let Some(oldest_key) = seen
                 .iter()
                 .min_by_key(|(_, ts)| **ts)
                 .map(|(k, _)| k.clone())
-            {
-                seen.remove(&oldest_key);
-            }
+        {
+            seen.remove(&oldest_key);
         }
 
         true
@@ -398,14 +397,13 @@ impl ResetRequestNonceTracker {
         seen.insert(key, now);
 
         // Capacity bound: evict oldest entry if over limit.
-        if seen.len() > MAX_NONCE_CACHE_ENTRIES {
-            if let Some(oldest_key) = seen
+        if seen.len() > MAX_NONCE_CACHE_ENTRIES
+            && let Some(oldest_key) = seen
                 .iter()
                 .min_by_key(|(_, ts)| **ts)
                 .map(|(k, _)| k.clone())
-            {
-                seen.remove(&oldest_key);
-            }
+        {
+            seen.remove(&oldest_key);
         }
     }
 }
@@ -469,11 +467,7 @@ pub fn validate_reset_request(
 ) -> Result<ValidatedResetRequest, WeeksOfflineError> {
     // Check 1: freshness — absolute difference (§23.5.2 requires
     // |relay_clock - timestamp| <= 30s, rejecting both past and future).
-    let diff = if now >= request.timestamp {
-        now - request.timestamp
-    } else {
-        request.timestamp - now
-    };
+    let diff = now.abs_diff(request.timestamp);
     if diff > RESET_REQUEST_FRESHNESS_SECS {
         return Err(WeeksOfflineError::StaleResetRequest {
             context_id: request.context_id.clone(),

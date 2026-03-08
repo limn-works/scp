@@ -265,7 +265,7 @@ impl IdentityBackedDidResolver {
     /// Callers should periodically drain this to detect DID rotations and
     /// take appropriate action (e.g., re-fetching UCAN tokens, updating
     /// MLS credentials).
-    #[must_use] 
+    #[must_use]
     pub fn drain_rotation_events(&self) -> Vec<DidRotatedEvent> {
         let mut events = self
             .rotation_events
@@ -299,10 +299,9 @@ impl IdentityBackedDidResolver {
             }) => Err(ResolutionError::Revoked(format!(
                 "stale sequence for {did}: received {received}, last known {last_known}"
             ))),
-            Err(
-                IdentityError::DhtResolveFailed(msg)
-                | IdentityError::RelayQueryFailed(msg),
-            ) => Err(ResolutionError::NetworkUnavailable(msg)),
+            Err(IdentityError::DhtResolveFailed(msg) | IdentityError::RelayQueryFailed(msg)) => {
+                Err(ResolutionError::NetworkUnavailable(msg))
+            }
             Err(IdentityError::DhtNotFound(msg)) => Err(ResolutionError::NotFound(msg)),
             Err(e) => Err(ResolutionError::InvalidDocument(e.to_string())),
         }
@@ -476,7 +475,7 @@ pub enum DispatchDidResolver<'a> {
 impl DispatchDidResolver<'_> {
     /// Creates a dispatch resolver that uses the production resolver if
     /// available, otherwise falls back to `BridgeDidResolver`.
-    #[must_use] 
+    #[must_use]
     pub const fn new(production: Option<&IdentityBackedDidResolver>) -> DispatchDidResolver<'_> {
         match production {
             Some(resolver) => DispatchDidResolver::Identity(resolver),

@@ -178,7 +178,54 @@ pub fn trust_verify_response(challenge_json: String, response_json: String) -> n
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let signer = EphemeralSigner(signing_key);
 
-    Ok(scp_core::trust::verify_challenge_response(&request, &response, &resolver, &clock, &signer, None).is_ok())
+    Ok(scp_core::trust::verify_challenge_response(
+        &request, &response, &resolver, &clock, &signer, None,
+    )
+    .is_ok())
+}
+
+// ---------------------------------------------------------------------------
+// verify_participation_requirements (SCP-BA-004)
+// ---------------------------------------------------------------------------
+
+/// Verifies participation profiles against admission requirements.
+///
+/// Both inputs are JSON strings:
+/// - `profile_json`: JSON array of `ParticipationProfile` objects.
+/// - `requirements_json`: JSON array of `RequireParticipation` objects.
+///
+/// Uses the current system time for freshness checks. Returns `true` if all
+/// requirements are satisfied, throws an error with a diagnostic message
+/// if any requirement fails or if the JSON is malformed.
+///
+/// See §7.3.2.1.
+#[napi]
+pub fn verify_participation_requirements(
+    profile_json: String,
+    requirements_json: String,
+) -> napi::Result<bool> {
+    let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(&profile_json)
+        .map_err(|e| {
+            validation_error(&format!("failed to parse participation profiles JSON: {e}"))
+        })?;
+
+    let requirements: Vec<scp_core::trust::RequireParticipation> =
+        serde_json::from_str(&requirements_json).map_err(|e| {
+            validation_error(&format!(
+                "failed to parse participation requirements JSON: {e}"
+            ))
+        })?;
+
+    let current_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+
+    scp_core::trust::verify_participation_requirements(current_time, &requirements, &profiles)
+        .map_err(|e| {
+            validation_error(&format!("participation admission verification failed: {e}"))
+        })?;
+
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -236,5 +283,24 @@ mod tests {
     fn trust_verify_response_rejects_invalid_json() {
         let result = trust_verify_response("bad".to_owned(), "bad".to_owned());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_participation_requirements_rejects_invalid_profile_json() {
+        let result = verify_participation_requirements("not json".to_owned(), "[]".to_owned());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_participation_requirements_rejects_invalid_requirements_json() {
+        let result = verify_participation_requirements("[]".to_owned(), "not json".to_owned());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_participation_requirements_empty_inputs_succeeds() {
+        let result = verify_participation_requirements("[]".to_owned(), "[]".to_owned());
+        assert!(result.is_ok());
+        assert!(result.unwrap());
     }
 }

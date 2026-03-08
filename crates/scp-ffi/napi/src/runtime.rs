@@ -283,6 +283,11 @@ pub fn query_trust_event_counts(context_id: &str, _did: &str) -> (u64, u64) {
 }
 
 /// Registers a test context in the UCAN state registry.
+///
+/// # Panics
+///
+/// Panics if `ContextRoleState::new` fails with default ceiling and no
+/// custom roles, which should be infallible.
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 pub fn register_test_context(context_id: &str, creator_did: &str) {

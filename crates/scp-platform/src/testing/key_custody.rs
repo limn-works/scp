@@ -161,6 +161,7 @@ impl Default for InMemoryKeyCustody {
 }
 
 /// Salt for HKDF-SHA-256 pseudonym secret derivation (§9.10.4A).
+#[allow(dead_code)] // Used by derive_pseudonym_secret, retained for future pseudonym wiring
 const PSEUDONYM_SECRET_SALT: &[u8] = b"scp-pseudonym-secret-v1";
 
 /// Derives a `pseudonym_secret` from Ed25519 private key bytes via HKDF-SHA-256.
@@ -176,9 +177,10 @@ const PSEUDONYM_SECRET_SALT: &[u8] = b"scp-pseudonym-secret-v1";
 ///
 /// CRITICAL PRIVACY REQUIREMENT (§9.10.4A): Using public key bytes as the
 /// HMAC key would be a membership enumeration oracle — anyone who knows a
-/// member's public key could compute their pseudonym for any context_id
+/// member's public key could compute their pseudonym for any `context_id`
 /// and check relay subscriptions. The `pseudonym_secret` is derived from
 /// private key bytes, making it unknowable without the private key.
+#[allow(dead_code)] // Retained for future pseudonym wiring
 fn derive_pseudonym_secret(signing_key: &SigningKey) -> Zeroizing<[u8; 32]> {
     let hk = Hkdf::<Sha256>::new(Some(PSEUDONYM_SECRET_SALT), signing_key.as_bytes());
     let mut secret = Zeroizing::new([0u8; 32]);

@@ -635,7 +635,8 @@ async fn rotate_content_keys_via_threshold_governance() {
 }
 
 // =========================================================================
-// AC-8: Membership/access decoupling — revoked member can still vote
+// AC-8: Membership/access decoupling — read-only member can vote,
+//       presence-only member cannot (§5.9, ADR-038)
 // =========================================================================
 
 #[tokio::test]
@@ -680,28 +681,9 @@ async fn revoked_member_can_still_participate_in_governance() {
         .unwrap();
     assert_eq!(status, ProposalStatus::Approved);
 
-    // Revoke Dave's read AND write access via governance.
-
-    // Revoke read access.
-    let (proposal, _) = manager
-        .propose_governance_action(
-            ctx_id,
-            &alice(),
-            GovernanceAction::RevokeReadAccess {
-                did: dave(),
-                scope: RevocationScope::Full,
-            },
-            &sk_alice,
-        )
-        .await
-        .unwrap();
-    let (status, _) = manager
-        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), true, &sk_bob)
-        .await
-        .unwrap();
-    assert_eq!(status, ProposalStatus::Approved);
-
-    // Revoke write access.
+    // Revoke ONLY Dave's write access (making him a read-only member).
+    // Per §5.9: "Read-only members retain governance capabilities —
+    // they can still observe content and participate meaningfully."
     let (proposal, _) = manager
         .propose_governance_action(
             ctx_id,
@@ -720,14 +702,13 @@ async fn revoked_member_can_still_participate_in_governance() {
         .unwrap();
     assert_eq!(status, ProposalStatus::Approved);
 
-    // Now: Dave has both read and write revoked, but should still be a
-    // member and able to participate in governance votes.
+    // Dave is still a member and a read-only member (write revoked only).
     assert!(
         manager.is_member(ctx_id, dave().as_ref()).await,
-        "Dave should remain a member despite read+write revocation"
+        "Dave should remain a member despite write access revocation"
     );
 
-    // Alice proposes a new action. Dave should be able to vote on it.
+    // Alice proposes a new action. Dave (read-only) should be able to vote.
     let (proposal, _) = manager
         .propose_governance_action(
             ctx_id,
@@ -743,7 +724,7 @@ async fn revoked_member_can_still_participate_in_governance() {
     assert_eq!(proposal.status, ProposalStatus::Pending);
 
     // Dave casts an approval vote — this should succeed because
-    // governance participation is decoupled from content access.
+    // read-only members retain governance capabilities (§5.9).
     let sk_dave = signing_key_for_did(&dave());
     let (status, events) = manager
         .vote_on_proposal(ctx_id, &proposal.proposal_id, &dave(), true, &sk_dave)
@@ -754,7 +735,7 @@ async fn revoked_member_can_still_participate_in_governance() {
     assert_eq!(
         status,
         ProposalStatus::Approved,
-        "Dave's vote should count despite content access revocation"
+        "Dave's vote should count — read-only members retain GovernanceVote"
     );
     assert!(
         events.iter().any(
@@ -762,6 +743,66 @@ async fn revoked_member_can_still_participate_in_governance() {
         ),
         "VoteCast event should be recorded for Dave"
     );
+
+    // Now also revoke Dave's read access, making him presence-only.
+    // Per §5.9: "Presence-only members lose GovernanceVote and
+    // GovernancePropose capabilities alongside content access."
+    let (proposal, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::RevokeReadAccess {
+                did: dave(),
+                scope: RevocationScope::Full,
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    let (status, _) = manager
+        .vote_on_proposal(ctx_id, &proposal.proposal_id, &bob(), true, &sk_bob)
+        .await
+        .unwrap();
+    assert_eq!(status, ProposalStatus::Approved);
+
+    // Dave is still a member but now presence-only (both read+write revoked).
+    assert!(
+        manager.is_member(ctx_id, dave().as_ref()).await,
+        "Dave should remain a member despite full access revocation"
+    );
+
+    // Alice proposes another action. Dave (presence-only) should NOT be able to vote.
+    let (proposal, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::ChangeRole {
+                did: bob(),
+                new_role: "admin".into(),
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(proposal.status, ProposalStatus::Pending);
+
+    // Dave's vote should be rejected — presence-only members cannot vote.
+    let vote_result = manager
+        .vote_on_proposal(ctx_id, &proposal.proposal_id, &dave(), true, &sk_dave)
+        .await;
+    assert!(
+        vote_result.is_err(),
+        "Presence-only member should not be able to vote"
+    );
+    match vote_result.unwrap_err() {
+        ContextError::PermissionDenied(msg) => {
+            assert!(
+                msg.contains("presence-only"),
+                "error should mention presence-only restriction: {msg}"
+            );
+        }
+        other => panic!("expected PermissionDenied, got {other:?}"),
+    }
 }
 
 // =========================================================================
