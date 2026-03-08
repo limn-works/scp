@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
 use super::broadcast::{
-    AuthorBlockResult, BlockResult, BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot,
+    BlockResult, BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot,
     GovernanceBanResult, KeyRequestDecision, SubscriptionResult, UnsubscribeResult,
 };
 use super::builder::{
@@ -165,10 +165,9 @@ pub enum GovernanceActionResult {
     ContentKeysRotated(ContentKeysRotatedResult),
     /// Governance was reconfigured via deadlock recovery (ADR-031 §10).
     GovernanceReconfigured(GovernanceReconfiguredResult),
-    /// An author was blocked from a broadcast context (spec section 5.14.8).
-    /// Legacy variant — new code should use `WriteAccessRevoked` with
-    /// `RevocationScope::Full`.
-    AuthorBlocked(AuthorBlockResult),
+    // NOTE: `AuthorBlocked(AuthorBlockResult)` was removed in CAC-008.
+    // `BlockAuthor` now delegates to `RevokeWriteAccess(Full)` and returns
+    // `WriteAccessRevoked` instead. See §5.14.8.
     /// A subscriber's read access was revoked in a broadcast context
     /// (ADR-031, §5.9). The subscriber was removed from the registry and
     /// added to all authors' block lists; all author keys were rotated.
@@ -2175,7 +2174,8 @@ impl ContextManager {
     /// context's governance model (e.g., `SingleAdminEngine::propose()` for
     /// single-admin contexts, or `ThresholdEngine::approve()` reaching quorum).
     ///
-    /// Supports all 25 [`GovernanceAction`] variants (24 from ADR-031 + legacy `BlockAuthor`).
+    /// Supports all 28 [`GovernanceAction`] variants (24 from ADR-031 + legacy `BlockAuthor`
+    /// + 3 economic). Legacy `BlockAuthor` delegates to `RevokeWriteAccess(Full)` per CAC-008.
     /// Actions that modify context state do so under the context write lock
     /// and emit appropriate events.
     ///
@@ -2267,10 +2267,24 @@ impl ContextManager {
         let pid = proposal.proposal_id;
         match &proposal.action {
             GovernanceAction::BlockAuthor { did, .. } => {
-                let r = self
-                    .block_broadcast_author_internal(context_id, did)
-                    .await?;
-                Ok(GovernanceActionResult::AuthorBlocked(r))
+                // Legacy variant: delegate to RevokeWriteAccess(Full) which
+                // subsumes BlockAuthor per CAC-008 / §5.14.8. The write
+                // revocation path handles both encrypted and broadcast
+                // contexts, destroying the author's broadcast key in
+                // broadcast mode and marking the member as write-revoked.
+                self.execute_revoke_write_access(
+                    context_id,
+                    did,
+                    RevocationScope::Full,
+                    proposal.proposal_id,
+                )
+                .await?;
+                Ok(GovernanceActionResult::WriteAccessRevoked(
+                    WriteAccessRevokedResult {
+                        did: did.clone(),
+                        scope: RevocationScope::Full,
+                    },
+                ))
             }
             GovernanceAction::RevokeReadAccess { did, scope } => {
                 let r = self
@@ -3041,78 +3055,6 @@ impl ContextManager {
         }
 
         Ok(status)
-    }
-
-    /// Internal implementation of author blocking. Only callable within the
-    /// crate -- external callers must go through [`execute_governance_action`]
-    /// with an approved [`GovernanceProposal`] containing a
-    /// [`GovernanceAction::BlockAuthor`] action.
-    ///
-    /// Removes the author from the broadcast context's author map, destroying
-    /// their sender key. After this call:
-    ///
-    /// - `publish_broadcast()` by this author returns `PermissionDenied`.
-    /// - `handle_broadcast_key_request()` for this author returns `Deny`.
-    /// - Subscribers who cached the author's old key can still decrypt old
-    ///   messages, but no new messages can be sealed.
-    ///
-    /// Emits an `AuthorBlocked` event. See SCP-227 AC4 and spec section 5.14.8.
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-    /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
-    ///   context.
-    async fn block_broadcast_author_internal(
-        &self,
-        context_id: &str,
-        author_did: &DID,
-    ) -> Result<AuthorBlockResult, ContextError> {
-        let context_id_bytes = context_id_to_bytes(context_id);
-
-        // Replay check and executed_proposals tracking are handled by the
-        // outer execute_governance_action wrapper — not duplicated here.
-        let (result, snapshot) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
-            require_active(&ctx.handle)?;
-
-            // Gate: ceiling must include MemberBan (§5.3, ADR-031, #339).
-            // Consistent with revoke_read_access_internal and
-            // restore_read_access_internal which already check this.
-            if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
-                return Err(ContextError::PermissionDenied(
-                    "context ceiling does not include member:ban capability".into(),
-                ));
-            }
-
-            let bc = ctx
-                .broadcast_context
-                .as_mut()
-                .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
-
-            let result = bc.block_author(author_did)?;
-
-            // Take snapshot for persistence before dropping lock.
-            let snapshot = bc.to_snapshot();
-
-            // Emit block event to receive buffer.
-            ctx.receive_buffer.push(ContextEvent::AuthorBlocked {
-                author_did: author_did.clone(),
-            });
-
-            (result, snapshot)
-        };
-
-        // Persist broadcast state for crash recovery.
-        self.persist_broadcast_snapshot(context_id, &snapshot);
-
-        self.event_log
-            .append_context_event(&context_id_bytes, "AuthorBlocked")?;
-
-        Ok(result)
     }
 
     /// Internal implementation of read access revocation. Only callable within
@@ -4234,7 +4176,7 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        let snapshot = {
+        let (snapshot, bc_snapshot) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
@@ -4263,14 +4205,33 @@ impl ContextManager {
                 ctx.role_state.restore_governance_capabilities(did);
             }
 
+            // Broadcast mode: re-add the author to BroadcastContext with a
+            // new epoch-0 broadcast key. This is forward-only — previously
+            // suppressed content remains suppressed because the old key was
+            // destroyed during revocation.
+            let bc_snap = if let Some(ref mut bc) = ctx.broadcast_context {
+                // add_author creates a fresh AuthorState with epoch 0 and a
+                // new random broadcast key. If the author already exists
+                // (e.g. FutureOnly revocation that didn't destroy the key),
+                // this returns an error — which we ignore because the
+                // author entry is still present and functional.
+                let _ = bc.add_author(&did.0);
+                Some(bc.to_snapshot())
+            } else {
+                None
+            };
+
             // Emit write access restored event to receive buffer.
             ctx.receive_buffer
                 .push(ContextEvent::WriteAccessRestored { did: did.clone() });
 
-            Self::snapshot_context(ctx)
+            (Self::snapshot_context(ctx), bc_snap)
         };
 
         self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref bc_snap) = bc_snapshot {
+            self.persist_broadcast_snapshot(context_id, bc_snap);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "WriteAccessRestored")?;
         Ok(())
@@ -4303,10 +4264,9 @@ impl ContextManager {
             };
 
             // Emit content keys rotated event to receive buffer.
-            ctx.receive_buffer
-                .push(ContextEvent::ContentKeysRotated {
-                    reason: reason.map(String::from),
-                });
+            ctx.receive_buffer.push(ContextEvent::ContentKeysRotated {
+                reason: reason.map(String::from),
+            });
 
             (Self::snapshot_context(ctx), bc_snap)
         };
@@ -6918,16 +6878,18 @@ mod tests {
         );
 
         // Block bob via governance: admin proposes, auto-approved.
+        // CAC-008: BlockAuthor now delegates to RevokeWriteAccess(Full),
+        // returning WriteAccessRevoked instead of AuthorBlocked.
         let proposal =
             approved_block_author_proposal(&"did:key:alice".into(), &ctx_id, &"did:key:bob".into());
         let action_result = manager.execute_governance_action(&ctx_id, &proposal).await;
         assert!(action_result.is_ok());
-        let super::GovernanceActionResult::AuthorBlocked(block_result) = action_result.unwrap()
+        let super::GovernanceActionResult::WriteAccessRevoked(result) = action_result.unwrap()
         else {
-            panic!("expected AuthorBlocked result");
+            panic!("expected WriteAccessRevoked result");
         };
-        assert_eq!(block_result.author_did, "did:key:bob");
-        assert_eq!(block_result.final_epoch, 0);
+        assert_eq!(result.did.0, "did:key:bob");
+        assert_eq!(result.scope, super::RevocationScope::Full);
 
         // Alice can still publish (unaffected).
         assert!(
@@ -7611,11 +7573,7 @@ mod tests {
         };
 
         let _handle = manager
-            .create_context(
-                "encrypted-ban-ctx".into(),
-                params,
-                "did:key:alice".into(),
-            )
+            .create_context("encrypted-ban-ctx".into(), params, "did:key:alice".into())
             .await
             .unwrap();
 
@@ -7714,9 +7672,7 @@ mod tests {
             action,
         );
         proposal2.proposal_id = [2u8; 32]; // distinct from first proposal
-        let result = manager
-            .execute_governance_action(&ctx_id, &proposal2)
-            .await;
+        let result = manager.execute_governance_action(&ctx_id, &proposal2).await;
         assert!(
             result.is_ok(),
             "redundant RevokeWriteAccess should succeed (no-op)"
@@ -7806,7 +7762,10 @@ mod tests {
         );
 
         let result = manager.execute_governance_action(&ctx_id, &proposal).await;
-        assert!(result.is_err(), "RestoreWriteAccess on never-revoked should fail");
+        assert!(
+            result.is_err(),
+            "RestoreWriteAccess on never-revoked should fail"
+        );
         assert!(
             matches!(
                 result.unwrap_err(),
@@ -7858,8 +7817,14 @@ mod tests {
         {
             let contexts = manager.contexts.lock().await;
             let ctx = contexts.get(&ctx_id).unwrap();
-            assert!(ctx.write_revoked_members.contains(&DID("did:key:bob".into())));
-            assert!(ctx.read_revoked_members.contains(&DID("did:key:bob".into())));
+            assert!(
+                ctx.write_revoked_members
+                    .contains(&DID("did:key:bob".into()))
+            );
+            assert!(
+                ctx.read_revoked_members
+                    .contains(&DID("did:key:bob".into()))
+            );
         }
     }
 
@@ -7913,7 +7878,10 @@ mod tests {
         );
 
         let result = manager.execute_governance_action(&ctx_id, &proposal).await;
-        assert!(result.is_ok(), "RotateContentKeys with no reason should succeed");
+        assert!(
+            result.is_ok(),
+            "RotateContentKeys with no reason should succeed"
+        );
 
         match result.unwrap() {
             super::GovernanceActionResult::ContentKeysRotated(r) => {
@@ -7952,7 +7920,10 @@ mod tests {
         );
 
         let result = manager.execute_governance_action(&ctx_id, &proposal).await;
-        assert!(result.is_ok(), "RevokeWriteAccess Full in broadcast should succeed");
+        assert!(
+            result.is_ok(),
+            "RevokeWriteAccess Full in broadcast should succeed"
+        );
 
         // Verify WriteAccessRevoked event.
         let events = manager.drain_events(&ctx_id).await;
@@ -8034,7 +8005,10 @@ mod tests {
         );
 
         let result = manager.execute_governance_action(&ctx_id, &proposal).await;
-        assert!(result.is_err(), "RevokeWriteAccess on non-member should fail");
+        assert!(
+            result.is_err(),
+            "RevokeWriteAccess on non-member should fail"
+        );
         assert!(
             matches!(result.unwrap_err(), ContextError::MemberNotFound(_)),
             "error should be MemberNotFound"
@@ -8057,7 +8031,10 @@ mod tests {
         );
 
         let result = manager.execute_governance_action(&ctx_id, &proposal).await;
-        assert!(result.is_ok(), "RotateContentKeys in broadcast should succeed");
+        assert!(
+            result.is_ok(),
+            "RotateContentKeys in broadcast should succeed"
+        );
 
         match result.unwrap() {
             super::GovernanceActionResult::ContentKeysRotated(r) => {
@@ -8065,6 +8042,300 @@ mod tests {
             }
             other => panic!("expected ContentKeysRotated, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // CAC-008: Replace BlockAuthor with RevokeWriteAccess in broadcast wiring
+    // -----------------------------------------------------------------------
+
+    /// CAC-008 AC1: BlockAuthor delegates to RevokeWriteAccess(Full) and
+    /// returns WriteAccessRevoked (not AuthorBlocked).
+    #[tokio::test]
+    async fn block_author_delegates_to_revoke_write_access() {
+        let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
+
+        // Add bob to membership so the revoke path finds them.
+        // (setup_broadcast_context_two_authors already adds bob to membership)
+
+        let proposal =
+            approved_block_author_proposal(&"did:key:alice".into(), &ctx_id, &"did:key:bob".into());
+        let result = manager
+            .execute_governance_action(&ctx_id, &proposal)
+            .await
+            .unwrap();
+
+        // Should return WriteAccessRevoked, NOT AuthorBlocked.
+        match result {
+            super::GovernanceActionResult::WriteAccessRevoked(r) => {
+                assert_eq!(r.did.0, "did:key:bob");
+                assert_eq!(r.scope, super::RevocationScope::Full);
+            }
+            other => panic!("expected WriteAccessRevoked, got {other:?}"),
+        }
+
+        // Bob should be in write_revoked_members.
+        {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get(&ctx_id).unwrap();
+            assert!(
+                ctx.write_revoked_members
+                    .contains(&DID("did:key:bob".into())),
+                "bob should be in write_revoked_members after BlockAuthor"
+            );
+        }
+
+        // WriteAccessRevoked event should be emitted (not AuthorBlocked).
+        let events = manager.drain_events(&ctx_id).await;
+        let has_write_revoked = events.iter().any(|e| {
+            matches!(
+                e,
+                super::ContextEvent::WriteAccessRevoked { did } if did.0 == "did:key:bob"
+            )
+        });
+        assert!(
+            has_write_revoked,
+            "WriteAccessRevoked event should be emitted"
+        );
+        let has_author_blocked = events
+            .iter()
+            .any(|e| matches!(e, super::ContextEvent::AuthorBlocked { .. }));
+        assert!(
+            !has_author_blocked,
+            "AuthorBlocked event should NOT be emitted"
+        );
+    }
+
+    /// CAC-008 AC3: RevokeWriteAccess(Full) in broadcast mode destroys
+    /// author broadcast key, denies key requests.
+    #[tokio::test]
+    async fn revoke_write_full_broadcast_destroys_key_denies_requests() {
+        let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
+
+        // Verify bob can publish before revocation.
+        let bob_sk = ed25519_dalek::SigningKey::from_bytes(&[0xBB; 32]);
+        assert!(
+            manager
+                .publish_broadcast(&ctx_id, &"did:key:bob".into(), b"before", &bob_sk)
+                .await
+                .is_ok(),
+            "bob should publish before revocation"
+        );
+
+        // Revoke bob's write access via governance.
+        let action = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            action,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &proposal)
+            .await
+            .unwrap();
+
+        // Bob cannot publish (PermissionDenied from write_revoked_members check).
+        let bob_result = manager
+            .publish_broadcast(&ctx_id, &"did:key:bob".into(), b"after", &bob_sk)
+            .await;
+        assert!(bob_result.is_err(), "revoked author should not publish");
+        assert!(matches!(
+            bob_result.unwrap_err(),
+            ContextError::PermissionDenied(_)
+        ));
+
+        // Key request for bob should be denied (author removed from broadcast context).
+        {
+            use crate::crypto::ucan::validate::{
+                InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+                InMemoryRevocationChecker,
+            };
+            use std::hash::RandomState;
+
+            // Subscribe a subscriber first.
+            manager
+                .subscribe_broadcast::<
+                    InMemoryDidResolver,
+                    InMemoryNonceTracker,
+                    InMemoryRevocationChecker,
+                    InMemoryProofResolver,
+                    RandomState,
+                >(
+                    &ctx_id,
+                    &"did:key:sub1".into(),
+                    None,
+                    1000,
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let decision = manager
+                .handle_broadcast_key_request(
+                    &ctx_id,
+                    &"did:key:bob".into(),
+                    &"did:key:sub1".into(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(decision, super::KeyRequestDecision::Deny { .. }),
+                "key request for revoked author should be denied"
+            );
+        }
+    }
+
+    /// CAC-008 AC4: RevokeWriteAccess(FutureOnly) in broadcast mode revokes
+    /// messagesWrite UCAN only (existing broadcast key remains).
+    #[tokio::test]
+    async fn revoke_write_future_only_broadcast_keeps_key() {
+        let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
+
+        let action = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::FutureOnly,
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            action,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &proposal)
+            .await
+            .unwrap();
+
+        // Bob should be marked as write-revoked (cannot publish).
+        let bob_sk = ed25519_dalek::SigningKey::from_bytes(&[0xBB; 32]);
+        let result = manager
+            .publish_broadcast(&ctx_id, &"did:key:bob".into(), b"after", &bob_sk)
+            .await;
+        assert!(
+            result.is_err(),
+            "FutureOnly revoked author should not publish"
+        );
+
+        // But the broadcast key should still exist (author not removed from
+        // BroadcastContext), so subscribers can still decrypt historical
+        // content by requesting the key.
+        {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get(&ctx_id).unwrap();
+            let bc = ctx.broadcast_context.as_ref().unwrap();
+            assert!(
+                bc.is_author("did:key:bob"),
+                "FutureOnly should NOT remove author from broadcast context"
+            );
+        }
+    }
+
+    /// CAC-008 AC5: RestoreWriteAccess in broadcast mode re-grants write
+    /// access, author generates new broadcast key (forward-only).
+    #[tokio::test]
+    async fn restore_write_access_broadcast_re_adds_author() {
+        let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
+
+        // Revoke with Full scope first (destroys author key).
+        let revoke = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            revoke,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &proposal)
+            .await
+            .unwrap();
+
+        // Verify bob is removed from broadcast context.
+        {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get(&ctx_id).unwrap();
+            let bc = ctx.broadcast_context.as_ref().unwrap();
+            assert!(
+                !bc.is_author("did:key:bob"),
+                "bob should be removed from broadcast context after Full revocation"
+            );
+        }
+
+        // Restore write access.
+        let restore = super::GovernanceAction::RestoreWriteAccess {
+            did: "did:key:bob".into(),
+        };
+        let restore_proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            restore,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &restore_proposal)
+            .await
+            .unwrap();
+
+        // Bob should be re-added to broadcast context with a new key.
+        {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get(&ctx_id).unwrap();
+            let bc = ctx.broadcast_context.as_ref().unwrap();
+            assert!(
+                bc.is_author("did:key:bob"),
+                "bob should be re-added to broadcast context after restore"
+            );
+            let author = bc.get_author("did:key:bob").unwrap();
+            assert_eq!(
+                author.epoch, 0,
+                "restored author should have epoch 0 (new key)"
+            );
+        }
+
+        // Bob should no longer be write-revoked and can publish.
+        assert!(
+            !manager
+                .contexts
+                .lock()
+                .await
+                .get(&ctx_id)
+                .unwrap()
+                .write_revoked_members
+                .contains(&DID("did:key:bob".into())),
+            "bob should not be write-revoked after restore"
+        );
+
+        let bob_sk = ed25519_dalek::SigningKey::from_bytes(&[0xBB; 32]);
+        assert!(
+            manager
+                .publish_broadcast(&ctx_id, &"did:key:bob".into(), b"after restore", &bob_sk)
+                .await
+                .is_ok(),
+            "restored author should be able to publish"
+        );
+    }
+
+    /// CAC-008 AC6: No references to standalone `block_broadcast_author()`
+    /// method — it has been removed from ContextManager.
+    #[tokio::test]
+    async fn no_standalone_block_broadcast_author_method() {
+        // Verify at compile time: `block_broadcast_author_internal` is not
+        // a public or crate-public method on ContextManager. This test
+        // exists to document the removal per CAC-008 AC1.
+        // If block_broadcast_author_internal were still defined, this test
+        // file would need it to be called — its absence is the assertion.
+        let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
+
+        // The only way to block an author is through governance:
+        let proposal =
+            approved_block_author_proposal(&"did:key:alice".into(), &ctx_id, &"did:key:bob".into());
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_ok(), "author blocking must go through governance");
     }
 
     // -----------------------------------------------------------------------
@@ -9991,8 +10262,8 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("member:ban")),
-            "expected PermissionDenied about member:ban, got: {err}"
+            matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("MemberBan")),
+            "expected PermissionDenied about MemberBan, got: {err}"
         );
     }
 

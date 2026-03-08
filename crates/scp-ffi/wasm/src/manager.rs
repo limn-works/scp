@@ -177,8 +177,8 @@ pub enum WasmContextEvent {
         sequence_number: u64,
         payload_base64: String,
     },
-    AuthorBlocked {
-        author_did: String,
+    WriteAccessRevoked {
+        did: String,
     },
     SystemClose {
         initiator_did: String,
@@ -1135,19 +1135,16 @@ impl WasmContextManager {
                 Ok(serde_json::json!({"action": "RestoreWriteAccess", "did": did}))
             }
             WasmGovernanceAction::BlockAuthor { did } => {
+                // CAC-008: BlockAuthor delegates to RevokeWriteAccess(Full).
+                // Destroy the author's broadcast key and mark write-revoked.
                 let ctx = self.require_active_context_mut(context_id)?;
-                let bc = ctx
-                    .broadcast
-                    .as_mut()
-                    .ok_or_else(|| ScpWasmError::Context {
-                        message: "not a broadcast context".to_owned(),
-                        code: "SCP-CTX-2001".to_owned(),
-                    })?;
-                bc.authors.remove(did);
-                ctx.event_buffer.push(WasmContextEvent::AuthorBlocked {
-                    author_did: did.clone(),
-                });
-                Ok(serde_json::json!({"action": "BlockAuthor", "did": did}))
+                if let Some(ref mut bc) = ctx.broadcast {
+                    bc.authors.remove(did);
+                }
+                ctx.write_revoked_members.insert(did.clone());
+                ctx.event_buffer
+                    .push(WasmContextEvent::WriteAccessRevoked { did: did.clone() });
+                Ok(serde_json::json!({"action": "WriteAccessRevoked", "did": did, "scope": "Full"}))
             }
             WasmGovernanceAction::RevokeReadAccess { did } => {
                 let ctx = self.require_active_context_mut(context_id)?;
