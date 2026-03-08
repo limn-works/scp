@@ -38,9 +38,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::BridgeMode;
-use super::credentials::{
-    BridgeCredentialStore, CredentialError, CredentialType,
-};
+use super::credentials::{BridgeCredentialStore, CredentialError, CredentialType};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -330,10 +328,7 @@ fn percent_encode(input: &str) -> String {
 /// should override with the platform's actual scope identifiers.
 #[must_use]
 pub fn relay_mode_scopes() -> Vec<String> {
-    vec![
-        "read:messages".to_owned(),
-        "read:users".to_owned(),
-    ]
+    vec!["read:messages".to_owned(), "read:users".to_owned()]
 }
 
 /// Returns recommended read+write scopes for Puppet mode bridges.
@@ -511,11 +506,10 @@ impl<H: OAuthHttpClient, S: BridgeCredentialStore> OAuthCredentialManager<H, S> 
             )
             .await?;
 
-        let refresh_token = String::from_utf8(refresh_token_bytes.to_vec()).map_err(|e| {
-            OAuthError::HttpError {
+        let refresh_token =
+            String::from_utf8(refresh_token_bytes.to_vec()).map_err(|e| OAuthError::HttpError {
                 reason: format!("stored refresh token is not valid UTF-8: {e}"),
-            }
-        })?;
+            })?;
 
         // Retry with exponential backoff.
         let mut last_error = String::new();
@@ -576,7 +570,12 @@ impl<H: OAuthHttpClient, S: BridgeCredentialStore> OAuthCredentialManager<H, S> 
     /// - `issued_at` or `expires_in` is `None` (no expiry tracking).
     /// - The token has not yet reached the refresh threshold.
     #[must_use]
-    pub const fn should_refresh(&self, issued_at: Option<u64>, expires_in: Option<u64>, now: u64) -> bool {
+    pub const fn should_refresh(
+        &self,
+        issued_at: Option<u64>,
+        expires_in: Option<u64>,
+        now: u64,
+    ) -> bool {
         match (issued_at, expires_in) {
             (Some(issued), Some(lifetime)) if lifetime > 0 => {
                 let threshold_secs = lifetime * self.refresh_threshold_percent / 100;
@@ -612,23 +611,37 @@ impl<H: OAuthHttpClient, S: BridgeCredentialStore> OAuthCredentialManager<H, S> 
             // Attempt to retrieve and revoke access token (best-effort).
             if let Some(token) = self
                 .credential_store
-                .retrieve(bridge_id, &CredentialType::OAuthAccessToken, operator_key_material)
+                .retrieve(
+                    bridge_id,
+                    &CredentialType::OAuthAccessToken,
+                    operator_key_material,
+                )
                 .await
                 .ok()
                 .and_then(|b| String::from_utf8(b.to_vec()).ok())
             {
-                let _ = self.http_client.revoke_token(revocation_endpoint, &token, "access_token").await;
+                let _ = self
+                    .http_client
+                    .revoke_token(revocation_endpoint, &token, "access_token")
+                    .await;
             }
 
             // Attempt to retrieve and revoke refresh token (best-effort).
             if let Some(token) = self
                 .credential_store
-                .retrieve(bridge_id, &CredentialType::OAuthRefreshToken, operator_key_material)
+                .retrieve(
+                    bridge_id,
+                    &CredentialType::OAuthRefreshToken,
+                    operator_key_material,
+                )
                 .await
                 .ok()
                 .and_then(|b| String::from_utf8(b.to_vec()).ok())
             {
-                let _ = self.http_client.revoke_token(revocation_endpoint, &token, "refresh_token").await;
+                let _ = self
+                    .http_client
+                    .revoke_token(revocation_endpoint, &token, "refresh_token")
+                    .await;
             }
         }
 
@@ -653,7 +666,12 @@ impl<H: OAuthHttpClient, S: BridgeCredentialStore> fmt::Debug for OAuthCredentia
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::significant_drop_tightening)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::significant_drop_tightening
+)]
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -829,7 +847,10 @@ mod tests {
             *self.exchange_response.lock().await = Some(response);
         }
 
-        async fn set_refresh_responses(&self, responses: Vec<Result<OAuthTokenResponse, OAuthError>>) {
+        async fn set_refresh_responses(
+            &self,
+            responses: Vec<Result<OAuthTokenResponse, OAuthError>>,
+        ) {
             *self.refresh_response.lock().await = responses;
         }
     }
@@ -845,9 +866,11 @@ mod tests {
                 .lock()
                 .await
                 .take()
-                .unwrap_or_else(|| Err(OAuthError::HttpError {
-                    reason: "no mock response configured".to_owned(),
-                }))
+                .unwrap_or_else(|| {
+                    Err(OAuthError::HttpError {
+                        reason: "no mock response configured".to_owned(),
+                    })
+                })
         }
 
         async fn refresh_token(
@@ -1221,8 +1244,8 @@ mod tests {
     fn should_refresh_custom_threshold() {
         let mock = MockOAuthHttpClient::new();
         let store = InMemoryCredentialStore::new();
-        let manager = OAuthCredentialManager::new(test_config(), mock, store)
-            .with_refresh_threshold(50);
+        let manager =
+            OAuthCredentialManager::new(test_config(), mock, store).with_refresh_threshold(50);
 
         // 50% of 3600 = 1800. At t=2801 (1801s elapsed), should refresh.
         assert!(manager.should_refresh(Some(1000), Some(3600), 2801));

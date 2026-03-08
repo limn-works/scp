@@ -358,9 +358,9 @@ impl CapabilityUri {
     #[must_use]
     pub fn name(&self) -> &str {
         match self {
-            Self::Protocol { name, .. }
-            | Self::DidScoped { name, .. }
-            | Self::System { name } => name,
+            Self::Protocol { name, .. } | Self::DidScoped { name, .. } | Self::System { name } => {
+                name
+            }
         }
     }
 }

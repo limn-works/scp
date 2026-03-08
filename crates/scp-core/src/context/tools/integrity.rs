@@ -444,7 +444,11 @@ mod tests {
         assert!(result.integrity_ok);
         assert_eq!(result.vector_results.len(), 1);
         assert!(result.vector_results[0].passed);
-        assert!(verification.challenge_id.starts_with("tool-integrity-calc-"));
+        assert!(
+            verification
+                .challenge_id
+                .starts_with("tool-integrity-calc-")
+        );
         assert_eq!(verification.challenge_type, ChallengeType::tool_integrity());
     }
 
@@ -470,7 +474,12 @@ mod tests {
         assert!(!result.vector_results[0].passed);
         assert!(result.vector_results[0].mismatch_detail.is_some());
         assert!(
-            !verification.result.get("integrity_ok").unwrap().as_bool().unwrap()
+            !verification
+                .result
+                .get("integrity_ok")
+                .unwrap()
+                .as_bool()
+                .unwrap()
         );
     }
 

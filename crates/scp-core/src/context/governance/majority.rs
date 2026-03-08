@@ -2255,8 +2255,8 @@ mod tests {
     #[test]
     fn majority_set_economic_policy() {
         let voters = vec![alice(), bob(), carol()];
-        let mut engine =
-            MajorityVoteEngine::new(voters.clone(), 86_400, 5000, mock_resolver()).expect("valid config");
+        let mut engine = MajorityVoteEngine::new(voters.clone(), 86_400, 5000, mock_resolver())
+            .expect("valid config");
         let ctx = test_context(&voters, 1_700_000_000);
 
         let action = GovernanceAction::SetEconomicPolicy {
@@ -2284,8 +2284,8 @@ mod tests {
     #[test]
     fn majority_approve_spend() {
         let voters = vec![alice(), bob()];
-        let mut engine =
-            MajorityVoteEngine::new(voters.clone(), 86_400, 5000, mock_resolver()).expect("valid config");
+        let mut engine = MajorityVoteEngine::new(voters.clone(), 86_400, 5000, mock_resolver())
+            .expect("valid config");
         let ctx = test_context(&voters, 1_700_000_000);
 
         let action = GovernanceAction::ApproveSpend {
@@ -2301,8 +2301,8 @@ mod tests {
     #[test]
     fn majority_lock_economic_policy() {
         let voters = vec![alice(), bob()];
-        let mut engine =
-            MajorityVoteEngine::new(voters.clone(), 86_400, 5000, mock_resolver()).expect("valid config");
+        let mut engine = MajorityVoteEngine::new(voters.clone(), 86_400, 5000, mock_resolver())
+            .expect("valid config");
         let ctx = test_context(&voters, 1_700_000_000);
 
         let action = GovernanceAction::LockEconomicPolicy;

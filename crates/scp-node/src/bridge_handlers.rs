@@ -13,7 +13,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::{Extension, Json, Router, routing::{delete, get, post}};
+use axum::{
+    Extension, Json, Router,
+    routing::{delete, get, post},
+};
 use scp_core::bridge::shadow::{CreateShadowParams, ShadowRegistry, create_shadow};
 use scp_core::bridge::{BridgeMode, ShadowProvenanceStatus};
 use scp_core::crypto::sender_keys::SenderKeyStore;
@@ -455,10 +458,8 @@ async fn attest_handler(
             .into_response();
     }
     if body.attestation_evidence.verification_method.is_empty() {
-        return ApiError::bad_request(
-            "attestation_evidence.verification_method must not be empty",
-        )
-        .into_response();
+        return ApiError::bad_request("attestation_evidence.verification_method must not be empty")
+            .into_response();
     }
     if !is_valid_confidence(&body.attestation_evidence.platform_confidence) {
         return ApiError::bad_request(
@@ -728,11 +729,7 @@ async fn delete_shadow_handler(
                     .into_response();
             }
 
-            bridge_state
-                .deleted_shadows
-                .write()
-                .await
-                .insert(shadow_id);
+            bridge_state.deleted_shadows.write().await.insert(shadow_id);
 
             StatusCode::NO_CONTENT.into_response()
         }
@@ -827,7 +824,10 @@ async fn webhook_handler(
     Json(body): Json<WebhookRequest>,
 ) -> impl IntoResponse {
     if !VALID_EVENT_TYPES.contains(&body.event_type.as_str()) {
-        return webhook_reject(body.event_id, &format!("unknown event_type: {}", body.event_type));
+        return webhook_reject(
+            body.event_id,
+            &format!("unknown event_type: {}", body.event_type),
+        );
     }
     if body.event_id.is_empty() {
         return ApiError::bad_request("event_id must not be empty").into_response();
@@ -839,21 +839,40 @@ async fn webhook_handler(
         if processed.contains(&body.event_id) {
             return (
                 StatusCode::OK,
-                Json(WebhookResponse { accepted: true, event_id: body.event_id, reason: None }),
+                Json(WebhookResponse {
+                    accepted: true,
+                    event_id: body.event_id,
+                    reason: None,
+                }),
             )
                 .into_response();
         }
     }
 
-    if let Some(reason) = process_webhook_event(&bridge_state, &body.event_type, &body.event_id, &body.payload).await {
+    if let Some(reason) = process_webhook_event(
+        &bridge_state,
+        &body.event_type,
+        &body.event_id,
+        &body.payload,
+    )
+    .await
+    {
         return webhook_reject(body.event_id, &reason);
     }
 
-    bridge_state.processed_event_ids.write().await.insert(body.event_id.clone());
+    bridge_state
+        .processed_event_ids
+        .write()
+        .await
+        .insert(body.event_id.clone());
 
     (
         StatusCode::OK,
-        Json(WebhookResponse { accepted: true, event_id: body.event_id, reason: None }),
+        Json(WebhookResponse {
+            accepted: true,
+            event_id: body.event_id,
+            reason: None,
+        }),
     )
         .into_response()
 }
@@ -982,10 +1001,7 @@ mod tests {
         assert_eq!(json["platform_handle"], "@alice#1234");
         assert_eq!(json["platform_user_id"], "user-alice-001");
         assert_eq!(json["attributed_role"], "observer");
-        assert_eq!(
-            json["shadow_id"],
-            "shadow:bridge-test-001:user-alice-001"
-        );
+        assert_eq!(json["shadow_id"], "shadow:bridge-test-001:user-alice-001");
         assert!(json["created_at"].as_u64().is_some());
     }
 
@@ -1094,10 +1110,7 @@ mod tests {
         let json = response_json(resp).await;
         assert_eq!(json["status"], "active");
         assert_eq!(json["platform_handle"], "@dave#1234");
-        assert_eq!(
-            json["attestation_id"],
-            "attest:bridge-test-001:usr_abc123"
-        );
+        assert_eq!(json["attestation_id"], "attest:bridge-test-001:usr_abc123");
         assert!(json["issued_at"].as_u64().is_some());
         assert!(json["expires_at"].as_u64().is_some());
 
@@ -1585,7 +1598,10 @@ mod tests {
         let resp = app.oneshot(req).await.expect("test");
         assert_eq!(resp.status(), StatusCode::CREATED);
         let create_json = response_json(resp).await;
-        let shadow_id = create_json["shadow_id"].as_str().expect("shadow_id").to_owned();
+        let shadow_id = create_json["shadow_id"]
+            .as_str()
+            .expect("shadow_id")
+            .to_owned();
         assert_eq!(create_json["attributed_role"], "observer");
 
         // 2. Emit message.
@@ -1603,9 +1619,15 @@ mod tests {
         assert!(msg_json["message_id"].as_str().is_some());
         assert_eq!(msg_json["sequence"], 1);
         // Verify provenance fields.
-        assert_eq!(msg_json["bridge_provenance"]["originating_platform"], "discord");
+        assert_eq!(
+            msg_json["bridge_provenance"]["originating_platform"],
+            "discord"
+        );
         assert_eq!(msg_json["bridge_provenance"]["bridge_mode"], "Relay");
-        assert_eq!(msg_json["bridge_provenance"]["operator_did"], "did:dht:z6MkTestOperator");
+        assert_eq!(
+            msg_json["bridge_provenance"]["operator_did"],
+            "did:dht:z6MkTestOperator"
+        );
         assert_eq!(msg_json["bridge_provenance"]["shadow_status"], "Shadow");
 
         // 3. Attest identity.
@@ -1678,7 +1700,9 @@ mod tests {
         }));
         let resp = app.oneshot(req).await.expect("test");
         assert_eq!(
-            resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
             Some("application/json"),
             "POST /shadow must return application/json"
         );
@@ -1692,7 +1716,9 @@ mod tests {
         }));
         let resp = app.oneshot(req).await.expect("test");
         assert_eq!(
-            resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
             Some("application/json"),
             "POST /message must return application/json"
         );
@@ -1702,7 +1728,9 @@ mod tests {
         let req = status_request();
         let resp = app.oneshot(req).await.expect("test");
         assert_eq!(
-            resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
             Some("application/json"),
             "GET /status must return application/json"
         );
@@ -1712,7 +1740,9 @@ mod tests {
         let req = attest_request(valid_attest_body());
         let resp = app.oneshot(req).await.expect("test");
         assert_eq!(
-            resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
             Some("application/json"),
             "POST /attest must return application/json"
         );
@@ -1727,7 +1757,9 @@ mod tests {
         }));
         let resp = app.oneshot(req).await.expect("test");
         assert_eq!(
-            resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
             Some("application/json"),
             "POST /webhook must return application/json"
         );
@@ -1748,8 +1780,14 @@ mod tests {
         let resp = app.oneshot(req).await.expect("test");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let json = response_json(resp).await;
-        assert!(json["code"].as_str().is_some(), "error response must have code field");
-        assert!(json["error"].as_str().is_some(), "error response must have error field");
+        assert!(
+            json["code"].as_str().is_some(),
+            "error response must have code field"
+        );
+        assert!(
+            json["error"].as_str().is_some(),
+            "error response must have error field"
+        );
     }
 
     /// Verifies that deleting an unclaimed shadow succeeds and the

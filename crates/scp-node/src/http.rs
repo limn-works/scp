@@ -578,7 +578,10 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
         let projection =
             crate::projection::broadcast_projection_router(Arc::clone(&self.state)).layer(cors);
 
-        let dev_router = self.state.dev_token.clone()
+        let dev_router = self
+            .state
+            .dev_token
+            .clone()
             .map(|t| crate::dev_api::dev_router(Arc::clone(&self.state), t));
         let dev_bind_addr = self.state.dev_bind_addr;
         let tls_config = self.state.tls_config.clone();
@@ -612,7 +615,9 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
         let listener = tokio::net::TcpListener::bind(state.http_bind_addr)
             .await
             .map_err(|e| NodeError::Serve(e.to_string()))?;
-        let local_addr = listener.local_addr().map_err(|e| NodeError::Serve(e.to_string()))?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|e| NodeError::Serve(e.to_string()))?;
         let shutdown_token = state.shutdown_token.clone();
         let token = shutdown_token.clone();
         tokio::spawn(async move {

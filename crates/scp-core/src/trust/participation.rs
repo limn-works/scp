@@ -460,9 +460,7 @@ impl ParticipationProfile {
 pub enum ParticipationAdmissionError {
     /// A statement's Ed25519 signature does not verify against its
     /// `signer_public_key` over `signable_bytes`.
-    #[error(
-        "invalid signature on statement for {subject_did} (signer {signer_hex}): {reason}"
-    )]
+    #[error("invalid signature on statement for {subject_did} (signer {signer_hex}): {reason}")]
     InvalidSignature {
         /// The subject DID of the failing statement.
         subject_did: DID,
@@ -474,9 +472,7 @@ pub enum ParticipationAdmissionError {
 
     /// The fact value extracted from the profile does not satisfy the
     /// requirement's threshold.
-    #[error(
-        "threshold not met for {fact:?}: value {value} does not satisfy {threshold:?}"
-    )]
+    #[error("threshold not met for {fact:?}: value {value} does not satisfy {threshold:?}")]
     ThresholdNotMet {
         /// Which fact category failed.
         fact: ParticipationFact,
@@ -505,9 +501,7 @@ pub enum ParticipationAdmissionError {
 
     /// Statements span fewer than `min_contexts` distinct `signer_public_key`
     /// values for a requirement.
-    #[error(
-        "insufficient contexts for {fact:?}: need {required} distinct signers, found {found}"
-    )]
+    #[error("insufficient contexts for {fact:?}: need {required} distinct signers, found {found}")]
     InsufficientContexts {
         /// Which fact category this applies to.
         fact: ParticipationFact,
@@ -630,14 +624,13 @@ fn verify_statement_signature(
 ) -> Result<(), ParticipationAdmissionError> {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
-    let verifying_key =
-        VerifyingKey::from_bytes(&statement.signer_public_key).map_err(|e| {
-            ParticipationAdmissionError::InvalidSignature {
-                subject_did: statement.subject_did.clone(),
-                signer_hex: hex::encode(&statement.signer_public_key[..8]),
-                reason: format!("invalid public key: {e}"),
-            }
-        })?;
+    let verifying_key = VerifyingKey::from_bytes(&statement.signer_public_key).map_err(|e| {
+        ParticipationAdmissionError::InvalidSignature {
+            subject_did: statement.subject_did.clone(),
+            signer_hex: hex::encode(&statement.signer_public_key[..8]),
+            reason: format!("invalid public key: {e}"),
+        }
+    })?;
 
     let signature = Signature::from_bytes(&statement.signature);
     let signable = statement.signable_bytes();
@@ -670,9 +663,7 @@ const PARTICIPATION_KEY_DOMAIN: &[u8] = b"scp-participation-statement-v1";
 /// `"scp-participation-statement-v1"` as the info string. The same context
 /// key material always produces the same signing key (deterministic), but
 /// different contexts produce different keys (preventing correlation).
-fn derive_participation_signing_key(
-    context_key_material: &[u8; 32],
-) -> ed25519_dalek::SigningKey {
+fn derive_participation_signing_key(context_key_material: &[u8; 32]) -> ed25519_dalek::SigningKey {
     use hkdf::Hkdf;
     use sha2::Sha256;
 
@@ -744,13 +735,8 @@ pub fn produce_participation_profile(
 
     // Compute participation facts from the event log. We use a dummy
     // context_id since ParticipationProfile intentionally omits it.
-    let record = compute_participation_record(
-        events,
-        member_did,
-        "_internal",
-        merkle_root,
-        current_time,
-    )?;
+    let record =
+        compute_participation_record(events, member_did, "_internal", merkle_root, current_time)?;
 
     // Derive the context-specific signing key.
     let signing_key = derive_participation_signing_key(context_key_material);
@@ -1574,8 +1560,7 @@ mod tests {
             min_contexts: 1,
         };
 
-        let result =
-            verify_participation_requirements(1_700_000_100, &[req], &[statement]);
+        let result = verify_participation_requirements(1_700_000_100, &[req], &[statement]);
         assert!(result.is_ok());
     }
 
@@ -1599,8 +1584,7 @@ mod tests {
             },
         ];
 
-        let result =
-            verify_participation_requirements(1_700_000_100, &reqs, &[statement]);
+        let result = verify_participation_requirements(1_700_000_100, &reqs, &[statement]);
         assert!(result.is_ok());
     }
 
@@ -1618,8 +1602,7 @@ mod tests {
             min_contexts: 1,
         };
 
-        let result =
-            verify_participation_requirements(1_700_000_100, &[req], &[statement]);
+        let result = verify_participation_requirements(1_700_000_100, &[req], &[statement]);
         assert!(result.is_err());
         match result {
             Err(ParticipationAdmissionError::InvalidSignature { subject_did, .. }) => {
@@ -1649,14 +1632,9 @@ mod tests {
             min_contexts: 1,
         };
 
-        let result =
-            verify_participation_requirements(1_700_000_100, &[req], &[statement]);
+        let result = verify_participation_requirements(1_700_000_100, &[req], &[statement]);
         match result {
-            Err(ParticipationAdmissionError::ThresholdNotMet {
-                fact,
-                value,
-                ..
-            }) => {
+            Err(ParticipationAdmissionError::ThresholdNotMet { fact, value, .. }) => {
                 assert_eq!(fact, ParticipationFact::ToolInvocationCount);
                 assert_eq!(value, 50);
             }
@@ -1677,8 +1655,7 @@ mod tests {
         };
 
         // current_time is way past max_age_secs
-        let result =
-            verify_participation_requirements(1_700_010_000, &[req], &[statement]);
+        let result = verify_participation_requirements(1_700_010_000, &[req], &[statement]);
         match result {
             Err(ParticipationAdmissionError::RecordTooStale {
                 fact,
@@ -1707,13 +1684,10 @@ mod tests {
             min_contexts: 3, // need 3, only have 1
         };
 
-        let result =
-            verify_participation_requirements(1_700_000_100, &[req], &[statement]);
+        let result = verify_participation_requirements(1_700_000_100, &[req], &[statement]);
         match result {
             Err(ParticipationAdmissionError::InsufficientContexts {
-                required,
-                found,
-                ..
+                required, found, ..
             }) => {
                 assert_eq!(required, 3);
                 assert_eq!(found, 1);
@@ -1736,13 +1710,10 @@ mod tests {
             min_contexts: 2, // need 2 distinct signers
         };
 
-        let result =
-            verify_participation_requirements(1_700_000_100, &[req], &[s1, s2]);
+        let result = verify_participation_requirements(1_700_000_100, &[req], &[s1, s2]);
         match result {
             Err(ParticipationAdmissionError::InsufficientContexts {
-                required,
-                found,
-                ..
+                required, found, ..
             }) => {
                 assert_eq!(required, 2);
                 assert_eq!(found, 1);
@@ -1768,8 +1739,7 @@ mod tests {
             min_contexts: 3,
         };
 
-        let result =
-            verify_participation_requirements(1_700_000_100, &[req], &[s1, s2, s3]);
+        let result = verify_participation_requirements(1_700_000_100, &[req], &[s1, s2, s3]);
         assert!(result.is_ok());
     }
 
@@ -1782,8 +1752,7 @@ mod tests {
             min_contexts: 1,
         };
 
-        let result =
-            verify_participation_requirements(1_700_000_000, &[req], &[]);
+        let result = verify_participation_requirements(1_700_000_000, &[req], &[]);
         // No statements means threshold can't be met.
         match result {
             Err(ParticipationAdmissionError::ThresholdNotMet { .. }) => {}
@@ -1808,13 +1777,10 @@ mod tests {
             min_contexts: 2, // need 2, but only 1 is fresh
         };
 
-        let result =
-            verify_participation_requirements(1_700_003_700, &[req], &[s1, s2]);
+        let result = verify_participation_requirements(1_700_003_700, &[req], &[s1, s2]);
         match result {
             Err(ParticipationAdmissionError::InsufficientContexts {
-                required,
-                found,
-                ..
+                required, found, ..
             }) => {
                 assert_eq!(required, 2);
                 assert_eq!(found, 1);
@@ -1852,14 +1818,9 @@ mod tests {
             },
         ];
 
-        let result =
-            verify_participation_requirements(1_700_000_100, &reqs, &[statement]);
+        let result = verify_participation_requirements(1_700_000_100, &reqs, &[statement]);
         match result {
-            Err(ParticipationAdmissionError::ThresholdNotMet {
-                fact,
-                value,
-                ..
-            }) => {
+            Err(ParticipationAdmissionError::ThresholdNotMet { fact, value, .. }) => {
                 assert_eq!(fact, ParticipationFact::ContextCreationCount);
                 assert_eq!(value, 1);
             }
@@ -2200,7 +2161,11 @@ mod tests {
             .iter()
             .filter(|s| s.service_type == PARTICIPATION_STATEMENTS_SERVICE_TYPE)
             .collect();
-        assert_eq!(matching.len(), 1, "should have exactly one entry after replacement");
+        assert_eq!(
+            matching.len(),
+            1,
+            "should have exactly one entry after replacement"
+        );
         assert_eq!(
             matching[0].service_endpoint,
             "https://new.example.com/v1/scp/participation/did"
@@ -2212,7 +2177,10 @@ mod tests {
         let did = "did:dht:zTestDid";
         let mut doc = make_test_document(did);
 
-        add_participation_service(&mut doc, "https://relay.example.com/v1/scp/participation/did");
+        add_participation_service(
+            &mut doc,
+            "https://relay.example.com/v1/scp/participation/did",
+        );
         assert!(extract_participation_service_endpoint(&doc).is_some());
 
         remove_participation_service(&mut doc);
@@ -2258,7 +2226,10 @@ mod tests {
         // Document starts with pre-rotation service.
         let initial_count = doc.service.len();
 
-        add_participation_service(&mut doc, "https://relay.example.com/v1/scp/participation/did");
+        add_participation_service(
+            &mut doc,
+            "https://relay.example.com/v1/scp/participation/did",
+        );
         assert_eq!(doc.service.len(), initial_count + 1);
 
         remove_participation_service(&mut doc);

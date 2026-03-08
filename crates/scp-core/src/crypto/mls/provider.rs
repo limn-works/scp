@@ -252,9 +252,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                 // Bind credential to owner_did: extract the ScpCredential
                 // from the key package's leaf node and verify the DID matches.
                 let leaf_node = verified.leaf_node();
-                if let Ok(basic_cred) =
-                    BasicCredential::try_from(leaf_node.credential().clone())
-                {
+                if let Ok(basic_cred) = BasicCredential::try_from(leaf_node.credential().clone()) {
                     let scp_cred =
                         ScpCredential::from_bytes(basic_cred.identity()).map_err(|e| {
                             ContextError::InvalidKeyPackage(format!(
@@ -831,11 +829,7 @@ mod tests {
         }
 
         // remove_member_sender_key removes by the given DID.
-        assert!(
-            provider
-                .remove_member_sender_key(&ctx_id, TEST_DID)
-                .is_ok()
-        );
+        assert!(provider.remove_member_sender_key(&ctx_id, TEST_DID).is_ok());
     }
 
     #[test]

@@ -340,14 +340,11 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                 .sender_keys
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let sender_key =
-                store
-                    .get(&ctx_str, &self.creator_did)
-                    .ok_or_else(|| {
-                        ContextError::CryptoFailed(
-                            "no sender key for local DID in this context".to_string(),
-                        )
-                    })?;
+            let sender_key = store.get(&ctx_str, &self.creator_did).ok_or_else(|| {
+                ContextError::CryptoFailed(
+                    "no sender key for local DID in this context".to_string(),
+                )
+            })?;
             crate::crypto::sender_keys::encrypt::encrypt_sender_layer(sender_key, payload)
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?
         };
@@ -456,7 +453,11 @@ mod tests {
     #[test]
     fn validate_key_package_accepts_valid_did() {
         let provider = MlsCryptoProvider::new(test_did());
-        assert!(provider.validate_key_package("did:dht:z6MkAlice", None).is_ok());
+        assert!(
+            provider
+                .validate_key_package("did:dht:z6MkAlice", None)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -514,12 +515,11 @@ mod tests {
             let ctx_str = MlsCryptoProvider::context_id_str(&ctx_id);
             store.get(&ctx_str, &alice_did).unwrap().clone()
         };
-        let fully_decrypted =
-            crate::crypto::sender_keys::encrypt::decrypt_sender_layer(
-                &alice_sender_key,
-                &mls_decrypted,
-            )
-            .unwrap();
+        let fully_decrypted = crate::crypto::sender_keys::encrypt::decrypt_sender_layer(
+            &alice_sender_key,
+            &mls_decrypted,
+        )
+        .unwrap();
         assert_eq!(fully_decrypted, plaintext);
     }
 

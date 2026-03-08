@@ -99,8 +99,9 @@ impl SubscriberRegistration {
     ) -> Vec<u8> {
         let ctx_bytes = context_id.as_bytes();
         let did_bytes = subscriber_did.0.as_bytes();
-        let mut input =
-            Vec::with_capacity(4 + ctx_bytes.len() + 4 + did_bytes.len() + wrapping_pubkey.len() + 8);
+        let mut input = Vec::with_capacity(
+            4 + ctx_bytes.len() + 4 + did_bytes.len() + wrapping_pubkey.len() + 8,
+        );
         // Length-prefix variable-length fields to prevent ambiguous concatenation
         // (e.g. context_id="a" + did="bc" vs context_id="ab" + did="c").
         input.extend_from_slice(&(ctx_bytes.len() as u32).to_be_bytes());

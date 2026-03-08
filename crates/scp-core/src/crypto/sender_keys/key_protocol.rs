@@ -1251,8 +1251,10 @@ pub fn handle_bridge_shadow_key_request(
     requester_wrapping_pubkey: &[u8; 32],
     params: &BridgeShadowKeyParams<'_>,
 ) -> Result<([u8; 60], [u8; 32]), SenderKeyError> {
-    let (sealed_vec, ephemeral_pub) =
-        hpke_seal(params.shadow_sender_key.as_bytes(), requester_wrapping_pubkey)?;
+    let (sealed_vec, ephemeral_pub) = hpke_seal(
+        params.shadow_sender_key.as_bytes(),
+        requester_wrapping_pubkey,
+    )?;
 
     // Convert to fixed-size array.
     let mut sealed_arr = [0u8; 60];
@@ -2871,9 +2873,7 @@ mod tests {
 
     #[test]
     fn bridge_shadow_key_request_roundtrip() {
-        use super::{
-            BridgeShadowKeyParams, handle_bridge_shadow_key_request,
-        };
+        use super::{BridgeShadowKeyParams, handle_bridge_shadow_key_request};
 
         let shadow_key = generate_sender_key();
         let (recipient_pub, recipient_secret) = generate_wrapping_keypair();
@@ -2889,8 +2889,7 @@ mod tests {
             handle_bridge_shadow_key_request(&recipient_pub, &params).unwrap();
 
         // Unwrap: ECDH with recipient secret and ephemeral public.
-        let recipient_static =
-            x25519_dalek::StaticSecret::from(recipient_secret);
+        let recipient_static = x25519_dalek::StaticSecret::from(recipient_secret);
         let eph_pub = x25519_dalek::PublicKey::from(ephemeral_pub);
         let shared = recipient_static.diffie_hellman(&eph_pub);
         let aes_key = hkdf_derive_key(shared.as_bytes()).unwrap();
@@ -2932,21 +2931,9 @@ mod tests {
         use crate::crypto::sender_keys::SenderKeyStore;
 
         let mut store = SenderKeyStore::new();
-        store.set(
-            "ctx-1",
-            "shadow:bridge-001:alice",
-            generate_sender_key(),
-        );
-        store.set(
-            "ctx-1",
-            "shadow:bridge-001:bob",
-            generate_sender_key(),
-        );
-        store.set(
-            "ctx-1",
-            "did:dht:z6MkNative",
-            generate_sender_key(),
-        );
+        store.set("ctx-1", "shadow:bridge-001:alice", generate_sender_key());
+        store.set("ctx-1", "shadow:bridge-001:bob", generate_sender_key());
+        store.set("ctx-1", "did:dht:z6MkNative", generate_sender_key());
 
         let shadow_dids = list_shadow_sender_key_dids(&store, "ctx-1", "shadow:");
         assert_eq!(shadow_dids.len(), 2);

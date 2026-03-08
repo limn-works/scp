@@ -1023,10 +1023,19 @@ mod mock_providers {
         fn destroy_sender_key(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn validate_key_package(&self, _owner_did: &str, _key_package_bytes: Option<&[u8]>) -> Result<(), ContextError> {
+        fn validate_key_package(
+            &self,
+            _owner_did: &str,
+            _key_package_bytes: Option<&[u8]>,
+        ) -> Result<(), ContextError> {
             Ok(())
         }
-        fn add_member(&self, _ctx_id: &[u8; 32], _member_did: &str, _key_package_bytes: Option<&[u8]>) -> Result<(), ContextError> {
+        fn add_member(
+            &self,
+            _ctx_id: &[u8; 32],
+            _member_did: &str,
+            _key_package_bytes: Option<&[u8]>,
+        ) -> Result<(), ContextError> {
             Ok(())
         }
         fn remove_member(&self, _ctx_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
@@ -1184,9 +1193,7 @@ async fn context_manager_broadcast_restore_roundtrip() {
 
     // Execute the governance action (this persists the snapshot including
     // executed_proposals via the shared persistence).
-    let result = manager
-        .execute_governance_action(ctx_id, &proposal)
-        .await;
+    let result = manager.execute_governance_action(ctx_id, &proposal).await;
     assert!(result.is_ok(), "first execution should succeed");
 
     // Verify bob was actually added.
@@ -1218,10 +1225,7 @@ async fn context_manager_broadcast_restore_roundtrip() {
 
     let handle2 = ContextHandle::new(ctx_id.to_owned(), params);
     handle2.transition_to(&ContextState::Active).await.unwrap();
-    manager2
-        .restore_context(ctx_id, &handle2)
-        .await
-        .unwrap();
+    manager2.restore_context(ctx_id, &handle2).await.unwrap();
 
     // Verify membership survived restart.
     assert!(
@@ -1236,9 +1240,7 @@ async fn context_manager_broadcast_restore_roundtrip() {
     // Attempt to replay the SAME governance proposal after restart.
     // This must be rejected -- the executed_proposals set should have
     // been restored from persistence.
-    let replay_result = manager2
-        .execute_governance_action(ctx_id, &proposal)
-        .await;
+    let replay_result = manager2.execute_governance_action(ctx_id, &proposal).await;
     assert!(
         replay_result.is_err(),
         "replayed governance proposal must be rejected after restart"

@@ -660,8 +660,9 @@ impl ContextProvider for FfiBridgeProvider {
 
             crate::runtime::with_context(context_id, |rt| {
                 let production_resolver = crate::runtime::did_resolver();
-                let did_resolver =
-                    crate::bridge_adapters::DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
+                let did_resolver = crate::bridge_adapters::DispatchDidResolver::new(
+                    production_resolver.map(std::convert::AsRef::as_ref),
+                );
                 let revocation_checker = crate::bridge_adapters::BridgeRevocationChecker {
                     revocation_list: &rt.revocation_list,
                 };
@@ -1101,9 +1102,8 @@ pub fn py_mcp_serve(
 
     // Validate that all context IDs are registered in the runtime.
     for ctx_id in &context_ids {
-        crate::runtime::with_context(ctx_id, |_rt| Ok(())).map_err(|e| {
-            ScpPyError::transport(format!("cannot serve context '{ctx_id}': {e}"))
-        })?;
+        crate::runtime::with_context(ctx_id, |_rt| Ok(()))
+            .map_err(|e| ScpPyError::transport(format!("cannot serve context '{ctx_id}': {e}")))?;
     }
 
     // Create the FfiBridgeProvider and McpServer.
@@ -1275,15 +1275,14 @@ pub fn py_mcp_serve(
 #[pyo3(name = "py_mcp_server_stop")]
 pub fn py_mcp_server_stop(handle: &str) -> PyResult<()> {
     validate::validate_mcp_handle(handle)?;
-    let mut entry = server_registry().get_mut(handle).ok_or_else(|| {
-        ScpPyError::transport(format!("MCP server handle '{handle}' not found"))
-    })?;
+    let mut entry = server_registry()
+        .get_mut(handle)
+        .ok_or_else(|| ScpPyError::transport(format!("MCP server handle '{handle}' not found")))?;
 
     if entry.stopped {
-        return Err(ScpPyError::transport(format!(
-            "MCP server '{handle}' is already stopped"
-        ))
-        .into());
+        return Err(
+            ScpPyError::transport(format!("MCP server '{handle}' is already stopped")).into(),
+        );
     }
 
     entry.stopped = true;
@@ -1357,9 +1356,9 @@ pub fn py_mcp_server_wait(py: Python<'_>, handle: &str) -> PyResult<()> {
 #[pyo3(name = "py_mcp_server_info")]
 pub fn py_mcp_server_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
     validate::validate_mcp_handle(handle)?;
-    let entry = server_registry().get(handle).ok_or_else(|| {
-        ScpPyError::transport(format!("MCP server handle '{handle}' not found"))
-    })?;
+    let entry = server_registry()
+        .get(handle)
+        .ok_or_else(|| ScpPyError::transport(format!("MCP server handle '{handle}' not found")))?;
 
     let dict = PyDict::new(py);
     dict.set_item("identity_did", &entry.identity_did)?;
@@ -1387,9 +1386,9 @@ pub fn py_mcp_server_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
 #[pyo3(name = "py_mcp_client_info")]
 pub fn py_mcp_client_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
     validate::validate_mcp_handle(handle)?;
-    let entry = client_registry().get(handle).ok_or_else(|| {
-        ScpPyError::transport(format!("MCP client handle '{handle}' not found"))
-    })?;
+    let entry = client_registry()
+        .get(handle)
+        .ok_or_else(|| ScpPyError::transport(format!("MCP client handle '{handle}' not found")))?;
 
     let dict = PyDict::new(py);
     dict.set_item("transport", &entry.transport)?;
@@ -1427,9 +1426,7 @@ pub fn py_mcp_client_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec for #[pyfunction] arguments.
 pub fn py_mcp_client_connect_stdio(command: Vec<String>) -> PyResult<String> {
     if command.is_empty() {
-        return Err(
-            ScpPyError::validation("command must be a non-empty list".to_owned()).into(),
-        );
+        return Err(ScpPyError::validation("command must be a non-empty list".to_owned()).into());
     }
 
     // Spawn the subprocess and create the transport.
@@ -1520,9 +1517,9 @@ pub fn py_mcp_client_connect_sse(url: &str) -> PyResult<String> {
 #[pyo3(name = "py_mcp_client_disconnect")]
 pub fn py_mcp_client_disconnect(handle: &str) -> PyResult<()> {
     validate::validate_mcp_handle(handle)?;
-    let (_, state) = client_registry().remove(handle).ok_or_else(|| {
-        ScpPyError::transport(format!("MCP client handle '{handle}' not found"))
-    })?;
+    let (_, state) = client_registry()
+        .remove(handle)
+        .ok_or_else(|| ScpPyError::transport(format!("MCP client handle '{handle}' not found")))?;
 
     // Dropping `state` drops the Arc<Mutex<McpClient>>, which drops the
     // McpClient, which drops the ClientTransport. For stdio transports,
@@ -1555,9 +1552,9 @@ pub fn py_mcp_client_disconnect(handle: &str) -> PyResult<()> {
 #[pyo3(name = "py_mcp_client_list_tools")]
 pub fn py_mcp_client_list_tools(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
     validate::validate_mcp_handle(handle)?;
-    let entry = client_registry().get(handle).ok_or_else(|| {
-        ScpPyError::transport(format!("MCP client handle '{handle}' not found"))
-    })?;
+    let entry = client_registry()
+        .get(handle)
+        .ok_or_else(|| ScpPyError::transport(format!("MCP client handle '{handle}' not found")))?;
 
     // Send the real tools/list request via the MCP client.
     let client = Arc::clone(&entry.client);
@@ -1623,9 +1620,9 @@ pub fn py_mcp_client_invoke(
     validate::validate_tool_name(tool_name)?;
     validate::validate_context_id(context_id)?;
     validate::validate_did(identity_did)?;
-    let entry = client_registry().get(handle).ok_or_else(|| {
-        ScpPyError::transport(format!("MCP client handle '{handle}' not found"))
-    })?;
+    let entry = client_registry()
+        .get(handle)
+        .ok_or_else(|| ScpPyError::transport(format!("MCP client handle '{handle}' not found")))?;
 
     let client = Arc::clone(&entry.client);
     drop(entry); // Release the DashMap guard before Python object access.

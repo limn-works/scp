@@ -120,8 +120,7 @@ pub use participation::{
     PARTICIPATION_STATEMENTS_SERVICE_TYPE, ParticipationAdmissionError, ParticipationFact,
     ParticipationProfile, ParticipationRecord, ParticipationThreshold, RequireParticipation,
     add_participation_service, extract_participation_service_endpoint,
-    produce_participation_profile, remove_participation_service,
-    verify_participation_requirements,
+    produce_participation_profile, remove_participation_service, verify_participation_requirements,
 };
 pub use renewal::{DefaultRenewalChecker, RenewalChecker, RenewalError, renew_attestation};
 
@@ -266,7 +265,9 @@ pub enum TrustError {
 
     /// The capability URI refers to a system capability (`scp:system:*`),
     /// which is a protocol feature flag and not challenge-testable.
-    #[error("system capability '{uri}' is not challengeable — system capabilities are feature flags, not testable capabilities")]
+    #[error(
+        "system capability '{uri}' is not challengeable — system capabilities are feature flags, not testable capabilities"
+    )]
     NotChallengeable {
         /// The system capability URI that was rejected.
         uri: String,

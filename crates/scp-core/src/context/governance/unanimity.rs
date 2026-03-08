@@ -599,7 +599,6 @@ impl GovernanceEngine for UnanimityEngine {
             proposal_id: *proposal_id,
             status: ProposalStatus::Invalidated { reason },
         }])
-
     }
 }
 
@@ -1819,7 +1818,8 @@ mod tests {
     #[test]
     fn unanimity_set_economic_policy() {
         let members = vec![alice(), bob()];
-        let mut engine = UnanimityEngine::new(members, 86_400, mock_resolver()).expect("valid config");
+        let mut engine =
+            UnanimityEngine::new(members, 86_400, mock_resolver()).expect("valid config");
         let ctx = test_context_at(1_700_000_000);
 
         let action = GovernanceAction::SetEconomicPolicy {
@@ -1846,7 +1846,8 @@ mod tests {
     #[test]
     fn unanimity_approve_spend() {
         let members = vec![alice(), bob()];
-        let mut engine = UnanimityEngine::new(members, 86_400, mock_resolver()).expect("valid config");
+        let mut engine =
+            UnanimityEngine::new(members, 86_400, mock_resolver()).expect("valid config");
         let ctx = test_context_at(1_700_000_000);
 
         let action = GovernanceAction::ApproveSpend {
@@ -1862,7 +1863,8 @@ mod tests {
     #[test]
     fn unanimity_lock_economic_policy() {
         let members = vec![alice(), bob()];
-        let mut engine = UnanimityEngine::new(members, 86_400, mock_resolver()).expect("valid config");
+        let mut engine =
+            UnanimityEngine::new(members, 86_400, mock_resolver()).expect("valid config");
         let ctx = test_context_at(1_700_000_000);
 
         let action = GovernanceAction::LockEconomicPolicy;

@@ -176,9 +176,7 @@ fn parse_capability_endpoint(endpoint: &str) -> Result<Vec<CapabilityUri>, Disco
     let mut caps = Vec::with_capacity(raw_caps.len());
     for raw in raw_caps {
         let uri: CapabilityUri = raw.parse().map_err(|e| {
-            DiscoveryError::InvalidCapabilities(format!(
-                "invalid capability URI '{raw}': {e}"
-            ))
+            DiscoveryError::InvalidCapabilities(format!("invalid capability URI '{raw}': {e}"))
         })?;
         caps.push(uri);
     }
@@ -257,10 +255,9 @@ mod tests {
 
     #[test]
     fn parse_capability_endpoint_did_scoped_uri() {
-        let caps = parse_capability_endpoint(
-            "scp:capabilities:did:dht:z6Mk123:capability:custom/v1",
-        )
-        .unwrap();
+        let caps =
+            parse_capability_endpoint("scp:capabilities:did:dht:z6Mk123:capability:custom/v1")
+                .unwrap();
         assert_eq!(caps.len(), 1);
         assert_eq!(caps[0], cap("did:dht:z6Mk123:capability:custom/v1"));
         assert!(matches!(caps[0], CapabilityUri::DidScoped { .. }));
@@ -278,8 +275,7 @@ mod tests {
 
     #[test]
     fn parse_capability_endpoint_rejects_bare_string() {
-        let err =
-            parse_capability_endpoint("scp:capabilities:code_review").unwrap_err();
+        let err = parse_capability_endpoint("scp:capabilities:code_review").unwrap_err();
         assert!(matches!(err, DiscoveryError::InvalidCapabilities(_)));
     }
 
@@ -289,10 +285,9 @@ mod tests {
 
     #[test]
     fn parse_capability_endpoint_single_capability() {
-        let caps = parse_capability_endpoint(
-            "scp:capabilities:scp:capability:schema-validation/v1",
-        )
-        .unwrap();
+        let caps =
+            parse_capability_endpoint("scp:capabilities:scp:capability:schema-validation/v1")
+                .unwrap();
         assert_eq!(caps, vec![cap("scp:capability:schema-validation/v1")]);
     }
 
@@ -477,7 +472,10 @@ mod tests {
 
         let json = serde_json::to_value(&entry).unwrap();
         let caps = json["capabilities"].as_array().unwrap();
-        assert_eq!(caps[0].as_str().unwrap(), "scp:capability:schema-validation/v1");
+        assert_eq!(
+            caps[0].as_str().unwrap(),
+            "scp:capability:schema-validation/v1"
+        );
         assert_eq!(
             caps[1].as_str().unwrap(),
             "did:dht:z6Mk123:capability:custom/v1"
@@ -543,7 +541,9 @@ mod tests {
         doc.service.push(scp_identity::document::Service {
             id: format!("{did}#scp-capabilities-1"),
             service_type: SCP_CAPABILITIES_SERVICE_TYPE.to_owned(),
-            service_endpoint: "scp:capabilities:scp:system:relay-operation,scp:capability:schema-validation/v1".to_owned(),
+            service_endpoint:
+                "scp:capabilities:scp:system:relay-operation,scp:capability:schema-validation/v1"
+                    .to_owned(),
         });
         doc.service.push(scp_identity::document::Service {
             id: format!("{did}#scp-capabilities-2"),
@@ -555,7 +555,10 @@ mod tests {
         // relay-operation appears in both but should be deduplicated.
         assert_eq!(entry.capabilities.len(), 3);
         assert_eq!(entry.capabilities[0], cap("scp:system:relay-operation"));
-        assert_eq!(entry.capabilities[1], cap("scp:capability:schema-validation/v1"));
+        assert_eq!(
+            entry.capabilities[1],
+            cap("scp:capability:schema-validation/v1")
+        );
         assert_eq!(entry.capabilities[2], cap("scp:system:bridge-operation"));
     }
 
