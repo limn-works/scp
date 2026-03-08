@@ -1144,7 +1144,7 @@ mod tests {
         let signature = sk.sign(&build_broadcast_signing_payload(&SigningPayloadFields {
             version: scp_core::envelope::SCP_PROTOCOL_VERSION,
             context_id: "test-ctx",
-            author_did: &key.author_did(),
+            author_did: key.author_did(),
             sequence: 1,
             key_epoch: key.epoch(),
             timestamp: 1_700_000_000_000,
