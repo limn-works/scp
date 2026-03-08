@@ -41,8 +41,67 @@ Properties of bridge connectors:
 
 - **Operated by accountable identities.** Every bridge has a human operator bound by DID. Bridge misbehavior traces to a person. This is consistent with SCP's core invariant: every action traces to a human.
 - **Registered with contexts.** A bridge connector registers with a specific context. The context's governance model controls whether the bridge is admitted. Context members can see which bridges are active and who operates them.
-- **Transparent.** Bridge presence, operator identity, connected platform, and operating mode are visible to all context members and in context metadata (visible before opt-in).
+- **Transparent.** Bridge presence, operator identity, connected platform, and operating mode are visible to all context members via the `bridges` structural field in context metadata (§5.7). Because `bridges` is a structural field, it is always visible before opt-in — prospective members see active bridges before deciding whether to join. The canonical definition of `BridgeMetadata` lives in §5.7; this section describes the protocol semantics. When a bridge is registered, revoked, or suspended, the context's metadata record MUST be republished with updated bridge metadata (§5.7.1).
 - **Revocable.** Context governance can remove a bridge at any time, severing the connection to the external platform.
+
+### 12.2.1 Bridge Registration Protocol
+
+Bridge registration is a governance-gated operation using the `RegisterBridge` governance action:
+
+```
+RegisterBridge {
+  operator_did:    DID,              // the bridge operator's DID
+  platform:        String,           // platform identifier (e.g., "discord", "slack", "x")
+  mode:            BridgeMode,       // Relay | Puppet | API | Cooperative
+  webhook_url:     Option<String>,   // for cooperative mode: platform's webhook receiver URL
+  platform_key:    Option<[u8; 32]>, // for cooperative mode: platform's Ed25519 public key
+  max_shadows:     u32,              // governance-configured shadow limit for this bridge
+  metadata:        BridgeMetadata,   // display name, description, operator contact
+}
+```
+
+**Registration flow:**
+
+1. The bridge operator submits a `RegisterBridge` proposal to the context via the standard governance mechanism (§5.9). The operator MUST be a context member or hold a valid UCAN granting `bridging` capability in the context.
+2. The context's governance model processes the proposal (SingleAdmin: admin approves; Threshold/MajorityVote/Unanimity: members vote).
+3. On approval, the context emits a `BridgeRegistered` event in the Merkle event log containing the full `RegisterBridge` payload, the approving governance action ID, and the assigned `bridge_id` (SHA-256 of `context_id || operator_did || platform || timestamp`).
+4. The context metadata is republished with the new bridge in the `bridges` structural field (§5.7).
+5. For cooperative mode: the bridge node stores the `platform_key` for webhook signature verification (§12.10.2).
+
+**Bridge status state machine:**
+
+```
+Active ──→ Suspended ──→ Active     (reactivation via governance)
+Active ──→ Suspended ──→ Revoked    (permanent removal)
+Active ──→ Revoked                  (immediate permanent removal)
+```
+
+`Revoked` is a terminal state — a revoked bridge cannot be reactivated. A new `RegisterBridge` proposal is required to re-establish a bridge with the same operator and platform.
+
+### 12.2.2 Bridge Removal Protocol
+
+Bridge removal uses the `RevokeBridge` governance action:
+
+```
+RevokeBridge {
+  bridge_id:       [u8; 32],         // the bridge to revoke
+  reason:          String,           // governance justification
+  destroy_shadows: bool,             // true = retire all shadows; false = shadows persist as orphaned
+}
+```
+
+**Removal flow:**
+
+1. An admin or governance-authorized member submits a `RevokeBridge` proposal.
+2. On governance approval, the context emits a `BridgeRevoked` event in the Merkle event log.
+3. The bridge's `BridgeStatus` transitions to `Revoked`.
+4. If `destroy_shadows` is true: all shadow identities associated with this bridge are retired. Each shadow retirement emits a `ShadowRetired` event. Historical actions attributed to shadows remain in the event log with their original provenance.
+5. If `destroy_shadows` is false: shadows persist but are orphaned — no new messages can be emitted through them, but their historical attributions remain.
+6. The credential store for this bridge instance MUST destroy all delegated credentials (§12.11.1 Phase 5).
+7. In-flight messages from shadows that have not yet been committed to the event log are dropped. The bridge node receives a `BRIDGE_SUSPENDED` or `BRIDGE_FORBIDDEN` error on subsequent API calls.
+8. Context metadata is republished with the bridge removed from the `bridges` field.
+
+**Suspension** uses `SuspendBridge { bridge_id, reason, duration: Option<u64> }`. Suspension stops message processing but retains shadow state and credentials (§12.11.1). If `duration` is set, the bridge automatically reactivates after the specified seconds. Otherwise, explicit `ReactivateBridge { bridge_id }` governance action is required.
 
 ## 12.3 Shadow Identities
 
@@ -53,7 +112,16 @@ Shadow identities differ from native SCP identities in critical ways:
 - **Attributed but not verified.** A shadow identity for `@dave_x` asserts that this entity is Dave on X. The assertion comes from the bridge operator, not from Dave himself. The trust in this attribution depends on trust in the bridge operator.
 - **Restricted by default.** Shadow identities receive a constrained role — typically observer-equivalent. They cannot exercise capabilities that require verified identity. Specific role assignment is up to context governance.
 - **Marked as bridged.** All actions and content associated with a shadow identity carry provenance marking indicating the bridge source. No shadow identity can be mistaken for a native SCP participant.
+- **Bounded per bridge.** Each bridge has a governance-configured `max_shadows` limit (set during registration, §12.2.1). The protocol default is 10,000 shadows per bridge instance. Contexts MAY set lower limits. When the limit is reached, `POST /v1/scp/bridge/shadow` returns `RATE_LIMITED` (429) with a message indicating the shadow cap. The limit prevents resource exhaustion from unbounded shadow creation.
 - **Claimable.** If Dave later joins SCP and publishes an identity attestation (§3.5) binding his X handle to his DID, his shadow identity can be claimed and merged with his native identity. Past actions attributed to the shadow are now attributed to Dave's DID. This transition is one-way and irreversible — once claimed, the shadow is retired.
+
+**Claimed shadow role upgrade path.** When a shadow is claimed by a DID:
+
+1. The shadow's `provenance_status` transitions from `Shadow` to `Claimed`.
+2. The claimant does NOT automatically become a context member — claiming a shadow and joining a context are independent operations. The claimant MUST separately join the context via the standard join flow (§5.12).
+3. On successful join, the context governance MAY automatically upgrade the claimant's role from the default join role to the shadow's previous role (if the governance model permits role inheritance from claimed shadows). This is a governance policy decision, not a protocol default.
+4. Historical messages attributed to the shadow are retroactively associated with the claimant's DID in the event log metadata. The original `BridgeProvenance` marking is preserved — historical content carries `provenance_status: "ClaimedHistorical"` to distinguish pre-claim bridged content from post-claim native content.
+5. The shadow entry is retired: no further messages can be emitted through it via the bridge. The bridge operator receives `SHADOW_ALREADY_CLAIMED` (409) on subsequent message attempts for this shadow.
 
 ```
   Before claiming:                   After claiming:
@@ -125,6 +193,42 @@ Trust hierarchy:
 
 Agents can calibrate their behavior based on provenance. A conservative agent might ignore all shadow-attributed content. A permissive agent might treat claimed shadows equivalently to native identities. The protocol makes the distinction legible; the evaluation is up to the participant.
 
+**Integration with DataProvenance (§24).** `BridgeProvenance` extends `DataProvenance` (§24.2) for bridge-originated content:
+
+```
+BridgeProvenance {
+  // Inherited from DataProvenance (§24.2.1):
+  source_context:     ContextId,
+  source_type:        .persistent,          // bridge contexts are always persistent
+  counterparties:     [DID],                // includes shadow DIDs
+  purpose:            String,
+  discovery_method:   DiscoveryMethod,
+  age:                Duration,
+  memory_scope:       MemoryScope,
+  chain_depth:        u8,                   // 0 for direct bridge content
+
+  // Bridge-specific extensions:
+  originating_platform: String,             // "discord", "slack", "x", etc.
+  bridge_mode:          BridgeMode,         // Relay | Puppet | API | Cooperative
+  shadow_status:        ShadowStatus,       // Shadow | Claimed | ClaimedHistorical
+  operator_did:         DID,                // bridge operator's DID
+  platform_timestamp:   Option<u64>,        // platform-reported timestamp (untrusted)
+  platform_message_id:  Option<String>,     // cross-reference to platform message
+}
+```
+
+When the quality evaluation pipeline (§24.5) encounters bridge-originated content, it applies the following `source_type` mapping:
+
+| Bridge mode | Shadow status | Equivalent `ProvenanceQuality` | Rationale |
+|-------------|---------------|-------------------------------|-----------|
+| Cooperative | Claimed | `PersistentVerifiable` (minus 1 tier) | Platform vouched for identity, but content transited bridge infrastructure |
+| Cooperative | Shadow | `PersistentPartial` | Platform vouched for attribution, no DID binding |
+| API | Claimed | `PersistentPartial` | API-sourced, platform did not actively vouch |
+| API | Shadow | `EphemeralKnown` | API-sourced, no identity verification |
+| Relay/Puppet | Any | `EphemeralKnown` | Bridge operator is sole trust anchor |
+
+This mapping feeds into the `evaluate_quality` pipeline (§24.5.1) so that bridge-originated content receives appropriate quality scoring without requiring special-case logic in the provenance evaluation engine.
+
 ## 12.6 Bridge Connectors and Context Isolation
 
 Bridge connectors do not violate context isolation. A bridge registered in Context A has no access to Context B. If the same external platform is bridged into two contexts, they are separate bridge instances with separate registrations.
@@ -133,34 +237,38 @@ Bridge connectors are not agents — they cannot initiate actions, exercise capa
 
 ### 12.6.1 Bridge Encryption Model
 
-Bridge connectors are **not MLS group members**. They do not receive MLS key schedule material and cannot decrypt messages between native context members. End-to-end encryption is preserved for native-to-native communication in bridged contexts.
+Bridge connectors — the translation infrastructure — are **not MLS group members**. Shadow identities created by a bridge do not receive MLS key schedule material.
+
+However, the **bridge operator** (the DID-bearing human who runs the bridge) IS an MLS group member admitted through normal context governance. The operator must be a member to receive and decrypt SCP messages for SCP-to-platform forwarding (§12.10.5). This means the bridge operator can read all MLS-encrypted messages in the context — a necessary consequence of bidirectional bridging. The trust implications are explicit: admitting a bridge means trusting the bridge operator with access to context content. This is visible in context metadata (§5.7) so members can make informed consent decisions.
 
 Shadow identity messages use the **sender key layer** (§9.16) rather than MLS encryption. The bridge operator generates a sender key per shadow identity and distributes it via the same pull-based protocol used in broadcast contexts. Native members decrypt bridge-originated messages using the shadow's sender key.
 
 This creates two envelope types within a bridged encrypted context:
 
-- **MLS-encrypted envelopes** — from native members, using the MLS group key schedule. Bridge cannot decrypt these.
-- **Sender-key-encrypted envelopes** — from shadow identities, using per-shadow sender keys. All context members (native and bridge) can decrypt these.
+- **MLS-encrypted envelopes** — from native members and the bridge operator, using the MLS group key schedule.
+- **Sender-key-encrypted envelopes** — from shadow identities, using per-shadow sender keys. All context members (native and bridge operator) can decrypt these.
 
 The receiver distinguishes the two paths by envelope structure: MLS-encrypted envelopes contain an MLS ciphertext payload, while sender-key-encrypted envelopes contain a sender key ciphertext with the shadow's DID in the sender field. Both decryption paths already exist in the protocol — MLS for encrypted contexts, sender keys for broadcast contexts.
 
-Context metadata (§5.7) MUST include `bridge_operator_did` when a bridge is registered, so members can see that a bridge is present and evaluate trust accordingly.
+Context metadata (§5.7) MUST include a `BridgeMetadata` entry in the `bridges` structural field when a bridge is registered, including the bridge operator's DID, the connected platform, the bridge's capabilities, and its directionality mode. This is a structural field visible before opt-in, so prospective members can see that a bridge is present and evaluate trust accordingly before joining.
 
 ### 12.6.2 Bridge Threat Model
 
 A malicious bridge operator can:
 
-1. **Fabricate shadow messages** — attribute content to platform users who did not produce it. Mitigated by `BridgeProvenance` (§12.5) which makes bridge attribution visible.
-2. **Selectively drop messages** — suppress platform-to-SCP or SCP-to-platform delivery. Detectable via the platform's own delivery confirmation mechanisms.
-3. **Correlate activity** — observe which platform users correspond to which shadow identities across contexts it operates in. Mitigated by separate bridge registrations per context (§12.6).
-4. **Inject false attestations** — claim platform identity verification that did not occur. Mitigated by attestation freshness checks (§7.4.4) and governance-level bridge revocation (§12.2).
+1. **Read all MLS-encrypted messages in the context** — the bridge operator is an MLS group member (§12.6.1) and can decrypt all messages. This is an inherent property of bidirectional bridging, not mitigated — it is why bridge admission is a governance decision.
+2. **Fabricate shadow messages** — attribute content to platform users who did not produce it. Mitigated by `BridgeProvenance` (§12.5) which makes bridge attribution visible.
+3. **Selectively drop messages** — suppress platform-to-SCP or SCP-to-platform delivery. Detectable via the platform's own delivery confirmation mechanisms.
+4. **Correlate activity** — observe which platform users correspond to which shadow identities across contexts it operates in. Mitigated by separate bridge registrations per context (§12.6).
+5. **Inject false attestations** — claim platform identity verification that did not occur. Mitigated by attestation freshness checks (§7.4.4) and governance-level bridge revocation (§12.2).
 
 A malicious bridge operator **cannot**:
 
-- Read native-to-native messages (no MLS key material).
 - Modify native member messages (MLS authentication prevents forgery).
-- Exercise capabilities or participate in governance (bridge is not an agent).
+- Exercise capabilities or participate in governance beyond the operator's own member role (bridge connector is not an agent).
 - Access other contexts (bridge registration is per-context).
+
+Note: the bridge operator CAN read all MLS-encrypted messages in the context (they are an MLS group member — see §12.6.1). This is an inherent property of bidirectional bridging and is why bridge admission is a governance decision visible in context metadata (§5.7).
 
 ## 12.7 Self-Hosting Bridges
 
@@ -235,14 +343,25 @@ The JWT payload contains:
 
 The platform verifies the JWT signature against the operator's DID document (§3.2). Token lifetime SHOULD NOT exceed 1 hour. The platform MAY cache resolved DID documents with TTL.
 
-For webhook callbacks (platform to bridge node), the platform signs the request body:
+**JWT signing algorithm.** The JWT `alg` header MUST be `EdDSA` (RFC 8037) using Ed25519, consistent with the protocol's key infrastructure. SDKs MUST reject JWTs with any other algorithm.
+
+For webhook callbacks (platform to bridge node), the platform signs the request body with the following scheme:
 
 ```
-X-SCP-Signature: <Ed25519 signature over raw request body>
+X-SCP-Signature: <base64url(Ed25519-sign(signing_key, canonical_payload))>
 X-SCP-Platform-Key-Id: <platform's signing key identifier>
+X-SCP-Timestamp: <Unix timestamp in seconds>
 ```
 
-The bridge node verifies the signature against the platform's pre-registered public key (exchanged during bridge registration).
+**Canonical payload construction.** The signed payload is constructed as: `timestamp_bytes || raw_request_body_bytes`, where `timestamp_bytes` is the ASCII decimal representation of the `X-SCP-Timestamp` value. This prevents replay attacks — the bridge node MUST reject requests where `X-SCP-Timestamp` differs from the current time by more than 300 seconds (5 minutes).
+
+**Platform key registration mechanism.** The platform's Ed25519 public key is registered during bridge setup via the `RegisterBridge` governance action (§12.2.1), which includes an optional `platform_key: Option<[u8; 32]>` field. For cooperative mode, this field is REQUIRED. The key exchange flow:
+
+1. Before registration, the bridge operator and platform operator exchange the platform's Ed25519 public key out-of-band (e.g., via the platform's developer console, an API call to the platform, or manual configuration).
+2. The bridge operator includes the `platform_key` in the `RegisterBridge` proposal.
+3. On governance approval, the bridge node stores the platform key associated with the bridge instance.
+4. All subsequent webhook requests from the platform are verified against this key.
+5. Key rotation: the platform publishes a new key by having the bridge operator submit a `UpdateBridgePlatformKey { bridge_id, new_platform_key }` governance action. During the rotation period (24 hours), the bridge node accepts signatures from either key.
 
 ### 12.10.3 Error Format
 
@@ -336,7 +455,7 @@ Emit a message attributed to a shadow identity. The bridge node receives this, c
 |-------|------|----------|-------------|
 | `shadow_id` | string | yes | The shadow identity sending the message |
 | `content` | string | yes | Message content |
-| `content_type` | string | yes | MIME type of the content (`text/plain`, `text/markdown`, `application/json`) |
+| `content_type` | string | yes | MIME type of the content (`text/plain`, `text/markdown`, `application/json`). Binary content types are not supported — binary data MUST be base64-encoded and sent as `application/json` with the encoded data in a JSON field |
 | `platform_message_id` | string | no | The message ID on the originating platform (for deduplication and cross-reference) |
 | `platform_timestamp` | integer | no | Unix timestamp (seconds) when the message was created on the platform. Preserved in provenance as platform-reported time |
 
@@ -356,6 +475,8 @@ Emit a message attributed to a shadow identity. The bridge node receives this, c
 ```
 
 The `202 Accepted` status indicates the bridge node has accepted the message for processing. Envelope construction and sender key encryption (§12.6.1) happen asynchronously. The `bridge_provenance` field confirms the provenance chain that will be attached.
+
+**Content size limit.** The `content` field MUST NOT exceed 262,144 bytes (256 KiB), matching the relay's default `max_blob_size` (§10). Requests exceeding this limit are rejected with `INVALID_REQUEST` (400) and the message `"Content exceeds maximum size of 262144 bytes"`. The bridge node MUST enforce this limit before attempting MLS envelope construction.
 
 **Claimed shadows:** If the shadow has been claimed (bound to a DID), messages can still be emitted through this endpoint, but the provenance chain will reflect the claimed status (`shadow_status: "Claimed"`) and the trust level evaluation will place it at the `ClaimedBridged` tier (§12.5).
 
@@ -494,8 +615,8 @@ Webhook receiver on the bridge node for platform-initiated events. The platform 
 - **`presence`** — User online/offline status change. Payload: `platform_user_id`, `platform_handle`, `status` (`"online"`, `"offline"`, `"idle"`).
 - **`identity_update`** — User changed their handle, display name, or avatar. Payload: `platform_user_id`, `old_handle`, `new_handle`, `metadata`.
 - **`user_departed`** — User left the platform or deleted their account. Payload: `platform_user_id`, `platform_handle`, `reason` (`"left"`, `"banned"`, `"deleted"`).
-- **`message_edit`** — A previously bridged message was edited. Payload: `platform_message_id`, `new_content`, `new_content_type`, `edited_at`.
-- **`message_delete`** — A previously bridged message was deleted on the platform. Payload: `platform_message_id`, `deleted_at`.
+- **`message_edit`** — A previously bridged message was edited on the external platform. Payload: `platform_message_id`, `new_content`, `new_content_type`, `edited_at`. Because SCP event logs are immutable (Merkle-logged), edits cannot modify the original message. The bridge node translates an edit into a **new SCP message** with a `references` field pointing to the original message's `message_id` and a `reference_type` of `"edit"`. The new message carries `BridgeProvenance` with the original `platform_message_id`. Receiving SDKs SHOULD display the edit as an update to the original message in the UI, while preserving both versions in the event log.
+- **`message_delete`** — A previously bridged message was deleted on the external platform. Payload: `platform_message_id`, `deleted_at`. Deletions are translated into a **new SCP message** with `reference_type: "deletion_notice"` pointing to the original message's `message_id`. The original message remains in the event log (immutability is preserved). Receiving SDKs SHOULD display a deletion indicator in the UI (e.g., "This message was deleted on the original platform"). The deletion notice carries `BridgeProvenance` with the `platform_message_id` and `deleted_at` timestamp.
 
 **Response (200 OK):**
 
@@ -518,17 +639,70 @@ Webhook receiver on the bridge node for platform-initiated events. The platform 
 
 Webhook delivery uses at-least-once semantics. The bridge node deduplicates by `event_id`. The platform SHOULD retry failed deliveries with exponential backoff (initial 1s, max 60s, 5 retries). The bridge node MUST respond within 5 seconds; events requiring longer processing are queued internally.
 
-### 12.10.5 Bridge Node Lifecycle
+### 12.10.5 SCP-to-Platform Message Flow
+
+The cooperative mode HTTP binding (§12.10.4) specifies how platform-originated messages enter SCP. This section specifies the reverse direction: how SCP messages are forwarded to external platform users via the bridge.
+
+**Bridge operator as MLS group member.** The bridge operator's DID is a full context member admitted through normal governance (§12.2). In encrypted contexts (`ContextMode::Encrypted`), the bridge operator participates in the MLS group and receives encrypted messages like any native member. In broadcast contexts (`ContextMode::Broadcast`), the bridge operator holds sender key material via the standard pull-based distribution protocol (§9.16). This is distinct from the bridge connector itself — the connector is translation infrastructure (§12.6), but the operator is a DID-bearing participant with MLS membership. Shadow identities created by the bridge do NOT have MLS membership; they use per-shadow sender keys (§12.6.1).
+
+**Decryption.** The bridge operator decrypts incoming SCP messages using its MLS epoch keys (encrypted contexts) or sender keys (broadcast contexts). Decryption uses the same protocol path as any other member — no special bridge-specific decryption mechanism exists.
+
+**Translation.** The bridge translates decrypted SCP messages into the external platform's native format. Translation is platform-specific and defined by each platform adapter. The mapping includes:
+
+- **Content format:** SCP `text/plain` and `text/markdown` content types map to the platform's native text format. Rich content (attachments, embeds) maps to platform equivalents where available; unsupported content types are rendered as plaintext fallbacks with a note indicating the original type.
+- **Author attribution:** The SCP sender's display name (or DID if no display name is set) is prepended or attributed per the platform's conventions (e.g., "Alice via SCP: ..."). Native SCP identity information is not leaked to the platform beyond the display name.
+- **Threading:** SCP message reply references (if present) map to platform reply/thread primitives where available. Platforms without threading receive messages as flat sequential posts.
+- **Metadata stripping:** SCP-internal metadata (sequence numbers, Merkle proofs, MLS epoch info) is stripped before forwarding. Only user-visible content reaches the platform.
+
+**Forwarding.** The bridge forwards translated messages to the external platform using the platform's API (cooperative mode: the platform's documented endpoints; relay/puppet mode: the platform's user-facing API or web interface). The bridge authenticates to the platform using credentials managed per §12.11.
+
+**Provenance annotation.** Messages forwarded from SCP to the platform carry a `bridge_forwarded` provenance annotation on the SCP side, recorded in the context's event log. The annotation includes:
+
+```rust
+pub struct BridgeForwardedAnnotation {
+    /// DID of the bridge operator that forwarded the message.
+    pub bridge_did: DID,
+    /// Timestamp when the bridge forwarded the message to the platform.
+    pub forwarded_at: u64,
+    /// Platform the message was forwarded to.
+    pub target_platform: String,
+    /// Delivery status (updated asynchronously).
+    pub delivery_status: BridgeDeliveryStatus,
+}
+
+pub enum BridgeDeliveryStatus {
+    /// Successfully delivered to the platform.
+    Delivered,
+    /// Delivery failed after all retry attempts.
+    Failed,
+    /// Delivery is pending (initial state).
+    Pending,
+}
+```
+
+This annotation is attached to the SCP message's provenance chain, making it auditable that the message was forwarded and to where.
+
+**Failure handling.** If platform delivery fails, the bridge retries with exponential backoff: initial delay 1 second, multiplied by 2 on each retry, maximum 3 attempts (delays: 1s, 2s, 4s). If all 3 attempts fail, the bridge:
+
+1. Updates the `BridgeForwardedAnnotation.delivery_status` to `Failed`.
+2. Records the failure in the context's event log (visible to context members).
+3. Does NOT retry further. The message is marked as undeliverable. The bridge operator MAY manually re-trigger delivery through bridge-specific tooling, but the protocol does not mandate automatic recovery beyond the 3-attempt limit.
+
+**Export policy enforcement.** The bridge MUST respect the context's export policies. If the context's governance prohibits content export (e.g., via a `no_export` ceiling constraint or equivalent governance policy), the bridge MUST NOT forward any SCP messages to the external platform. A bridge operating in a no-export context functions as a one-way inbound bridge only — external platform content enters SCP, but SCP content does not leave. Violation of export policy by a bridge operator is a governance violation subject to the same enforcement mechanisms as any other member violation (§5.3).
+
+**Rate limiting.** The bridge SHOULD rate-limit outbound forwarding to respect platform API limits. Rate limits are platform-specific and configured per bridge instance. The bridge MUST NOT drop messages due to rate limiting — it queues them and delivers in order when rate limit windows reset.
+
+### 12.10.6 Bridge Node Lifecycle
 
 The bridge node mediates between the platform's HTTP API and SCP protocol operations. The lifecycle is:
 
 1. **Registration.** The bridge operator registers the bridge with an SCP context via `register_bridge()` (§12.2). The registration includes the platform's webhook URL and authentication credentials.
 2. **Shadow creation.** The bridge node calls `POST /v1/scp/bridge/shadow` to create shadow identities for platform participants as they become relevant to the context.
-3. **Bidirectional message flow.** SCP-to-platform: the bridge node receives SCP messages and calls platform APIs to deliver them. Platform-to-SCP: the platform pushes events via the webhook endpoint, and the bridge node constructs SCP envelopes with bridge provenance.
+3. **Bidirectional message flow.** SCP-to-platform: the bridge operator receives and decrypts SCP messages as an MLS group member, translates them to the platform's native format, and forwards them via the platform's API (§12.10.5). Platform-to-SCP: the platform pushes events via the webhook endpoint, and the bridge node constructs SCP envelopes with bridge provenance (§12.10.4).
 4. **Attestation.** The platform attests to user identities via `POST /v1/scp/bridge/attest`. These attestations strengthen the trust evaluation for cooperative-mode shadows.
 5. **Suspension/revocation.** Context governance can suspend or revoke the bridge at any time (§12.2). On suspension, the bridge node stops processing messages but retains shadow state. On revocation, the bridge is permanently disconnected.
 
-### 12.10.6 Cooperative Mode Trust Differentiation
+### 12.10.7 Cooperative Mode Trust Differentiation
 
 Content entering SCP through the cooperative mode HTTP binding receives enhanced trust evaluation compared to relay or puppet mode. The trust differentiation (§12.5) applies:
 
@@ -536,7 +710,7 @@ Content entering SCP through the cooperative mode HTTP binding receives enhanced
 - The `bridge_mode` field in `BridgeProvenance` distinguishes `Cooperative` from other modes. Trust engines (§7) and agents MAY treat cooperative-mode provenance as a positive signal.
 - Platform-provided attestation evidence (via `POST /v1/scp/bridge/attest`) further strengthens identity confidence for individual shadows.
 
-### 12.10.7 Implementation Considerations
+### 12.10.8 Implementation Considerations
 
 **For platforms implementing this API:**
 
@@ -562,7 +736,29 @@ Bridge credentials pass through five phases:
 
 1. **Provision.** The user authorizes the bridge to act on their behalf on the external platform. The authorization mechanism is platform-specific: OAuth Authorization Code flow, API key generation, manual token entry, etc. The bridge operator initiates this flow; the user completes it.
 
-2. **Store.** Credentials are encrypted at rest and stored in isolation from the operator's SCP identity keys. Credentials MUST be encrypted using a key derived from the bridge operator's identity key material (e.g., HKDF from the operator's signing key with a bridge-specific salt). Credentials MUST be stored separately from the operator's SCP identity keys — the credential store is a distinct storage domain, not a field on the bridge entity.
+2. **Store.** Credentials are encrypted at rest and stored in isolation from the operator's SCP identity keys. The credential encryption key MUST NOT be derived from the `#active` signing key, because `#active` rotates (software key, periodic rotation per §3.4) — rotation would silently invalidate all encrypted credentials. Instead, the credential encryption key is a random 32-byte value generated once per bridge instance at provisioning time and stored within the custody boundary (alongside `pseudonym_secret` and other non-exportable secrets per §3.7). This is the `bridge_credential_key`.
+
+   The `bridge_credential_key` is generated and stored as follows:
+   ```
+   bridge_credential_key = CSPRNG(32)  // generated once at bridge provisioning
+   // Stored in ProtocolStore under: custody/{did}/bridge_credential_key/{bridge_id}
+   // Protected by the same custody boundary as identity keys
+   ```
+
+   The per-credential encryption key is then derived from the `bridge_credential_key` using HKDF-SHA-256:
+   ```
+   ikm  = bridge_credential_key                       // 32 bytes, per-bridge random secret
+   salt = SHA-256("SCP-BRIDGE-CREDENTIAL-V1")          // fixed salt, 32 bytes
+   info = "scp-bridge-credential:" || bridge_id        // bridge_id as hex-encoded bytes
+   prk  = HKDF-Extract(salt, ikm)                      // 32 bytes
+   okm  = HKDF-Expand(prk, info, 32)                   // 32 bytes — AES-256-GCM key
+   ```
+
+   Encryption algorithm: AES-256-GCM. Nonce: 12 bytes, randomly generated per encryption operation via CSPRNG. The nonce is prepended to the ciphertext. Authentication tag: 16 bytes, appended to the ciphertext. Stored format: `nonce (12 bytes) || ciphertext || tag (16 bytes)`.
+
+   This design avoids coupling credential encryption to any key that rotates (`#active`) or that hardware custody may prevent exporting (`#0`). The `bridge_credential_key` is a standalone secret with the same lifecycle as the bridge instance — created at provisioning, destroyed at revocation (Phase 5).
+
+   Credentials MUST be stored separately from the operator's SCP identity keys — the credential store is a distinct storage domain under `bridge/{bridge_id}/credential/{credential_type}` in `ProtocolStore`, not a field on the bridge entity.
 
 3. **Use.** The bridge authenticates to the external platform using stored credentials. Credential access is scoped to the bridge instance — a bridge registered in Context A cannot use credentials provisioned for a bridge in Context B, even if operated by the same DID.
 
@@ -572,9 +768,9 @@ Bridge credentials pass through five phases:
 
 ### 12.11.2 Requirements
 
-- Credentials MUST be encrypted at rest using a key derived from the bridge operator's identity key material.
-- Credentials MUST be stored separately from the operator's SCP identity keys (key isolation). A compromise of the credential store does not compromise the operator's SCP identity. A compromise of the operator's SCP keys does not directly expose platform credentials (derived key, not the identity key itself).
-- When `BridgeStatus` transitions to `Revoked`, the credential store MUST destroy all delegated credentials for that bridge instance. Destruction means: (a) call the platform's revocation endpoint if one exists, (b) overwrite local credential material with zeros, (c) delete the credential record.
+- Credentials MUST be encrypted at rest using a key derived from the bridge's `bridge_credential_key` (§12.11.1 Phase 2). The `bridge_credential_key` is a per-bridge random secret stored in the custody boundary — it is NOT derived from any identity key.
+- Credentials MUST be stored separately from the operator's SCP identity keys (key isolation). A compromise of the credential store does not compromise the operator's SCP identity. A compromise of the operator's SCP identity keys does not expose platform credentials (the `bridge_credential_key` is an independent random secret, not derived from identity material).
+- When `BridgeStatus` transitions to `Revoked`, the credential store MUST destroy all delegated credentials for that bridge instance. Destruction means: (a) call the platform's revocation endpoint if one exists, (b) overwrite local credential material with zeros, (c) delete the credential record, (d) overwrite and delete the `bridge_credential_key` from the custody boundary.
 - When `BridgeStatus` transitions to `Suspended`, credential use MUST stop but credentials are retained for potential reactivation.
 - Credential storage SHOULD support multiple concurrent credential types per bridge instance (e.g., an OAuth access token + a webhook signing secret + an API key for a secondary service).
 - Credential access MUST be scoped to the bridge instance. Cross-bridge credential sharing is prohibited even under the same operator DID.
@@ -595,7 +791,7 @@ Approximately 80% of major platforms use OAuth 2.0 for third-party authorization
 
 - `access_token` — Short-lived (typically 1 hour). Used for API requests to the platform.
 - `refresh_token` — Long-lived (days to months). Used to obtain new access tokens without user re-authorization.
-- Both are encrypted at rest using a key derived from the operator's identity key material.
+- Both are encrypted at rest using a key derived from the bridge's `bridge_credential_key` (§12.11.1 Phase 2).
 
 **Token refresh:**
 

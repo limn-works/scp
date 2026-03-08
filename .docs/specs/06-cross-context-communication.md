@@ -29,14 +29,90 @@ This is the mechanism for all structured inter-agent interaction across context 
 
 Properties:
 
-- Both contexts opt in explicitly (bidirectional consent at the context level, not the agent level).
+- Both contexts opt in explicitly (bidirectional consent at the context level, not the agent level — see §6.2.0.1 for the consent protocol).
 - Data flows through defined function signatures, not through agent memory or discretion.
 - Auditable: every call through an interface is logged in both contexts' event logs with full provenance (§7.7).
 - Tool interfaces carry provenance: data received through an interface carries its origin context, invoking agent, timestamp, and chain depth (§7.7.1).
-- Rate-limited: both contexts can enforce rate limits on interface calls.
-- **Chain depth limit.** Cross-context tool calls carry a `chain_depth` counter, incremented on each hop. A tool call at maximum depth (protocol default: 3) cannot trigger further cross-context tool calls. This bounds amplification and makes transitive provenance degradation mechanically enforced (§9.2.1).
+- Rate-limited: both contexts can enforce rate limits on interface calls (see §6.2.0.2 for defaults).
+- **Chain depth limit.** Cross-context tool calls carry a `chain_depth` counter, incremented on each hop. A tool call at maximum depth cannot trigger further cross-context tool calls. The protocol defines a hard maximum of 5 hops that cannot be exceeded. Contexts MAY configure a lower maximum via `max_chain_depth` in `ContextParams` (RECOMMENDED default: 3). This bounds amplification and makes transitive provenance degradation mechanically enforced (§9.2.1, §24.4).
 - **Schema constraints.** Tool schemas must satisfy a structural specificity floor at registration time — no unbounded string-only interfaces, minimum two distinct fields in input or output. This prevents degenerate broad-schema tools that function as arbitrary message channels (§9.2.1).
 - **Tool-level costs.** Individual tools may declare per-invocation costs in their registration metadata (§5.4). These are additive with context-level costs and carry their own payee DID. Cross-context tool calls inherit the target tool's cost structure. See §19.3 for economic policy and §19.2.2 for the payment integration sequence.
+
+#### 6.2.0.1 Bidirectional Consent Protocol
+
+Tool interface creation requires explicit consent from both the exposing context and the consuming context. The consent protocol:
+
+1. **Interface proposal.** An admin in Context A proposes exposing a tool to Context B via a governance action:
+   ```
+   ProposeToolInterface {
+     tool_id:        ToolId,       // Tool to expose
+     target_context: ContextId,    // Context B
+     outbound_policy: OutboundPolicy,
+     max_calls_per_minute: u32,    // Rate limit for this interface
+   }
+   ```
+   This proposal follows Context A's governance model (§5.9).
+
+2. **Outbound policy validation.** Context A validates that `toolInterface` is in its ceiling (§5.3) and the proposer holds the `toolInterface` capability.
+
+3. **Interface offer.** On governance approval, Context A publishes an `InterfaceOffer` to its event log:
+   ```
+   InterfaceOffer {
+     offer_id:       [u8; 32],     // SHA-256(context_a_id || tool_id || context_b_id || timestamp)
+     source_context: ContextId,    // Context A
+     target_context: ContextId,    // Context B
+     tool_schema:    ToolRegistration, // Full tool schema (§5.4.1)
+     outbound_policy: OutboundPolicy,
+     expires_at:     u64,          // Offer expires if not accepted within 7 days
+   }
+   ```
+
+4. **Acceptance.** A shared member carries the offer to Context B (shared-member bridging). Context B's governance decides whether to accept:
+   ```
+   AcceptToolInterface {
+     offer_id:       [u8; 32],
+     inbound_policy: InboundPolicy,
+   }
+   ```
+   This follows Context B's governance model. Acceptance creates an `InterfaceEstablished` event in both event logs.
+
+5. **Teardown.** Either context can revoke the interface at any time via governance action `RevokeToolInterface { interface_id }`. Revocation is unilateral — no consent from the other side is needed. An `InterfaceRevoked` event is recorded in the revoking context's event log.
+
+**Outbound and inbound policies:**
+
+```
+OutboundPolicy {
+  allowed_callers:      Vec<DID>,   // DIDs in Context A authorized to use this interface.
+                                    // Empty = any member with toolInterface capability.
+  max_calls_per_minute: u32,        // Rate limit from Context A's perspective.
+  max_payload_bytes:    u32,        // Maximum request payload size. Default: 65536 (64 KiB).
+  require_provenance:   bool,       // Whether responses must carry provenance. Default: true.
+}
+
+InboundPolicy {
+  allowed_source_roles: Vec<String>, // Roles in Context A whose members can call. Empty = any.
+  max_calls_per_minute: u32,        // Rate limit from Context B's perspective.
+  max_response_bytes:   u32,        // Maximum response payload size. Default: 65536 (64 KiB).
+  require_spending_ucan: bool,      // Whether callers must present spending UCANs. Default: false.
+}
+```
+
+Outbound policy is set by Context A (the exposing context). Inbound policy is set by Context B (the consuming context). Both policies are enforced — a call must satisfy BOTH to proceed. The effective rate limit is `min(outbound.max_calls_per_minute, inbound.max_calls_per_minute)`.
+
+#### 6.2.0.2 Tool Interface Rate Limit Defaults
+
+Rate limits for cross-context tool interfaces use a sliding window counter with the following defaults:
+
+| Parameter | Default | Configurable range |
+|-----------|---------|-------------------|
+| Per-interface calls/minute | 60 | 1 - 6000 |
+| Per-caller calls/minute | 10 | 1 - 1000 |
+| Burst allowance | 5 (calls above limit within 1 second) | 0 - 50 |
+| Window duration | 60 seconds (sliding) | 10 - 3600 seconds |
+
+**Enforcement semantics.** When a rate limit is exceeded, the call is rejected with error code `TOOL_INTERFACE_RATE_LIMITED` (code 4030). The response includes a `Retry-After` header indicating seconds until the next call will be accepted. Calls are NOT queued — rate-limited calls fail immediately. The caller's SDK MAY retry after the indicated delay.
+
+**Per-caller vs. per-interface limits.** Both limits are enforced independently. A single caller is limited to 10 calls/minute by default; all callers combined are limited to 60 calls/minute per interface. This prevents a single caller from monopolizing an interface.
 
 ### 6.2.1 Stateful Tool Sessions
 
@@ -106,8 +182,25 @@ These are conventions, not mandates — discovery contexts can add custom tools 
 - **Writer tier (MLS members, bounded).** Writers are standard MLS group members. They can register/deregister entries, modify governance, and process registration requests. The MLS group is bounded at ~500 members to maintain practical epoch advance costs (O(N) cost per MLS Update). Writers are typically registry operators, curators, and high-volume registrants.
 - **Reader tier (DID-authenticated, unbounded).** Readers query the discovery context's tool endpoints via DID-signed requests without joining the MLS group. They can search (`agent_search`), inspect entries, and request inclusion proofs from the Merkle event log. No MLS membership required, no epoch advance cost. Reader capacity is unbounded.
 - **Registration flow.** A reader (non-MLS-member) registers by sending a DID-signed registration request to the context's `agent_register` tool endpoint. A writer processes the request and records it as an MLS application message in the event log. The registrant does NOT become an MLS member — their entry is stored in the context's registry data, and they can update or deregister via subsequent DID-authenticated requests to tool endpoints, processed by writers.
-- **Self-service updates.** Registered agents update their entries via DID-authenticated requests to tool endpoints. Writers verify the DID signature matches the entry owner and process the update.
+- **Self-service updates.** Registered agents update their entries via DID-authenticated requests to tool endpoints. Updates are subject to ownership enforcement:
+  1. **Entries are owned by their creator DID.** The DID that called `agent_register` is the entry owner, recorded at creation time.
+  2. **Only the owner can update or delete their own entries.** Writers MUST verify that the DID signature on the update request matches the entry's owner DID before processing.
+  3. **Context admins can update or delete any entry.** DIDs holding the `Admin` role in the discovery context bypass ownership checks.
+  4. **Signature verification.** All update and delete requests MUST carry a valid signature from the requester's Active Signing Key (`#active`) or Agent Signing Key (`#agent`). Writers verify the signature against the requester's current DID document before processing.
+  5. **Rejection on mismatch.** If the requester's DID does not match the entry owner and the requester is not a context admin, the request is rejected with an `OwnershipViolation` error. The rejection is logged in the Merkle event log.
 - **Consistency.** All writes are recorded in the Merkle event log. Readers can request inclusion proofs to verify their registration was recorded and to audit the registry's integrity.
+
+**Registration request authentication.** All registration, update, and deregistration requests from non-MLS readers are authenticated via DID-signed request envelopes. The authentication protocol:
+
+1. **Request signing.** The requester constructs a request payload containing the operation type (`register`, `update`, `deregister`), the entry data, and a freshness tuple `(timestamp, nonce)`. The payload is signed with the requester's Active Signing Key (`#active`) or Agent Signing Key (`#agent`), using the canonical hash construction (§9.5.1) with domain separator `"SCP-DISCOVERY-REQUEST-V1:"`. The signed preimage includes: `context_id || requester_did || operation_tag || entry_data_hash || nonce || timestamp`, where `entry_data_hash` is `SHA-256(serialized_entry_data)` and `nonce` is a 16-byte CSPRNG value.
+
+2. **Signature verification.** Writers MUST resolve the requester's DID document and verify the Ed25519 signature against the `#active` or `#agent` verification method. If the DID document cannot be resolved or the signature is invalid, the request is rejected.
+
+3. **Replay protection.** Writers MUST validate that the request timestamp is within 5 minutes of local time (consistent with §9.14 clock skew tolerance) and that the `nonce` has not been previously seen. Writers maintain a nonce deduplication cache with a 5-minute TTL, bounded at 10,000 entries with oldest-first eviction. Requests with expired timestamps or duplicate nonces are rejected.
+
+4. **Rate limiting.** Writers MUST enforce per-DID rate limits on registration requests. Default limits: 1 registration per DID per hour, 10 updates per DID per hour. Discovery context governance MAY configure stricter or more lenient limits. Rate-limited requests receive `ErrorCode::RATE_LIMITED` with a `Retry-After` hint.
+
+5. **Earned capacity enforcement.** Writers SHOULD apply the earned capacity tier system (§9.3) to registration requests. New identities (tier 0) with minimal participation history receive lower registration priority or may be subject to additional verification requirements configured by the discovery context's governance.
 
 **Bootstrap / cold-start.** How agents find their first discovery context:
 

@@ -61,7 +61,88 @@ This is load-bearing. If protocol state is small, devices can be nodes. If proto
 
 Content storage is outside protocol scope — the protocol does not define where content lives, how it's stored, or how it's replicated. That is a client and app-layer decision (see §10.8). The protocol concerns itself with protocol state (membership, roles, tokens, governance, event logs). Content is whatever the context's participants produce and consume. The protocol delivers it through encrypted envelopes; storage is the app's responsibility.
 
-**Verifiable event logs (§7.3.1) add a storage requirement.** Each context maintains a Merkle tree of its event history. This is protocol state — it must be available for validation queries. The tree itself is append-only and grows with context activity. For active contexts, this could become significant. The protocol must define pruning rules (how old events are archived or summarized), checkpoint mechanisms (periodic Merkle roots that compress history), and availability requirements (does every device store the full tree, or can proofs be fetched on demand from relays or peers?). This is the primary tension between minimal state and verifiable history — the design must resolve it explicitly.
+**Verifiable event logs (§7.3.1) add a storage requirement.** Each context maintains a Merkle tree of its event history. This is protocol state — it must be available for validation queries. The tree itself is append-only and grows with context activity. For active contexts, this could become significant. The following subsections define pruning rules, checkpoint mechanisms, and availability requirements that resolve the tension between minimal state and verifiable history.
+
+### 10.3.1 Event Log Pruning Rules
+
+Event log pruning compresses historical event data while preserving verifiability. Pruning operates on completed checkpoint intervals — it never modifies un-checkpointed events.
+
+**Pruning tiers:**
+
+| Tier | Retention | What is retained | What is pruned |
+|------|-----------|------------------|----------------|
+| Full | All events | Complete event data + Merkle proofs | Nothing |
+| Summary | Checkpoint roots + event type counts per interval | Checkpoint Merkle root, aggregate statistics (event counts by type, membership delta) | Individual event payloads and intermediate Merkle nodes |
+| Root-only | Checkpoint roots only | Checkpoint Merkle root hash and sequence number | Everything except the root |
+
+**Pruning policy:** Each context declares a pruning policy at creation as part of its governance parameters:
+
+```
+EventLogPruningPolicy {
+  full_retention_checkpoints: u32,    // Number of recent checkpoints retained at Full tier (MUST >= 2, default: 10)
+  summary_retention_checkpoints: u32, // Number of checkpoints retained at Summary tier after Full expires (default: 100)
+  root_only_after: bool,              // Whether to prune to Root-only after Summary expires (default: true)
+}
+```
+
+- The most recent `full_retention_checkpoints` checkpoints are always retained at Full tier. This ensures recent history is always available for validation queries and dispute resolution.
+- The next `summary_retention_checkpoints` checkpoints are retained at Summary tier. This provides aggregate data for participation record computation (§7.3.2) without storing individual events.
+- Older checkpoints are retained at Root-only tier if `root_only_after` is true, otherwise deleted entirely. Root-only checkpoints form a verifiable chain of custody — any checkpoint root can be verified against its successor.
+
+**Maximum event log size:** The SDK MUST enforce a per-context event log size limit of 100MB at the Full tier. When the log exceeds this limit, the SDK MUST prune the oldest Full-tier checkpoint interval to Summary tier, regardless of the retention policy. This prevents unbounded state growth on resource-constrained devices.
+
+**Pruning execution:** Pruning is performed by the SDK locally. Each device prunes independently based on the context's policy. There is no coordination protocol — devices may hold different amounts of history based on when they joined and when they last pruned. The Merkle checkpoint chain ensures that devices with different pruning states can still verify each other's claims by comparing checkpoint roots.
+
+### 10.3.2 Checkpoint Mechanism
+
+Checkpoints compress the event log into periodic Merkle root snapshots that serve as trust anchors for pruned history.
+
+**Checkpoint interval:** A checkpoint is created every `checkpoint_interval` events (default: 1000, configurable per context via governance, minimum: 100, maximum: 100,000). The checkpoint interval is declared at context creation and MAY be changed via governance action.
+
+**Checkpoint format:**
+
+```
+EventLogCheckpoint {
+  context_id:       String,
+  sequence_number:  u64,          // Monotonic checkpoint number (0, 1, 2, ...)
+  event_range:      (u64, u64),   // (first_event_seq, last_event_seq) inclusive
+  merkle_root:      [u8; 32],     // SHA-256 Merkle root of events in this interval
+  previous_root:    [u8; 32],     // Merkle root of the previous checkpoint (zeros for first)
+  event_count:      u64,          // Total events in this checkpoint interval
+  membership_snapshot: MembershipDigest, // SHA-256 hash of the sorted membership list at checkpoint time
+  timestamp:        u64,          // Wall-clock time of checkpoint creation (best-effort)
+  creator_did:      DID,          // DID of the member who created this checkpoint
+  signature:        Ed25519Signature,  // Signed by creator's signing key
+}
+```
+
+**Checkpoint chain:** Each checkpoint includes `previous_root`, forming a hash chain. Any device can verify the integrity of the checkpoint chain by walking backward from the most recent checkpoint. A gap in the chain (missing checkpoint) is detectable by comparing `sequence_number` values.
+
+**Checkpoint creation:** The member whose event triggers the checkpoint interval boundary creates the checkpoint. If multiple members submit the boundary event concurrently, the first checkpoint received by a majority of members is canonical (determined by the Merkle event log ordering, §7.3.1). Duplicate checkpoints for the same interval are discarded.
+
+### 10.3.3 Event Log Availability
+
+**Storage tiers by device type:**
+
+| Device | Full tier | Summary tier | Root-only | Proof fetching |
+|--------|-----------|--------------|-----------|----------------|
+| Server/workstation | Unlimited | Unlimited | All | Serves proofs to peers |
+| Desktop | Policy-based | Policy-based | All | Serves and fetches |
+| Mobile | 2 checkpoints minimum | 10 checkpoints minimum | All | Fetches from relays/peers |
+
+**Proof-on-demand protocol:** Devices that have pruned Full-tier data can request Merkle proofs from peers or relays that still hold the full data. The request format is:
+
+```
+EventLogProofRequest {
+  context_id: String,
+  event_sequence: u64,         // Sequence number of the event to prove
+  checkpoint_sequence: u64,    // Checkpoint interval containing the event
+}
+```
+
+The response includes the Merkle inclusion proof (sibling hashes along the path from the event's leaf to the checkpoint's Merkle root). The requester verifies the proof against the checkpoint root they hold locally. If the checkpoint root is unavailable locally (pruned beyond Root-only), the proof cannot be verified — the requester MUST fetch the checkpoint from a peer first.
+
+**Relay caching:** Relays MAY cache event log checkpoints and serve them to members. Checkpoints are signed by their creator and verified by the recipient — the relay cannot forge checkpoints. Relay caching is opportunistic; the protocol does not require relays to store event log data.
 
 ## 10.4 Relay Architecture
 
@@ -295,6 +376,51 @@ Mobile devices need push notifications. On iOS the only mechanism is APNs (Apple
 - **The push service knows timing, not content or source.** Apple/Google learn when a device received a notification. They cannot determine which context, which sender, or even whether the notification corresponds to one message or many.
 - **A sovereign push alternative is desirable but not blocking.** If a mechanism emerges that enables push without platform gatekeepers, the protocol should adopt it. For now, this is an accepted constraint with the opacity guarantee limiting metadata exposure to timing only.
 
+### 10.7.1 Push Registration Protocol
+
+Clients register for push notifications with relays via the following wire protocol:
+
+**PushRegistration message:**
+
+```
+PushRegistration {
+  did:          DID                       // the registering identity
+  platform:     enum { APNS, FCM, WebPush }  // push service platform
+  token:        String                    // platform-specific push token (APNs device token, FCM registration token, WebPush endpoint URL)
+  contexts:     Vec<ContextId>            // contexts for which to receive push notifications (empty = all contexts on this relay)
+  timestamp:    DateTime                  // registration time
+  signature:    Ed25519Signature          // signed by the DID's Active Signing Key (#active)
+}
+```
+
+The signature covers `did || platform (1-byte tag: 0x01=APNS, 0x02=FCM, 0x03=WebPush) || token || contexts (length-prefixed concatenation) || timestamp` using the canonical signed structure format (§9.5.2).
+
+**Registration flow:**
+
+1. The client generates a `PushRegistration` message and signs it with the DID's Active Signing Key.
+2. The client sends the `PushRegistration` to the relay via a PUBLISH operation (ADR-004) with a reserved `routing_id` of `SHA-256("scp-push-registration" || relay_url)`.
+3. The relay verifies the signature against the DID's public key (resolved via DID document). Invalid signatures are rejected.
+4. The relay stores the registration, associating the push token with the DID and the listed context routing IDs.
+5. On new message arrival for a registered context (matching the routing IDs the DID subscribes to), the relay sends an opaque push notification to the registered token. The push payload is exactly `{ "scp": 1 }` — a wake signal with no content, no context, no sender, no metadata.
+6. The relay MUST rate-limit push notifications to at most one push per 30 seconds per device token to prevent push notification flooding.
+
+**Token refresh:** When the platform issues a new push token (e.g., APNs token rotation), the client sends a new `PushRegistration` with the updated token. The relay replaces the previous registration for that DID + platform combination. Registrations are idempotent — re-registering with the same token is a no-op.
+
+**PushDeregistration message:**
+
+```
+PushDeregistration {
+  did:          DID
+  platform:     enum { APNS, FCM, WebPush }
+  timestamp:    DateTime
+  signature:    Ed25519Signature          // signed by the DID's Active Signing Key (#active)
+}
+```
+
+The client sends a `PushDeregistration` to explicitly remove its push registration. The relay deletes the stored registration for the DID + platform combination. Implicit deregistration occurs when the relay observes push delivery failures (invalid token responses from APNs/FCM) — the relay MUST remove registrations after 3 consecutive delivery failures for the same token.
+
+**Relay-side storage:** Push registrations are stored in the relay's local state (not in the protocol's encrypted state). The relay operator can see which DIDs have registered for push and their platform tokens — this is an accepted tradeoff, equivalent to any push notification service. The push token itself does not reveal which contexts the DID participates in beyond the routing IDs the DID subscribes to (which the relay already knows from SUBSCRIBE operations).
+
 ## 10.8 Multi-Device
 
 Multi-device coordination — read state, session continuity, notification deduplication, device handoff — is a client-scope concern. The protocol provides the building blocks:
@@ -304,6 +430,24 @@ Multi-device coordination — read state, session continuity, notification dedup
 - **Encrypted envelopes** are available on relays for any device that holds the keys.
 
 How a client uses these to implement read markers, notification deduplication, or session handoff is the client's decision. A simple client might treat each device as independent. A sophisticated client might sync UI state through identity private state or through a dedicated coordination mechanism. The protocol delivers the same encrypted envelopes to all devices; the client decides how to present them.
+
+### 10.8.1 Multi-Device MLS Participation Model
+
+While client-level coordination (read markers, notification dedup) is a client-scope concern, MLS group membership for multiple devices is a protocol-level concern. Each device MUST have its own MLS leaf node — MLS does not support shared leaf nodes across devices (RFC 9420 §14).
+
+**Per-device MLS leaf nodes:**
+
+1. **Each device has its own MLS leaf.** A DID with N devices appears as N leaf nodes in every MLS group the DID participates in. Each device generates its own MLS leaf key (X25519) and maintains independent MLS epoch state.
+2. **Per-device KeyPackages.** Each device generates its own KeyPackages, signed by the DID's Active Signing Key (`#active`). The KeyPackage's credential contains the DID (shared across devices) plus a `device_id` field (a random 16-byte identifier, stable per device) in the LeafNode extensions. This enables other members to distinguish leaf nodes belonging to the same DID.
+3. **Governance counting.** For governance purposes (voting, quorum, role assignment), a DID with N devices counts as ONE participant, not N. The governance engine deduplicates by DID — it does not matter how many leaf nodes a DID has. This prevents multi-device users from gaining disproportionate governance weight.
+4. **Sender key and access key sharing.** Sender keys (§9.16) and access keys (§9.17) are per-DID, not per-device. All devices for a DID share the same sender key and access key. When a device requests a sender key (§9.16.2), the key holder responds to the DID — any of the DID's devices can decrypt the response using the DID's wrapping key (which is also per-DID, stored in KeyCustody and synchronized across devices via identity private state, §3.7).
+
+**Device list management:**
+
+5. **Device list in DID document.** The DID document MAY include a `devices` service endpoint listing active device IDs. This is informational — group members use MLS group state (which leaf nodes exist) as the authoritative device list for a DID. The `devices` endpoint enables pre-join device enumeration (e.g., to determine how many KeyPackages to fetch when adding a new member).
+6. **Adding a new device.** When a user adds a new device: (a) the new device generates an MLS leaf key and publishes KeyPackages to relays, (b) an existing device (which is already a group member) sends an MLS Add proposal for the new device's KeyPackage in each active context, (c) the group processes the Add via a Commit, and the new device receives a Welcome message. The existing device coordinates this — the new device cannot add itself because it is not yet a group member.
+7. **Removing a device.** When a device is decommissioned: (a) an existing device or context admin sends an MLS Remove proposal for the departing device's leaf node, (b) the group processes the Remove via a Commit, advancing the epoch and revoking the removed device's access to future messages. If the removed device was the last device for a DID, the DID is effectively removed from the group.
+8. **Device limit.** A single DID MUST NOT have more than 10 active devices in any single MLS group. This bounds the leaf node overhead per participant. SDKs MUST reject Add proposals that would exceed this limit.
 
 ## 10.9 Real-Time and Async
 
@@ -320,7 +464,13 @@ The SDK provides the transport abstraction and envelope delivery. Whether that d
 Real-time media (voice, video, screen sharing) has different performance requirements than messaging. The full SCP message pipeline — sender-side encryption, MLS group encryption, fixed bucket padding, store-and-forward relay delivery — adds per-frame overhead and latency incompatible with real-time media at 30-60fps. Media transport uses a delegated model:
 
 1. **Context establishes the session.** The context provides identity (who's in the call), trust (are they authorized), governance (does the context allow media), and membership enforcement. All of this happens through the standard SCP message pipeline.
-2. **MLS derives media session keys.** The MLS group's key schedule exports keying material for the media session (MLS exporter, RFC 9420 §8). This binds the media encryption to the context's group state — only current members can derive the keys.
+2. **MLS derives media session keys.** The MLS group's key schedule exports keying material for the media session via the MLS exporter (RFC 9420 §8.5). Key derivation parameters:
+   - **Exporter label:** `"scp-media-key-v1"`
+   - **Exporter context:** `context_id || session_id` where `session_id` is a random 16-byte value generated by the session initiator and distributed to participants via the SCP signaling message (step 4). The `context_id` is length-prefixed (4-byte BE length + UTF-8 bytes) and `session_id` is exactly 16 bytes. This binds the exported key to both the context and the specific media session.
+   - **Key length:** 32 bytes (256 bits, suitable for AES-256).
+   - **DTLS-SRTP binding:** The 32-byte exported key is used as the DTLS-SRTP external PSK (pre-shared key) via the `external_psk_identity` extension (RFC 8446 §4.2.11). DTLS-SRTP negotiation uses this PSK to establish the SRTP master key, binding the media encryption to the MLS group state. Only current MLS group members can derive the PSK — non-members cannot decrypt media.
+   - **Key rotation:** The media session key MUST be re-derived on every MLS epoch change (Commit processing). When the MLS epoch advances, all participants independently re-export the key using the new epoch's key schedule with the same label and context. The DTLS-SRTP session is rekeyed with the new derived key via a DTLS KeyUpdate. This ensures that members removed from the MLS group (who triggered the epoch advance) lose media decryption access immediately.
+   - **Session ID distribution:** The session initiator generates `session_id` and includes it in the `MediaSessionStart` signaling message (step 4). All participants use this `session_id` for key derivation, ensuring they derive the same key.
 3. **Media flows over WebRTC.** DTLS-SRTP handles the actual media encryption and transport, using keys derived from step 2. Media frames flow peer-to-peer (or through a WebRTC SFU) without passing through SCP relays or the MLS encryption pipeline. WebRTC provides the low-latency, high-throughput transport that media requires.
 4. **Signaling goes through SCP.** WebRTC session negotiation (SDP offers/answers, ICE candidates) flows through the context as standard SCP messages. This means signaling is end-to-end encrypted, authenticated, and governed by the context — only members can initiate or join media sessions.
 
@@ -423,7 +573,44 @@ For routers that do not support UPnP, STUN (Session Traversal Utilities for NAT,
 2. For full-cone NATs, this external address is immediately reachable by any host.
 3. For address-restricted and port-restricted NATs, the SDK must send an initial packet to a peer before the peer can send back. Connection coordination (step 5 below) handles this.
 4. The external address is published in the DID document as the relay's reachable address.
-5. **Connection coordination:** A peer resolving the self-hosted relay's DID document obtains the external address. For restricted NATs, the self-hosted relay must initiate a packet exchange with each connecting peer. The relay periodically sends keepalive packets to peers that have announced their intent to connect (via a coordination message through an intermediary relay). This creates the NAT pinhole that allows the peer to connect back.
+5. **Connection coordination:** A peer resolving the self-hosted relay's DID document obtains the external address. For restricted NATs, the self-hosted relay must initiate a packet exchange with each connecting peer. The coordination protocol below specifies how peers signal intent and exchange addresses.
+
+**STUN hole punching coordination protocol:**
+
+For address-restricted and port-restricted NATs, both the self-hosted relay and the connecting peer must send packets to each other's external addresses to create NAT pinholes. This requires a coordination exchange through an intermediary relay that both parties can reach:
+
+```
+HOLE_PUNCH_REQUEST (peer → intermediary relay → self-hosted relay) {
+  requester_did:     DID,              // DID of the connecting peer
+  requester_address: SocketAddr,       // Peer's STUN-discovered external address
+  target_routing_id: [u8; 32],         // DID routing ID of the self-hosted relay
+  nonce:             [u8; 16],         // Random nonce for replay prevention
+  timestamp:         u64,             // Unix timestamp (ms)
+  signature:         Ed25519Signature, // Signs "SCP-HOLE-PUNCH-V1:" || requester_address || target_routing_id || nonce || timestamp
+}
+```
+
+```
+HOLE_PUNCH_RESPONSE (self-hosted relay → intermediary relay → peer) {
+  responder_address: SocketAddr,       // Self-hosted relay's STUN-discovered external address
+  requester_did:     DID,              // Echo of requester DID
+  nonce:             [u8; 16],         // Echo of request nonce
+  timestamp:         u64,
+  signature:         Ed25519Signature, // Signs "SCP-HOLE-PUNCH-V1:" || responder_address || requester_did || nonce || timestamp
+}
+```
+
+**Protocol sequence:**
+
+1. The peer discovers the self-hosted relay's DID document, which lists an intermediary relay address (the relay the self-hosted relay maintains a persistent connection to).
+2. The peer performs a STUN binding request to discover its own external address.
+3. The peer sends `HOLE_PUNCH_REQUEST` to the intermediary relay, which forwards it to the self-hosted relay over the existing connection.
+4. The self-hosted relay sends `HOLE_PUNCH_RESPONSE` back through the intermediary.
+5. Both parties simultaneously begin sending UDP keepalive packets to each other's external addresses (3 attempts at 500ms intervals). The first packet from each side creates the NAT pinhole; subsequent packets traverse the pinhole.
+6. Once bidirectional UDP connectivity is established (verified by receiving a keepalive response), the peer upgrades to a WebSocket connection over the punched hole.
+7. If no response is received after 3 attempts (1.5 seconds total), the punch has failed. The peer falls through to Tier 3 (relay bridging).
+
+**Security:** The intermediary relay sees both external addresses but cannot inject itself into the connection — MLS handles all payload encryption. The signatures prevent address spoofing (an attacker cannot redirect a peer to a different address). The nonce prevents replay.
 
 **Keepalive:** NAT mappings expire if unused (typical timeout: 30-120 seconds). The SDK sends a 25-second UDP keepalive to maintain the mapping. The keepalive is a minimal STUN Binding Indication (no response expected) or a zero-length UDP packet, depending on the STUN server's capabilities.
 
@@ -489,6 +676,20 @@ The `source_routing_id` field is zeroed (`[0u8; 32]`) because the bridge operate
 1. The Ed25519 signature is valid for the provided `public_key`.
 2. The DID derived from `public_key` maps to the claimed `routing_id` via `SHA-256("scp:did:" || did_string)` (§3.10.2).
 3. The `timestamp` is within 60 seconds of the server's current time (replay window).
+
+#### 10.12.4.1 Routing ID Derivation Disambiguation
+
+The protocol uses two distinct routing ID derivation schemes for different purposes. Implementations MUST NOT conflate them:
+
+| Routing ID type | Derivation | Purpose | Used by |
+|----------------|------------|---------|---------|
+| **DID routing ID** | `SHA-256("scp:did:" \|\| did_string)` | Identity-level routing — locating a DID's relay presence. Used for bridge registration, directed messages outside context scope, and relay discovery. | `BRIDGE_REGISTER` (§10.12.4), relay SUBSCRIBE for DID-level messages |
+| **Context pseudonym** | `HMAC-SHA256(pseudonym_secret, context_id \|\| "scp-pseudonym")` | Context-level routing — routing messages within a specific context. Unlinkable across contexts. Never publicly derivable (§9.10.4.A). | Context message delivery, relay SUBSCRIBE for context messages |
+| **Metadata routing ID** | `HMAC-SHA256(context_metadata_key, context_id \|\| "scp-metadata-v2")` | Context metadata retrieval — pre-join inspection of context parameters. | Relay QUERY for context metadata (§9.10.4.B) |
+
+**Key distinction:** DID routing IDs are publicly derivable by design — any party that knows a DID can compute the routing ID to send messages to that DID. Context pseudonyms are NOT publicly derivable — they require the pseudonym secret (§9.10.4.A), which is private key material. These serve fundamentally different privacy goals.
+
+**Wire-level disambiguation:** The `routing_id` field in relay operations (`PUBLISH`, `SUBSCRIBE`, `BRIDGE_REGISTER`, etc.) is an opaque `[u8; 32]`. The relay does not know or care which derivation produced it. The SDK is responsible for using the correct derivation for each operation.
 
 **Bridge establishment:**
 
@@ -719,7 +920,19 @@ QUIC replaces WebSocket for native (non-browser) clients. Same relay, same Messa
 ### 10.14.2 Connection Lifecycle
 
 1. **Initial connection.** Client opens a QUIC connection to the relay using `quinn` (or equivalent QUIC implementation). TLS 1.3 is built into QUIC — no separate TLS handshake.
-2. **0-RTT resumption.** Resumed QUIC sessions use 0-RTT to send application data immediately without waiting for the handshake to complete, eliminating round-trip latency on reconnection. Session tickets are stored locally and rotated per the QUIC specification. 0-RTT data has no replay protection (RFC 9001 §9.2); SCP operations sent as 0-RTT MUST be idempotent or the relay MUST implement anti-replay measures.
+2. **0-RTT resumption.** Resumed QUIC sessions use 0-RTT to send application data immediately without waiting for the handshake to complete, eliminating round-trip latency on reconnection. Session tickets are stored locally and rotated per the QUIC specification. 0-RTT data has no replay protection from the transport layer (RFC 9001 §9.2). SCP specifies the following 0-RTT safety classification:
+
+   **0-RTT-safe operations (idempotent — MAY be sent as 0-RTT data):**
+   - `SUBSCRIBE` — subscribing to a routing ID is idempotent; duplicate subscriptions are no-ops.
+   - `QUERY` — read-only queries produce the same result regardless of replay.
+   - `PING` — keepalive, inherently idempotent.
+
+   **0-RTT-unsafe operations (non-idempotent — MUST NOT be sent as 0-RTT data):**
+   - `PUBLISH` — publishing a message is not idempotent; replaying a PUBLISH creates duplicate blobs on the relay. Clients MUST wait for the 1-RTT handshake to complete before sending PUBLISH operations.
+   - `DELETE` — while semantically idempotent (deleting an already-deleted blob is a no-op), DELETE carries authorization implications and MUST NOT be sent in 0-RTT to prevent replay-based deletion attacks.
+   - `UNSUBSCRIBE` — replaying an UNSUBSCRIBE could cancel a subscription established after the original UNSUBSCRIBE.
+
+   **Relay enforcement:** Relays MUST reject 0-RTT-unsafe operations received as 0-RTT data with an error response (`{ op: "ERR", code: 4010, message: "operation not permitted in 0-RTT" }`). The client MUST retry the operation after the 1-RTT handshake completes. Relays that accept 0-RTT data MUST additionally maintain a nonce-based anti-replay cache as defense-in-depth: each 0-RTT QUIC packet's `client_initial` is cached (keyed by the session ticket + packet number) with a TTL of 10 minutes. Duplicate 0-RTT packets are silently dropped.
 3. **Connection migration.** When the client's IP address changes (e.g., WiFi → cellular), QUIC migrates the connection without closing it. Active subscription streams continue uninterrupted. This is critical for mobile profiles where network transitions are frequent.
 4. **Reconnection.** On connection loss, the client uses profile-aware exponential backoff (§10.13.1). After reconnection, the client re-opens subscription streams with `since = last_received_stored_at - 5s` overlap (same gap-fill strategy as WebSocket, per ADR-004).
 5. **Keepalive.** QUIC's native PING frame mechanism (RFC 9000 §19.2) replaces WebSocket PING/PONG. PING frames are ack-eliciting, resetting the idle timeout. No application-level keepalive is needed.
