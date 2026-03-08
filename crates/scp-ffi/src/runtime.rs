@@ -70,7 +70,7 @@ use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_event_log::EventLog;
 use scp_identity::cache::SystemClock;
 use scp_identity::{DidDocument, ScpIdentity};
-use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+use scp_platform::testing::InMemoryStorage;
 use scp_transport::native::adapter::NativeRelayAdapter;
 use tokio::sync::mpsc;
 
@@ -749,10 +749,10 @@ pub fn known_contexts_for_member(member_did: &str) -> Vec<(String, KnownContext)
 /// Global identity registry mapping DID strings to retained identity state.
 ///
 /// Stores the [`ScpIdentity`] (with opaque [`KeyHandle`]s), the
-/// [`Arc<InMemoryKeyCustody>`] that owns the key material, and the
-/// [`DidDocument`]. This allows bridge functions to perform crypto
-/// operations (signing, pseudonym derivation, key rotation) without private
-/// key material crossing the FFI boundary (ADR-006).
+/// [`Arc<FfiKeyCustody>`](crate::custody::FfiKeyCustody) that owns the key
+/// material, and the [`DidDocument`]. This allows bridge functions to perform
+/// crypto operations (signing, pseudonym derivation, key rotation) without
+/// private key material crossing the FFI boundary (ADR-006).
 ///
 /// Uses [`DashMap`] for lock-free concurrent access matching the context
 /// registry pattern.
@@ -765,18 +765,23 @@ fn identity_registry() -> &'static DashMap<String, IdentityEntry> {
 
 /// Retained identity state for a single DID.
 ///
-/// Stores the [`ScpIdentity`] (opaque key handles), the [`InMemoryKeyCustody`]
+/// Stores the [`ScpIdentity`] (opaque key handles), the [`FfiKeyCustody`]
 /// that owns the key material, and the [`DidDocument`]. The custody provider
 /// is behind an `Arc` so it can be shared with context-scoped operations
 /// (pseudonym derivation, signing, UCAN minting) without moving or cloning
 /// the key material.
 ///
-/// See ADR-006 and SCP-214 criterion 3.
+/// The `custody` field uses [`FfiKeyCustody`] — an enum dispatch wrapper —
+/// because [`KeyCustody`] uses RPITIT and is not object-safe. This allows
+/// the FFI bridge to support both in-memory (testing) and file-backed
+/// (production) custody without dynamic dispatch via `dyn`.
+///
+/// See ADR-006, SCP-214 criterion 3, and issue #323.
 pub struct IdentityEntry {
     /// The scp-core identity handle (DID string, key handles, pre-rotation).
     pub identity: ScpIdentity,
     /// The key custody provider that manages the actual key material.
-    pub custody: Arc<InMemoryKeyCustody>,
+    pub custody: Arc<crate::custody::FfiKeyCustody>,
     /// The DID document for this identity.
     pub document: DidDocument,
 }
@@ -1121,6 +1126,7 @@ pub fn remove_identity_if_present(did: &str) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use scp_platform::testing::InMemoryKeyCustody;
 
     /// Helper to generate unique context IDs for parallel test isolation.
     fn unique_ctx_id(prefix: &str) -> String {
@@ -1186,7 +1192,9 @@ mod tests {
                 agent_signing_key: None,
                 pre_rotation_commitment: [0u8; 32],
             },
-            custody: Arc::new(InMemoryKeyCustody::new()),
+            custody: Arc::new(crate::custody::FfiKeyCustody::InMemory(
+                InMemoryKeyCustody::new(),
+            )),
             document: test_did_document(did),
         };
         register_identity(did, entry);
@@ -1251,7 +1259,9 @@ mod tests {
                 agent_signing_key: None,
                 pre_rotation_commitment: [0u8; 32],
             },
-            custody: Arc::new(InMemoryKeyCustody::new()),
+            custody: Arc::new(crate::custody::FfiKeyCustody::InMemory(
+                InMemoryKeyCustody::new(),
+            )),
             document: test_did_document(did),
         };
         register_identity(did, entry);

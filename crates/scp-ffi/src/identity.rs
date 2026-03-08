@@ -40,9 +40,11 @@ use scp_identity::{
     DidCache, DidDht, DidDocument, DidMethod, DualLayerResolver, InMemoryDhtClient,
     NoOpRelayQuerier, ScpIdentity,
 };
+use scp_platform::file::FileKeyCustody;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, Storage};
 
+use crate::custody::FfiKeyCustody;
 use crate::error::ScpPyError;
 use crate::runtime::IdentityEntry;
 use crate::validate;
@@ -287,32 +289,76 @@ impl PyDIDDocument {
 // Custody parsing helper
 // ---------------------------------------------------------------------------
 
-/// Parses a custody type string and returns an [`InMemoryKeyCustody`] instance.
+/// Parses a custody type string and returns an [`FfiKeyCustody`] instance.
 ///
-/// Only `"in_memory"` creates an [`InMemoryKeyCustody`]. The `"platform"`
-/// custody type is reserved for hardware-backed custody (Secure Enclave,
-/// Android Keystore) which is not yet implemented. Using `"platform"` returns
-/// an error to prevent silent fallback to in-memory custody (SCP-214
-/// criterion 11).
+/// Supported custody types:
+///
+/// - `"in_memory"` — Test-only in-memory custody. Keys are lost on process
+///   exit. Only available when compiled with `cfg(feature = "testing")`.
+/// - `"platform"` — Encrypted file-backed custody ([`FileKeyCustody`]) using
+///   Argon2id + AES-256-GCM. This is the production default for desktop/server
+///   platforms. Mobile platforms (iOS/Android) should use their native
+///   `KeyCustodyProvider` callback interface via UniFFI instead.
+///
+/// The `"platform"` path creates a [`FileKeyCustody`] at a default location
+/// (`$HOME/.scp/keys.bin`) with a passphrase from the `SCP_KEY_PASSPHRASE`
+/// environment variable. If the variable is not set, an error is returned.
 ///
 /// # Errors
 ///
-/// Returns [`ScpPyError::ValidationError`] if the custody string is not
-/// recognized or if platform custody is requested but not available.
-fn parse_custody(custody: &str) -> Result<(Arc<InMemoryKeyCustody>, String), ScpPyError> {
+/// Returns [`ScpPyError::ValidationError`] if:
+/// - The custody string is not recognized.
+/// - `"in_memory"` is requested but the `testing` feature is not enabled.
+/// - `"platform"` is requested but `SCP_KEY_PASSPHRASE` is not set.
+/// - [`FileKeyCustody`] initialization fails (I/O error, corrupt key file).
+///
+/// See issue #323 and ADR-006.
+fn parse_custody(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
     match custody {
         "in_memory" => {
-            let kc = Arc::new(InMemoryKeyCustody::new());
+            let kc = Arc::new(FfiKeyCustody::InMemory(InMemoryKeyCustody::new()));
             Ok((kc, custody.to_owned()))
         }
-        "platform" => Err(ScpPyError::validation(
-            "platform custody (Secure Enclave, Android Keystore) is not yet \
-             implemented — use \"in_memory\" for testing",
-        )),
+        "platform" => {
+            let passphrase = std::env::var("SCP_KEY_PASSPHRASE").map_err(|_| {
+                ScpPyError::validation(
+                    "platform custody requires the SCP_KEY_PASSPHRASE environment \
+                     variable to be set — this passphrase protects the encrypted key file",
+                )
+            })?;
+
+            let key_dir = dirs_home().join(".scp");
+            std::fs::create_dir_all(&key_dir).map_err(|e| {
+                ScpPyError::validation(format!(
+                    "failed to create key directory {}: {e}",
+                    key_dir.display()
+                ))
+            })?;
+
+            let key_path = key_dir.join("keys.bin");
+            let file_kc = FileKeyCustody::new(&key_path, &passphrase).map_err(|e| {
+                ScpPyError::identity(format!(
+                    "failed to initialize file-backed key custody at {}: {e}",
+                    key_path.display()
+                ))
+            })?;
+
+            Ok((Arc::new(FfiKeyCustody::File(file_kc)), custody.to_owned()))
+        }
         other => Err(ScpPyError::validation(format!(
             "unknown custody type: {other:?} — expected \"in_memory\" or \"platform\""
         ))),
     }
+}
+
+/// Returns the user's home directory.
+///
+/// Falls back to the current directory if `$HOME` is not set (unlikely on
+/// any supported platform).
+fn dirs_home() -> std::path::PathBuf {
+    std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
 // ---------------------------------------------------------------------------
@@ -537,8 +583,9 @@ fn py_identity_create_with_agent_key(py: Python<'_>, custody: &str) -> PyResult<
 ///
 /// If the identity was created in this process (via `py_identity_create`),
 /// it will be in the registry and this function succeeds. If the identity
-/// was created in a different process, the [`InMemoryKeyCustody`] key
-/// material is lost and this function returns `SCP-IDENT-1010`.
+/// was created in a different process with in-memory custody, the key
+/// material is lost and this function returns `SCP-IDENT-1010`. File-backed
+/// custody persists across restarts if the same passphrase is provided.
 ///
 /// # Arguments
 ///
@@ -558,8 +605,8 @@ fn py_identity_create_with_agent_key(py: Python<'_>, custody: &str) -> PyResult<
 /// - The stored state is malformed.
 /// - The identity has no live crypto state in the registry
 ///   (`SCP-IDENT-1010`). This happens when loading an identity created
-///   in a different process, since [`InMemoryKeyCustody`] does not
-///   persist key material.
+///   in a different process with in-memory custody (which does not
+///   persist key material). File-backed custody survives restarts.
 ///
 /// Does NOT silently fall back to in-memory -- an explicit error is raised
 /// if the DID is not found (SCP-217 acceptance criterion 4).
@@ -586,9 +633,7 @@ fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
                 .retrieve(&key)
                 .await
                 .map_err(|e| {
-                    ScpPyError::identity(format!(
-                        "failed to read identity state from storage: {e}"
-                    ))
+                    ScpPyError::identity(format!("failed to read identity state from storage: {e}"))
                 })?
                 .ok_or_else(|| {
                     ScpPyError::identity(format!(
@@ -625,9 +670,9 @@ fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
             Err(PyErr::from(ScpPyError::identity(format!(
                 "SCP-IDENT-1010: identity '{did_owned}' was found in storage \
                  but has no live crypto state in the runtime registry. \
-                 InMemoryKeyCustody does not persist key material across \
-                 process boundaries. Use py_identity_create to create a \
-                 new identity, or use platform custody (when available) \
+                 If using in-memory custody, key material does not persist \
+                 across process boundaries. Use py_identity_create to create \
+                 a new identity, or use platform custody (custody='platform') \
                  for cross-process identity persistence."
             ))))
         })
@@ -961,7 +1006,7 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
             // We need a pre-rotation key handle. Generate one for the
             // migration — in a full implementation, the pre-rotation key
             // would have been generated and stored during identity creation.
-            // The InMemoryKeyCustody already holds the pre-rotation key from
+            // The custody provider already holds the pre-rotation key from
             // the original create call (handle = identity_key + 2, following
             // the sequential handle allocation in DidDht::create).
             //
@@ -972,8 +1017,8 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
                 .await
                 .map_err(|e| ScpPyError::identity(format!("key generation failed: {e}")))?;
 
-            let rotated_at = scp_core::time::now_secs()
-                .map_err(|e| ScpPyError::identity(format!("{e}")))?;
+            let rotated_at =
+                scp_core::time::now_secs().map_err(|e| ScpPyError::identity(format!("{e}")))?;
 
             let old_identity = ScpIdentity {
                 identity_key: old_identity_key,
