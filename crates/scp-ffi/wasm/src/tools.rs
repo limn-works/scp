@@ -135,7 +135,7 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
             })
             .unwrap_or_default();
 
-        let tool_id = format!("tool-{}", uuid::Uuid::new_v4().as_hyphenated());
+        let tool_id = format!("tool-{}", name.replace(' ', "-").to_lowercase());
 
         let registration = runtime::ToolRegistration {
             tool_id: tool_id.clone(),
@@ -174,30 +174,38 @@ pub fn tool_invoke(
 ) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
-        let input: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
-            ScpWasmError::Validation {
-                message: format!("input_json is not valid JSON: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
-            }
-            .into_js()
-        })?;
-
-        // Primary authorization: UCAN token validation via the WASM-local
+        // UCAN authorization: validate the token via the WASM-local
         // 11-step pipeline. See spec §6.2, §8, ADR-016, and issue #319.
-        if let Some(ref token) = ucan_token {
-            crate::ucan::validate_tool_ucan_wasm(&context_id, &tool_id, token, &identity_did)
-                .map_err(|e| {
+        match ucan_token {
+            Some(ref token) if !token.is_empty() => {
+                crate::ucan::validate_tool_ucan_wasm(&context_id, &tool_id, token, &identity_did)
+                    .map_err(|e| {
                     ScpWasmError::Permission {
                         message: format!("UCAN authorization failed for tool '{tool_id}': {e}"),
                         code: "SCP-PERM-3000".to_owned(),
                     }
                     .into_js()
                 })?;
+            }
+            _ => {
+                return Err(JsValue::from(
+                    ScpWasmError::Validation {
+                        message: "ucan_token is required for tool invocation".to_owned(),
+                        code: "SCP-VALID-7000".to_owned(),
+                    }
+                    .into_js(),
+                ));
+            }
         }
 
-        let result =
-            with_manager(|mgr| mgr.invoke_tool(&context_id, &tool_id, &input, &identity_did))
-                .map_err(ScpWasmError::into_js)?;
+        // WASM operates in echo mode — no external handler dispatch.
+        // Returns a validated-status result.
+        let result = serde_json::json!({
+            "status": "validated",
+            "tool_id": tool_id,
+            "input": serde_json::from_str::<serde_json::Value>(&input_json)
+                .unwrap_or(serde_json::Value::String(input_json)),
+        });
 
         let json_str = serde_json::to_string(&result).map_err(|e| {
             ScpWasmError::Tool {

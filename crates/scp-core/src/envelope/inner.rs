@@ -239,12 +239,7 @@ pub async fn create_inner_envelope(
     let provenance_hash: [u8; 32] = compute_provenance_hash(params.provenance.as_ref())?;
 
     // 3. Compute canonical hash for signing.
-    let canonical_hash = compute_canonical_hash(
-        SCP_INNER_ENVELOPE_VERSION,
-        params,
-        &payload_hash,
-        &provenance_hash,
-    );
+    let canonical_hash = compute_canonical_hash(params, &payload_hash, &provenance_hash);
 
     // 4. Sign the canonical hash.
     let signature = key_custody
@@ -334,12 +329,7 @@ pub fn verify_inner_signature(
     // already validated as [u8; 32] by serde deserialization.
     // The version from the envelope is used (not the constant) so that
     // tampering with the version field causes verification to fail (§13.2.1).
-    let canonical_hash = compute_canonical_hash(
-        inner.version,
-        &params,
-        &inner.payload_hash,
-        &provenance_hash,
-    );
+    let canonical_hash = compute_canonical_hash(&params, &inner.payload_hash, &provenance_hash);
 
     // Verify using strict mode (rejects small-order points).
     match crate::crypto::ed25519::verify_ed25519_signature_strict(
@@ -469,7 +459,6 @@ fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<[u8; 32], 
 ///         || len(signing_key_id) || signing_key_id)
 /// ```
 fn compute_canonical_hash(
-    version: u16,
     params: &InnerEnvelopeParams<'_>,
     payload_hash: &[u8; 32],
     provenance_hash: &[u8; 32],
@@ -480,15 +469,14 @@ fn compute_canonical_hash(
     // context_id, sender_did, epoch, generation, sequence, timestamp,
     // payload_hash, provenance_hash, signing_key_id.
     //
-    // version is field 1 per §13.2.1 — part of the signature commitment.
-    // message_type follows as a discriminator byte to prevent type-flipping
-    // attacks (issue #290).
+    // version from params is field 1 per §13.2.1 — part of the signature
+    // commitment. message_type follows as a discriminator byte to prevent
+    // type-flipping attacks (issue #290).
     canonical_hash(
         "SCP-INNER-ENVELOPE-V1:",
         &[
-            CanonicalField::U16(version),
-            CanonicalField::U8(params.message_type.as_discriminator_byte()),
             CanonicalField::U16(params.version),
+            CanonicalField::U8(params.message_type.as_discriminator_byte()),
             CanonicalField::VarBytes(params.context_id.as_bytes()),
             CanonicalField::VarBytes(params.sender_did.as_bytes()),
             CanonicalField::U64(params.epoch),
@@ -829,12 +817,7 @@ mod tests {
             provenance: None,
             signing_key_id: SigningKeyId::Active,
         };
-        let hash_with_domain = compute_canonical_hash(
-            SCP_INNER_ENVELOPE_VERSION,
-            &params,
-            &payload_hash,
-            &provenance_hash,
-        );
+        let hash_with_domain = compute_canonical_hash(&params, &payload_hash, &provenance_hash);
 
         // Hash WITHOUT any domain separator (manual construction with length prefixes).
         #[allow(clippy::cast_possible_truncation)]

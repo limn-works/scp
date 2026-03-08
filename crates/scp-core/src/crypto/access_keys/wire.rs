@@ -6,7 +6,7 @@
 //!
 //! Protocol flow:
 //! 1. New member sends [`AccessKeyRequest`] with ephemeral X25519 wrapping
-//!    pubkey, signature, and timestamp for replay protection.
+//!    pubkey, signature, nonce, and timestamp for replay protection.
 //! 2. Key holder verifies the request and HPKE-encrypts the access key.
 //! 3. Key holder responds with [`AccessKeyResponse`] containing the sealed
 //!    key and ephemeral pubkey.
@@ -35,9 +35,18 @@ use super::{AccessKey, AccessKeyError};
 /// AES-128-GCM nonce size in bytes.
 const HPKE_NONCE_SIZE: usize = 12;
 
+/// Size of the cryptographic nonce in access key requests (bytes).
+const ACCESS_KEY_NONCE_SIZE: usize = 16;
+
 /// HKDF info prefix for access key HPKE encryption.
 ///
-/// The full info string is: `"scp-access-key-v1" || context_id || member_did || epoch_bytes`.
+/// The full info string is:
+/// `"scp-access-key-v1" || BE32(len(context_id)) || context_id || BE32(len(member_did)) || member_did || epoch_bytes`
+///
+/// Variable-length fields (`context_id`, `member_did`) are preceded by 4-byte
+/// big-endian length prefixes to prevent concatenation ambiguity. The epoch
+/// is fixed-width (8 bytes BE) and needs no prefix.
+///
 /// This MUST be distinct from the sender key HPKE info (`"scp-sender-key-hpke-v1"`)
 /// to prevent cross-protocol key confusion per spec §9.17.1.
 const HPKE_INFO_PREFIX: &[u8] = b"scp-access-key-v1";
@@ -58,10 +67,11 @@ const REQUEST_FRESHNESS_SECS: u64 = 30;
 /// The requester includes a fresh X25519 wrapping public key so the
 /// responder can HPKE-encrypt the access key material.
 ///
-/// Contains a timestamp for replay protection. The responder rejects
-/// requests older than 30 seconds.
+/// Contains a timestamp and cryptographic nonce for replay protection.
+/// The responder rejects requests older than 30 seconds and deduplicates
+/// by nonce within the freshness window.
 ///
-/// Signature payload: `SHA-256("SCP-ACCESS-KEY-REQUEST-V1:" || context_id || requester_did || timestamp_BE || wrapping_pubkey)`.
+/// Signature payload: `SHA-256("SCP-ACCESS-KEY-REQUEST-V1:" || context_id || requester_did || nonce || timestamp_BE || wrapping_pubkey)`.
 ///
 /// See spec §9.17.1 and §9.5.2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +83,9 @@ pub struct AccessKeyRequest {
     /// Fresh X25519 public key for HPKE wrapping (32 bytes).
     #[serde(with = "serde_bytes")]
     pub wrapping_pubkey: Vec<u8>,
+    /// Cryptographic nonce for replay protection (16 bytes, CSPRNG).
+    #[serde(with = "serde_bytes")]
+    pub nonce: [u8; ACCESS_KEY_NONCE_SIZE],
     /// Unix timestamp in seconds when the request was created.
     pub timestamp: u64,
     /// Ed25519 signature over the request payload.
@@ -149,10 +162,15 @@ pub async fn request_access_key(
 
     let timestamp = crate::time::now_secs()?;
 
+    // Generate cryptographic nonce for replay protection.
+    let mut nonce = [0u8; ACCESS_KEY_NONCE_SIZE];
+    OsRng.fill_bytes(&mut nonce);
+
     // Sign the request payload.
     let hash = compute_request_hash(
         context_id,
         requester_did,
+        &nonce,
         timestamp,
         wrapping_pubkey.as_bytes(),
     );
@@ -166,6 +184,7 @@ pub async fn request_access_key(
         requester_did: requester_did.to_owned(),
         context_id: context_id.to_owned(),
         wrapping_pubkey: wrapping_pubkey.into_bytes(),
+        nonce,
         timestamp,
         signature: signature.into_bytes(),
     };
@@ -197,6 +216,7 @@ pub fn verify_access_key_request(
     let hash = compute_request_hash(
         &request.context_id,
         &request.requester_did,
+        &request.nonce,
         request.timestamp,
         &request.wrapping_pubkey,
     );
@@ -206,8 +226,9 @@ pub fn verify_access_key_request(
 /// Validates that an [`AccessKeyRequest`] timestamp is within the
 /// freshness window.
 ///
-/// Requests older than [`REQUEST_FRESHNESS_SECS`] are rejected to
-/// prevent replay attacks per spec §9.17.1.
+/// Requests older than [`REQUEST_FRESHNESS_SECS`] or more than
+/// [`REQUEST_FRESHNESS_SECS`] in the future are rejected to prevent
+/// replay attacks and clock manipulation per spec §9.17.1.
 ///
 /// # Errors
 ///
@@ -217,6 +238,10 @@ pub const fn validate_request_freshness(
     request: &AccessKeyRequest,
     now_secs: u64,
 ) -> Result<(), AccessKeyError> {
+    // Reject far-future timestamps (clock skew / manipulation).
+    if request.timestamp > now_secs.saturating_add(REQUEST_FRESHNESS_SECS) {
+        return Err(AccessKeyError::StaleRequest);
+    }
     let age = now_secs.saturating_sub(request.timestamp);
     if age > REQUEST_FRESHNESS_SECS {
         return Err(AccessKeyError::StaleRequest);
@@ -225,8 +250,8 @@ pub const fn validate_request_freshness(
 }
 
 /// Handles an incoming [`AccessKeyRequest`]: verifies the signature,
-/// checks freshness, and HPKE-encrypts the access key to the requester's
-/// wrapping public key.
+/// checks freshness, checks nonce replay, and HPKE-encrypts the access
+/// key to the requester's wrapping public key.
 ///
 /// Returns the serialized [`AccessKeyResponse`] on success.
 ///
@@ -234,7 +259,7 @@ pub const fn validate_request_freshness(
 ///
 /// 1. Generate ephemeral X25519 keypair.
 /// 2. ECDH between ephemeral secret and requester's wrapping pubkey.
-/// 3. HKDF-SHA256 with info = `"scp-access-key-v1" || context_id || member_did || epoch_bytes`
+/// 3. HKDF-SHA256 with info = `"scp-access-key-v1" || BE32(len(context_id)) || context_id || BE32(len(member_did)) || member_did || epoch_bytes`
 ///    to derive a 16-byte AES-128-GCM encryption key.
 /// 4. AES-128-GCM encrypt the access key bytes.
 /// 5. Include the ephemeral public key in the response.
@@ -243,13 +268,17 @@ pub const fn validate_request_freshness(
 ///
 /// Returns [`AccessKeyError::VerificationFailed`] if the request signature
 /// is invalid or malformed.
-/// Returns [`AccessKeyError::StaleRequest`] if the request is too old.
+/// Returns [`AccessKeyError::StaleRequest`] if the request is too old or
+/// too far in the future.
+/// Returns [`AccessKeyError::ReplayedNonce`] if the request nonce has been
+/// seen before within the expiry window.
 /// Returns other variants for HPKE failures.
 pub fn handle_access_key_request(
     request: &AccessKeyRequest,
     requester_public_key: &[u8],
     access_key: &AccessKey,
     now_secs: u64,
+    nonce_dedup: &mut crate::crypto::sender_keys::NonceDedup,
 ) -> Result<Vec<u8>, AccessKeyError> {
     // Verify the request signature.
     let valid = verify_access_key_request(request, requester_public_key)?;
@@ -261,6 +290,11 @@ pub fn handle_access_key_request(
 
     // Check freshness (replay protection).
     validate_request_freshness(request, now_secs)?;
+
+    // Nonce replay protection: reject requests with previously-seen nonces.
+    if nonce_dedup.is_replayed(&request.nonce, now_secs) {
+        return Err(AccessKeyError::ReplayedNonce);
+    }
 
     // Parse the requester's wrapping public key.
     let wrapping_bytes: [u8; 32] = request.wrapping_pubkey.as_slice().try_into().map_err(|_| {
@@ -285,6 +319,11 @@ pub fn handle_access_key_request(
         hpke_sealed_key: sealed,
         ephemeral_pubkey: ephemeral_pub.to_vec(),
     };
+
+    // Record the nonce only after the request has been fully validated and
+    // the response constructed. This prevents the nonce dedup cache from
+    // being poisoned by requests that fail for other reasons.
+    nonce_dedup.record(request.nonce, now_secs);
 
     serde_json::to_vec(&response).map_err(|e| AccessKeyError::SerializationFailed(e.to_string()))
 }
@@ -357,15 +396,26 @@ pub async fn open_access_key_response(
 
 /// Builds the HPKE info string for access key distribution.
 ///
-/// Format: `"scp-access-key-v1" || context_id || member_did || epoch_bytes`
+/// Format: `"scp-access-key-v1" || BE32(len(context_id)) || context_id || BE32(len(member_did)) || member_did || epoch_bytes`
+///
+/// Variable-length fields are preceded by 4-byte big-endian length prefixes
+/// to prevent concatenation ambiguity. The epoch is fixed-width (8 bytes BE)
+/// and needs no prefix.
 ///
 /// This MUST be distinct from sender key HPKE info to prevent
 /// cross-protocol key confusion per spec §9.17.1.
 fn build_hpke_info(context_id: &str, member_did: &str, epoch: u64) -> Vec<u8> {
-    let mut info =
-        Vec::with_capacity(HPKE_INFO_PREFIX.len() + context_id.len() + member_did.len() + 8);
+    let mut info = Vec::with_capacity(
+        HPKE_INFO_PREFIX.len() + 4 + context_id.len() + 4 + member_did.len() + 8,
+    );
     info.extend_from_slice(HPKE_INFO_PREFIX);
+    #[allow(clippy::cast_possible_truncation)] // context_id/DID lengths << u32::MAX
+    let ctx_len = context_id.len() as u32;
+    info.extend_from_slice(&ctx_len.to_be_bytes());
     info.extend_from_slice(context_id.as_bytes());
+    #[allow(clippy::cast_possible_truncation)]
+    let did_len = member_did.len() as u32;
+    info.extend_from_slice(&did_len.to_be_bytes());
     info.extend_from_slice(member_did.as_bytes());
     info.extend_from_slice(&epoch.to_be_bytes());
     info
@@ -459,10 +509,14 @@ fn aes128gcm_decrypt(key: &[u8; 16], sealed: &[u8]) -> Result<Vec<u8>, AccessKey
 /// Computes the canonical hash for an `AccessKeyRequest`.
 ///
 /// Uses the canonical hash construction from §9.5.2:
-/// `SHA-256("SCP-ACCESS-KEY-REQUEST-V1:" || context_id || requester_did || timestamp_BE || wrapping_pubkey)`
+/// `SHA-256("SCP-ACCESS-KEY-REQUEST-V1:" || context_id || requester_did || nonce || timestamp_BE || wrapping_pubkey)`
+///
+/// The nonce is fixed-size (`ACCESS_KEY_NONCE_SIZE` = 16 bytes) and
+/// needs no length prefix.
 fn compute_request_hash(
     context_id: &str,
     requester_did: &str,
+    nonce: &[u8; ACCESS_KEY_NONCE_SIZE],
     timestamp: u64,
     wrapping_pubkey: &[u8],
 ) -> Vec<u8> {
@@ -473,6 +527,7 @@ fn compute_request_hash(
         &[
             CanonicalField::VarBytes(context_id.as_bytes()),
             CanonicalField::VarBytes(requester_did.as_bytes()),
+            CanonicalField::RawBytes(nonce),
             CanonicalField::U64(timestamp),
             CanonicalField::RawBytes(wrapping_pubkey),
         ],
@@ -518,6 +573,7 @@ fn verify_ed25519_signature(
 mod tests {
     use super::*;
     use crate::crypto::access_keys::generate_access_key;
+    use crate::crypto::sender_keys::NonceDedup;
 
     // -----------------------------------------------------------------------
     // Wire type serialization tests
@@ -529,6 +585,7 @@ mod tests {
             requester_did: "did:dht:alice".to_owned(),
             context_id: "ctx-1".to_owned(),
             wrapping_pubkey: vec![0u8; 32],
+            nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_700_000_000,
             signature: vec![0u8; 64],
         };
@@ -537,6 +594,7 @@ mod tests {
         assert_eq!(deserialized.requester_did, request.requester_did);
         assert_eq!(deserialized.context_id, request.context_id);
         assert_eq!(deserialized.timestamp, request.timestamp);
+        assert_eq!(deserialized.nonce, request.nonce);
     }
 
     #[test]
@@ -561,6 +619,7 @@ mod tests {
             requester_did: "did:dht:bob".to_owned(),
             context_id: "ctx-2".to_owned(),
             wrapping_pubkey: vec![42u8; 32],
+            nonce: [0xAA; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_700_000_000,
             signature: vec![7u8; 64],
         };
@@ -568,6 +627,7 @@ mod tests {
         let deserialized: AccessKeyRequest = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(deserialized.requester_did, request.requester_did);
         assert_eq!(deserialized.wrapping_pubkey, request.wrapping_pubkey);
+        assert_eq!(deserialized.nonce, request.nonce);
     }
 
     #[test]
@@ -628,6 +688,37 @@ mod tests {
         let access_info = build_hpke_info("ctx-1", "did:dht:alice", 0);
         // Sender key HPKE uses "scp-sender-key-hpke-v1" as a flat info string.
         assert!(!access_info.starts_with(b"scp-sender-key"));
+    }
+
+    #[test]
+    fn build_hpke_info_has_length_prefixes() {
+        let info = build_hpke_info("ctx-1", "did:dht:alice", 42);
+        let prefix_len = HPKE_INFO_PREFIX.len();
+
+        // After the domain separator, the next 4 bytes should be the
+        // big-endian length of "ctx-1" (5).
+        let ctx_len_bytes = &info[prefix_len..prefix_len + 4];
+        assert_eq!(ctx_len_bytes, &5u32.to_be_bytes());
+
+        // After context_id, the next 4 bytes should be the big-endian
+        // length of "did:dht:alice" (13).
+        let member_offset = prefix_len + 4 + 5;
+        let member_len_bytes = &info[member_offset..member_offset + 4];
+        assert_eq!(member_len_bytes, &13u32.to_be_bytes());
+
+        // After member_did, the last 8 bytes should be the epoch (42).
+        let epoch_offset = member_offset + 4 + 13;
+        let epoch_bytes = &info[epoch_offset..epoch_offset + 8];
+        assert_eq!(epoch_bytes, &42u64.to_be_bytes());
+    }
+
+    #[test]
+    fn build_hpke_info_length_prefixes_prevent_boundary_shift() {
+        // Without length prefixes, ("ab", "cd") and ("a", "bcd") would
+        // produce the same concatenation. With length prefixes they differ.
+        let info_a = build_hpke_info("ab", "cd", 0);
+        let info_b = build_hpke_info("a", "bcd", 0);
+        assert_ne!(info_a, info_b);
     }
 
     // -----------------------------------------------------------------------
@@ -696,6 +787,7 @@ mod tests {
             requester_did: "did:dht:alice".to_owned(),
             context_id: "ctx-1".to_owned(),
             wrapping_pubkey: vec![0u8; 32],
+            nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_000_000,
             signature: vec![0u8; 64],
         };
@@ -708,6 +800,7 @@ mod tests {
             requester_did: "did:dht:alice".to_owned(),
             context_id: "ctx-1".to_owned(),
             wrapping_pubkey: vec![0u8; 32],
+            nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_000_000,
             signature: vec![0u8; 64],
         };
@@ -720,11 +813,42 @@ mod tests {
             requester_did: "did:dht:alice".to_owned(),
             context_id: "ctx-1".to_owned(),
             wrapping_pubkey: vec![0u8; 32],
+            nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_000_000,
             signature: vec![0u8; 64],
         };
         let result = validate_request_freshness(&request, 1_000_031);
         assert!(matches!(result, Err(AccessKeyError::StaleRequest)));
+    }
+
+    #[test]
+    fn validate_request_freshness_rejects_far_future() {
+        let request = AccessKeyRequest {
+            requester_did: "did:dht:alice".to_owned(),
+            context_id: "ctx-1".to_owned(),
+            wrapping_pubkey: vec![0u8; 32],
+            nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
+            // Timestamp far ahead of "now".
+            timestamp: 1_000_100,
+            signature: vec![0u8; 64],
+        };
+        let result = validate_request_freshness(&request, 1_000_000);
+        assert!(matches!(result, Err(AccessKeyError::StaleRequest)));
+    }
+
+    #[test]
+    fn validate_request_freshness_accepts_slight_future() {
+        // A timestamp up to REQUEST_FRESHNESS_SECS ahead should be accepted
+        // (covers minor clock skew).
+        let request = AccessKeyRequest {
+            requester_did: "did:dht:alice".to_owned(),
+            context_id: "ctx-1".to_owned(),
+            wrapping_pubkey: vec![0u8; 32],
+            nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
+            timestamp: 1_000_030,
+            signature: vec![0u8; 64],
+        };
+        assert!(validate_request_freshness(&request, 1_000_000).is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -750,12 +874,14 @@ mod tests {
     #[test]
     fn handle_access_key_request_rejects_invalid_signature() {
         let access_key = generate_access_key("ctx-1", "did:dht:alice");
+        let mut nonce_dedup = NonceDedup::new();
 
         // Create a request with a bogus signature.
         let request = AccessKeyRequest {
             requester_did: "did:dht:bob".to_owned(),
             context_id: "ctx-1".to_owned(),
             wrapping_pubkey: vec![0u8; 32],
+            nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_000_000,
             signature: vec![0u8; 64],
         };
@@ -766,6 +892,7 @@ mod tests {
             &[1u8; 32], // bogus pubkey
             &access_key,
             1_000_000,
+            &mut nonce_dedup,
         );
         // Should fail at signature verification or produce false.
         assert!(result.is_err());
@@ -774,6 +901,7 @@ mod tests {
     #[test]
     fn handle_access_key_request_rejects_stale_request() {
         let access_key = generate_access_key("ctx-1", "did:dht:alice");
+        let mut nonce_dedup = NonceDedup::new();
 
         // Even with a valid-looking request, staleness should be caught.
         // (The signature check happens first, but let's test that stale
@@ -782,6 +910,7 @@ mod tests {
             requester_did: "did:dht:bob".to_owned(),
             context_id: "ctx-1".to_owned(),
             wrapping_pubkey: vec![0u8; 32],
+            nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_000_000,
             signature: vec![0u8; 64],
         };
@@ -792,25 +921,39 @@ mod tests {
         assert!(matches!(freshness, Err(AccessKeyError::StaleRequest)));
 
         // And the full handler also rejects (due to sig failure):
-        let result = handle_access_key_request(&request, &[1u8; 32], &access_key, 1_000_100);
+        let result = handle_access_key_request(
+            &request,
+            &[1u8; 32],
+            &access_key,
+            1_000_100,
+            &mut nonce_dedup,
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn handle_access_key_request_rejects_wrong_wrapping_key_length() {
         let access_key = generate_access_key("ctx-1", "did:dht:alice");
+        let mut nonce_dedup = NonceDedup::new();
 
         let request = AccessKeyRequest {
             requester_did: "did:dht:bob".to_owned(),
             context_id: "ctx-1".to_owned(),
             wrapping_pubkey: vec![0u8; 16], // wrong length
+            nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
             timestamp: 1_000_000,
             signature: vec![0u8; 64],
         };
 
         // Will fail on signature first, but wrapping key validation
         // would also catch this.
-        let result = handle_access_key_request(&request, &[1u8; 32], &access_key, 1_000_000);
+        let result = handle_access_key_request(
+            &request,
+            &[1u8; 32],
+            &access_key,
+            1_000_000,
+            &mut nonce_dedup,
+        );
         assert!(result.is_err());
     }
 
@@ -818,6 +961,8 @@ mod tests {
     #[test]
     fn hpke_distribution_e2e_with_real_signing() {
         use ed25519_dalek::{Signer, SigningKey};
+
+        let mut nonce_dedup = NonceDedup::new();
 
         // 1. Generate requester's Ed25519 keypair.
         let signing_key = SigningKey::generate(&mut OsRng);
@@ -828,11 +973,14 @@ mod tests {
         let wrapping_public = X25519Pub::from(&wrapping_secret);
 
         let timestamp = 1_700_000_000_u64;
+        let mut nonce = [0u8; ACCESS_KEY_NONCE_SIZE];
+        OsRng.fill_bytes(&mut nonce);
 
         // 3. Build and sign the request.
         let hash = compute_request_hash(
             "ctx-1",
             "did:dht:bob",
+            &nonce,
             timestamp,
             &wrapping_public.to_bytes(),
         );
@@ -842,6 +990,7 @@ mod tests {
             requester_did: "did:dht:bob".to_owned(),
             context_id: "ctx-1".to_owned(),
             wrapping_pubkey: wrapping_public.to_bytes().to_vec(),
+            nonce,
             timestamp,
             signature: sig.to_bytes().to_vec(),
         };
@@ -851,9 +1000,14 @@ mod tests {
         let original_key_bytes = *access_key.as_bytes();
 
         // 5. Handle the request (responder side).
-        let response_bytes =
-            handle_access_key_request(&request, verifying_key.as_bytes(), &access_key, timestamp)
-                .unwrap();
+        let response_bytes = handle_access_key_request(
+            &request,
+            verifying_key.as_bytes(),
+            &access_key,
+            timestamp,
+            &mut nonce_dedup,
+        )
+        .unwrap();
 
         // 6. Parse the response.
         let response: AccessKeyResponse = serde_json::from_slice(&response_bytes).unwrap();
@@ -862,7 +1016,7 @@ mod tests {
         assert_eq!(response.member_did, "did:dht:alice");
         assert_eq!(response.epoch, 0);
 
-        // 7. Decrypt the response (requester side) — manual HPKE open.
+        // 7. Decrypt the response (requester side) -- manual HPKE open.
         let ephemeral_bytes: [u8; 32] = response.ephemeral_pubkey.as_slice().try_into().unwrap();
         let ephemeral_key = X25519Pub::from(ephemeral_bytes);
         let shared_secret = wrapping_secret.diffie_hellman(&ephemeral_key);
@@ -873,5 +1027,87 @@ mod tests {
 
         let recovered_bytes: [u8; 32] = plaintext.as_slice().try_into().unwrap();
         assert_eq!(recovered_bytes, original_key_bytes);
+
+        // 8. Replaying the same request should be rejected.
+        let replay_result = handle_access_key_request(
+            &request,
+            verifying_key.as_bytes(),
+            &access_key,
+            timestamp,
+            &mut nonce_dedup,
+        );
+        assert!(matches!(replay_result, Err(AccessKeyError::ReplayedNonce)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Nonce replay protection tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_access_key_request_rejects_replayed_nonce() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let mut nonce_dedup = NonceDedup::new();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let verifying_key = signing_key.verifying_key();
+
+        let wrapping_secret = EphemeralSecret::random_from_rng(OsRng);
+        let wrapping_public = X25519Pub::from(&wrapping_secret);
+
+        let timestamp = 1_700_000_000_u64;
+        let mut nonce = [0u8; ACCESS_KEY_NONCE_SIZE];
+        OsRng.fill_bytes(&mut nonce);
+
+        let hash = compute_request_hash(
+            "ctx-1",
+            "did:dht:bob",
+            &nonce,
+            timestamp,
+            &wrapping_public.to_bytes(),
+        );
+        let sig = signing_key.sign(&hash);
+
+        let request = AccessKeyRequest {
+            requester_did: "did:dht:bob".to_owned(),
+            context_id: "ctx-1".to_owned(),
+            wrapping_pubkey: wrapping_public.to_bytes().to_vec(),
+            nonce,
+            timestamp,
+            signature: sig.to_bytes().to_vec(),
+        };
+
+        let access_key = generate_access_key("ctx-1", "did:dht:alice");
+
+        // First request should succeed.
+        let result = handle_access_key_request(
+            &request,
+            verifying_key.as_bytes(),
+            &access_key,
+            timestamp,
+            &mut nonce_dedup,
+        );
+        assert!(result.is_ok());
+
+        // Replay with same nonce should fail.
+        let result = handle_access_key_request(
+            &request,
+            verifying_key.as_bytes(),
+            &access_key,
+            timestamp,
+            &mut nonce_dedup,
+        );
+        assert!(matches!(result, Err(AccessKeyError::ReplayedNonce)));
+    }
+
+    #[test]
+    fn nonce_included_in_request_hash() {
+        // Different nonces should produce different hashes.
+        let nonce_a = [0xAAu8; ACCESS_KEY_NONCE_SIZE];
+        let nonce_b = [0xBBu8; ACCESS_KEY_NONCE_SIZE];
+
+        let hash_a = compute_request_hash("ctx-1", "did:dht:bob", &nonce_a, 100, &[0u8; 32]);
+        let hash_b = compute_request_hash("ctx-1", "did:dht:bob", &nonce_b, 100, &[0u8; 32]);
+
+        assert_ne!(hash_a, hash_b);
     }
 }

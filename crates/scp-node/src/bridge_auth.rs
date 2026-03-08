@@ -303,7 +303,7 @@ fn verify_bridge_jwt(token: &str, lookup: &dyn BridgeLookup) -> Result<BridgeJwt
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_err(|_| "system clock is before Unix epoch".to_owned())?;
 
     // Check expiration (with clock skew tolerance).
     if claims.exp + CLOCK_SKEW_TOLERANCE_SECS < now {

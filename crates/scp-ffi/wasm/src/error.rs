@@ -15,6 +15,7 @@
 //! | `SCP-TRANS-` | 5000–5999 | Transport errors |
 //! | `SCP-TOOL-` | 6000–6999 | Tool errors |
 //! | `SCP-VALID-` | 7000–7999 | Validation errors |
+//! | `SCP-TRUST-` | 8000–8999 | Trust engine errors |
 //!
 //! # Error message format
 //!
@@ -114,6 +115,15 @@ pub enum ScpWasmError {
         /// Human-readable error message.
         message: String,
         /// Stable error code (e.g. `SCP-VALID-7000`).
+        code: String,
+    },
+
+    /// A trust engine operation failed (attestation, challenge, verification).
+    #[error("[{code}] trust error: {message}")]
+    Trust {
+        /// Human-readable error message.
+        message: String,
+        /// Stable error code (e.g. `SCP-VALID-7070`).
         code: String,
     },
 }
