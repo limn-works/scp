@@ -674,6 +674,53 @@ impl ContextRoleState {
             .get(member_did)
             .is_some_and(|caps| caps.contains(capability))
     }
+
+    /// Revokes `GovernanceVote` and `GovernancePropose` capabilities from a
+    /// member (§5.9: presence-only members lose governance capabilities).
+    ///
+    /// Called when a member has both read and write access revoked. The member
+    /// remains in the context but cannot influence governance decisions about
+    /// content they cannot see.
+    pub fn revoke_governance_capabilities(&mut self, member_did: &scp_identity::DID) {
+        let did_str = member_did.as_ref();
+        if let Some(caps) = self.member_capabilities.get_mut(did_str) {
+            caps.remove(&Capability::GovernanceVote);
+            caps.remove(&Capability::GovernancePropose);
+        }
+    }
+
+    /// Restores `GovernanceVote` and `GovernancePropose` capabilities for a
+    /// member, re-deriving them from the member's current role definition.
+    ///
+    /// Called when a presence-only member has read or write access restored,
+    /// taking them out of presence-only state. Only restores capabilities
+    /// that exist in the member's role definition AND the context ceiling.
+    pub fn restore_governance_capabilities(&mut self, member_did: &scp_identity::DID) {
+        let did_str = member_did.as_ref();
+        // Look up the member's current role to see which capabilities they
+        // should have. Only restore governance capabilities that are in the
+        // role definition AND the ceiling.
+        let role_caps: Option<HashSet<Capability>> = self
+            .assignments
+            .get(did_str)
+            .and_then(|assignment| self.role_definitions.get(&assignment.role_name))
+            .map(|def| def.capabilities.clone());
+
+        if let Some(role_caps) = role_caps {
+            if let Some(caps) = self.member_capabilities.get_mut(did_str) {
+                if role_caps.contains(&Capability::GovernanceVote)
+                    && self.ceiling.contains(&Capability::GovernanceVote)
+                {
+                    caps.insert(Capability::GovernanceVote);
+                }
+                if role_caps.contains(&Capability::GovernancePropose)
+                    && self.ceiling.contains(&Capability::GovernancePropose)
+                {
+                    caps.insert(Capability::GovernancePropose);
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
