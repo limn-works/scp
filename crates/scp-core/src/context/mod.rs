@@ -287,6 +287,11 @@ pub enum ContextError {
     #[error("member not found: {0}")]
     MemberNotFound(String),
 
+    /// An operation was attempted while the context or subcomponent is in an
+    /// unexpected state (e.g., summary window already disputed).
+    #[error("invalid state: {0}")]
+    InvalidState(String),
+
     /// A key package validation failed.
     #[error("invalid key package: {0}")]
     InvalidKeyPackage(String),

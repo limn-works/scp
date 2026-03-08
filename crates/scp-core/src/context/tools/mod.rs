@@ -48,6 +48,7 @@ pub mod lifecycle;
 pub mod registry;
 pub mod schema;
 pub mod session;
+pub mod summary;
 
 use crate::context::roles;
 

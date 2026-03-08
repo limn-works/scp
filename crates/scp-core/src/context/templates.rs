@@ -17,8 +17,8 @@
 
 use super::params::{
     Capability, CeilingPolicy, ContextMode, ContextParams, FieldVisibility, GovernanceModel,
-    MemoryScope, MetadataVisibilityPolicy, ProjectionPolicy, ProjectionRule, PromotionPolicy,
-    TemplateId,
+    IncompleteVerificationPolicy, MemoryScope, MetadataVisibilityPolicy, ProjectionPolicy,
+    ProjectionRule, PromotionPolicy, TemplateId,
 };
 
 // ---------------------------------------------------------------------------
@@ -279,6 +279,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             metadata_visibility: private_encrypted_visibility(),
             projection_policy: None,
             participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         TemplateId::BilateralPersistent => ContextParams {
             mode: ContextMode::Encrypted,
@@ -295,6 +296,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             metadata_visibility: private_encrypted_visibility(),
             projection_policy: None,
             participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         TemplateId::Coordination => ContextParams {
             mode: ContextMode::Encrypted,
@@ -311,6 +313,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             metadata_visibility: private_encrypted_visibility(),
             projection_policy: None,
             participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         TemplateId::GroupDiscussion => ContextParams {
             mode: ContextMode::Encrypted,
@@ -327,6 +330,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             metadata_visibility: group_discussion_visibility(),
             projection_policy: None,
             participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         TemplateId::PublicBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
@@ -346,6 +350,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
                 overrides: vec![],
             }),
             participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         TemplateId::GatedBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
@@ -365,6 +370,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
                 overrides: vec![],
             }),
             participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         TemplateId::ToolInterfaceTemplate => ContextParams {
             mode: ContextMode::Encrypted,
@@ -381,6 +387,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
             participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         // Extends scp:template/tool-interface -- same ceiling and governance,
         // but economic_policy is caller-provided and validated separately.
@@ -399,6 +406,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             metadata_visibility: member_count_hidden_visibility(),
             projection_policy: None,
             participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         // Extends scp:template/gated-broadcast -- broadcast mode with gated
         // subscriber admission. economic_policy is caller-provided.
@@ -420,6 +428,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
                 overrides: vec![],
             }),
             participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
     }
 }

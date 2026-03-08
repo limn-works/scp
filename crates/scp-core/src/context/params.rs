@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use crate::economy::EconomicPolicy;
 use crate::trust::RequireParticipation;
 
+pub use super::close::IncompleteVerificationPolicy;
+
 // ---------------------------------------------------------------------------
 // Capability (unified type from roles module)
 // ---------------------------------------------------------------------------
@@ -542,6 +544,16 @@ pub struct ContextParams {
     /// requirements (the default).
     #[serde(default)]
     pub participation_requirements: Vec<RequireParticipation>,
+
+    /// Policy for handling incomplete summary verification at window expiry.
+    ///
+    /// Only relevant for `MemoryScope::Summary` contexts. Determines whether
+    /// close proceeds or the window is extended when not all members have
+    /// verified. Defaults to [`IncompleteVerificationPolicy::Proceed`].
+    ///
+    /// See issue #365.
+    #[serde(default)]
+    pub incomplete_verification_policy: IncompleteVerificationPolicy,
 }
 
 impl Default for ContextParams {
@@ -561,6 +573,7 @@ impl Default for ContextParams {
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
             participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         }
     }
 }
@@ -697,6 +710,7 @@ mod tests {
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
             participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         };
 
         assert_eq!(params.mode, ContextMode::Broadcast);
@@ -807,6 +821,7 @@ mod tests {
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
             participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         };
 
         let json = serde_json::to_string(&params).ok();
@@ -859,6 +874,7 @@ mod tests {
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
             participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         };
 
         let json = serde_json::to_string(&params).unwrap();
