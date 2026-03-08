@@ -115,6 +115,7 @@ pub use bridge::{
     governance_execute,
     // Free functions — identity
     identity_create,
+    identity_create_with_custody,
     identity_load,
     identity_resolve,
     is_local_did,
@@ -122,7 +123,11 @@ pub use bridge::{
     register_local_did,
     // Free functions — tools
     tool_invoke,
+    tool_invoke_cross_context,
     tool_register,
+    tool_session_close,
+    tool_session_create,
+    tool_session_invoke,
     tool_verify,
     // Free functions — transport
     transport_connect,

@@ -28,12 +28,14 @@ scp-identity = { path = "../../scp-identity" }
 scp-event-log = { path = "../../scp-event-log" }
 scp-ffi-common = { path = "../common" }
 scp-platform = { path = "../../scp-platform", features = ["testing"] }
+scp-transport = { path = "../../scp-transport" }
 
 [dev-dependencies]
 scp-ffi-common = { path = "../common", features = ["testing"] }
 
 [build-dependencies]
 napi-build = "2"
+cc = "1"
 
 [lints]
 workspace = true

@@ -470,6 +470,14 @@ async fn run_full_node_ephemeral() {
         "starting scp-node with in-memory storage"
     );
 
+    eprintln!(
+        "WARNING: Using in-memory key custody. Private keys are not persisted \
+         and will be lost on restart. Use persistent mode (default) for production."
+    );
+    tracing::warn!(
+        "using InMemoryKeyCustody — private keys exist only in memory and are \
+         not persisted. This mode is for development/testing only."
+    );
     let custody = Arc::new(InMemoryKeyCustody::new());
     let cache = Arc::new(DidCache::new());
     let sequence_store = Arc::new(InMemorySequenceStore::new());

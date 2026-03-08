@@ -78,15 +78,6 @@ cd bindings/swift && swift package generate-documentation --target SCP --output-
 
 # Kotlin (requires Gradle project)
 cd bindings/kotlin && ./gradlew dokkaHtml
-
-# Java (requires Gradle project)
-cd bindings/java && ./gradlew javadoc
-
-# Go
-cd bindings/go && go doc ./...
-
-# C#
-cd bindings/csharp && dotnet build /p:GenerateDocumentationFile=true
 ```
 
 For Swift, you must first build the XCFramework (see `bindings/swift/build-xcframework.sh`) or download it from a CI artifact.

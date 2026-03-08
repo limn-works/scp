@@ -43,6 +43,7 @@ use std::time::Duration;
 use pyo3::prelude::*;
 
 pub mod bridge_adapters;
+pub mod custody;
 pub mod error;
 pub mod event_log;
 pub mod identity;

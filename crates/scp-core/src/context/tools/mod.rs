@@ -64,6 +64,10 @@ pub use registry::{
     ToolVerificationResult, VectorResult, register_tool, update_tool, verify_tool,
 };
 pub use schema::{SchemaValidationError, validate_schema, validate_value_against_schema};
+pub use session::{
+    DEFAULT_SESSION_CAP_PER_CALLER, SessionStore, ToolSession, cleanup_expired, create_session,
+    invoke_session,
+};
 
 // ---------------------------------------------------------------------------
 // ToolId

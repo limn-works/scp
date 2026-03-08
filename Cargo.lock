@@ -4879,6 +4879,7 @@ dependencies = [
  "scp-transport",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",
@@ -4903,6 +4904,7 @@ name = "scp-ffi-napi"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "cc",
  "dashmap",
  "ed25519-dalek 2.2.0",
  "hex",
@@ -4915,6 +4917,7 @@ dependencies = [
  "scp-ffi-common",
  "scp-identity",
  "scp-platform",
+ "scp-transport",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -4959,6 +4962,7 @@ dependencies = [
  "hex",
  "js-sys",
  "jsonschema",
+ "rand_core 0.6.4",
  "serde",
  "serde_json",
  "sha2 0.10.9",

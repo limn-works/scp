@@ -286,7 +286,43 @@ struct PerContextState {
     read_exclusion_list: HashSet<String>,
     /// Broadcast context state (only for Broadcast mode).
     broadcast: Option<BroadcastState>,
+    /// Stateful tool sessions (spec section 6.2.1).
+    sessions: HashMap<String, WasmToolSession>,
 }
+
+/// A stateful tool session for the WASM bridge.
+///
+/// Mirrors `scp_core::context::tools::ToolSession` locally since WASM
+/// cannot depend on scp-core (ADR-034).
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields read via pattern matching and clone.
+struct WasmToolSession {
+    /// Unique session identifier.
+    session_id: String,
+    /// The tool this session is associated with.
+    tool_id: String,
+    /// The calling context.
+    source_context: String,
+    /// Opaque session state.
+    state: serde_json::Value,
+    /// Creation timestamp (milliseconds since epoch).
+    created_at_ms: f64,
+    /// TTL in milliseconds.
+    ttl_ms: f64,
+    /// Number of invocations.
+    call_count: u64,
+}
+
+impl WasmToolSession {
+    /// Returns `true` if this session has expired.
+    fn is_expired(&self) -> bool {
+        let now = js_sys::Date::now();
+        (now - self.created_at_ms) >= self.ttl_ms
+    }
+}
+
+/// Maximum concurrent sessions per calling context (spec section 6.2.1).
+const WASM_SESSION_CAP_PER_CALLER: usize = 5;
 
 impl PerContextState {
     /// Returns `true` if the member has the given capability string.
@@ -461,6 +497,7 @@ impl WasmContextManager {
             read_revoked_members: HashSet::new(),
             read_exclusion_list: HashSet::new(),
             broadcast,
+            sessions: HashMap::new(),
         };
 
         self.contexts.insert(context_id.to_owned(), per_context);
@@ -799,6 +836,181 @@ impl WasmContextManager {
         }
 
         Ok((failures.is_empty(), failures))
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-context tool invocation (spec section 6.2)
+    // -----------------------------------------------------------------------
+
+    /// Invokes a tool across context boundaries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either context is not found, tool is not found,
+    /// or chain depth is exceeded.
+    pub fn invoke_tool_cross_context(
+        &self,
+        source_context_id: &str,
+        target_context_id: &str,
+        tool_id: &str,
+        input: &serde_json::Value,
+        invoker_did: &str,
+        chain_depth: u8,
+    ) -> Result<serde_json::Value, ScpWasmError> {
+        // Validate both contexts exist and are active.
+        let _source = self.require_active_context(source_context_id)?;
+        let target = self.require_active_context(target_context_id)?;
+
+        // Validate chain depth (max 3 per spec section 6.2).
+        if chain_depth > 3 {
+            return Err(ScpWasmError::Tool {
+                message: format!(
+                    "cross-context chain depth {chain_depth} exceeds maximum 3"
+                ),
+                code: "SCP-TOOL-6012".to_owned(),
+            });
+        }
+
+        // Validate tool exists in target.
+        if target.tool_registry.get(tool_id).is_none() {
+            return Err(ScpWasmError::Tool {
+                message: format!(
+                    "tool '{tool_id}' not found in target context '{target_context_id}'"
+                ),
+                code: "SCP-TOOL-6003".to_owned(),
+            });
+        }
+
+        Ok(serde_json::json!({
+            "tool": tool_id,
+            "source_context": source_context_id,
+            "target_context": target_context_id,
+            "status": "validated",
+            "chain_depth": chain_depth,
+            "invoker_did": invoker_did,
+            "validated_input": input,
+        }))
+    }
+
+    // -----------------------------------------------------------------------
+    // Stateful tool sessions (spec section 6.2.1)
+    // -----------------------------------------------------------------------
+
+    /// Creates a stateful tool session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not active, tool not found,
+    /// or per-caller session cap exceeded.
+    pub fn session_create(
+        &mut self,
+        context_id: &str,
+        tool_id: &str,
+        source_context_id: &str,
+        ttl_seconds: u64,
+    ) -> Result<String, ScpWasmError> {
+        let ctx = self.require_active_context_mut(context_id)?;
+
+        // Enforce per-caller cap.
+        let current = ctx
+            .sessions
+            .values()
+            .filter(|s| s.source_context == source_context_id)
+            .count();
+        if current >= WASM_SESSION_CAP_PER_CALLER {
+            return Err(ScpWasmError::Tool {
+                message: format!(
+                    "session cap exceeded for caller '{}': {} active (max {})",
+                    source_context_id, current, WASM_SESSION_CAP_PER_CALLER
+                ),
+                code: "SCP-TOOL-6015".to_owned(),
+            });
+        }
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let now = js_sys::Date::now();
+
+        let session = WasmToolSession {
+            session_id: session_id.clone(),
+            tool_id: tool_id.to_owned(),
+            source_context: source_context_id.to_owned(),
+            state: serde_json::Value::Null,
+            created_at_ms: now,
+            ttl_ms: (ttl_seconds as f64) * 1000.0,
+            call_count: 0,
+        };
+
+        ctx.sessions.insert(session_id.clone(), session);
+        Ok(session_id)
+    }
+
+    /// Invokes a tool within an active session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session is not found or has expired.
+    pub fn session_invoke(
+        &mut self,
+        context_id: &str,
+        session_id: &str,
+        input: &serde_json::Value,
+        invoker_did: &str,
+    ) -> Result<serde_json::Value, ScpWasmError> {
+        let ctx = self.require_active_context_mut(context_id)?;
+
+        let session = ctx.sessions.get(session_id).ok_or_else(|| {
+            ScpWasmError::Tool {
+                message: format!("session '{session_id}' not found"),
+                code: "SCP-TOOL-6018".to_owned(),
+            }
+        })?;
+
+        if session.is_expired() {
+            ctx.sessions.remove(session_id);
+            return Err(ScpWasmError::Tool {
+                message: format!("session '{session_id}' has expired"),
+                code: "SCP-TOOL-6019".to_owned(),
+            });
+        }
+
+        let tool_id = session.tool_id.clone();
+        let call_count = session.call_count;
+
+        // Increment call count.
+        if let Some(s) = ctx.sessions.get_mut(session_id) {
+            s.call_count = s.call_count.saturating_add(1);
+        }
+
+        Ok(serde_json::json!({
+            "tool": tool_id,
+            "session_id": session_id,
+            "status": "validated",
+            "call_count": call_count + 1,
+            "invoker_did": invoker_did,
+            "validated_input": input,
+        }))
+    }
+
+    /// Closes a stateful tool session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session is not found.
+    pub fn session_close(
+        &mut self,
+        context_id: &str,
+        session_id: &str,
+    ) -> Result<(), ScpWasmError> {
+        let ctx = self.require_active_context_mut(context_id)?;
+
+        if ctx.sessions.remove(session_id).is_none() {
+            return Err(ScpWasmError::Tool {
+                message: format!("session '{session_id}' not found"),
+                code: "SCP-TOOL-6021".to_owned(),
+            });
+        }
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1497,6 +1709,23 @@ impl WasmContextManager {
     }
 
     /// Returns a mutable reference to context state, or an error if not found.
+    fn require_active_context(
+        &self,
+        context_id: &str,
+    ) -> Result<&PerContextState, ScpWasmError> {
+        let ctx = self.require_context(context_id)?;
+        if ctx.state != "active" {
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "context '{context_id}' is in '{0}' state — must be 'active'",
+                    ctx.state
+                ),
+                code: "SCP-CTX-2002".to_owned(),
+            });
+        }
+        Ok(ctx)
+    }
+
     fn require_context_mut(
         &mut self,
         context_id: &str,

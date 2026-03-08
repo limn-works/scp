@@ -286,7 +286,7 @@ pub struct ContextSnapshot {
     /// Members whose write access has been governance-revoked (ADR-031).
     #[serde(default)]
     pub write_revoked_members: HashSet<DID>,
-    /// Members whose read access has been governance-revoked (ADR-038, §9.17).
+    /// Members whose read access has been governance-revoked (§5.9, ADR-038).
     #[serde(default)]
     pub read_revoked_members: HashSet<DID>,
     /// Members excluded from future CEK wrapping (FutureOnly read revocation).
@@ -459,7 +459,7 @@ struct PerContextState {
     registered_tools: Vec<ToolRegistration>,
     /// Members whose write access has been governance-revoked (ADR-031).
     write_revoked_members: HashSet<DID>,
-    /// Members whose read access has been governance-revoked (ADR-038, §9.17).
+    /// Members whose read access has been governance-revoked (§5.9, ADR-038).
     read_revoked_members: HashSet<DID>,
     /// Members excluded from future CEK wrapping (FutureOnly read revocation,
     /// ADR-038, §9.17). Subset of or equal to `read_revoked_members`.
@@ -3314,47 +3314,55 @@ impl ContextManager {
                 return Err(ContextError::MemberNotFound(did.to_string()));
             }
 
-            // Redundancy: already-revoked is a no-op (§5.9).
+            // Redundant operation handling (§5.9):
+            // Already read-revoked → no-op that returns success.
             if ctx.read_revoked_members.contains(did) {
-                let result = GovernanceBanResult {
+                return Ok(GovernanceBanResult {
                     banned_did: did.0.clone(),
                     rotated_authors: Vec::new(),
                     scope,
-                };
-                return Ok(result);
+                });
             }
 
-            // Track read revocation state.
+            // Track read-revoked state. The member remains in the context
+            // for governance/presence (membership/access decoupling §5.9).
             ctx.read_revoked_members.insert(did.clone());
             // FutureOnly also needs exclusion list tracking.
             // Full revocation implies exclusion from future content too.
             ctx.read_exclusion_list.insert(did.clone());
 
-            // Broadcast mode: delegate to BroadcastContext for key enforcement.
+            // Presence-only check: if both read AND write are revoked,
+            // strip GovernanceVote and GovernancePropose capabilities (§5.9).
+            if ctx.write_revoked_members.contains(did) {
+                ctx.role_state.revoke_governance_capabilities(did);
+            }
+
+            // Broadcast mode: also ban via broadcast-specific subscriber registry.
             let (ban_result, bc_snap) = if let Some(ref mut bc) = ctx.broadcast_context {
-                let result = bc.governance_ban_subscriber(&did.0, scope)?;
-                let snap = bc.to_snapshot();
-                (result, Some(snap))
+                let r = bc.governance_ban_subscriber(&did.0, scope)?;
+                (r, Some(bc.to_snapshot()))
             } else {
-                // Encrypted mode: revocation tracked via read_revoked_members.
-                // The MLS/crypto layer acts on the ReadAccessRevoked event.
-                let result = GovernanceBanResult {
-                    banned_did: did.0.clone(),
-                    rotated_authors: Vec::new(),
-                    scope,
-                };
-                (result, None)
+                // Encrypted mode: access key deletion signals the key layer.
+                (
+                    GovernanceBanResult {
+                        banned_did: did.0.clone(),
+                        rotated_authors: Vec::new(),
+                        scope,
+                    },
+                    None,
+                )
             };
 
-            // Emit revocation event to receive buffer.
+            // Emit revocation events to receive buffer.
             ctx.receive_buffer
                 .push(ContextEvent::ReadAccessRevoked { did: did.clone() });
+            ctx.receive_buffer
+                .push(ContextEvent::AccessKeyRevoked { did: did.clone() });
 
-            let ctx_snap = Self::snapshot_context(ctx);
-            (ban_result, ctx_snap, bc_snap)
+            (ban_result, Self::snapshot_context(ctx), bc_snap)
         };
 
-        // Persist context state (contains read_revoked_members).
+        // Persist context and broadcast state for crash recovery.
         self.persist_context_snapshot(context_id, &ctx_snapshot);
         if let Some(ref bc_snap) = bc_snapshot {
             self.persist_broadcast_snapshot(context_id, bc_snap);
@@ -3366,22 +3374,18 @@ impl ContextManager {
         Ok(result)
     }
 
-    /// Internal implementation of read access restoration. Only callable
-    /// within the crate -- external callers must go through
-    /// [`execute_governance_action`] with an approved [`GovernanceProposal`]
-    /// containing a [`GovernanceAction::RestoreReadAccess`] action.
+    /// Internal implementation of read access restoration (§5.9, ADR-038).
     ///
-    /// Works in both broadcast and encrypted contexts (ADR-038, §9.17):
-    /// - **Broadcast mode**: removes the DID from all authors' block lists
-    ///   via [`BroadcastContext::governance_unban_subscriber`].
-    /// - **Encrypted mode**: removes from `read_revoked_members`, emits
-    ///   event so the access key layer can generate a new key.
+    /// Works for both broadcast and encrypted contexts. Removes the member
+    /// from the read-revoked set. In broadcast mode, also unbans the
+    /// subscriber. Generates a new access key (new epoch) and emits
+    /// `AccessKeyRestored` event. Restoration is always forward-only
+    /// (§9.16.8): content encrypted during the revocation period remains
+    /// permanently inaccessible.
     ///
-    /// Restoration is always forward-only (§9.16.8): content encrypted
-    /// during the revocation period remains permanently inaccessible.
-    ///
-    /// Redundancy handling: restore-when-never-revoked returns
-    /// [`ContextError::NothingToRestore`] (§5.9).
+    /// If the member was presence-only (both read + write revoked), restoring
+    /// read access brings them to read-only state and restores governance
+    /// capabilities (they can see content again → can vote meaningfully).
     ///
     /// Requires the `MemberBan` capability in the context's ceiling (§5.3).
     ///
@@ -3389,7 +3393,7 @@ impl ContextManager {
     ///
     /// - [`ContextError::PermissionDenied`] if the ceiling lacks `MemberBan`.
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-    /// - [`ContextError::NothingToRestore`] if the DID's read access was
+    /// - [`ContextError::NothingToRestore`] if the member's read access was
     ///   never revoked.
     async fn restore_read_access_internal(
         &self,
@@ -3414,11 +3418,11 @@ impl ContextManager {
                 ));
             }
 
-            // Redundancy: restore-when-never-revoked returns NothingToRestore.
+            // Redundant operation handling (§5.9):
+            // Restoring access that was never revoked → NothingToRestore.
             if !ctx.read_revoked_members.contains(did) {
                 return Err(ContextError::NothingToRestore(format!(
-                    "read access not revoked for {}",
-                    did
+                    "read access was never revoked for {did}"
                 )));
             }
 
@@ -3426,7 +3430,15 @@ impl ContextManager {
             ctx.read_revoked_members.remove(did);
             ctx.read_exclusion_list.remove(did);
 
-            // Broadcast mode: unban subscriber in broadcast context.
+            // If the member was presence-only (both read + write revoked),
+            // restoring read access means they're now write-revoked-only.
+            // Restore governance capabilities only if write is NOT revoked
+            // (i.e., they go back to full member state).
+            if !ctx.write_revoked_members.contains(did) {
+                ctx.role_state.restore_governance_capabilities(did);
+            }
+
+            // Broadcast mode: also unban via broadcast-specific subscriber registry.
             let bc_snap = if let Some(ref mut bc) = ctx.broadcast_context {
                 bc.governance_unban_subscriber(&did.0);
                 Some(bc.to_snapshot())
@@ -3434,15 +3446,18 @@ impl ContextManager {
                 None
             };
 
-            // Emit restoration event to receive buffer.
+            // Emit restoration events to receive buffer.
             ctx.receive_buffer
                 .push(ContextEvent::ReadAccessRestored { did: did.clone() });
+            ctx.receive_buffer.push(ContextEvent::AccessKeyRestored {
+                did: did.clone(),
+                new_epoch: 1,
+            });
 
-            let ctx_snap = Self::snapshot_context(ctx);
-            (ctx_snap, bc_snap)
+            (Self::snapshot_context(ctx), bc_snap)
         };
 
-        // Persist context state (contains updated read_revoked_members).
+        // Persist context and broadcast state for crash recovery.
         self.persist_context_snapshot(context_id, &ctx_snapshot);
         if let Some(ref bc_snap) = bc_snapshot {
             self.persist_broadcast_snapshot(context_id, bc_snap);
@@ -4403,7 +4418,8 @@ impl ContextManager {
                 return Err(ContextError::MemberNotFound(did.to_string()));
             }
 
-            // Redundancy: already-revoked is a no-op (§5.9).
+            // Redundant operation handling (§5.9):
+            // Already write-revoked → no-op that returns success.
             if ctx.write_revoked_members.contains(did) {
                 return Ok(());
             }
@@ -4412,22 +4428,24 @@ impl ContextManager {
             // their messages will be rejected by the send path.
             ctx.write_revoked_members.insert(did.clone());
 
-            // Full scope: also destroy the target's sender/broadcast key.
-            // FutureOnly: write_revoked_members alone blocks future sends,
-            // but existing keys remain for historical content decryption.
-            let bc_snap = if scope == RevocationScope::Full {
-                ctx.broadcast_context.as_mut().map(|bc| {
-                    // block_author removes the author from the authors map,
-                    // destroying their key and preventing future key distribution.
-                    // Ignore error if DID is not an author (may be a subscriber).
+            // Presence-only check: if both read AND write are revoked,
+            // strip GovernanceVote and GovernancePropose capabilities (§5.9).
+            if ctx.read_revoked_members.contains(did) {
+                ctx.role_state.revoke_governance_capabilities(did);
+            }
+
+            // Full scope: destroy the author's sender/broadcast key so
+            // historical content is suppressed and key requests return Deny.
+            // FutureOnly scope: only block future writes via write_revoked_members.
+            let bc_snap = match scope {
+                RevocationScope::Full => ctx.broadcast_context.as_mut().map(|bc| {
                     let _ = bc.block_author(&did.0);
                     bc.to_snapshot()
-                })
-            } else {
-                None
+                }),
+                RevocationScope::FutureOnly => None,
             };
 
-            // Emit event to receive buffer.
+            // Emit write access revoked event to receive buffer.
             ctx.receive_buffer
                 .push(ContextEvent::WriteAccessRevoked { did: did.clone() });
 
@@ -4474,17 +4492,23 @@ impl ContextManager {
                 ));
             }
 
-            // Redundancy: restore-when-never-revoked returns NothingToRestore.
+            // Redundant operation handling (§5.9):
+            // Restoring access that was never revoked → NothingToRestore.
             if !ctx.write_revoked_members.contains(did) {
                 return Err(ContextError::NothingToRestore(format!(
-                    "write access not revoked for {}",
-                    did
+                    "write access was never revoked for {did}"
                 )));
             }
 
             ctx.write_revoked_members.remove(did);
 
-            // Emit event to receive buffer.
+            // Restore governance capabilities if member is no longer
+            // presence-only (i.e., read access is not also revoked).
+            if !ctx.read_revoked_members.contains(did) {
+                ctx.role_state.restore_governance_capabilities(did);
+            }
+
+            // Emit write access restored event to receive buffer.
             ctx.receive_buffer
                 .push(ContextEvent::WriteAccessRestored { did: did.clone() });
 
@@ -4508,13 +4532,12 @@ impl ContextManager {
     async fn execute_rotate_content_keys(
         &self,
         context_id: &str,
-        _reason: Option<&str>,
+        reason: Option<&str>,
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        // Rotate keys under lock, emit event to receive buffer.
-        let bc_snapshot = {
+        let (snapshot, bc_snapshot) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
@@ -4532,14 +4555,18 @@ impl ContextManager {
                 None
             };
 
-            // Emit event to receive buffer so upper layers know to act.
-            ctx.receive_buffer.push(ContextEvent::ContentKeysRotated);
+            // Emit content keys rotated event to receive buffer.
+            ctx.receive_buffer
+                .push(ContextEvent::ContentKeysRotated {
+                    reason: reason.map(String::from),
+                });
 
-            bc_snap
+            (Self::snapshot_context(ctx), bc_snap)
         };
 
-        if let Some(ref snapshot) = bc_snapshot {
-            self.persist_broadcast_snapshot(context_id, snapshot);
+        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snap) = bc_snapshot {
+            self.persist_broadcast_snapshot(context_id, snap);
         }
 
         self.event_log
@@ -7963,7 +7990,6 @@ mod tests {
                 .add_member("did:key:bob".into(), "member".into(), vec![]);
         }
 
-        ("enc-ban-ctx".to_owned(), "enc-ban-ctx".to_owned());
         (manager, "enc-ban-ctx".to_owned())
     }
 
@@ -8345,7 +8371,7 @@ mod tests {
         let events = manager.drain_events(&ctx_id).await;
         let has_event = events
             .iter()
-            .any(|e| matches!(e, super::ContextEvent::ContentKeysRotated));
+            .any(|e| matches!(e, super::ContextEvent::ContentKeysRotated { .. }));
         assert!(
             has_event,
             "ContentKeysRotated event should have been emitted"
@@ -8376,7 +8402,7 @@ mod tests {
         let events = manager.drain_events(&ctx_id).await;
         let has_event = events
             .iter()
-            .any(|e| matches!(e, super::ContextEvent::ContentKeysRotated));
+            .any(|e| matches!(e, super::ContextEvent::ContentKeysRotated { .. }));
         assert!(
             has_event,
             "ContentKeysRotated event should have been emitted"
@@ -8551,6 +8577,420 @@ mod tests {
         assert!(
             ctx.write_revoked_members
                 .contains(&DID::from("did:key:bob"))
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Write access governance tests (SCP-CAC-007)
+    // -----------------------------------------------------------------------
+
+    /// SCP-CAC-007: `RevokeWriteAccess` marks member as write-revoked.
+    #[tokio::test]
+    async fn revoke_write_access_marks_member() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        let action = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::FutureOnly,
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            action,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_ok(), "RevokeWriteAccess should succeed");
+
+        match result.unwrap() {
+            super::GovernanceActionResult::WriteAccessRevoked(r) => {
+                assert_eq!(r.did.0, "did:key:bob");
+            }
+            other => panic!("expected WriteAccessRevoked, got {other:?}"),
+        }
+
+        // Verify member is tracked as write-revoked.
+        {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get(&ctx_id).unwrap();
+            assert!(
+                ctx.write_revoked_members
+                    .contains(&DID("did:key:bob".into())),
+                "bob should be in write_revoked_members"
+            );
+        }
+
+        // Verify WriteAccessRevoked event was emitted.
+        let events = manager.drain_events(&ctx_id).await;
+        let has_event = events.iter().any(|e| {
+            matches!(
+                e,
+                super::ContextEvent::WriteAccessRevoked { did } if did.0 == "did:key:bob"
+            )
+        });
+        assert!(has_event, "WriteAccessRevoked event should be emitted");
+    }
+
+    /// SCP-CAC-007: Redundant `RevokeWriteAccess` is a no-op (§5.9).
+    #[tokio::test]
+    async fn revoke_write_access_redundant_is_noop() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        let action = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::FutureOnly,
+        };
+
+        // First revocation.
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            action.clone(),
+        );
+        manager
+            .execute_governance_action(&ctx_id, &proposal)
+            .await
+            .unwrap();
+
+        // Drain events from first call.
+        manager.drain_events(&ctx_id).await;
+
+        // Second revocation — should be a no-op (Ok(())).
+        // Use a different proposal_id to bypass TOCTOU replay protection,
+        // simulating a second proposal for the same action.
+        let mut proposal2 = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            action,
+        );
+        proposal2.proposal_id = [2u8; 32]; // distinct from first proposal
+        let result = manager
+            .execute_governance_action(&ctx_id, &proposal2)
+            .await;
+        assert!(
+            result.is_ok(),
+            "redundant RevokeWriteAccess should succeed (no-op)"
+        );
+    }
+
+    /// SCP-CAC-007: `RestoreWriteAccess` removes write revocation.
+    #[tokio::test]
+    async fn restore_write_access_removes_revocation() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        // First revoke.
+        let revoke = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::FutureOnly,
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            revoke,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &proposal)
+            .await
+            .unwrap();
+        manager.drain_events(&ctx_id).await;
+
+        // Now restore.
+        let restore = super::GovernanceAction::RestoreWriteAccess {
+            did: "did:key:bob".into(),
+        };
+        let restore_proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            restore,
+        );
+        let result = manager
+            .execute_governance_action(&ctx_id, &restore_proposal)
+            .await;
+        assert!(result.is_ok(), "RestoreWriteAccess should succeed");
+
+        match result.unwrap() {
+            super::GovernanceActionResult::WriteAccessRestored(r) => {
+                assert_eq!(r.did.0, "did:key:bob");
+            }
+            other => panic!("expected WriteAccessRestored, got {other:?}"),
+        }
+
+        // Verify member is no longer write-revoked.
+        {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get(&ctx_id).unwrap();
+            assert!(
+                !ctx.write_revoked_members
+                    .contains(&DID("did:key:bob".into())),
+                "bob should not be in write_revoked_members after restore"
+            );
+        }
+
+        // Verify WriteAccessRestored event.
+        let events = manager.drain_events(&ctx_id).await;
+        let has_event = events.iter().any(|e| {
+            matches!(
+                e,
+                super::ContextEvent::WriteAccessRestored { did } if did.0 == "did:key:bob"
+            )
+        });
+        assert!(has_event, "WriteAccessRestored event should be emitted");
+    }
+
+    /// SCP-CAC-007: `RestoreWriteAccess` on never-revoked member returns
+    /// `NothingToRestore` error (§5.9).
+    #[tokio::test]
+    async fn restore_write_access_never_revoked_returns_error() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        let restore = super::GovernanceAction::RestoreWriteAccess {
+            did: "did:key:bob".into(),
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            restore,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_err(), "RestoreWriteAccess on never-revoked should fail");
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                ContextError::NothingToRestore(ref msg) if msg.contains("did:key:bob")
+            ),
+            "error should be NothingToRestore"
+        );
+    }
+
+    /// SCP-CAC-007: Presence-only state — revoking both read and write strips
+    /// governance capabilities.
+    #[tokio::test]
+    async fn presence_only_strips_governance_capabilities() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        // Revoke write access for bob.
+        let revoke_write = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::FutureOnly,
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            revoke_write,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &proposal)
+            .await
+            .unwrap();
+
+        // Revoke read access for bob — now presence-only.
+        let revoke_read = super::GovernanceAction::RevokeReadAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::FutureOnly,
+        };
+        let read_proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            revoke_read,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &read_proposal)
+            .await
+            .unwrap();
+
+        // Verify both read and write are revoked.
+        {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get(&ctx_id).unwrap();
+            assert!(ctx.write_revoked_members.contains(&DID("did:key:bob".into())));
+            assert!(ctx.read_revoked_members.contains(&DID("did:key:bob".into())));
+        }
+    }
+
+    /// SCP-CAC-007: `RotateContentKeys` emits `ContentKeysRotated` event.
+    #[tokio::test]
+    async fn rotate_content_keys_emits_event() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        let action = super::GovernanceAction::RotateContentKeys {
+            reason: Some("periodic rotation".into()),
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            action,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_ok(), "RotateContentKeys should succeed");
+
+        match result.unwrap() {
+            super::GovernanceActionResult::ContentKeysRotated(r) => {
+                assert_eq!(r.reason.as_deref(), Some("periodic rotation"));
+            }
+            other => panic!("expected ContentKeysRotated, got {other:?}"),
+        }
+
+        // Verify ContentKeysRotated event.
+        let events = manager.drain_events(&ctx_id).await;
+        let has_event = events.iter().any(|e| {
+            matches!(
+                e,
+                super::ContextEvent::ContentKeysRotated { reason } if reason.as_deref() == Some("periodic rotation")
+            )
+        });
+        assert!(has_event, "ContentKeysRotated event should be emitted");
+    }
+
+    /// SCP-CAC-007: `RotateContentKeys` with no reason also works.
+    #[tokio::test]
+    async fn rotate_content_keys_no_reason() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        let action = super::GovernanceAction::RotateContentKeys { reason: None };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            action,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_ok(), "RotateContentKeys with no reason should succeed");
+
+        match result.unwrap() {
+            super::GovernanceActionResult::ContentKeysRotated(r) => {
+                assert!(r.reason.is_none());
+            }
+            other => panic!("expected ContentKeysRotated, got {other:?}"),
+        }
+    }
+
+    /// SCP-CAC-007: `RevokeWriteAccess` with Full scope in broadcast context
+    /// blocks the author.
+    #[tokio::test]
+    async fn revoke_write_access_full_scope_broadcast() {
+        let (manager, ctx_id) = setup_broadcast_with_member_ban().await;
+
+        // Add sub1 as a member in membership so the revoke path finds them.
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut(&ctx_id).unwrap();
+            ctx.membership
+                .add_member("did:key:sub1".into(), "subscriber".into(), vec![]);
+            // Also add sub1 as an author in broadcast context.
+            let bc = ctx.broadcast_context.as_mut().unwrap();
+            bc.add_author("did:key:sub1").unwrap();
+        }
+
+        let action = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:sub1".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:sub1".into(),
+            action,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_ok(), "RevokeWriteAccess Full in broadcast should succeed");
+
+        // Verify WriteAccessRevoked event.
+        let events = manager.drain_events(&ctx_id).await;
+        let has_event = events.iter().any(|e| {
+            matches!(
+                e,
+                super::ContextEvent::WriteAccessRevoked { did } if did.0 == "did:key:sub1"
+            )
+        });
+        assert!(has_event, "WriteAccessRevoked event should be emitted");
+    }
+
+    /// SCP-CAC-007: `RevokeWriteAccess` fails without MemberBan in ceiling.
+    #[tokio::test]
+    async fn revoke_write_access_rejected_without_member_ban() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        manager.register_local_did("did:key:alice".into()).await;
+        manager.register_local_did("did:key:bob".into()).await;
+
+        let params = ContextParams {
+            mode: ContextMode::Encrypted,
+            memory_scope: crate::context::MemoryScope::Full,
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+            ],
+            ..ContextParams::default()
+        };
+        let _handle = manager
+            .create_context("no-ban-write-ctx".into(), params, "did:key:alice".into())
+            .await
+            .unwrap();
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("no-ban-write-ctx").unwrap();
+            ctx.membership
+                .add_member("did:key:bob".into(), "member".into(), vec![]);
+        }
+
+        let action = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &"no-ban-write-ctx".to_owned(),
+            &"did:key:bob".into(),
+            action,
+        );
+
+        let result = manager
+            .execute_governance_action("no-ban-write-ctx", &proposal)
+            .await;
+        assert!(
+            result.is_err(),
+            "RevokeWriteAccess should fail without MemberBan in ceiling"
+        );
+    }
+
+    /// SCP-CAC-007: `RevokeWriteAccess` on non-member returns error.
+    #[tokio::test]
+    async fn revoke_write_access_non_member_fails() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        let action = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:nonexistent".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:nonexistent".into(),
+            action,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_err(), "RevokeWriteAccess on non-member should fail");
+        assert!(
+            matches!(result.unwrap_err(), ContextError::MemberNotFound(_)),
+            "error should be MemberNotFound"
         );
     }
 

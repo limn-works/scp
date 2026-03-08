@@ -144,8 +144,13 @@ impl SessionStore {
     }
 
     /// Inserts a session into the store.
-    fn insert(&mut self, session: ToolSession) {
+    pub fn insert(&mut self, session: ToolSession) {
         self.sessions.insert(session.session_id.clone(), session);
+    }
+
+    /// Removes a session by ID. Returns the removed session if it existed.
+    pub fn remove(&mut self, session_id: &str) -> Option<ToolSession> {
+        self.sessions.remove(session_id)
     }
 
     /// Removes expired sessions based on the given current timestamp
@@ -307,7 +312,7 @@ where
     let now_ms = crate::time::now_millis()?;
     if session.is_expired(now_ms) {
         // Remove the expired session.
-        store.sessions.remove(session_id);
+        store.remove(session_id);
         return Err(ToolError::SessionExpired {
             session_id: session_id.to_owned(),
         });

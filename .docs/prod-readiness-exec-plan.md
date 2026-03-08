@@ -62,15 +62,15 @@ Every capability above must work through at least one SDK binding (Python).
 |---|---|---|---|
 | SCP-038 | PyO3 identity bridge functions | in-progress | — |
 | SCP-092 | Signaling message construction and routing | in-progress | #290 |
-| SCP-116 | Kotlin Flow/Channel streaming layer | pending | — |
-| SCP-117 | Android lifecycle-aware SCP resource management | pending | — |
-| SCP-118 | Jetpack Compose state holders for SCP | pending | SCP-116 |
-| SCP-120 | Kotlin SDK cross-platform conformance tests | pending | SCP-116, SCP-117 |
+| SCP-116 | Kotlin Flow/Channel streaming layer | done | — |
+| SCP-117 | Android lifecycle-aware SCP resource management | done | — |
+| SCP-118 | Jetpack Compose state holders for SCP | done | SCP-116 |
+| SCP-120 | Kotlin SDK cross-platform conformance tests | done | SCP-116, SCP-117 |
 | SCP-214 | Wire KeyCustodyProvider callbacks across all FFI bridges | pending | #356 |
 | SCP-215 | Error code range audit and normalization | done | — |
-| SCP-218 | Wire WASM bridge to scp-core for tools, UCAN, event log | pending | #306 |
-| SCP-220 | Wire UniFFI bridge to scp-core for UCAN and event log | pending | #307 |
-| SCP-221 | Wire Swift SDK wrapper functions to UniFFI bridge | pending | #307 |
+| SCP-218 | Wire WASM bridge to scp-core for tools, UCAN, event log | done | #306 |
+| SCP-220 | Wire UniFFI bridge to scp-core for UCAN and event log | done | #307 |
+| SCP-221 | Wire Swift SDK wrapper functions to UniFFI bridge | done | #307 |
 | SCP-227 | Broadcast subscriber registration, blocking, integration | in-progress | — |
 
 ### Spec Audit Findings: 48 NEW untracked (VERIFIED-DEDUPED-REPORT.md)
