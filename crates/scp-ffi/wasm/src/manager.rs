@@ -266,6 +266,9 @@ struct PerContextState {
     economic_policy: Option<String>,
     /// Tool registry.
     tool_registry: ToolRegistry,
+    /// Registered tool handlers keyed by tool ID.
+    tool_handlers:
+        HashMap<String, Box<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String>>>,
     /// Event log (Merkle tree).
     event_log: WasmEventLog,
     /// UCAN revocation set (token CIDs).
@@ -483,6 +486,7 @@ impl WasmContextManager {
             governance,
             economic_policy,
             tool_registry: ToolRegistry::new(),
+            tool_handlers: HashMap::new(),
             event_log: WasmEventLog::new(context_id.to_owned()),
             revoked_tokens: HashSet::new(),
             seen_nonces: HashSet::new(),
@@ -743,6 +747,36 @@ impl WasmContextManager {
         Ok(tool_id)
     }
 
+    /// Registers a handler function for a tool.
+    ///
+    /// The handler will be called when the tool is invoked. The tool must
+    /// already be registered in the context's tool registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not active or the tool is not found.
+    pub fn register_tool_handler(
+        &mut self,
+        context_id: &str,
+        tool_id: &str,
+        handler: Box<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String>>,
+    ) -> Result<(), ScpWasmError> {
+        let ctx = self.require_active_context_mut(context_id)?;
+
+        if ctx.tool_registry.get(tool_id).is_none() {
+            return Err(ScpWasmError::Tool {
+                message: format!(
+                    "tool '{tool_id}' not found in context '{context_id}' \
+                     -- register the tool before adding a handler"
+                ),
+                code: "SCP-TOOL-6002".to_owned(),
+            });
+        }
+
+        ctx.tool_handlers.insert(tool_id.to_owned(), handler);
+        Ok(())
+    }
+
     /// Invokes a tool. Validates the tool exists, validates input against schema,
     /// and returns a JSON result.
     ///
@@ -775,14 +809,30 @@ impl WasmContextManager {
             }
         })?;
 
-        // Tool invocation — in the WASM bridge, tools are JS callbacks.
-        // The bridge returns a validated status response; the TypeScript SDK
-        // is responsible for dispatching to the actual tool handler.
-        let result = serde_json::json!({
-            "tool_id": tool_id,
-            "status": "validated",
-            "input": input_json,
-        });
+        let output_schema = registration.output_schema.clone();
+
+        // Dispatch to registered handler if available.
+        let result = if let Some(handler) = ctx.tool_handlers.get(tool_id) {
+            let out = handler(input_json.clone()).map_err(|e| ScpWasmError::Tool {
+                message: format!("tool handler for '{tool_id}' failed: {e}"),
+                code: "SCP-TOOL-6002".to_owned(),
+            })?;
+
+            validate_value_against_schema(&out, &output_schema).map_err(|msg| {
+                ScpWasmError::Tool {
+                    message: format!("output validation failed for tool '{tool_id}': {msg}"),
+                    code: "SCP-TOOL-6002".to_owned(),
+                }
+            })?;
+
+            out
+        } else {
+            serde_json::json!({
+                "tool_id": tool_id,
+                "status": "validated",
+                "input": input_json,
+            })
+        };
 
         let leaf_hash = compute_event_hash("ToolInvoked", context_id);
         ctx.event_log.append_leaf(leaf_hash);
@@ -858,32 +908,59 @@ impl WasmContextManager {
         // Validate chain depth (max 3 per spec section 6.2).
         if chain_depth > 3 {
             return Err(ScpWasmError::Tool {
-                message: format!(
-                    "cross-context chain depth {chain_depth} exceeds maximum 3"
-                ),
+                message: format!("cross-context chain depth {chain_depth} exceeds maximum 3"),
                 code: "SCP-TOOL-6012".to_owned(),
             });
         }
 
-        // Validate tool exists in target.
-        if target.tool_registry.get(tool_id).is_none() {
-            return Err(ScpWasmError::Tool {
+        // Validate tool exists in target and validate input.
+        let registration = target
+            .tool_registry
+            .get(tool_id)
+            .ok_or_else(|| ScpWasmError::Tool {
                 message: format!(
                     "tool '{tool_id}' not found in target context '{target_context_id}'"
                 ),
                 code: "SCP-TOOL-6003".to_owned(),
-            });
-        }
+            })?;
 
-        Ok(serde_json::json!({
-            "tool": tool_id,
-            "source_context": source_context_id,
-            "target_context": target_context_id,
-            "status": "validated",
-            "chain_depth": chain_depth,
-            "invoker_did": invoker_did,
-            "validated_input": input,
-        }))
+        validate_value_against_schema(input, &registration.input_schema).map_err(|e| {
+            ScpWasmError::Tool {
+                message: format!("input validation failed: {e}"),
+                code: "SCP-TOOL-6002".to_owned(),
+            }
+        })?;
+
+        let output_schema = registration.output_schema.clone();
+
+        // Dispatch to handler or echo mode.
+        let result = if let Some(handler) = target.tool_handlers.get(tool_id) {
+            let out = handler(input.clone()).map_err(|e| ScpWasmError::Tool {
+                message: format!("cross-context tool handler for '{tool_id}' failed: {e}"),
+                code: "SCP-TOOL-6002".to_owned(),
+            })?;
+
+            validate_value_against_schema(&out, &output_schema).map_err(|msg| {
+                ScpWasmError::Tool {
+                    message: format!("output validation failed for tool '{tool_id}': {msg}"),
+                    code: "SCP-TOOL-6002".to_owned(),
+                }
+            })?;
+
+            out
+        } else {
+            serde_json::json!({
+                "tool": tool_id,
+                "source_context": source_context_id,
+                "target_context": target_context_id,
+                "status": "validated",
+                "chain_depth": chain_depth,
+                "invoker_did": invoker_did,
+                "validated_input": input,
+            })
+        };
+
+        Ok(result)
     }
 
     // -----------------------------------------------------------------------
@@ -952,12 +1029,13 @@ impl WasmContextManager {
     ) -> Result<serde_json::Value, ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
-        let session = ctx.sessions.get(session_id).ok_or_else(|| {
-            ScpWasmError::Tool {
+        let session = ctx
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| ScpWasmError::Tool {
                 message: format!("session '{session_id}' not found"),
                 code: "SCP-TOOL-6018".to_owned(),
-            }
-        })?;
+            })?;
 
         if session.is_expired() {
             ctx.sessions.remove(session_id);
@@ -968,21 +1046,45 @@ impl WasmContextManager {
         }
 
         let tool_id = session.tool_id.clone();
+        let current_state = session.state.clone();
         let call_count = session.call_count;
 
-        // Increment call count.
+        // Validate input against tool's input schema if tool is registered.
+        if let Some(registration) = ctx.tool_registry.get(&tool_id) {
+            validate_value_against_schema(input, &registration.input_schema).map_err(|e| {
+                ScpWasmError::Tool {
+                    message: format!("input validation failed: {e}"),
+                    code: "SCP-TOOL-6002".to_owned(),
+                }
+            })?;
+        }
+
+        // Execute via handler or echo mode.
+        let (new_state, output) = if let Some(handler) = ctx.tool_handlers.get(&tool_id) {
+            let out = handler(input.clone()).map_err(|e| ScpWasmError::Tool {
+                message: format!("tool handler for '{tool_id}' failed: {e}"),
+                code: "SCP-TOOL-6002".to_owned(),
+            })?;
+            (current_state, out)
+        } else {
+            let out = serde_json::json!({
+                "tool": tool_id,
+                "session_id": session_id,
+                "status": "validated",
+                "call_count": call_count + 1,
+                "invoker_did": invoker_did,
+                "validated_input": input,
+            });
+            (current_state, out)
+        };
+
+        // Update session state and increment call count.
         if let Some(s) = ctx.sessions.get_mut(session_id) {
+            s.state = new_state;
             s.call_count = s.call_count.saturating_add(1);
         }
 
-        Ok(serde_json::json!({
-            "tool": tool_id,
-            "session_id": session_id,
-            "status": "validated",
-            "call_count": call_count + 1,
-            "invoker_did": invoker_did,
-            "validated_input": input,
-        }))
+        Ok(output)
     }
 
     /// Closes a stateful tool session.
@@ -1703,10 +1805,7 @@ impl WasmContextManager {
     }
 
     /// Returns a mutable reference to context state, or an error if not found.
-    fn require_active_context(
-        &self,
-        context_id: &str,
-    ) -> Result<&PerContextState, ScpWasmError> {
+    fn require_active_context(&self, context_id: &str) -> Result<&PerContextState, ScpWasmError> {
         let ctx = self.require_context(context_id)?;
         if ctx.state != "active" {
             return Err(ScpWasmError::Context {
