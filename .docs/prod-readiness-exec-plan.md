@@ -21,15 +21,28 @@ Every capability above must work through at least one SDK binding (Python).
 
 ---
 
-## Current State
+## Current State (updated 2026-03-08)
 
 **What works E2E today:**
 - UCAN pipeline (mint → validate → delegate → revoke)
-- Identity pipeline (create → resolve → rotate) — but only with InMemoryDhtClient
+- Identity pipeline (create → resolve → rotate) with PkarrDhtClient (#310) and InMemoryDhtClient
 - ApplicationNode + relay (HTTP, WebSocket, .well-known)
-- All scp-core subsystems in isolation (envelope, MLS crypto, sender keys, governance, trust, tools, sync, broadcast, bridge)
+- All scp-core subsystems integrated: envelope pipeline (seal/open), MLS crypto (OpenMLS), sender keys, governance (4 engines, 24 actions), trust, tools, sync, broadcast, bridge
+- FFI bridges (PyO3, UniFFI, NAPI, WASM) delegate to ContextManager (#356 resolved via #385-390)
+- Content access control (ADR-038, SCP-CAC-001–010)
+- Governance integration (SCP-267–274)
+- 6 transport adapters (Nostr, WebRTC, CoAP, QUIC, UDP/DTLS, WebTransport)
 
-**What breaks:** Every path that goes through FFI → ContextManager. The FFI bridges maintain parallel state (#356). This blocks message send/receive, governance enforcement, persistence, and MLS integration through any SDK binding.
+**Remaining gaps (14 items):**
+- #302: scp-node still hardcodes InMemory providers
+- #324: MLS max_past_epochs still 0
+- #336: No DHT/relay-based context discovery
+- #342: scp-relay hardcodes in_memory blob storage
+- #347: Deserialization size limits only in sync reorder buffer (not general envelope)
+- #373, #375, #376: Spec gaps (invitation bundle, bucket size, app sandboxing)
+- #392: Apple Secure Enclave custody not started
+- #394: InMemoryKeyCustody not gated behind testing feature
+- #399-401: Sybil resistance (new scope, not started)
 
 ---
 
@@ -406,8 +419,8 @@ SCP-267 → SCP-268 → SCP-269 → SCP-270 → SCP-271 → SCP-272 → SCP-273 
 **Lane A:** SCP-227 — **COMPLETE** (subscriber registration, blocking, integration — multiple commits). #335 closed by Phase 5 bridge rewrites.
 **Lane B:** #337 — **COMPLETE** → 9180dd5. #334 — **COMPLETE** → f78ceb4b (economic governance, spending UCANs).
 **Lane C:** #318 — **COMPLETE** → 91317fc. #330 — **COMPLETE** → 032cb41.
-**Lane D:** #316 (compromise recovery) — **COMMITTED** → b225bd12 (types complete, backend trait being added). #323 (platform key custody) — **COMPLETE** (3 backends: SQLite, File, Apple Keychain + InMemory for testing).
-**Lane E:** #302 — **COMPLETE** → bf53ec5. #305 — **COMPLETE** → 1dc533b. #342 — **COMPLETE** → 254ed89.
+**Lane D:** #316 (compromise recovery) — **COMPLETE** → b225bd12 + de42d1f3 (RecoveryBackend trait, CompromiseRecoveryOrchestrator). #323 (platform key custody) — **COMPLETE** (FileKeyCustody with Argon2id+AES). #391 (FileKeyCustody) — **COMPLETE**. #392 (Apple Secure Enclave) — **NOT STARTED**. #393 (Android Keystore) — **COMPLETE** (AndroidKeyCustody.kt with TEE Ed25519).
+**Lane E:** #302 — **NOT COMPLETE** (scp-node still hardcodes InMemoryKeyCustody, InMemoryDhtClient, InMemoryStorage). #305 — **COMPLETE** → 1dc533b (ACME key_auth fixed on worktree). #342 — **NOT COMPLETE** (relay still hardcodes BlobStorageBackend::in_memory()).
 
 ### Phase 9: SDK Bindings (depends on Phase 5) — COMPLETE
 
@@ -435,23 +448,23 @@ Spec-only changes in .docs/specs/. Content_hash confirmation oracle fix, registr
 
 Phase 11 spec→code gap audit COMPLETE — found 3 CRITICAL, 25 HIGH, 19 MEDIUM gaps. All being fixed in parallel (10 agents dispatched).
 
-### Phase 13: Spec→Code Gap Fixes (depends on Phase 11)
+### Phase 13: Spec→Code Gap Fixes (depends on Phase 11) — MOSTLY COMPLETE
 
-**CRITICALs (3):**
-- C1: Chain depth hard max 3→5 + ContextParams.max_chain_depth — IN PROGRESS
-- C2: BroadcastEnvelope signature content_hash + provenance_hash — IN PROGRESS
-- C3: Merkle tree RFC 6962 hash construction — VERIFYING
+**CRITICALs (3) — ALL COMPLETE:**
+- C1: Chain depth hard max 3→5 + ContextParams.max_chain_depth — **COMPLETE** → de42d1f3
+- C2: BroadcastEnvelope signature content_hash + provenance_hash — **COMPLETE** → de42d1f3 + 828464d7 (content_hash omitted per ADR-038 confirmation oracle)
+- C3: Merkle tree RFC 6962 hash construction — **COMPLETE** → de42d1f3 (domain-separated leaf/interior hashing)
 
-**HIGHs (25) — all IN PROGRESS across 8 agents:**
-- H2 (counterparty policy), H3 (bridge metadata), H4 (tool registration fields)
-- H5 (moderator role), H6 (identity link attestation), H7/H8 (challenge structs)
-- H9 (custody migration), H10 (shadow claiming), H11 (private state events)
-- H12/H13 (private state routing/hash), H14 (metadata record), H15 (MLS extension)
-- H16 (sync errors), H17 (epoch grace recovery), H18 (equivocation alert)
-- H19 (chunk envelope), H20 (pseudonym derivation), H21 (bridge governance)
-- H22 (participation signing), H23 (capability registry), H24 (UCAN CID), H25 (revocation status)
+**HIGHs (25) — 22 COMPLETE, 3 REMAINING:**
+- **COMPLETE:** H2-H13, H15-H17, H20, H22-H25 → de42d1f3 + 9fb582ec
+- **REMAINING:**
+  - H14 (metadata record) — no MetadataRecord type exists; requirement unclear
+  - H18 (equivocation alert) — detection via CheckpointComparison::Divergent exists, but no EquivocationAlert struct or notification path
+  - H19 (chunk envelope) — ChunkEnvelope type completely missing, zero code
 
-**Recovery.rs stub fix** — RecoveryBackend trait being added — IN PROGRESS
+**MEDIUMs (5):** M3, M7, M15-M17 — **COMPLETE** → 9fb582ec
+
+**Recovery.rs stub fix** — **COMPLETE** → de42d1f3 (RecoveryBackend trait with 5 methods, CompromiseRecoveryOrchestrator)
 
 ### Spec-Code Alignment (parallel with Phase 6+) — COMPLETE
 
@@ -463,22 +476,11 @@ Phase 11 spec→code gap audit COMPLETE — found 3 CRITICAL, 25 HIGH, 19 MEDIUM
 
 ### Phase 12: Polish — COMPLETE
 
-<<<<<<< HEAD
 - #291 — **COMPLETE** → 69cdf557 (stub policy fixes)
 - #301 — **COMPLETE** (node dev API metrics)
 - #303 — **COMPLETE** (event log payload persistence)
 - #343 — **COMPLETE** → 298666cd + 9507d032 (Nostr BIP-340 + WebRTC DataChannelProvider)
 - #344 — **COMPLETE** → 7f45bcb1 (artifact health findings)
-=======
-- #395 — HPKE sender key wrapping: add context_id/sender_did/epoch to info + AAD ✅ (1fe28a47)
-- #396 — BroadcastEnvelope: add top-level nonce field, expand AAD with context_id + sequence ✅ (b4b9161c)
-- #397 — ResetRequest: add nonce field, anti-replay validation (signature + 30s freshness + nonce dedup) ✅ (d6146a16)
-- #398 — Envelope version field: add `version: u16` to InnerEnvelope, BroadcastEnvelope, OuterEnvelope + canonical hashes
-
-### Phase 12: Polish
-
-#291, #301, #303, #343, #344
->>>>>>> feat/spec-code-alignment
 
 ---
 
