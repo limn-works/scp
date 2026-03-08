@@ -177,6 +177,9 @@ pub struct FileKeyCustody {
     next_id: AtomicU64,
     /// In-memory store for derived pseudonym keys (not persisted to disk).
     pseudonym_keys: Mutex<HashMap<u64, SigningKey>>,
+    /// Serializes file read-modify-write operations to prevent data races
+    /// when multiple tasks call `append_entry` concurrently.
+    file_write_lock: Mutex<()>,
 }
 
 impl FileKeyCustody {
@@ -221,6 +224,7 @@ impl FileKeyCustody {
             handle_map: Mutex::new(HandleMap::new()),
             next_id: AtomicU64::new(1),
             pseudonym_keys: Mutex::new(HashMap::new()),
+            file_write_lock: Mutex::new(()),
         })
     }
 
@@ -281,6 +285,7 @@ impl FileKeyCustody {
             handle_map: Mutex::new(handle_map),
             next_id: AtomicU64::new(next_id),
             pseudonym_keys: Mutex::new(HashMap::new()),
+            file_write_lock: Mutex::new(()),
         })
     }
 

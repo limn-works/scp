@@ -172,6 +172,15 @@ pub enum SenderKeyError {
     #[error("stale sender key request: timestamp outside freshness window")]
     StaleSenderKeyRequest,
 
+    /// The envelope's protocol version is not supported by this implementation.
+    #[error("unsupported broadcast envelope version: {version}, expected {expected}")]
+    UnsupportedVersion {
+        /// The version found in the envelope.
+        version: u16,
+        /// The version this implementation supports.
+        expected: u16,
+    },
+
     /// The epoch counter overflowed (reached `u64::MAX`).
     #[error("epoch counter overflow: already at u64::MAX")]
     EpochOverflow,

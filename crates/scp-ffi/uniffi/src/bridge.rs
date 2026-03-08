@@ -2417,7 +2417,7 @@ pub async fn governance_execute(
                 GovernanceActionResult::WriteAccessRestored(_) => "WriteAccessRestored",
                 GovernanceActionResult::ContentKeysRotated(_) => "ContentKeysRotated",
                 GovernanceActionResult::GovernanceReconfigured(_) => "GovernanceReconfigured",
-                // AuthorBlocked removed in CAC-008 — BlockAuthor now returns WriteAccessRevoked.
+                GovernanceActionResult::AuthorBlocked(_) => "AuthorBlocked",
                 GovernanceActionResult::SubscriberBanned(_) => "SubscriberBanned",
                 GovernanceActionResult::SubscriberUnbanned { .. } => "SubscriberUnbanned",
                 GovernanceActionResult::Executed => "Executed",

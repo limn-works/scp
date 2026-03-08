@@ -176,6 +176,7 @@ mod tests {
             registered_tools: Vec::new(),
             write_revoked_members: HashSet::default(),
             read_revoked_members: HashSet::default(),
+            read_exclusion_list: HashSet::default(),
             tool_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
