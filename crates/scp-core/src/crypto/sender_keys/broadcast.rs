@@ -158,8 +158,24 @@ pub struct BroadcastKeyEpochAdvance {
 /// See issue #352.
 ///
 /// [`encrypt_sender_layer`]: super::encrypt::encrypt_sender_layer
+/// The current SCP protocol version for broadcast envelopes.
+///
+/// See spec §13.2.2 for broadcast envelope versioning.
+pub const SCP_BROADCAST_ENVELOPE_VERSION: u16 = 1;
+
+/// Serde default for the `version` field on [`BroadcastEnvelope`].
+const fn default_broadcast_version() -> u16 {
+    SCP_BROADCAST_ENVELOPE_VERSION
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BroadcastEnvelope {
+    /// Protocol version (§13.2.2). Defaults to [`SCP_BROADCAST_ENVELOPE_VERSION`]
+    /// for backward compatibility with envelopes serialized before this field
+    /// was added.
+    #[serde(default = "default_broadcast_version")]
+    pub version: u16,
+
     /// The context ID this envelope belongs to.
     pub context_id: String,
     /// The DID of the author who sealed this envelope.
@@ -303,14 +319,16 @@ pub struct SealBroadcastParams<'a> {
 
 /// Constructs the canonical signing payload for a `BroadcastEnvelope`.
 ///
-/// Uses [`canonical_hash`] with domain separator `"SCP-BROADCAST-ENVELOPE-V1:"`
+/// Uses [`canonical_hash`] with domain separator `"SCP-BROADCAST-ENVELOPE-V2:"`
 /// and length-prefixed variable-length fields, matching the pattern used by
 /// [`compute_block_notification_hash`] in `key_protocol.rs`.
 ///
-/// Field order: `context_id`, `author_did`, `sequence`, `timestamp`, `key_epoch`.
+/// Field order per §13.2.2: `version`, `context_id`, `author_did`, `sequence`,
+/// `timestamp`, `key_epoch`.
 ///
 /// Used by both [`seal_broadcast`] (sign) and [`open_broadcast`] (verify).
 fn build_signing_payload(
+    version: u16,
     context_id: &str,
     author_did: &str,
     sequence: u64,
@@ -320,8 +338,9 @@ fn build_signing_payload(
     use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
     canonical_hash(
-        "SCP-BROADCAST-ENVELOPE-V1:",
+        "SCP-BROADCAST-ENVELOPE-V2:",
         &[
+            CanonicalField::U16(version),
             CanonicalField::VarBytes(context_id.as_bytes()),
             CanonicalField::VarBytes(author_did.as_bytes()),
             CanonicalField::U64(sequence),
@@ -387,6 +406,7 @@ pub fn seal_broadcast(
 
     // Sign over canonical field concatenation.
     let signing_payload = build_signing_payload(
+        SCP_BROADCAST_ENVELOPE_VERSION,
         params.context_id,
         &key.author_did,
         params.sequence,
@@ -399,6 +419,7 @@ pub fn seal_broadcast(
         .map_err(|e| SenderKeyError::SigningFailed(e.to_string()))?;
 
     Ok(BroadcastEnvelope {
+        version: SCP_BROADCAST_ENVELOPE_VERSION,
         context_id: params.context_id.to_owned(),
         author_did: key.author_did.clone(),
         sequence: params.sequence,
@@ -480,8 +501,17 @@ pub fn open_broadcast(
     envelope: &BroadcastEnvelope,
     verifying_key: &ed25519_dalek::VerifyingKey,
 ) -> Result<Vec<u8>, SenderKeyError> {
+    // Step 0: Reject unsupported protocol versions before any crypto (§13.2.2).
+    if envelope.version != SCP_BROADCAST_ENVELOPE_VERSION {
+        return Err(SenderKeyError::UnsupportedVersion {
+            version: envelope.version,
+            expected: SCP_BROADCAST_ENVELOPE_VERSION,
+        });
+    }
+
     // Step 1: Verify signature BEFORE decryption (issue #352).
     let signing_payload = build_signing_payload(
+        envelope.version,
         &envelope.context_id,
         &envelope.author_did,
         envelope.sequence,
@@ -519,6 +549,12 @@ pub fn open_broadcast_trusted(
     key: &BroadcastKey,
     envelope: &BroadcastEnvelope,
 ) -> Result<Vec<u8>, SenderKeyError> {
+    if envelope.version != SCP_BROADCAST_ENVELOPE_VERSION {
+        return Err(SenderKeyError::UnsupportedVersion {
+            version: envelope.version,
+            expected: SCP_BROADCAST_ENVELOPE_VERSION,
+        });
+    }
     decrypt_envelope(key, envelope)
 }
 
@@ -840,6 +876,7 @@ mod tests {
     fn open_with_too_short_ciphertext_fails() {
         let key = generate_broadcast_key("did:dht:alice");
         let envelope = BroadcastEnvelope {
+            version: SCP_BROADCAST_ENVELOPE_VERSION,
             context_id: "test-ctx".to_owned(),
             author_did: "did:dht:alice".to_owned(),
             sequence: 1,

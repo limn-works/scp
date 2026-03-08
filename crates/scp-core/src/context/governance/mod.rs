@@ -1833,8 +1833,6 @@ mod tests {
 
     /// Core governance actions (membership, tools, settings, access control).
     fn governance_actions_core() -> Vec<GovernanceAction> {
-        use crate::context::tools::interface::ToolInterface;
-
         vec![
             GovernanceAction::AddMember {
                 did: bob(),

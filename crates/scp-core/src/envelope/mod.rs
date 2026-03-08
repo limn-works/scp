@@ -104,6 +104,18 @@ pub enum EnvelopeError {
     #[error("content integrity failed: payload_hash mismatch")]
     ContentIntegrityFailed,
 
+    /// The envelope's protocol version is not supported by this implementation.
+    ///
+    /// Currently only version 1 (SCP/1.0) is supported. Future protocol
+    /// versions will require updated implementations.
+    #[error("unsupported protocol version: {version}, expected {expected}")]
+    UnsupportedVersion {
+        /// The version found in the envelope.
+        version: u16,
+        /// The version this implementation supports.
+        expected: u16,
+    },
+
     /// An agent key (`#agent`) attempted a Category A action (DID document
     /// modification) via an inner envelope. The action was rejected and a
     /// custody violation attestation was generated.

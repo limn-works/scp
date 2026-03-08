@@ -74,9 +74,25 @@ pub struct Provenance {
 ///
 /// All fields are serialized with `MessagePack` via `rmp-serde`. Binary fields
 /// use `serde_bytes` for efficient `MessagePack` binary encoding.
+/// The current SCP protocol version for inner envelopes.
+///
+/// See spec §13.2 for the version encoding scheme.
+pub const SCP_INNER_ENVELOPE_VERSION: u16 = 1;
+
+/// Serde default for the `version` field on [`InnerEnvelope`].
+const fn default_inner_version() -> u16 {
+    SCP_INNER_ENVELOPE_VERSION
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InnerEnvelope {
+    /// Protocol version (§13.2.1). Defaults to [`SCP_INNER_ENVELOPE_VERSION`]
+    /// for backward compatibility with envelopes serialized before this field
+    /// was added.
+    #[serde(default = "default_inner_version")]
+    pub version: u16,
+
     /// The SCP context identifier.
     pub context_id: String,
 
@@ -142,6 +158,9 @@ pub struct InnerEnvelope {
 /// easy to accidentally transpose.
 #[derive(Debug, Clone)]
 pub struct InnerEnvelopeParams<'a> {
+    /// Protocol version (§13.2.1). Use [`SCP_INNER_ENVELOPE_VERSION`] for
+    /// current protocol version.
+    pub version: u16,
     /// The SCP context identifier.
     pub context_id: &'a str,
     /// The sender's full DID.
@@ -217,6 +236,7 @@ pub async fn create_inner_envelope(
         .map_err(|_| EnvelopeError::SigningFailed("Ed25519 signature must be 64 bytes".into()))?;
 
     Ok(InnerEnvelope {
+        version: params.version,
         context_id: params.context_id.to_owned(),
         sender_did: params.sender_did.to_owned(),
         epoch: params.epoch,
@@ -262,8 +282,17 @@ pub fn verify_inner_signature(
     let provenance_hash = compute_provenance_hash(inner.provenance.as_ref())
         .map_err(|e| EnvelopeError::VerificationFailed(e.to_string()))?;
 
+    // Reject unsupported protocol versions before signature verification.
+    if inner.version != SCP_INNER_ENVELOPE_VERSION {
+        return Err(EnvelopeError::UnsupportedVersion {
+            version: inner.version,
+            expected: SCP_INNER_ENVELOPE_VERSION,
+        });
+    }
+
     // Reconstruct params for canonical hash computation.
     let params = InnerEnvelopeParams {
+        version: inner.version,
         context_id: &inner.context_id,
         sender_did: &inner.sender_did,
         epoch: inner.epoch,
@@ -396,17 +425,18 @@ fn compute_canonical_hash(
 ) -> Vec<u8> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
-    // Field order per §9.5.2: message_type (discriminator byte), context_id,
-    // sender_did, epoch, generation, sequence, timestamp, payload_hash,
-    // provenance_hash, signing_key_id.
+    // Field order per §13.2.1: message_type (discriminator byte), version,
+    // context_id, sender_did, epoch, generation, sequence, timestamp,
+    // payload_hash, provenance_hash, signing_key_id.
     //
     // message_type is prepended (after domain separator) so that the type
     // commitment is the first thing in the hash input — making type-flipping
-    // attacks structurally impossible.
+    // attacks structurally impossible. version follows immediately per §13.2.1.
     canonical_hash(
         "SCP-INNER-ENVELOPE-V1:",
         &[
             CanonicalField::U8(params.message_type.as_discriminator_byte()),
+            CanonicalField::U16(params.version),
             CanonicalField::VarBytes(params.context_id.as_bytes()),
             CanonicalField::VarBytes(params.sender_did.as_bytes()),
             CanonicalField::U64(params.epoch),
@@ -443,6 +473,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -491,6 +522,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-2",
                 sender_did: "did:dht:bob",
                 epoch: 5,
@@ -523,6 +555,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -551,6 +584,7 @@ mod tests {
 
         let mut envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -587,6 +621,7 @@ mod tests {
 
         let mut envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -618,6 +653,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -660,6 +696,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -694,6 +731,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -722,6 +760,7 @@ mod tests {
 
         // Hash with the real domain separator (via the production function).
         let params = InnerEnvelopeParams {
+            version: SCP_INNER_ENVELOPE_VERSION,
             context_id: "ctx-1",
             sender_did: "did:dht:alice",
             epoch: 1,
@@ -792,6 +831,7 @@ mod tests {
 
         let mut envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -826,6 +866,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -854,6 +895,7 @@ mod tests {
 
         let content_envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -873,6 +915,7 @@ mod tests {
 
         let signaling_envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -903,6 +946,7 @@ mod tests {
         for msg_type in [MessageType::Content, MessageType::Signaling] {
             let envelope = create_inner_envelope(
                 &InnerEnvelopeParams {
+                    version: SCP_INNER_ENVELOPE_VERSION,
                     context_id: "ctx-1",
                     sender_did: "did:dht:alice",
                     epoch: 1,
@@ -937,6 +981,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -966,6 +1011,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -995,6 +1041,7 @@ mod tests {
 
         let mut envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -1028,6 +1075,7 @@ mod tests {
 
         let active_envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -1047,6 +1095,7 @@ mod tests {
 
         let agent_envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -1078,6 +1127,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -1114,6 +1164,7 @@ mod tests {
         for key_id in [SigningKeyId::Active, SigningKeyId::Agent] {
             let envelope = create_inner_envelope(
                 &InnerEnvelopeParams {
+                    version: SCP_INNER_ENVELOPE_VERSION,
                     context_id: "ctx-1",
                     sender_did: "did:dht:alice",
                     epoch: 1,
@@ -1147,6 +1198,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -1180,6 +1232,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -1208,6 +1261,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -1236,6 +1290,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -1288,6 +1343,7 @@ mod tests {
 
                     let envelope = create_inner_envelope(
                         &InnerEnvelopeParams {
+                            version: SCP_INNER_ENVELOPE_VERSION,
                             context_id: "ctx-prop",
                             sender_did: "did:dht:proptest",
                             epoch: 1,

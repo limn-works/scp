@@ -268,6 +268,7 @@ mod tests {
 
         create_inner_envelope(
             &InnerEnvelopeParams {
+                version: crate::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -299,6 +300,7 @@ mod tests {
 
         create_inner_envelope(
             &InnerEnvelopeParams {
+                version: crate::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
                 context_id,
                 sender_did,
                 epoch: 1,
