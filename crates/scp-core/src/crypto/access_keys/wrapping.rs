@@ -197,12 +197,7 @@ pub fn unwrap_cek(
 ///
 /// This prevents cross-context ciphertext relocation, epoch substitution,
 /// and message reordering. See ADR-038 and spec section 9.17.1.
-fn build_aad(
-    context_id: &str,
-    sender_did: &str,
-    key_epoch: u64,
-    sequence_number: u64,
-) -> Vec<u8> {
+fn build_aad(context_id: &str, sender_did: &str, key_epoch: u64, sequence_number: u64) -> Vec<u8> {
     let ctx_bytes = context_id.as_bytes();
     let did_bytes = sender_did.as_bytes();
     let mut aad = Vec::with_capacity(4 + ctx_bytes.len() + 4 + did_bytes.len() + 8 + 8);
@@ -464,8 +459,10 @@ mod tests {
         assert_eq!(wrapped.wrapped_ceks.len(), 3);
 
         // Each recipient can decrypt
-        let dec_alice =
-            unwrap_content(&wrapped, did_alice, &key_alice, context_id, sender_did, 0, seq).unwrap();
+        let dec_alice = unwrap_content(
+            &wrapped, did_alice, &key_alice, context_id, sender_did, 0, seq,
+        )
+        .unwrap();
         assert_eq!(dec_alice, plaintext);
 
         let dec_bob =
@@ -529,7 +526,9 @@ mod tests {
         let wrapped = wrap_content(plaintext, &recipients, context_id, sender_did, 0, seq).unwrap();
 
         // Alice tries with wrong key
-        let result = unwrap_content(&wrapped, did_alice, &key_wrong, context_id, sender_did, 0, seq);
+        let result = unwrap_content(
+            &wrapped, did_alice, &key_wrong, context_id, sender_did, 0, seq,
+        );
         assert!(
             matches!(result, Err(AccessKeyError::KeyUnwrapFailed)),
             "wrong access key should fail at key unwrap, got {result:?}"
@@ -763,7 +762,8 @@ mod tests {
             access_key: &access_key,
         }];
 
-        let wrapped = wrap_content(&plaintext, &recipients, context_id, sender_did, 0, seq).unwrap();
+        let wrapped =
+            wrap_content(&plaintext, &recipients, context_id, sender_did, 0, seq).unwrap();
 
         let decrypted =
             unwrap_content(&wrapped, did, &access_key, context_id, sender_did, 0, seq).unwrap();

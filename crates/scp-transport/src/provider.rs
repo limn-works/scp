@@ -107,6 +107,7 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
         // The routing_id is the context_id itself (used by relays for routing).
         // blob_ttl of 0 means use relay default.
         let envelope = OuterEnvelope {
+            version: scp_core::envelope::outer::SCP_OUTER_ENVELOPE_VERSION,
             routing_id: context_id.to_vec(),
             recipient_hint: None,
             blob_ttl: 0,
@@ -155,6 +156,7 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
         encrypted_payload: &[u8],
     ) -> Result<(), ContextError> {
         let envelope = OuterEnvelope {
+            version: scp_core::envelope::outer::SCP_OUTER_ENVELOPE_VERSION,
             routing_id: context_id.to_vec(),
             recipient_hint: None,
             blob_ttl: 0,

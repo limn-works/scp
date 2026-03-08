@@ -338,7 +338,6 @@ pub enum ContextError {
     /// Context creation failed due to invalid parameters or internal error.
     #[error("creation failed: {0}")]
     CreationFailed(String),
-
 }
 
 // ---------------------------------------------------------------------------

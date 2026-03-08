@@ -349,6 +349,7 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
             payload: original_msg,
             provenance: None,
             signing_key_id: scp_core::identity::SigningKeyId::Active,
+            version: scp_core::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
         },
         &alice_mls_custody,
         &dummy_handle,

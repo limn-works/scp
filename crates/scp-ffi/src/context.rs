@@ -1103,6 +1103,7 @@ fn py_context_send(
                 payload: &payload_bytes,
                 provenance: None,
                 signing_key_id: scp_identity::SigningKeyId::Active,
+                version: scp_core::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
             };
             scp_core::envelope::create_inner_envelope(
                 &params,
