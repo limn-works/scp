@@ -3,18 +3,18 @@
 //! Exposes trust engine operations to JavaScript (browser target):
 //!
 //! - [`trust_query_score`] — Query participation-based trust data.
-//! - [`trust_verify_attestation`] — Verify an attestation (bridge stub).
+//! - [`trust_verify_attestation`] — Verify an attestation (throws — requires WebCrypto).
 //! - [`trust_create_challenge`] — Create a challenge request.
-//! - [`trust_verify_response`] — Verify a challenge response (bridge stub).
+//! - [`trust_verify_response`] — Verify a challenge response (throws — requires WebCrypto).
 //!
 //! # WASM constraints
 //!
 //! This bridge does NOT depend on `scp-core` (tokio multi-thread incompatible
 //! with `wasm32-unknown-unknown`). Trust functions that require Ed25519
 //! signature verification (`trust_verify_attestation`, `trust_verify_response`)
-//! are bridge stubs that return typed errors documenting the JS-side
-//! implementation pattern (`WebCrypto`). The query and challenge creation
-//! functions work fully using WASM-local state.
+//! throw `SCP-TRUST-800x` errors to prevent silent false negatives — the
+//! TypeScript wrapper layer must implement these via `WebCrypto`. The query
+//! and challenge creation functions work fully using WASM-local state.
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md`.
 
@@ -72,17 +72,23 @@ pub fn trust_query_score(did: String, context_id: String) -> Promise {
 // trust_verify_attestation
 // ---------------------------------------------------------------------------
 
-/// Verifies an attestation (bridge stub).
+/// Verifies an attestation.
 ///
-/// Full attestation verification requires Ed25519 signature verification via
-/// `WebCrypto`, which must be injected from the TypeScript wrapper layer.
-/// Returns a JSON string indicating the stub status.
+/// **Always throws** `SCP-TRUST-8001` — full attestation verification
+/// requires Ed25519 signature verification via `WebCrypto`, which must be
+/// implemented in the TypeScript wrapper layer. This function validates
+/// the JSON structure but rejects with an explicit error rather than
+/// returning a silent `false`.
 ///
 /// # JS usage
 ///
 /// ```js
-/// const resultJson = await trust_verify_attestation(attestationJson);
-/// const result = JSON.parse(resultJson);
+/// try {
+///     await trust_verify_attestation(attestationJson);
+/// } catch (e) {
+///     // e.message contains "[SCP-TRUST-8001] trust error: ..."
+///     // Implement verification via WebCrypto in the TS wrapper.
+/// }
 /// ```
 #[wasm_bindgen]
 pub fn trust_verify_attestation(attestation_json: String) -> Promise {
@@ -101,14 +107,16 @@ pub fn trust_verify_attestation(attestation_json: String) -> Promise {
         })?;
 
         // Signature verification requires `WebCrypto` (Ed25519) — must be
-        // implemented in the TypeScript wrapper layer.
-        let result = serde_json::json!({
-            "valid": false,
-            "chain_depth": 0,
-            "error": "attestation signature verification requires `WebCrypto` — implement in TypeScript wrapper",
-        });
-
-        Ok(JsValue::from_str(&result.to_string()))
+        // implemented in the TypeScript wrapper layer. Throw an explicit error
+        // so callers cannot silently consume a false negative.
+        Err(ScpWasmError::Trust {
+            message: "attestation signature verification requires WebCrypto \
+                      — implement in TypeScript wrapper layer"
+                .to_owned(),
+            code: "SCP-TRUST-8001".to_owned(),
+        }
+        .into_js()
+        .into())
     })
 }
 
@@ -160,15 +168,23 @@ pub fn trust_create_challenge(target_did: String) -> Promise {
 // trust_verify_response
 // ---------------------------------------------------------------------------
 
-/// Verifies a challenge response (bridge stub).
+/// Verifies a challenge response.
 ///
-/// Full response verification requires Ed25519 signature verification via
-/// `WebCrypto`, which must be injected from the TypeScript wrapper layer.
+/// **Always throws** `SCP-TRUST-8002` — full response verification
+/// requires Ed25519 signature verification via `WebCrypto`, which must be
+/// implemented in the TypeScript wrapper layer. This function validates
+/// the JSON structure but rejects with an explicit error rather than
+/// returning a silent `false`.
 ///
 /// # JS usage
 ///
 /// ```js
-/// const valid = await trust_verify_response(challengeJson, responseJson);
+/// try {
+///     await trust_verify_response(challengeJson, responseJson);
+/// } catch (e) {
+///     // e.message contains "[SCP-TRUST-8002] trust error: ..."
+///     // Implement verification via WebCrypto in the TS wrapper.
+/// }
 /// ```
 #[wasm_bindgen]
 pub fn trust_verify_response(challenge_json: String, response_json: String) -> Promise {
@@ -192,7 +208,15 @@ pub fn trust_verify_response(challenge_json: String, response_json: String) -> P
         })?;
 
         // Signature verification requires `WebCrypto` — must be implemented in
-        // the TypeScript wrapper layer.
-        Ok(JsValue::from_bool(false))
+        // the TypeScript wrapper layer. Throw an explicit error so callers
+        // cannot silently consume a false negative.
+        Err(ScpWasmError::Trust {
+            message: "challenge response signature verification requires WebCrypto \
+                      — implement in TypeScript wrapper layer"
+                .to_owned(),
+            code: "SCP-TRUST-8002".to_owned(),
+        }
+        .into_js()
+        .into())
     })
 }

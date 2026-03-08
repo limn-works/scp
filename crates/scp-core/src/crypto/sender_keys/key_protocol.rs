@@ -1077,19 +1077,29 @@ impl NonceDedup {
 // ---------------------------------------------------------------------------
 
 fn build_hpke_info(context_id: &str, sender_did: &str, epoch: u64) -> Vec<u8> {
+    let ctx_bytes = context_id.as_bytes();
+    let did_bytes = sender_did.as_bytes();
+    // 4-byte BE length prefix per variable-length field prevents boundary-shift collisions.
     let mut info =
-        Vec::with_capacity(HPKE_INFO_PREFIX.len() + context_id.len() + sender_did.len() + 8);
+        Vec::with_capacity(HPKE_INFO_PREFIX.len() + 4 + ctx_bytes.len() + 4 + did_bytes.len() + 8);
     info.extend_from_slice(HPKE_INFO_PREFIX);
-    info.extend_from_slice(context_id.as_bytes());
-    info.extend_from_slice(sender_did.as_bytes());
+    info.extend_from_slice(&(ctx_bytes.len() as u32).to_be_bytes());
+    info.extend_from_slice(ctx_bytes);
+    info.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
+    info.extend_from_slice(did_bytes);
     info.extend_from_slice(&epoch.to_be_bytes());
     info
 }
 
 fn build_hpke_aad(context_id: &str, sender_did: &str, epoch: u64) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(context_id.len() + sender_did.len() + 8);
-    aad.extend_from_slice(context_id.as_bytes());
-    aad.extend_from_slice(sender_did.as_bytes());
+    let ctx_bytes = context_id.as_bytes();
+    let did_bytes = sender_did.as_bytes();
+    // 4-byte BE length prefix per variable-length field prevents boundary-shift collisions.
+    let mut aad = Vec::with_capacity(4 + ctx_bytes.len() + 4 + did_bytes.len() + 8);
+    aad.extend_from_slice(&(ctx_bytes.len() as u32).to_be_bytes());
+    aad.extend_from_slice(ctx_bytes);
+    aad.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
+    aad.extend_from_slice(did_bytes);
     aad.extend_from_slice(&epoch.to_be_bytes());
     aad
 }

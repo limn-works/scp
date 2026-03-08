@@ -135,7 +135,7 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
             })
             .unwrap_or_default();
 
-        let tool_id = format!("tool-{}", uuid::Uuid::new_v4().as_hyphenated());
+        let tool_id = format!("tool-{}", name.replace(' ', "-").to_lowercase());
 
         let registration = runtime::ToolRegistration {
             tool_id: tool_id.clone(),
@@ -167,30 +167,27 @@ pub fn tool_invoke(
     tool_id: String,
     input_json: String,
     identity_did: String,
+    ucan_token: String,
 ) -> Promise {
     let context_id = context.context_id();
+    let _ = (context_id, tool_id, input_json, identity_did);
     future_to_promise(async move {
-        let input: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
-            ScpWasmError::Validation {
-                message: format!("input_json is not valid JSON: {e}"),
+        // UCAN authorization is required but WASM-local UCAN-to-tool
+        // validation is not yet wired. Reject with an explicit error
+        // rather than silently succeeding without auth. See issue #319.
+        if ucan_token.is_empty() {
+            return Err(JsValue::from(ScpWasmError::Validation {
+                message: "ucan_token is required for tool invocation".to_owned(),
                 code: "SCP-VALID-7000".to_owned(),
             }
-            .into_js()
-        })?;
+            .into_js()));
+        }
 
-        let result =
-            with_manager(|mgr| mgr.invoke_tool(&context_id, &tool_id, &input, &identity_did))
-                .map_err(ScpWasmError::into_js)?;
-
-        let json_str = serde_json::to_string(&result).map_err(|e| {
-            ScpWasmError::Tool {
-                message: format!("failed to serialize tool output: {e}"),
-                code: "SCP-TOOL-6002".to_owned(),
-            }
-            .into_js()
-        })?;
-
-        Ok(JsValue::from_str(&json_str))
+        Err(JsValue::from(ScpWasmError::Tool {
+            message: "WASM tool invocation requires UCAN authorization but WASM-local UCAN-to-tool validation is not yet wired — see issue #319".to_owned(),
+            code: "SCP-TOOL-6099".to_owned(),
+        }
+        .into_js()))
     })
 }
 

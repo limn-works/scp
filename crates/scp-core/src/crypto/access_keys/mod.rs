@@ -155,6 +155,11 @@ pub enum AccessKeyError {
     #[error("stale access key request: timestamp outside freshness window")]
     StaleRequest,
 
+    /// A replayed access key request was detected (duplicate nonce within
+    /// the expiry window).
+    #[error("replayed access key request: nonce already seen")]
+    ReplayedNonce,
+
     /// The system clock is unavailable or before the Unix epoch.
     #[error("clock error: {0}")]
     ClockError(#[from] crate::time::ClockError),
