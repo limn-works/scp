@@ -177,18 +177,22 @@ ParticipationProfile {
 
 The `signer_public_key` is context-specific — derived from the context's identity with domain separation, not reused across contexts. This prevents the verifier from correlating which contexts share a signer. The signature covers all fields except itself.
 
-**Signer key derivation.** The context-specific signing key is derived using HKDF-SHA-256 (RFC 5869):
+**Signer key derivation.** The context's participation signing key is generated from a `participation_signing_seed` — a random 32-byte value created once at context creation time and stored in the context's governance state. This seed is independent of any admin's identity key, ensuring that admin rotation does not invalidate historical participation statements.
 
 ```
-ikm = context_admin_identity_key_private_bytes  // 32 bytes, #0 key of context creator
-salt = SHA-256("SCP-PARTICIPATION-SIGNER-V1")   // fixed salt, 32 bytes
+participation_signing_seed = CSPRNG(32)          // generated once at context creation
+salt = SHA-256("SCP-PARTICIPATION-SIGNER-V1")    // fixed salt, 32 bytes
 info = "scp-participation-signer:" || context_id // context_id as UTF-8 bytes
-prk = HKDF-Extract(salt, ikm)                   // 32 bytes
+prk = HKDF-Extract(salt, participation_signing_seed)  // 32 bytes
 okm = HKDF-Expand(prk, info, 32)                // 32 bytes — Ed25519 seed
 signer_keypair = Ed25519::from_seed(okm)
 ```
 
-The `signer_public_key` in the `ParticipationProfile` is the public half of this derived keypair. Each context produces a unique signing key deterministically, so verification is possible by anyone who receives the statement — but the verifier cannot reverse-derive the context ID from the public key (one-way derivation). Context governance changes (admin rotation) MUST trigger re-derivation of the signer key and re-signing of all outstanding participation statements.
+The `signer_public_key` in the `ParticipationProfile` is the public half of this derived keypair. Each context produces a unique signing key deterministically from its seed, so verification is possible by anyone who receives the statement — but the verifier cannot reverse-derive the context ID from the public key (one-way derivation).
+
+**Seed custody and admin rotation.** The `participation_signing_seed` is stored encrypted in the context's governance state, wrapped to the current admin's `#0` identity key using HPKE (X25519-HKDF-SHA256, HKDF-SHA256, ChaCha20Poly1305) with info string `"scp-participation-seed-wrap:" || context_id`. During admin rotation, the outgoing admin MUST re-wrap the seed to the incoming admin's `#0` key and include the re-wrapped seed in the `AdminRotation` governance event. The incoming admin unwraps the seed and can then produce and sign participation statements. If the outgoing admin is unavailable (e.g., key compromise), the seed is lost and a new seed MUST be generated — this invalidates all prior statements from this context, which is the correct security behavior when admin continuity is broken.
+
+**Participation signing key rotation.** The `participation_signing_seed` itself can be rotated independently of admin rotation via the `RotateParticipationKey` governance action. This generates a new random seed, derives a new signing keypair, re-signs all outstanding participation statements with the new key, and publishes a `ParticipationKeyRotated` event containing the new `signer_public_key`. Verifiers who cached the old public key MUST accept both old and new keys for a 30-day overlap period (matching the statement `max_age_secs` default). After the overlap period, only the new key is valid for newly-signed statements. Historical statements signed with the old key remain valid if their `updated_at` predates the rotation event.
 
 **Context-hosted storage model:**
 
@@ -592,12 +596,15 @@ The signed protocol registry is a JSON document listing all valid `scp:capabilit
 }
 ```
 
-**Signing authority.** The registry is signed by the SCP protocol authority key — a dedicated Ed25519 key whose public key is hardcoded in every SDK build. The signing key is distinct from any identity key. The key is published in the protocol governance DID document (§14) and in the SDK source code. Key rotation follows the protocol governance process (§14): new key published with a 180-day overlap period during which both old and new signatures are accepted.
+**Signing authority.** The registry is signed by the SCP protocol authority key — a dedicated Ed25519 key whose public key is hardcoded in every SDK build. The signing key is distinct from any identity key. The key is published in the protocol governance DID document (§14) and in the SDK source code. The signing key MUST be rotatable via the protocol governance process (§14). On rotation, the new key is published with a 90-day grace period during which both old and new signatures are accepted. The old key MUST be accepted for verification of registry versions published before the rotation event. After the 90-day grace period, the old key is no longer accepted for newly-fetched registry documents (but historical verification of previously-cached versions remains valid).
 
-**Distribution.** The registry is distributed through three channels:
-1. **Bundled in SDK.** Each SDK release includes the registry version current at release time. This is the cold-start source.
-2. **Fetched from protocol relay.** SDKs periodically fetch the latest registry from a well-known protocol relay URL: `https://registry.scp.dev/v1/capability-registry.json`. Fetch interval: once per 24 hours. The response includes `ETag` and `Last-Modified` headers for conditional requests.
-3. **Embedded in DID document.** The protocol governance DID document includes a `ProtocolRegistry` service endpoint pointing to the current registry URL.
+**Distribution.** The registry is distributed through four channels:
+1. **Bundled in SDK (REQUIRED).** Each SDK release MUST include the registry version current at release time. This is the cold-start source and the fallback when all network sources are unavailable. SDKs MUST operate correctly using only the bundled snapshot — network fetch is an update mechanism, not a boot dependency.
+2. **Fetched from protocol relay (primary network source).** SDKs periodically fetch the latest registry from a well-known protocol relay URL: `https://registry.scp.dev/v1/capability-registry.json`. Fetch interval: once per 24 hours. The response includes `ETag` and `Last-Modified` headers for conditional requests.
+3. **Fetched from alternative URL (fallback network source).** SDKs MUST support at least one alternative fetch URL as a fallback when the primary URL is unreachable. The default alternative is `https://raw.githubusercontent.com/limn-scp/protocol-registry/main/v1/capability-registry.json`. Implementations MAY add additional fallback URLs (e.g., IPFS CID-addressed copies). Fallback URLs serve the same signed document — the signature verification is the trust anchor, not the transport URL.
+4. **Embedded in DID document.** The protocol governance DID document includes a `ProtocolRegistry` service endpoint pointing to the current registry URL.
+
+**Managed centralization tradeoff.** The registry model is a managed centralization tradeoff analogous to browser CA root stores or system time zone databases: a curated, signed list distributed with the software and periodically updated from a canonical source. The signing key — not the distribution URL — is the trust anchor. Implementations MAY override the default registry with a custom registry by providing an alternative signing key and fetch URL via SDK configuration. This enables private deployments, forks, and testing without protocol changes. Custom registries MUST use the same format and verification rules; only the signing key and fetch URLs differ.
 
 **Verification.** On fetch, the SDK verifies:
 1. The `signature` is valid against the hardcoded registry signing public key.

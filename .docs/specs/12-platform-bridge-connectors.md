@@ -736,17 +736,27 @@ Bridge credentials pass through five phases:
 
 1. **Provision.** The user authorizes the bridge to act on their behalf on the external platform. The authorization mechanism is platform-specific: OAuth Authorization Code flow, API key generation, manual token entry, etc. The bridge operator initiates this flow; the user completes it.
 
-2. **Store.** Credentials are encrypted at rest and stored in isolation from the operator's SCP identity keys. Credentials MUST be encrypted using a key derived from the bridge operator's identity key material via the following HKDF-SHA-256 construction:
+2. **Store.** Credentials are encrypted at rest and stored in isolation from the operator's SCP identity keys. The credential encryption key MUST NOT be derived from the `#active` signing key, because `#active` rotates (software key, periodic rotation per §3.4) — rotation would silently invalidate all encrypted credentials. Instead, the credential encryption key is a random 32-byte value generated once per bridge instance at provisioning time and stored within the custody boundary (alongside `pseudonym_secret` and other non-exportable secrets per §3.7). This is the `bridge_credential_key`.
 
+   The `bridge_credential_key` is generated and stored as follows:
    ```
-   ikm  = operator_active_signing_key_private_bytes  // 32 bytes, #active key
-   salt = SHA-256("SCP-BRIDGE-CREDENTIAL-V1")         // fixed salt, 32 bytes
-   info = "scp-bridge-credential:" || bridge_id       // bridge_id as hex-encoded bytes
-   prk  = HKDF-Extract(salt, ikm)                     // 32 bytes
-   okm  = HKDF-Expand(prk, info, 32)                  // 32 bytes — AES-256-GCM key
+   bridge_credential_key = CSPRNG(32)  // generated once at bridge provisioning
+   // Stored in ProtocolStore under: custody/{did}/bridge_credential_key/{bridge_id}
+   // Protected by the same custody boundary as identity keys
+   ```
+
+   The per-credential encryption key is then derived from the `bridge_credential_key` using HKDF-SHA-256:
+   ```
+   ikm  = bridge_credential_key                       // 32 bytes, per-bridge random secret
+   salt = SHA-256("SCP-BRIDGE-CREDENTIAL-V1")          // fixed salt, 32 bytes
+   info = "scp-bridge-credential:" || bridge_id        // bridge_id as hex-encoded bytes
+   prk  = HKDF-Extract(salt, ikm)                      // 32 bytes
+   okm  = HKDF-Expand(prk, info, 32)                   // 32 bytes — AES-256-GCM key
    ```
 
    Encryption algorithm: AES-256-GCM. Nonce: 12 bytes, randomly generated per encryption operation via CSPRNG. The nonce is prepended to the ciphertext. Authentication tag: 16 bytes, appended to the ciphertext. Stored format: `nonce (12 bytes) || ciphertext || tag (16 bytes)`.
+
+   This design avoids coupling credential encryption to any key that rotates (`#active`) or that hardware custody may prevent exporting (`#0`). The `bridge_credential_key` is a standalone secret with the same lifecycle as the bridge instance — created at provisioning, destroyed at revocation (Phase 5).
 
    Credentials MUST be stored separately from the operator's SCP identity keys — the credential store is a distinct storage domain under `bridge/{bridge_id}/credential/{credential_type}` in `ProtocolStore`, not a field on the bridge entity.
 
@@ -758,9 +768,9 @@ Bridge credentials pass through five phases:
 
 ### 12.11.2 Requirements
 
-- Credentials MUST be encrypted at rest using a key derived from the bridge operator's identity key material.
-- Credentials MUST be stored separately from the operator's SCP identity keys (key isolation). A compromise of the credential store does not compromise the operator's SCP identity. A compromise of the operator's SCP keys does not directly expose platform credentials (derived key, not the identity key itself).
-- When `BridgeStatus` transitions to `Revoked`, the credential store MUST destroy all delegated credentials for that bridge instance. Destruction means: (a) call the platform's revocation endpoint if one exists, (b) overwrite local credential material with zeros, (c) delete the credential record.
+- Credentials MUST be encrypted at rest using a key derived from the bridge's `bridge_credential_key` (§12.11.1 Phase 2). The `bridge_credential_key` is a per-bridge random secret stored in the custody boundary — it is NOT derived from any identity key.
+- Credentials MUST be stored separately from the operator's SCP identity keys (key isolation). A compromise of the credential store does not compromise the operator's SCP identity. A compromise of the operator's SCP identity keys does not expose platform credentials (the `bridge_credential_key` is an independent random secret, not derived from identity material).
+- When `BridgeStatus` transitions to `Revoked`, the credential store MUST destroy all delegated credentials for that bridge instance. Destruction means: (a) call the platform's revocation endpoint if one exists, (b) overwrite local credential material with zeros, (c) delete the credential record, (d) overwrite and delete the `bridge_credential_key` from the custody boundary.
 - When `BridgeStatus` transitions to `Suspended`, credential use MUST stop but credentials are retained for potential reactivation.
 - Credential storage SHOULD support multiple concurrent credential types per bridge instance (e.g., an OAuth access token + a webhook signing secret + an API key for a secondary service).
 - Credential access MUST be scoped to the bridge instance. Cross-bridge credential sharing is prohibited even under the same operator DID.
@@ -781,7 +791,7 @@ Approximately 80% of major platforms use OAuth 2.0 for third-party authorization
 
 - `access_token` — Short-lived (typically 1 hour). Used for API requests to the platform.
 - `refresh_token` — Long-lived (days to months). Used to obtain new access tokens without user re-authorization.
-- Both are encrypted at rest using a key derived from the operator's identity key material.
+- Both are encrypted at rest using a key derived from the bridge's `bridge_credential_key` (§12.11.1 Phase 2).
 
 **Token refresh:**
 
