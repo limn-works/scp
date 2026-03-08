@@ -48,7 +48,7 @@ pub fn py_discovery_parse_address<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let parsed = parse_address(address).map_err(|e| ScpPyError::ValidationError {
         message: format!("invalid address '{address}': {e}"),
-        code: "SCP-VALID-9020".to_string(),
+        code: "SCP-VALID-7060".to_string(),
     })?;
 
     let dict = PyDict::new(py);
@@ -107,7 +107,7 @@ pub fn py_discovery_create_query(
     serde_json::to_string(&query).map_err(|e| {
         ScpPyError::ValidationError {
             message: format!("failed to serialize query: {e}"),
-            code: "SCP-VALID-9021".to_string(),
+            code: "SCP-VALID-7061".to_string(),
         }
         .into()
     })
@@ -239,7 +239,7 @@ pub fn py_context_discover<'py>(py: Python<'py>, query: &str) -> PyResult<Bound<
                 "query must be a DID (starts with 'did:') or an scp:// URI \
                  (starts with 'scp://'), got: {query}"
             ),
-            code: "SCP-VALID-9022".to_owned(),
+            code: "SCP-VALID-7062".to_owned(),
         }
         .into())
     }

@@ -225,9 +225,9 @@ fn default_backend_is_sqlite() {
         "sqlite database file should be created when using default backend; output: {output}"
     );
 
-    // Verify the relay actually started (logged "relay listening").
+    // Verify the relay used sqlite (logged "using sqlite blob storage").
     assert!(
-        output.contains("relay listening"),
-        "relay should have logged 'relay listening'; output: {output}"
+        output.contains("using sqlite blob storage"),
+        "relay should have logged 'using sqlite blob storage'; output: {output}"
     );
 }

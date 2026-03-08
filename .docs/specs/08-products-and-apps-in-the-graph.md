@@ -111,6 +111,24 @@ The capability declaration uses JSON Schema (MCP-compatible) with SCP-specific e
 4. If all capabilities are grantable, the declaration is accepted. If any capability is denied, the entire declaration is rejected (all-or-nothing). The rejection response includes a `denied_capabilities` array listing which capabilities failed and why.
 5. The validated declaration is stored in the context's tool registry for auditability.
 
+### 8.4.2 SDK-Level Enforcement
+
+The SDK is the enforcement boundary for capability declarations. Apps interact with the protocol exclusively through SDK-provided handles that are scoped to their declared capabilities. The SDK MUST NOT provide unscoped or privileged access to any app — all protocol access flows through capability-checked entry points.
+
+**Enforcement mechanics:**
+
+1. **Registration.** Apps register their capability declaration (§8.4.1) with the SDK before binding to any context. The SDK validates the declaration's signature, protocol version compatibility, and structural correctness. Invalid declarations are rejected at registration time — the app never receives a handle.
+
+2. **Bind-time validation.** When an app binds to a context, the SDK checks every declared capability against the context's ceiling (§5.3) and the agent's current role (§5.5). If any capability is not grantable, the entire binding is rejected (all-or-nothing semantics). On success, the SDK returns a **scoped handle** — a context handle that only exposes the APIs corresponding to granted capabilities.
+
+3. **Runtime enforcement.** The SDK MUST reject API calls that exceed the app's declared capabilities at the call site. An app that declared `["read"]` on `messaging` MUST receive an error if it attempts to call `send_message()`. This is a hard enforcement boundary, not a suggestion. The rejection is immediate (no governance vote, no capability negotiation) and returns a `CapabilityDenied` error with the missing capability.
+
+4. **No capability escalation.** Once bound, an app cannot request additional capabilities without re-registration with a new declaration. The SDK does not support runtime capability grants. If an app needs expanded capabilities, it must present a new (or updated) signed declaration from its publisher.
+
+5. **Scoped handle isolation.** Each app receives its own scoped handle to the context. Scoped handles are not interchangeable — an app cannot use another app's handle to access capabilities it did not declare. The SDK maintains per-app-binding state that maps the handle to the validated declaration.
+
+**Auditability.** The validated declaration is recorded in the context's event log at bind time. Context members can inspect which apps are bound and what capabilities they hold. App binding and unbinding events are visible in the event log — silent app attachment is not possible.
+
 ## 8.5 MCP Compatibility (Model Context Protocol)
 
 MCP (Model Context Protocol) defines how AI models connect to tools and data sources locally — a JSON-RPC protocol where servers expose tool schemas, models discover and call them. MCP and SCP operate at different layers and integrate naturally.

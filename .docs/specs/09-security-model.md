@@ -9,6 +9,7 @@
 5. **Contexts are isolated by default.** No transitive exposure. Cross-context data flow only through two explicit, opt-in mechanisms: tool interfaces (asymmetric, §6.2) and multi-parent child contexts (symmetric, §5.13).
 6. **Role assignment is non-negotiable.** Agents cannot request elevated permissions.
 7. **Context metadata is transparent.** Full legibility before opt-in.
+8. **Apps are capability-scoped.** The SDK enforces declaration contracts — apps receive scoped handles that expose only declared capabilities. API calls exceeding declared capabilities are rejected at the call site (§8.4.2).
 
 ## 9.2 Identified Threat Vectors and Mitigations
 
@@ -937,7 +938,7 @@ Cover traffic uses **tiered configuration driven by transport profiles** (§10.1
 2. **Push-wake connections: no cover traffic.** Push-wake connections are transient and brief; cover traffic is meaningless over them.
 3. **Dummy message format.** Single-byte flag inside encrypted payload distinguishes real from dummy. `REAL_FLAG = 0x01`, `DUMMY_FLAG = 0x00`. Recipients decrypt, check the flag, discard dummies.
 4. **Rate is per relay connection, not per context.** Prevents relay from correlating traffic rate changes with context activity.
-5. **Bucket padding.** All payloads (real and dummy) are padded to the nearest power-of-2 bucket: 256, 512, 1024, 2048, 4096 bytes. This normalizes message sizes regardless of content length.
+5. **Bucket padding.** All payloads (real and dummy) are padded to the nearest bucket boundary per §9.10.3. This normalizes message sizes regardless of content length.
 
 **Bandwidth baseline by tier:**
 - `full`: ~15MB/day for 5 relay connections at 1024-byte padding. Real messages add <5% above baseline at moderate usage.

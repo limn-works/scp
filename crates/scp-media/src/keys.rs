@@ -27,8 +27,9 @@ pub type ContextId = String;
 ///
 /// The label is fixed to prevent callers from injecting arbitrary labels into
 /// the MLS exporter, which could be used for domain-separation attacks or
-/// key confusion.
-const MEDIA_EXPORT_LABEL: &str = "scp-media-dtls-srtp";
+/// key confusion. Uses the protocol-standard `"scp-media-key-v1"` domain
+/// separator (not tied to any specific media transport like DTLS-SRTP).
+const MEDIA_EXPORT_LABEL: &str = "scp-media-key-v1";
 
 /// Minimum key length in bytes.
 ///
@@ -147,7 +148,7 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 /// removed (triggering an epoch advance), all previously derived keys become
 /// invalid and receivers must re-derive.
 ///
-/// The MLS export label is hardcoded to `"scp-media-dtls-srtp"` to prevent
+/// The MLS export label is hardcoded to `"scp-media-key-v1"` to prevent
 /// label injection attacks.
 ///
 /// # Arguments
@@ -557,6 +558,6 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn label_is_hardcoded() {
         // Verify the hardcoded label constant exists and has the expected value.
-        assert_eq!(MEDIA_EXPORT_LABEL, "scp-media-dtls-srtp");
+        assert_eq!(MEDIA_EXPORT_LABEL, "scp-media-key-v1");
     }
 }

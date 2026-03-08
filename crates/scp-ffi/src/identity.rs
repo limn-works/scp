@@ -1077,6 +1077,126 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
 }
 
 // ---------------------------------------------------------------------------
+// Device attestation bridge (#362)
+// ---------------------------------------------------------------------------
+
+/// Generates a device attestation token for an identity.
+///
+/// Uses [`InMemoryDeviceAttestation`] (available only with
+/// `allow_in_memory_custody` feature) to produce a synthetic attestation
+/// token, then attaches it to the identity's DID document via
+/// [`DidDht::attach_device_attestation`].
+///
+/// # Arguments
+///
+/// * `identity_did` -- The DID string of the identity to attest.
+///
+/// # Returns
+///
+/// The attestation token as a base64-encoded string.
+///
+/// # Errors
+///
+/// Raises `IdentityError` if the identity is not in the registry or
+/// attestation fails.
+///
+/// See §9.3, issue #362.
+#[pyfunction]
+#[cfg(feature = "allow_in_memory_custody")]
+fn py_identity_attest_device(py: Python<'_>, identity_did: &str) -> PyResult<String> {
+    validate::validate_did(identity_did)?;
+    let did_owned = identity_did.to_owned();
+    let rt = crate::runtime()?;
+
+    py.allow_threads(|| {
+        crate::runtime::with_identity_mut(&did_owned, |entry| {
+            let attestation = scp_platform::testing::InMemoryDeviceAttestation::new();
+            let dht = DidDht::new();
+
+            let new_document = rt
+                .block_on(async {
+                    dht.attach_device_attestation(&entry.document, &attestation)
+                        .await
+                })
+                .map_err(|e| ScpPyError::identity(format!("device attestation failed: {e}")))?;
+
+            // Extract the attestation token from the updated document's
+            // service entries.
+            let token_bytes = new_document
+                .service
+                .iter()
+                .find(|s| s.service_type == "ScpDeviceAttestation")
+                .map(|s| s.service_endpoint.clone())
+                .ok_or_else(|| {
+                    ScpPyError::identity(
+                        "device attestation succeeded but no ScpDeviceAttestation \
+                         service entry found in updated document"
+                            .to_owned(),
+                    )
+                })?;
+
+            // Update the identity's document with the attestation.
+            entry.document = new_document;
+
+            use base64::Engine;
+            Ok(base64::engine::general_purpose::STANDARD.encode(token_bytes.as_bytes()))
+        })
+    })
+    .map_err(PyErr::from)
+}
+
+/// Verifies a device attestation token.
+///
+/// Uses [`InMemoryDeviceAttestation`] to check the token format.
+///
+/// # Arguments
+///
+/// * `_did` -- The DID string (unused in verification but kept for API
+///   consistency with the `UniFFI` bridge).
+/// * `token_base64` -- The base64-encoded attestation token to verify.
+///
+/// # Returns
+///
+/// `True` if the token is valid, `False` otherwise.
+///
+/// # Errors
+///
+/// Raises `IdentityError` if base64 decoding fails.
+///
+/// See §9.3, issue #362.
+#[pyfunction]
+#[cfg(feature = "allow_in_memory_custody")]
+fn py_identity_verify_device_attestation(
+    py: Python<'_>,
+    _did: &str,
+    token_base64: &str,
+) -> PyResult<bool> {
+    let token_b64_owned = token_base64.to_owned();
+    let rt = crate::runtime()?;
+
+    py.allow_threads(|| -> Result<bool, ScpPyError> {
+        use base64::Engine;
+        let token_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&token_b64_owned)
+            .map_err(|e| ScpPyError::identity(format!("invalid base64 attestation token: {e}")))?;
+
+        let token = scp_platform::traits::DeviceAttestationToken::new(token_bytes);
+        let attestation = scp_platform::testing::InMemoryDeviceAttestation::new();
+
+        let result = rt
+            .block_on(async {
+                scp_platform::traits::DeviceAttestation::verify(&attestation, &token).await
+            })
+            .map_err(|e| {
+                ScpPyError::identity(format!("device attestation verification failed: {e}"))
+            })?;
+
+        Ok(result)
+    })
+    .map_err(PyErr::from)
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
@@ -1100,5 +1220,11 @@ pub fn register_identity(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_identity_rotate_agent_key, m)?)?;
     m.add_function(wrap_pyfunction!(py_identity_remove_agent_key, m)?)?;
     m.add_function(wrap_pyfunction!(py_identity_migrate, m)?)?;
+    // Device attestation (#362)
+    #[cfg(feature = "allow_in_memory_custody")]
+    {
+        m.add_function(wrap_pyfunction!(py_identity_attest_device, m)?)?;
+        m.add_function(wrap_pyfunction!(py_identity_verify_device_attestation, m)?)?;
+    }
     Ok(())
 }

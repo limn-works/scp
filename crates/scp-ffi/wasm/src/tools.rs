@@ -156,7 +156,10 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
 
 /// Invokes a registered tool within an SCP context.
 ///
-/// Delegates to `WasmContextManager::invoke_tool`.
+/// Delegates to `WasmContextManager::invoke_tool`. When `ucan_token` is
+/// provided, validates the token before dispatch using the WASM-local UCAN
+/// validation pipeline, requiring `tool_invoke:{tool_id}` or `tool_invoke:*`
+/// capability. See spec §6.2, §8, ADR-016, and issue #319.
 ///
 /// # Returns
 ///
@@ -167,6 +170,7 @@ pub fn tool_invoke(
     tool_id: String,
     input_json: String,
     identity_did: String,
+    ucan_token: Option<String>,
 ) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
@@ -177,6 +181,19 @@ pub fn tool_invoke(
             }
             .into_js()
         })?;
+
+        // Primary authorization: UCAN token validation via the WASM-local
+        // 11-step pipeline. See spec §6.2, §8, ADR-016, and issue #319.
+        if let Some(ref token) = ucan_token {
+            crate::ucan::validate_tool_ucan_wasm(&context_id, &tool_id, token, &identity_did)
+                .map_err(|e| {
+                    ScpWasmError::Permission {
+                        message: format!("UCAN authorization failed for tool '{tool_id}': {e}"),
+                        code: "SCP-PERM-3000".to_owned(),
+                    }
+                    .into_js()
+                })?;
+        }
 
         let result =
             with_manager(|mgr| mgr.invoke_tool(&context_id, &tool_id, &input, &identity_did))

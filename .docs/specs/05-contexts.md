@@ -756,6 +756,74 @@ sdk.create_context(params: ContextParams {
 
 **Invitation bundling.** When creating a bilateral context with a peer, the SDK bundles the context metadata and MLS Welcome message into a single transport delivery. The peer receives everything needed to evaluate and join in one message — no roundtrip to fetch metadata before deciding.
 
+#### 5.12.3.1 InvitationBundle Wire Format
+
+The invitation bundle is the single-delivery package that enables zero-roundtrip context joining. It is serialized as MessagePack (§17.5) and encrypted to the invitee's public key (X25519, derived from their Ed25519 identity key via RFC 7748 birational mapping).
+
+```
+InvitationBundle {
+  context_id:         String              // The context being invited to.
+  creator_did:        DID                 // The DID of the context creator / inviter.
+  relay_urls:         Vec<String>         // Relay endpoints where the context is hosted.
+  welcome_message:    Vec<u8>             // MLS Welcome message (RFC 9420 §12.4.3.1).
+                                          // Contains the GroupInfo, encrypted group secrets,
+                                          // and the invitee's KeyPackage reference.
+                                          // Omitted (empty) for Broadcast contexts.
+  key_material:       InvitationKeyMaterial  // Context-specific key material for the invitee.
+  metadata_snapshot:  MetadataSnapshot    // Snapshot of structural + visible operational metadata.
+  signature:          Ed25519Signature    // Creator signs all fields above.
+}
+
+InvitationKeyMaterial {
+  context_metadata_key:  [u8; 32]        // Symmetric key for metadata routing ID derivation (§9.10.4.B).
+  sender_key_seed:       Option<Vec<u8>> // Initial sender key material (Broadcast contexts only).
+}
+
+MetadataSnapshot {
+  structural:   StructuralMetadata       // Template ID, ceiling, roles, governance, TTL, etc.
+  operational:  OperationalMetadata      // Member count, age, creator, name, description, etc.
+                                         // Filtered by MetadataVisibilityPolicy — MemberOnly
+                                         // fields are omitted for non-member invitees.
+}
+```
+
+**Signature scope.** The creator signs `SHA-256("SCP-INVITATION-BUNDLE-V1:" || context_id || creator_did || relay_urls_hash || welcome_message_hash || key_material_hash || metadata_snapshot_hash)` where each `_hash` is `SHA-256(MessagePack(field))`. The signature uses the creator's Active Signing Key (`#active`).
+
+**Validation.** The invitee verifies the bundle before processing:
+1. Resolve `creator_did` and verify `signature` against the creator's `#active` public key.
+2. Validate `metadata_snapshot.structural` against the invitee's auto-accept policy (§5.12.2).
+3. If accepted, process `welcome_message` via MLS to join the group (Encrypted contexts) or initialize subscriber state (Broadcast contexts).
+4. Use `context_metadata_key` to derive the metadata routing ID for ongoing metadata retrieval.
+
+#### 5.12.3.2 JoinResponse Wire Format
+
+After accepting an invitation bundle, the invitee sends a join response back to the creator via the relay. The response is serialized as MessagePack and encrypted to the creator's public key.
+
+```
+JoinResponse {
+  context_id:       String              // The context being joined.
+  joiner_did:       DID                 // The DID of the joining member.
+  mls_commit:       Vec<u8>             // MLS Commit message confirming group join
+                                        // (Encrypted contexts only; empty for Broadcast).
+  sender_key:       Vec<u8>             // The joiner's initial sender key for this context
+                                        // (§9.16). Encrypted to the context's current
+                                        // sender key distribution mechanism.
+  timestamp:        u64                 // Unix timestamp (seconds) of the join.
+  signature:        Ed25519Signature    // Joiner signs all fields above with #active key.
+}
+```
+
+**Signature scope.** The joiner signs `SHA-256("SCP-JOIN-RESPONSE-V1:" || context_id || joiner_did || mls_commit_hash || sender_key_hash || timestamp)`.
+
+#### 5.12.3.3 Transport Delivery
+
+Invitation bundles and join responses are delivered via the relay transport layer (§10.4, §10.5). Both messages use the same `OuterEnvelope` format as regular context messages:
+
+1. **Invitation delivery.** The creator publishes the `InvitationBundle` to the invitee's personal routing ID (`SHA-256(invitee_did || "scp-invitations")`). This is a reserved routing ID that every SCP identity subscribes to for receiving invitations.
+2. **Join response delivery.** The joiner publishes the `JoinResponse` to the creator's personal routing ID, using the relay URLs from the invitation bundle.
+3. **TTL.** Invitation bundles carry a relay TTL of 7 days (default). After expiry, the invitation must be re-sent. Join responses carry a TTL of 24 hours.
+4. **Deduplication.** The `context_id` + `creator_did` + `joiner_did` triple uniquely identifies an invitation flow. Duplicate bundles (retransmissions) are idempotent — processing the same MLS Welcome twice produces the same group state.
+
 ### 5.12.4 Context Creation as a Runtime Operation
 
 Context creation is not infrastructure provisioning. It is a runtime operation — comparable in weight to opening a TLS connection, not to deploying a database. Understanding this is critical to the protocol's viability: if context creation feels like a build action, agents will treat it as one and route around it for lightweight coordination. Context creation must be (and is) as fluid as `connect()`.

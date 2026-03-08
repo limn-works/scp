@@ -1,9 +1,17 @@
-//! Shared `ContextManager` — replaces the old per-context runtime registry.
+//! Shared `ContextManager` and per-context UCAN state registry.
 //!
 //! A single `Arc<ContextManager>` is created once (lazily) and shared across
 //! all bridge functions. The `ContextManager` owns all per-context state
 //! (membership, roles, governance, broadcast, TTL) and the injected providers
 //! for crypto, transport, and event log operations.
+//!
+//! # Per-context UCAN state
+//!
+//! The `ContextManager` does not own UCAN revocation lists or nonce trackers.
+//! Those are validation-layer concerns that live in the bridge. We keep a
+//! lightweight `DashMap<String, UcanContextState>` registry for them, keyed by
+//! context ID. This mirrors the NAPI bridge's `UcanContextState` pattern
+//! (see `crates/scp-ffi/napi/src/runtime.rs`).
 //!
 //! # Lifecycle
 //!
@@ -15,13 +23,19 @@
 //! This replaces the old `DashMap<String, ContextRuntime>` global registry
 //! (deleted as part of issue #387).
 
+use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
+use dashmap::DashMap;
 use scp_core::context::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
 };
 use scp_core::context::manager::ContextManager;
 use scp_core::context::{ContextError, ContextParams};
+use scp_core::crypto::ucan::nonce::NonceTracker;
+use scp_core::crypto::ucan::revoke::RevocationList;
+use scp_event_log::EventLog;
+use scp_identity::cache::SystemClock;
 
 /// Global shared `ContextManager` instance.
 static CONTEXT_MANAGER: OnceLock<Arc<ContextManager>> = OnceLock::new();
@@ -50,6 +64,112 @@ pub fn context_manager() -> &'static Arc<ContextManager> {
             noop_key_resolver(),
         ))
     })
+}
+
+/// Global stub crypto provider shared with the `CloseOrchestrator`.
+///
+/// The `CloseOrchestrator::new` requires a `&dyn ContextCryptoProvider`.
+/// This provides the same no-op `FfiBridgeCrypto` used by the
+/// `ContextManager` initialization. The actual crypto operations are
+/// handled by the platform-injected `KeyCustodyProvider`.
+static FFI_CRYPTO: FfiBridgeCrypto = FfiBridgeCrypto;
+
+/// Returns a reference to the bridge crypto provider for `CloseOrchestrator`.
+pub fn context_manager_crypto() -> &'static dyn ContextCryptoProvider {
+    &FFI_CRYPTO
+}
+
+// ---------------------------------------------------------------------------
+// Per-context UCAN state — retained for the UCAN validation pipeline
+//
+// The ContextManager does not own UCAN revocation lists or nonce trackers.
+// Those are validation-layer concerns that live in the bridge. We keep a
+// lightweight registry for them, keyed by context ID.
+// ---------------------------------------------------------------------------
+
+/// Per-context UCAN validation state.
+///
+/// Retains the `RevocationList` and `NonceTracker` needed by the UCAN
+/// validation pipeline (ADR-016). These are NOT duplicates of `ContextManager`
+/// state — the manager does not track UCAN revocation or nonces.
+pub struct UcanContextState {
+    /// UCAN revocation list for this context.
+    pub revocation_list: RevocationList,
+    /// UCAN nonce tracker for replay prevention (ADR-016 step 9).
+    pub nonce_tracker: NonceTracker<SystemClock>,
+    /// Capability ceiling as a set of `{resource}:{action}` strings for
+    /// UCAN validation (ADR-016 step 8).
+    pub ceiling_strings: HashSet<String>,
+    /// The DID of the context creator.
+    pub creator_did: String,
+    /// Event log (Merkle tree) for this context.
+    pub event_log: EventLog,
+}
+
+/// Global registry of per-context UCAN validation state.
+static UCAN_REGISTRY: OnceLock<DashMap<String, UcanContextState>> = OnceLock::new();
+
+/// Returns a reference to the UCAN state registry.
+fn ucan_registry() -> &'static DashMap<String, UcanContextState> {
+    UCAN_REGISTRY.get_or_init(DashMap::new)
+}
+
+/// Ensures UCAN validation state is registered for a context.
+///
+/// If the context is already registered, this is a no-op. Otherwise, creates
+/// UCAN state from the provided context metadata.
+pub fn ensure_ucan_registered(context_id: &str, creator_did: &str, ceiling: &[String]) {
+    let map = ucan_registry();
+
+    if map.contains_key(context_id) {
+        return;
+    }
+
+    let ceiling_strings = if ceiling.is_empty() {
+        scp_core::context::roles::default_ceiling()
+            .capabilities
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<HashSet<String>>()
+    } else {
+        ceiling.iter().cloned().collect::<HashSet<String>>()
+    };
+
+    let event_log = EventLog::new(context_id.to_owned());
+    let revocation_list = RevocationList::new(context_id.to_owned());
+    let nonce_tracker = NonceTracker::new(context_id.to_owned(), SystemClock);
+
+    map.insert(
+        context_id.to_owned(),
+        UcanContextState {
+            revocation_list,
+            nonce_tracker,
+            ceiling_strings,
+            creator_did: creator_did.to_owned(),
+            event_log,
+        },
+    );
+}
+
+/// Accesses per-context UCAN state via a closure.
+///
+/// Returns `None` if the context is not registered. The caller is responsible
+/// for converting `None` to an appropriate error.
+pub fn with_ucan_state<T, F>(context_id: &str, f: F) -> Option<T>
+where
+    F: FnOnce(&mut UcanContextState) -> T,
+{
+    let map = ucan_registry();
+    let mut entry = map.get_mut(context_id)?;
+    Some(f(&mut entry))
+}
+
+/// Removes UCAN validation state for a context.
+///
+/// Called on context close to clean up per-context state.
+pub fn remove_ucan_state(context_id: &str) {
+    let map = ucan_registry();
+    map.remove(context_id);
 }
 
 // ---------------------------------------------------------------------------

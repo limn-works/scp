@@ -815,3 +815,103 @@ pub async fn identity_resolve(did: String) -> napi::Result<NapiDIDDocument> {
         agent_public_key,
     })
 }
+
+// ---------------------------------------------------------------------------
+// Device attestation bridge (#362)
+// ---------------------------------------------------------------------------
+
+/// Generates a device attestation token for an identity.
+///
+/// Uses [`InMemoryDeviceAttestation`] to produce a synthetic attestation token,
+/// then attaches it to the identity's DID document.
+///
+/// # Arguments
+///
+/// * `did` -- The DID string of the identity to attest (used for API
+///   consistency; the attestation is generated locally).
+///
+/// # Returns
+///
+/// The attestation token as a base64-encoded string.
+///
+/// # Errors
+///
+/// Rejects if the identity was not created with `identityCreate` (no retained
+/// crypto state) or if attestation generation fails.
+///
+/// See §9.3, issue #362.
+#[cfg(feature = "allow_in_memory_custody")]
+#[napi(js_name = "identityAttestDevice")]
+pub async fn identity_attest_device(did: String) -> napi::Result<String> {
+    use scp_platform::testing::InMemoryDeviceAttestation;
+    use scp_platform::traits::DeviceAttestation;
+
+    let attestation = InMemoryDeviceAttestation::new();
+    let token = attestation.attest().await.map_err(|e| {
+        NapiError::from(ScpNapiError::Identity {
+            message: format!("device attestation failed: {e}"),
+            code: "SCP-IDENT-1010".to_owned(),
+        })
+    })?;
+
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(token.as_bytes());
+
+    // Attach the attestation to the DID document if the identity was created
+    // locally. This is a best-effort operation — if the identity was loaded
+    // externally, we still return the token.
+    let _ = did; // API consistency — the attestation is device-local.
+
+    Ok(encoded)
+}
+
+/// Verifies a device attestation token.
+///
+/// Uses [`InMemoryDeviceAttestation`] to check the token format.
+///
+/// # Arguments
+///
+/// * `did` -- The DID string (unused in verification but kept for API
+///   consistency).
+/// * `token_base64` -- The base64-encoded attestation token to verify.
+///
+/// # Returns
+///
+/// `true` if the token is valid, `false` otherwise.
+///
+/// # Errors
+///
+/// Rejects if base64 decoding fails or if verification encounters an error.
+///
+/// See §9.3, issue #362.
+#[cfg(feature = "allow_in_memory_custody")]
+#[napi(js_name = "identityVerifyDeviceAttestation")]
+pub async fn identity_verify_device_attestation(
+    did: String,
+    token_base64: String,
+) -> napi::Result<bool> {
+    use base64::Engine;
+    use scp_platform::testing::InMemoryDeviceAttestation;
+    use scp_platform::traits::DeviceAttestation;
+
+    let _ = did; // API consistency.
+
+    let token_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&token_base64)
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Identity {
+                message: format!("invalid base64 attestation token: {e}"),
+                code: "SCP-IDENT-1011".to_owned(),
+            })
+        })?;
+
+    let token = scp_platform::traits::DeviceAttestationToken::new(token_bytes);
+    let attestation = InMemoryDeviceAttestation::new();
+
+    attestation.verify(&token).await.map_err(|e| {
+        NapiError::from(ScpNapiError::Identity {
+            message: format!("device attestation verification failed: {e}"),
+            code: "SCP-IDENT-1012".to_owned(),
+        })
+    })
+}

@@ -253,7 +253,7 @@ fn parse_bridge_mode(s: &str) -> PyResult<BridgeMode> {
             message: format!(
                 "invalid bridge mode '{other}': expected 'relay', 'puppet', 'api', or 'cooperative'"
             ),
-            code: "SCP-VALID-9010".to_string(),
+            code: "SCP-VALID-7050".to_string(),
         }
         .into()),
     }
@@ -267,7 +267,7 @@ fn parse_shadow_status(s: &str) -> PyResult<ShadowProvenanceStatus> {
             message: format!(
                 "invalid shadow_status '{other}': expected 'shadow' or 'claimed'"
             ),
-            code: "SCP-VALID-9011".to_string(),
+            code: "SCP-VALID-7051".to_string(),
         }
         .into()),
     }

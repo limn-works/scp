@@ -161,7 +161,7 @@ fn parse_memory_scope(s: &str) -> PyResult<MemoryScope> {
             message: format!(
                 "invalid memory_scope '{other}': expected 'full', 'summary', or 'ephemeral'"
             ),
-            code: "SCP-PERM-9003".to_string(),
+            code: "SCP-PERM-3010".to_string(),
         }
         .into()),
     }
@@ -195,7 +195,7 @@ fn parse_source_type(s: &str) -> PyResult<SourceType> {
             message: format!(
                 "invalid source_type '{other}': expected 'persistent', 'ephemeral', or 'summary'"
             ),
-            code: "SCP-PERM-9001".to_string(),
+            code: "SCP-PERM-3011".to_string(),
         }
         .into()),
     }
@@ -217,7 +217,7 @@ fn parse_context_state(s: &str) -> PyResult<SourceContextState> {
                 "invalid context_state '{other}': expected 'active', 'closed_with_summary_verified', \
                  'closed_with_summary_unverified', 'closed_ephemeral', or 'unknown'"
             ),
-            code: "SCP-PERM-9002".to_string(),
+            code: "SCP-PERM-3012".to_string(),
         }
         .into()),
     }

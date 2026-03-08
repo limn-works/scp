@@ -83,5 +83,9 @@ required-features = ["testing"]
 name = "governance_integration"
 required-features = ["testing"]
 
+[[test]]
+name = "content_access_integration"
+required-features = ["testing"]
+
 [lints]
 workspace = true

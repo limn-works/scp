@@ -33,6 +33,7 @@
 //!
 //! See ADR-029 in `.docs/adrs/phase-6.md`.
 
+pub mod alerts;
 pub mod conflict_resolution;
 pub mod days_offline;
 pub mod hours_offline;

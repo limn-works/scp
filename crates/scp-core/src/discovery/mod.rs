@@ -44,6 +44,7 @@ pub mod dht_context;
 pub mod did_capabilities;
 pub mod handles;
 pub mod petnames;
+pub mod push;
 pub mod search;
 
 use std::time::Duration;

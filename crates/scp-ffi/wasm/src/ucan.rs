@@ -817,6 +817,46 @@ pub fn ucan_mint(
     })
 }
 
+/// Validates a UCAN token for tool invocation authorization (WASM bridge).
+///
+/// Extracts capability from the token and verifies it includes `tool_invoke`
+/// permission for the given `tool_id`. Uses the WASM-local 11-step UCAN
+/// validation pipeline.
+///
+/// See spec §6.2, §8, ADR-016, and issue #319.
+///
+/// # Errors
+///
+/// Returns an error string if the UCAN token is malformed, the context state
+/// cannot be retrieved, or the 11-step validation pipeline rejects the token.
+pub fn validate_tool_ucan_wasm(
+    context_id: &str,
+    tool_id: &str,
+    token: &str,
+    identity_did: &str,
+) -> Result<(), String> {
+    let parsed = parse_ucan(token).map_err(|e| format!("malformed UCAN token: {e}"))?;
+
+    // Build the required capability URI: scp:ctx:{context_id}/tool_invoke:{tool_id}
+    let required_capability = format!("scp:ctx:{context_id}/tool_invoke:{tool_id}");
+
+    // Read ceiling, creator_did, and revoked CIDs from WasmContextManager.
+    let (ceiling, creator_did, _seen_nonces, revoked_cids) =
+        with_manager(|mgr| mgr.ucan_context_state(context_id))
+            .map_err(|e| format!("failed to get UCAN context state: {e}"))?;
+
+    validate_ucan_full(&UcanValidationParams {
+        token: &parsed,
+        capability: &required_capability,
+        context_id,
+        expected_aud_did: identity_did,
+        proof_tokens: None,
+        ceiling: &ceiling,
+        creator_did: &creator_did,
+        revoked_cids: &revoked_cids,
+    })
+}
+
 /// Revokes a UCAN token.
 ///
 /// Delegates to `WasmContextManager::ucan_revoke`. Computes the token CID

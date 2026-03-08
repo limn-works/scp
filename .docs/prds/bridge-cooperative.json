@@ -1,6 +1,6 @@
 {
   "project": "scp",
-  "description": "Cooperative mode HTTP binding for bridge connectors: implement the six-endpoint REST API specified in §12.10 as HTTP handlers in scp-node. Platforms implement the shadow/message/attest/status/webhook endpoints; scp-node hosts the bridge node that mediates between these endpoints and SCP protocol operations. Authentication via DID-signed bearer tokens. Webhook receiver for platform-initiated events. Integration with existing bridge submodules (registration, shadow, claiming, provenance).",
+  "description": "Cooperative mode HTTP binding for bridge connectors: implement the six-endpoint REST API specified in \u00a712.10 as HTTP handlers in scp-node. Platforms implement the shadow/message/attest/status/webhook endpoints; scp-node hosts the bridge node that mediates between these endpoints and SCP protocol operations. Authentication via DID-signed bearer tokens. Webhook receiver for platform-initiated events. Integration with existing bridge submodules (registration, shadow, claiming, provenance).",
   "gates": [
     {
       "id": "gate-bridge-http-binding",
@@ -52,7 +52,7 @@
         "crates/scp-node/src/bridge_auth.rs",
         "crates/scp-node/src/lib.rs"
       ],
-      "description": "Implement the authentication layer specified in §12.10.2. The bridge operator authenticates using DID-signed JWTs in the Authorization header. The JWT contains iss (operator DID), aud (node URL), iat, exp, scp_bridge_id, and scp_context_id. The node verifies the JWT signature against the operator's DID document (§3.2). Token lifetime MUST NOT exceed 1 hour. For webhook callbacks (platform to bridge node), verify Ed25519 signatures in the X-SCP-Signature header against the platform's pre-registered public key.\n\nThis story is foundational — all other bridge HTTP endpoints depend on it for authentication.",
+      "description": "Implement the authentication layer specified in \u00a712.10.2. The bridge operator authenticates using DID-signed JWTs in the Authorization header. The JWT contains iss (operator DID), aud (node URL), iat, exp, scp_bridge_id, and scp_context_id. The node verifies the JWT signature against the operator's DID document (\u00a73.2). Token lifetime MUST NOT exceed 1 hour. For webhook callbacks (platform to bridge node), verify Ed25519 signatures in the X-SCP-Signature header against the platform's pre-registered public key.\n\nThis story is foundational \u2014 all other bridge HTTP endpoints depend on it for authentication.",
       "acceptanceCriteria": [
         "BridgeAuthMiddleware extracts bearer token from Authorization header and validates JWT structure",
         "JWT signature is verified against the operator's DID document resolved via scp-identity",
@@ -104,12 +104,12 @@
         "crates/scp-node/src/bridge_handlers.rs",
         "crates/scp-node/src/lib.rs"
       ],
-      "description": "Implement the shadow creation endpoint specified in §12.10.4. Accepts platform_handle, platform_user_id, and optional metadata. Delegates to create_shadow() in scp-core/bridge/shadow.rs. Returns the created shadow identity with shadow_id, attributed_role (observer), and created_at. Idempotent: if a shadow with the same platform_user_id already exists, returns 200 with the existing shadow instead of 201.",
+      "description": "Implement the shadow creation endpoint specified in \u00a712.10.4. Accepts platform_handle, platform_user_id, and optional metadata. Delegates to create_shadow() in scp-core/bridge/shadow.rs. Returns the created shadow identity with shadow_id, attributed_role (observer), and created_at. Idempotent: if a shadow with the same platform_user_id already exists, returns 200 with the existing shadow instead of 201.",
       "acceptanceCriteria": [
         "POST /v1/scp/bridge/shadow accepts JSON body with platform_handle (required), platform_user_id (required), metadata (optional)",
         "Delegates to create_shadow() in scp-core/bridge/shadow.rs",
         "Returns 201 Created with shadow_id, platform_handle, platform_user_id, attributed_role, created_at on success",
-        "attributed_role defaults to 'observer' per §12.3",
+        "attributed_role defaults to 'observer' per \u00a712.3",
         "Idempotent: existing shadow for same platform_user_id returns 200 OK with existing shadow data",
         "Returns 400 INVALID_REQUEST when required fields are missing",
         "Returns 401 BRIDGE_NOT_AUTHORIZED when authentication fails",
@@ -148,7 +148,7 @@
       "files": [
         "crates/scp-node/src/bridge_handlers.rs"
       ],
-      "description": "Implement the message emission endpoint specified in §12.10.4. Accepts shadow_id, content, content_type, optional platform_message_id, and optional platform_timestamp. The bridge node constructs the SCP envelope with BridgeProvenance (§12.5) via mark_bridge_provenance() from scp-core/bridge/provenance.rs and publishes to the context. Returns 202 Accepted with message_id, sequence, and bridge_provenance. Handles claimed shadows by reflecting the claimed provenance status.",
+      "description": "Implement the message emission endpoint specified in \u00a712.10.4. Accepts shadow_id, content, content_type, optional platform_message_id, and optional platform_timestamp. The bridge node constructs the SCP envelope with BridgeProvenance (\u00a712.5) via mark_bridge_provenance() from scp-core/bridge/provenance.rs and publishes to the context. Returns 202 Accepted with message_id, sequence, and bridge_provenance. Handles claimed shadows by reflecting the claimed provenance status.",
       "acceptanceCriteria": [
         "POST /v1/scp/bridge/message accepts JSON body with shadow_id (required), content (required), content_type (required), platform_message_id (optional), platform_timestamp (optional)",
         "Constructs BridgeProvenance via mark_bridge_provenance() with correct originating_platform, bridge_mode, operator_did, and shadow_status",
@@ -192,7 +192,7 @@
       "files": [
         "crates/scp-node/src/bridge_handlers.rs"
       ],
-      "description": "Implement the attestation endpoint specified in §12.10.4. The platform vouches for a user's identity by providing attestation evidence (evidence_type, verification_method, verified_at, platform_confidence, optional additional_signals). The bridge node produces an IdentityLink attestation (§3.5) signed by the bridge operator's DID. This attestation feeds into the shadow claiming flow — a user who later joins SCP can present it to claim their shadow. Attestation expiry defaults to 24 hours.",
+      "description": "Implement the attestation endpoint specified in \u00a712.10.4. The platform vouches for a user's identity by providing attestation evidence (evidence_type, verification_method, verified_at, platform_confidence, optional additional_signals). The bridge node produces an IdentityLink attestation (\u00a73.5) signed by the bridge operator's DID. This attestation feeds into the shadow claiming flow \u2014 a user who later joins SCP can present it to claim their shadow. Attestation expiry defaults to 24 hours.",
       "acceptanceCriteria": [
         "POST /v1/scp/bridge/attest accepts JSON body with platform_handle (required), platform_user_id (required), attestation_evidence (required)",
         "attestation_evidence must contain evidence_type, verification_method, verified_at, platform_confidence",
@@ -234,7 +234,7 @@
       "files": [
         "crates/scp-node/src/bridge_handlers.rs"
       ],
-      "description": "Implement the bridge status and shadow deletion endpoints specified in §12.10.4. The status endpoint returns bridge_id, status, platform, mode, operator_did, registered_at, shadow_count, rate_limits, and shadows array. The delete endpoint removes a shadow identity (historical actions remain in event log), returns 204 on success, 404 if not found, 409 if claimed. Deletion is idempotent (re-deleting returns 204). Both endpoints delegate to existing scp-core/bridge/ functions.",
+      "description": "Implement the bridge status and shadow deletion endpoints specified in \u00a712.10.4. The status endpoint returns bridge_id, status, platform, mode, operator_did, registered_at, shadow_count, rate_limits, and shadows array. The delete endpoint removes a shadow identity (historical actions remain in event log), returns 204 on success, 404 if not found, 409 if claimed. Deletion is idempotent (re-deleting returns 204). Both endpoints delegate to existing scp-core/bridge/ functions.",
       "acceptanceCriteria": [
         "GET /v1/scp/bridge/status returns 200 with bridge_id, status, platform, mode, operator_did, registered_at, shadow_count, rate_limits, shadows array",
         "shadows array includes shadow_id, platform_handle, attributed_role, provenance_status, created_at for each shadow",
@@ -281,12 +281,12 @@
         "crates/scp-node/src/bridge_webhook.rs",
         "crates/scp-node/src/lib.rs"
       ],
-      "description": "Implement the webhook receiver specified in §12.10.4. Accepts platform-initiated events with event_type (message, presence, identity_update, user_departed, message_edit, message_delete), event_id (for deduplication), timestamp, and event-specific payload. Authentication via X-SCP-Signature header (§12.10.2). Deduplication by event_id. Must respond within 5 seconds; events requiring longer processing are queued internally. Returns accepted/rejected status with reason.",
+      "description": "Implement the webhook receiver specified in \u00a712.10.4. Accepts platform-initiated events with event_type (message, presence, identity_update, user_departed, message_edit, message_delete), event_id (for deduplication), timestamp, and event-specific payload. Authentication via X-SCP-Signature header (\u00a712.10.2). Deduplication by event_id. Must respond within 5 seconds; events requiring longer processing are queued internally. Returns accepted/rejected status with reason.",
       "acceptanceCriteria": [
         "POST /v1/scp/bridge/webhook accepts JSON body with event_type (required), event_id (required), timestamp (required), payload (required)",
         "Supports event types: message, presence, identity_update, user_departed, message_edit, message_delete",
         "Verifies X-SCP-Signature header via Ed25519 signature over raw request body",
-        "Deduplicates events by event_id — repeated delivery of same event_id returns accepted: true without reprocessing",
+        "Deduplicates events by event_id \u2014 repeated delivery of same event_id returns accepted: true without reprocessing",
         "Returns 200 with accepted: true and event_id on successful acceptance",
         "Returns 200 with accepted: false, event_id, and reason when event is rejected (e.g., unknown user)",
         "Response time is under 5 seconds; longer-running processing is queued internally",
@@ -331,7 +331,7 @@
         "crates/scp-node/src/lib.rs",
         "crates/scp-node/tests/bridge_integration.rs"
       ],
-      "description": "Wire all bridge HTTP handlers into the scp-node axum router under the /v1/scp/bridge/ prefix. Add integration tests that exercise the full lifecycle: register bridge, create shadow, emit message, attest identity, check status, receive webhook event, delete shadow. Verify provenance chain is correctly constructed end-to-end. Verify authentication is enforced on all endpoints. Verify error responses conform to §12.10.3.",
+      "description": "Wire all bridge HTTP handlers into the scp-node axum router under the /v1/scp/bridge/ prefix. Add integration tests that exercise the full lifecycle: register bridge, create shadow, emit message, attest identity, check status, receive webhook event, delete shadow. Verify provenance chain is correctly constructed end-to-end. Verify authentication is enforced on all endpoints. Verify error responses conform to \u00a712.10.3.",
       "acceptanceCriteria": [
         "All bridge endpoints are mounted under /v1/scp/bridge/ in the scp-node axum router",
         "Bridge auth middleware is applied to all bridge endpoints",
@@ -347,7 +347,7 @@
         "Apply BridgeAuthMiddleware to the bridge route group",
         "Create bridge_integration.rs with end-to-end lifecycle test",
         "Add test helpers for constructing DID-signed JWTs",
-        "Verify all error responses conform to §12.10.3 format"
+        "Verify all error responses conform to \u00a712.10.3 format"
       ],
       "blockedBy": [
         "SCP-BCH-002",
@@ -363,7 +363,7 @@
         },
         {
           "file": ".docs/specs/12-platform-bridge-connectors.md",
-          "section": "### 12.10.5 Bridge Node Lifecycle"
+          "section": "### 12.10.6 Bridge Node Lifecycle"
         },
         {
           "file": ".docs/adrs/phase-5.md",
@@ -383,7 +383,7 @@
         "crates/scp-core/src/bridge/credentials.rs",
         "crates/scp-core/src/bridge/mod.rs"
       ],
-      "description": "Implement the BridgeCredentialStore trait specified in §12.11. The trait defines the credential lifecycle: provision (store new credentials), retrieve (get credentials for use), rotate (replace credentials), revoke (destroy all credentials for a bridge instance), and list (enumerate credential types for a bridge). Credentials are encrypted at rest using a key derived from the bridge operator's identity key material via HKDF with a bridge-specific salt. The trait is async and returns Result types. On BridgeStatus::Revoked, revoke() destroys all credentials (overwrite with zeros, delete record). On BridgeStatus::Suspended, credentials are retained but retrieve() returns an error indicating the bridge is suspended. Credential access is scoped to bridge instance — cross-bridge credential sharing is prohibited. Add a BridgeCredential struct holding encrypted_data, credential_type, created_at, expires_at, and bridge_id. Add a CredentialType enum with variants OAuthAccessToken, OAuthRefreshToken, ApiKey, WebhookSecret, and Custom(String).",
+      "description": "Implement the BridgeCredentialStore trait specified in \u00a712.11. The trait defines the credential lifecycle: provision (store new credentials), retrieve (get credentials for use), rotate (replace credentials), revoke (destroy all credentials for a bridge instance), and list (enumerate credential types for a bridge). Credentials are encrypted at rest using a key derived from the bridge operator's identity key material via HKDF with a bridge-specific salt. The trait is async and returns Result types. On BridgeStatus::Revoked, revoke() destroys all credentials (overwrite with zeros, delete record). On BridgeStatus::Suspended, credentials are retained but retrieve() returns an error indicating the bridge is suspended. Credential access is scoped to bridge instance \u2014 cross-bridge credential sharing is prohibited. Add a BridgeCredential struct holding encrypted_data, credential_type, created_at, expires_at, and bridge_id. Add a CredentialType enum with variants OAuthAccessToken, OAuthRefreshToken, ApiKey, WebhookSecret, and Custom(String).",
       "acceptanceCriteria": [
         "BridgeCredentialStore trait is defined with async methods: provision, retrieve, rotate, revoke, list",
         "BridgeCredential struct has fields: encrypted_data (Vec<u8>), credential_type (CredentialType), created_at (u64), expires_at (Option<u64>), bridge_id (String)",
@@ -436,7 +436,7 @@
         "crates/scp-core/src/bridge/oauth.rs",
         "crates/scp-core/src/bridge/mod.rs"
       ],
-      "description": "Implement the OAuth 2.0 reference binding specified in §12.11.3. This provides a concrete OAuthBridgeFlow struct that orchestrates the Authorization Code + PKCE flow and integrates with BridgeCredentialStore for token storage. The flow is: (1) generate PKCE code verifier and challenge, (2) build authorization URL, (3) exchange authorization code for access + refresh tokens, (4) store both tokens via BridgeCredentialStore::provision, (5) auto-refresh access token when 80% of lifetime has elapsed, (6) on refresh failure, retry with exponential backoff (initial 1s, max 60s, 5 retries). On bridge revocation, call the platform's RFC 7009 token revocation endpoint for both tokens before destroying local copies. Scope minimization: Relay mode requests read-only scopes, Puppet mode requests read+write. The implementation uses reqwest for HTTP calls and is async.",
+      "description": "Implement the OAuth 2.0 reference binding specified in \u00a712.11.3. This provides a concrete OAuthBridgeFlow struct that orchestrates the Authorization Code + PKCE flow and integrates with BridgeCredentialStore for token storage. The flow is: (1) generate PKCE code verifier and challenge, (2) build authorization URL, (3) exchange authorization code for access + refresh tokens, (4) store both tokens via BridgeCredentialStore::provision, (5) auto-refresh access token when 80% of lifetime has elapsed, (6) on refresh failure, retry with exponential backoff (initial 1s, max 60s, 5 retries). On bridge revocation, call the platform's RFC 7009 token revocation endpoint for both tokens before destroying local copies. Scope minimization: Relay mode requests read-only scopes, Puppet mode requests read+write. The implementation uses reqwest for HTTP calls and is async.",
       "acceptanceCriteria": [
         "OAuthBridgeFlow struct is defined with fields: client_id, redirect_uri, token_endpoint, authorization_endpoint, revocation_endpoint (optional), scopes",
         "generate_pkce() returns a (code_verifier, code_challenge) tuple using S256 method",
@@ -494,13 +494,13 @@
         "crates/scp-core/src/bridge/shadow.rs",
         "crates/scp-core/src/crypto/sender_keys/mod.rs"
       ],
-      "description": "When create_shadow() is called, generate an AES-256-GCM sender key for the new shadow identity and store it in SenderKeyStore keyed by (context_id, shadow_did). This is the foundational key material for the bridge encryption model specified in §12.6.1: shadow identity messages use the sender key layer (§9.16) rather than MLS encryption. Each shadow gets its own sender key so that key compromise of one shadow does not affect others. The generated key must be cryptographically random (32 bytes from the platform CSPRNG).",
+      "description": "When create_shadow() is called, generate an AES-256-GCM sender key for the new shadow identity and store it in SenderKeyStore keyed by (context_id, shadow_did). This is the foundational key material for the bridge encryption model specified in \u00a712.6.1: shadow identity messages use the sender key layer (\u00a79.16) rather than MLS encryption. Each shadow gets its own sender key so that key compromise of one shadow does not affect others. The generated key must be cryptographically random (32 bytes from the platform CSPRNG).",
       "acceptanceCriteria": [
         "create_shadow() generates a 32-byte AES-256-GCM sender key using the platform CSPRNG",
         "The generated sender key is stored in SenderKeyStore keyed by (context_id, shadow_did)",
-        "Each shadow identity receives a unique sender key — no key reuse across shadows",
+        "Each shadow identity receives a unique sender key \u2014 no key reuse across shadows",
         "Sender key generation failure causes create_shadow() to return an error (no shadow created without a key)",
-        "The sender key is zeroized on drop (Zeroizing wrapper or equivalent) (SenderKey already derives ZeroizeOnDrop — verify it applies to the stored key)",
+        "The sender key is zeroized on drop (Zeroizing wrapper or equivalent) (SenderKey already derives ZeroizeOnDrop \u2014 verify it applies to the stored key)",
         "Unit tests verify sender key is stored after shadow creation",
         "Unit tests verify distinct shadows in the same context receive distinct keys",
         "Unit tests verify shadow creation fails gracefully when SenderKeyStore is unavailable"
@@ -533,12 +533,12 @@
         "crates/scp-core/src/crypto/sender_keys/key_protocol.rs",
         "crates/scp-core/src/bridge/mod.rs"
       ],
-      "description": "Native members request shadow sender keys via SenderKeyRequest. The bridge responds with the shadow's sender key wrapped via HPKE. This reuses the existing pull-based sender key distribution protocol specified in §9.16.2: SenderKeyRequest from native member, SenderKeyResponse from bridge containing the HPKE-wrapped key. The bridge operator's identity key is the HPKE sender; the requesting member's identity key is the HPKE recipient. Domain separation label for HPKE must use \"scp-sender-key-v1\" per the existing protocol. New members joining a bridged context automatically request sender keys for all active shadows.",
+      "description": "Native members request shadow sender keys via SenderKeyRequest. The bridge responds with the shadow's sender key wrapped via HPKE. This reuses the existing pull-based sender key distribution protocol specified in \u00a79.16.2: SenderKeyRequest from native member, SenderKeyResponse from bridge containing the HPKE-wrapped key. The bridge operator's identity key is the HPKE sender; the requesting member's identity key is the HPKE recipient. Domain separation label for HPKE must use \"scp-sender-key-v1\" per the existing protocol. New members joining a bridged context automatically request sender keys for all active shadows.",
       "acceptanceCriteria": [
         "Native members can send SenderKeyRequest for a shadow's sender key by (context_id, shadow_did)",
         "Bridge handles SenderKeyRequest by retrieving the shadow's sender key from SenderKeyStore and wrapping it via HPKE",
         "HPKE wrapping uses the bridge operator's identity key as sender and the requesting member's identity key as recipient",
-        "HPKE domain separation label is \"scp-sender-key-v1\" per §9.16.2",
+        "HPKE domain separation label is \"scp-sender-key-v1\" per \u00a79.16.2",
         "SenderKeyResponse contains the HPKE-wrapped sender key and is routed to the requesting member",
         "Members joining a bridged context request sender keys for all active shadows",
         "SenderKeyRequest for a non-existent shadow returns an error (not a silent failure)",
@@ -579,15 +579,15 @@
         "crates/scp-core/src/bridge/mod.rs",
         "crates/scp-core/src/envelope/inner.rs"
       ],
-      "description": "POST /v1/scp/bridge/message constructs a sender-key-encrypted envelope (not MLS) for shadow messages. AES-256-GCM encryption with the shadow's sender key, random 12-byte nonce per message, BridgeProvenance attached per §12.5. The envelope is distinguishable from MLS envelopes by structure: sender-key-encrypted envelopes contain a sender key ciphertext with the shadow's DID in the sender field, while MLS-encrypted envelopes contain an MLS ciphertext payload (§12.6.1). The receiver uses the envelope structure to select the correct decryption path — MLS for native members, sender key for shadow identities. Both paths already exist in the protocol.",
+      "description": "POST /v1/scp/bridge/message constructs a sender-key-encrypted envelope (not MLS) for shadow messages. AES-256-GCM encryption with the shadow's sender key, random 12-byte nonce per message, BridgeProvenance attached per \u00a712.5. The envelope is distinguishable from MLS envelopes by structure: sender-key-encrypted envelopes contain a sender key ciphertext with the shadow's DID in the sender field, while MLS-encrypted envelopes contain an MLS ciphertext payload (\u00a712.6.1). The receiver uses the envelope structure to select the correct decryption path \u2014 MLS for native members, sender key for shadow identities. Both paths already exist in the protocol.",
       "acceptanceCriteria": [
         "POST /v1/scp/bridge/message constructs a sender-key-encrypted envelope using the shadow's AES-256-GCM sender key",
         "Each envelope uses a unique random 12-byte nonce generated from the platform CSPRNG",
-        "BridgeProvenance is attached to the envelope per §12.5 via mark_bridge_provenance()",
+        "BridgeProvenance is attached to the envelope per \u00a712.5 via mark_bridge_provenance()",
         "The envelope's sender field contains the shadow's DID",
         "Sender-key-encrypted envelopes are structurally distinguishable from MLS-encrypted envelopes",
         "Receivers can select the correct decryption path (sender key vs MLS) based on envelope structure alone",
-        "Nonce reuse is prevented — each message gets a fresh random nonce",
+        "Nonce reuse is prevented \u2014 each message gets a fresh random nonce",
         "Encryption failure (e.g., missing sender key) returns an appropriate error to the bridge endpoint",
         "Unit tests verify envelope construction with correct AES-256-GCM ciphertext",
         "Unit tests verify envelope is decryptable with the shadow's sender key",
@@ -600,7 +600,7 @@
         "Encrypt message content with AES-256-GCM using the sender key and a random 12-byte nonce",
         "Attach BridgeProvenance via mark_bridge_provenance()",
         "Set the envelope sender field to the shadow's DID",
-        "Ensure envelope structure is distinguishable from MLS envelopes per §12.6.1",
+        "Ensure envelope structure is distinguishable from MLS envelopes per \u00a712.6.1",
         "Add unit tests for encryption, decryption roundtrip, provenance attachment, and envelope type discrimination"
       ],
       "blockedBy": [
@@ -626,9 +626,9 @@
         "crates/scp-core/src/bridge/registration.rs",
         "crates/scp-core/src/context/params.rs"
       ],
-      "description": "When register_bridge() succeeds, add the operator's DID to context metadata (§5.7) so that context members can see bridge presence and evaluate trust accordingly. Per §12.6.1: \"Context metadata (§5.7) MUST include bridge_operator_did when a bridge is registered.\" This is a MUST-level requirement. The bridge_operator_did field is added to context metadata and is visible to all members, including in pre-join context previews. If multiple bridges are registered, all operator DIDs are listed. On bridge revocation, the operator's DID is removed from context metadata.",
+      "description": "When register_bridge() succeeds, add the operator's DID to context metadata (\u00a75.7) so that context members can see bridge presence and evaluate trust accordingly. Per \u00a712.6.1: \"Context metadata (\u00a75.7) MUST include bridge_operator_did when a bridge is registered.\" This is a MUST-level requirement. The bridge_operator_did field is added to context metadata and is visible to all members, including in pre-join context previews. If multiple bridges are registered, all operator DIDs are listed. On bridge revocation, the operator's DID is removed from context metadata.",
       "acceptanceCriteria": [
-        "register_bridge() adds bridge_operator_did to context metadata (§5.7) on successful registration",
+        "register_bridge() adds bridge_operator_did to context metadata (\u00a75.7) on successful registration",
         "bridge_operator_did is visible to all context members",
         "bridge_operator_did is visible in pre-join context previews",
         "Multiple bridge registrations result in all operator DIDs listed in context metadata",

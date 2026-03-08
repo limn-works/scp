@@ -156,7 +156,7 @@ pub async fn context_discover(query: String) -> napi::Result<String> {
         let result = scp_core::discovery::resolve_context_uri(&query).map_err(|e| {
             napi::Error::from(ScpNapiError::Context {
                 message: format!("failed to resolve scp:// URI: {e}"),
-                code: "SCP-CTX-7023".to_owned(),
+                code: "SCP-CTX-2020".to_owned(),
             })
         })?;
 
@@ -164,7 +164,7 @@ pub async fn context_discover(query: String) -> napi::Result<String> {
         serde_json::to_string(&results).map_err(|e| {
             napi::Error::from(ScpNapiError::Context {
                 message: format!("failed to serialize discovery results: {e}"),
-                code: "SCP-CTX-7024".to_owned(),
+                code: "SCP-CTX-2021".to_owned(),
             })
         })
     } else if query.starts_with("did:") {
@@ -174,7 +174,7 @@ pub async fn context_discover(query: String) -> napi::Result<String> {
             .map_err(|e| {
                 napi::Error::from(ScpNapiError::Context {
                     message: format!("DHT discovery failed for '{query}': {e}"),
-                    code: "SCP-CTX-7025".to_owned(),
+                    code: "SCP-CTX-2022".to_owned(),
                 })
             })?;
 
@@ -183,7 +183,7 @@ pub async fn context_discover(query: String) -> napi::Result<String> {
         serde_json::to_string(&json_results).map_err(|e| {
             napi::Error::from(ScpNapiError::Context {
                 message: format!("failed to serialize discovery results: {e}"),
-                code: "SCP-CTX-7026".to_owned(),
+                code: "SCP-CTX-2023".to_owned(),
             })
         })
     } else {

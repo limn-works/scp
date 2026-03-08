@@ -1916,6 +1916,10 @@ pub async fn context_create(
                 let _ = core_id;
             }
 
+            // Register per-context UCAN validation state (revocation list,
+            // nonce tracker, event log) for the UCAN pipeline.
+            crate::runtime::ensure_ucan_registered(&context_id, &identity.did, &params.ceiling);
+
             let handle = Arc::new(ContextHandle {
                 context_id,
                 state: tokio::sync::Mutex::new(ContextState::Active),
@@ -2113,6 +2117,66 @@ pub async fn context_close(
                 .close_context(&core_handle, &initiator_did)
                 .await
                 .map_err(ScpError::from)?;
+
+            // Wire CloseOrchestrator for contexts with summary verification.
+            // After the ContextManager has processed the close, check the
+            // context's memory scope and initiate the appropriate destruction
+            // path via CloseOrchestrator (#365).
+            let memory_scope = core_handle.params().memory_scope;
+            let now = scp_core::time::now_secs().unwrap_or(0);
+
+            let crypto_provider = crate::runtime::context_manager_crypto();
+            let orchestrator = scp_core::context::close::CloseOrchestrator::new(crypto_provider);
+
+            let close_action = orchestrator
+                .initiate_close(
+                    &handle.context_id,
+                    scp_core::context::close::ContextCloseReason::GovernanceClosed,
+                    memory_scope,
+                    &[], // relay_urls — not available at bridge layer
+                    &[], // blob_ids — not available at bridge layer
+                    scp_core::context::memory_scope::KeyDestructionLevel::SoftwareOnly,
+                    0,    // member_count — not tracked at bridge layer
+                    None, // verification_window_secs — use default
+                    now,
+                )
+                .map_err(|e| ScpError::Context {
+                    message: format!("close orchestration failed: {e}"),
+                    code: "SCP-CTX-2017".to_owned(),
+                })?;
+
+            // Log the close action for observability. For Summary scope,
+            // the verification window is opened but not actively polled —
+            // that requires a SummaryTool which needs design decisions.
+            // For Ephemeral, keys are destroyed immediately.
+            // For Full, data is preserved.
+            match close_action {
+                scp_core::context::close::CloseAction::KeysDestroyed { .. } => {
+                    tracing::info!(
+                        context_id = %handle.context_id,
+                        "close orchestrator: keys destroyed (ephemeral scope)"
+                    );
+                }
+                scp_core::context::close::CloseAction::VerificationWindowOpened {
+                    ref window,
+                    ..
+                } => {
+                    tracing::info!(
+                        context_id = %handle.context_id,
+                        deadline = window.deadline(),
+                        "close orchestrator: summary verification window opened"
+                    );
+                }
+                scp_core::context::close::CloseAction::Preserved { .. } => {
+                    tracing::info!(
+                        context_id = %handle.context_id,
+                        "close orchestrator: full data preservation (no key destruction)"
+                    );
+                }
+            }
+
+            // Clean up per-context UCAN state.
+            crate::runtime::remove_ucan_state(&handle.context_id);
 
             *state = ContextState::Closed;
             drop(state);
@@ -2401,6 +2465,13 @@ pub async fn tool_register(
 /// * `tool_id` — The ID of the tool to invoke.
 /// * `input_json` — Tool input parameters as a JSON string.
 /// * `identity` — The identity of the invoker (used for capability checking).
+/// * `ucan_token` — Optional JWT-encoded UCAN token authorizing the invocation.
+///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability. When
+///   present, the full 11-step ADR-016 validation pipeline is executed before
+///   tool dispatch. See spec §6.2, §8, ADR-016, and issue #319.
+/// * `proof_tokens` — Optional list of encoded parent UCAN tokens for
+///   delegation chain traversal (ADR-016 step 3). Only relevant when
+///   `ucan_token` is `Some`.
 ///
 /// # Returns
 ///
@@ -2410,12 +2481,16 @@ pub async fn tool_register(
 ///
 /// Returns `ScpError::Tool` if the tool is not found, invocation fails,
 /// input fails schema validation, or the invoker lacks capability.
+/// Returns `ScpError::Permission` if the UCAN token is invalid, expired,
+/// revoked, or lacks the required tool invocation capability.
 #[uniffi::export]
 pub async fn tool_invoke(
     handle: Arc<ContextHandle>,
     tool_id: String,
     input_json: String,
     identity: Arc<Identity>,
+    ucan_token: Option<String>,
+    proof_tokens: Option<Vec<String>>,
 ) -> Result<String, ScpError> {
     runtime()
         .spawn(async move {
@@ -2431,6 +2506,18 @@ pub async fn tool_invoke(
                 });
             }
             drop(state);
+
+            // Primary authorization: UCAN token validation via the full 11-step
+            // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
+            if let Some(ref token) = ucan_token {
+                validate_tool_ucan_uniffi(
+                    &handle,
+                    &tool_id,
+                    token,
+                    &identity.did,
+                    proof_tokens.as_ref(),
+                )?;
+            }
 
             let registry = handle.tool_registry.lock().await;
             let registration = registry.get(&tool_id).ok_or_else(|| ScpError::Tool {
@@ -2491,6 +2578,76 @@ pub async fn tool_invoke(
             message: format!("tokio task join error during tool invocation: {e}"),
             code: "SCP-TOOL-6006".to_owned(),
         })?
+}
+
+/// Validates a UCAN token for tool invocation authorization (`UniFFI` bridge).
+///
+/// Runs the full 11-step ADR-016 pipeline, requiring `tool_invoke:{tool_id}`
+/// or `tool_invoke:*` capability. Extracted to keep `tool_invoke` focused.
+fn validate_tool_ucan_uniffi(
+    handle: &ContextHandle,
+    tool_id: &str,
+    ucan_token: &str,
+    identity_did: &str,
+    proof_tokens: Option<&Vec<String>>,
+) -> Result<(), ScpError> {
+    use scp_core::context::tools::invoke::validate_tool_invocation_ucan;
+    use scp_core::crypto::ucan::validate::{
+        DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, parse_ucan,
+    };
+
+    // Build proof resolver from optional proof tokens.
+    let mut proofs = std::collections::HashMap::new();
+    if let Some(tokens) = proof_tokens {
+        for encoded in tokens {
+            let proof_token = parse_ucan(encoded).map_err(|e| ScpError::Permission {
+                message: format!("malformed proof token: {e}"),
+                code: "SCP-PERM-3002".to_owned(),
+            })?;
+            let cid = scp_core::crypto::ucan::mint::compute_cid(&proof_token);
+            proofs.insert(cid, proof_token);
+        }
+    }
+    let proof_resolver = scp_ffi_common::BridgeProofResolver { proofs };
+
+    // Ensure UCAN state is registered for this context.
+    crate::runtime::ensure_ucan_registered(
+        &handle.context_id,
+        &handle.creator_did,
+        &handle.ceiling_strings,
+    );
+
+    crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
+        let did_resolver = scp_ffi_common::BridgeDidResolver;
+        let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
+            revocation_list: &ucan_state.revocation_list,
+        };
+        let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
+            inner: &mut ucan_state.nonce_tracker,
+        };
+
+        let mut ctx = ValidationContext {
+            did_resolver: &did_resolver,
+            nonce_tracker: &mut nonce_adapter,
+            revocation_checker: &revocation_checker,
+            proof_resolver: &proof_resolver,
+            ceiling: &ucan_state.ceiling_strings,
+            context_creator_did: &ucan_state.creator_did,
+            presenting_agent_did: identity_did,
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        validate_tool_invocation_ucan(ucan_token, &handle.context_id, tool_id, &mut ctx).map_err(
+            |e| ScpError::Permission {
+                message: format!("UCAN authorization failed for tool '{tool_id}': {e}"),
+                code: "SCP-PERM-3002".to_owned(),
+            },
+        )
+    })
+    .ok_or_else(|| ScpError::Permission {
+        message: format!("context '{}' not found in UCAN registry", handle.context_id),
+        code: "SCP-PERM-3002".to_owned(),
+    })?
 }
 
 /// Verifies a tool against its registered test vectors.
@@ -2985,18 +3142,90 @@ pub async fn ucan_validate(
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let _ = (
-                handle,
-                token,
-                capability,
-                presenting_agent_did,
-                proof_tokens,
-            );
-            Err(ScpError::Permission {
-                message: "not yet connected to runtime — UCAN validation requires a live context"
-                    .to_owned(),
+            use scp_core::crypto::ucan::capability::CapabilityUri;
+            use scp_core::crypto::ucan::validate::{
+                DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, parse_ucan, validate_ucan,
+            };
+
+            // Step 1: Parse the UCAN token.
+            let parsed_token = parse_ucan(&token).map_err(|e| ScpError::Permission {
+                message: format!("malformed UCAN token: {e}"),
                 code: "SCP-PERM-3002".to_owned(),
-            })
+            })?;
+
+            // Parse the required capability URI.
+            let required_cap: CapabilityUri =
+                capability
+                    .parse()
+                    .map_err(
+                        |e: scp_core::crypto::ucan::UcanError| ScpError::Permission {
+                            message: format!("invalid capability URI '{capability}': {e}"),
+                            code: "SCP-PERM-3002".to_owned(),
+                        },
+                    )?;
+
+            // Determine the presenting agent DID: explicit parameter or token audience.
+            let agent_did = presenting_agent_did
+                .as_deref()
+                .unwrap_or(&parsed_token.payload.aud);
+
+            // Build proof resolver from optional proof tokens.
+            let mut proofs = std::collections::HashMap::new();
+            if let Some(ref tokens) = proof_tokens {
+                for encoded in tokens {
+                    let proof_token = parse_ucan(encoded).map_err(|e| ScpError::Permission {
+                        message: format!("malformed proof token: {e}"),
+                        code: "SCP-PERM-3002".to_owned(),
+                    })?;
+                    let cid = scp_core::crypto::ucan::mint::compute_cid(&proof_token);
+                    proofs.insert(cid, proof_token);
+                }
+            }
+            let proof_resolver = scp_ffi_common::BridgeProofResolver { proofs };
+
+            // Ensure UCAN state is registered for this context.
+            crate::runtime::ensure_ucan_registered(
+                &handle.context_id,
+                &handle.creator_did,
+                &handle.ceiling_strings,
+            );
+
+            // Execute the full 11-step validation pipeline via per-context state.
+            let validation_result =
+                crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
+                    let did_resolver = scp_ffi_common::BridgeDidResolver;
+                    let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
+                        revocation_list: &ucan_state.revocation_list,
+                    };
+                    let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
+                        inner: &mut ucan_state.nonce_tracker,
+                    };
+
+                    let mut ctx = ValidationContext {
+                        did_resolver: &did_resolver,
+                        nonce_tracker: &mut nonce_adapter,
+                        revocation_checker: &revocation_checker,
+                        proof_resolver: &proof_resolver,
+                        ceiling: &ucan_state.ceiling_strings,
+                        context_creator_did: &ucan_state.creator_did,
+                        presenting_agent_did: agent_did,
+                        clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                    };
+
+                    validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(|e| {
+                        ScpError::Permission {
+                            message: format!("UCAN validation failed: {e}"),
+                            code: "SCP-PERM-3002".to_owned(),
+                        }
+                    })
+                })
+                .ok_or_else(|| ScpError::Permission {
+                    message: format!("context '{}' not found in UCAN registry", handle.context_id),
+                    code: "SCP-PERM-3002".to_owned(),
+                })?;
+            validation_result?;
+
+            Ok(())
         })
         .await
         .map_err(|e| ScpError::Permission {
@@ -3153,12 +3382,34 @@ async fn ucan_mint_impl(
 pub async fn ucan_revoke(handle: Arc<ContextHandle>, token: String) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            let _ = (handle, token);
-            Err(ScpError::Permission {
-                message: "not yet connected to runtime — UCAN revocation requires a live context"
-                    .to_owned(),
+            use scp_core::crypto::ucan::revoke::compute_revocation_cid;
+            use scp_core::crypto::ucan::validate::parse_ucan;
+
+            // Parse the token to extract its payload for CID computation.
+            let parsed = parse_ucan(&token).map_err(|e| ScpError::Permission {
+                message: format!("malformed UCAN token: {e}"),
                 code: "SCP-PERM-3006".to_owned(),
+            })?;
+
+            // Ensure UCAN state is registered for this context.
+            crate::runtime::ensure_ucan_registered(
+                &handle.context_id,
+                &handle.creator_did,
+                &handle.ceiling_strings,
+            );
+
+            // Compute the content-hash CID matching scp-core's format and add
+            // it to the context's revocation list.
+            crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
+                let token_cid = compute_revocation_cid(&parsed.payload);
+                ucan_state.revocation_list.revoke(token_cid);
             })
+            .ok_or_else(|| ScpError::Permission {
+                message: format!("context '{}' not found in UCAN registry", handle.context_id),
+                code: "SCP-PERM-3006".to_owned(),
+            })?;
+
+            Ok(())
         })
         .await
         .map_err(|e| ScpError::Permission {
@@ -3197,12 +3448,154 @@ pub async fn event_log_query(
 ) -> Result<Vec<Event>, ScpError> {
     runtime()
         .spawn(async move {
-            let _ = (handle, filter_json);
-            Err(ScpError::Context {
-                message: "not yet connected to runtime — event log query requires a live context"
-                    .to_owned(),
-                code: "SCP-CTX-2023".to_owned(),
+            // Ensure UCAN state (which contains the event log) is registered.
+            crate::runtime::ensure_ucan_registered(
+                &handle.context_id,
+                &handle.creator_did,
+                &handle.ceiling_strings,
+            );
+
+            // Parse optional filter JSON.
+            let filter: Option<serde_json::Value> = match filter_json {
+                Some(ref json_str) => {
+                    Some(
+                        serde_json::from_str(json_str).map_err(|e| ScpError::Context {
+                            message: format!("invalid filter JSON: {e}"),
+                            code: "SCP-CTX-2023".to_owned(),
+                        })?,
+                    )
+                }
+                None => None,
+            };
+
+            let filter_event_type = filter
+                .as_ref()
+                .and_then(|f| f.get("event_type"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let filter_actor_did = filter
+                .as_ref()
+                .and_then(|f| f.get("actor_did"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let filter_after_seq = filter
+                .as_ref()
+                .and_then(|f| f.get("after_sequence"))
+                .and_then(serde_json::Value::as_u64);
+            let filter_before_seq = filter
+                .as_ref()
+                .and_then(|f| f.get("before_sequence"))
+                .and_then(serde_json::Value::as_u64);
+            #[allow(clippy::cast_possible_truncation)]
+            let filter_limit = filter
+                .as_ref()
+                .and_then(|f| f.get("limit"))
+                .and_then(serde_json::Value::as_u64)
+                .map(|v| v as usize);
+
+            // Query the event log from per-context UCAN state.
+            let events = crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
+                let event_count = scp_event_log::tree::event_count(&ucan_state.event_log);
+
+                if event_count == 0 {
+                    return Vec::new();
+                }
+
+                let merkle_root = scp_event_log::tree::root(&ucan_state.event_log);
+                let merkle_root_hex = hex::encode(merkle_root);
+
+                // Query events stored in the event log by iterating the
+                // stored events slice and applying filters.
+                let all_events = ucan_state.event_log.events();
+
+                if !all_events.is_empty() {
+                    let mut results: Vec<Event> = Vec::new();
+                    for evt in all_events {
+                        // Apply sequence range filters.
+                        if let Some(after) = filter_after_seq
+                            && evt.sequence <= after
+                        {
+                            continue;
+                        }
+                        if let Some(before) = filter_before_seq
+                            && evt.sequence >= before
+                        {
+                            continue;
+                        }
+                        // Apply event type filter.
+                        if let Some(ref et) = filter_event_type
+                            && format!("{:?}", evt.event_type) != *et
+                        {
+                            continue;
+                        }
+                        // Apply actor DID filter.
+                        if let Some(ref actor) = filter_actor_did
+                            && evt.actor_did.0 != *actor
+                        {
+                            continue;
+                        }
+
+                        // Try to interpret payload bytes as UTF-8 JSON; fall
+                        // back to hex encoding for binary payloads.
+                        let payload_json = std::str::from_utf8(&evt.payload.data)
+                            .ok()
+                            .filter(|s| serde_json::from_str::<serde_json::Value>(s).is_ok())
+                            .map_or_else(
+                                || {
+                                    serde_json::json!({
+                                        "hex": hex::encode(&evt.payload.data),
+                                    })
+                                    .to_string()
+                                },
+                                str::to_owned,
+                            );
+
+                        results.push(Event {
+                            event_type: format!("{:?}", evt.event_type),
+                            actor_did: evt.actor_did.0.clone(),
+                            timestamp: evt.timestamp,
+                            payload_json,
+                            sequence: evt.sequence,
+                        });
+
+                        if let Some(lim) = filter_limit
+                            && results.len() >= lim
+                        {
+                            break;
+                        }
+                    }
+                    if !results.is_empty() {
+                        return results;
+                    }
+                }
+
+                // Fallback: return a summary event with Merkle root metadata.
+                let now = scp_core::time::now_secs().unwrap_or(0);
+                let summary = Event {
+                    event_type: "LogSummary".to_owned(),
+                    actor_did: String::new(),
+                    timestamp: now,
+                    payload_json: serde_json::json!({
+                        "event_count": event_count,
+                        "merkle_root": merkle_root_hex,
+                    })
+                    .to_string(),
+                    sequence: event_count.saturating_sub(1),
+                };
+
+                let summary_events = vec![summary];
+                if let Some(lim) = filter_limit {
+                    summary_events.into_iter().take(lim).collect()
+                } else {
+                    summary_events
+                }
             })
+            .ok_or_else(|| ScpError::Context {
+                message: format!("context '{}' not found in UCAN registry", handle.context_id),
+                code: "SCP-CTX-2023".to_owned(),
+            })?;
+
+            Ok(events)
         })
         .await
         .map_err(|e| ScpError::Context {
@@ -3238,13 +3631,170 @@ pub async fn event_log_verify(
 ) -> Result<Proof, ScpError> {
     runtime()
         .spawn(async move {
-            let _ = (handle, claim_json);
-            Err(ScpError::Context {
-                message:
-                    "not yet connected to runtime — event log verification requires a live context"
-                        .to_owned(),
-                code: "SCP-CTX-2025".to_owned(),
-            })
+            // Parse the claim JSON.
+            let claim: serde_json::Value =
+                serde_json::from_str(&claim_json).map_err(|e| ScpError::Context {
+                    message: format!("invalid claim JSON: {e}"),
+                    code: "SCP-CTX-2025".to_owned(),
+                })?;
+
+            let claim_type =
+                claim
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ScpError::Context {
+                        message: "claim must include 'type' field ('inclusion' or 'absence')"
+                            .to_owned(),
+                        code: "SCP-CTX-2025".to_owned(),
+                    })?;
+
+            // Ensure UCAN state (which contains the event log) is registered.
+            crate::runtime::ensure_ucan_registered(
+                &handle.context_id,
+                &handle.creator_did,
+                &handle.ceiling_strings,
+            );
+
+            match claim_type {
+                "inclusion" => {
+                    let leaf_index = claim
+                        .get("leaf_index")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or_else(|| ScpError::Context {
+                            message: "inclusion claim must include 'leaf_index' (integer)"
+                                .to_owned(),
+                            code: "SCP-CTX-2025".to_owned(),
+                        })?;
+
+                    crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
+                        let proof = scp_event_log::proof::prove_inclusion(
+                            &ucan_state.event_log,
+                            leaf_index,
+                        )
+                        .map_err(|e| ScpError::Context {
+                            message: format!("inclusion proof failed: {e}"),
+                            code: "SCP-CTX-2025".to_owned(),
+                        })?;
+                        let verified = scp_event_log::proof::verify_inclusion(&proof);
+
+                        let path_steps: Vec<serde_json::Value> = proof
+                            .path
+                            .iter()
+                            .map(|step| {
+                                let direction = match step.direction {
+                                    scp_event_log::proof::Direction::Left => "left",
+                                    scp_event_log::proof::Direction::Right => "right",
+                                };
+                                serde_json::json!({
+                                    "sibling_hash": hex::encode(step.sibling_hash),
+                                    "direction": direction,
+                                })
+                            })
+                            .collect();
+
+                        let details = serde_json::json!({
+                            "leaf_index": proof.leaf_index,
+                            "leaf_hash": hex::encode(proof.leaf_hash),
+                            "root": hex::encode(proof.root),
+                            "path": path_steps,
+                            "path_length": proof.path.len(),
+                        });
+
+                        Ok(Proof {
+                            verified,
+                            proof_type: "inclusion".to_owned(),
+                            details_json: details.to_string(),
+                        })
+                    })
+                    .ok_or_else(|| ScpError::Context {
+                        message: format!(
+                            "context '{}' not found in UCAN registry",
+                            handle.context_id
+                        ),
+                        code: "SCP-CTX-2025".to_owned(),
+                    })?
+                }
+                "absence" => {
+                    let event_hash_hex = claim
+                        .get("event_hash")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| ScpError::Context {
+                            message: "absence claim must include 'event_hash' (hex string)"
+                                .to_owned(),
+                            code: "SCP-CTX-2025".to_owned(),
+                        })?;
+
+                    let event_hash_bytes =
+                        hex::decode(event_hash_hex).map_err(|e| ScpError::Context {
+                            message: format!("invalid event_hash hex: {e}"),
+                            code: "SCP-CTX-2025".to_owned(),
+                        })?;
+                    let event_hash: [u8; 32] =
+                        event_hash_bytes
+                            .try_into()
+                            .map_err(|v: Vec<u8>| ScpError::Context {
+                                message: format!("event_hash must be 32 bytes, got {}", v.len()),
+                                code: "SCP-CTX-2025".to_owned(),
+                            })?;
+
+                    crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
+                        let proof =
+                            scp_event_log::proof::prove_absence(&ucan_state.event_log, &event_hash)
+                                .map_err(|e| ScpError::Context {
+                                    message: format!("absence proof failed: {e}"),
+                                    code: "SCP-CTX-2025".to_owned(),
+                                })?;
+
+                        let lower = proof.lower.as_ref().map(|lwp| {
+                            serde_json::json!({
+                                "leaf_hash": hex::encode(lwp.leaf_hash),
+                                "leaf_index": lwp.leaf_index,
+                            })
+                        });
+                        let upper = proof.upper.as_ref().map(|uwp| {
+                            serde_json::json!({
+                                "leaf_hash": hex::encode(uwp.leaf_hash),
+                                "leaf_index": uwp.leaf_index,
+                            })
+                        });
+
+                        let lower_verified = proof.lower.as_ref().is_none_or(|lwp| {
+                            scp_event_log::proof::verify_inclusion(&lwp.inclusion_proof)
+                        });
+                        let upper_verified = proof.upper.as_ref().is_none_or(|uwp| {
+                            scp_event_log::proof::verify_inclusion(&uwp.inclusion_proof)
+                        });
+                        let verified = lower_verified && upper_verified;
+
+                        let details = serde_json::json!({
+                            "query_hash": hex::encode(proof.query_hash),
+                            "root": hex::encode(proof.root),
+                            "leaf_count": proof.leaf_count,
+                            "lower": lower,
+                            "upper": upper,
+                        });
+
+                        Ok(Proof {
+                            verified,
+                            proof_type: "absence".to_owned(),
+                            details_json: details.to_string(),
+                        })
+                    })
+                    .ok_or_else(|| ScpError::Context {
+                        message: format!(
+                            "context '{}' not found in UCAN registry",
+                            handle.context_id
+                        ),
+                        code: "SCP-CTX-2025".to_owned(),
+                    })?
+                }
+                other => Err(ScpError::Context {
+                    message: format!(
+                        "unsupported claim type '{other}': expected 'inclusion' or 'absence'"
+                    ),
+                    code: "SCP-CTX-2025".to_owned(),
+                }),
+            }
         })
         .await
         .map_err(|e| ScpError::Context {
@@ -4260,7 +4810,7 @@ pub fn provenance_attach(
         other => {
             return Err(ScpError::Validation {
                 message: format!("invalid source_type '{other}'"),
-                code: "SCP-VALID-6020".to_owned(),
+                code: "SCP-VALID-7040".to_owned(),
             });
         }
     };
@@ -4271,7 +4821,7 @@ pub fn provenance_attach(
         other => {
             return Err(ScpError::Validation {
                 message: format!("invalid memory_scope '{other}'"),
-                code: "SCP-VALID-6021".to_owned(),
+                code: "SCP-VALID-7041".to_owned(),
             });
         }
     };
@@ -4320,7 +4870,7 @@ pub fn provenance_attach(
 
     serde_json::to_string(&result).map_err(|e| ScpError::Validation {
         message: format!("failed to serialize provenance: {e}"),
-        code: "SCP-VALID-6022".to_owned(),
+        code: "SCP-VALID-7042".to_owned(),
     })
 }
 
@@ -4370,7 +4920,7 @@ pub fn bridge_evaluate_trust(
         other => {
             return Err(ScpError::Validation {
                 message: format!("invalid shadow_status '{other}': expected 'shadow' or 'claimed'"),
-                code: "SCP-VALID-6030".to_owned(),
+                code: "SCP-VALID-7043".to_owned(),
             });
         }
     };
@@ -4465,7 +5015,7 @@ pub fn discovery_parse_address(address: String) -> Result<String, ScpError> {
     let parsed =
         scp_core::discovery::parse_address(&address).map_err(|e| ScpError::Validation {
             message: format!("invalid address '{address}': {e}"),
-            code: "SCP-VALID-6040".to_owned(),
+            code: "SCP-VALID-7044".to_owned(),
         })?;
 
     let result = match parsed {
@@ -4500,7 +5050,7 @@ pub fn discovery_parse_address(address: String) -> Result<String, ScpError> {
 
     serde_json::to_string(&result).map_err(|e| ScpError::Validation {
         message: format!("failed to serialize parsed address: {e}"),
-        code: "SCP-VALID-6041".to_owned(),
+        code: "SCP-VALID-7045".to_owned(),
     })
 }
 
@@ -4519,7 +5069,7 @@ pub fn discovery_create_query(
 
     serde_json::to_string(&query).map_err(|e| ScpError::Validation {
         message: format!("failed to serialize query: {e}"),
-        code: "SCP-VALID-6042".to_owned(),
+        code: "SCP-VALID-7046".to_owned(),
     })
 }
 

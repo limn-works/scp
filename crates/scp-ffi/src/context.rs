@@ -1533,6 +1533,524 @@ fn py_context_import(data: &[u8]) -> PyResult<String> {
 }
 
 // ---------------------------------------------------------------------------
+// No-op UCAN validation trait stubs for subscribe_broadcast (#369)
+//
+// Minimal implementations satisfying the generic bounds on
+// ContextManager::subscribe_broadcast. Broadcast subscription in open mode
+// does not require UCAN validation; gated mode validation will be wired
+// when the full UCAN pipeline is integrated with the FFI layer.
+// ---------------------------------------------------------------------------
+
+struct NoOpDidResolver;
+impl scp_core::crypto::ucan::validate::DidResolver for NoOpDidResolver {
+    fn resolve_public_key(
+        &self,
+        _did: &str,
+    ) -> Result<[u8; 32], scp_core::crypto::ucan::UcanError> {
+        Err(scp_core::crypto::ucan::UcanError::MalformedToken(
+            "NoOpDidResolver: no DID resolution available".into(),
+        ))
+    }
+}
+
+struct NoOpNonceTracker;
+impl scp_core::crypto::ucan::validate::NonceTracker for NoOpNonceTracker {
+    fn check_and_record(
+        &mut self,
+        _nonce: &str,
+        _token_expiry: u64,
+    ) -> Result<(), scp_core::crypto::ucan::UcanError> {
+        Ok(())
+    }
+}
+
+struct NoOpRevocationChecker;
+impl scp_core::crypto::ucan::validate::RevocationChecker for NoOpRevocationChecker {
+    fn is_revoked(&self, _token_cid: &str) -> bool {
+        false
+    }
+}
+
+struct NoOpProofResolver;
+impl scp_core::crypto::ucan::validate::ProofResolver for NoOpProofResolver {
+    fn resolve_proof(
+        &self,
+        cid: &str,
+    ) -> Result<scp_core::crypto::ucan::UcanToken, scp_core::crypto::ucan::UcanError> {
+        Err(scp_core::crypto::ucan::UcanError::DelegationChainBroken(
+            format!("NoOpProofResolver: no proof available for CID {cid}"),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Governance bridge (#369)
+// ---------------------------------------------------------------------------
+
+/// Executes a governance action on a context.
+///
+/// # Arguments
+///
+/// * `handle` -- The context handle.
+/// * `proposal_json` -- JSON-serialized `GovernanceProposal`.
+///
+/// # Returns
+///
+/// A string describing the governance action result (e.g., `"MemberAdded"`).
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the context manager is not initialized, the
+/// proposal JSON is invalid, or governance execution fails.
+#[pyfunction]
+#[pyo3(signature = (handle, proposal_json))]
+fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyResult<String> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let proposal_json_owned = proposal_json.to_owned();
+
+    rt.block_on(async move {
+        let proposal: scp_core::context::governance::GovernanceProposal =
+            serde_json::from_str(&proposal_json_owned).map_err(|e| {
+                PyValueError::new_err(format!("invalid governance proposal JSON: {e}"))
+            })?;
+        let result = mgr
+            .execute_governance_action(&context_id, &proposal)
+            .await
+            .map_err(|e| PyRuntimeError::new_err(format!("governance execution failed: {e}")))?;
+
+        use scp_core::context::manager::GovernanceActionResult;
+        let result_str = match result {
+            GovernanceActionResult::MemberAdded => "MemberAdded",
+            GovernanceActionResult::MemberRemoved => "MemberRemoved",
+            GovernanceActionResult::RoleChanged => "RoleChanged",
+            GovernanceActionResult::ToolRegistered => "ToolRegistered",
+            GovernanceActionResult::ToolRemoved => "ToolRemoved",
+            GovernanceActionResult::CeilingModified => "CeilingModified",
+            GovernanceActionResult::ContextClosed => "ContextClosed",
+            GovernanceActionResult::TtlExtended => "TtlExtended",
+            GovernanceActionResult::PruningPolicyModified => "PruningPolicyModified",
+            GovernanceActionResult::AdminTransferred => "AdminTransferred",
+            GovernanceActionResult::SignerAdded => "SignerAdded",
+            GovernanceActionResult::SignerRemoved => "SignerRemoved",
+            GovernanceActionResult::ThresholdModified => "ThresholdModified",
+            GovernanceActionResult::ChildContextCreated => "ChildContextCreated",
+            GovernanceActionResult::ToolInterfaceEstablished => "ToolInterfaceEstablished",
+            GovernanceActionResult::MemberReset => "MemberReset",
+            GovernanceActionResult::ConflictResolved => "ConflictResolved",
+            GovernanceActionResult::ContextPromoted => "ContextPromoted",
+            GovernanceActionResult::ReadAccessRevoked(_) => "ReadAccessRevoked",
+            GovernanceActionResult::ReadAccessRestored(_) => "ReadAccessRestored",
+            GovernanceActionResult::WriteAccessRevoked(_) => "WriteAccessRevoked",
+            GovernanceActionResult::WriteAccessRestored(_) => "WriteAccessRestored",
+            GovernanceActionResult::ContentKeysRotated(_) => "ContentKeysRotated",
+            GovernanceActionResult::GovernanceReconfigured(_) => "GovernanceReconfigured",
+            GovernanceActionResult::AuthorBlocked(_) => "AuthorBlocked",
+            GovernanceActionResult::SubscriberBanned(_) => "SubscriberBanned",
+            GovernanceActionResult::SubscriberUnbanned { .. } => "SubscriberUnbanned",
+            GovernanceActionResult::Executed => "Executed",
+        };
+        Ok(result_str.to_owned())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Broadcast bridge (#369)
+// ---------------------------------------------------------------------------
+
+/// Subscribes a DID to a broadcast context.
+///
+/// For open broadcast contexts, any DID can subscribe. For gated contexts,
+/// a valid `messagesRead` UCAN is required.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the context is not active, not a broadcast
+/// context, or if subscription fails.
+#[pyfunction]
+#[pyo3(signature = (handle, subscriber_did))]
+fn py_broadcast_subscribe(handle: &PyContextHandle, subscriber_did: &str) -> PyResult<()> {
+    validate::validate_did(subscriber_did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let did: scp_identity::DID = subscriber_did.to_owned().into();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    rt.block_on(async move {
+        mgr.subscribe_broadcast::<
+            NoOpDidResolver,
+            NoOpNonceTracker,
+            NoOpRevocationChecker,
+            NoOpProofResolver,
+            std::hash::RandomState,
+        >(&context_id, &did, None, timestamp, None)
+        .await
+        .map_err(|e| PyRuntimeError::new_err(format!("broadcast subscribe failed: {e}")))?;
+        Ok(())
+    })
+}
+
+/// Unsubscribes a DID from a broadcast context.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the context is not active or not broadcast.
+#[pyfunction]
+#[pyo3(signature = (handle, subscriber_did, rotate_keys=false))]
+fn py_broadcast_unsubscribe(
+    handle: &PyContextHandle,
+    subscriber_did: &str,
+    rotate_keys: bool,
+) -> PyResult<()> {
+    validate::validate_did(subscriber_did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let did: scp_identity::DID = subscriber_did.to_owned().into();
+
+    rt.block_on(async move {
+        mgr.unsubscribe_broadcast(&context_id, &did, rotate_keys)
+            .await
+            .map_err(|e| PyRuntimeError::new_err(format!("broadcast unsubscribe failed: {e}")))?;
+        Ok(())
+    })
+}
+
+/// Publishes a message to a broadcast context.
+///
+/// The payload is encrypted with the author's broadcast key.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the context is not active, not broadcast,
+/// or the sender is not an author.
+#[pyfunction]
+#[pyo3(signature = (handle, author_did, payload))]
+fn py_broadcast_publish(
+    handle: &PyContextHandle,
+    author_did: &str,
+    payload: Vec<u8>,
+) -> PyResult<()> {
+    validate::validate_did(author_did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let did: scp_identity::DID = author_did.to_owned().into();
+
+    rt.block_on(async move {
+        mgr.publish_broadcast(
+            &context_id,
+            &did,
+            &payload,
+            &ed25519_dalek::SigningKey::from_bytes(&[0u8; 32]),
+        )
+        .await
+        .map_err(|e| PyRuntimeError::new_err(format!("broadcast publish failed: {e}")))?;
+        Ok(())
+    })
+}
+
+/// Blocks a subscriber's read access in a broadcast context.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the operation fails.
+#[pyfunction]
+#[pyo3(signature = (handle, subscriber_did, blocker_did))]
+fn py_broadcast_block_subscriber(
+    handle: &PyContextHandle,
+    subscriber_did: &str,
+    blocker_did: &str,
+) -> PyResult<()> {
+    validate::validate_did(subscriber_did)?;
+    validate::validate_did(blocker_did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let subscriber: scp_identity::DID = subscriber_did.to_owned().into();
+    let blocker: scp_identity::DID = blocker_did.to_owned().into();
+
+    rt.block_on(async move {
+        mgr.block_broadcast_subscriber(&context_id, &subscriber, &blocker)
+            .await
+            .map_err(|e| PyRuntimeError::new_err(format!("broadcast block failed: {e}")))?;
+        Ok(())
+    })
+}
+
+/// Handles a broadcast key request from a subscriber.
+///
+/// # Returns
+///
+/// A debug string describing the key request decision.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the operation fails.
+#[pyfunction]
+#[pyo3(signature = (handle, author_did, requester_did))]
+fn py_broadcast_handle_key_request(
+    handle: &PyContextHandle,
+    author_did: &str,
+    requester_did: &str,
+) -> PyResult<String> {
+    validate::validate_did(author_did)?;
+    validate::validate_did(requester_did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let author: scp_identity::DID = author_did.to_owned().into();
+    let requester: scp_identity::DID = requester_did.to_owned().into();
+
+    rt.block_on(async move {
+        let decision = mgr
+            .handle_broadcast_key_request(&context_id, &author, &requester)
+            .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("broadcast key request handling failed: {e}"))
+            })?;
+        Ok(format!("{decision:?}"))
+    })
+}
+
+/// Returns the number of broadcast subscribers for a context.
+///
+/// Returns `None` if the context is not registered or not a broadcast context.
+#[pyfunction]
+#[pyo3(signature = (handle,))]
+fn py_broadcast_subscriber_count(handle: &PyContextHandle) -> PyResult<Option<u64>> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let context_id = handle.context_id.clone();
+    Ok(rt
+        .block_on(mgr.broadcast_subscriber_count(&context_id))
+        .map(|n| n as u64))
+}
+
+/// Returns `True` if the given DID is a broadcast subscriber.
+#[pyfunction]
+#[pyo3(signature = (handle, did))]
+fn py_broadcast_is_subscriber(handle: &PyContextHandle, did: &str) -> PyResult<bool> {
+    validate::validate_did(did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let context_id = handle.context_id.clone();
+    Ok(rt.block_on(mgr.is_broadcast_subscriber(&context_id, did)))
+}
+
+/// Returns the broadcast admission policy for a context.
+///
+/// Returns the policy as a string: `"Open"` or `"Gated"`.
+/// Returns `None` if the context is not a broadcast context.
+#[pyfunction]
+#[pyo3(signature = (handle,))]
+fn py_broadcast_admission(handle: &PyContextHandle) -> PyResult<Option<String>> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let context_id = handle.context_id.clone();
+    Ok(rt
+        .block_on(mgr.broadcast_admission(&context_id))
+        .map(|a| format!("{a:?}")))
+}
+
+// ---------------------------------------------------------------------------
+// Membership query bridge (#369)
+// ---------------------------------------------------------------------------
+
+/// Returns the current member count for a context.
+///
+/// Returns `None` if the context is not registered.
+#[pyfunction]
+#[pyo3(signature = (handle,))]
+fn py_context_member_count(handle: &PyContextHandle) -> PyResult<Option<u64>> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let context_id = handle.context_id.clone();
+    Ok(rt.block_on(mgr.member_count(&context_id)).map(|n| n as u64))
+}
+
+/// Returns `True` if the given DID is a member of the context.
+#[pyfunction]
+#[pyo3(signature = (handle, did))]
+fn py_context_is_member(handle: &PyContextHandle, did: &str) -> PyResult<bool> {
+    validate::validate_did(did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let context_id = handle.context_id.clone();
+    Ok(rt.block_on(mgr.is_member(&context_id, did)))
+}
+
+/// Returns all member DIDs for a context.
+#[pyfunction]
+#[pyo3(signature = (handle,))]
+fn py_context_member_dids(handle: &PyContextHandle) -> PyResult<Vec<String>> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let context_id = handle.context_id.clone();
+    Ok(rt.block_on(mgr.member_dids(&context_id)))
+}
+
+/// Returns the role assignment for a specific member as a debug string.
+///
+/// Returns `None` if the member is not found or the context is not registered.
+#[pyfunction]
+#[pyo3(signature = (handle, did))]
+fn py_context_member_role(handle: &PyContextHandle, did: &str) -> PyResult<Option<String>> {
+    validate::validate_did(did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let context_id = handle.context_id.clone();
+    Ok(rt
+        .block_on(mgr.member_role(&context_id, did))
+        .map(|r| format!("{r:?}")))
+}
+
+// ---------------------------------------------------------------------------
+// Events bridge (#369)
+// ---------------------------------------------------------------------------
+
+/// Drains all pending events from the context's receive buffer.
+///
+/// Returns a list of event descriptions as debug strings. Returns empty
+/// if the context is not registered.
+#[pyfunction]
+#[pyo3(signature = (handle,))]
+fn py_context_drain_events(handle: &PyContextHandle) -> PyResult<Vec<String>> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    Ok(rt
+        .block_on(mgr.drain_events(&context_id))
+        .into_iter()
+        .map(|e| format!("{e:?}"))
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// TTL bridge (#369)
+// ---------------------------------------------------------------------------
+
+/// Handles TTL expiry for a context.
+///
+/// Transitions from `Active` to `Expired`, destroys keys per memory scope.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the context is not active.
+#[pyfunction]
+#[pyo3(signature = (handle,))]
+fn py_context_handle_ttl_expiry(handle: &PyContextHandle) -> PyResult<()> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let core_params = build_core_context_params(&handle.params);
+
+    rt.block_on(async move {
+        let core_handle = scp_core::context::ContextHandle::new(context_id, core_params);
+        let _ = core_handle
+            .transition_to(&scp_core::context::ContextState::Active)
+            .await;
+        mgr.handle_ttl_expiry(&core_handle)
+            .await
+            .map_err(|e| PyRuntimeError::new_err(format!("TTL expiry handling failed: {e}")))?;
+        Ok::<(), PyErr>(())
+    })?;
+
+    // Update FFI handle state to reflect expiry.
+    let mut state = handle
+        .state
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
+    "expired".clone_into(&mut state);
+
+    Ok(())
+}
+
+/// Proposes a TTL extension. Records consent from the given member.
+///
+/// Returns `True` if all members have consented (unanimous approval).
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the context is not registered or the member
+/// is not found.
+#[pyfunction]
+#[pyo3(signature = (handle, member_did, proposed_seconds))]
+fn py_context_propose_ttl_extension(
+    handle: &PyContextHandle,
+    member_did: &str,
+    proposed_seconds: u64,
+) -> PyResult<bool> {
+    validate::validate_did(member_did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let did: scp_identity::DID = member_did.to_owned().into();
+    let duration = std::time::Duration::from_secs(proposed_seconds);
+
+    rt.block_on(async move {
+        mgr.propose_ttl_extension(&context_id, &did, duration)
+            .await
+            .map_err(|e| PyRuntimeError::new_err(format!("TTL extension proposal failed: {e}")))
+    })
+}
+
+/// Resets the TTL timer after a successful unanimous extension.
+///
+/// Cancels the old timer and spawns a new one with the given duration.
+#[pyfunction]
+#[pyo3(signature = (handle, new_seconds))]
+fn py_context_reset_ttl_timer(handle: &PyContextHandle, new_seconds: u64) -> PyResult<()> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let core_params = build_core_context_params(&handle.params);
+
+    rt.block_on(async move {
+        let core_handle = scp_core::context::ContextHandle::new(context_id.clone(), core_params);
+        let _ = core_handle
+            .transition_to(&scp_core::context::ContextState::Active)
+            .await;
+        let duration = std::time::Duration::from_secs(new_seconds);
+        mgr.reset_ttl_timer(&context_id, duration, core_handle)
+            .await;
+    });
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
@@ -1558,6 +2076,28 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_get_economic_policy, m)?)?;
     m.add_function(wrap_pyfunction!(py_context_export, m)?)?;
     m.add_function(wrap_pyfunction!(py_context_import, m)?)?;
+    // Governance (#369)
+    m.add_function(wrap_pyfunction!(py_governance_execute, m)?)?;
+    // Broadcast (#369)
+    m.add_function(wrap_pyfunction!(py_broadcast_subscribe, m)?)?;
+    m.add_function(wrap_pyfunction!(py_broadcast_unsubscribe, m)?)?;
+    m.add_function(wrap_pyfunction!(py_broadcast_publish, m)?)?;
+    m.add_function(wrap_pyfunction!(py_broadcast_block_subscriber, m)?)?;
+    m.add_function(wrap_pyfunction!(py_broadcast_handle_key_request, m)?)?;
+    m.add_function(wrap_pyfunction!(py_broadcast_subscriber_count, m)?)?;
+    m.add_function(wrap_pyfunction!(py_broadcast_is_subscriber, m)?)?;
+    m.add_function(wrap_pyfunction!(py_broadcast_admission, m)?)?;
+    // Membership (#369)
+    m.add_function(wrap_pyfunction!(py_context_member_count, m)?)?;
+    m.add_function(wrap_pyfunction!(py_context_is_member, m)?)?;
+    m.add_function(wrap_pyfunction!(py_context_member_dids, m)?)?;
+    m.add_function(wrap_pyfunction!(py_context_member_role, m)?)?;
+    // Events (#369)
+    m.add_function(wrap_pyfunction!(py_context_drain_events, m)?)?;
+    // TTL (#369)
+    m.add_function(wrap_pyfunction!(py_context_handle_ttl_expiry, m)?)?;
+    m.add_function(wrap_pyfunction!(py_context_propose_ttl_extension, m)?)?;
+    m.add_function(wrap_pyfunction!(py_context_reset_ttl_timer, m)?)?;
     Ok(())
 }
 

@@ -35,6 +35,7 @@ pub mod invitation;
 pub mod manager;
 pub mod membership;
 pub mod memory_scope;
+pub mod metadata;
 pub mod nesting;
 pub mod params;
 pub mod policy;
