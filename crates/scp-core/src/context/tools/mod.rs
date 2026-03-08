@@ -42,6 +42,7 @@
 //! - [`ToolErrorCode`] -- Error code enum. (Re-exported from [`lifecycle`].)
 //! - [`ToolCancel`] -- Cancellation request. (Re-exported from [`lifecycle`].)
 
+pub mod integrity;
 pub mod interface;
 pub mod invoke;
 pub mod lifecycle;

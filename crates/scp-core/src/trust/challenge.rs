@@ -115,6 +115,19 @@ impl ChallengeType {
         })
     }
 
+    /// Convenience constructor for tool integrity verification challenges.
+    ///
+    /// Used by [`verify_tool_integrity`](crate::context::tools::integrity::verify_tool_integrity)
+    /// to produce [`ChallengeVerification`] results with a tool-integrity
+    /// challenge type.
+    #[must_use]
+    pub fn tool_integrity() -> Self {
+        Self::Uri(CapabilityUri::Protocol {
+            name: "tool-integrity".to_owned(),
+            version: 1,
+        })
+    }
+
     /// Returns a reference to the inner [`CapabilityUri`].
     #[must_use]
     pub const fn uri(&self) -> &CapabilityUri {
@@ -1444,9 +1457,7 @@ mod tests {
         let result = issue_challenge(
             "did:key:challenger".into(),
             "did:key:subject".into(),
-            ChallengeType::Uri(
-                "scp:capability:latency-compliance/v1".parse().unwrap(),
-            ),
+            ChallengeType::Uri("scp:capability:latency-compliance/v1".parse().unwrap()),
             serde_json::json!({"max_ms": 500}),
             Duration::from_secs(300),
             &signer,
@@ -1469,9 +1480,7 @@ mod tests {
         let result = issue_challenge(
             "did:key:challenger".into(),
             "did:key:subject".into(),
-            ChallengeType::Uri(
-                "scp:capability:mathematical-reasoning/v1".parse().unwrap(),
-            ),
+            ChallengeType::Uri("scp:capability:mathematical-reasoning/v1".parse().unwrap()),
             serde_json::json!({"difficulty": "intermediate"}),
             Duration::from_secs(300),
             &signer,
@@ -1487,9 +1496,7 @@ mod tests {
         let result = issue_challenge(
             "did:key:challenger".into(),
             "did:key:subject".into(),
-            ChallengeType::Uri(
-                "scp:capability:code-generation/v1".parse().unwrap(),
-            ),
+            ChallengeType::Uri("scp:capability:code-generation/v1".parse().unwrap()),
             serde_json::json!({"languages": ["rust", "python"]}),
             Duration::from_secs(300),
             &signer,
@@ -1558,9 +1565,7 @@ mod tests {
         let result = issue_challenge(
             "did:key:challenger".into(),
             "did:key:subject".into(),
-            ChallengeType::Uri(
-                "scp:capability:latency-compliance/v1".parse().unwrap(),
-            ),
+            ChallengeType::Uri("scp:capability:latency-compliance/v1".parse().unwrap()),
             serde_json::json!({"max_ms": "not-an-integer"}),
             Duration::from_secs(300),
             &signer,
@@ -1582,9 +1587,7 @@ mod tests {
         let result = issue_challenge(
             "did:key:challenger".into(),
             "did:key:subject".into(),
-            ChallengeType::Uri(
-                "scp:capability:mathematical-reasoning/v1".parse().unwrap(),
-            ),
+            ChallengeType::Uri("scp:capability:mathematical-reasoning/v1".parse().unwrap()),
             serde_json::json!({"wrong_field": true}),
             Duration::from_secs(300),
             &signer,
@@ -1606,14 +1609,15 @@ mod tests {
         let result = issue_challenge(
             "did:key:challenger".into(),
             "did:key:subject".into(),
-            ChallengeType::Uri(
-                "scp:capability:latency-compliance/v1".parse().unwrap(),
-            ),
+            ChallengeType::Uri("scp:capability:latency-compliance/v1".parse().unwrap()),
             serde_json::Value::Null,
             Duration::from_secs(300),
             &signer,
         );
-        assert!(result.is_ok(), "null params should skip schema validation, got {result:?}");
+        assert!(
+            result.is_ok(),
+            "null params should skip schema validation, got {result:?}"
+        );
     }
 
     #[test]
@@ -1625,13 +1629,18 @@ mod tests {
             "did:key:challenger".into(),
             "did:key:subject".into(),
             ChallengeType::Uri(
-                "scp:capability:prompt-injection-resistance/v1".parse().unwrap(),
+                "scp:capability:prompt-injection-resistance/v1"
+                    .parse()
+                    .unwrap(),
             ),
             serde_json::json!({"test_vectors": ["attack1", "attack2"]}),
             Duration::from_secs(300),
             &signer,
         );
-        assert!(result.is_ok(), "non-parameterized capability should accept any params, got {result:?}");
+        assert!(
+            result.is_ok(),
+            "non-parameterized capability should accept any params, got {result:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
