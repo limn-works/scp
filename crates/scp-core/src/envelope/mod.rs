@@ -27,10 +27,16 @@ pub mod padding;
 pub mod pseudonym;
 pub mod validation;
 
+/// SCP protocol version for wire structures (§13.2).
+///
+/// Encoded as `(major << 8) | minor`. SCP/1.0 = `0x0100` (decimal 256).
+/// All envelope types include this as their first serialized field.
+pub const SCP_PROTOCOL_VERSION: u16 = 0x0100;
+
 // Re-export primary types and functions at the envelope module level.
 pub use inner::{
     InnerEnvelope, InnerEnvelopeParams, MessageType, Provenance, create_inner_envelope,
-    enforce_inner_envelope_category_a, verify_inner_signature,
+    enforce_inner_envelope_category_a, validate_inner_version, verify_inner_signature,
 };
 pub use outer::{OuterEnvelope, create_outer_envelope, open_envelope, seal_envelope};
 pub use padding::{BUCKET_SIZES, pad_to_bucket, strip_padding};
@@ -118,6 +124,17 @@ pub enum EnvelopeError {
     /// `SHA-256(stripped_payload)`.
     #[error("content integrity failed: payload_hash mismatch")]
     ContentIntegrityFailed,
+
+    /// The envelope's `version` field is not supported by this implementation.
+    ///
+    /// Currently only version `0x0100` (SCP/1.0) is supported. This error
+    /// triggers on deserialization or validation to future-proof the wire
+    /// format (§13.2).
+    #[error("unsupported envelope version: {version:#06x}")]
+    UnsupportedVersion {
+        /// The version value from the wire.
+        version: u16,
+    },
 
     /// An agent key (`#agent`) attempted a Category A action (DID document
     /// modification) via an inner envelope. The action was rejected and a

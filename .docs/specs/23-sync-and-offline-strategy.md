@@ -192,7 +192,77 @@ Messages may arrive out of order due to relay batching, multi-relay delivery, or
 
 To support offline member addition (a member can be added to a group even when they are not currently connected), the SDK pre-publishes `KeyPackage`s to relays. This ensures that an admin can add an offline member using a valid, pre-stored KeyPackage rather than waiting for the member to come online. KeyPackages are single-use and signed by the credential key (`#active` or `#agent`) matching the member's `ScpCredential.signing_key_id` (ADR-039). This is consistent with standard MLS behavior where the leaf node signature key matches the credential key, and avoids requiring the hardware-backed `#0` for routine background operations.
 
-## 23.11 Constants
+## 23.11 EpochGraceStore Crash Recovery
+
+The `EpochGraceStore` (ADR-001) holds old epoch keys in memory during the grace window after an MLS epoch transition. If the node crashes mid-epoch-transition or during the grace window, the in-memory grace store is lost. This section specifies crash recovery semantics.
+
+**Transactional persistence with MLS group state.** EpochGraceStore state -- specifically the set of epoch numbers with active grace windows and their expiration timestamps -- MUST be persisted transactionally with the MLS group state update. When a Commit is processed and the epoch advances, the following MUST occur in a single database transaction:
+
+1. The new MLS group state is written to `ProtocolStore`.
+2. The grace window entry (epoch number, expiration timestamp) is written to `ProtocolStore` under `context/{context_id}/grace/{epoch:020d}`.
+3. Any expired grace window entries are deleted within the same transaction.
+
+If the transaction fails, neither the MLS group state nor the grace window entry is persisted -- the node remains at the previous epoch.
+
+**Recovery on startup.** On node startup after a crash, the SDK MUST:
+
+1. Load all persisted grace window entries from `ProtocolStore`.
+2. For each entry, compare the persisted expiration timestamp against the current wall-clock time.
+3. If the grace period has expired during downtime, immediately destroy the corresponding old epoch keys (remove the grace entry and any cached key material for that epoch). These keys MUST NOT be retained past their expiration -- forward secrecy requires prompt destruction.
+4. If the grace period has NOT yet expired, retain the keys and restart the grace timer from the persisted expiration timestamp (not from recovery time). This ensures the total grace window duration is preserved regardless of crash timing.
+
+**Inconsistent state fallback.** If the persisted grace state is inconsistent with the persisted MLS group state (e.g., a grace entry references an epoch newer than the persisted group epoch, indicating a partial write that escaped the transaction), the SDK MUST:
+
+1. Discard all grace window entries.
+2. Destroy any old epoch key material.
+3. Re-sync the MLS group state from the relay by re-entering the reconnection protocol (section 23.3) for the affected context.
+4. Log an `EpochGraceStoreInconsistency` warning to the application layer.
+
+This fallback is conservative -- it prioritizes forward secrecy (destroy keys) over message recovery (retain keys). Messages encrypted under the lost epoch keys are unrecoverable, which is the same outcome as a grace window expiring normally.
+
+## 23.12 Checkpoint Signature Verification
+
+Consistency checkpoints (ADR-011, section 23.7) are exchanged between members during event log reconciliation. Each checkpoint includes the Merkle root, event count, and a signature from the checkpoint's author. Without mandatory signature verification, a malicious relay or peer could forge checkpoints to trigger false equivocation alerts or suppress real equivocation detection.
+
+**Verification requirements:**
+
+1. Clients MUST verify the signature on every received `ConsistencyCheckpoint` before accepting it for comparison. The signature is verified against the checkpoint author's public key, resolved from their DID document using the `signing_key_id` field (ADR-039: `#active` or `#agent`).
+
+2. If signature verification fails, the checkpoint MUST be rejected entirely. The client MUST NOT use the checkpoint's Merkle root or event count for any comparison or reconciliation decision. A failed verification SHOULD be reported as a `CheckpointSignatureFailure` event to the application layer, indicating a potential relay compromise or peer impersonation.
+
+3. For relay-generated checkpoints (checkpoints that relays produce as part of their store-and-forward operations), the signing key is the relay's known public key, established during relay registration (section 18.3). The client MUST have obtained and cached the relay's public key during initial relay connection. Relay checkpoints signed with an unknown key MUST be rejected.
+
+4. For multi-relay contexts (contexts with multiple relay endpoints), each relay signs its own checkpoints independently. Clients MUST verify each checkpoint against the respective relay's key. Cross-relay checkpoint comparison (section 9.9.3) MUST only use checkpoints that have passed signature verification.
+
+5. A checkpoint with a valid signature from a known key but containing a Merkle root that diverges from the local log at the same event count is NOT a verification failure -- it is a legitimate equivocation detection signal. Signature verification confirms authenticity; divergence detection confirms consistency. These are separate concerns.
+
+## 23.13 Event Verification During Reconciliation
+
+During event log reconciliation (section 23.7, Phase 3 of the reconnection protocol), the reconnecting member receives events from peers to fill gaps in their local log. Without per-event verification, a malicious peer could inject fabricated events -- forging governance actions, membership changes, or other protocol events that never occurred.
+
+**Per-event signature verification:**
+
+1. During reconciliation, each received event MUST be verified against the claimed sender's signing key before being accepted into the local event log. The verification uses the `actor_did` and `signing_key_id` fields of the `Event` struct (ADR-011) to resolve the correct public key from the actor's DID document. Events that fail signature verification MUST be rejected and MUST NOT be added to the local log.
+
+2. The SDK MUST log rejected events with the reason (`InvalidSignature`) and the claimed actor DID. If more than 3 events from the same peer fail verification in a single reconciliation session, the SDK MUST abort reconciliation with that peer and attempt reconciliation with a different online member.
+
+**Sequence number ordering:**
+
+3. The reconciliation protocol MUST verify event ordering: sequence numbers MUST be monotonically increasing per sender within the context's event log. An event with a sequence number less than or equal to the last known sequence number from that sender (that is not already in the local log as a duplicate) indicates either replay or fabrication. Such events MUST be rejected.
+
+4. If a peer provides events with gaps in the sequence (e.g., provides event 5 and event 8 from a sender but not events 6 and 7), the client MUST request the missing events before accepting the later ones. Events MUST NOT be accepted out of order -- the gap must be filled first. If the missing events cannot be obtained from any peer within the reconnection timeout (section 23.3), the events after the gap are discarded and the gap is recorded as an `EventGapDetected` notification to the application layer.
+
+**Hash chain continuity:**
+
+5. Each event's `prev_hash` field MUST chain to the hash of the immediately preceding event in the log (ADR-011 criterion 2). During reconciliation, the SDK MUST verify this chain for every received event. If an event's `prev_hash` does not match the hash of the event at `sequence - 1`, the chain is broken. A broken hash chain indicates tampering or data loss.
+
+6. When a hash chain break is detected, the SDK MUST reject the event and all subsequent events from that peer in the current reconciliation. The SDK MUST attempt to obtain the correct event chain from a different peer. If no peer can provide a consistent chain, the SDK MUST raise an `EventChainTampered` alert to the application layer and mark the context's event log as `Unverified` until a consistent chain is obtained.
+
+**Merkle proof verification:**
+
+7. After accepting events into the local log, the SDK MUST recompute the Merkle tree and verify that the resulting root matches the checkpoint root provided by the majority of peers. This is the final consistency check -- individual event verification ensures authenticity, and Merkle root comparison ensures completeness (no events were omitted).
+
+## 23.14 Constants
 
 | Constant | Value | Purpose |
 |----------|-------|---------|
@@ -208,8 +278,9 @@ To support offline member addition (a member can be added to a group even when t
 | `RESET_REQUEST_FRESHNESS_WINDOW` | 30 seconds | Maximum age of a valid ResetRequest timestamp |
 | `RESET_NONCE_DEDUP_TTL` | 60 seconds | TTL for ResetRequest nonce deduplication cache entries |
 | `RESET_NONCE_DEDUP_CAPACITY` | 10,000 entries | Maximum entries in ResetRequest nonce dedup cache |
+| `MAX_PEER_VERIFICATION_FAILURES` | 3 | Maximum event signature failures from a single peer before aborting reconciliation with that peer |
 
-## 23.12 Error Model
+## 23.15 Error Model
 
 Sync errors are categorized by the reconnection phase in which they occur:
 
@@ -225,6 +296,11 @@ Sync errors are categorized by the reconnection phase in which they occur:
 - **GapTimeoutExpired** -- Gap timeout expired before a missing message arrived.
 - **ReconnectionTimeout** -- Overall 120-second reconnection timeout exceeded.
 - **ResetRequestRejected** -- ResetRequest failed anti-replay validation (invalid signature, stale timestamp, or replayed nonce).
+- **CheckpointSignatureFailure** -- A received checkpoint failed signature verification (section 23.12).
+- **EpochGraceStoreInconsistency** -- Persisted grace state was inconsistent with MLS group state on recovery (section 23.11).
+- **EventSignatureFailure** -- A received event failed per-event signature verification during reconciliation (section 23.13).
+- **EventGapDetected** -- Gap in event sequence could not be filled during reconciliation (section 23.13).
+- **EventChainTampered** -- Hash chain continuity was broken during reconciliation, indicating tampering or data loss (section 23.13).
 
 Per-context sync outcomes are reported to the application layer:
 

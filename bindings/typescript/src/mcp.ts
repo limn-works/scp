@@ -5,12 +5,117 @@
  * servers. MCP integration enables SCP contexts to serve as tool providers
  * for AI agents that speak the MCP protocol.
  *
- * See ADR-022 in `.docs/adrs/phase-4.md` and `crates/scp-mcp/`.
+ * On native targets (Bun/Node.js), all operations delegate to the napi-rs
+ * bridge (`mcp_server_create`, `mcp_client_connect_stdio`, etc.). On WASM
+ * targets (browser), a graceful degradation is provided since subprocess
+ * spawning is unavailable.
+ *
+ * See ADR-015 in `.docs/adrs/phase-3.md` and `crates/scp-mcp/`.
  */
 
 import type { Context } from "./context.js";
 import { mapBridgeError, TransportError } from "./errors.js";
+import { BRIDGE_TARGET } from "./internal/bridge.js";
 import type { McpClientConfig, McpServerConfig, ToolDefinition } from "./types.js";
+
+// ---------------------------------------------------------------------------
+// Native addon MCP handle types (from napi-rs)
+// ---------------------------------------------------------------------------
+
+/** Opaque server handle from the napi-rs bridge. */
+interface NativeServerHandle {
+  readonly handleId: string;
+}
+
+/** Opaque client handle from the napi-rs bridge. */
+interface NativeClientHandle {
+  readonly handleId: string;
+}
+
+/** Tool info returned by `mcp_client_list_tools`. */
+interface NativeToolInfo {
+  readonly name: string;
+  readonly description: string;
+  readonly inputSchemaJson: string;
+}
+
+/** Invoke result returned by `mcp_client_invoke`. */
+interface NativeInvokeResult {
+  readonly contentJson: string;
+  readonly isError: boolean;
+  readonly source: string;
+  readonly invokedBy: string;
+  readonly contextId: string;
+  readonly timestamp: number;
+}
+
+// ---------------------------------------------------------------------------
+// Native addon loading (lazy, MCP-specific functions)
+// ---------------------------------------------------------------------------
+
+/** Shape of the native addon's MCP-related exports. */
+interface McpNativeAddon {
+  mcpServerCreate(config: {
+    identityDid: string;
+    contextIds: string[];
+    transport: string;
+  }): Promise<NativeServerHandle>;
+  mcpServerStop(handle: NativeServerHandle): Promise<void>;
+  mcpClientConnectStdio(command: string[]): Promise<NativeClientHandle>;
+  mcpClientConnectSse(url: string): Promise<NativeClientHandle>;
+  mcpClientDisconnect(handle: NativeClientHandle): Promise<void>;
+  mcpClientListTools(handle: NativeClientHandle): Promise<NativeToolInfo[]>;
+  mcpClientInvoke(
+    handle: NativeClientHandle,
+    toolName: string,
+    inputJson: string,
+    contextId: string,
+    invokerDid: string,
+  ): Promise<NativeInvokeResult>;
+}
+
+let _mcpAddon: McpNativeAddon | null = null;
+
+async function getMcpAddon(): Promise<McpNativeAddon> {
+  if (_mcpAddon !== null) {
+    return _mcpAddon;
+  }
+
+  if (BRIDGE_TARGET !== "native") {
+    throw new TransportError(
+      "MCP native bridge is only available in Bun/Node.js environments",
+      "SCP-TRANS-5001",
+    );
+  }
+
+  // Load the native addon using the same pattern as internal/native.ts
+  const { createRequire } = await import("node:module");
+  const req = createRequire(import.meta.url);
+
+  const platform = process.platform;
+  const arch = process.arch;
+  const platformMap: Record<string, string> = {
+    "linux-x64": "@scp/sdk-napi-linux-x64-gnu",
+    "linux-arm64": "@scp/sdk-napi-linux-arm64-gnu",
+    "darwin-x64": "@scp/sdk-napi-darwin-x64",
+    "darwin-arm64": "@scp/sdk-napi-darwin-arm64",
+    "win32-x64": "@scp/sdk-napi-win32-x64-msvc",
+  };
+
+  const key = `${platform}-${arch}`;
+  const pkg = platformMap[key];
+  if (pkg === undefined) {
+    throw new TransportError(`No native addon for platform ${key}`, "SCP-TRANS-5001");
+  }
+
+  try {
+    _mcpAddon = req(pkg) as unknown as McpNativeAddon;
+  } catch {
+    throw new TransportError(`Failed to load native addon ${pkg} for MCP bridge`, "SCP-TRANS-5001");
+  }
+
+  return _mcpAddon;
+}
 
 // ---------------------------------------------------------------------------
 // MCP Server
@@ -32,6 +137,9 @@ export interface McpServer extends AsyncDisposable {
  * The server listens for MCP-protocol tool invocation requests and routes
  * them to the corresponding SCP context tool.
  *
+ * On native targets, delegates to the napi-rs `mcp_server_create` bridge
+ * function which starts a real MCP server on the tokio runtime.
+ *
  * @param ctx - The SCP context whose tools to expose.
  * @param config - MCP server configuration.
  * @returns A handle to the running server.
@@ -39,32 +147,49 @@ export interface McpServer extends AsyncDisposable {
  */
 export async function serveMcp(ctx: Context, config: McpServerConfig): Promise<McpServer> {
   try {
-    const _ = ctx;
     const host = config.host ?? "127.0.0.1";
     const port = config.port ?? 0;
-
-    // MCP server implementation will be wired to the MCP crate in an
-    // integration story. For now, return a server handle with the configured
-    // tools.
     const url = `http://${host}:${port}`;
 
-    let stopped = false;
+    if (BRIDGE_TARGET === "native") {
+      const addon = await getMcpAddon();
 
-    const server: McpServer = {
-      url,
-      tools: config.tools,
-      async stop(): Promise<void> {
-        if (stopped) {
-          return;
-        }
-        stopped = true;
-      },
-      async [Symbol.asyncDispose](): Promise<void> {
-        await server.stop();
-      },
-    };
+      // Determine transport from port: if port is specified, use SSE;
+      // otherwise default to stdio.
+      const transport = port > 0 ? "sse" : "stdio";
 
-    return server;
+      const nativeHandle = await addon.mcpServerCreate({
+        identityDid: ctx._handle.creatorDid,
+        contextIds: [ctx._handle.contextId],
+        transport,
+      });
+
+      let stopped = false;
+
+      const server: McpServer = {
+        url,
+        tools: config.tools,
+        async stop(): Promise<void> {
+          if (stopped) {
+            return;
+          }
+          stopped = true;
+          await addon.mcpServerStop(nativeHandle);
+        },
+        async [Symbol.asyncDispose](): Promise<void> {
+          await server.stop();
+        },
+      };
+
+      return server;
+    }
+
+    // WASM fallback: MCP server is not available in browser environments
+    // because it requires subprocess spawning (stdio) or socket binding (SSE).
+    throw new TransportError(
+      "MCP server is not available in browser environments -- use a Bun/Node.js runtime",
+      "SCP-TRANS-5002",
+    );
   } catch (error) {
     throw mapBridgeError(error);
   }
@@ -81,7 +206,12 @@ export interface McpClient extends AsyncDisposable {
   /** Lists available tools on the MCP server. */
   listTools(): Promise<readonly ToolDefinition[]>;
   /** Invokes a tool on the MCP server. */
-  invokeTool(toolName: string, input: Readonly<Record<string, unknown>>): Promise<unknown>;
+  invokeTool(
+    toolName: string,
+    input: Readonly<Record<string, unknown>>,
+    contextId?: string,
+    invokerDid?: string,
+  ): Promise<unknown>;
   /** Disconnects from the MCP server. */
   disconnect(): Promise<void>;
 }
@@ -92,45 +222,175 @@ export interface McpClient extends AsyncDisposable {
  * Establishes a JSON-RPC connection to the specified MCP server URL and
  * returns a client handle for tool listing and invocation.
  *
+ * On native targets, delegates to the napi-rs `mcp_client_connect_sse`
+ * bridge function for URL-based connections.
+ *
  * @param config - MCP client configuration.
  * @returns An MCP client handle.
  * @throws {TransportError} If the connection fails.
  */
 export async function connectMcp(config: McpClientConfig): Promise<McpClient> {
   try {
-    // MCP client implementation will be wired to the MCP crate in an
-    // integration story.
+    if (BRIDGE_TARGET === "native") {
+      const addon = await getMcpAddon();
+
+      const nativeHandle = await addon.mcpClientConnectSse(config.serverUrl);
+      let disconnected = false;
+
+      const client: McpClient = {
+        serverUrl: config.serverUrl,
+        async listTools(): Promise<readonly ToolDefinition[]> {
+          if (disconnected) {
+            throw new TransportError(
+              "MCP client is disconnected -- call connectMcp() to reconnect",
+              "SCP-TRANS-5010",
+            );
+          }
+          const tools = await addon.mcpClientListTools(nativeHandle);
+          return tools.map((t: NativeToolInfo) => ({
+            name: t.name,
+            description: t.description || "",
+            inputSchema: JSON.parse(t.inputSchemaJson || "{}") as Readonly<Record<string, unknown>>,
+            outputSchema: {} as Readonly<Record<string, unknown>>,
+            operator: "",
+          }));
+        },
+        async invokeTool(
+          toolName: string,
+          input: Readonly<Record<string, unknown>>,
+          contextId?: string,
+          invokerDid?: string,
+        ): Promise<unknown> {
+          if (disconnected) {
+            throw new TransportError(
+              "MCP client is disconnected -- call connectMcp() to reconnect",
+              "SCP-TRANS-5010",
+            );
+          }
+          const result = await addon.mcpClientInvoke(
+            nativeHandle,
+            toolName,
+            JSON.stringify(input),
+            contextId ?? "",
+            invokerDid ?? "",
+          );
+          return {
+            content: JSON.parse(result.contentJson),
+            isError: result.isError,
+            source: result.source,
+            invokedBy: result.invokedBy,
+            contextId: result.contextId,
+            timestamp: result.timestamp,
+          };
+        },
+        async disconnect(): Promise<void> {
+          if (disconnected) {
+            return;
+          }
+          disconnected = true;
+          await addon.mcpClientDisconnect(nativeHandle);
+        },
+        async [Symbol.asyncDispose](): Promise<void> {
+          await client.disconnect();
+        },
+      };
+
+      return client;
+    }
+
+    // WASM fallback: MCP client is not available in browser environments
+    // because it requires subprocess spawning or HTTP connections to local
+    // MCP servers.
+    throw new TransportError(
+      "MCP client is not available in browser environments -- use a Bun/Node.js runtime",
+      "SCP-TRANS-5003",
+    );
+  } catch (error) {
+    throw mapBridgeError(error);
+  }
+}
+
+/**
+ * Connects to an MCP server via stdio transport.
+ *
+ * Spawns the given command as a subprocess and communicates via
+ * line-delimited JSON-RPC over stdin/stdout.
+ *
+ * Only available on native targets (Bun/Node.js).
+ *
+ * @param command - The command to execute (e.g., `"uvx"`).
+ * @param args - Arguments to pass to the command.
+ * @returns An MCP client handle.
+ * @throws {TransportError} If the subprocess fails to start or handshake fails.
+ */
+export async function connectMcpStdio(
+  command: string,
+  args: readonly string[] = [],
+): Promise<McpClient> {
+  try {
+    if (BRIDGE_TARGET !== "native") {
+      throw new TransportError(
+        "MCP stdio client is not available in browser environments",
+        "SCP-TRANS-5004",
+      );
+    }
+
+    const addon = await getMcpAddon();
+    const nativeHandle = await addon.mcpClientConnectStdio([command, ...args]);
     let disconnected = false;
 
     const client: McpClient = {
-      serverUrl: config.serverUrl,
+      serverUrl: `stdio://${command}`,
       async listTools(): Promise<readonly ToolDefinition[]> {
         if (disconnected) {
           throw new TransportError(
-            "MCP client is disconnected -- call connectMcp() to reconnect",
+            "MCP client is disconnected -- call connectMcpStdio() to reconnect",
             "SCP-TRANS-5010",
           );
         }
-        return [];
+        const tools = await addon.mcpClientListTools(nativeHandle);
+        return tools.map((t: NativeToolInfo) => ({
+          name: t.name,
+          description: t.description || "",
+          inputSchema: JSON.parse(t.inputSchemaJson || "{}") as Readonly<Record<string, unknown>>,
+          outputSchema: {} as Readonly<Record<string, unknown>>,
+          operator: "",
+        }));
       },
       async invokeTool(
         toolName: string,
         input: Readonly<Record<string, unknown>>,
+        contextId?: string,
+        invokerDid?: string,
       ): Promise<unknown> {
         if (disconnected) {
           throw new TransportError(
-            "MCP client is disconnected -- call connectMcp() to reconnect",
+            "MCP client is disconnected -- call connectMcpStdio() to reconnect",
             "SCP-TRANS-5010",
           );
         }
-        const _ = { toolName, input };
-        return {};
+        const result = await addon.mcpClientInvoke(
+          nativeHandle,
+          toolName,
+          JSON.stringify(input),
+          contextId ?? "",
+          invokerDid ?? "",
+        );
+        return {
+          content: JSON.parse(result.contentJson),
+          isError: result.isError,
+          source: result.source,
+          invokedBy: result.invokedBy,
+          contextId: result.contextId,
+          timestamp: result.timestamp,
+        };
       },
       async disconnect(): Promise<void> {
         if (disconnected) {
           return;
         }
         disconnected = true;
+        await addon.mcpClientDisconnect(nativeHandle);
       },
       async [Symbol.asyncDispose](): Promise<void> {
         await client.disconnect();

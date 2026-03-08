@@ -190,7 +190,10 @@ const SCP_RELAY_PATH: &str = "/scp/v1";
 /// Device attestation tokens (Apple App Attest, Android Play Integrity) are
 /// stored as DID document service entries. The protocol carries the proofs;
 /// contexts interpret them. See issue #362.
-const SCP_DEVICE_ATTESTATION_SERVICE_TYPE: &str = "ScpDeviceAttestation";
+const DEVICE_ATTESTATION_SERVICE_TYPE: &str = "ScpDeviceAttestation";
+
+/// The fragment identifier for device attestation service entries.
+const DEVICE_ATTESTATION_FRAGMENT: &str = "device-attestation";
 
 /// Maximum number of retired agent keys to retain in a DID document.
 ///
@@ -512,6 +515,38 @@ impl DidDocument {
             .collect()
     }
 
+    // Device attestation service (§9.3, #362)
+    // -----------------------------------------------------------------------
+
+    /// Adds a `ScpDeviceAttestation` service entry containing the attestation
+    /// token bytes encoded as hex.
+    ///
+    /// If a `ScpDeviceAttestation` service entry already exists, it is replaced.
+    /// The service entry ID uses the format `{did}#device-attestation`.
+    ///
+    /// See §9.3 and issue #362.
+    pub fn add_device_attestation(&mut self, token_bytes: &[u8]) {
+        // Remove any existing device attestation entry.
+        self.service
+            .retain(|s| s.service_type != DEVICE_ATTESTATION_SERVICE_TYPE);
+
+        let service = Service {
+            id: format!("{}#{DEVICE_ATTESTATION_FRAGMENT}", self.id),
+            service_type: DEVICE_ATTESTATION_SERVICE_TYPE.to_owned(),
+            service_endpoint: format!(
+                "data:application/octet-stream;hex,{}",
+                hex::encode(token_bytes)
+            ),
+        };
+        self.service.push(service);
+    }
+
+    /// Removes the `ScpDeviceAttestation` service entry, if present.
+    pub fn remove_device_attestation(&mut self) {
+        self.service
+            .retain(|s| s.service_type != DEVICE_ATTESTATION_SERVICE_TYPE);
+    }
+
     /// Returns the key custody attestation from this DID document, if present.
     ///
     /// Searches the service entries for one with type `ScpKeyCustodyAttestation`
@@ -580,7 +615,7 @@ impl DidDocument {
         let entry = self
             .service
             .iter()
-            .find(|s| s.service_type == SCP_DEVICE_ATTESTATION_SERVICE_TYPE);
+            .find(|s| s.service_type == DEVICE_ATTESTATION_SERVICE_TYPE);
 
         match entry {
             None => Ok(None),
@@ -616,12 +651,12 @@ impl DidDocument {
 
         // Remove any existing device attestation entry.
         self.service
-            .retain(|s| s.service_type != SCP_DEVICE_ATTESTATION_SERVICE_TYPE);
+            .retain(|s| s.service_type != DEVICE_ATTESTATION_SERVICE_TYPE);
 
         let endpoint = base64::engine::general_purpose::STANDARD.encode(token);
         let service = Service {
             id: format!("{}#device-attestation", self.id),
-            service_type: SCP_DEVICE_ATTESTATION_SERVICE_TYPE.to_owned(),
+            service_type: DEVICE_ATTESTATION_SERVICE_TYPE.to_owned(),
             service_endpoint: endpoint,
         };
         self.service.push(service);
@@ -632,7 +667,7 @@ impl DidDocument {
     pub fn has_device_attestation(&self) -> bool {
         self.service
             .iter()
-            .any(|s| s.service_type == SCP_DEVICE_ATTESTATION_SERVICE_TYPE)
+            .any(|s| s.service_type == DEVICE_ATTESTATION_SERVICE_TYPE)
     }
 
     /// Retires the current active signing key and installs a new one.
@@ -1929,5 +1964,107 @@ mod tests {
 
         let retrieved = parsed.custody_attestation().unwrap().unwrap();
         assert_eq!(retrieved, attestation);
+    }
+
+    // -----------------------------------------------------------------------
+    // Device attestation service entry tests (#362)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn add_device_attestation_creates_service_entry() {
+        let did = "did:dht:zDevAttest1";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        assert!(doc.device_attestation_token().unwrap().is_none());
+
+        doc.add_device_attestation(&[0xCA, 0xFE, 0xBA, 0xBE]);
+
+        let svc = doc
+            .service
+            .iter()
+            .find(|s| s.service_type == "ScpDeviceAttestation")
+            .expect("service entry should exist");
+        assert_eq!(svc.id, format!("{did}#device-attestation"));
+        assert_eq!(svc.service_type, "ScpDeviceAttestation");
+    }
+
+    #[test]
+    fn device_attestation_token_roundtrip() {
+        let did = "did:dht:zDevAttest2";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        let token = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03];
+
+        doc.add_device_attestation(&token);
+        let retrieved = doc.device_attestation_token().unwrap().unwrap();
+        assert_eq!(retrieved, token);
+    }
+
+    #[test]
+    fn device_attestation_absent_returns_none() {
+        let did = "did:dht:zDevAttest3";
+        let doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        assert!(doc.device_attestation_token().unwrap().is_none());
+    }
+
+    #[test]
+    fn device_attestation_survives_json_roundtrip() {
+        let did = "did:dht:zDevAttest4";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        let token = vec![0x01, 0x02, 0x03, 0x04, 0x05];
+
+        doc.add_device_attestation(&token);
+        let json = doc.to_json().unwrap();
+        let parsed = DidDocument::from_json(&json).unwrap();
+
+        let retrieved = parsed.device_attestation_token().unwrap().unwrap();
+        assert_eq!(retrieved, token);
+    }
+
+    #[test]
+    fn add_device_attestation_replaces_existing() {
+        let did = "did:dht:zDevAttest5";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        doc.add_device_attestation(&[0x01]);
+        doc.add_device_attestation(&[0x02]);
+
+        let count = doc
+            .service
+            .iter()
+            .filter(|s| s.service_type == "ScpDeviceAttestation")
+            .count();
+        assert_eq!(count, 1, "should have exactly one device attestation entry");
+
+        let retrieved = doc.device_attestation_token().unwrap().unwrap();
+        assert_eq!(retrieved, vec![0x02]);
+    }
+
+    #[test]
+    fn remove_device_attestation_clears_entry() {
+        let did = "did:dht:zDevAttest6";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        doc.add_device_attestation(&[0x01, 0x02]);
+        assert!(doc.device_attestation_token().unwrap().is_some());
+
+        doc.remove_device_attestation();
+        assert!(doc.device_attestation_token().unwrap().is_none());
+    }
+
+    #[test]
+    fn device_attestation_tampered_token_decode_fails() {
+        let did = "did:dht:zDevAttest7";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        doc.add_device_attestation(&[0x01]);
+
+        // Tamper with the service endpoint to have invalid hex.
+        let svc = doc
+            .service
+            .iter_mut()
+            .find(|s| s.service_type == "ScpDeviceAttestation")
+            .unwrap();
+        svc.service_endpoint = "data:application/octet-stream;hex,ZZZZ".to_owned();
+
+        let result = doc.device_attestation_token();
+        assert!(result.is_err());
     }
 }

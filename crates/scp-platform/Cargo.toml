@@ -13,6 +13,7 @@ software_platform = [
     "dep:rand",
     "dep:hmac",
     "dep:sha2",
+    "dep:hkdf",
     "dep:uuid",
 ]
 # In-memory platform adapters for testing and development (ADR-006).
@@ -51,6 +52,7 @@ argon2 = { workspace = true, optional = true }
 ed25519-dalek = { workspace = true, optional = true }
 x25519-dalek = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
+hkdf = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }

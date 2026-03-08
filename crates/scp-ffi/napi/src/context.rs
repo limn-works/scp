@@ -560,6 +560,7 @@ pub async fn context_send(
         })?;
 
         let params = scp_core::envelope::InnerEnvelopeParams {
+            version: scp_core::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
             context_id: &context_id,
             sender_did: &sender_did_str,
             epoch: 0,
@@ -923,4 +924,58 @@ pub async fn context_reset_ttl_timer(
         .reset_ttl_timer(&handle.context_id, duration, core_handle.clone())
         .await;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Context export/import (#363)
+// ---------------------------------------------------------------------------
+
+/// Exports a context's full state as serialized MessagePack bytes.
+///
+/// Returns serialized `StoredValue<ContextExport>` bytes (§17.5) suitable for
+/// backup, migration, or transfer to another node.
+///
+/// # Errors
+///
+/// Returns NAPI error if the context does not exist, export fails, or
+/// serialization fails.
+#[napi(js_name = "contextExport")]
+pub async fn context_export(handle: &NapiContextHandle) -> napi::Result<Vec<u8>> {
+    let exporter_did = scp_identity::DID::from(handle.creator_did.clone());
+    let manager = context_manager();
+    let export = manager
+        .export_context(&handle.context_id, exporter_did)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    scp_core::context::export_import::serialize_export(&export)
+        .map_err(|e| NapiError::from(ScpNapiError::Context {
+            message: format!("export serialization failed: {e}"),
+            code: "SCP-CTX-2030".to_owned(),
+        }))
+}
+
+/// Imports a context from serialized MessagePack bytes.
+///
+/// The bytes must be a `StoredValue<ContextExport>` envelope (§17.5), as
+/// produced by [`context_export`].
+///
+/// Returns the context ID of the imported context.
+///
+/// # Errors
+///
+/// Returns NAPI error if deserialization, validation, or import fails.
+#[napi(js_name = "contextImport")]
+pub async fn context_import(data: Vec<u8>) -> napi::Result<String> {
+    let export = scp_core::context::export_import::deserialize_export(&data)
+        .map_err(|e| NapiError::from(ScpNapiError::Context {
+            message: format!("invalid export data: {e}"),
+            code: "SCP-CTX-2032".to_owned(),
+        }))?;
+    let context_id = export.snapshot.context_id.clone();
+    let manager = context_manager();
+    manager
+        .import_context(export)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    Ok(context_id)
 }

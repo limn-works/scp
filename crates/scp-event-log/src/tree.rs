@@ -277,7 +277,18 @@ fn serialize_event_for_hashing(event: &Event) -> Result<Vec<u8>, EventLogError> 
 ///
 /// The signature covers a canonical hash of all event fields except the
 /// signature itself.
-fn verify_event_signature(event: &Event) -> Result<(), EventLogError> {
+/// Verifies the Ed25519 signature on an event (M16).
+///
+/// Extracts the signer's public key from `event.actor_did`, recomputes the
+/// canonical event hash, and verifies the signature. This function is used
+/// both during `append` (for new events) and during sync reconciliation
+/// (for events received from remote peers).
+///
+/// # Errors
+///
+/// Returns [`EventLogError::InvalidSignature`] if the signature is invalid
+/// or the public key cannot be extracted from the DID.
+pub fn verify_event_signature(event: &Event) -> Result<(), EventLogError> {
     let public_key_bytes = extract_public_key_from_did(&event.actor_did).map_err(|reason| {
         EventLogError::InvalidSignature {
             sequence: event.sequence,
@@ -291,6 +302,27 @@ fn verify_event_signature(event: &Event) -> Result<(), EventLogError> {
             reason,
         },
     )
+}
+
+/// Verifies signatures on a batch of events during sync reconciliation (M16).
+///
+/// Iterates through the provided events and verifies each event's Ed25519
+/// signature. Returns the index and error of the first failing event, or
+/// `Ok(())` if all events pass.
+///
+/// This is the entry point for M16 (event verification during reconciliation).
+/// Callers in the sync module should call this on received events before
+/// applying them to local state.
+///
+/// # Errors
+///
+/// Returns [`EventLogError::InvalidSignature`] for the first event that
+/// fails signature verification.
+pub fn verify_event_batch(events: &[Event]) -> Result<(), EventLogError> {
+    for event in events {
+        verify_event_signature(event)?;
+    }
+    Ok(())
 }
 
 /// Computes the canonical hash of an event for signature purposes.

@@ -9,6 +9,8 @@
 
 pub mod block_list;
 pub mod blocking;
+pub mod custody_migration;
+pub mod private_state;
 pub mod recovery;
 
 // Re-export SigningKeyId from scp-identity — the single canonical definition.

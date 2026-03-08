@@ -184,14 +184,32 @@ pub fn unwrap_cek(
 
 /// Constructs the AES-256-GCM additional authenticated data (AAD).
 ///
-/// AAD = `context_id` || `sender_did` || `sequence_number` (big-endian u64).
+/// Per spec section 05-contexts.md line 979:
+/// ```text
+/// aad = context_id || sender_did || key_epoch_bytes || sequence_bytes
+/// ```
+/// Where `context_id` and `sender_did` are UTF-8 bytes with 4-byte BE length
+/// prefixes, `key_epoch_bytes` is 8-byte big-endian, and `sequence_bytes` is
+/// 8-byte big-endian.
 ///
-/// This prevents cross-context ciphertext relocation and message reordering.
-/// See ADR-038 §4 and §9.17.1.
-fn build_aad(context_id: &str, sender_did: &str, sequence_number: u64) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(context_id.len() + sender_did.len() + 8);
-    aad.extend_from_slice(context_id.as_bytes());
-    aad.extend_from_slice(sender_did.as_bytes());
+/// Length prefixes prevent field-boundary ambiguity (e.g., a context_id
+/// "ab" + sender_did "cd" would otherwise collide with "abc" + "d").
+///
+/// This prevents cross-context ciphertext relocation, epoch substitution,
+/// and message reordering. See ADR-038 and spec section 9.17.1.
+fn build_aad(context_id: &str, sender_did: &str, key_epoch: u64, sequence_number: u64) -> Vec<u8> {
+    let ctx_bytes = context_id.as_bytes();
+    let did_bytes = sender_did.as_bytes();
+    let mut aad = Vec::with_capacity(4 + ctx_bytes.len() + 4 + did_bytes.len() + 8 + 8);
+    // context_id with u32 BE length prefix
+    aad.extend_from_slice(&(ctx_bytes.len() as u32).to_be_bytes());
+    aad.extend_from_slice(ctx_bytes);
+    // sender_did with u32 BE length prefix
+    aad.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
+    aad.extend_from_slice(did_bytes);
+    // key_epoch as 8-byte big-endian
+    aad.extend_from_slice(&key_epoch.to_be_bytes());
+    // sequence_number as 8-byte big-endian
     aad.extend_from_slice(&sequence_number.to_be_bytes());
     aad
 }
@@ -216,7 +234,7 @@ pub struct Recipient<'a> {
 ///
 /// 1. Generates a fresh random CEK (32 bytes).
 /// 2. Encrypts the plaintext with AES-256-GCM using the CEK.
-///    AAD = `context_id || sender_did || sequence_number`.
+///    AAD per spec section 05-contexts.md line 979 (length-prefixed fields + key_epoch).
 /// 3. Wraps the CEK with each recipient's access key using AES-256-KW.
 /// 4. Returns a `WrappedContent` containing ciphertext, nonce, and wrapped CEKs.
 ///
@@ -231,6 +249,7 @@ pub fn wrap_content(
     recipients: &[Recipient<'_>],
     context_id: &str,
     sender_did: &str,
+    key_epoch: u64,
     sequence_number: u64,
 ) -> Result<WrappedContent, AccessKeyError> {
     // 1. Generate fresh CEK
@@ -244,7 +263,7 @@ pub fn wrap_content(
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let aad = build_aad(context_id, sender_did, sequence_number);
+    let aad = build_aad(context_id, sender_did, key_epoch, sequence_number);
     let payload = Payload {
         msg: plaintext,
         aad: &aad,
@@ -281,7 +300,7 @@ pub fn wrap_content(
 /// 2. Finds the corresponding `WrappedCek` in the `wrapped_ceks` list.
 /// 3. Unwraps the CEK using the member's access key (AES-256-KW).
 /// 4. Decrypts the ciphertext with AES-256-GCM using the unwrapped CEK.
-///    AAD = `context_id || sender_did || sequence_number`.
+///    AAD per spec section 05-contexts.md line 979 (length-prefixed fields + key_epoch).
 ///
 /// # Errors
 ///
@@ -295,6 +314,7 @@ pub fn unwrap_content(
     access_key: &AccessKey,
     context_id: &str,
     sender_did: &str,
+    key_epoch: u64,
     sequence_number: u64,
 ) -> Result<Vec<u8>, AccessKeyError> {
     // 1. Compute truncated DID hash for recipient lookup
@@ -315,7 +335,7 @@ pub fn unwrap_content(
         .map_err(|e| AccessKeyError::EncryptionFailed(e.to_string()))?;
 
     let nonce = Nonce::from_slice(&wrapped.nonce);
-    let aad = build_aad(context_id, sender_did, sequence_number);
+    let aad = build_aad(context_id, sender_did, key_epoch, sequence_number);
     let payload = Payload {
         msg: &wrapped.ciphertext,
         aad: &aad,
@@ -397,13 +417,13 @@ mod tests {
             access_key: &access_key,
         }];
 
-        let wrapped = wrap_content(plaintext, &recipients, context_id, sender_did, seq).unwrap();
+        let wrapped = wrap_content(plaintext, &recipients, context_id, sender_did, 0, seq).unwrap();
 
         assert_eq!(wrapped.wrapped_ceks.len(), 1);
         assert_eq!(wrapped.nonce.len(), 12);
 
         let decrypted =
-            unwrap_content(&wrapped, did, &access_key, context_id, sender_did, seq).unwrap();
+            unwrap_content(&wrapped, did, &access_key, context_id, sender_did, 0, seq).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
@@ -435,16 +455,18 @@ mod tests {
             },
         ];
 
-        let wrapped = wrap_content(plaintext, &recipients, context_id, sender_did, seq).unwrap();
+        let wrapped = wrap_content(plaintext, &recipients, context_id, sender_did, 0, seq).unwrap();
         assert_eq!(wrapped.wrapped_ceks.len(), 3);
 
         // Each recipient can decrypt
-        let dec_alice =
-            unwrap_content(&wrapped, did_alice, &key_alice, context_id, sender_did, seq).unwrap();
+        let dec_alice = unwrap_content(
+            &wrapped, did_alice, &key_alice, context_id, sender_did, 0, seq,
+        )
+        .unwrap();
         assert_eq!(dec_alice, plaintext);
 
         let dec_bob =
-            unwrap_content(&wrapped, did_bob, &key_bob, context_id, sender_did, seq).unwrap();
+            unwrap_content(&wrapped, did_bob, &key_bob, context_id, sender_did, 0, seq).unwrap();
         assert_eq!(dec_bob, plaintext);
 
         let dec_charlie = unwrap_content(
@@ -453,6 +475,7 @@ mod tests {
             &key_charlie,
             context_id,
             sender_did,
+            0,
             seq,
         )
         .unwrap();
@@ -475,10 +498,10 @@ mod tests {
             access_key: &key_alice,
         }];
 
-        let wrapped = wrap_content(plaintext, &recipients, context_id, sender_did, seq).unwrap();
+        let wrapped = wrap_content(plaintext, &recipients, context_id, sender_did, 0, seq).unwrap();
 
         // Eve is not a recipient
-        let result = unwrap_content(&wrapped, did_eve, &key_eve, context_id, sender_did, seq);
+        let result = unwrap_content(&wrapped, did_eve, &key_eve, context_id, sender_did, 0, seq);
         assert!(
             matches!(result, Err(AccessKeyError::NotRecipient)),
             "non-recipient should get NotRecipient error, got {result:?}"
@@ -500,10 +523,12 @@ mod tests {
             access_key: &key_alice,
         }];
 
-        let wrapped = wrap_content(plaintext, &recipients, context_id, sender_did, seq).unwrap();
+        let wrapped = wrap_content(plaintext, &recipients, context_id, sender_did, 0, seq).unwrap();
 
         // Alice tries with wrong key
-        let result = unwrap_content(&wrapped, did_alice, &key_wrong, context_id, sender_did, seq);
+        let result = unwrap_content(
+            &wrapped, did_alice, &key_wrong, context_id, sender_did, 0, seq,
+        );
         assert!(
             matches!(result, Err(AccessKeyError::KeyUnwrapFailed)),
             "wrong access key should fail at key unwrap, got {result:?}"
@@ -525,14 +550,14 @@ mod tests {
         }];
 
         let mut wrapped =
-            wrap_content(plaintext, &recipients, context_id, sender_did, seq).unwrap();
+            wrap_content(plaintext, &recipients, context_id, sender_did, 0, seq).unwrap();
 
         // Tamper with the ciphertext
         if let Some(byte) = wrapped.ciphertext.get_mut(5) {
             *byte ^= 0xFF;
         }
 
-        let result = unwrap_content(&wrapped, did, &access_key, context_id, sender_did, seq);
+        let result = unwrap_content(&wrapped, did, &access_key, context_id, sender_did, 0, seq);
         assert!(
             matches!(result, Err(AccessKeyError::IntegrityFailure)),
             "tampered ciphertext should fail with IntegrityFailure, got {result:?}"
@@ -554,7 +579,7 @@ mod tests {
             access_key: &access_key,
         }];
 
-        let wrapped = wrap_content(plaintext, &recipients, context_id, sender_did, seq).unwrap();
+        let wrapped = wrap_content(plaintext, &recipients, context_id, sender_did, 0, seq).unwrap();
 
         // Attempt to decrypt with wrong context_id (simulating cross-context relocation)
         let result = unwrap_content(
@@ -563,6 +588,7 @@ mod tests {
             &access_key,
             wrong_context_id,
             sender_did,
+            0,
             seq,
         );
         assert!(
@@ -586,9 +612,9 @@ mod tests {
             access_key: &access_key,
         }];
 
-        let wrapped = wrap_content(plaintext, &recipients, context_id, sender_did, seq).unwrap();
+        let wrapped = wrap_content(plaintext, &recipients, context_id, sender_did, 0, seq).unwrap();
 
-        let result = unwrap_content(&wrapped, did, &access_key, context_id, wrong_sender, seq);
+        let result = unwrap_content(&wrapped, did, &access_key, context_id, wrong_sender, 0, seq);
         assert!(
             matches!(result, Err(AccessKeyError::IntegrityFailure)),
             "wrong sender_did should fail with IntegrityFailure (AAD mismatch), got {result:?}"
@@ -610,7 +636,7 @@ mod tests {
             access_key: &access_key,
         }];
 
-        let wrapped = wrap_content(plaintext, &recipients, context_id, sender_did, seq).unwrap();
+        let wrapped = wrap_content(plaintext, &recipients, context_id, sender_did, 0, seq).unwrap();
 
         let result = unwrap_content(
             &wrapped,
@@ -618,6 +644,7 @@ mod tests {
             &access_key,
             context_id,
             sender_did,
+            0,
             wrong_seq,
         );
         assert!(
@@ -650,7 +677,7 @@ mod tests {
             },
         ];
 
-        let wrapped = wrap_content(b"test", &recipients, context_id, sender_did, seq).unwrap();
+        let wrapped = wrap_content(b"test", &recipients, context_id, sender_did, 0, seq).unwrap();
 
         // Verify sorted order
         for i in 1..wrapped.wrapped_ceks.len() {
@@ -675,7 +702,7 @@ mod tests {
             access_key: &access_key,
         }];
 
-        let wrapped = wrap_content(plaintext, &recipients, context_id, sender_did, seq).unwrap();
+        let wrapped = wrap_content(plaintext, &recipients, context_id, sender_did, 0, seq).unwrap();
 
         // Serialize to MessagePack
         let encoded =
@@ -696,7 +723,7 @@ mod tests {
 
         // Verify that deserialized content can still be decrypted
         let decrypted =
-            unwrap_content(&decoded, did, &access_key, context_id, sender_did, seq).unwrap();
+            unwrap_content(&decoded, did, &access_key, context_id, sender_did, 0, seq).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
@@ -713,10 +740,10 @@ mod tests {
             access_key: &access_key,
         }];
 
-        let wrapped = wrap_content(b"", &recipients, context_id, sender_did, seq).unwrap();
+        let wrapped = wrap_content(b"", &recipients, context_id, sender_did, 0, seq).unwrap();
 
         let decrypted =
-            unwrap_content(&wrapped, did, &access_key, context_id, sender_did, seq).unwrap();
+            unwrap_content(&wrapped, did, &access_key, context_id, sender_did, 0, seq).unwrap();
         assert!(decrypted.is_empty());
     }
 
@@ -735,10 +762,11 @@ mod tests {
             access_key: &access_key,
         }];
 
-        let wrapped = wrap_content(&plaintext, &recipients, context_id, sender_did, seq).unwrap();
+        let wrapped =
+            wrap_content(&plaintext, &recipients, context_id, sender_did, 0, seq).unwrap();
 
         let decrypted =
-            unwrap_content(&wrapped, did, &access_key, context_id, sender_did, seq).unwrap();
+            unwrap_content(&wrapped, did, &access_key, context_id, sender_did, 0, seq).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 

@@ -1105,6 +1105,7 @@ fn py_context_send(
 
         let inner_result = rt.block_on(async {
             let params = scp_core::envelope::InnerEnvelopeParams {
+                version: scp_core::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
                 context_id: &context_id,
                 sender_did: &identity_did_owned,
                 epoch: 0,
@@ -1381,6 +1382,8 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
             test_vectors: vec![],
             operator_did: scp_identity::DID("did:key:placeholder".to_owned()),
             economic_metadata: None,
+            registered_at: 0,
+            signature: Vec::new(),
         })
         .collect();
 
@@ -1401,6 +1404,9 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
         metadata_visibility: scp_core::context::params::MetadataVisibilityPolicy::default(),
         projection_policy: None,
         discoverable: false,
+        max_chain_depth: None,
+        participation_requirements: Vec::new(),
+        incomplete_verification_policy: scp_core::context::params::IncompleteVerificationPolicy::default(),
     }
 }
 
@@ -1440,6 +1446,89 @@ fn py_get_economic_policy(handle: &PyContextHandle) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Context export/import bridge (#363)
+// ---------------------------------------------------------------------------
+
+/// Exports a context's full state as serialized MessagePack bytes.
+///
+/// The returned bytes are a [`StoredValue<ContextExport>`] envelope per §17.5,
+/// suitable for backup, migration, or transfer to another node.
+///
+/// # Arguments
+///
+/// * `context_id` -- The context to export.
+///
+/// # Returns
+///
+/// Serialized bytes of the context export.
+///
+/// # Errors
+///
+/// - `RuntimeError` if the context does not exist or export fails.
+#[pyfunction]
+#[pyo3(signature = (context_id,))]
+fn py_context_export(context_id: &str) -> PyResult<Vec<u8>> {
+    let rt = crate::runtime()?;
+    let mgr = crate::runtime::context_manager()
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let ctx_id = context_id.to_owned();
+
+    // Use the first registered local DID as the exporter.
+    let exporter_did = rt
+        .block_on(async {
+            // Get a local DID from the context's membership.
+            let contexts = mgr.member_dids(&ctx_id).await;
+            contexts.into_iter().next()
+        })
+        .map(scp_identity::DID::from)
+        .unwrap_or_else(|| scp_identity::DID::from("did:key:unknown-exporter"));
+
+    let export = rt
+        .block_on(mgr.export_context(&ctx_id, exporter_did))
+        .map_err(|e| PyRuntimeError::new_err(format!("context export failed: {e}")))?;
+
+    scp_core::context::export_import::serialize_export(&export)
+        .map_err(|e| PyRuntimeError::new_err(format!("export serialization failed: {e}")))
+}
+
+/// Imports a context from serialized MessagePack bytes.
+///
+/// The bytes must be a [`StoredValue<ContextExport>`] envelope per §17.5,
+/// as produced by [`py_context_export`].
+///
+/// # Arguments
+///
+/// * `data` -- Serialized context export bytes.
+///
+/// # Returns
+///
+/// The context ID string of the imported context.
+///
+/// # Errors
+///
+/// - `RuntimeError` if deserialization, validation, or import fails.
+/// - `ValueError` if the data is malformed.
+#[pyfunction]
+#[pyo3(signature = (data,))]
+fn py_context_import(data: &[u8]) -> PyResult<String> {
+    let export = scp_core::context::export_import::deserialize_export(data)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid export data: {e}")))?;
+
+    let context_id = export.snapshot.context_id.clone();
+
+    let rt = crate::runtime()?;
+    let mgr = crate::runtime::context_manager()
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+
+    rt.block_on(mgr.import_context(export))
+        .map_err(|e| PyRuntimeError::new_err(format!("context import failed: {e}")))?;
+
+    Ok(context_id)
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
@@ -1463,6 +1552,8 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_context_receive, m)?)?;
     m.add_function(wrap_pyfunction!(py_set_economic_policy, m)?)?;
     m.add_function(wrap_pyfunction!(py_get_economic_policy, m)?)?;
+    m.add_function(wrap_pyfunction!(py_context_export, m)?)?;
+    m.add_function(wrap_pyfunction!(py_context_import, m)?)?;
     Ok(())
 }
 

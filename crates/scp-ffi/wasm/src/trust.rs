@@ -145,6 +145,7 @@ pub fn trust_create_challenge(target_did: String) -> Promise {
                 "challenge_type": "SchemaValidation",
                 "challenger_did": "did:key:ephemeral-challenger",
                 "subject_did": target_did,
+                "capability_uri": "scp:capability:schema-validation",
                 "parameters": {},
                 "timeout_secs": 300,
                 "signature": [],

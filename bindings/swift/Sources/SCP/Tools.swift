@@ -227,7 +227,7 @@ extension Context {
         let outputJson = try await invokeFn(contextHandle, tool, inputJson, identity)
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
-            invokerDid: "",
+            invokerDid: contextHandle.creatorDid(),
             contextId: contextId,
             timestamp: UInt64(Date().timeIntervalSince1970 * 1_000)
         )
@@ -357,7 +357,7 @@ extension Context {
         )
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
-            invokerDid: "",
+            invokerDid: sourceHandle.creatorDid(),
             contextId: contextId,
             timestamp: UInt64(Date().timeIntervalSince1970 * 1_000)
         )
@@ -448,7 +448,7 @@ extension Context {
         )
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
-            invokerDid: "",
+            invokerDid: contextHandle.creatorDid(),
             contextId: contextId,
             timestamp: UInt64(Date().timeIntervalSince1970 * 1_000)
         )

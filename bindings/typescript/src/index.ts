@@ -76,7 +76,7 @@ export { delegateUcan, mintUcan, revokeUcan, validateUcan } from "./ucan.js";
 // ---------------------------------------------------------------------------
 
 export type { McpClient, McpServer } from "./mcp.js";
-export { connectMcp, serveMcp } from "./mcp.js";
+export { connectMcp, connectMcpStdio, serveMcp } from "./mcp.js";
 
 // ---------------------------------------------------------------------------
 // Errors

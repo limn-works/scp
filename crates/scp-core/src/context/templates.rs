@@ -17,8 +17,8 @@
 
 use super::params::{
     Capability, CeilingPolicy, ContextMode, ContextParams, FieldVisibility, GovernanceModel,
-    MemoryScope, MetadataVisibilityPolicy, ProjectionPolicy, ProjectionRule, PromotionPolicy,
-    TemplateId,
+    IncompleteVerificationPolicy, MemoryScope, MetadataVisibilityPolicy, ProjectionPolicy,
+    ProjectionRule, PromotionPolicy, TemplateId,
 };
 
 // ---------------------------------------------------------------------------
@@ -279,6 +279,9 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             metadata_visibility: private_encrypted_visibility(),
             projection_policy: None,
             discoverable: false,
+            max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         TemplateId::BilateralPersistent => ContextParams {
             mode: ContextMode::Encrypted,
@@ -295,6 +298,9 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             metadata_visibility: private_encrypted_visibility(),
             projection_policy: None,
             discoverable: false,
+            max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         TemplateId::Coordination => ContextParams {
             mode: ContextMode::Encrypted,
@@ -311,6 +317,9 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             metadata_visibility: private_encrypted_visibility(),
             projection_policy: None,
             discoverable: false,
+            max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         TemplateId::GroupDiscussion => ContextParams {
             mode: ContextMode::Encrypted,
@@ -327,6 +336,9 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             metadata_visibility: group_discussion_visibility(),
             projection_policy: None,
             discoverable: false,
+            max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         TemplateId::PublicBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
@@ -346,6 +358,9 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
                 overrides: vec![],
             }),
             discoverable: false,
+            max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         TemplateId::GatedBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
@@ -365,6 +380,9 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
                 overrides: vec![],
             }),
             discoverable: false,
+            max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         TemplateId::ToolInterfaceTemplate => ContextParams {
             mode: ContextMode::Encrypted,
@@ -381,6 +399,9 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
             discoverable: false,
+            max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         // Extends scp:template/tool-interface -- same ceiling and governance,
         // but economic_policy is caller-provided and validated separately.
@@ -399,6 +420,9 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             metadata_visibility: member_count_hidden_visibility(),
             projection_policy: None,
             discoverable: false,
+            max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         // Extends scp:template/gated-broadcast -- broadcast mode with gated
         // subscriber admission. economic_policy is caller-provided.
@@ -420,6 +444,9 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
                 overrides: vec![],
             }),
             discoverable: false,
+            max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         // Discovery context: encrypted mode with messaging + tool invocation
         // ceiling. Discoverable by default so it can be found via DHT. Used
@@ -439,6 +466,9 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
             discoverable: true,
+            max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
     }
 }
@@ -1465,6 +1495,8 @@ mod tests {
             test_vectors: vec![],
             operator_did: "did:dht:z6MkTestOperator".into(),
             economic_metadata: None,
+            registered_at: 0,
+            signature: Vec::new(),
         }];
         let err = validate_against_template(&params).unwrap_err();
         assert!(matches!(

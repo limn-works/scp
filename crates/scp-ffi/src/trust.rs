@@ -160,7 +160,8 @@ pub fn py_trust_create_challenge(py: Python<'_>, target_did: &str) -> PyResult<P
     let request = scp_core::trust::issue_challenge(
         challenger_did.into(),
         target_did.into(),
-        scp_core::trust::ChallengeType::SchemaValidation,
+        scp_core::trust::ChallengeType::schema_validation(),
+        "scp:capability:schema-validation/v1".to_owned(),
         serde_json::json!({}),
         std::time::Duration::from_secs(300),
         &signer,
@@ -212,7 +213,26 @@ pub fn py_trust_verify_response(challenge_json: &str, response_json: &str) -> Py
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
     let clock = scp_identity::cache::SystemClock;
 
-    Ok(scp_core::trust::verify_challenge_response(&request, &response, &resolver, &clock).is_ok())
+    struct EphemeralVerifierSigner(ed25519_dalek::SigningKey);
+    impl scp_core::trust::ChallengeSigner for EphemeralVerifierSigner {
+        fn sign(&self, data: &[u8]) -> Result<Vec<u8>, scp_core::trust::TrustError> {
+            use ed25519_dalek::Signer;
+            let sig = self.0.sign(data);
+            Ok(sig.to_bytes().to_vec())
+        }
+    }
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let verifier_signer = EphemeralVerifierSigner(signing_key);
+
+    Ok(scp_core::trust::verify_challenge_response(
+        &request,
+        &response,
+        &resolver,
+        &clock,
+        &verifier_signer,
+        None,
+    )
+    .is_ok())
 }
 
 // ---------------------------------------------------------------------------

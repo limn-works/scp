@@ -1502,12 +1502,16 @@ mod tests {
             registered_tools: Vec::new(),
             write_revoked_members: std::collections::HashSet::new(),
             read_revoked_members: std::collections::HashSet::new(),
+            read_exclusion_list: std::collections::HashSet::new(),
             tool_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
+            approved_proposals: std::collections::HashMap::new(),
+            governance_freeze: None,
+            pending_ceiling_modification: None,
         }
     }
 

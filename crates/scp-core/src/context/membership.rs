@@ -285,17 +285,18 @@ pub enum ContextEvent {
     },
     /// A member's write access was revoked via governance (§9.17, ADR-038).
     ///
-    /// The member can no longer publish messages. In `Full` scope, the
-    /// member's sender/broadcast key is also destroyed and historical
-    /// content is suppressed.
+    /// The member remains in the context for governance/presence purposes
+    /// but cannot publish new content. In `Full` scope, the member's
+    /// sender/broadcast key is also destroyed and historical content is
+    /// suppressed.
     WriteAccessRevoked {
         /// The DID whose write access was revoked.
         did: DID,
     },
     /// A member's write access was restored via governance (§9.17, ADR-038).
     ///
-    /// The member can publish messages again. Restoration is forward-only:
-    /// previously suppressed content remains suppressed.
+    /// Forward-only: the member can publish new content but previously
+    /// suppressed content remains suppressed.
     WriteAccessRestored {
         /// The DID whose write access was restored.
         did: DID,

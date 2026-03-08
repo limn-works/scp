@@ -29,9 +29,10 @@
 use std::collections::HashMap;
 
 use super::{
-    GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
-    GovernanceModelConfig, GovernanceProposal, KeyResolver, ProposalId, ProposalStatus,
-    RejectionReason, VoteType, compute_proposal_id, sign_vote, verify_vote,
+    CheckpointAttestationStatus, CosignedCheckpoint, GovernanceAction, GovernanceContext,
+    GovernanceEngine, GovernanceError, GovernanceEvent, GovernanceModelConfig, GovernanceProposal,
+    KeyResolver, ProposalId, ProposalStatus, RejectionReason, VoteType, compute_proposal_id,
+    sign_vote, verify_vote,
 };
 use scp_identity::DID;
 
@@ -652,6 +653,59 @@ impl GovernanceEngine for MajorityVoteEngine {
             proposal_id: *proposal_id,
             status: ProposalStatus::Invalidated { reason },
         }])
+    }
+
+    fn checkpoint_cosignature_requirements(&self) -> (Vec<DID>, usize) {
+        // Majority: require >50% cosignatures from eligible voters (ADR-031 §9)
+        let majority_count = (self.eligible_voter_dids.len() / 2) + 1;
+        (self.eligible_voter_dids.clone(), majority_count)
+    }
+
+    fn validate_checkpoint_cosignatures(
+        &self,
+        cosignatures: &[CosignedCheckpoint],
+        checkpoint_hash: &[u8; 32],
+    ) -> Result<CheckpointAttestationStatus, GovernanceError> {
+        // Verify all cosignatures are from eligible voters and valid
+        let mut valid_cosignatures = 0;
+        for cosig in cosignatures {
+            if !self.eligible_voter_dids.contains(&cosig.signer_did) {
+                return Err(GovernanceError::NotEligible(format!(
+                    "Cosigner {} not in eligible voter set",
+                    cosig.signer_did
+                )));
+            }
+
+            // Get public key for this voter
+            let verifying_key = match (self.key_resolver)(&cosig.signer_did) {
+                Some(key) => key,
+                None => {
+                    return Err(GovernanceError::NotEligible(format!(
+                        "Cannot resolve public key for cosigner {}",
+                        cosig.signer_did
+                    )));
+                }
+            };
+
+            // Verify signature
+            let sig_bytes: [u8; 64] = cosig.signature.as_slice().try_into().map_err(|_| {
+                GovernanceError::VerificationFailed("invalid signature length".to_string())
+            })?;
+            let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+            verifying_key
+                .verify_strict(checkpoint_hash, &signature)
+                .map_err(|e| GovernanceError::VerificationFailed(e.to_string()))?;
+
+            valid_cosignatures += 1;
+        }
+
+        // Check if we have majority (>50%) for full attestation
+        let majority_count = (self.eligible_voter_dids.len() / 2) + 1;
+        if valid_cosignatures >= majority_count {
+            Ok(CheckpointAttestationStatus::FullyAttested)
+        } else {
+            Ok(CheckpointAttestationStatus::PartiallyAttested)
+        }
     }
 }
 

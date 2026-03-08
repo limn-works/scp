@@ -79,5 +79,9 @@ required-features = ["testing"]
 name = "participation_event_log"
 required-features = ["testing"]
 
+[[test]]
+name = "governance_integration"
+required-features = ["testing"]
+
 [lints]
 workspace = true

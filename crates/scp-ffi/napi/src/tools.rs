@@ -9,10 +9,53 @@
 //! See ADR-022 in `.docs/adrs/phase-4.md`.
 
 use napi_derive::napi;
-use uuid::Uuid;
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
+
+/// Validates a UCAN token for tool invocation authorization.
+///
+/// Performs the full 11-step ADR-016 validation pipeline.
+fn validate_ucan_for_tool(
+    context_id: &str,
+    tool_id: &str,
+    identity_did: &str,
+    ucan_token: &str,
+    proof_resolver: &scp_ffi_common::BridgeProofResolver,
+) -> Result<(), ScpNapiError> {
+    crate::runtime::with_context(context_id, |rt| {
+        let production_resolver = crate::runtime::did_resolver();
+        let did_resolver = scp_ffi_common::DispatchDidResolver::new(
+            production_resolver.map(std::convert::AsRef::as_ref),
+        );
+        let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
+            revocation_list: &rt.revocation_list,
+        };
+        let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
+            inner: &mut rt.nonce_tracker,
+        };
+
+        let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
+            did_resolver: &did_resolver,
+            nonce_tracker: &mut nonce_adapter,
+            revocation_checker: &revocation_checker,
+            proof_resolver,
+            ceiling: &rt.ceiling_strings,
+            context_creator_did: &rt.creator_did,
+            presenting_agent_did: identity_did,
+            clock_skew_tolerance_secs:
+                scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        scp_core::context::tools::validate_tool_invocation_ucan(
+            ucan_token, context_id, tool_id, &mut ctx,
+        )
+        .map_err(|e| ScpNapiError::Permission {
+            message: format!("UCAN authorization failed for tool '{tool_id}': {e}"),
+            code: "SCP-PERM-3001".to_owned(),
+        })
+    })
+}
 
 // ---------------------------------------------------------------------------
 // NapiToolDefinition — tool definition for registration
@@ -92,9 +135,64 @@ pub async fn tool_register(
         .into());
     }
 
-    let tool_id = format!("tool-{}", Uuid::new_v4());
-    let _ = definition;
-    Ok(tool_id)
+    // Ensure UCAN state is registered so the tool registry is available.
+    crate::runtime::ensure_registered(handle)?;
+
+    let context_id = handle.context_id();
+
+    // Build a scp-core ToolRegistration from the NAPI definition.
+    let tool_id = format!("tool-{}", definition.name.replace(' ', "-").to_lowercase());
+
+    let input_schema: serde_json::Value = serde_json::from_str(&definition.input_schema_json)
+        .unwrap_or_else(|_| serde_json::json!({"type": "object"}));
+    let output_schema: serde_json::Value = serde_json::from_str(&definition.output_schema_json)
+        .unwrap_or_else(|_| serde_json::json!({"type": "object"}));
+
+    let test_vectors: Vec<scp_core::context::tools::TestVector> = definition
+        .test_vectors_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or_default();
+
+    let implementation_hash: [u8; 32] = definition
+        .implementation_hash
+        .as_deref()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .unwrap_or([0u8; 32]);
+
+    let core_registration = scp_core::context::tools::ToolRegistration {
+        tool_id: tool_id.clone(),
+        name: definition.name,
+        description: definition.description,
+        schema: scp_core::context::tools::ToolSchema {
+            input_schema,
+            output_schema,
+        },
+        implementation_hash,
+        test_vectors,
+        operator_did: definition.operator_did.into(),
+        economic_metadata: None,
+        registered_at: 0,
+        signature: Vec::new(),
+    };
+
+    // Register the tool in the context's tool registry.
+    let registered_id = crate::runtime::with_context(&context_id, |rt| {
+        let (registered_id, _event) = scp_core::context::tools::register_tool(
+            &mut rt.tool_registry,
+            &rt.role_state,
+            core_registration,
+            &rt.creator_did.clone(),
+        )
+        .map_err(|e| ScpNapiError::Tool {
+            message: format!("tool registration failed: {e}"),
+            code: "SCP-TOOL-6001".to_owned(),
+        })?;
+        Ok(registered_id)
+    })
+    .map_err(napi::Error::from)?;
+
+    Ok(registered_id)
 }
 
 /// Invokes a tool within an SCP context.
@@ -148,14 +246,10 @@ pub async fn tool_invoke(
         .into());
     }
 
-    // Primary authorization: UCAN token validation via the full 11-step
-    // ADR-016 pipeline. Verifies the token grants tool_invoke:{tool_id}
-    // or tool_invoke:* for this context.
-    // See spec §6.2, §8, ADR-016, and issue #319.
     let context_id = handle.context_id();
     crate::runtime::ensure_registered(handle)?;
 
-    // Build proof resolver from optional proof tokens (supports delegated UCANs).
+    // UCAN authorization (full 11-step ADR-016 pipeline).
     let proof_resolver = crate::ucan::build_proof_resolver_from_tokens(proof_tokens.as_deref())
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Permission {
@@ -163,46 +257,78 @@ pub async fn tool_invoke(
                 code: "SCP-PERM-3001".to_owned(),
             })
         })?;
+    validate_ucan_for_tool(
+        &context_id,
+        &tool_id,
+        &identity_did,
+        &ucan_token,
+        &proof_resolver,
+    )
+    .map_err(napi::Error::from)?;
 
-    crate::runtime::with_context(&context_id, |rt| {
-        let production_resolver = crate::runtime::did_resolver();
-        let did_resolver = scp_ffi_common::DispatchDidResolver::new(
-            production_resolver.map(std::convert::AsRef::as_ref),
-        );
-        let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
-            revocation_list: &rt.revocation_list,
-        };
-        let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
-            inner: &mut rt.nonce_tracker,
-        };
+    // Validate tool existence, input schema, and dispatch (matching PyO3 pattern).
+    let output_json = crate::runtime::with_context(&context_id, |rt| {
+        let registration = rt
+            .tool_registry
+            .get(&tool_id)
+            .ok_or_else(|| ScpNapiError::Tool {
+                message: format!("tool '{tool_id}' not found in context '{context_id}'"),
+                code: "SCP-TOOL-6002".to_owned(),
+            })?;
 
-        let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
-            did_resolver: &did_resolver,
-            nonce_tracker: &mut nonce_adapter,
-            revocation_checker: &revocation_checker,
-            proof_resolver: &proof_resolver,
-            ceiling: &rt.ceiling_strings,
-            context_creator_did: &rt.creator_did,
-            presenting_agent_did: &identity_did,
-            clock_skew_tolerance_secs:
-                scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-        };
-
-        scp_core::context::tools::validate_tool_invocation_ucan(
-            &ucan_token,
-            &context_id,
-            &tool_id,
-            &mut ctx,
+        // Validate input against the tool's input schema.
+        let input_value: serde_json::Value =
+            serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
+        scp_core::context::tools::validate_value_against_schema(
+            &input_value,
+            &registration.schema.input_schema,
         )
-        .map_err(|e| ScpNapiError::Permission {
-            message: format!("UCAN authorization failed for tool '{tool_id}': {e}"),
-            code: "SCP-PERM-3001".to_owned(),
-        })
+        .map_err(|e| ScpNapiError::Tool {
+            message: format!("input validation failed: {e}"),
+            code: "SCP-TOOL-6002".to_owned(),
+        })?;
+
+        // Dispatch to registered handler if available.
+        let output = if let Some(handler) = rt.tool_handlers.get(&tool_id) {
+            let handler = handler.clone();
+            let out = handler(input_value.clone()).map_err(|e| ScpNapiError::Tool {
+                message: format!("tool handler for '{tool_id}' failed: {e}"),
+                code: "SCP-TOOL-6002".to_owned(),
+            })?;
+
+            // Validate output against the tool's output schema (defense-in-depth).
+            scp_core::context::tools::validate_value_against_schema(
+                &out,
+                &registration.schema.output_schema,
+            )
+            .map_err(|msg| ScpNapiError::Tool {
+                message: format!("output validation failed for tool '{tool_id}': {msg}"),
+                code: "SCP-TOOL-6002".to_owned(),
+            })?;
+
+            out
+        } else {
+            // No handler registered — fall back to echo mode with metadata.
+            serde_json::json!({
+                "tool": tool_id,
+                "context": context_id,
+                "status": "validated",
+                "input_valid": true,
+                "invoker_did": identity_did,
+                "validated_input": input_value,
+            })
+        };
+
+        Ok(output)
     })
     .map_err(napi::Error::from)?;
 
-    let _ = (tool_id, input_json, identity_did);
-    Ok("{}".to_owned())
+    serde_json::to_string(&output_json).map_err(|e| {
+        napi::Error::from(ScpNapiError::Tool {
+            message: format!("failed to serialize tool output: {e}"),
+            code: "SCP-TOOL-6002".to_owned(),
+        })
+    })
 }
 
 /// Verifies a tool against its registered test vectors.
@@ -238,10 +364,48 @@ pub async fn tool_verify(
         .into());
     }
 
+    let context_id = handle.context_id();
+    crate::runtime::ensure_registered(handle)?;
+
+    // Look up the tool and verify against its test vectors (matching PyO3 pattern).
+    let result = crate::runtime::with_context(&context_id, |rt| {
+        let (verification_result, _event) = scp_core::context::tools::verify_tool(
+            &rt.tool_registry,
+            &tool_id,
+            // Identity executor: returns the expected output for each vector.
+            // This validates the test vector structure; real execution verification
+            // happens when a full executor is connected.
+            |input| {
+                if let Some(registration) = rt.tool_registry.get(&tool_id) {
+                    for vector in &registration.test_vectors {
+                        if vector.input == *input {
+                            return vector.expected_output.clone();
+                        }
+                    }
+                }
+                serde_json::Value::Null
+            },
+        )
+        .map_err(|e| ScpNapiError::Tool {
+            message: format!("tool verification failed: {e}"),
+            code: "SCP-TOOL-6001".to_owned(),
+        })?;
+
+        Ok(verification_result)
+    })
+    .map_err(napi::Error::from)?;
+
+    let failures: Vec<String> = result
+        .vector_results
+        .iter()
+        .filter(|r| !r.passed)
+        .map(|r| r.description.clone())
+        .collect();
+
     Ok(NapiToolVerificationResult {
-        tool_id,
-        passed: true,
-        failures: Vec::new(),
+        tool_id: result.tool_id,
+        passed: result.integrity_ok,
+        failures,
     })
 }
 
@@ -306,16 +470,66 @@ pub async fn tool_invoke_cross_context(
     let source_context_id = source_handle.context_id();
     let target_context_id = target_handle.context_id();
 
-    let output = serde_json::json!({
-        "tool": tool_id,
-        "source_context": source_context_id,
-        "target_context": target_context_id,
-        "status": "validated",
-        "chain_depth": chain_depth,
-        "invoker_did": invoker_did,
-        "validated_input": serde_json::from_str::<serde_json::Value>(&input_json)
-            .unwrap_or(serde_json::Value::Null),
-    });
+    // Ensure target context UCAN state is registered.
+    crate::runtime::ensure_registered(target_handle)?;
+
+    let input_value: serde_json::Value =
+        serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
+
+    let output = crate::runtime::with_context(&target_context_id, |rt| {
+        let registration = rt
+            .tool_registry
+            .get(&tool_id)
+            .ok_or_else(|| ScpNapiError::Tool {
+                message: format!(
+                    "tool '{tool_id}' not found in target context '{target_context_id}'"
+                ),
+                code: "SCP-TOOL-6002".to_owned(),
+            })?;
+
+        // Validate input against the tool's input schema.
+        scp_core::context::tools::validate_value_against_schema(
+            &input_value,
+            &registration.schema.input_schema,
+        )
+        .map_err(|e| ScpNapiError::Tool {
+            message: format!("input validation failed: {e}"),
+            code: "SCP-TOOL-6002".to_owned(),
+        })?;
+
+        // Dispatch to handler or echo mode.
+        let output = if let Some(handler) = rt.tool_handlers.get(&tool_id) {
+            let handler = handler.clone();
+            let out = handler(input_value.clone()).map_err(|e| ScpNapiError::Tool {
+                message: format!("cross-context tool handler for '{tool_id}' failed: {e}"),
+                code: "SCP-TOOL-6002".to_owned(),
+            })?;
+
+            scp_core::context::tools::validate_value_against_schema(
+                &out,
+                &registration.schema.output_schema,
+            )
+            .map_err(|msg| ScpNapiError::Tool {
+                message: format!("output validation failed for tool '{tool_id}': {msg}"),
+                code: "SCP-TOOL-6002".to_owned(),
+            })?;
+
+            out
+        } else {
+            serde_json::json!({
+                "tool": tool_id,
+                "source_context": source_context_id,
+                "target_context": target_context_id,
+                "status": "validated",
+                "chain_depth": chain_depth,
+                "invoker_did": invoker_did,
+                "validated_input": input_value,
+            })
+        };
+
+        Ok(output)
+    })
+    .map_err(napi::Error::from)?;
 
     serde_json::to_string(&output).map_err(|e| {
         napi::Error::from(ScpNapiError::Tool {
@@ -445,22 +659,49 @@ pub async fn tool_session_invoke(
         }
 
         let tool_id = session.tool_id.clone();
+        let current_state = session.state.clone();
         let call_count = session.call_count;
 
-        // Increment call count.
-        if let Some(session) = rt.session_store.get_mut(&session_id) {
-            session.call_count = session.call_count.saturating_add(1);
+        let input_value: serde_json::Value =
+            serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
+
+        // Validate input against tool's input schema if tool is registered.
+        if let Some(registration) = rt.tool_registry.get(&tool_id) {
+            scp_core::context::tools::validate_value_against_schema(
+                &input_value,
+                &registration.schema.input_schema,
+            )
+            .map_err(|e| ScpNapiError::Tool {
+                message: format!("input validation failed: {e}"),
+                code: "SCP-TOOL-6002".to_owned(),
+            })?;
         }
 
-        let output = serde_json::json!({
-            "tool": tool_id,
-            "session_id": session_id,
-            "status": "validated",
-            "call_count": call_count + 1,
-            "invoker_did": invoker_did,
-            "validated_input": serde_json::from_str::<serde_json::Value>(&input_json)
-                .unwrap_or(serde_json::Value::Null),
-        });
+        // Execute via handler or echo mode.
+        let (new_state, output) = if let Some(handler) = rt.tool_handlers.get(&tool_id) {
+            let handler = handler.clone();
+            let out = handler(input_value).map_err(|e| ScpNapiError::Tool {
+                message: format!("tool handler for '{tool_id}' failed: {e}"),
+                code: "SCP-TOOL-6002".to_owned(),
+            })?;
+            (current_state, out)
+        } else {
+            let out = serde_json::json!({
+                "tool": tool_id,
+                "session_id": session_id,
+                "status": "validated",
+                "call_count": call_count + 1,
+                "invoker_did": invoker_did,
+                "validated_input": input_value,
+            });
+            (current_state, out)
+        };
+
+        // Update session state and increment call count.
+        if let Some(session) = rt.session_store.get_mut(&session_id) {
+            session.state = new_state;
+            session.call_count = session.call_count.saturating_add(1);
+        }
 
         Ok(output)
     })

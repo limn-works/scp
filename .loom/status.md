@@ -1,55 +1,84 @@
-# Loom Status
+# Loom Status — Phase 10 Features
+
+**Branch:** `feat/phase-10-features`
+**Last commit:** `941a501e` — chore(loom): iteration 1 checkpoint
+**Date:** 2026-03-07
+**Iteration:** 3
 
 ## Failing Tests
-None known — disk full prevents running tests.
+
+Unknown — disk space exhaustion on `/private/tmp` prevented running any tests or git commands.
 
 ## Uncommitted Changes
-None — WASM changes committed as `167b2cf2`.
+
+### Stashed changes
+- `git stash list` entry `phase10-iter1-363-partial` — partial #363 (context export/import) work from iteration 1. 276 lines across `context/builder.rs`, `context/manager.rs`, `context/mod.rs`, `context/providers/event_log.rs`. New file `context/export_import.rs` is untracked.
+
+### Agent worktrees with committed work (ready to merge)
+| Agent Branch | Story | Commit | Status |
+|---|---|---|---|
+| `worktree-agent-a7df9ffe` | SCP-ACR-005 | `d99f7860` | **COMMITTED** — ready to merge |
+
+### Agent worktrees with completed but uncommitted work
+| Agent Branch | Story | Status |
+|---|---|---|
+| `worktree-agent-afc4f71d` | SCP-ACR-004 | Hit usage limit. Tests passing (37/37) but no commit. |
+| `worktree-agent-a46ebe8f` | SCP-BCH-004 | Hit usage limit. Clippy error (function too long). No commit. |
+| `worktree-agent-aefbb407` | SCP-BCH-002 | Completed implementation. Commit status unknown (disk full). |
+| `worktree-agent-a663e8f9` | SCP-BA-002 | Completed. 2844 tests passing, clippy clean. Could not commit (disk full). |
+
+### Iteration 1 worktrees (confirmed 0 commits — work is lost)
+- `worktree-agent-a8c1f3e3` (SCP-BCH-009), `worktree-agent-adb8502a` (SCP-ACR-004), `worktree-agent-a1fe421a` (#365), `worktree-agent-a7bdfcde` (SCP-BA-006) — all 0 commits ahead.
 
 ## Fixed This Iteration
-- Committed uncommitted WASM tools.rs and event_log.rs changes (WasmContextManager delegation refactor)
+
+Nothing — disk space prevented any merges or test runs.
 
 ## Tests Added / Updated
-None this iteration.
 
-## Work Summary
+None on the main branch. ACR-005 agent added 16 tests (on worktree branch). BA-002 agent added 3 tests (uncommitted in worktree).
 
-### Phase 9 Assessment Complete
+## Outcomes
 
-**Already done (from previous iterations on this branch):**
-- #304 ✅ — Go/Java/C# scaffolding removed (commit `edb7f790`)
-- #306/SCP-218 ✅ — WASM bridge wiring (commit `2acbece6`, refactor `167b2cf2`)
-- #307/SCP-220 ✅ — UniFFI and NAPI bridge wiring (commit `95146b16`)
-- SCP-215 ✅ — Error code range audit (PRD status: done)
+### Completed (committed in worktrees, not yet merged)
+- **SCP-ACR-005:** PASS — CapabilityEntry uses CapabilityUri type (commit d99f7860)
 
-**Remaining Phase 9 work (7 items):**
-1. **#341** — TypeScript SDK runtime (1 subagent dispatched, likely failed due to disk)
-2. **SCP-221** — Wire Swift SDK wrappers to UniFFI bridge (BLOCKED: no disk space for worktree)
-3. **#331** — Swift Trust/MCP (depends on SCP-221)
-4. **SCP-214** — KeyCustodyProvider callbacks (BLOCKED: no disk space for worktree)
-5. **#322** — Cross-context tool interfaces (BLOCKED: no disk space for worktree)
-6. **SCP-116 → SCP-117 → SCP-118 → SCP-120** — Kotlin SDK chain (BLOCKED: no disk space for worktree)
+### Completed (work done, not committed — disk full / rate limit)
+- **SCP-BA-002:** PASS — 2844 tests passing, clippy clean, but disk full prevented commit
+- **SCP-BCH-002:** PASS — implementation complete, commit status unknown
+- **SCP-ACR-004:** PARTIAL — tests passing but hit usage limit before commit
+- **SCP-BCH-004:** PARTIAL — hit usage limit, had clippy error (function too long)
 
-**All blocker stories are done:**
-- SCP-115 ✅, SCP-106 ✅, SCP-211 ✅, SCP-078 ✅, SCP-079 ✅, SCP-093 ✅, SCP-099 ✅, SCP-103 ✅, SCP-105 ✅, SCP-110 ✅, SCP-163 ✅
+### Not Yet Started (Waves 2-6)
+- SCP-BCH-009, BCH-011, BA-003, BA-005, BA-006
+- SCP-ACR-006, ACR-007, #362, #363, #365, #367
+- SCP-BCH-003, BCH-005, BCH-006, BCH-012, #364
+- SCP-BA-004, SCP-038, SCP-092
+- SCP-BCH-007
 
-### BLOCKER: Disk Full
-`ENOSPC: no space left on device` — cannot create git worktrees, cannot run builds/tests. Only 1 of 5 subagents launched before disk exhaustion. Previous iterations accumulated worktrees and cargo build artifacts.
+## Blockers
 
-**Resolution needed:** Free disk space before next iteration. Possible actions:
-- `git worktree prune` to remove stale worktrees
-- Clean cargo target dirs in worktrees: `find /Users/alec/Developer/limn/scp/.claude/worktrees -name target -type d -exec rm -rf {} +`
-- Remove old worktree directories that are no longer referenced
+1. **DISK FULL (`/private/tmp` and root filesystem):** CRITICAL. The Bash tool creates output files at `/private/tmp/claude-501/.../tasks/*.output` BEFORE executing any command. When disk is full, ALL bash commands fail — including cleanup commands. This is a chicken-and-egg deadlock. MUST be freed externally before any work can proceed. Agent worktrees with Rust build artifacts are likely the main consumer.
 
-### Parallelization Plan (for next iteration)
-Wave 1 (parallel): #341, SCP-221, SCP-214, #322, SCP-116
-Wave 2 (after Wave 1): #331, SCP-117
-Wave 3 (after Wave 2): SCP-118, SCP-120
+2. **Rate limits:** 2 of 5 Wave 1 agents hit API usage limits.
 
-## Review Outcomes
-Review skipped — no production code changes this iteration (only commit of prior agent work).
+3. **Bash guard hook:** Blocks access to agent worktree directories.
+
+## Already Completed (merged into feat/phase-10-features)
+- SCP-ACR-001, ACR-002, ACR-003
+- SCP-BA-001
+- SCP-BCH-001, BCH-008, BCH-010, BCH-013
+- #366
 
 ## Next Iteration
-1. **Free disk space** — prune worktrees and cargo artifacts
-2. **Re-dispatch Wave 1** — 5 parallel subagents for remaining Phase 9 items
-3. After Wave 1: dispatch serial dependencies (Wave 2, Wave 3)
+
+1. **PREREQUISITE:** Free disk space externally:
+   - `find /private/tmp -name "*.output" -delete`
+   - Remove agent worktree target/ directories or set shared CARGO_TARGET_DIR
+   - Prune old worktrees: `git worktree prune`
+2. Merge ACR-005 from `worktree-agent-a7df9ffe`
+3. Check BCH-002 (`worktree-agent-aefbb407`) and BA-002 (`worktree-agent-a663e8f9`) for commits
+4. Re-dispatch: ACR-004, BCH-004 (and BCH-002/BA-002 if no commits)
+5. Waves 2-6: 21 remaining stories (limit 3 agents parallel)
+6. Full test suite + review cycle
+7. Update exec plan to mark Phase 10 COMPLETE

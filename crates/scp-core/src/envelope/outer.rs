@@ -34,9 +34,26 @@ use crate::crypto::sender_keys::encrypt::{decrypt_sender_layer, encrypt_sender_l
 /// They learn nothing about the sender, context, or message content.
 ///
 /// Binary fields use `serde_bytes` for efficient `MessagePack` encoding.
+/// The current SCP protocol version for outer envelopes.
+///
+/// See spec §13.2.3 for outer envelope versioning.
+pub const SCP_OUTER_ENVELOPE_VERSION: u16 = super::SCP_PROTOCOL_VERSION;
+
+/// Serde default for the `version` field on [`OuterEnvelope`].
+const fn default_outer_version() -> u16 {
+    super::SCP_PROTOCOL_VERSION
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OuterEnvelope {
+    /// Protocol version (§13.2.3). SCP/1.0 = `0x0100`.
+    /// Used for deserialization routing — tells the recipient which version's
+    /// deserializer to use. Since the outer envelope is unsigned, this is
+    /// purely informational.
+    #[serde(default = "default_outer_version")]
+    pub version: u16,
+
     /// Per-context pseudonym derived via `HMAC-SHA256`. Used as the routing
     /// key by relays. 32 bytes.
     #[serde(with = "serde_bytes")]
@@ -91,6 +108,7 @@ pub fn create_outer_envelope(
     }
 
     Ok(OuterEnvelope {
+        version: super::SCP_PROTOCOL_VERSION,
         routing_id: routing_id.to_vec(),
         recipient_hint: recipient_hint.map(<[u8]>::to_vec),
         blob_ttl,
@@ -133,8 +151,32 @@ impl OuterEnvelope {
                 max: MAX_ENVELOPE_SIZE,
             });
         }
-        rmp_serde::from_slice(bytes)
-            .map_err(|e| EnvelopeError::DeserializationFailed(e.to_string()))
+        let envelope: Self = rmp_serde::from_slice(bytes)
+            .map_err(|e| EnvelopeError::DeserializationFailed(e.to_string()))?;
+        if envelope.version != SCP_OUTER_ENVELOPE_VERSION {
+            return Err(EnvelopeError::UnsupportedVersion {
+                version: envelope.version,
+            });
+        }
+        Ok(envelope)
+    }
+
+    /// Validates that this outer envelope's version field is supported (§13.2.3).
+    ///
+    /// Currently only SCP/1.0 (`0x0100`) is recognized. Call this after
+    /// deserialization to reject envelopes from incompatible protocol versions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvelopeError::UnsupportedVersion`] if `self.version` is not
+    /// `SCP_PROTOCOL_VERSION`.
+    pub fn validate_version(&self) -> Result<(), EnvelopeError> {
+        if self.version != super::SCP_PROTOCOL_VERSION {
+            return Err(EnvelopeError::UnsupportedVersion {
+                version: self.version,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -295,6 +337,13 @@ pub fn open_envelope(
     }
     let inner: InnerEnvelope = rmp_serde::from_slice(&plaintext)
         .map_err(|e| EnvelopeError::DeserializationFailed(e.to_string()))?;
+
+    // 3a. Reject unsupported protocol versions early (§13.2.1).
+    if inner.version != super::inner::SCP_INNER_ENVELOPE_VERSION {
+        return Err(EnvelopeError::UnsupportedVersion {
+            version: inner.version,
+        });
+    }
 
     // 4. Verify sender_did is a member of the MLS group.
     verify_sender_in_group(group, &inner.sender_did)?;
@@ -538,6 +587,7 @@ mod seal_open_tests {
 
         create_inner_envelope(
             &InnerEnvelopeParams {
+                version: crate::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: &scp_cred.did,
                 epoch: group.epoch().unwrap(),
@@ -564,6 +614,7 @@ mod seal_open_tests {
 
         create_inner_envelope(
             &InnerEnvelopeParams {
+                version: crate::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did,
                 epoch: 1,
@@ -780,6 +831,7 @@ mod seal_open_tests {
         // Create a legitimate inner envelope.
         let mut inner = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: crate::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: &scp_cred.did,
                 epoch: alice_group.epoch().unwrap(),
@@ -1020,6 +1072,7 @@ mod seal_open_tests {
 
         let inner = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: crate::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:z6MkNOBODY",
                 epoch: alice_group.epoch().unwrap(),

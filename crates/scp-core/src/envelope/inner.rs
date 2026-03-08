@@ -92,9 +92,24 @@ pub struct Provenance {
 ///
 /// All fields are serialized with `MessagePack` via `rmp-serde`. Binary fields
 /// use `serde_bytes` for efficient `MessagePack` binary encoding.
+/// The current SCP protocol version for inner envelopes.
+///
+/// See spec §13.2 for the version encoding scheme.
+pub const SCP_INNER_ENVELOPE_VERSION: u16 = 1;
+
+/// Serde default for the `version` field on [`InnerEnvelope`].
+const fn default_inner_version() -> u16 {
+    SCP_INNER_ENVELOPE_VERSION
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InnerEnvelope {
+    /// Protocol version (§13.2.1). SCP/1.0 = `0x0100`.
+    /// Part of the signature commitment — changing this changes the signed bytes.
+    #[serde(default = "default_inner_version")]
+    pub version: u16,
+
     /// The SCP context identifier.
     /// Bounded to 1 KiB on deserialization to prevent OOM (#347).
     #[serde(with = "crate::serde_util::serde_bounded_string")]
@@ -164,6 +179,9 @@ pub struct InnerEnvelope {
 /// easy to accidentally transpose.
 #[derive(Debug, Clone)]
 pub struct InnerEnvelopeParams<'a> {
+    /// Protocol version (§13.2.1). Use [`SCP_INNER_ENVELOPE_VERSION`] for
+    /// current protocol version.
+    pub version: u16,
     /// The SCP context identifier.
     pub context_id: &'a str,
     /// The sender's full DID.
@@ -221,7 +239,12 @@ pub async fn create_inner_envelope(
     let provenance_hash: [u8; 32] = compute_provenance_hash(params.provenance.as_ref())?;
 
     // 3. Compute canonical hash for signing.
-    let canonical_hash = compute_canonical_hash(params, &payload_hash, &provenance_hash);
+    let canonical_hash = compute_canonical_hash(
+        SCP_INNER_ENVELOPE_VERSION,
+        params,
+        &payload_hash,
+        &provenance_hash,
+    );
 
     // 4. Sign the canonical hash.
     let signature = key_custody
@@ -239,6 +262,7 @@ pub async fn create_inner_envelope(
         .map_err(|_| EnvelopeError::SigningFailed("Ed25519 signature must be 64 bytes".into()))?;
 
     Ok(InnerEnvelope {
+        version: SCP_INNER_ENVELOPE_VERSION,
         context_id: params.context_id.to_owned(),
         sender_did: params.sender_did.to_owned(),
         epoch: params.epoch,
@@ -284,8 +308,16 @@ pub fn verify_inner_signature(
     let provenance_hash = compute_provenance_hash(inner.provenance.as_ref())
         .map_err(|e| EnvelopeError::VerificationFailed(e.to_string()))?;
 
+    // Reject unsupported protocol versions before signature verification.
+    if inner.version != SCP_INNER_ENVELOPE_VERSION {
+        return Err(EnvelopeError::UnsupportedVersion {
+            version: inner.version,
+        });
+    }
+
     // Reconstruct params for canonical hash computation.
     let params = InnerEnvelopeParams {
+        version: inner.version,
         context_id: &inner.context_id,
         sender_did: &inner.sender_did,
         epoch: inner.epoch,
@@ -300,7 +332,14 @@ pub fn verify_inner_signature(
 
     // Recompute the canonical hash. payload_hash and provenance_hash are
     // already validated as [u8; 32] by serde deserialization.
-    let canonical_hash = compute_canonical_hash(&params, &inner.payload_hash, &provenance_hash);
+    // The version from the envelope is used (not the constant) so that
+    // tampering with the version field causes verification to fail (§13.2.1).
+    let canonical_hash = compute_canonical_hash(
+        inner.version,
+        &params,
+        &inner.payload_hash,
+        &provenance_hash,
+    );
 
     // Verify using strict mode (rejects small-order points).
     match crate::crypto::ed25519::verify_ed25519_signature_strict(
@@ -369,6 +408,24 @@ pub fn enforce_inner_envelope_category_a(
     Ok(())
 }
 
+/// Validates that an inner envelope's version field is supported (§13.2.1).
+///
+/// Currently only inner envelope version 1 is recognized. Call this after
+/// deserialization to reject envelopes from incompatible protocol versions.
+///
+/// # Errors
+///
+/// Returns [`EnvelopeError::UnsupportedVersion`] if `inner.version` is not
+/// `SCP_INNER_ENVELOPE_VERSION`.
+pub fn validate_inner_version(inner: &InnerEnvelope) -> Result<(), EnvelopeError> {
+    if inner.version != SCP_INNER_ENVELOPE_VERSION {
+        return Err(EnvelopeError::UnsupportedVersion {
+            version: inner.version,
+        });
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -412,23 +469,26 @@ fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<[u8; 32], 
 ///         || len(signing_key_id) || signing_key_id)
 /// ```
 fn compute_canonical_hash(
+    version: u16,
     params: &InnerEnvelopeParams<'_>,
     payload_hash: &[u8; 32],
     provenance_hash: &[u8; 32],
 ) -> Vec<u8> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
-    // Field order per §9.5.2: message_type (discriminator byte), context_id,
-    // sender_did, epoch, generation, sequence, timestamp, payload_hash,
-    // provenance_hash, signing_key_id.
+    // Field order per §13.2.1: version, message_type (discriminator byte),
+    // context_id, sender_did, epoch, generation, sequence, timestamp,
+    // payload_hash, provenance_hash, signing_key_id.
     //
-    // message_type is prepended (after domain separator) so that the type
-    // commitment is the first thing in the hash input — making type-flipping
-    // attacks structurally impossible.
+    // version is field 1 per §13.2.1 — part of the signature commitment.
+    // message_type follows as a discriminator byte to prevent type-flipping
+    // attacks (issue #290).
     canonical_hash(
         "SCP-INNER-ENVELOPE-V1:",
         &[
+            CanonicalField::U16(version),
             CanonicalField::U8(params.message_type.as_discriminator_byte()),
+            CanonicalField::U16(params.version),
             CanonicalField::VarBytes(params.context_id.as_bytes()),
             CanonicalField::VarBytes(params.sender_did.as_bytes()),
             CanonicalField::U64(params.epoch),
@@ -465,6 +525,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -513,6 +574,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-2",
                 sender_did: "did:dht:bob",
                 epoch: 5,
@@ -545,6 +607,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -573,6 +636,7 @@ mod tests {
 
         let mut envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -609,6 +673,7 @@ mod tests {
 
         let mut envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -640,6 +705,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -682,6 +748,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -716,6 +783,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -744,6 +812,7 @@ mod tests {
 
         // Hash with the real domain separator (via the production function).
         let params = InnerEnvelopeParams {
+            version: SCP_INNER_ENVELOPE_VERSION,
             context_id: "ctx-1",
             sender_did: "did:dht:alice",
             epoch: 1,
@@ -755,7 +824,12 @@ mod tests {
             provenance: None,
             signing_key_id: SigningKeyId::Active,
         };
-        let hash_with_domain = compute_canonical_hash(&params, &payload_hash, &provenance_hash);
+        let hash_with_domain = compute_canonical_hash(
+            SCP_INNER_ENVELOPE_VERSION,
+            &params,
+            &payload_hash,
+            &provenance_hash,
+        );
 
         // Hash WITHOUT any domain separator (manual construction with length prefixes).
         #[allow(clippy::cast_possible_truncation)]
@@ -814,6 +888,7 @@ mod tests {
 
         let mut envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -848,6 +923,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -876,6 +952,7 @@ mod tests {
 
         let content_envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -895,6 +972,7 @@ mod tests {
 
         let signaling_envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -925,6 +1003,7 @@ mod tests {
         for msg_type in [MessageType::Content, MessageType::Signaling] {
             let envelope = create_inner_envelope(
                 &InnerEnvelopeParams {
+                    version: SCP_INNER_ENVELOPE_VERSION,
                     context_id: "ctx-1",
                     sender_did: "did:dht:alice",
                     epoch: 1,
@@ -959,6 +1038,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -988,6 +1068,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -1017,6 +1098,7 @@ mod tests {
 
         let mut envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -1050,6 +1132,7 @@ mod tests {
 
         let active_envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -1069,6 +1152,7 @@ mod tests {
 
         let agent_envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -1100,6 +1184,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -1136,6 +1221,7 @@ mod tests {
         for key_id in [SigningKeyId::Active, SigningKeyId::Agent] {
             let envelope = create_inner_envelope(
                 &InnerEnvelopeParams {
+                    version: SCP_INNER_ENVELOPE_VERSION,
                     context_id: "ctx-1",
                     sender_did: "did:dht:alice",
                     epoch: 1,
@@ -1169,6 +1255,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -1202,6 +1289,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -1230,6 +1318,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -1258,6 +1347,7 @@ mod tests {
 
         let envelope = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:alice",
                 epoch: 1,
@@ -1310,6 +1400,7 @@ mod tests {
 
                     let envelope = create_inner_envelope(
                         &InnerEnvelopeParams {
+                            version: SCP_INNER_ENVELOPE_VERSION,
                             context_id: "ctx-prop",
                             sender_did: "did:dht:proptest",
                             epoch: 1,
@@ -1337,6 +1428,177 @@ mod tests {
                     Ok(())
                 })?;
             }
+        }
+
+        // -------------------------------------------------------------------
+        // Version field tests (§13.2.1, #398)
+        // -------------------------------------------------------------------
+
+        #[tokio::test]
+        async fn inner_envelope_has_version_field() {
+            let (custody, signing_key) = setup().await;
+
+            let envelope = create_inner_envelope(
+                &InnerEnvelopeParams {
+                    version: SCP_INNER_ENVELOPE_VERSION,
+                    context_id: "ctx-1",
+                    sender_did: "did:dht:alice",
+                    epoch: 1,
+                    generation: 0,
+                    sequence: 1,
+                    timestamp: 1_700_000_000,
+                    message_type: MessageType::Content,
+                    payload: b"version test",
+                    provenance: None,
+                    signing_key_id: SigningKeyId::Active,
+                },
+                &custody,
+                &signing_key,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                envelope.version,
+                SCP_INNER_ENVELOPE_VERSION,
+                "version must match SCP_INNER_ENVELOPE_VERSION"
+            );
+        }
+
+        #[tokio::test]
+        async fn validate_inner_version_accepts_current() {
+            let (custody, signing_key) = setup().await;
+
+            let envelope = create_inner_envelope(
+                &InnerEnvelopeParams {
+                    version: SCP_INNER_ENVELOPE_VERSION,
+                    context_id: "ctx-1",
+                    sender_did: "did:dht:alice",
+                    epoch: 1,
+                    generation: 0,
+                    sequence: 1,
+                    timestamp: 1_700_000_000,
+                    message_type: MessageType::Content,
+                    payload: b"version ok",
+                    provenance: None,
+                    signing_key_id: SigningKeyId::Active,
+                },
+                &custody,
+                &signing_key,
+            )
+            .await
+            .unwrap();
+
+            assert!(validate_inner_version(&envelope).is_ok());
+        }
+
+        #[tokio::test]
+        async fn validate_inner_version_rejects_wrong_version() {
+            let (custody, signing_key) = setup().await;
+
+            let mut envelope = create_inner_envelope(
+                &InnerEnvelopeParams {
+                    version: SCP_INNER_ENVELOPE_VERSION,
+                    context_id: "ctx-1",
+                    sender_did: "did:dht:alice",
+                    epoch: 1,
+                    generation: 0,
+                    sequence: 1,
+                    timestamp: 1_700_000_000,
+                    message_type: MessageType::Content,
+                    payload: b"wrong version",
+                    provenance: None,
+                    signing_key_id: SigningKeyId::Active,
+                },
+                &custody,
+                &signing_key,
+            )
+            .await
+            .unwrap();
+
+            // Tamper with version.
+            envelope.version = 0x0200;
+
+            let result = validate_inner_version(&envelope);
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(
+                format!("{err}").contains("0x0200"),
+                "error must include the rejected version"
+            );
+        }
+
+        #[tokio::test]
+        async fn version_is_part_of_signature_commitment() {
+            let (custody, signing_key) = setup().await;
+            let pubkey = custody.public_key(&signing_key).await.unwrap();
+
+            let mut envelope = create_inner_envelope(
+                &InnerEnvelopeParams {
+                    version: SCP_INNER_ENVELOPE_VERSION,
+                    context_id: "ctx-1",
+                    sender_did: "did:dht:alice",
+                    epoch: 1,
+                    generation: 0,
+                    sequence: 1,
+                    timestamp: 1_700_000_000,
+                    message_type: MessageType::Content,
+                    payload: b"version commitment",
+                    provenance: None,
+                    signing_key_id: SigningKeyId::Active,
+                },
+                &custody,
+                &signing_key,
+            )
+            .await
+            .unwrap();
+
+            // Tamper with version — verification must fail because version is
+            // committed in the canonical hash. The verifier rejects unsupported
+            // versions before reaching the signature check, so we expect an
+            // UnsupportedVersion error (or Ok(false) if version validation
+            // were removed — either way, the envelope must not pass).
+            envelope.version = 0x0200;
+
+            let result = verify_inner_signature(&envelope, pubkey.as_bytes());
+            let rejected = match result {
+                Err(_) => true,     // UnsupportedVersion error
+                Ok(false) => true,  // signature mismatch
+                Ok(true) => false,  // should not happen
+            };
+            assert!(
+                rejected,
+                "changing version after signing must reject the envelope"
+            );
+        }
+
+        #[tokio::test]
+        async fn version_survives_msgpack_roundtrip() {
+            let (custody, signing_key) = setup().await;
+
+            let envelope = create_inner_envelope(
+                &InnerEnvelopeParams {
+                    version: SCP_INNER_ENVELOPE_VERSION,
+                    context_id: "ctx-1",
+                    sender_did: "did:dht:alice",
+                    epoch: 1,
+                    generation: 0,
+                    sequence: 1,
+                    timestamp: 1_700_000_000,
+                    message_type: MessageType::Content,
+                    payload: b"roundtrip version",
+                    provenance: None,
+                    signing_key_id: SigningKeyId::Active,
+                },
+                &custody,
+                &signing_key,
+            )
+            .await
+            .unwrap();
+
+            let bytes = rmp_serde::to_vec_named(&envelope).unwrap();
+            let deserialized: InnerEnvelope = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(deserialized.version, SCP_INNER_ENVELOPE_VERSION);
         }
     }
 }

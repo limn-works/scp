@@ -16,6 +16,7 @@ scp-identity = { path = "../scp-identity", features = ["production-dht"] }
 scp-transport = { path = "../scp-transport" }
 scp-platform = { path = "../scp-platform", features = ["testing", "sqlite", "file"] }
 axum = { workspace = true, features = ["ws"] }
+ed25519-dalek = { workspace = true }
 instant-acme = "0.8"
 rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std"] }
@@ -45,11 +46,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 x509-parser = "0.16"
 
 [dev-dependencies]
+bs58 = { workspace = true }
+ed25519-dalek = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
 tower = { version = "0.5", features = ["util"] }
-ed25519-dalek = { workspace = true }
 http-body-util = "0.1"
 hyper = "1"
 rcgen = "0.14"

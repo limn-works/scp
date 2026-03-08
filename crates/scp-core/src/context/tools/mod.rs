@@ -42,12 +42,14 @@
 //! - [`ToolErrorCode`] -- Error code enum. (Re-exported from [`lifecycle`].)
 //! - [`ToolCancel`] -- Cancellation request. (Re-exported from [`lifecycle`].)
 
+pub mod integrity;
 pub mod interface;
 pub mod invoke;
 pub mod lifecycle;
 pub mod registry;
 pub mod schema;
 pub mod session;
+pub mod summary;
 
 use crate::context::roles;
 
@@ -285,6 +287,17 @@ pub enum ToolError {
         field_count: usize,
         /// Minimum number of fields required.
         min_fields: usize,
+    },
+
+    /// Tool registration signature verification failed (M15).
+    ///
+    /// The `signature` field on a [`ToolRegistration`] is a Ed25519 signature
+    /// over the canonical registration bytes. If the signature is non-empty,
+    /// it MUST verify against the registrant's signing key.
+    #[error("tool registration signature verification failed: {reason}")]
+    SignatureVerificationFailed {
+        /// Human-readable description of the failure.
+        reason: String,
     },
 
     /// The system clock is unavailable or before the Unix epoch.

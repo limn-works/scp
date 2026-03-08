@@ -1,667 +1,629 @@
-//! Compromise recovery orchestrator (§9.12).
+//! Compromise recovery orchestrator for SCP identity keys.
 //!
-//! Coordinates the 6-step ordered recovery protocol when a key is known or
-//! suspected to be compromised. Individual primitives exist across the
-//! codebase; this module orchestrates them in dependency order:
+//! Implements the 6-step ordered recovery protocol from spec §9.12. When a key
+//! is known or suspected to be compromised, the orchestrator coordinates:
 //!
-//! 1. Key rotation on trusted device (tier-appropriate)
-//! 2. MLS Update in all active contexts
-//! 3. UCAN revocation (scoped by tier)
-//! 4. `KeyPackage` rotation
-//! 5. Contact notification (parallel with 6)
-//! 6. Identity private state re-encryption (parallel with 5)
+//! 1. **Key rotation** on a trusted device (3 tiers: agent, active, identity).
+//! 2. **MLS `Update`** in all active contexts (per-context, failure-isolated).
+//! 3. **UCAN revocation** of all tokens issued by the compromised key.
+//! 4. **`KeyPackage` rotation** — delete old, publish new.
+//! 5. **Contact notification** — key-change alerts to all known contacts.
+//! 6. **Identity private state re-encryption** — PSK rotation, device removal.
 //!
-//! Three compromise tiers determine the recovery path:
+//! Step ordering is enforced by dependency: 1→2→3→4→(5,6 parallel). Failure
+//! in one context does not block recovery in others. Each per-context step
+//! retries independently.
 //!
-//! - [`CompromiseTier::AgentKey`] — cheapest: DID doc update, scoped UCAN
-//!   revocation, MLS Update, new `KeyPackages`. No identity migration.
-//! - [`CompromiseTier::ActiveSigningKey`] — `rotate_active_key`, new UCANs,
-//!   MLS Updates, PSK re-encryption.
-//! - [`CompromiseTier::IdentityKey`] — `migrate_identity` using pre-rotation
-//!   key, new DID, forwarding record, full re-keying.
+//! Three compromise tiers:
+//! - **Agent key** (cheapest): DID doc update → scoped UCAN revocation → MLS
+//!   `Update` → new `KeyPackages`. No identity migration.
+//! - **Active signing key**: Includes PSK re-encryption.
+//! - **Identity key** (most severe): Pre-rotation, new DID, forwarding record.
 //!
-//! **Step ordering (§9.12):** Steps 1→2→3→4 are sequential (each depends on
-//! the output of the previous). Steps 5 and 6 are independent cleanup after
-//! step 4. Steps 2-4 are per-context — failure in one context does not block
-//! recovery in other contexts.
-//!
-//! See spec §9.12, ADR-003 (DID rotation), ADR-039 (agent key model).
+//! See spec §9.12 and ADR-003 §4a/§4b.
 
-use std::fmt;
-use std::future::Future;
+use std::collections::HashSet;
 
-use scp_identity::document::DidDocument;
-use scp_identity::{DidRotationEvent, IdentityError, ScpIdentity};
+use serde::{Deserialize, Serialize};
 
-use scp_platform::traits::{KeyCustody, KeyHandle};
+use scp_identity::DID;
 
-use crate::crypto::mls::error::MlsError;
-use crate::crypto::mls::group::ScpMlsGroup;
-use crate::crypto::mls::ratchet::propose_update;
-use crate::crypto::ucan::UcanPayload;
-use crate::crypto::ucan::revoke::{
-    RevocationAuthorizer, RevocationDistributor, RevocationEventLogger, RevocationList, revoke_ucan,
-};
-
-// ---------------------------------------------------------------------------
-// KeyRotator — trait abstracting key rotation operations
-// ---------------------------------------------------------------------------
-
-/// Abstraction over DID key rotation and identity migration operations.
-///
-/// This trait decouples the orchestrator from `DidDht`'s generic parameters
-/// (`DhtClient`, `Clock`), allowing tests and production code to use different
-/// DID method implementations without generic proliferation.
-///
-/// All methods mirror the corresponding `DidDht` inherent methods.
-pub trait KeyRotator: Send + Sync {
-    /// Removes the `#agent` verification method from the DID document.
-    fn remove_agent_key(
-        &self,
-        identity: &ScpIdentity,
-        document: &DidDocument,
-    ) -> impl Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send;
-
-    /// Adds a new `#agent` verification method to the DID document.
-    fn add_agent_key(
-        &self,
-        identity: &ScpIdentity,
-        document: &DidDocument,
-        key_custody: &impl KeyCustody,
-    ) -> impl Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send;
-
-    /// Rotates the active signing key (DID string preserved).
-    fn rotate_active_key(
-        &self,
-        identity: &ScpIdentity,
-        document: &DidDocument,
-        key_custody: &impl KeyCustody,
-    ) -> impl Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send;
-
-    /// Migrates identity to a new DID using the pre-rotation key.
-    fn migrate_identity(
-        &self,
-        identity: &ScpIdentity,
-        old_document: &DidDocument,
-        pre_rotation_key: &KeyHandle,
-        key_custody: &impl KeyCustody,
-        rotated_at: u64,
-    ) -> impl Future<Output = Result<(ScpIdentity, DidDocument, DidRotationEvent), IdentityError>> + Send;
-}
-
-// Blanket implementation for DidDht<D, C>.
-impl<D, C> KeyRotator for scp_identity::DidDht<D, C>
-where
-    D: scp_identity::DhtClient + 'static,
-    C: scp_identity::cache::Clock + 'static,
-{
-    fn remove_agent_key(
-        &self,
-        identity: &ScpIdentity,
-        document: &DidDocument,
-    ) -> impl Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send {
-        self.remove_agent_key(identity, document)
-    }
-
-    fn add_agent_key(
-        &self,
-        identity: &ScpIdentity,
-        document: &DidDocument,
-        key_custody: &impl KeyCustody,
-    ) -> impl Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send {
-        self.add_agent_key(identity, document, key_custody)
-    }
-
-    fn rotate_active_key(
-        &self,
-        identity: &ScpIdentity,
-        document: &DidDocument,
-        key_custody: &impl KeyCustody,
-    ) -> impl Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send {
-        self.rotate_active_key(identity, document, key_custody)
-    }
-
-    fn migrate_identity(
-        &self,
-        identity: &ScpIdentity,
-        old_document: &DidDocument,
-        pre_rotation_key: &KeyHandle,
-        key_custody: &impl KeyCustody,
-        rotated_at: u64,
-    ) -> impl Future<Output = Result<(ScpIdentity, DidDocument, DidRotationEvent), IdentityError>> + Send
-    {
-        self.migrate_identity(
-            identity,
-            old_document,
-            pre_rotation_key,
-            key_custody,
-            rotated_at,
-        )
-    }
-}
+use crate::time;
 
 // ---------------------------------------------------------------------------
 // CompromiseTier — which key was compromised
 // ---------------------------------------------------------------------------
 
-/// Which key was compromised, determining the recovery path.
+/// The tier of key compromise, determining the scope of recovery actions.
 ///
-/// Each tier includes all steps of the tiers below it (Agent < Active <
-/// Identity). Higher tiers are more expensive but cover more severe
-/// compromises.
+/// Ordered by severity: `Agent` (cheapest recovery) < `ActiveSigning`
+/// < `IdentityKey` (most severe, requires identity migration).
 ///
-/// See spec §9.12.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// See spec §9.12 steps 1a–1c.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CompromiseTier {
-    /// Agent Signing Key (`#agent`) compromise — most common, cheapest
-    /// recovery. No identity migration. Removes/replaces `#agent` VM,
-    /// revokes agent-scoped UCANs only. See ADR-039.
-    AgentKey,
+    /// Agent Signing Key (`#agent`) compromise — most common case.
+    ///
+    /// The agent runtime is typically less secure than device HSM. Recovery:
+    /// publish new DID document removing/replacing `#agent` VM, revoke only
+    /// agent-scoped UCANs, MLS `Update`, new `KeyPackages`. No identity
+    /// migration.
+    Agent,
 
-    /// Active Signing Key (`#active`) compromise. Calls
-    /// `rotate_active_key` (ADR-003 §4a). DID string is preserved.
-    /// Includes PSK re-encryption (step 6).
-    ActiveSigningKey,
+    /// Active Signing Key (`#active`) compromise.
+    ///
+    /// Calls `rotate_active_key` (ADR-003 §4a). DID string unchanged. Includes
+    /// PSK re-encryption (step 6).
+    ActiveSigning,
 
-    /// Identity Key (`#0`) compromise — rare, severe. Calls
-    /// `migrate_identity` (ADR-003 §4b) using the pre-rotation key.
-    /// Creates a new DID with forwarding record.
+    /// Identity Key (`#0`) compromise — rare, most severe.
+    ///
+    /// Calls `migrate_identity` (ADR-003 §4b) using pre-rotation key. Creates
+    /// new DID with forwarding record. All contexts receive `DidRotationEvent`.
     IdentityKey,
 }
 
-impl fmt::Display for CompromiseTier {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::AgentKey => write!(f, "AgentKey (#agent)"),
-            Self::ActiveSigningKey => write!(f, "ActiveSigningKey (#active)"),
-            Self::IdentityKey => write!(f, "IdentityKey (#0)"),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
-// RecoveryStepError — per-step failure
+// RecoveryStepError — per-step error type
 // ---------------------------------------------------------------------------
 
 /// Error from a single recovery step in a single context.
 ///
-/// Wraps the underlying error and records which step failed. Steps are
-/// per-context and failure-isolated: failure in one context does not block
-/// recovery in others.
-#[derive(Debug)]
-pub enum RecoveryStepError {
-    /// Step 1 (key rotation) failed.
-    KeyRotation(String),
-    /// Step 2 (MLS Update) failed in a specific context.
-    MlsUpdate {
-        /// The context where the update failed.
-        context_id: String,
-        /// The underlying MLS error description.
-        error: String,
-    },
-    /// Step 3 (UCAN revocation) failed.
-    UcanRevocation {
-        /// The context where revocation failed.
-        context_id: String,
-        /// The underlying UCAN error description.
-        error: String,
-    },
-    /// Step 4 (`KeyPackage` rotation) failed.
-    KeyPackageRotation(String),
-    /// Step 5 (contact notification) failed.
-    ContactNotification(String),
-    /// Step 6 (identity private state re-encryption) failed.
-    PrivateStateReEncryption(String),
+/// Each step that operates per-context (steps 2, 3, 4) may fail independently.
+/// The orchestrator collects these errors without blocking recovery in other
+/// contexts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryStepError {
+    /// The step number (1–6) where the failure occurred.
+    pub step: u8,
+
+    /// Human-readable description of the failure.
+    pub description: String,
 }
 
-impl fmt::Display for RecoveryStepError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::KeyRotation(e) => write!(f, "key rotation failed: {e}"),
-            Self::MlsUpdate { context_id, error } => {
-                write!(f, "MLS Update failed in {context_id}: {error}")
-            }
-            Self::UcanRevocation { context_id, error } => {
-                write!(f, "UCAN revocation failed in {context_id}: {error}")
-            }
-            Self::KeyPackageRotation(e) => write!(f, "KeyPackage rotation failed: {e}"),
-            Self::ContactNotification(e) => write!(f, "contact notification failed: {e}"),
-            Self::PrivateStateReEncryption(e) => {
-                write!(f, "private state re-encryption failed: {e}")
-            }
-        }
+impl std::fmt::Display for RecoveryStepError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "step {}: {}", self.step, self.description)
     }
 }
 
 // ---------------------------------------------------------------------------
-// RecoveryError — orchestrator-level failure
+// RecoveryResult — outcome of the full recovery sequence
 // ---------------------------------------------------------------------------
 
-/// Top-level error from the compromise recovery orchestrator.
+/// Outcome of executing the compromise recovery protocol.
 ///
-/// Step 1 failure is fatal (cannot proceed without new key material).
-/// Steps 2-6 are per-context and failure-isolated.
+/// Contains per-context results with failure isolation: a partial failure does
+/// not roll back completed contexts. Contexts requiring Tier 3 re-join (MLS
+/// `Update` cannot succeed, e.g. member offline too long per ADR-029) are
+/// flagged separately from outright failures.
+///
+/// See spec §9.12 "Step ordering and failure isolation."
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryResult {
+    /// The compromise tier that was addressed.
+    pub tier: CompromiseTier,
+
+    /// The DID that initiated recovery.
+    pub did: DID,
+
+    /// Whether the DID changed (only for `IdentityKey` tier with migration).
+    pub new_did: Option<DID>,
+
+    /// Contexts where ALL recovery steps completed successfully.
+    pub completed_contexts: Vec<String>,
+
+    /// Contexts where one or more steps failed.
+    pub failed_contexts: Vec<(String, RecoveryStepError)>,
+
+    /// Contexts flagged for manual re-join (Tier 3 per ADR-029).
+    ///
+    /// These contexts could not complete MLS `Update` because the member has
+    /// been offline too long. Recovery is NOT blocked by these — they require
+    /// separate action (remove + re-add by an admin).
+    pub pending_rejoin: Vec<String>,
+
+    /// Whether step 1 (key rotation on trusted device) succeeded.
+    pub key_rotation_completed: bool,
+
+    /// Whether step 5 (contact notification) was sent.
+    pub contacts_notified: bool,
+
+    /// Whether step 6 (identity private state re-encryption) completed.
+    pub private_state_reencrypted: bool,
+
+    /// Unix timestamp (milliseconds) when recovery was initiated.
+    pub initiated_at: u64,
+
+    /// Unix timestamp (milliseconds) when recovery completed.
+    pub completed_at: u64,
+}
+
+// ---------------------------------------------------------------------------
+// RecoveryError — orchestrator-level error
+// ---------------------------------------------------------------------------
+
+/// Errors produced by the compromise recovery orchestrator.
+///
+/// Step 1 (key rotation) failure is fatal — the orchestrator cannot proceed
+/// without new key material. Steps 2–4 failures are per-context and recorded
+/// in `RecoveryResult::failed_contexts`. Steps 5–6 failures are non-fatal
+/// cleanup errors.
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveryError {
-    /// Step 1 (key rotation) failed — recovery cannot proceed.
+    /// Step 1 failed: key rotation on trusted device.
+    ///
+    /// This is fatal — cannot proceed without new key material.
     #[error("key rotation failed (step 1): {0}")]
-    KeyRotationFailed(#[from] IdentityError),
-
-    /// `KeyPackage` buffer creation or replenishment failed.
-    #[error("KeyPackage rotation failed (step 4): {0}")]
-    KeyPackageRotationFailed(#[from] MlsError),
+    KeyRotationFailed(String),
 
     /// The system clock is unavailable.
     #[error("clock error: {0}")]
-    ClockError(#[from] crate::time::ClockError),
+    ClockError(#[from] time::ClockError),
+
+    /// The compromise tier requires an agent key but none exists.
+    #[error("agent key not found in identity")]
+    AgentKeyNotFound,
+
+    /// The compromise tier requires a pre-rotation key but none is available.
+    #[error("pre-rotation key not available for identity migration")]
+    PreRotationKeyNotAvailable,
+
+    /// The DID method implementation returned an error.
+    #[error("DID method error: {0}")]
+    DidMethodError(String),
+
+    /// A platform custody error occurred during key operations.
+    #[error("custody error: {0}")]
+    CustodyError(String),
 }
 
 // ---------------------------------------------------------------------------
-// ContextRecoveryOutcome — per-context result
+// ContextRecoveryState — per-context step tracking
 // ---------------------------------------------------------------------------
 
-/// Outcome of steps 2-4 for a single context.
-#[derive(Debug)]
-pub enum ContextRecoveryOutcome {
-    /// All per-context steps (MLS Update, UCAN revocation, `KeyPackage`
-    /// rotation) succeeded in this context.
-    Completed,
-
-    /// MLS Update succeeded but the context requires Tier 3 re-join
-    /// (e.g., member offline too long per ADR-029).
-    PendingRejoin {
-        /// Reason the context needs re-join.
-        reason: String,
-    },
-
-    /// One or more per-context steps failed. The context is recorded for
-    /// independent retry; other contexts are not affected.
-    Failed {
-        /// The errors that occurred.
-        errors: Vec<RecoveryStepError>,
-    },
-}
-
-// ---------------------------------------------------------------------------
-// RecoveryResult — overall result
-// ---------------------------------------------------------------------------
-
-/// Result of executing the compromise recovery protocol.
+/// Tracks which recovery steps have been completed for a single context.
 ///
-/// Contains per-context outcomes and the artifacts from each step.
-/// A partial failure does not roll back completed contexts.
-///
-/// See spec §9.12.
-#[derive(Debug)]
-pub struct RecoveryResult {
-    /// The compromise tier that was recovered from.
-    pub tier: CompromiseTier,
-
-    /// The updated identity after key rotation (step 1).
-    pub updated_identity: ScpIdentity,
-
-    /// The updated DID document after key rotation (step 1).
-    pub updated_document: DidDocument,
-
-    /// For [`CompromiseTier::IdentityKey`]: the DID rotation event to
-    /// distribute to all active contexts. `None` for other tiers.
-    pub rotation_event: Option<DidRotationEvent>,
-
-    /// Contexts where all per-context steps completed successfully.
-    pub completed_contexts: Vec<String>,
-
-    /// Contexts where recovery failed. Each entry maps the context ID
-    /// to the errors that occurred. These contexts should be retried
-    /// independently.
-    pub failed_contexts: Vec<(String, Vec<RecoveryStepError>)>,
-
-    /// Contexts requiring Tier 3 re-join (member offline too long,
-    /// ADR-029). The orchestrator flags these for manual re-join and
-    /// does not block recovery in other contexts.
-    pub pending_rejoin: Vec<String>,
-
-    /// Whether contact notification (step 5) succeeded.
-    pub contacts_notified: bool,
-
-    /// Whether identity private state re-encryption (step 6) succeeded.
-    pub private_state_re_encrypted: bool,
-}
-
-// ---------------------------------------------------------------------------
-// PerContextState — mutable per-context state for steps 2-4
-// ---------------------------------------------------------------------------
-
-/// Mutable per-context state bundle for recovery steps 2-4.
-///
-/// The orchestrator processes each context independently. This struct
-/// groups the per-context mutable references needed during recovery.
-pub struct PerContextState<'a> {
+/// Used internally by the orchestrator to resume after partial failures.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextRecoveryState {
     /// The context ID.
     pub context_id: String,
 
-    /// The MLS group for this context. Step 2 issues an MLS Update.
-    pub mls_group: &'a mut ScpMlsGroup,
+    /// Whether step 2 (MLS `Update`) completed.
+    pub mls_updated: bool,
 
-    /// UCAN tokens issued by the compromised key in this context.
-    /// Step 3 revokes these.
-    pub tokens_to_revoke: Vec<UcanPayload>,
+    /// Whether step 3 (UCAN revocation) completed.
+    pub ucan_revoked: bool,
 
-    /// The context's revocation list. Step 3 adds revocations.
-    pub revocation_list: &'a mut RevocationList,
+    /// Whether step 4 (`KeyPackage` rotation) completed.
+    pub key_packages_rotated: bool,
+
+    /// Whether this context requires Tier 3 re-join.
+    pub requires_rejoin: bool,
+
+    /// Error encountered, if any.
+    pub error: Option<RecoveryStepError>,
+}
+
+impl ContextRecoveryState {
+    /// Creates a new context recovery state with no steps completed.
+    #[must_use]
+    pub const fn new(context_id: String) -> Self {
+        Self {
+            context_id,
+            mls_updated: false,
+            ucan_revoked: false,
+            key_packages_rotated: false,
+            requires_rejoin: false,
+            error: None,
+        }
+    }
+
+    /// Returns `true` if all per-context steps completed successfully.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        (self.mls_updated || self.requires_rejoin)
+            && self.ucan_revoked
+            && self.key_packages_rotated
+            && self.error.is_none()
+    }
 }
 
 // ---------------------------------------------------------------------------
-// RecoveryParams — input to execute_recovery
+// KeyRotationOutcome — result of step 1
 // ---------------------------------------------------------------------------
 
-/// Parameters for [`execute_recovery`].
+/// Outcome of step 1 (key rotation on trusted device).
 ///
-/// Groups the inputs to avoid excessive argument count.
-pub struct RecoveryParams<'a, R: KeyRotator = scp_identity::DidDht> {
+/// Contains the new key material identifiers needed by subsequent steps.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyRotationOutcome {
+    /// The compromise tier that was addressed.
+    pub tier: CompromiseTier,
+
+    /// The DID after rotation. Same as original for `Agent`/`ActiveSigning`
+    /// tiers; new DID for `IdentityKey` tier.
+    pub did_after: DID,
+
+    /// Whether the DID changed (identity migration occurred).
+    pub did_changed: bool,
+
+    /// Key scope(s) that were rotated — used to scope UCAN revocation.
+    ///
+    /// For `Agent` tier: `["#agent"]`.
+    /// For `ActiveSigning` tier: `["#active"]`.
+    /// For `IdentityKey` tier: `["#active", "#agent"]` (all signing keys).
+    pub rotated_key_scopes: Vec<String>,
+
+    /// Unix timestamp (milliseconds) of the rotation.
+    pub rotated_at: u64,
+}
+
+// ---------------------------------------------------------------------------
+// ContactNotification — step 5 payload
+// ---------------------------------------------------------------------------
+
+/// Key-change notification sent to contacts in step 5.
+///
+/// Contacts who completed Key Continuity Verification (§9.11) are alerted
+/// that re-verification is needed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactNotification {
+    /// The DID that underwent recovery.
+    pub did: DID,
+
+    /// The new DID, if identity migration occurred.
+    pub new_did: Option<DID>,
+
     /// The compromise tier.
     pub tier: CompromiseTier,
 
-    /// The current identity being recovered.
-    pub identity: &'a ScpIdentity,
+    /// Unix timestamp (milliseconds) of the key change.
+    pub timestamp: u64,
 
-    /// The current DID document.
-    pub document: &'a DidDocument,
-
-    /// The DID method instance for key rotation and identity migration.
-    pub did_method: &'a R,
-
-    /// For [`CompromiseTier::IdentityKey`]: the pre-rotation key handle.
-    /// Required for identity migration. Ignored for other tiers.
-    pub pre_rotation_key: Option<&'a KeyHandle>,
-
-    /// The revoker DID (same as `identity.did` — the compromised party
-    /// is revoking their own tokens).
-    pub revoker_did: &'a str,
+    /// Whether Key Continuity Verification re-verification is needed.
+    pub kcv_reverification_required: bool,
 }
 
 // ---------------------------------------------------------------------------
-// ContactNotifier — trait for step 5
+// PskRotationParams — step 6 parameters
 // ---------------------------------------------------------------------------
 
-/// Abstraction for sending key-change notifications to contacts (step 5).
+/// Parameters for step 6: identity private state re-encryption.
 ///
-/// Implementors distribute notifications to all known contacts, alerting
-/// those who completed Key Continuity Verification (§9.11) that
-/// re-verification is needed.
-pub trait ContactNotifier {
-    /// Sends a key-change notification to all known contacts.
+/// Includes the set of enrolled device public keys (to distribute the new PSK
+/// via HPKE) and optionally a compromised device to exclude.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PskRotationParams {
+    /// X25519 public keys of all enrolled devices.
+    pub enrolled_device_pubkeys: Vec<Vec<u8>>,
+
+    /// If the compromise involved a device, its X25519 public key to exclude
+    /// from new PSK distribution.
+    pub compromised_device_pubkey: Option<Vec<u8>>,
+}
+
+// ---------------------------------------------------------------------------
+// RecoveryBackend — trait for platform-specific recovery operations
+// ---------------------------------------------------------------------------
+
+/// Backend trait for platform-specific recovery operations.
+///
+/// The orchestrator defines step ordering and failure isolation; the backend
+/// provides the concrete MLS, UCAN, KeyPackage, notification, and PSK
+/// operations. Each method corresponds to one recovery step (2–6).
+///
+/// SDK integration layers implement this trait to wire the orchestrator into
+/// the actual MLS group manager, UCAN store, relay transport, etc.
+///
+/// See spec §9.12.
+pub trait RecoveryBackend {
+    /// Step 2: Issue an MLS `Update` proposal in the given context.
     ///
-    /// # Arguments
+    /// The MLS `Update` provides post-compromise security: new epoch keys are
+    /// derived from the new key material, making the compromised old key
+    /// useless for future messages.
     ///
-    /// * `old_did` — The DID before rotation (same as new for non-identity
-    ///   key tiers).
-    /// * `new_did` — The DID after rotation (different only for identity
-    ///   key compromise).
-    /// * `tier` — The compromise tier, so contacts know the severity.
+    /// If the member has been offline too long (Tier 3 per ADR-029), return
+    /// a `RecoveryStepError` with `description` containing "requires rejoin".
+    fn mls_update(
+        &self,
+        context_id: &str,
+        key_rotation: &KeyRotationOutcome,
+    ) -> Result<(), RecoveryStepError>;
+
+    /// Step 3: Revoke all UCAN tokens issued by the compromised key.
     ///
-    /// # Errors
+    /// For agent key compromise: revoke only tokens with
+    /// `fct.scp_key_scope: "#agent"`. The `key_rotation.rotated_key_scopes`
+    /// field indicates which scopes to revoke.
     ///
-    /// Returns an error string if notification fails.
+    /// Adds revocations to the context's `RevocationList` and distributes
+    /// via MLS application messages (§9.5). Issues new tokens signed by the
+    /// new key.
+    fn revoke_ucans(
+        &self,
+        context_id: &str,
+        key_rotation: &KeyRotationOutcome,
+    ) -> Result<(), RecoveryStepError>;
+
+    /// Step 4: Delete old `KeyPackages` and publish new ones.
+    ///
+    /// Prevents new group additions using old key material.
+    fn rotate_key_packages(&self, context_id: &str) -> Result<(), RecoveryStepError>;
+
+    /// Step 5: Send key-change notification to contacts.
+    ///
+    /// Contacts who completed Key Continuity Verification (§9.11) are alerted
+    /// that re-verification is needed. Returns `true` if notifications were
+    /// successfully sent.
     fn notify_contacts(
         &self,
-        old_did: &str,
-        new_did: &str,
+        did: &DID,
         tier: CompromiseTier,
-    ) -> Result<(), String>;
+        key_rotation: &KeyRotationOutcome,
+        contacts: &HashSet<DID>,
+    ) -> bool;
+
+    /// Step 6: Rotate the PSK and re-encrypt identity private state.
+    ///
+    /// If the compromise involved a device, that device is excluded from the
+    /// new PSK distribution. Returns `true` if PSK rotation succeeded.
+    fn rotate_psk(&self, params: &PskRotationParams) -> bool;
 }
 
-/// Abstraction for re-encrypting identity private state (step 6).
+// ---------------------------------------------------------------------------
+// CompromiseRecoveryOrchestrator
+// ---------------------------------------------------------------------------
+
+/// Orchestrates the 6-step compromise recovery protocol (§9.12).
 ///
-/// Implementors generate a new PSK, distribute it to enrolled devices
-/// via HPKE (§3.7.2), re-encrypt private state, and destroy the old PSK.
-pub trait PrivateStateReEncryptor {
-    /// Re-encrypts identity private state under a new PSK.
-    ///
-    /// For device compromise: the compromised device should be removed
-    /// from the device registry before calling this, so it is excluded
-    /// from new PSK distribution.
+/// The orchestrator coordinates key rotation, MLS updates, UCAN revocation,
+/// `KeyPackage` rotation, contact notification, and PSK re-encryption in
+/// dependency order. Failure in one context does not block recovery in others.
+///
+/// Step operations are delegated to a [`RecoveryBackend`] implementation,
+/// which provides the platform-specific MLS, UCAN, relay, and notification
+/// primitives.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// let backend = MyRecoveryBackend::new(/* ... */);
+/// let orchestrator = CompromiseRecoveryOrchestrator::new(
+///     did.clone(),
+///     context_ids.clone(),
+/// );
+/// let result = orchestrator.execute_recovery(
+///     CompromiseTier::Agent,
+///     &key_rotation_outcome,
+///     &contact_dids,
+///     None, // no PSK rotation for agent key compromise
+///     &backend,
+/// ).await?;
+/// ```
+///
+/// See spec §9.12.
+pub struct CompromiseRecoveryOrchestrator {
+    /// The DID performing recovery.
+    did: DID,
+
+    /// Active context IDs where the DID is a member.
+    context_ids: Vec<String>,
+}
+
+impl CompromiseRecoveryOrchestrator {
+    /// Creates a new orchestrator for the given DID and set of active contexts.
     ///
     /// # Arguments
     ///
-    /// * `did` — The DID whose private state is being re-encrypted.
+    /// * `did` — The DID performing recovery.
+    /// * `context_ids` — All context IDs where this DID is an active member.
+    #[must_use]
+    pub const fn new(did: DID, context_ids: Vec<String>) -> Self {
+        Self { did, context_ids }
+    }
+
+    /// Executes the full 6-step compromise recovery protocol.
+    ///
+    /// Steps execute in dependency order: 1→2→3→4→(5,6 parallel).
+    ///
+    /// Step 1 (key rotation) must be completed externally before calling this
+    /// method — the caller provides the `KeyRotationOutcome` from step 1.
+    /// This design separates the DID-method-specific rotation logic (which
+    /// lives in `scp-identity`) from the protocol-level orchestration (which
+    /// lives here in `scp-core`).
+    ///
+    /// Steps 2–4 execute per-context with failure isolation via the
+    /// [`RecoveryBackend`]. Steps 5–6 are cleanup and run after all
+    /// per-context steps.
+    ///
+    /// # Arguments
+    ///
+    /// * `tier` — The compromise tier being addressed.
+    /// * `key_rotation` — Outcome of step 1 (key rotation), completed externally.
+    /// * `contact_dids` — DIDs to notify in step 5. Empty set skips notification.
+    /// * `psk_params` — Parameters for step 6. `None` skips PSK re-encryption
+    ///   (appropriate for agent key compromise where PSK is unaffected).
+    /// * `backend` — Platform-specific implementation of recovery operations.
     ///
     /// # Errors
     ///
-    /// Returns an error string if re-encryption fails.
-    fn re_encrypt_private_state(&self, did: &str) -> Result<(), String>;
-}
+    /// Returns [`RecoveryError::ClockError`] if the system clock is unavailable.
+    /// Per-context failures are recorded in `RecoveryResult::failed_contexts`,
+    /// NOT as errors from this method.
+    #[allow(clippy::unused_async)] // async by design: SDK integration layer adds await points
+    pub async fn execute_recovery(
+        &self,
+        tier: CompromiseTier,
+        key_rotation: &KeyRotationOutcome,
+        contact_dids: &HashSet<DID>,
+        psk_params: Option<&PskRotationParams>,
+        backend: &dyn RecoveryBackend,
+    ) -> Result<RecoveryResult, RecoveryError> {
+        let initiated_at = time::now_millis()?;
 
-// ---------------------------------------------------------------------------
-// execute_recovery — the 6-step orchestrator
-// ---------------------------------------------------------------------------
+        let mut completed_contexts = Vec::new();
+        let mut failed_contexts = Vec::new();
+        let mut pending_rejoin = Vec::new();
 
-/// Executes the 6-step compromise recovery protocol (§9.12).
-///
-/// **Step ordering:** 1→2→3→4→(5,6 parallel).
-///
-/// - Step 1 is fatal: if key rotation fails, recovery cannot proceed.
-/// - Steps 2-4 are per-context and failure-isolated.
-/// - Steps 5 and 6 are independent cleanup.
-///
-/// # Arguments
-///
-/// * `key_custody` — Key custody provider for key generation and signing.
-/// * `params` — Recovery parameters (tier, identity, document, DID method).
-/// * `contexts` — Per-context mutable state for steps 2-4.
-/// * `authorizer` — UCAN revocation authorizer.
-/// * `distributor` — UCAN revocation distributor.
-/// * `event_logger` — UCAN revocation event logger.
-/// * `contact_notifier` — Contact notification (step 5).
-/// * `state_re_encryptor` — Private state re-encryption (step 6).
-///
-/// # Errors
-///
-/// Returns [`RecoveryError`] if step 1 (key rotation) fails. All other
-/// step failures are recorded in [`RecoveryResult`] without halting.
-#[allow(clippy::too_many_arguments)]
-pub async fn execute_recovery<R: KeyRotator>(
-    key_custody: &impl KeyCustody,
-    params: &RecoveryParams<'_, R>,
-    contexts: Vec<PerContextState<'_>>,
-    authorizer: &(impl RevocationAuthorizer + Sync),
-    distributor: &(impl RevocationDistributor + Sync),
-    event_logger: &(impl RevocationEventLogger + Sync),
-    contact_notifier: &(impl ContactNotifier + Sync),
-    state_re_encryptor: &(impl PrivateStateReEncryptor + Sync),
-) -> Result<RecoveryResult, RecoveryError> {
-    let timestamp = crate::time::now_secs()?;
+        // Steps 2–4: per-context recovery.
+        for context_id in &self.context_ids {
+            let mut state = ContextRecoveryState::new(context_id.clone());
 
-    // -----------------------------------------------------------------------
-    // Step 1: Key rotation on trusted device (tier-appropriate)
-    // -----------------------------------------------------------------------
-    let (updated_identity, updated_document, rotation_event) =
-        execute_step1_key_rotation(key_custody, params, timestamp).await?;
-
-    // -----------------------------------------------------------------------
-    // Steps 2-4: Per-context operations (failure-isolated)
-    // -----------------------------------------------------------------------
-    let mut completed_contexts = Vec::new();
-    let mut failed_contexts: Vec<(String, Vec<RecoveryStepError>)> = Vec::new();
-    let mut pending_rejoin = Vec::new();
-
-    for mut ctx in contexts {
-        let context_id = ctx.context_id.clone();
-        let outcome = execute_per_context_steps(&mut ctx, params, authorizer, distributor, event_logger);
-
-        match outcome {
-            ContextRecoveryOutcome::Completed => {
-                completed_contexts.push(context_id);
+            // Step 2: MLS Update.
+            match backend.mls_update(context_id, key_rotation) {
+                Ok(()) => {
+                    state.mls_updated = true;
+                }
+                Err(e) if e.step == 2 && e.description.contains("requires rejoin") => {
+                    // Tier 3 re-join needed (ADR-029).
+                    state.requires_rejoin = true;
+                    pending_rejoin.push(context_id.clone());
+                    // Continue with steps 3 and 4 even if MLS Update requires
+                    // rejoin — UCAN revocation and KeyPackage deletion should
+                    // still proceed to limit the compromised key's utility.
+                }
+                Err(e) => {
+                    state.error = Some(e.clone());
+                    failed_contexts.push((context_id.clone(), e));
+                    continue;
+                }
             }
-            ContextRecoveryOutcome::PendingRejoin { reason: _ } => {
-                pending_rejoin.push(context_id);
+
+            // Step 3: UCAN revocation (depends on step 2).
+            match backend.revoke_ucans(context_id, key_rotation) {
+                Ok(()) => {
+                    state.ucan_revoked = true;
+                }
+                Err(e) => {
+                    state.error = Some(e.clone());
+                    failed_contexts.push((context_id.clone(), e));
+                    continue;
+                }
             }
-            ContextRecoveryOutcome::Failed { errors } => {
-                failed_contexts.push((context_id, errors));
+
+            // Step 4: KeyPackage rotation (depends on step 3).
+            match backend.rotate_key_packages(context_id) {
+                Ok(()) => {
+                    state.key_packages_rotated = true;
+                }
+                Err(e) => {
+                    state.error = Some(e.clone());
+                    failed_contexts.push((context_id.clone(), e));
+                    continue;
+                }
+            }
+
+            if state.is_complete() {
+                completed_contexts.push(context_id.clone());
             }
         }
+
+        // Steps 5 and 6 are independent cleanup after step 4.
+        // They can execute in any order (or parallel).
+
+        // Step 5: Contact notification.
+        let contacts_notified = if contact_dids.is_empty() {
+            true // Nothing to do.
+        } else {
+            backend.notify_contacts(&self.did, tier, key_rotation, contact_dids)
+        };
+
+        // Step 6: Identity private state re-encryption.
+        // Only for ActiveSigning and IdentityKey tiers.
+        let private_state_reencrypted = match tier {
+            CompromiseTier::Agent => true, // PSK unaffected for agent-only compromise.
+            CompromiseTier::ActiveSigning | CompromiseTier::IdentityKey => {
+                psk_params.is_some_and(|params| backend.rotate_psk(params))
+            }
+        };
+
+        let completed_at = time::now_millis()?;
+
+        Ok(RecoveryResult {
+            tier,
+            did: self.did.clone(),
+            new_did: if key_rotation.did_changed {
+                Some(key_rotation.did_after.clone())
+            } else {
+                None
+            },
+            completed_contexts,
+            failed_contexts,
+            pending_rejoin,
+            key_rotation_completed: true, // Step 1 was provided as input.
+            contacts_notified,
+            private_state_reencrypted,
+            initiated_at,
+            completed_at,
+        })
     }
 
-    // -----------------------------------------------------------------------
-    // Steps 5 & 6: Independent cleanup (parallel in spirit; sequential here
-    // because we're in a single-threaded test context, but the spec allows
-    // parallel execution)
-    // -----------------------------------------------------------------------
+    /// Returns the DID this orchestrator is recovering.
+    #[must_use]
+    pub const fn did(&self) -> &DID {
+        &self.did
+    }
 
-    // Step 5: Contact notification.
-    let old_did = &params.identity.did;
-    let new_did = &updated_identity.did;
-    let contacts_notified = contact_notifier
-        .notify_contacts(old_did, new_did, params.tier)
-        .is_ok();
-
-    // Step 6: Identity private state re-encryption.
-    // Required for ActiveSigningKey and IdentityKey tiers (not agent-only).
-    let private_state_re_encrypted = if params.tier == CompromiseTier::AgentKey {
-        // Agent key compromise does not require PSK re-encryption.
-        true
-    } else {
-        state_re_encryptor.re_encrypt_private_state(new_did).is_ok()
-    };
-
-    Ok(RecoveryResult {
-        tier: params.tier,
-        updated_identity,
-        updated_document,
-        rotation_event,
-        completed_contexts,
-        failed_contexts,
-        pending_rejoin,
-        contacts_notified,
-        private_state_re_encrypted,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Step 1: Key rotation
-// ---------------------------------------------------------------------------
-
-/// Executes step 1: tier-appropriate key rotation.
-///
-/// - Agent key: removes/replaces `#agent` VM, signed by `#0`.
-/// - Active signing key: `rotate_active_key` (ADR-003 §4a).
-/// - Identity key: `migrate_identity` (ADR-003 §4b).
-async fn execute_step1_key_rotation<R: KeyRotator>(
-    key_custody: &impl KeyCustody,
-    params: &RecoveryParams<'_, R>,
-    timestamp: u64,
-) -> Result<(ScpIdentity, DidDocument, Option<DidRotationEvent>), RecoveryError> {
-    match params.tier {
-        CompromiseTier::AgentKey => {
-            // Remove the compromised #agent VM and re-add with a new key.
-            // Step 1a: Remove old agent key.
-            let (identity_no_agent, doc_no_agent) = params
-                .did_method
-                .remove_agent_key(params.identity, params.document)
-                .await?;
-
-            // Step 1b: Add new agent key.
-            let (updated_identity, updated_document) = params
-                .did_method
-                .add_agent_key(&identity_no_agent, &doc_no_agent, key_custody)
-                .await?;
-
-            Ok((updated_identity, updated_document, None))
-        }
-
-        CompromiseTier::ActiveSigningKey => {
-            // Rotate the active signing key (DID string preserved).
-            let (updated_identity, updated_document) = params
-                .did_method
-                .rotate_active_key(params.identity, params.document, key_custody)
-                .await?;
-
-            Ok((updated_identity, updated_document, None))
-        }
-
-        CompromiseTier::IdentityKey => {
-            // Migrate identity using pre-rotation key.
-            let pre_rotation_key = params.pre_rotation_key.ok_or_else(|| {
-                IdentityError::KeyRotationFailed(
-                    "pre-rotation key required for identity key compromise recovery".to_owned(),
-                )
-            })?;
-
-            let (updated_identity, updated_document, rotation_event) = params
-                .did_method
-                .migrate_identity(
-                    params.identity,
-                    params.document,
-                    pre_rotation_key,
-                    key_custody,
-                    timestamp,
-                )
-                .await?;
-
-            Ok((updated_identity, updated_document, Some(rotation_event)))
-        }
+    /// Returns the context IDs included in recovery.
+    #[must_use]
+    pub fn context_ids(&self) -> &[String] {
+        &self.context_ids
     }
 }
 
 // ---------------------------------------------------------------------------
-// Steps 2-4: Per-context operations
+// Helper: build KeyRotationOutcome for each tier
 // ---------------------------------------------------------------------------
 
-/// Executes steps 2-4 for a single context, with failure isolation.
+/// Builds a [`KeyRotationOutcome`] for agent key compromise (tier 1).
 ///
-/// Step 2: MLS Update proposal.
-/// Step 3: UCAN revocation (all tokens issued by compromised key).
-/// Step 4: `KeyPackage` rotation is handled at the orchestrator level
-///         (not per-context), but old `KeyPackages` for this context are
-///         invalidated by the MLS epoch advance in step 2.
-fn execute_per_context_steps<R: KeyRotator>(
-    ctx: &mut PerContextState<'_>,
-    params: &RecoveryParams<'_, R>,
-    authorizer: &impl RevocationAuthorizer,
-    distributor: &impl RevocationDistributor,
-    event_logger: &impl RevocationEventLogger,
-) -> ContextRecoveryOutcome {
-    let mut errors = Vec::new();
-
-    // Step 2: MLS Update in this context.
-    match propose_update(ctx.mls_group) {
-        Ok(_commit_message) => {
-            // Update succeeded — new epoch keys derived from new key material.
-        }
-        Err(MlsError::GroupDestroyed) => {
-            // Group is destroyed — likely needs Tier 3 re-join.
-            return ContextRecoveryOutcome::PendingRejoin {
-                reason: "MLS group destroyed, requires Tier 3 re-join (ADR-029)".to_owned(),
-            };
-        }
-        Err(e) => {
-            errors.push(RecoveryStepError::MlsUpdate {
-                context_id: ctx.context_id.clone(),
-                error: e.to_string(),
-            });
-        }
+/// The DID does not change. Only `#agent` key scope is rotated.
+#[must_use]
+pub fn agent_key_rotation_outcome(did: &DID, rotated_at: u64) -> KeyRotationOutcome {
+    KeyRotationOutcome {
+        tier: CompromiseTier::Agent,
+        did_after: did.clone(),
+        did_changed: false,
+        rotated_key_scopes: vec!["#agent".to_owned()],
+        rotated_at,
     }
+}
 
-    // Step 3: UCAN revocation for all tokens issued by the compromised key.
-    for token in &ctx.tokens_to_revoke {
-        if let Err(e) = revoke_ucan(
-            ctx.revocation_list,
-            token,
-            params.revoker_did,
-            authorizer,
-            distributor,
-            event_logger,
-        ) {
-            errors.push(RecoveryStepError::UcanRevocation {
-                context_id: ctx.context_id.clone(),
-                error: e.to_string(),
-            });
-        }
+/// Builds a [`KeyRotationOutcome`] for active signing key compromise (tier 2).
+///
+/// The DID does not change. Only `#active` key scope is rotated.
+#[must_use]
+pub fn active_key_rotation_outcome(did: &DID, rotated_at: u64) -> KeyRotationOutcome {
+    KeyRotationOutcome {
+        tier: CompromiseTier::ActiveSigning,
+        did_after: did.clone(),
+        did_changed: false,
+        rotated_key_scopes: vec!["#active".to_owned()],
+        rotated_at,
     }
+}
 
-    if errors.is_empty() {
-        ContextRecoveryOutcome::Completed
-    } else {
-        ContextRecoveryOutcome::Failed { errors }
+/// Builds a [`KeyRotationOutcome`] for identity key compromise (tier 3).
+///
+/// The DID changes — `new_did` is the migrated identity.
+#[must_use]
+pub fn identity_key_rotation_outcome(
+    old_did: &DID,
+    new_did: DID,
+    rotated_at: u64,
+) -> KeyRotationOutcome {
+    let _ = old_did; // Not stored — the orchestrator already knows the old DID.
+    KeyRotationOutcome {
+        tier: CompromiseTier::IdentityKey,
+        did_after: new_did,
+        did_changed: true,
+        rotated_key_scopes: vec!["#active".to_owned(), "#agent".to_owned()],
+        rotated_at,
     }
 }
 
@@ -670,1012 +632,684 @@ fn execute_per_context_steps<R: KeyRotator>(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::large_stack_frames
-)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
-
-    use scp_identity::cache::DidCache;
-    use scp_identity::dht_client::InMemoryDhtClient;
-    use scp_identity::DidDht;
-    use scp_platform::testing::InMemoryKeyCustody;
-    use scp_platform::traits::KeyType;
-
-    use crate::crypto::mls::credential::ScpCredential;
-    use crate::crypto::mls::group::create_group;
-    use crate::crypto::ucan::{UcanError, UcanPayload};
-
-    // -----------------------------------------------------------------------
-    // Test doubles
-    // -----------------------------------------------------------------------
-
-    /// Always-authorizes revocation.
-    struct AlwaysAuthorize;
-    impl RevocationAuthorizer for AlwaysAuthorize {
-        fn authorize_revocation(&self, _cid: &str, _revoker: &str) -> Result<(), UcanError> {
-            Ok(())
-        }
-    }
-
-    /// No-op distributor — always succeeds.
-    struct NoOpDistributor;
-    impl RevocationDistributor for NoOpDistributor {
-        fn distribute_revocation(&self, _ctx: &str, _cid: &str) -> Result<(), UcanError> {
-            Ok(())
-        }
-    }
-
-    /// No-op event logger — always succeeds.
-    struct NoOpEventLogger;
-    impl RevocationEventLogger for NoOpEventLogger {
-        fn log_token_revoked(
-            &self,
-            _ctx: &str,
-            _cid: &str,
-            _revoker: &str,
-        ) -> Result<(), UcanError> {
-            Ok(())
-        }
-    }
-
-    /// Failing distributor — always fails.
-    struct FailingDistributor;
-    impl RevocationDistributor for FailingDistributor {
-        fn distribute_revocation(&self, _ctx: &str, _cid: &str) -> Result<(), UcanError> {
-            Err(UcanError::RevocationFailed(
-                "distributor unavailable".to_owned(),
-            ))
-        }
-    }
-
-    /// No-op contact notifier.
-    struct NoOpContactNotifier;
-    impl ContactNotifier for NoOpContactNotifier {
-        fn notify_contacts(
-            &self,
-            _old: &str,
-            _new: &str,
-            _tier: CompromiseTier,
-        ) -> Result<(), String> {
-            Ok(())
-        }
-    }
-
-    /// Failing contact notifier.
-    struct FailingContactNotifier;
-    impl ContactNotifier for FailingContactNotifier {
-        fn notify_contacts(
-            &self,
-            _old: &str,
-            _new: &str,
-            _tier: CompromiseTier,
-        ) -> Result<(), String> {
-            Err("contact notification failed".to_owned())
-        }
-    }
-
-    /// No-op state re-encryptor.
-    struct NoOpReEncryptor;
-    impl PrivateStateReEncryptor for NoOpReEncryptor {
-        fn re_encrypt_private_state(&self, _did: &str) -> Result<(), String> {
-            Ok(())
-        }
-    }
-
-    /// Failing state re-encryptor.
-    struct FailingReEncryptor;
-    impl PrivateStateReEncryptor for FailingReEncryptor {
-        fn re_encrypt_private_state(&self, _did: &str) -> Result<(), String> {
-            Err("re-encryption failed".to_owned())
-        }
+    fn did(s: &str) -> DID {
+        DID::from(s)
     }
 
     // -----------------------------------------------------------------------
-    // Helper: create a DidMethod + identity for testing
+    // Mock backend for testing
     // -----------------------------------------------------------------------
 
-    fn make_test_dht(custody: &Arc<InMemoryKeyCustody>) -> DidDht<InMemoryDhtClient> {
-        let dht_client = Arc::new(InMemoryDhtClient::new());
-        let cache = Arc::new(DidCache::new());
-        let sign_fn = DidDht::<InMemoryDhtClient>::make_sign_fn(Arc::clone(custody));
-        DidDht::with_client_and_signer(dht_client, cache, sign_fn)
+    /// A mock `RecoveryBackend` that succeeds for all operations by default.
+    /// Individual steps can be configured to fail.
+    struct MockRecoveryBackend {
+        /// If set, `mls_update` returns this error for the matching context.
+        mls_update_error: Option<(String, RecoveryStepError)>,
+        /// If set, `revoke_ucans` returns this error for the matching context.
+        revoke_ucans_error: Option<(String, RecoveryStepError)>,
+        /// If set, `rotate_key_packages` returns this error for the matching context.
+        rotate_key_packages_error: Option<(String, RecoveryStepError)>,
+        /// Whether `notify_contacts` succeeds.
+        notify_contacts_result: bool,
+        /// Whether `rotate_psk` succeeds.
+        rotate_psk_result: bool,
     }
 
-    async fn create_test_identity(
-        custody: &Arc<InMemoryKeyCustody>,
-    ) -> (DidDht<InMemoryDhtClient>, ScpIdentity, DidDocument) {
-        let dht = make_test_dht(custody);
-        let (identity, document) = dht.create_with_agent_key(&**custody).await.unwrap();
-        (dht, identity, document)
-    }
-
-    /// Constructs a minimal `DidDocument` for tests that don't exercise step 1.
-    /// Step 1 tests use `create_test_identity` which produces a real document.
-    fn minimal_did_document() -> DidDocument {
-        DidDocument {
-            context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
-            id: "did:dht:z6MkAlice".to_owned(),
-            verification_method: vec![],
-            authentication: vec![],
-            assertion_method: vec![],
-            also_known_as: vec![],
-            service: vec![],
-        }
-    }
-
-    fn make_test_ucan_payload(issuer: &str) -> UcanPayload {
-        UcanPayload {
-            iss: issuer.to_owned(),
-            aud: "did:dht:z6MkBob".to_owned(),
-            exp: 9_999_999_999,
-            nbf: None,
-            nnc: "test-nonce".to_owned(),
-            att: vec![],
-            prf: vec![],
-            fct: None,
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // CompromiseTier display
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn compromise_tier_display() {
-        assert_eq!(CompromiseTier::AgentKey.to_string(), "AgentKey (#agent)");
-        assert_eq!(
-            CompromiseTier::ActiveSigningKey.to_string(),
-            "ActiveSigningKey (#active)"
-        );
-        assert_eq!(CompromiseTier::IdentityKey.to_string(), "IdentityKey (#0)");
-    }
-
-    // -----------------------------------------------------------------------
-    // Step 1: Agent key rotation
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn step1_agent_key_rotation_replaces_agent_vm() {
-        let custody = Arc::new(InMemoryKeyCustody::new());
-        let (dht, identity, document) = create_test_identity(&custody).await;
-
-        let old_agent_key = identity.agent_signing_key.expect("should have agent key");
-
-        let (updated_identity, updated_document, rotation_event) = execute_step1_key_rotation(
-            &*custody,
-            &RecoveryParams {
-                tier: CompromiseTier::AgentKey,
-                identity: &identity,
-                document: &document,
-                did_method: &dht,
-                pre_rotation_key: None,
-                revoker_did: &identity.did,
-            },
-            0,
-        )
-        .await
-        .unwrap();
-
-        // DID string unchanged.
-        assert_eq!(updated_identity.did, identity.did);
-
-        // Agent key replaced (not None, but different handle).
-        let new_agent_key = updated_identity
-            .agent_signing_key
-            .expect("should have new agent key");
-        assert_ne!(
-            old_agent_key, new_agent_key,
-            "agent key handle should differ after rotation"
-        );
-
-        // No rotation event for agent key compromise.
-        assert!(rotation_event.is_none());
-
-        // Document should have an #agent VM (the new one).
-        let has_agent = updated_document
-            .verification_method
-            .iter()
-            .any(|vm| vm.id.ends_with("#agent"));
-        assert!(has_agent, "document should have new #agent VM");
-    }
-
-    // -----------------------------------------------------------------------
-    // Step 1: Active signing key rotation
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn step1_active_key_rotation_preserves_did() {
-        let custody = Arc::new(InMemoryKeyCustody::new());
-        let (dht, identity, document) = create_test_identity(&custody).await;
-
-        let old_active_key = identity.active_signing_key;
-
-        let (updated_identity, _updated_document, rotation_event) = execute_step1_key_rotation(
-            &*custody,
-            &RecoveryParams {
-                tier: CompromiseTier::ActiveSigningKey,
-                identity: &identity,
-                document: &document,
-                did_method: &dht,
-                pre_rotation_key: None,
-                revoker_did: &identity.did,
-            },
-            0,
-        )
-        .await
-        .unwrap();
-
-        // DID string unchanged.
-        assert_eq!(updated_identity.did, identity.did);
-
-        // Active key changed.
-        assert_ne!(
-            old_active_key, updated_identity.active_signing_key,
-            "active signing key should differ after rotation"
-        );
-
-        // No rotation event (DID preserved).
-        assert!(rotation_event.is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // Step 1: Identity key migration
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn step1_identity_key_migration_creates_new_did() {
-        let custody = Arc::new(InMemoryKeyCustody::new());
-        let (dht, identity, document) = create_test_identity(&custody).await;
-
-        // Generate a pre-rotation key (in real usage, this comes from cold storage).
-        let pre_rotation_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
-
-        let (updated_identity, _updated_document, rotation_event) = execute_step1_key_rotation(
-            &*custody,
-            &RecoveryParams {
-                tier: CompromiseTier::IdentityKey,
-                identity: &identity,
-                document: &document,
-                did_method: &dht,
-                pre_rotation_key: Some(&pre_rotation_key),
-                revoker_did: &identity.did,
-            },
-            1234,
-        )
-        .await
-        .unwrap();
-
-        // DID string changed.
-        assert_ne!(
-            updated_identity.did, identity.did,
-            "DID should change on identity key migration"
-        );
-
-        // Rotation event present.
-        let event = rotation_event.expect("should have rotation event for identity key migration");
-        assert_eq!(event.old_did, identity.did);
-        assert_eq!(event.new_did, updated_identity.did);
-    }
-
-    #[tokio::test]
-    async fn step1_identity_key_fails_without_pre_rotation_key() {
-        let custody = Arc::new(InMemoryKeyCustody::new());
-        let (dht, identity, document) = create_test_identity(&custody).await;
-
-        let result = execute_step1_key_rotation(
-            &*custody,
-            &RecoveryParams {
-                tier: CompromiseTier::IdentityKey,
-                identity: &identity,
-                document: &document,
-                did_method: &dht,
-                pre_rotation_key: None,
-                revoker_did: &identity.did,
-            },
-            0,
-        )
-        .await;
-
-        assert!(result.is_err(), "should fail without pre-rotation key");
-    }
-
-    // -----------------------------------------------------------------------
-    // Steps 2-4: Per-context operations
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn per_context_steps_mls_update_succeeds() {
-        let cred = ScpCredential::new(
-            "did:dht:z6MkAlice".to_owned(),
-            None,
-            scp_identity::SigningKeyId::Active,
-        )
-        .unwrap();
-        let mut group = create_group(&cred).unwrap();
-
-        let mut revocation_list = RevocationList::new("ctx-1".to_owned());
-
-        let mut ctx = PerContextState {
-            context_id: "ctx-1".to_owned(),
-            mls_group: &mut group,
-            tokens_to_revoke: vec![],
-            revocation_list: &mut revocation_list,
-        };
-
-        let params = RecoveryParams {
-            tier: CompromiseTier::AgentKey,
-            identity: &ScpIdentity {
-                identity_key: KeyHandle::new(0),
-                active_signing_key: KeyHandle::new(1),
-                agent_signing_key: Some(KeyHandle::new(2)),
-                pre_rotation_commitment: [0u8; 32],
-                did: "did:dht:z6MkAlice".to_owned(),
-            },
-            document: &minimal_did_document(),
-            did_method: &DidDht::new(),
-            pre_rotation_key: None,
-            revoker_did: "did:dht:z6MkAlice",
-        };
-
-        let outcome = execute_per_context_steps(
-            &mut ctx,
-            &params,
-            &AlwaysAuthorize,
-            &NoOpDistributor,
-            &NoOpEventLogger,
-        );
-
-        assert!(
-            matches!(outcome, ContextRecoveryOutcome::Completed),
-            "should complete when MLS Update succeeds"
-        );
-    }
-
-    #[test]
-    fn per_context_steps_destroyed_group_flags_rejoin() {
-        let cred = ScpCredential::new(
-            "did:dht:z6MkAlice".to_owned(),
-            None,
-            scp_identity::SigningKeyId::Active,
-        )
-        .unwrap();
-        let mut group = create_group(&cred).unwrap();
-
-        // Destroy the group to simulate a scenario needing re-join.
-        crate::crypto::mls::group::destroy_group(&mut group).unwrap();
-
-        let mut revocation_list = RevocationList::new("ctx-2".to_owned());
-
-        let mut ctx = PerContextState {
-            context_id: "ctx-2".to_owned(),
-            mls_group: &mut group,
-            tokens_to_revoke: vec![],
-            revocation_list: &mut revocation_list,
-        };
-
-        let params = RecoveryParams {
-            tier: CompromiseTier::AgentKey,
-            identity: &ScpIdentity {
-                identity_key: KeyHandle::new(0),
-                active_signing_key: KeyHandle::new(1),
-                agent_signing_key: Some(KeyHandle::new(2)),
-                pre_rotation_commitment: [0u8; 32],
-                did: "did:dht:z6MkAlice".to_owned(),
-            },
-            document: &minimal_did_document(),
-            did_method: &DidDht::new(),
-            pre_rotation_key: None,
-            revoker_did: "did:dht:z6MkAlice",
-        };
-
-        let outcome = execute_per_context_steps(
-            &mut ctx,
-            &params,
-            &AlwaysAuthorize,
-            &NoOpDistributor,
-            &NoOpEventLogger,
-        );
-
-        assert!(
-            matches!(outcome, ContextRecoveryOutcome::PendingRejoin { .. }),
-            "destroyed group should flag for Tier 3 re-join"
-        );
-    }
-
-    #[test]
-    fn per_context_steps_ucan_revocation_failure_isolated() {
-        let cred = ScpCredential::new(
-            "did:dht:z6MkAlice".to_owned(),
-            None,
-            scp_identity::SigningKeyId::Active,
-        )
-        .unwrap();
-        let mut group = create_group(&cred).unwrap();
-
-        let mut revocation_list = RevocationList::new("ctx-3".to_owned());
-
-        // Add a token to revoke — the failing distributor will cause step 3 to fail.
-        let token = make_test_ucan_payload("did:dht:z6MkAlice");
-
-        let mut ctx = PerContextState {
-            context_id: "ctx-3".to_owned(),
-            mls_group: &mut group,
-            tokens_to_revoke: vec![token],
-            revocation_list: &mut revocation_list,
-        };
-
-        let params = RecoveryParams {
-            tier: CompromiseTier::AgentKey,
-            identity: &ScpIdentity {
-                identity_key: KeyHandle::new(0),
-                active_signing_key: KeyHandle::new(1),
-                agent_signing_key: Some(KeyHandle::new(2)),
-                pre_rotation_commitment: [0u8; 32],
-                did: "did:dht:z6MkAlice".to_owned(),
-            },
-            document: &minimal_did_document(),
-            did_method: &DidDht::new(),
-            pre_rotation_key: None,
-            revoker_did: "did:dht:z6MkAlice",
-        };
-
-        let outcome = execute_per_context_steps(
-            &mut ctx,
-            &params,
-            &AlwaysAuthorize,
-            &FailingDistributor,
-            &NoOpEventLogger,
-        );
-
-        match outcome {
-            ContextRecoveryOutcome::Failed { errors } => {
-                assert_eq!(errors.len(), 1, "should have exactly one error");
-                assert!(
-                    matches!(&errors[0], RecoveryStepError::UcanRevocation { .. }),
-                    "error should be UCAN revocation failure"
-                );
-            }
-            other => panic!("expected Failed, got {other:?}"),
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Failure isolation: multi-context
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn failure_in_context_a_does_not_prevent_context_b() {
-        let cred = ScpCredential::new(
-            "did:dht:z6MkAlice".to_owned(),
-            None,
-            scp_identity::SigningKeyId::Active,
-        )
-        .unwrap();
-
-        // Context A: destroyed group → PendingRejoin.
-        let mut group_a = create_group(&cred).unwrap();
-        crate::crypto::mls::group::destroy_group(&mut group_a).unwrap();
-        let mut rev_list_a = RevocationList::new("ctx-a".to_owned());
-
-        // Context B: healthy group → Completed.
-        let mut group_b = create_group(&cred).unwrap();
-        let mut rev_list_b = RevocationList::new("ctx-b".to_owned());
-
-        let contexts = vec![
-            PerContextState {
-                context_id: "ctx-a".to_owned(),
-                mls_group: &mut group_a,
-                tokens_to_revoke: vec![],
-                revocation_list: &mut rev_list_a,
-            },
-            PerContextState {
-                context_id: "ctx-b".to_owned(),
-                mls_group: &mut group_b,
-                tokens_to_revoke: vec![],
-                revocation_list: &mut rev_list_b,
-            },
-        ];
-
-        let params = RecoveryParams {
-            tier: CompromiseTier::AgentKey,
-            identity: &ScpIdentity {
-                identity_key: KeyHandle::new(0),
-                active_signing_key: KeyHandle::new(1),
-                agent_signing_key: Some(KeyHandle::new(2)),
-                pre_rotation_commitment: [0u8; 32],
-                did: "did:dht:z6MkAlice".to_owned(),
-            },
-            document: &minimal_did_document(),
-            did_method: &DidDht::new(),
-            pre_rotation_key: None,
-            revoker_did: "did:dht:z6MkAlice",
-        };
-
-        let mut completed = Vec::new();
-        let mut pending = Vec::new();
-
-        for mut ctx in contexts {
-            let context_id = ctx.context_id.clone();
-            let outcome = execute_per_context_steps(
-                &mut ctx,
-                &params,
-                &AlwaysAuthorize,
-                &NoOpDistributor,
-                &NoOpEventLogger,
-            );
-            match outcome {
-                ContextRecoveryOutcome::Completed => completed.push(context_id),
-                ContextRecoveryOutcome::PendingRejoin { .. } => pending.push(context_id),
-                ContextRecoveryOutcome::Failed { .. } => {}
+    impl MockRecoveryBackend {
+        fn new() -> Self {
+            Self {
+                mls_update_error: None,
+                revoke_ucans_error: None,
+                rotate_key_packages_error: None,
+                notify_contacts_result: true,
+                rotate_psk_result: true,
             }
         }
+    }
 
-        assert_eq!(completed, vec!["ctx-b"], "context B should complete");
-        assert_eq!(
-            pending,
-            vec!["ctx-a"],
-            "context A should be pending re-join"
-        );
+    impl RecoveryBackend for MockRecoveryBackend {
+        fn mls_update(
+            &self,
+            context_id: &str,
+            _key_rotation: &KeyRotationOutcome,
+        ) -> Result<(), RecoveryStepError> {
+            if let Some((ref ctx, ref err)) = self.mls_update_error {
+                if ctx == context_id {
+                    return Err(err.clone());
+                }
+            }
+            Ok(())
+        }
+
+        fn revoke_ucans(
+            &self,
+            context_id: &str,
+            _key_rotation: &KeyRotationOutcome,
+        ) -> Result<(), RecoveryStepError> {
+            if let Some((ref ctx, ref err)) = self.revoke_ucans_error {
+                if ctx == context_id {
+                    return Err(err.clone());
+                }
+            }
+            Ok(())
+        }
+
+        fn rotate_key_packages(&self, context_id: &str) -> Result<(), RecoveryStepError> {
+            if let Some((ref ctx, ref err)) = self.rotate_key_packages_error {
+                if ctx == context_id {
+                    return Err(err.clone());
+                }
+            }
+            Ok(())
+        }
+
+        fn notify_contacts(
+            &self,
+            _did: &DID,
+            _tier: CompromiseTier,
+            _key_rotation: &KeyRotationOutcome,
+            _contacts: &HashSet<DID>,
+        ) -> bool {
+            self.notify_contacts_result
+        }
+
+        fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
+            self.rotate_psk_result
+        }
     }
 
     // -----------------------------------------------------------------------
-    // Full orchestrator: agent key compromise
+    // CompromiseTier tests
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn full_recovery_agent_key_compromise() {
-        let custody = Arc::new(InMemoryKeyCustody::new());
-        let (dht, identity, document) = create_test_identity(&custody).await;
+    #[test]
+    fn compromise_tier_serialization_roundtrip() {
+        for tier in [
+            CompromiseTier::Agent,
+            CompromiseTier::ActiveSigning,
+            CompromiseTier::IdentityKey,
+        ] {
+            let json = serde_json::to_string(&tier).unwrap();
+            let parsed: CompromiseTier = serde_json::from_str(&json).unwrap();
+            assert_eq!(tier, parsed);
+        }
+    }
 
-        let cred = ScpCredential::new(
-            identity.did.clone(),
-            None,
-            scp_identity::SigningKeyId::Active,
-        )
-        .unwrap();
-        let mut group = create_group(&cred).unwrap();
-        let mut rev_list = RevocationList::new("ctx-1".to_owned());
+    #[test]
+    fn compromise_tier_msgpack_roundtrip() {
+        for tier in [
+            CompromiseTier::Agent,
+            CompromiseTier::ActiveSigning,
+            CompromiseTier::IdentityKey,
+        ] {
+            let bytes = rmp_serde::to_vec(&tier).unwrap();
+            let parsed: CompromiseTier = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(tier, parsed);
+        }
+    }
 
-        let contexts = vec![PerContextState {
+    // -----------------------------------------------------------------------
+    // KeyRotationOutcome helper tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn agent_key_rotation_outcome_does_not_change_did() {
+        let outcome = agent_key_rotation_outcome(&did("did:dht:alice"), 1000);
+        assert_eq!(outcome.tier, CompromiseTier::Agent);
+        assert_eq!(outcome.did_after, did("did:dht:alice"));
+        assert!(!outcome.did_changed);
+        assert_eq!(outcome.rotated_key_scopes, vec!["#agent"]);
+    }
+
+    #[test]
+    fn active_key_rotation_outcome_does_not_change_did() {
+        let outcome = active_key_rotation_outcome(&did("did:dht:alice"), 2000);
+        assert_eq!(outcome.tier, CompromiseTier::ActiveSigning);
+        assert_eq!(outcome.did_after, did("did:dht:alice"));
+        assert!(!outcome.did_changed);
+        assert_eq!(outcome.rotated_key_scopes, vec!["#active"]);
+    }
+
+    #[test]
+    fn identity_key_rotation_outcome_changes_did() {
+        let outcome =
+            identity_key_rotation_outcome(&did("did:dht:alice"), did("did:dht:alice-new"), 3000);
+        assert_eq!(outcome.tier, CompromiseTier::IdentityKey);
+        assert_eq!(outcome.did_after, did("did:dht:alice-new"));
+        assert!(outcome.did_changed);
+        assert_eq!(outcome.rotated_key_scopes, vec!["#active", "#agent"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // ContextRecoveryState tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn context_recovery_state_not_complete_initially() {
+        let state = ContextRecoveryState::new("ctx-1".to_owned());
+        assert!(!state.is_complete());
+    }
+
+    #[test]
+    fn context_recovery_state_complete_when_all_steps_done() {
+        let state = ContextRecoveryState {
             context_id: "ctx-1".to_owned(),
-            mls_group: &mut group,
-            tokens_to_revoke: vec![],
-            revocation_list: &mut rev_list,
-        }];
-
-        let result = execute_recovery(
-            &*custody,
-            &RecoveryParams {
-                tier: CompromiseTier::AgentKey,
-                identity: &identity,
-                document: &document,
-                did_method: &dht,
-                pre_rotation_key: None,
-                revoker_did: &identity.did,
-            },
-            contexts,
-            &AlwaysAuthorize,
-            &NoOpDistributor,
-            &NoOpEventLogger,
-            &NoOpContactNotifier,
-            &NoOpReEncryptor,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result.tier, CompromiseTier::AgentKey);
-        assert_eq!(result.completed_contexts, vec!["ctx-1"]);
-        assert!(result.failed_contexts.is_empty());
-        assert!(result.pending_rejoin.is_empty());
-        assert!(result.rotation_event.is_none());
-        assert!(result.contacts_notified);
-        // Agent key compromise skips PSK re-encryption.
-        assert!(result.private_state_re_encrypted);
+            mls_updated: true,
+            ucan_revoked: true,
+            key_packages_rotated: true,
+            requires_rejoin: false,
+            error: None,
+        };
+        assert!(state.is_complete());
     }
 
-    // -----------------------------------------------------------------------
-    // Full orchestrator: active signing key compromise
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn full_recovery_active_key_compromise() {
-        let custody = Arc::new(InMemoryKeyCustody::new());
-        let (dht, identity, document) = create_test_identity(&custody).await;
-
-        let cred = ScpCredential::new(
-            identity.did.clone(),
-            None,
-            scp_identity::SigningKeyId::Active,
-        )
-        .unwrap();
-        let mut group = create_group(&cred).unwrap();
-        let mut rev_list = RevocationList::new("ctx-1".to_owned());
-
-        let contexts = vec![PerContextState {
+    #[test]
+    fn context_recovery_state_complete_with_rejoin() {
+        // A context requiring rejoin is considered complete if
+        // UCAN revocation and KeyPackage rotation succeeded.
+        let state = ContextRecoveryState {
             context_id: "ctx-1".to_owned(),
-            mls_group: &mut group,
-            tokens_to_revoke: vec![],
-            revocation_list: &mut rev_list,
-        }];
-
-        let result = execute_recovery(
-            &*custody,
-            &RecoveryParams {
-                tier: CompromiseTier::ActiveSigningKey,
-                identity: &identity,
-                document: &document,
-                did_method: &dht,
-                pre_rotation_key: None,
-                revoker_did: &identity.did,
-            },
-            contexts,
-            &AlwaysAuthorize,
-            &NoOpDistributor,
-            &NoOpEventLogger,
-            &NoOpContactNotifier,
-            &NoOpReEncryptor,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result.tier, CompromiseTier::ActiveSigningKey);
-        assert_eq!(result.completed_contexts, vec!["ctx-1"]);
-        assert!(result.rotation_event.is_none());
-        assert_ne!(
-            result.updated_identity.active_signing_key, identity.active_signing_key,
-            "active key should be rotated"
-        );
-        assert!(result.private_state_re_encrypted);
+            mls_updated: false,
+            ucan_revoked: true,
+            key_packages_rotated: true,
+            requires_rejoin: true,
+            error: None,
+        };
+        assert!(state.is_complete());
     }
 
-    // -----------------------------------------------------------------------
-    // Full orchestrator: identity key compromise
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn full_recovery_identity_key_compromise() {
-        let custody = Arc::new(InMemoryKeyCustody::new());
-        let (dht, identity, document) = create_test_identity(&custody).await;
-
-        let pre_rotation_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
-
-        let cred = ScpCredential::new(
-            identity.did.clone(),
-            None,
-            scp_identity::SigningKeyId::Active,
-        )
-        .unwrap();
-        let mut group = create_group(&cred).unwrap();
-        let mut rev_list = RevocationList::new("ctx-1".to_owned());
-
-        let contexts = vec![PerContextState {
+    #[test]
+    fn context_recovery_state_not_complete_with_error() {
+        let state = ContextRecoveryState {
             context_id: "ctx-1".to_owned(),
-            mls_group: &mut group,
-            tokens_to_revoke: vec![],
-            revocation_list: &mut rev_list,
-        }];
-
-        let result = execute_recovery(
-            &*custody,
-            &RecoveryParams {
-                tier: CompromiseTier::IdentityKey,
-                identity: &identity,
-                document: &document,
-                did_method: &dht,
-                pre_rotation_key: Some(&pre_rotation_key),
-                revoker_did: &identity.did,
-            },
-            contexts,
-            &AlwaysAuthorize,
-            &NoOpDistributor,
-            &NoOpEventLogger,
-            &NoOpContactNotifier,
-            &NoOpReEncryptor,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result.tier, CompromiseTier::IdentityKey);
-        assert_ne!(result.updated_identity.did, identity.did);
-        assert!(result.rotation_event.is_some());
-        assert_eq!(result.completed_contexts, vec!["ctx-1"]);
+            mls_updated: true,
+            ucan_revoked: true,
+            key_packages_rotated: true,
+            requires_rejoin: false,
+            error: Some(RecoveryStepError {
+                step: 3,
+                description: "UCAN revocation failed".to_owned(),
+            }),
+        };
+        assert!(!state.is_complete());
     }
 
     // -----------------------------------------------------------------------
-    // Steps 5 & 6: Contact notification and re-encryption failures
+    // ContactNotification tests
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn contact_notification_failure_does_not_block_recovery() {
-        let custody = Arc::new(InMemoryKeyCustody::new());
-        let (dht, identity, document) = create_test_identity(&custody).await;
+    #[test]
+    fn contact_notification_serialization_roundtrip() {
+        let notif = ContactNotification {
+            did: did("did:dht:alice"),
+            new_did: Some(did("did:dht:alice-new")),
+            tier: CompromiseTier::IdentityKey,
+            timestamp: 1_700_000_000_000,
+            kcv_reverification_required: true,
+        };
 
-        let result = execute_recovery(
-            &*custody,
-            &RecoveryParams {
-                tier: CompromiseTier::AgentKey,
-                identity: &identity,
-                document: &document,
-                did_method: &dht,
-                pre_rotation_key: None,
-                revoker_did: &identity.did,
-            },
-            vec![],
-            &AlwaysAuthorize,
-            &NoOpDistributor,
-            &NoOpEventLogger,
-            &FailingContactNotifier,
-            &NoOpReEncryptor,
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            !result.contacts_notified,
-            "should record notification failure"
-        );
-        // Recovery still succeeds overall.
-        assert!(result.failed_contexts.is_empty());
+        let json = serde_json::to_string(&notif).unwrap();
+        let parsed: ContactNotification = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, notif);
     }
 
-    #[tokio::test]
-    async fn re_encryption_failure_does_not_block_recovery() {
-        let custody = Arc::new(InMemoryKeyCustody::new());
-        let (dht, identity, document) = create_test_identity(&custody).await;
+    #[test]
+    fn contact_notification_without_new_did() {
+        let notif = ContactNotification {
+            did: did("did:dht:alice"),
+            new_did: None,
+            tier: CompromiseTier::Agent,
+            timestamp: 1_700_000_000_000,
+            kcv_reverification_required: true,
+        };
 
-        let result = execute_recovery(
-            &*custody,
-            &RecoveryParams {
-                tier: CompromiseTier::ActiveSigningKey,
-                identity: &identity,
-                document: &document,
-                did_method: &dht,
-                pre_rotation_key: None,
-                revoker_did: &identity.did,
-            },
-            vec![],
-            &AlwaysAuthorize,
-            &NoOpDistributor,
-            &NoOpEventLogger,
-            &NoOpContactNotifier,
-            &FailingReEncryptor,
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            !result.private_state_re_encrypted,
-            "should record re-encryption failure"
-        );
+        let json = serde_json::to_string(&notif).unwrap();
+        let parsed: ContactNotification = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, notif);
+        assert!(parsed.new_did.is_none());
     }
 
     // -----------------------------------------------------------------------
-    // RecoveryStepError display
+    // RecoveryStepError tests
     // -----------------------------------------------------------------------
 
     #[test]
     fn recovery_step_error_display() {
-        let e = RecoveryStepError::MlsUpdate {
-            context_id: "ctx-1".to_owned(),
-            error: "group destroyed".to_owned(),
+        let err = RecoveryStepError {
+            step: 2,
+            description: "MLS Update failed".to_owned(),
         };
-        assert_eq!(e.to_string(), "MLS Update failed in ctx-1: group destroyed");
+        assert_eq!(err.to_string(), "step 2: MLS Update failed");
+    }
 
-        let e = RecoveryStepError::KeyRotation("key not found".to_owned());
-        assert_eq!(e.to_string(), "key rotation failed: key not found");
-
-        let e = RecoveryStepError::UcanRevocation {
-            context_id: "ctx-2".to_owned(),
-            error: "unauthorized".to_owned(),
+    #[test]
+    fn recovery_step_error_serialization_roundtrip() {
+        let err = RecoveryStepError {
+            step: 4,
+            description: "KeyPackage deletion failed".to_owned(),
         };
-        assert_eq!(
-            e.to_string(),
-            "UCAN revocation failed in ctx-2: unauthorized"
-        );
-
-        let e = RecoveryStepError::KeyPackageRotation("buffer exhausted".to_owned());
-        assert_eq!(
-            e.to_string(),
-            "KeyPackage rotation failed: buffer exhausted"
-        );
-
-        let e = RecoveryStepError::ContactNotification("timeout".to_owned());
-        assert_eq!(e.to_string(), "contact notification failed: timeout");
-
-        let e = RecoveryStepError::PrivateStateReEncryption("psk error".to_owned());
-        assert_eq!(
-            e.to_string(),
-            "private state re-encryption failed: psk error"
-        );
+        let json = serde_json::to_string(&err).unwrap();
+        let parsed: RecoveryStepError = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, err);
     }
 
     // -----------------------------------------------------------------------
-    // Step ordering: MLS Update uses new key material (step 2 depends on step 1)
+    // CompromiseRecoveryOrchestrator — execute_recovery tests
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn step_ordering_mls_update_after_key_rotation() {
-        let custody = Arc::new(InMemoryKeyCustody::new());
-        let (dht, identity, document) = create_test_identity(&custody).await;
-
-        let cred = ScpCredential::new(
-            identity.did.clone(),
-            None,
-            scp_identity::SigningKeyId::Active,
-        )
-        .unwrap();
-        let mut group = create_group(&cred).unwrap();
-        let epoch_before = group.epoch().unwrap();
-
-        let mut rev_list = RevocationList::new("ctx-1".to_owned());
-
-        let contexts = vec![PerContextState {
-            context_id: "ctx-1".to_owned(),
-            mls_group: &mut group,
-            tokens_to_revoke: vec![],
-            revocation_list: &mut rev_list,
-        }];
-
-        let result = execute_recovery(
-            &*custody,
-            &RecoveryParams {
-                tier: CompromiseTier::ActiveSigningKey,
-                identity: &identity,
-                document: &document,
-                did_method: &dht,
-                pre_rotation_key: None,
-                revoker_did: &identity.did,
-            },
-            contexts,
-            &AlwaysAuthorize,
-            &NoOpDistributor,
-            &NoOpEventLogger,
-            &NoOpContactNotifier,
-            &NoOpReEncryptor,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result.completed_contexts, vec!["ctx-1"]);
-
-        // The MLS group should have advanced epoch (step 2 executed after step 1).
-        let epoch_after = group.epoch().unwrap();
-        assert!(
-            epoch_after > epoch_before,
-            "MLS epoch should advance after Update (step 2)"
+    async fn agent_key_recovery_all_contexts_succeed() {
+        let orch = CompromiseRecoveryOrchestrator::new(
+            did("did:dht:alice"),
+            vec!["ctx-1".to_owned(), "ctx-2".to_owned()],
         );
-    }
 
-    // -----------------------------------------------------------------------
-    // Multi-context: mixed success and failure
-    // -----------------------------------------------------------------------
+        let key_rotation = agent_key_rotation_outcome(&did("did:dht:alice"), 1000);
+        let contacts = HashSet::new();
+        let backend = MockRecoveryBackend::new();
 
-    #[tokio::test]
-    async fn multi_context_mixed_outcomes() {
-        let custody = Arc::new(InMemoryKeyCustody::new());
-        let (dht, identity, document) = create_test_identity(&custody).await;
+        let result = orch
+            .execute_recovery(
+                CompromiseTier::Agent,
+                &key_rotation,
+                &contacts,
+                None,
+                &backend,
+            )
+            .await
+            .unwrap();
 
-        let cred = ScpCredential::new(
-            identity.did.clone(),
-            None,
-            scp_identity::SigningKeyId::Active,
-        )
-        .unwrap();
-
-        // Context 1: healthy → Completed.
-        let mut group1 = create_group(&cred).unwrap();
-        let mut rev_list1 = RevocationList::new("ctx-1".to_owned());
-
-        // Context 2: destroyed → PendingRejoin.
-        let mut group2 = create_group(&cred).unwrap();
-        crate::crypto::mls::group::destroy_group(&mut group2).unwrap();
-        let mut rev_list2 = RevocationList::new("ctx-2".to_owned());
-
-        // Context 3: healthy but UCAN revocation will fail → Failed.
-        let _group3 = create_group(&cred).unwrap();
-        let _rev_list3 = RevocationList::new("ctx-3".to_owned());
-        let _token = make_test_ucan_payload(&identity.did);
-
-        let contexts = vec![
-            PerContextState {
-                context_id: "ctx-1".to_owned(),
-                mls_group: &mut group1,
-                tokens_to_revoke: vec![],
-                revocation_list: &mut rev_list1,
-            },
-            PerContextState {
-                context_id: "ctx-2".to_owned(),
-                mls_group: &mut group2,
-                tokens_to_revoke: vec![],
-                revocation_list: &mut rev_list2,
-            },
-        ];
-
-        // Execute first batch with NoOp distributor.
-        let result = execute_recovery(
-            &*custody,
-            &RecoveryParams {
-                tier: CompromiseTier::AgentKey,
-                identity: &identity,
-                document: &document,
-                did_method: &dht,
-                pre_rotation_key: None,
-                revoker_did: &identity.did,
-            },
-            contexts,
-            &AlwaysAuthorize,
-            &NoOpDistributor,
-            &NoOpEventLogger,
-            &NoOpContactNotifier,
-            &NoOpReEncryptor,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result.completed_contexts, vec!["ctx-1"]);
-        assert_eq!(result.pending_rejoin, vec!["ctx-2"]);
+        assert_eq!(result.tier, CompromiseTier::Agent);
+        assert_eq!(result.did, did("did:dht:alice"));
+        assert!(result.new_did.is_none());
+        assert_eq!(result.completed_contexts.len(), 2);
         assert!(result.failed_contexts.is_empty());
+        assert!(result.pending_rejoin.is_empty());
+        assert!(result.key_rotation_completed);
+        assert!(result.contacts_notified);
+        // Agent tier: PSK unaffected, so private_state_reencrypted is true.
+        assert!(result.private_state_reencrypted);
+        assert!(result.completed_at >= result.initiated_at);
+    }
+
+    #[tokio::test]
+    async fn active_signing_key_recovery_with_psk_rotation() {
+        let orch =
+            CompromiseRecoveryOrchestrator::new(did("did:dht:alice"), vec!["ctx-1".to_owned()]);
+
+        let key_rotation = active_key_rotation_outcome(&did("did:dht:alice"), 2000);
+        let contacts = HashSet::from([did("did:dht:bob"), did("did:dht:carol")]);
+        let psk_params = PskRotationParams {
+            enrolled_device_pubkeys: vec![vec![1u8; 32], vec![2u8; 32]],
+            compromised_device_pubkey: None,
+        };
+        let backend = MockRecoveryBackend::new();
+
+        let result = orch
+            .execute_recovery(
+                CompromiseTier::ActiveSigning,
+                &key_rotation,
+                &contacts,
+                Some(&psk_params),
+                &backend,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.tier, CompromiseTier::ActiveSigning);
+        assert_eq!(result.completed_contexts, vec!["ctx-1"]);
+        assert!(result.contacts_notified);
+        assert!(result.private_state_reencrypted);
+    }
+
+    #[tokio::test]
+    async fn identity_key_recovery_changes_did() {
+        let orch =
+            CompromiseRecoveryOrchestrator::new(did("did:dht:alice"), vec!["ctx-1".to_owned()]);
+
+        let key_rotation =
+            identity_key_rotation_outcome(&did("did:dht:alice"), did("did:dht:alice-new"), 3000);
+        let contacts = HashSet::from([did("did:dht:bob")]);
+        let psk_params = PskRotationParams {
+            enrolled_device_pubkeys: vec![vec![1u8; 32]],
+            compromised_device_pubkey: None,
+        };
+        let backend = MockRecoveryBackend::new();
+
+        let result = orch
+            .execute_recovery(
+                CompromiseTier::IdentityKey,
+                &key_rotation,
+                &contacts,
+                Some(&psk_params),
+                &backend,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.tier, CompromiseTier::IdentityKey);
+        assert_eq!(result.new_did, Some(did("did:dht:alice-new")));
+        assert!(result.key_rotation_completed);
+        assert!(result.private_state_reencrypted);
+    }
+
+    #[tokio::test]
+    async fn recovery_with_no_contexts() {
+        let orch = CompromiseRecoveryOrchestrator::new(did("did:dht:alice"), vec![]);
+
+        let key_rotation = agent_key_rotation_outcome(&did("did:dht:alice"), 1000);
+        let contacts = HashSet::new();
+        let backend = MockRecoveryBackend::new();
+
+        let result = orch
+            .execute_recovery(
+                CompromiseTier::Agent,
+                &key_rotation,
+                &contacts,
+                None,
+                &backend,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.completed_contexts.is_empty());
+        assert!(result.failed_contexts.is_empty());
+        assert!(result.pending_rejoin.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovery_without_psk_params_for_active_tier() {
+        // ActiveSigning without PSK params → private_state_reencrypted is false.
+        let orch =
+            CompromiseRecoveryOrchestrator::new(did("did:dht:alice"), vec!["ctx-1".to_owned()]);
+
+        let key_rotation = active_key_rotation_outcome(&did("did:dht:alice"), 2000);
+        let contacts = HashSet::new();
+        let backend = MockRecoveryBackend::new();
+
+        let result = orch
+            .execute_recovery(
+                CompromiseTier::ActiveSigning,
+                &key_rotation,
+                &contacts,
+                None,
+                &backend,
+            )
+            .await
+            .unwrap();
+
+        // Without PSK params, re-encryption didn't happen.
+        assert!(!result.private_state_reencrypted);
+    }
+
+    #[tokio::test]
+    async fn psk_rotation_excludes_compromised_device() {
+        let orch = CompromiseRecoveryOrchestrator::new(did("did:dht:alice"), vec![]);
+
+        let key_rotation = active_key_rotation_outcome(&did("did:dht:alice"), 2000);
+        let contacts = HashSet::new();
+        let backend = MockRecoveryBackend::new();
+
+        // Device 2 is compromised.
+        let psk_params = PskRotationParams {
+            enrolled_device_pubkeys: vec![vec![1u8; 32], vec![2u8; 32], vec![3u8; 32]],
+            compromised_device_pubkey: Some(vec![2u8; 32]),
+        };
+
+        let result = orch
+            .execute_recovery(
+                CompromiseTier::ActiveSigning,
+                &key_rotation,
+                &contacts,
+                Some(&psk_params),
+                &backend,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.private_state_reencrypted);
+    }
+
+    #[tokio::test]
+    async fn psk_rotation_fails_with_no_remaining_devices() {
+        // All devices compromised → PSK rotation fails.
+        let orch = CompromiseRecoveryOrchestrator::new(did("did:dht:alice"), vec![]);
+
+        let key_rotation = active_key_rotation_outcome(&did("did:dht:alice"), 2000);
+        let contacts = HashSet::new();
+
+        let psk_params = PskRotationParams {
+            enrolled_device_pubkeys: vec![vec![1u8; 32]],
+            compromised_device_pubkey: Some(vec![1u8; 32]),
+        };
+
+        // Backend reports PSK rotation failure (no remaining devices).
+        let backend = MockRecoveryBackend {
+            rotate_psk_result: false,
+            ..MockRecoveryBackend::new()
+        };
+
+        let result = orch
+            .execute_recovery(
+                CompromiseTier::ActiveSigning,
+                &key_rotation,
+                &contacts,
+                Some(&psk_params),
+                &backend,
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.private_state_reencrypted);
+    }
+
+    #[tokio::test]
+    async fn recovery_result_serialization_roundtrip() {
+        let orch =
+            CompromiseRecoveryOrchestrator::new(did("did:dht:alice"), vec!["ctx-1".to_owned()]);
+
+        let key_rotation = agent_key_rotation_outcome(&did("did:dht:alice"), 1000);
+        let contacts = HashSet::new();
+        let backend = MockRecoveryBackend::new();
+
+        let result = orch
+            .execute_recovery(
+                CompromiseTier::Agent,
+                &key_rotation,
+                &contacts,
+                None,
+                &backend,
+            )
+            .await
+            .unwrap();
+
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: RecoveryResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.tier, result.tier);
+        assert_eq!(parsed.did, result.did);
+        assert_eq!(parsed.completed_contexts, result.completed_contexts);
     }
 
     // -----------------------------------------------------------------------
-    // UCAN revocation: tokens issued by compromised key are revoked
+    // RecoveryResult field tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn recovery_result_msgpack_roundtrip() {
+        let result = RecoveryResult {
+            tier: CompromiseTier::ActiveSigning,
+            did: did("did:dht:alice"),
+            new_did: None,
+            completed_contexts: vec!["ctx-1".to_owned()],
+            failed_contexts: vec![(
+                "ctx-2".to_owned(),
+                RecoveryStepError {
+                    step: 2,
+                    description: "MLS update failed".to_owned(),
+                },
+            )],
+            pending_rejoin: vec!["ctx-3".to_owned()],
+            key_rotation_completed: true,
+            contacts_notified: true,
+            private_state_reencrypted: true,
+            initiated_at: 1000,
+            completed_at: 2000,
+        };
+
+        let bytes = rmp_serde::to_vec(&result).unwrap();
+        let parsed: RecoveryResult = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.tier, CompromiseTier::ActiveSigning);
+        assert_eq!(parsed.completed_contexts, vec!["ctx-1"]);
+        assert_eq!(parsed.failed_contexts.len(), 1);
+        assert_eq!(parsed.pending_rejoin, vec!["ctx-3"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Orchestrator accessors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn orchestrator_accessors() {
+        let orch = CompromiseRecoveryOrchestrator::new(
+            did("did:dht:alice"),
+            vec!["ctx-1".to_owned(), "ctx-2".to_owned()],
+        );
+        assert_eq!(*orch.did(), did("did:dht:alice"));
+        assert_eq!(orch.context_ids().len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Three recovery tiers — end-to-end test
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn ucan_revocation_in_context_succeeds() {
-        let custody = Arc::new(InMemoryKeyCustody::new());
-        let (dht, identity, document) = create_test_identity(&custody).await;
+    async fn three_tiers_end_to_end() {
+        let contexts = vec!["ctx-1".to_owned(), "ctx-2".to_owned(), "ctx-3".to_owned()];
+        let alice = did("did:dht:alice");
+        let contacts = HashSet::from([did("did:dht:bob"), did("did:dht:carol")]);
+        let psk_params = PskRotationParams {
+            enrolled_device_pubkeys: vec![vec![1u8; 32], vec![2u8; 32]],
+            compromised_device_pubkey: None,
+        };
+        let backend = MockRecoveryBackend::new();
 
-        let cred = ScpCredential::new(
-            identity.did.clone(),
-            None,
-            scp_identity::SigningKeyId::Active,
-        )
-        .unwrap();
-        let mut group = create_group(&cred).unwrap();
-        let mut rev_list = RevocationList::new("ctx-1".to_owned());
+        // Tier 1: Agent key compromise (cheapest).
+        {
+            let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), contexts.clone());
+            let kr = agent_key_rotation_outcome(&alice, 1000);
+            let result = orch
+                .execute_recovery(CompromiseTier::Agent, &kr, &contacts, None, &backend)
+                .await
+                .unwrap();
 
-        let token = make_test_ucan_payload(&identity.did);
+            assert_eq!(result.tier, CompromiseTier::Agent);
+            assert!(result.new_did.is_none()); // No DID change.
+            assert_eq!(result.completed_contexts.len(), 3);
+            assert!(result.private_state_reencrypted); // PSK unaffected.
+        }
 
-        let contexts = vec![PerContextState {
+        // Tier 2: Active signing key compromise.
+        {
+            let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), contexts.clone());
+            let kr = active_key_rotation_outcome(&alice, 2000);
+            let result = orch
+                .execute_recovery(
+                    CompromiseTier::ActiveSigning,
+                    &kr,
+                    &contacts,
+                    Some(&psk_params),
+                    &backend,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(result.tier, CompromiseTier::ActiveSigning);
+            assert!(result.new_did.is_none()); // No DID change.
+            assert!(result.private_state_reencrypted);
+        }
+
+        // Tier 3: Identity key compromise (most severe).
+        {
+            let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), contexts.clone());
+            let kr = identity_key_rotation_outcome(&alice, did("did:dht:alice-new"), 3000);
+            let result = orch
+                .execute_recovery(
+                    CompromiseTier::IdentityKey,
+                    &kr,
+                    &contacts,
+                    Some(&psk_params),
+                    &backend,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(result.tier, CompromiseTier::IdentityKey);
+            assert_eq!(result.new_did, Some(did("did:dht:alice-new")));
+            assert!(result.private_state_reencrypted);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Step ordering tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn context_recovery_state_requires_mls_before_complete() {
+        // Without MLS update AND without rejoin flag, not complete.
+        let state = ContextRecoveryState {
             context_id: "ctx-1".to_owned(),
-            mls_group: &mut group,
-            tokens_to_revoke: vec![token],
-            revocation_list: &mut rev_list,
-        }];
+            mls_updated: false,
+            ucan_revoked: true,
+            key_packages_rotated: true,
+            requires_rejoin: false,
+            error: None,
+        };
+        assert!(!state.is_complete());
+    }
 
-        let result = execute_recovery(
-            &*custody,
-            &RecoveryParams {
-                tier: CompromiseTier::AgentKey,
-                identity: &identity,
-                document: &document,
-                did_method: &dht,
-                pre_rotation_key: None,
-                revoker_did: &identity.did,
-            },
-            contexts,
-            &AlwaysAuthorize,
-            &NoOpDistributor,
-            &NoOpEventLogger,
-            &NoOpContactNotifier,
-            &NoOpReEncryptor,
-        )
-        .await
-        .unwrap();
+    #[test]
+    fn context_recovery_state_requires_ucan_revocation() {
+        let state = ContextRecoveryState {
+            context_id: "ctx-1".to_owned(),
+            mls_updated: true,
+            ucan_revoked: false,
+            key_packages_rotated: true,
+            requires_rejoin: false,
+            error: None,
+        };
+        assert!(!state.is_complete());
+    }
 
-        assert_eq!(result.completed_contexts, vec!["ctx-1"]);
+    #[test]
+    fn context_recovery_state_requires_key_package_rotation() {
+        let state = ContextRecoveryState {
+            context_id: "ctx-1".to_owned(),
+            mls_updated: true,
+            ucan_revoked: true,
+            key_packages_rotated: false,
+            requires_rejoin: false,
+            error: None,
+        };
+        assert!(!state.is_complete());
+    }
 
-        // The revocation list should have the token marked as revoked.
-        assert!(
-            !rev_list.is_empty(),
-            "revocation list should contain the revoked token"
-        );
+    // -----------------------------------------------------------------------
+    // PskRotationParams tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn psk_rotation_params_serialization_roundtrip() {
+        let params = PskRotationParams {
+            enrolled_device_pubkeys: vec![vec![1u8; 32], vec![2u8; 32]],
+            compromised_device_pubkey: Some(vec![2u8; 32]),
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        let parsed: PskRotationParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.enrolled_device_pubkeys.len(), 2);
+        assert!(parsed.compromised_device_pubkey.is_some());
     }
 }

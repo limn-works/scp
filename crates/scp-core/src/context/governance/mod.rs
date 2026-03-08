@@ -362,6 +362,56 @@ pub struct CheckpointSchedule {
     pub min_events_since_last: u64,
 }
 
+// ---------------------------------------------------------------------------
+// Checkpoint cosignature types (ADR-031 §9)
+// ---------------------------------------------------------------------------
+
+/// A cosigned checkpoint from a governance quorum member (ADR-031 §9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CosignedCheckpoint {
+    /// The DID of the signer.
+    pub signer_did: DID,
+    /// Ed25519 signature over the checkpoint hash (64 bytes).
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+}
+
+/// Attestation status for a checkpoint (ADR-031 §9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CheckpointAttestationStatus {
+    /// Checkpoint has full governance quorum cosignatures.
+    FullyAttested,
+    /// Checkpoint valid with creator's signature only (insufficient cosignatures).
+    PartiallyAttested,
+}
+
+/// Context checkpoint with governance cosignatures (ADR-031 §9, ADR-030 §1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCheckpoint {
+    /// Sequence number in the event log.
+    pub checkpoint_seq: u64,
+    /// Merkle root at this sequence number.
+    pub merkle_root: [u8; 32],
+    /// Number of events included in this checkpoint.
+    pub event_count: u64,
+    /// Hash of the last event before this checkpoint.
+    pub last_event_hash: [u8; 32],
+    /// Deterministic hash of the context state snapshot.
+    pub state_snapshot_hash: [u8; 32],
+    /// Timestamp when checkpoint was created.
+    pub created_at: u64,
+    /// Creator's DID and signature.
+    pub creator_did: DID,
+    /// Creator's Ed25519 signature over checkpoint data (64 bytes).
+    #[serde(with = "serde_bytes")]
+    pub creator_signature: Vec<u8>,
+    /// Governance quorum cosignatures (ADR-031 §9).
+    /// Empty for SingleAdmin contexts, populated for multi-admin contexts.
+    pub cosignatures: Vec<CosignedCheckpoint>,
+    /// Attestation status based on cosignature quorum.
+    pub attestation_status: CheckpointAttestationStatus,
+}
+
 /// Pruning policy for a context's event log (ADR-030 §6).
 ///
 /// Set at context creation or modified via governance. Included in
@@ -977,6 +1027,22 @@ pub enum GovernanceEvent {
         justification: DeadlockJustification,
         changes: Vec<GovernanceReconfigAction>,
     },
+    /// A simultaneous governance conflict was detected (ADR-031 §7).
+    ///
+    /// Logged when two conflicting proposals land at the same event log
+    /// sequence, triggering a governance freeze state.
+    ConflictDetected {
+        proposal_a: ProposalId,
+        proposal_b: ProposalId,
+    },
+    /// A governance conflict was resolved (ADR-031 §7).
+    ///
+    /// Logged when a sequential conflict is resolved (lower sequence wins)
+    /// or when a ResolveConflict action is executed.
+    ConflictResolved {
+        winner_id: ProposalId,
+        loser_id: ProposalId,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1166,6 +1232,48 @@ pub trait GovernanceEngine: Send + Sync {
         proposal_id: &ProposalId,
         reason: String,
     ) -> Result<Vec<GovernanceEvent>, GovernanceError>;
+
+    /// Get checkpoint cosignature requirements for this governance model (ADR-031 §9).
+    ///
+    /// Returns the set of DIDs that must cosign checkpoints and the minimum
+    /// number of cosignatures required for full attestation.
+    ///
+    /// # Returns
+    ///
+    /// Returns `(required_signers, minimum_count)`:
+    /// - `required_signers`: Vec of DIDs eligible to cosign checkpoints
+    /// - `minimum_count`: Minimum cosignatures needed for FullyAttested status
+    ///
+    /// For SingleAdmin: returns `(vec![], 0)` (no cosignatures required)
+    /// For Threshold: returns `(signers, threshold)`
+    /// For Majority: returns `(eligible_voters, ceil(voters * 0.5) + 1)`
+    /// For Unanimity: returns `(eligible_voters, eligible_voters.len())`
+    fn checkpoint_cosignature_requirements(&self) -> (Vec<DID>, usize);
+
+    /// Validate a checkpoint cosignature collection (ADR-031 §9).
+    ///
+    /// Verifies that cosignatures meet this governance model's requirements.
+    /// Returns the appropriate attestation status.
+    ///
+    /// # Parameters
+    ///
+    /// - `cosignatures`: Collected cosignatures for the checkpoint
+    /// - `checkpoint_hash`: The checkpoint hash that was signed
+    ///
+    /// # Returns
+    ///
+    /// Returns `CheckpointAttestationStatus`:
+    /// - `FullyAttested`: Required cosignature quorum reached
+    /// - `PartiallyAttested`: Insufficient cosignatures but creator signature valid
+    ///
+    /// # Errors
+    ///
+    /// Returns `GovernanceError` if signature verification fails or invalid signers.
+    fn validate_checkpoint_cosignatures(
+        &self,
+        cosignatures: &[CosignedCheckpoint],
+        checkpoint_hash: &[u8; 32],
+    ) -> Result<CheckpointAttestationStatus, GovernanceError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1402,6 +1510,134 @@ impl GovernanceEngine for SingleAdminEngine {
             status: ProposalStatus::Invalidated { reason },
         }])
     }
+
+    fn checkpoint_cosignature_requirements(&self) -> (Vec<DID>, usize) {
+        // SingleAdmin: admin signature only, no cosignatures required (ADR-031 §9)
+        (Vec::new(), 0)
+    }
+
+    fn validate_checkpoint_cosignatures(
+        &self,
+        cosignatures: &[CosignedCheckpoint],
+        _checkpoint_hash: &[u8; 32],
+    ) -> Result<CheckpointAttestationStatus, GovernanceError> {
+        // SingleAdmin: cosignatures should be empty, always FullyAttested with admin signature
+        if cosignatures.is_empty() {
+            Ok(CheckpointAttestationStatus::FullyAttested)
+        } else {
+            Err(GovernanceError::NotEligible(format!(
+                "SingleAdmin checkpoints must have empty cosignatures, found {}",
+                cosignatures.len()
+            )))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Conflict Detection
+// ---------------------------------------------------------------------------
+
+/// Detects if two governance actions conflict with each other (ADR-031 §7).
+///
+/// Two approved proposals are considered conflicting if they cannot both be
+/// executed without creating an inconsistent context state. This function
+/// implements the conflict detection rules from ADR-031 section 7.
+///
+/// # Conflict types detected:
+/// - Mutual `RemoveMember` proposals (each targeting the other's proposer)
+/// - Competing `ChangeRole` proposals for the same DID with different roles
+/// - Competing `ModifyCeiling` proposals with different ceiling sets
+/// - `RemoveMember` + `ChangeRole` for the same DID
+/// - `RevokeReadAccess` + `RestoreReadAccess` for the same DID
+/// - `RevokeWriteAccess` + `RestoreWriteAccess` for the same DID
+/// - Multiple `RevokeReadAccess` for same DID with different scopes
+/// - Multiple `RevokeWriteAccess` for same DID with different scopes
+///
+/// # Arguments
+/// * `action_a` - The first governance action
+/// * `proposer_a` - The DID of the proposer of action_a
+/// * `action_b` - The second governance action
+/// * `proposer_b` - The DID of the proposer of action_b
+///
+/// # Returns
+/// `true` if the actions conflict, `false` otherwise.
+pub fn actions_conflict(
+    action_a: &GovernanceAction,
+    proposer_a: &DID,
+    action_b: &GovernanceAction,
+    proposer_b: &DID,
+) -> bool {
+    use GovernanceAction::*;
+
+    match (action_a, action_b) {
+        // Mutual RemoveMember (each targeting the other's proposer)
+        (RemoveMember { did: target_a, .. }, RemoveMember { did: target_b, .. }) => {
+            target_a == proposer_b && target_b == proposer_a
+        }
+
+        // Competing ChangeRole proposals for the same DID with different roles
+        (
+            ChangeRole {
+                did: did_a,
+                new_role: role_a,
+            },
+            ChangeRole {
+                did: did_b,
+                new_role: role_b,
+            },
+        ) => did_a == did_b && role_a != role_b,
+
+        // Competing ModifyCeiling proposals with different ceiling sets
+        (
+            ModifyCeiling {
+                new_ceiling: ceiling_a,
+            },
+            ModifyCeiling {
+                new_ceiling: ceiling_b,
+            },
+        ) => ceiling_a != ceiling_b,
+
+        // RemoveMember + ChangeRole for the same DID
+        (RemoveMember { did: did_a, .. }, ChangeRole { did: did_b, .. })
+        | (ChangeRole { did: did_a, .. }, RemoveMember { did: did_b, .. }) => did_a == did_b,
+
+        // RevokeReadAccess + RestoreReadAccess for the same DID (mutually contradictory)
+        (RevokeReadAccess { did: did_a, .. }, RestoreReadAccess { did: did_b })
+        | (RestoreReadAccess { did: did_a }, RevokeReadAccess { did: did_b, .. }) => did_a == did_b,
+
+        // RevokeWriteAccess + RestoreWriteAccess for the same DID (mutually contradictory)
+        (RevokeWriteAccess { did: did_a, .. }, RestoreWriteAccess { did: did_b })
+        | (RestoreWriteAccess { did: did_a }, RevokeWriteAccess { did: did_b, .. }) => {
+            did_a == did_b
+        }
+
+        // Two RevokeReadAccess for same DID with different scopes
+        (
+            RevokeReadAccess {
+                did: did_a,
+                scope: scope_a,
+            },
+            RevokeReadAccess {
+                did: did_b,
+                scope: scope_b,
+            },
+        ) => did_a == did_b && scope_a != scope_b,
+
+        // Two RevokeWriteAccess for same DID with different scopes
+        (
+            RevokeWriteAccess {
+                did: did_a,
+                scope: scope_a,
+            },
+            RevokeWriteAccess {
+                did: did_b,
+                scope: scope_b,
+            },
+        ) => did_a == did_b && scope_a != scope_b,
+
+        // All other combinations are not conflicting
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1416,6 +1652,9 @@ impl GovernanceEngine for SingleAdminEngine {
     clippy::doc_markdown
 )]
 mod tests {
+    use super::majority::MajorityVoteEngine;
+    use super::multisig::ThresholdEngine;
+    use super::unanimity::UnanimityEngine;
     use super::*;
 
     fn alice() -> DID {
@@ -1444,21 +1683,30 @@ mod tests {
         ed25519_dalek::SigningKey::from_bytes(&[2u8; 32])
     }
 
+    /// Returns the signing key for the given seed byte (deterministic).
+    fn sk_for(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// Signs `data` with the signing key seeded by `seed` and returns the
+    /// signature bytes as a `Vec<u8>`.
+    fn sign_with(seed: u8, data: &[u8]) -> Vec<u8> {
+        use ed25519_dalek::Signer;
+        sk_for(seed).sign(data).to_bytes().to_vec()
+    }
+
     /// Mock key resolver that maps test DIDs to their corresponding signing
-    /// key's verifying key. Alice -> [1u8;32], Bob -> [2u8;32].
+    /// key's verifying key. Alice -> [1u8;32], Bob -> [2u8;32], etc.
     fn mock_resolver() -> KeyResolver {
         Arc::new(|did: &DID| {
             let did_str: &str = did.as_ref();
             match did_str {
-                "did:dht:z6MkAlice" => {
-                    Some(ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]).verifying_key())
-                }
-                "did:dht:z6MkBob" => {
-                    Some(ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]).verifying_key())
-                }
-                "did:dht:z6MkCarol" => {
-                    Some(ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]).verifying_key())
-                }
+                "did:dht:z6MkAlice" => Some(sk_for(1).verifying_key()),
+                "did:dht:z6MkBob" => Some(sk_for(2).verifying_key()),
+                "did:dht:z6MkCarol" => Some(sk_for(3).verifying_key()),
+                "did:dht:z6MkCharlie" => Some(sk_for(4).verifying_key()),
+                "did:dht:z6MkDavid" => Some(sk_for(5).verifying_key()),
+                "did:dht:z6MkEve" => Some(sk_for(6).verifying_key()),
                 _ => None,
             }
         })
@@ -1600,8 +1848,6 @@ mod tests {
 
     /// Core governance actions (membership, tools, settings, access control).
     fn governance_actions_core() -> Vec<GovernanceAction> {
-        
-
         vec![
             GovernanceAction::AddMember {
                 did: bob(),
@@ -1628,6 +1874,8 @@ mod tests {
                     test_vectors: vec![],
                     operator_did: "did:dht:z6MkTestOperator".into(),
                     economic_metadata: None,
+                    registered_at: 0,
+                    signature: Vec::new(),
                 }),
             },
             GovernanceAction::RemoveTool {
@@ -2182,6 +2430,8 @@ mod tests {
                     test_vectors: vec![],
                     operator_did: "did:dht:z6MkTestOperator".into(),
                     economic_metadata: None,
+                    registered_at: 0,
+                    signature: Vec::new(),
                 }),
             },
             GovernanceAction::RemoveTool {
@@ -2865,5 +3115,238 @@ mod tests {
         let (proposal, events) = engine.propose(&admin, action, &ctx, &sk).unwrap();
         assert_eq!(proposal.status, ProposalStatus::Approved);
         assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn single_admin_checkpoint_cosignature_requirements() {
+        let admin = alice();
+        let engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
+
+        let (required_signers, minimum_count) = engine.checkpoint_cosignature_requirements();
+        assert_eq!(required_signers.len(), 0);
+        assert_eq!(minimum_count, 0);
+    }
+
+    #[test]
+    fn single_admin_checkpoint_empty_cosignatures() {
+        let admin = alice();
+        let engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
+
+        let checkpoint_hash = [0u8; 32];
+        let cosignatures = vec![];
+
+        let status = engine
+            .validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash)
+            .unwrap();
+        assert_eq!(status, CheckpointAttestationStatus::FullyAttested);
+    }
+
+    #[test]
+    fn single_admin_checkpoint_rejects_cosignatures() {
+        let admin = alice();
+        let engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
+
+        let checkpoint_hash = [0u8; 32];
+        let cosignatures = vec![CosignedCheckpoint {
+            signer_did: bob(),
+            signature: vec![0u8; 64],
+        }];
+
+        let result = engine.validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            GovernanceError::NotEligible(msg) => {
+                assert!(msg.contains("SingleAdmin checkpoints must have empty cosignatures"));
+            }
+            _ => panic!("Expected InvalidSigner error"),
+        }
+    }
+
+    #[test]
+    fn threshold_checkpoint_cosignature_requirements() {
+        let signers = vec![alice(), bob(), charlie()];
+        let threshold = 2;
+        let engine =
+            ThresholdEngine::new(signers.clone(), threshold, 86_400, mock_resolver()).unwrap();
+
+        let (required_signers, minimum_count) = engine.checkpoint_cosignature_requirements();
+        assert_eq!(required_signers, signers);
+        assert_eq!(minimum_count, 2);
+    }
+
+    #[test]
+    fn threshold_checkpoint_fully_attested() {
+        let signers = vec![alice(), bob(), charlie()];
+        let threshold = 2;
+        let engine = ThresholdEngine::new(signers, threshold, 86_400, mock_resolver()).unwrap();
+
+        let checkpoint_hash = [1u8; 32];
+        let cosignatures = vec![
+            CosignedCheckpoint {
+                signer_did: alice(),
+                signature: sign_with(1, &checkpoint_hash),
+            },
+            CosignedCheckpoint {
+                signer_did: bob(),
+                signature: sign_with(2, &checkpoint_hash),
+            },
+        ];
+
+        let status = engine
+            .validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash)
+            .unwrap();
+        assert_eq!(status, CheckpointAttestationStatus::FullyAttested);
+    }
+
+    #[test]
+    fn threshold_checkpoint_partially_attested() {
+        let signers = vec![alice(), bob(), charlie()];
+        let threshold = 2;
+        let engine = ThresholdEngine::new(signers, threshold, 86_400, mock_resolver()).unwrap();
+
+        let checkpoint_hash = [1u8; 32];
+        let cosignatures = vec![CosignedCheckpoint {
+            signer_did: alice(),
+            signature: sign_with(1, &checkpoint_hash),
+        }];
+
+        let status = engine
+            .validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash)
+            .unwrap();
+        assert_eq!(status, CheckpointAttestationStatus::PartiallyAttested);
+    }
+
+    #[test]
+    fn majority_checkpoint_cosignature_requirements() {
+        let voters = vec![alice(), bob(), charlie(), david(), eve()]; // 5 voters
+        let engine =
+            MajorityVoteEngine::new(voters.clone(), 86_400, 5000, mock_resolver()).unwrap();
+
+        let (required_signers, minimum_count) = engine.checkpoint_cosignature_requirements();
+        assert_eq!(required_signers, voters);
+        assert_eq!(minimum_count, 3); // (5 / 2) + 1 = 3
+    }
+
+    #[test]
+    fn majority_checkpoint_fully_attested() {
+        let voters = vec![alice(), bob(), charlie(), david(), eve()];
+        let engine = MajorityVoteEngine::new(voters, 86_400, 5000, mock_resolver()).unwrap();
+
+        let checkpoint_hash = [1u8; 32];
+        let cosignatures = vec![
+            CosignedCheckpoint {
+                signer_did: alice(),
+                signature: sign_with(1, &checkpoint_hash),
+            },
+            CosignedCheckpoint {
+                signer_did: bob(),
+                signature: sign_with(2, &checkpoint_hash),
+            },
+            CosignedCheckpoint {
+                signer_did: charlie(),
+                signature: sign_with(4, &checkpoint_hash), // charlie = seed 4
+            },
+        ];
+
+        let status = engine
+            .validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash)
+            .unwrap();
+        assert_eq!(status, CheckpointAttestationStatus::FullyAttested);
+    }
+
+    #[test]
+    fn majority_checkpoint_partially_attested() {
+        let voters = vec![alice(), bob(), charlie(), david(), eve()];
+        let engine = MajorityVoteEngine::new(voters, 86_400, 5000, mock_resolver()).unwrap();
+
+        let checkpoint_hash = [1u8; 32];
+        let cosignatures = vec![
+            CosignedCheckpoint {
+                signer_did: alice(),
+                signature: sign_with(1, &checkpoint_hash),
+            },
+            CosignedCheckpoint {
+                signer_did: bob(),
+                signature: sign_with(2, &checkpoint_hash),
+            },
+        ];
+
+        let status = engine
+            .validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash)
+            .unwrap();
+        assert_eq!(status, CheckpointAttestationStatus::PartiallyAttested);
+    }
+
+    #[test]
+    fn unanimity_checkpoint_cosignature_requirements() {
+        let voters = vec![alice(), bob(), charlie()];
+        let engine = UnanimityEngine::new(voters.clone(), 172_800, mock_resolver()).unwrap();
+
+        let (required_signers, minimum_count) = engine.checkpoint_cosignature_requirements();
+        assert_eq!(required_signers, voters);
+        assert_eq!(minimum_count, 3); // All voters
+    }
+
+    #[test]
+    fn unanimity_checkpoint_fully_attested() {
+        let voters = vec![alice(), bob(), charlie()];
+        let engine = UnanimityEngine::new(voters, 172_800, mock_resolver()).unwrap();
+
+        let checkpoint_hash = [1u8; 32];
+        let cosignatures = vec![
+            CosignedCheckpoint {
+                signer_did: alice(),
+                signature: sign_with(1, &checkpoint_hash),
+            },
+            CosignedCheckpoint {
+                signer_did: bob(),
+                signature: sign_with(2, &checkpoint_hash),
+            },
+            CosignedCheckpoint {
+                signer_did: charlie(),
+                signature: sign_with(4, &checkpoint_hash), // charlie = seed 4
+            },
+        ];
+
+        let status = engine
+            .validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash)
+            .unwrap();
+        assert_eq!(status, CheckpointAttestationStatus::FullyAttested);
+    }
+
+    #[test]
+    fn unanimity_checkpoint_partially_attested() {
+        let voters = vec![alice(), bob(), charlie()];
+        let engine = UnanimityEngine::new(voters, 172_800, mock_resolver()).unwrap();
+
+        let checkpoint_hash = [1u8; 32];
+        let cosignatures = vec![
+            CosignedCheckpoint {
+                signer_did: alice(),
+                signature: sign_with(1, &checkpoint_hash),
+            },
+            CosignedCheckpoint {
+                signer_did: bob(),
+                signature: sign_with(2, &checkpoint_hash),
+            },
+            // Missing charlie() - not unanimous
+        ];
+
+        let status = engine
+            .validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash)
+            .unwrap();
+        assert_eq!(status, CheckpointAttestationStatus::PartiallyAttested);
+    }
+
+    fn charlie() -> DID {
+        DID::from("did:dht:z6MkCharlie")
+    }
+
+    fn david() -> DID {
+        DID::from("did:dht:z6MkDavid")
+    }
+
+    fn eve() -> DID {
+        DID::from("did:dht:z6MkEve")
     }
 }

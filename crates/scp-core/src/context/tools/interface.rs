@@ -23,7 +23,9 @@ use super::registry::ToolRegistry;
 use super::{DID, ToolError, ToolId, has_admin_role};
 use crate::context::ContextHandle;
 use crate::context::roles::ContextRoleState;
-use crate::provenance::attach::DEFAULT_MAX_CHAIN_DEPTH;
+use crate::provenance::attach::{
+    DEFAULT_MAX_CHAIN_DEPTH, PROTOCOL_HARD_MAX_CHAIN_DEPTH, effective_max_chain_depth,
+};
 
 // ---------------------------------------------------------------------------
 // ContextId
@@ -509,6 +511,8 @@ mod tests {
             test_vectors: vec![],
             operator_did: "did:dht:z6MkOperator".into(),
             economic_metadata: None,
+            registered_at: 0,
+            signature: Vec::new(),
         };
         register_tool(&mut registry, role_state, registration, registrant_did).unwrap();
         registry

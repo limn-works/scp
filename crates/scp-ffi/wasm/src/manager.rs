@@ -177,8 +177,8 @@ pub enum WasmContextEvent {
         sequence_number: u64,
         payload_base64: String,
     },
-    AuthorBlocked {
-        author_did: String,
+    WriteAccessRevoked {
+        did: String,
     },
     SystemClose {
         initiator_did: String,
@@ -266,6 +266,9 @@ struct PerContextState {
     economic_policy: Option<String>,
     /// Tool registry.
     tool_registry: ToolRegistry,
+    /// Registered tool handlers keyed by tool ID.
+    tool_handlers:
+        HashMap<String, Box<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String>>>,
     /// Event log (Merkle tree).
     event_log: WasmEventLog,
     /// UCAN revocation set (token CIDs).
@@ -280,6 +283,10 @@ struct PerContextState {
     executed_proposals: HashSet<String>,
     /// Write-revoked member DIDs (§9.17, ADR-038).
     write_revoked_members: HashSet<String>,
+    /// Read-revoked member DIDs (ADR-038, §9.17).
+    read_revoked_members: HashSet<String>,
+    /// Members excluded from future CEK wrapping (FutureOnly read revocation).
+    read_exclusion_list: HashSet<String>,
     /// Broadcast context state (only for Broadcast mode).
     broadcast: Option<BroadcastState>,
     /// Stateful tool sessions (spec section 6.2.1).
@@ -483,6 +490,7 @@ impl WasmContextManager {
             governance,
             economic_policy,
             tool_registry: ToolRegistry::new(),
+            tool_handlers: HashMap::new(),
             event_log: WasmEventLog::new(context_id.to_owned()),
             revoked_tokens: HashSet::new(),
             seen_nonces: HashSet::new(),
@@ -490,6 +498,8 @@ impl WasmContextManager {
             event_buffer: Vec::new(),
             executed_proposals: HashSet::new(),
             write_revoked_members: HashSet::new(),
+            read_revoked_members: HashSet::new(),
+            read_exclusion_list: HashSet::new(),
             broadcast,
             sessions: HashMap::new(),
         };
@@ -743,6 +753,36 @@ impl WasmContextManager {
         Ok(tool_id)
     }
 
+    /// Registers a handler function for a tool.
+    ///
+    /// The handler will be called when the tool is invoked. The tool must
+    /// already be registered in the context's tool registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not active or the tool is not found.
+    pub fn register_tool_handler(
+        &mut self,
+        context_id: &str,
+        tool_id: &str,
+        handler: Box<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String>>,
+    ) -> Result<(), ScpWasmError> {
+        let ctx = self.require_active_context_mut(context_id)?;
+
+        if ctx.tool_registry.get(tool_id).is_none() {
+            return Err(ScpWasmError::Tool {
+                message: format!(
+                    "tool '{tool_id}' not found in context '{context_id}' \
+                     -- register the tool before adding a handler"
+                ),
+                code: "SCP-TOOL-6002".to_owned(),
+            });
+        }
+
+        ctx.tool_handlers.insert(tool_id.to_owned(), handler);
+        Ok(())
+    }
+
     /// Invokes a tool. Validates the tool exists, validates input against schema,
     /// and returns a JSON result.
     ///
@@ -775,14 +815,30 @@ impl WasmContextManager {
             }
         })?;
 
-        // Tool invocation — in the WASM bridge, tools are JS callbacks.
-        // The bridge returns a validated status response; the TypeScript SDK
-        // is responsible for dispatching to the actual tool handler.
-        let result = serde_json::json!({
-            "tool_id": tool_id,
-            "status": "validated",
-            "input": input_json,
-        });
+        let output_schema = registration.output_schema.clone();
+
+        // Dispatch to registered handler if available.
+        let result = if let Some(handler) = ctx.tool_handlers.get(tool_id) {
+            let out = handler(input_json.clone()).map_err(|e| ScpWasmError::Tool {
+                message: format!("tool handler for '{tool_id}' failed: {e}"),
+                code: "SCP-TOOL-6002".to_owned(),
+            })?;
+
+            validate_value_against_schema(&out, &output_schema).map_err(|msg| {
+                ScpWasmError::Tool {
+                    message: format!("output validation failed for tool '{tool_id}': {msg}"),
+                    code: "SCP-TOOL-6002".to_owned(),
+                }
+            })?;
+
+            out
+        } else {
+            serde_json::json!({
+                "tool_id": tool_id,
+                "status": "validated",
+                "input": input_json,
+            })
+        };
 
         let leaf_hash = compute_event_hash("ToolInvoked", context_id);
         ctx.event_log.append_leaf(leaf_hash);
@@ -863,25 +919,54 @@ impl WasmContextManager {
             });
         }
 
-        // Validate tool exists in target.
-        if target.tool_registry.get(tool_id).is_none() {
-            return Err(ScpWasmError::Tool {
+        // Validate tool exists in target and validate input.
+        let registration = target
+            .tool_registry
+            .get(tool_id)
+            .ok_or_else(|| ScpWasmError::Tool {
                 message: format!(
                     "tool '{tool_id}' not found in target context '{target_context_id}'"
                 ),
                 code: "SCP-TOOL-6003".to_owned(),
-            });
-        }
+            })?;
 
-        Ok(serde_json::json!({
-            "tool": tool_id,
-            "source_context": source_context_id,
-            "target_context": target_context_id,
-            "status": "validated",
-            "chain_depth": chain_depth,
-            "invoker_did": invoker_did,
-            "validated_input": input,
-        }))
+        validate_value_against_schema(input, &registration.input_schema).map_err(|e| {
+            ScpWasmError::Tool {
+                message: format!("input validation failed: {e}"),
+                code: "SCP-TOOL-6002".to_owned(),
+            }
+        })?;
+
+        let output_schema = registration.output_schema.clone();
+
+        // Dispatch to handler or echo mode.
+        let result = if let Some(handler) = target.tool_handlers.get(tool_id) {
+            let out = handler(input.clone()).map_err(|e| ScpWasmError::Tool {
+                message: format!("cross-context tool handler for '{tool_id}' failed: {e}"),
+                code: "SCP-TOOL-6002".to_owned(),
+            })?;
+
+            validate_value_against_schema(&out, &output_schema).map_err(|msg| {
+                ScpWasmError::Tool {
+                    message: format!("output validation failed for tool '{tool_id}': {msg}"),
+                    code: "SCP-TOOL-6002".to_owned(),
+                }
+            })?;
+
+            out
+        } else {
+            serde_json::json!({
+                "tool": tool_id,
+                "source_context": source_context_id,
+                "target_context": target_context_id,
+                "status": "validated",
+                "chain_depth": chain_depth,
+                "invoker_did": invoker_did,
+                "validated_input": input,
+            })
+        };
+
+        Ok(result)
     }
 
     // -----------------------------------------------------------------------
@@ -967,21 +1052,45 @@ impl WasmContextManager {
         }
 
         let tool_id = session.tool_id.clone();
+        let current_state = session.state.clone();
         let call_count = session.call_count;
 
-        // Increment call count.
+        // Validate input against tool's input schema if tool is registered.
+        if let Some(registration) = ctx.tool_registry.get(&tool_id) {
+            validate_value_against_schema(input, &registration.input_schema).map_err(|e| {
+                ScpWasmError::Tool {
+                    message: format!("input validation failed: {e}"),
+                    code: "SCP-TOOL-6002".to_owned(),
+                }
+            })?;
+        }
+
+        // Execute via handler or echo mode.
+        let (new_state, output) = if let Some(handler) = ctx.tool_handlers.get(&tool_id) {
+            let out = handler(input.clone()).map_err(|e| ScpWasmError::Tool {
+                message: format!("tool handler for '{tool_id}' failed: {e}"),
+                code: "SCP-TOOL-6002".to_owned(),
+            })?;
+            (current_state, out)
+        } else {
+            let out = serde_json::json!({
+                "tool": tool_id,
+                "session_id": session_id,
+                "status": "validated",
+                "call_count": call_count + 1,
+                "invoker_did": invoker_did,
+                "validated_input": input,
+            });
+            (current_state, out)
+        };
+
+        // Update session state and increment call count.
         if let Some(s) = ctx.sessions.get_mut(session_id) {
+            s.state = new_state;
             s.call_count = s.call_count.saturating_add(1);
         }
 
-        Ok(serde_json::json!({
-            "tool": tool_id,
-            "session_id": session_id,
-            "status": "validated",
-            "call_count": call_count + 1,
-            "invoker_did": invoker_did,
-            "validated_input": input,
-        }))
+        Ok(output)
     }
 
     /// Closes a stateful tool session.
@@ -1342,47 +1451,47 @@ impl WasmContextManager {
             }
             WasmGovernanceAction::RestoreWriteAccess { did } => {
                 let ctx = self.require_active_context_mut(context_id)?;
-                ctx.write_revoked_members.remove(did);
+                if !ctx.write_revoked_members.remove(did) {
+                    return Err(ScpWasmError::Context {
+                        message: format!("write access not revoked for {did}"),
+                        code: "SCP-CTX-2001".to_owned(),
+                    });
+                }
                 Ok(serde_json::json!({"action": "RestoreWriteAccess", "did": did}))
             }
             WasmGovernanceAction::BlockAuthor { did } => {
+                // CAC-008: BlockAuthor delegates to RevokeWriteAccess(Full).
+                // Destroy the author's broadcast key and mark write-revoked.
                 let ctx = self.require_active_context_mut(context_id)?;
-                let bc = ctx
-                    .broadcast
-                    .as_mut()
-                    .ok_or_else(|| ScpWasmError::Context {
-                        message: "not a broadcast context".to_owned(),
-                        code: "SCP-CTX-2001".to_owned(),
-                    })?;
-                bc.authors.remove(did);
-                ctx.event_buffer.push(WasmContextEvent::AuthorBlocked {
-                    author_did: did.clone(),
-                });
-                Ok(serde_json::json!({"action": "BlockAuthor", "did": did}))
+                if let Some(ref mut bc) = ctx.broadcast {
+                    bc.authors.remove(did);
+                }
+                ctx.write_revoked_members.insert(did.clone());
+                ctx.event_buffer
+                    .push(WasmContextEvent::WriteAccessRevoked { did: did.clone() });
+                Ok(serde_json::json!({"action": "WriteAccessRevoked", "did": did, "scope": "Full"}))
             }
             WasmGovernanceAction::RevokeReadAccess { did } => {
                 let ctx = self.require_active_context_mut(context_id)?;
-                let bc = ctx
-                    .broadcast
-                    .as_mut()
-                    .ok_or_else(|| ScpWasmError::Context {
-                        message: "not a broadcast context".to_owned(),
-                        code: "SCP-CTX-2001".to_owned(),
-                    })?;
-                bc.subscribers.remove(did);
-                bc.blocked_subscribers.insert(did.clone());
+                ctx.read_revoked_members.insert(did.clone());
+                if let Some(bc) = ctx.broadcast.as_mut() {
+                    bc.subscribers.remove(did);
+                    bc.blocked_subscribers.insert(did.clone());
+                }
                 Ok(serde_json::json!({"action": "RevokeReadAccess", "did": did}))
             }
             WasmGovernanceAction::RestoreReadAccess { did } => {
                 let ctx = self.require_active_context_mut(context_id)?;
-                let bc = ctx
-                    .broadcast
-                    .as_mut()
-                    .ok_or_else(|| ScpWasmError::Context {
-                        message: "not a broadcast context".to_owned(),
+                if !ctx.read_revoked_members.remove(did) {
+                    return Err(ScpWasmError::Context {
+                        message: format!("read access not revoked for {did}"),
                         code: "SCP-CTX-2001".to_owned(),
-                    })?;
-                bc.blocked_subscribers.remove(did);
+                    });
+                }
+                ctx.read_exclusion_list.remove(did);
+                if let Some(bc) = ctx.broadcast.as_mut() {
+                    bc.blocked_subscribers.remove(did);
+                }
                 Ok(serde_json::json!({"action": "RestoreReadAccess", "did": did}))
             }
             _ => {

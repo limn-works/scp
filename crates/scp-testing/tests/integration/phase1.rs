@@ -291,6 +291,7 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
         &bob_pubkey,
         &scp_core::crypto::sender_keys::HandleRequestParams {
             sender_key: &alice_sender_key,
+            context_id: "ctx-1",
             sender_did: &alice_id.did,
             epoch: 1,
             block_list: &block_list,
@@ -306,10 +307,14 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
     // Bob decrypts the response to obtain Alice's sender key.
     let sk_response: scp_core::crypto::sender_keys::SenderKeyResponse =
         rmp_serde::from_slice(&resp_bytes).unwrap();
-    let received_sk =
-        open_sender_key_response(&bob_custody, &req_result.wrapping_key_handle, &sk_response)
-            .await
-            .unwrap();
+    let received_sk = open_sender_key_response(
+        &bob_custody,
+        &req_result.wrapping_key_handle,
+        "ctx-1",
+        &sk_response,
+    )
+    .await
+    .unwrap();
 
     // Verify the key material matches.
     assert_eq!(
@@ -349,6 +354,7 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
             payload: original_msg,
             provenance: None,
             signing_key_id: scp_core::identity::SigningKeyId::Active,
+            version: scp_core::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
         },
         &alice_mls_custody,
         &dummy_handle,

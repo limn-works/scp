@@ -21,15 +21,28 @@ Every capability above must work through at least one SDK binding (Python).
 
 ---
 
-## Current State
+## Current State (updated 2026-03-08)
 
 **What works E2E today:**
 - UCAN pipeline (mint → validate → delegate → revoke)
-- Identity pipeline (create → resolve → rotate) — but only with InMemoryDhtClient
+- Identity pipeline (create → resolve → rotate) with PkarrDhtClient (#310) and InMemoryDhtClient
 - ApplicationNode + relay (HTTP, WebSocket, .well-known)
-- All scp-core subsystems in isolation (envelope, MLS crypto, sender keys, governance, trust, tools, sync, broadcast, bridge)
+- All scp-core subsystems integrated: envelope pipeline (seal/open), MLS crypto (OpenMLS), sender keys, governance (4 engines, 24 actions), trust, tools, sync, broadcast, bridge
+- FFI bridges (PyO3, UniFFI, NAPI, WASM) delegate to ContextManager (#356 resolved via #385-390)
+- Content access control (ADR-038, SCP-CAC-001–010)
+- Governance integration (SCP-267–274)
+- 6 transport adapters (Nostr, WebRTC, CoAP, QUIC, UDP/DTLS, WebTransport)
 
-**What breaks:** Every path that goes through FFI → ContextManager. The FFI bridges maintain parallel state (#356). This blocks message send/receive, governance enforcement, persistence, and MLS integration through any SDK binding.
+**Remaining gaps (14 items):**
+- #302: scp-node still hardcodes InMemory providers
+- #324: MLS max_past_epochs still 0
+- #336: No DHT/relay-based context discovery
+- #342: scp-relay hardcodes in_memory blob storage
+- #347: Deserialization size limits only in sync reorder buffer (not general envelope)
+- #373, #375, #376: Spec gaps (invitation bundle, bucket size, app sandboxing)
+- #392: Apple Secure Enclave custody not started
+- #394: InMemoryKeyCustody not gated behind testing feature
+- #399-401: Sybil resistance (new scope, not started)
 
 ---
 
@@ -375,7 +388,12 @@ SCP-CAC-001 — **COMPLETE** → 7d56fdf
 SCP-CAC-004 — **COMPLETE** → 8c38383
 SCP-CAC-002 — **COMPLETE** → 586e025
 SCP-CAC-005 — **COMPLETE** → 7ede865
-SCP-CAC-003 → SCP-CAC-006 → SCP-CAC-007 → SCP-CAC-008 → SCP-CAC-009 → SCP-CAC-010
+SCP-CAC-003 — **COMPLETE** → abb9873
+SCP-CAC-006 — **COMPLETE** → 44210e41
+SCP-CAC-007 — **COMPLETE** → d2163551
+SCP-CAC-008 — **COMPLETE** → 1d7824c2
+SCP-CAC-009 — **COMPLETE** → 992c8221 (lifecycle tests across context types)
+SCP-CAC-010 — **COMPLETE** → 992c8221 (governance-gated content access tests)
 
 ### Phase 7: Governance Integration (depends on Phase 2 + Phase 5)
 
@@ -387,74 +405,101 @@ SCP-267 → SCP-268 → SCP-269 → SCP-270 → SCP-271 → SCP-272 → SCP-273 
 - SCP-269 — **COMPLETE** → a758149
 - SCP-270 — **COMPLETE** → 6a5cea5
 - SCP-271 — **COMPLETE** → 6ae5dc2
+- SCP-272 — **COMPLETE** → 09b0d838 + c5a3165f (conflict detection + vote submission wiring)
+- SCP-273 — **COMPLETE** → 2df9cd8b + 6ff7c953 (checkpoint cosignatures)
+- SCP-274 — **COMPLETE** → d0e0cf69 (governance integration tests, 49 tests)
+- Compilation fixes → c23f0601 (36+ errors from SCP-272/273 merge)
 - SCP-267–268 need #356 (ContextManager wiring)
 - SCP-269–270 need #320 (GovernanceModel enum expansion + proposal lifecycle — all 24 actions already dispatched per PR #296)
 - SCP-272 needs #354 (conflict detection)
 - SCP-273 needs #330 (provenance/checkpoint fields)
 
-### Phase 8: Feature Completions (parallel, depends on Phase 5)
+### Phase 8: Feature Completions (parallel, depends on Phase 5) — MOSTLY COMPLETE
 
-**Lane A:** SCP-227 (subscriber registration — in-progress). Note: #335 closed by Phase 5 bridge rewrites.
-**Lane B:** #337 — **COMPLETE** → 9180dd5. #334 remaining.
+**Lane A:** SCP-227 — **COMPLETE** (subscriber registration, blocking, integration — multiple commits). #335 closed by Phase 5 bridge rewrites.
+**Lane B:** #337 — **COMPLETE** → 9180dd5. #334 — **COMPLETE** → f78ceb4b (economic governance, spending UCANs).
 **Lane C:** #318 — **COMPLETE** → 91317fc. #330 — **COMPLETE** → 032cb41.
-**Lane D:** #316, #323 (identity features — decomposed: #391 file custody → #392+#393+#394 parallel)
-**Lane E:** #302 — **COMPLETE** → bf53ec5. #305 — **COMPLETE** → 1dc533b. #342 — **COMPLETE** → 254ed89.
+**Lane D:** #316 (compromise recovery) — **COMPLETE** → b225bd12 + de42d1f3 (RecoveryBackend trait, CompromiseRecoveryOrchestrator). #323 (platform key custody) — **COMPLETE** (FileKeyCustody with Argon2id+AES). #391 (FileKeyCustody) — **COMPLETE**. #392 (Apple Secure Enclave) — **NOT STARTED**. #393 (Android Keystore) — **COMPLETE** (AndroidKeyCustody.kt with TEE Ed25519).
+**Lane E:** #302 — **NOT COMPLETE** (scp-node still hardcodes InMemoryKeyCustody, InMemoryDhtClient, InMemoryStorage). #305 — **COMPLETE** → 1dc533b (ACME key_auth fixed on worktree). #342 — **NOT COMPLETE** (relay still hardcodes BlobStorageBackend::in_memory()).
 
-### Phase 9: SDK Bindings (depends on Phase 5)
+### Phase 9: SDK Bindings (depends on Phase 5) — COMPLETE
 
-**Lane A:** #306, SCP-218 (WASM bridge wiring) → #341 (TypeScript SDK) — **COMPLETE** → 2acbece6, 167b2cf2, eff26979
-**Lane B:** #307, SCP-220, SCP-221 (UniFFI bridge + Swift wiring) → #331 (Swift Trust/MCP) — **COMPLETE** → 95146b16, a9b57ede (MCP UniFFI exports pending upstream)
-**Lane C:** SCP-214 (KeyCustodyProvider callbacks across all FFI bridges) — needs #386/#387/#388/#389 (bridge rewrites)
-**Lane D:** #322 (cross-context tool interfaces) — **COMPLETE** → 07ebffaa
-**Lane E:** SCP-215 (error code range audit — independent) — **COMPLETE** (prior iteration)
-**Lane F:** #304 (Go/Java/C#) — **COMPLETE** → edb7f790
-**Lane G:** SCP-116 → SCP-117 → SCP-118 → SCP-120 (Kotlin SDK completion) — **COMPLETE** (prior iterations)
+**Lane A:** #306, SCP-218 — **COMPLETE** → 2acbece6, 167b2cf2 (WASM bridge wiring). #341 — **COMPLETE** → eff26979 (TypeScript SDK).
+**Lane B:** #307, SCP-220 — **COMPLETE** → 95146b16. SCP-221 — **COMPLETE** → a9b57ede. #331 — **COMPLETE** → 41d2d399 (NAPI MCP bridge).
+**Lane C:** SCP-214 — **COMPLETE** → 56265427 (UniFFI/NAPI KeyCustodyProvider) + PyO3 already wired via identity registry.
+**Lane D:** #322 — **COMPLETE** → 07ebffaa (cross-context tool interfaces + stateful sessions).
+**Lane E:** SCP-215 — **COMPLETE** (error code audit, PR #308).
+**Lane F:** #304 — **COMPLETE** → edb7f790 (Go/Java/C# scaffolding removed per reduced scope).
+**Lane G:** SCP-116 → SCP-117 → SCP-118 → SCP-120 — DEFERRED (Kotlin SDK completion, lower priority).
 
-### Phase 10: New Features (partially blocked by spec)
+### Phase 10: New Features — MOSTLY COMPLETE
 
-**Lane A:** SCP-ACR-001 — **COMPLETE** → ad83cef. SCP-ACR-002 — **COMPLETE** → 5b26f18. SCP-ACR-003–007 remaining
-**Lane B:** SCP-BCH-001–013 (bridge cooperative + credentials + sender key encryption) — **BLOCKED by S-D** (bridge MLS model)
-**Lane C:** SCP-BA-001–006 (participation admission) — **soft-blocked by S-A** (canonical serialization for profiles)
-**Lane D:** #362, #363, #364, #365, #366, #367
-**Lane E:** SCP-038 (PyO3 identity bridge — in-progress), SCP-092 (signaling — in-progress, #290 done)
+**Lane A:** SCP-ACR-001 — **COMPLETE** → ad83cef. SCP-ACR-002 — **COMPLETE** → 5b26f18. SCP-ACR-003 — **COMPLETE**. SCP-ACR-004 — **COMPLETE**. SCP-ACR-005 — **COMPLETE** → d99f7860. SCP-ACR-006 — **COMPLETE**. SCP-ACR-007 — **COMPLETE**.
+**Lane B:** SCP-BCH-001 — **COMPLETE**. BCH-002 — **COMPLETE**. BCH-003 — **COMPLETE** → 73b5ed70. BCH-004 — **COMPLETE**. BCH-005 — **COMPLETE** → 73b5ed70. BCH-006 — **COMPLETE** → 73b5ed70. BCH-007 — **COMPLETE** → 1629dd2c. BCH-008 — **COMPLETE**. BCH-009 — **COMPLETE** → a6558a5d. BCH-010 — **COMPLETE**. BCH-011 — **COMPLETE**. BCH-012 — **COMPLETE** → f468fc35. BCH-013 — **COMPLETE**.
+**Lane C:** SCP-BA-001 — **COMPLETE**. BA-002 — **COMPLETE**. BA-003 — **COMPLETE** → 074c90af. BA-004 — **COMPLETE**. BA-005 — **COMPLETE** → 9e86eacb. BA-006 — **COMPLETE** → 4605d808.
+**Lane D:** #362 — **COMPLETE** → 7d3a3a9c. #363 — **COMPLETE** → eb5c8276. #364 — **COMPLETE** (212 tests). #365 — **COMPLETE** → 61a4cdc7. #366 — **COMPLETE**. #367 — **COMPLETE** → a7def106.
+**Lane E:** SCP-038 — **COMPLETE** (PyO3 identity bridge — all 5 functions in scp-ffi/src/identity.rs). SCP-092 — **COMPLETE** (signaling — 521-line signaling.rs with 8 tests in scp-media).
 
-### Phase 11: Spec Audit NEW HIGHs (parallel with Phase 8+)
+### Phase 11: Spec Audit NEW HIGHs (parallel with Phase 8+) — COMPLETE
 
-Spec-only fixes for the 37 NEW HIGH findings. Grouped by topic:
+All 37 original H-01 through H-37 findings resolved. Additional ~61 HIGH findings from cross-reference audit also addressed (6 lanes, all committed on feat/phase-11-spec).
 
-**Lane H-A** — Identity spec gaps (H-01 through H-06)
-- Key custody migration, private state event log, routing_id, earned capacity, KeyPackage signing key, Merkle hash chain
+Spec-only changes in .docs/specs/. Content_hash confirmation oracle fix, registry centralization fix, bridge credential encryption, pseudonym derivation privacy fix, event log pruning, and 55+ more.
 
-**Lane H-B** — Context spec gaps (H-07 through H-12)
-- Creation failure states, metadata signing, multi-parent matching, group_context extension, TOCTOU, context migration
+Phase 11 spec→code gap audit COMPLETE — found 3 CRITICAL, 25 HIGH, 19 MEDIUM gaps. All being fixed in parallel (10 agents dispatched).
 
-**Lane H-C** — Trust spec gaps (H-13 through H-18)
-- Chain depth contradiction, self-service auth, proof-of-absence, attestation independence, revocation format, counterparties privacy
+### Phase 13: Spec→Code Gap Fixes (depends on Phase 11) — MOSTLY COMPLETE
 
-**Lane H-D** — Security spec gaps (H-19 through H-26)
-- Equivocation response, chunking, AccessKeyRequest timing, push registration, multi-device sync, media keys, QUIC 0-RTT, UCAN CID
+**CRITICALs (3) — ALL COMPLETE:**
+- C1: Chain depth hard max 3→5 + ContextParams.max_chain_depth — **COMPLETE** → de42d1f3
+- C2: BroadcastEnvelope signature content_hash + provenance_hash — **COMPLETE** → de42d1f3 + 828464d7 (content_hash omitted per ADR-038 confirmation oracle)
+- C3: Merkle tree RFC 6962 hash construction — **COMPLETE** → de42d1f3 (domain-separated leaf/interior hashing)
 
-**Lane H-E** — Versioning spec gaps (H-28 through H-32)
-- Already covered by Phase 0 Lane S-C
+**HIGHs (25) — 22 COMPLETE, 3 REMAINING:**
+- **COMPLETE:** H2-H13, H15-H17, H20, H22-H25 → de42d1f3 + 9fb582ec
+- **REMAINING:**
+  - H14 (metadata record) — no MetadataRecord type exists; requirement unclear
+  - H18 (equivocation alert) — detection via CheckpointComparison::Divergent exists, but no EquivocationAlert struct or notification path
+  - H19 (chunk envelope) — ChunkEnvelope type completely missing, zero code
 
-**Lane H-F** — Bridge spec gaps (H-27, H-33)
-- Bridge metadata in SS5.7, reverse bridge flow
+**MEDIUMs (5):** M3, M7, M15-M17 — **COMPLETE** → 9fb582ec
 
-**Lane H-G** — Sync/provenance spec gaps (H-34 through H-37)
-- Counterparties privacy, EpochGraceStore crash recovery, checkpoint verification, event log reconciliation trust
+**Recovery.rs stub fix** — **COMPLETE** → de42d1f3 (RecoveryBackend trait with 5 methods, CompromiseRecoveryOrchestrator)
 
-### Spec-Code Alignment (parallel with Phase 6+)
+### Spec-Code Alignment (parallel with Phase 6+) — COMPLETE
 
-Wire format and crypto fixes identified by spec review. All are code changes to match prescriptive spec:
+- #395 — **COMPLETE** → 1fe28a47 (HPKE sender key wrapping context binding)
+- #396 — **COMPLETE** → b4b9161c (BroadcastEnvelope nonce + AAD expansion)
+- #397 — **COMPLETE** → 7892b10f + 265c7071 (ResetRequest nonce + anti-replay)
+- #398 — **COMPLETE** → 14ab6b79 (envelope version fields) + 6e924a9d (broadcast signature nonce CRITICAL fix)
+- Envelope versioning also applied to primary: 992c8221 (version fields in all 3 envelope types + canonical hashes)
 
-- #395 — HPKE sender key wrapping: add context_id/sender_did/epoch to info + AAD
-- #396 — BroadcastEnvelope: add top-level nonce field, expand AAD with context_id + sequence
-- #397 — ResetRequest: add nonce field, anti-replay validation (signature + 30s freshness + nonce dedup)
-- #398 — Envelope version field: add `version: u16` to InnerEnvelope, BroadcastEnvelope, OuterEnvelope + canonical hashes
+### Phase 12: Polish — COMPLETE
 
-### Phase 12: Polish
+- #291 — **COMPLETE** → 69cdf557 (stub policy fixes)
+- #301 — **COMPLETE** (node dev API metrics)
+- #303 — **COMPLETE** (event log payload persistence)
+- #343 — **COMPLETE** → 298666cd + 9507d032 (Nostr BIP-340 + WebRTC DataChannelProvider)
+- #344 — **COMPLETE** → 7f45bcb1 (artifact health findings)
 
-#291, #301, #303, #343, #344
+---
+
+## Parallel Loom Execution (2026-03-07)
+
+Four loom sessions running simultaneously on separate branches to maximize throughput.
+File ownership is strictly partitioned to prevent merge conflicts.
+
+| Loom | Branch | Scope | Owned Files |
+|------|--------|-------|-------------|
+| Loom 1 (primary) | `feat/achieve-production-readiness` | Phase 6, Phase 7, #398 | `manager.rs`, `inner.rs`, `broadcast.rs`, `context/` governance |
+| Loom 2 | `feat/phase-9-sdk` | Phase 9 (SDK bindings) | `scp-ffi/`, `bindings/` |
+| Loom 3 | `feat/phase-10-features` | Phase 10 (new features) | PRD story modules, new files |
+| Loom 4 | `feat/phase-11-spec` | Phase 11 (spec audit HIGHs) | `.docs/specs/` only |
+| Loom 5 | `feat/phase-12-polish` | Phase 12 (polish) | misc code, `scp-transport/`, event log |
+| Loom 6 | `feat/spec-code-alignment` | #395, #396, #397 | `key_protocol.rs`, `broadcast.rs`, `sync/` |
+
+**Merge order:** All branches merge into `feat/achieve-production-readiness` after completion.
+**Conflict avoidance:** #398 assigned to Loom 1 (touches same files as Phase 6/7). #395-397 on Loom 6 (no overlap with Loom 1). Phase 11 is spec-only (no code). Phase 12 touches misc files with no overlap.
 
 ---
 

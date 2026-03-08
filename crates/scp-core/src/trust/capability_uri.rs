@@ -335,6 +335,36 @@ fn parse_did_scoped_capability(s: &str) -> Result<CapabilityUri, CapabilityUriEr
     })
 }
 
+impl CapabilityUri {
+    /// Returns `true` if this is a [`Protocol`](Self::Protocol) capability.
+    #[must_use]
+    pub fn is_protocol(&self) -> bool {
+        matches!(self, Self::Protocol { .. })
+    }
+
+    /// Returns `true` if this is a [`DidScoped`](Self::DidScoped) capability.
+    #[must_use]
+    pub fn is_did_scoped(&self) -> bool {
+        matches!(self, Self::DidScoped { .. })
+    }
+
+    /// Returns `true` if this is a [`System`](Self::System) capability.
+    #[must_use]
+    pub fn is_system(&self) -> bool {
+        matches!(self, Self::System { .. })
+    }
+
+    /// Returns the kebab-case name of this capability URI.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Protocol { name, .. } | Self::DidScoped { name, .. } | Self::System { name } => {
+                name
+            }
+        }
+    }
+}
+
 impl fmt::Display for CapabilityUri {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

@@ -278,6 +278,7 @@ async fn test_agent_binding_full_flow() {
 
     let payload = b"Hello from agent!";
     let params = InnerEnvelopeParams {
+        version: scp_core::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
         context_id: "ctx:test-context-001",
         sender_did: &did,
         epoch: 1,

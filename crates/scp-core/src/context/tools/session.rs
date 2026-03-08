@@ -456,6 +456,8 @@ mod tests {
             test_vectors: vec![],
             operator_did: "did:dht:z6MkOperator".into(),
             economic_metadata: None,
+            registered_at: 0,
+            signature: Vec::new(),
         };
         register_tool(&mut registry, role_state, registration, registrant_did).unwrap();
         registry

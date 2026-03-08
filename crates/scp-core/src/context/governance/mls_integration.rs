@@ -590,6 +590,8 @@ mod tests {
                 test_vectors: vec![],
                 operator_did: "did:dht:z6MkTestOperator".into(),
                 economic_metadata: None,
+                registered_at: 0,
+                signature: Vec::new(),
             }),
         };
         assert_eq!(classify_action(&action), MlsImpact::NoMlsChange);
