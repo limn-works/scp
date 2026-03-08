@@ -15,6 +15,7 @@ use std::time::Duration;
 use scp_identity::DID;
 use serde::{Deserialize, Serialize};
 
+use crate::bridge::BridgeMode;
 use crate::economy::EconomicPolicy;
 
 // ---------------------------------------------------------------------------
@@ -343,6 +344,28 @@ pub struct ProjectionPolicy {
 }
 
 // ---------------------------------------------------------------------------
+// BridgeInfo
+// ---------------------------------------------------------------------------
+
+/// Summary of an active bridge connector visible in context metadata.
+///
+/// Bridge presence, operator identity, connected platform, and operating mode
+/// are visible to all context members and in context metadata before opt-in
+/// (spec §12.2, §12.6.1). This is a structural field -- always visible
+/// regardless of `MetadataVisibilityPolicy`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeInfo {
+    /// Unique identifier for this bridge instance.
+    pub bridge_id: String,
+    /// DID of the human operator accountable for this bridge.
+    pub operator_did: DID,
+    /// Name of the external platform (e.g., `"discord"`, `"slack"`).
+    pub platform: String,
+    /// Operating mode of the bridge (Relay, Puppet, Api, Cooperative).
+    pub mode: BridgeMode,
+}
+
+// ---------------------------------------------------------------------------
 // PublicMetadata
 // ---------------------------------------------------------------------------
 
@@ -378,6 +401,13 @@ pub struct PublicMetadata {
     pub memory_scope: MemoryScope,
     /// The visibility policy itself (so prospective members know what's hidden).
     pub metadata_visibility: MetadataVisibilityPolicy,
+    /// Active bridge connectors registered in this context (spec §12.2, §12.6.1).
+    ///
+    /// Bridge presence is always visible in context metadata before opt-in
+    /// (legibility tenet). This is a structural field -- not governed by
+    /// `MetadataVisibilityPolicy`.
+    #[serde(default)]
+    pub bridges: Vec<BridgeInfo>,
 
     // --- Operational fields (governed by MetadataVisibilityPolicy) ---
     /// Current member count. `None` when hidden by `MemberOnly` or unavailable.
@@ -417,6 +447,11 @@ pub struct RuntimeMetadata {
     pub tool_interface_count: Option<u32>,
     /// Child context summary information (e.g., parent context IDs, summaries).
     pub child_context_info: Option<Vec<String>>,
+    /// Active bridge connectors registered in this context (spec §12.2, §12.6.1).
+    ///
+    /// Bridges are a structural metadata field -- always visible before opt-in.
+    /// Defaults to empty when no bridges are registered.
+    pub bridges: Vec<BridgeInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -510,6 +545,17 @@ pub struct ContextParams {
     /// per-author overrides. `None` for non-broadcast contexts.
     #[serde(default)]
     pub projection_policy: Option<ProjectionPolicy>,
+
+    /// Maximum cross-context chain depth for provenance enforcement (spec §24.4).
+    ///
+    /// When `None`, the protocol default of 3 hops applies. The effective limit
+    /// is always clamped to the protocol hard maximum of 5 via
+    /// [`effective_max_chain_depth`](crate::provenance::attach::effective_max_chain_depth).
+    ///
+    /// This bounds the worst-case amplification factor for cross-context tool
+    /// call chains originating from or passing through this context.
+    #[serde(default)]
+    pub max_chain_depth: Option<u8>,
 }
 
 impl Default for ContextParams {
@@ -528,6 +574,7 @@ impl Default for ContextParams {
             economic_policy: None,
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
+            max_chain_depth: None,
         }
     }
 }
@@ -559,6 +606,7 @@ impl ContextParams {
             promotion_policy: self.promotion_policy,
             memory_scope: self.memory_scope,
             metadata_visibility: self.metadata_visibility.clone(),
+            bridges: runtime.bridges.clone(),
 
             // Operational fields — filtered by visibility policy.
             member_count: filter_field(vis.member_count, runtime.member_count),
@@ -653,6 +701,8 @@ mod tests {
                 test_vectors: vec![],
                 operator_did: "did:dht:z6MkTestOperator".into(),
                 economic_metadata: None,
+                registered_at: 0,
+                signature: Vec::new(),
             }],
             ttl: Some(Duration::from_secs(3600)),
             memory_scope: MemoryScope::Full,
@@ -661,6 +711,7 @@ mod tests {
             economic_policy: None,
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
+            max_chain_depth: None,
         };
 
         assert_eq!(params.mode, ContextMode::Broadcast);
@@ -706,6 +757,8 @@ mod tests {
             test_vectors: vec![],
             operator_did: "did:dht:z6MkTestOperator".into(),
             economic_metadata: None,
+            registered_at: 0,
+            signature: Vec::new(),
         };
         let cloned = tool.clone();
         assert_eq!(tool, cloned);
@@ -770,6 +823,7 @@ mod tests {
             economic_policy: None,
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
+            max_chain_depth: None,
         };
 
         let json = serde_json::to_string(&params).ok();
@@ -821,6 +875,7 @@ mod tests {
             }),
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
+            max_chain_depth: None,
         };
 
         let json = serde_json::to_string(&params).unwrap();
@@ -970,6 +1025,7 @@ mod tests {
             description: Some("A test context".to_owned()),
             tool_interface_count: Some(3),
             child_context_info: Some(vec!["child-1".to_owned(), "child-2".to_owned()]),
+            bridges: Vec::new(),
         }
     }
 

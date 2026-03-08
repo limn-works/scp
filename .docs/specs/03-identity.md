@@ -144,11 +144,31 @@ Decryption (per event):
 
 **Storage model.** Same as context state: encrypted blobs stored on your published relays. Relays see "DID X has encrypted private state." Relays store and serve it. Relays cannot read, modify, or interpret it. This is encryption-as-access-control (§10.5) applied to identity rather than context — the same infrastructure, the same relay behavior, the same trust assumptions.
 
+**Routing ID derivation.** Private state blobs are addressed on relays by a deterministic `routing_id` derived via HKDF from the identity's key material:
+
+```
+private_state_routing_id = HKDF-SHA-256(
+    ikm: identity_key_material,
+    salt: SHA-256("scp-private-state-salt-v1"),
+    info: "scp-private-state-v1" || did_string,
+    len: 32
+)
+```
+
+The HKDF derivation (unlike the SHA-256 derivation used for DID document routing IDs in §3.10.2) produces a routing ID that is cryptographically unlinkable to the identity's DID without knowledge of the identity key material. This prevents relays from correlating private state blobs with DID documents or context activity. The salt is a fixed protocol constant (the SHA-256 of the salt domain string) to ensure determinism. The `info` parameter binds the derivation to both the protocol version and the specific DID.
+
 **Sync model.** Append-only event log, same pattern as context event logs. Each device appends events ("blocked DID Y at timestamp T", "granted Bob graph visibility at scope Z"). Any device that holds the PSK reconstructs current state from the log. Multi-device consistency: two phones and a laptop all hold the same PSK, all append to the same log, all converge to the same state. See §3.7.2 for how the PSK is distributed to devices.
 
 Most identity private state operations are naturally commutative — "block X" and "block Y" produce the same result regardless of order. Simultaneous updates from multiple devices resolve without conflict in most cases. The event log records all operations; state is derived from the full log.
 
-**Integrity.** The event log is authenticated (Merkle root or equivalent). If a relay tampers with your private state, you detect it on next read. Single-owner verification is simpler than multi-party — you're the only writer — but the integrity guarantee is the same. The AES-256-GCM authentication tag provides per-event integrity verification: any modification to ciphertext, nonce, or associated data causes tag verification failure.
+**Integrity.** The event log uses a hash chain for tamper detection. Each event's hash incorporates the previous event's hash, creating a chain that detects any insertion, deletion, or modification:
+
+```
+event_hash[0] = SHA-256("SCP-PRIVATE-LOG-V1:" || event_data[0])
+event_hash[i] = SHA-256("SCP-PRIVATE-LOG-V1:" || event_hash[i-1] || event_data[i])
+```
+
+The `"SCP-PRIVATE-LOG-V1:"` domain separator prevents cross-protocol hash confusion. The chain head (most recent hash) serves as the integrity root — any relay tampering with event ordering, content, or completeness is detected by recomputing the chain and comparing against the stored head. Single-owner verification is simpler than multi-party — you're the only writer — but the integrity guarantee is the same. The AES-256-GCM authentication tag provides per-event integrity verification: any modification to ciphertext, nonce, or associated data causes tag verification failure.
 
 **Relationship to context state.** Identity private state is the single-owner degenerate case of context state. Same storage infrastructure. Same integrity model. Same relay interaction. No governance, no roles, no capability ceiling — because it's your data. The protocol doesn't need new infrastructure for this — it's the existing infrastructure with membership count of one and no access control layer (the encryption IS the access control, and only you have the key).
 

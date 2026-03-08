@@ -406,7 +406,7 @@ SCP-267 → SCP-268 → SCP-269 → SCP-270 → SCP-271 → SCP-272 → SCP-273 
 **Lane A:** SCP-227 — **COMPLETE** (subscriber registration, blocking, integration — multiple commits). #335 closed by Phase 5 bridge rewrites.
 **Lane B:** #337 — **COMPLETE** → 9180dd5. #334 — **COMPLETE** → f78ceb4b (economic governance, spending UCANs).
 **Lane C:** #318 — **COMPLETE** → 91317fc. #330 — **COMPLETE** → 032cb41.
-**Lane D:** #316 (compromise recovery) — IN PROGRESS. #323 (platform key custody) — IN PROGRESS.
+**Lane D:** #316 (compromise recovery) — **COMMITTED** → b225bd12 (types complete, backend trait being added). #323 (platform key custody) — **COMPLETE** (3 backends: SQLite, File, Apple Keychain + InMemory for testing).
 **Lane E:** #302 — **COMPLETE** → bf53ec5. #305 — **COMPLETE** → 1dc533b. #342 — **COMPLETE** → 254ed89.
 
 ### Phase 9: SDK Bindings (depends on Phase 5) — COMPLETE
@@ -424,8 +424,8 @@ SCP-267 → SCP-268 → SCP-269 → SCP-270 → SCP-271 → SCP-272 → SCP-273 
 **Lane A:** SCP-ACR-001 — **COMPLETE** → ad83cef. SCP-ACR-002 — **COMPLETE** → 5b26f18. SCP-ACR-003 — **COMPLETE**. SCP-ACR-004 — **COMPLETE**. SCP-ACR-005 — **COMPLETE** → d99f7860. SCP-ACR-006 — **COMPLETE**. SCP-ACR-007 — **COMPLETE**.
 **Lane B:** SCP-BCH-001 — **COMPLETE**. BCH-002 — **COMPLETE**. BCH-003 — **COMPLETE** → 73b5ed70. BCH-004 — **COMPLETE**. BCH-005 — **COMPLETE** → 73b5ed70. BCH-006 — **COMPLETE** → 73b5ed70. BCH-007 — **COMPLETE** → 1629dd2c. BCH-008 — **COMPLETE**. BCH-009 — **COMPLETE** → a6558a5d. BCH-010 — **COMPLETE**. BCH-011 — **COMPLETE**. BCH-012 — **COMPLETE** → f468fc35. BCH-013 — **COMPLETE**.
 **Lane C:** SCP-BA-001 — **COMPLETE**. BA-002 — **COMPLETE**. BA-003 — **COMPLETE** → 074c90af. BA-004 — **COMPLETE**. BA-005 — **COMPLETE** → 9e86eacb. BA-006 — **COMPLETE** → 4605d808.
-**Lane D:** #362 — **COMPLETE** → 7d3a3a9c. #363 — IN PROGRESS. #364 — IN PROGRESS. #365 — **COMPLETE** → 61a4cdc7. #366 — **COMPLETE**. #367 — **COMPLETE** → a7def106.
-**Lane E:** SCP-038 (PyO3 identity bridge) — IN PROGRESS. SCP-092 (signaling) — IN PROGRESS.
+**Lane D:** #362 — **COMPLETE** → 7d3a3a9c. #363 — **COMPLETE** → eb5c8276. #364 — **COMPLETE** (212 tests). #365 — **COMPLETE** → 61a4cdc7. #366 — **COMPLETE**. #367 — **COMPLETE** → a7def106.
+**Lane E:** SCP-038 — **COMPLETE** (PyO3 identity bridge — all 5 functions in scp-ffi/src/identity.rs). SCP-092 — **COMPLETE** (signaling — 521-line signaling.rs with 8 tests in scp-media).
 
 ### Phase 11: Spec Audit NEW HIGHs (parallel with Phase 8+) — COMPLETE
 
@@ -433,7 +433,25 @@ All 37 original H-01 through H-37 findings resolved. Additional ~61 HIGH finding
 
 Spec-only changes in .docs/specs/. Content_hash confirmation oracle fix, registry centralization fix, bridge credential encryption, pseudonym derivation privacy fix, event log pruning, and 55+ more.
 
-Phase 11 spec→code gap audit IN PROGRESS — analyzing whether new spec additions require downstream code changes.
+Phase 11 spec→code gap audit COMPLETE — found 3 CRITICAL, 25 HIGH, 19 MEDIUM gaps. All being fixed in parallel (10 agents dispatched).
+
+### Phase 13: Spec→Code Gap Fixes (depends on Phase 11)
+
+**CRITICALs (3):**
+- C1: Chain depth hard max 3→5 + ContextParams.max_chain_depth — IN PROGRESS
+- C2: BroadcastEnvelope signature content_hash + provenance_hash — IN PROGRESS
+- C3: Merkle tree RFC 6962 hash construction — VERIFYING
+
+**HIGHs (25) — all IN PROGRESS across 8 agents:**
+- H2 (counterparty policy), H3 (bridge metadata), H4 (tool registration fields)
+- H5 (moderator role), H6 (identity link attestation), H7/H8 (challenge structs)
+- H9 (custody migration), H10 (shadow claiming), H11 (private state events)
+- H12/H13 (private state routing/hash), H14 (metadata record), H15 (MLS extension)
+- H16 (sync errors), H17 (epoch grace recovery), H18 (equivocation alert)
+- H19 (chunk envelope), H20 (pseudonym derivation), H21 (bridge governance)
+- H22 (participation signing), H23 (capability registry), H24 (UCAN CID), H25 (revocation status)
+
+**Recovery.rs stub fix** — RecoveryBackend trait being added — IN PROGRESS
 
 ### Spec-Code Alignment (parallel with Phase 6+) — COMPLETE
 

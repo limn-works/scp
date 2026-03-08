@@ -216,6 +216,11 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
         test_vectors,
         operator_did: operator_did.into(),
         economic_metadata,
+        registered_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        signature: vec![],
     };
 
     // Look up the context runtime and register the tool.

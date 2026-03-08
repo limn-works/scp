@@ -1033,6 +1033,8 @@ impl BroadcastContext {
     /// * `payload` -- The plaintext content to encrypt.
     /// * `timestamp` -- Unix timestamp in milliseconds.
     /// * `signing_key` -- The author's Ed25519 signing key.
+    /// * `signing_key_id` -- Which verification method signed this envelope
+    ///   (`"#active"` or `"#agent"`, ADR-039).
     /// * `provenance` -- Optional provenance metadata (§7.7.1).
     ///
     /// # Errors
@@ -1049,6 +1051,7 @@ impl BroadcastContext {
         payload: &[u8],
         timestamp: u64,
         signing_key: &ed25519_dalek::SigningKey,
+        signing_key_id: &str,
         provenance: Option<crate::provenance::DataProvenance>,
     ) -> Result<BroadcastEnvelope, ContextError> {
         if !self.can_write(author_did) {
@@ -1078,6 +1081,7 @@ impl BroadcastContext {
             timestamp,
             provenance,
             signing_key,
+            signing_key_id,
         };
 
         seal_broadcast(&broadcast_key, payload, &params)
@@ -1435,7 +1439,7 @@ mod tests {
         payload: &[u8],
     ) -> Result<BroadcastEnvelope, ContextError> {
         let sk = test_broadcast_signing_key();
-        ctx.publish(author_did, payload, 1_700_000_000_000, &sk, None)
+        ctx.publish(author_did, payload, 1_700_000_000_000, &sk, "#active", None)
     }
 
     /// Creates a properly signed UCAN token for testing gated subscription.

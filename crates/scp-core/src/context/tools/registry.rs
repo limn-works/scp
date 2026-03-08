@@ -88,6 +88,12 @@ pub struct ToolEconomicMetadata {
 /// Contains all metadata required for tool integrity verification: schema,
 /// implementation hash, test vectors, and operator identity. See ADR-010
 /// acceptance criterion 1.
+///
+/// Provenance fields (`registered_at`, `signature`) close spec audit finding
+/// [5.4] — tool registration wire format now includes a timestamp and an
+/// Ed25519 signature over the canonical registration bytes, enabling
+/// independent verification that the registration was created by the claimed
+/// registrant. Both fields default to zero/empty for backward compatibility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRegistration {
     /// Unique identifier for this tool within the context.
@@ -107,6 +113,22 @@ pub struct ToolRegistration {
     pub operator_did: DID,
     /// Optional economic metadata for per-invocation costs (spec section 19.3).
     pub economic_metadata: Option<ToolEconomicMetadata>,
+    /// Unix timestamp (milliseconds) when the tool was registered.
+    ///
+    /// Provides temporal provenance for tool registrations. Defaults to 0 for
+    /// backward compatibility with registrations created before this field
+    /// existed.
+    #[serde(default)]
+    pub registered_at: u64,
+    /// Ed25519 signature over the canonical registration bytes, produced by
+    /// the registrant's signing key.
+    ///
+    /// Enables independent verification that the registration was created by
+    /// the claimed registrant. The signed payload is the MessagePack encoding
+    /// of all fields except `signature` itself. Defaults to empty for backward
+    /// compatibility.
+    #[serde(default)]
+    pub signature: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -567,6 +589,8 @@ mod tests {
             ],
             operator_did: "did:dht:z6MkTestOperator".into(),
             economic_metadata: None,
+            registered_at: 0,
+            signature: Vec::new(),
         }
     }
 

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand::{CryptoRng, RngCore, SeedableRng};
 use sha2::Sha256;
@@ -157,6 +158,37 @@ impl Default for InMemoryKeyCustody {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Salt for HKDF-SHA-256 pseudonym secret derivation (§9.10.4A).
+const PSEUDONYM_SECRET_SALT: &[u8] = b"scp-pseudonym-secret-v1";
+
+/// Derives a `pseudonym_secret` from Ed25519 private key bytes via HKDF-SHA-256.
+///
+/// ```text
+/// pseudonym_secret = HKDF-SHA256(
+///     ikm: ed25519_private_key_bytes,
+///     salt: "scp-pseudonym-secret-v1",
+///     info: "",
+///     len: 32
+/// )
+/// ```
+///
+/// CRITICAL PRIVACY REQUIREMENT (§9.10.4A): Using public key bytes as the
+/// HMAC key would be a membership enumeration oracle — anyone who knows a
+/// member's public key could compute their pseudonym for any context_id
+/// and check relay subscriptions. The `pseudonym_secret` is derived from
+/// private key bytes, making it unknowable without the private key.
+fn derive_pseudonym_secret(signing_key: &SigningKey) -> Zeroizing<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(Some(PSEUDONYM_SECRET_SALT), signing_key.as_bytes());
+    let mut secret = Zeroizing::new([0u8; 32]);
+    // HKDF-Expand with 32-byte output cannot fail (32 <= 255 * HashLen).
+    // 32 <= 255 * 32, so this is infallible by construction.
+    if hk.expand(b"", secret.as_mut()).is_err() {
+        // Unreachable: HKDF-Expand only fails when output length > 255 * HashLen.
+        secret.fill(0);
+    }
+    secret
 }
 
 // Trait uses RPITIT with explicit `+ Send` bound; async fn in trait

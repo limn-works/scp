@@ -93,7 +93,8 @@ pub use templates::{TemplateError, template_params, validate_against_template};
 pub use roles::{
     CapabilityCeiling, ContextRoleState, RoleAssignment, RoleError, UcanAttestation, UcanToken,
     assign_role, builtin_admin, builtin_author, builtin_broadcast_roles, builtin_member,
-    builtin_observer, builtin_roles, builtin_subscriber, check_ceiling, validate_role_definition,
+    builtin_moderator, builtin_observer, builtin_roles, builtin_subscriber, check_ceiling,
+    validate_role_definition,
 };
 
 // Re-export builder and manager types for convenience.

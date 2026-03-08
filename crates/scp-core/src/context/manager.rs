@@ -1753,7 +1753,7 @@ impl ContextManager {
                 })?;
                 let timestamp = crate::time::now_millis()
                     .map_err(|e| ContextError::CryptoFailed(format!("clock error: {e}")))?;
-                let envelope = bc.publish(sender_did, payload, timestamp, sk, None)?;
+                let envelope = bc.publish(sender_did, payload, timestamp, sk, "#active", None)?;
 
                 // Assign per-sender monotonic sequence number.
                 let seq = ctx
@@ -2094,7 +2094,8 @@ impl ContextManager {
 
             let timestamp = crate::time::now_millis()
                 .map_err(|e| ContextError::CryptoFailed(format!("clock error: {e}")))?;
-            let envelope = bc.publish(author_did, payload, timestamp, signing_key, None)?;
+            let envelope =
+                bc.publish(author_did, payload, timestamp, signing_key, "#active", None)?;
 
             // Assign per-sender monotonic sequence number.
             let seq = ctx
@@ -5075,11 +5076,13 @@ impl ContextManager {
     /// # Errors
     ///
     /// Returns [`ContextError`] if signing fails.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_challenge(
         &self,
         challenger_did: &DID,
         subject_did: &DID,
         challenge_type: crate::trust::ChallengeType,
+        capability_uri: String,
         params: serde_json::Value,
         timeout: std::time::Duration,
         signer: &impl crate::trust::ChallengeSigner,
@@ -5088,6 +5091,7 @@ impl ContextManager {
             challenger_did.clone(),
             subject_did.clone(),
             challenge_type,
+            capability_uri,
             params,
             timeout,
             signer,
@@ -5109,12 +5113,20 @@ impl ContextManager {
         &self,
         request: &crate::trust::ChallengeRequest,
         response: &crate::trust::ChallengeResponse,
+        verifier_signer: &impl crate::trust::ChallengeSigner,
+        context_id: Option<String>,
     ) -> Result<crate::trust::ChallengeVerification, ContextError> {
         let resolver = crate::trust::IdentityDidPublicKeyResolver;
         let clock = scp_identity::cache::SystemClock;
-        crate::trust::verify_challenge_response(request, response, &resolver, &clock).map_err(|e| {
-            ContextError::PermissionDenied(format!("challenge verification failed: {e}"))
-        })
+        crate::trust::verify_challenge_response(
+            request,
+            response,
+            &resolver,
+            &clock,
+            verifier_signer,
+            context_id,
+        )
+        .map_err(|e| ContextError::PermissionDenied(format!("challenge verification failed: {e}")))
     }
 
     // -----------------------------------------------------------------------
@@ -5133,6 +5145,7 @@ impl ContextManager {
     ///
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_governance_checkpoint(
         &self,
         context_id: &str,
@@ -9189,6 +9202,8 @@ mod tests {
             }],
             operator_did: "did:key:test-operator".into(),
             economic_metadata: None,
+            registered_at: 0,
+            signature: Vec::new(),
         }
     }
 
@@ -10195,6 +10210,8 @@ mod tests {
             test_vectors: vec![],
             operator_did: "did:key:op".into(),
             economic_metadata: None,
+            registered_at: 0,
+            signature: Vec::new(),
         };
 
         let proposal = ceiling_test_proposal(
@@ -10237,6 +10254,8 @@ mod tests {
             test_vectors: vec![],
             operator_did: "did:key:op".into(),
             economic_metadata: None,
+            registered_at: 0,
+            signature: Vec::new(),
         };
 
         let proposal = ceiling_test_proposal(
@@ -12796,6 +12815,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn scp274_exercises_seven_action_variants() {
         let manager = ContextManager::new(
             Box::new(MockCrypto::default()),

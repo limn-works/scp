@@ -100,6 +100,57 @@ pub struct AttestationEvidence {
 }
 
 // ---------------------------------------------------------------------------
+// IdentityLinkClaim
+// ---------------------------------------------------------------------------
+
+/// Typed claim for `AttestationType::IdentityLink` attestations (spec §3.5, §7.4.2).
+///
+/// "Identity link. Issuer attests they control an external platform identity.
+/// Evidence: platform-specific proof (OAuth, signed post, DNS record)."
+///
+/// This struct provides a typed wire format for the identity link claim that
+/// would otherwise be an untyped `serde_json::Value` in [`Attestation::claim`].
+/// An `IdentityLinkClaim` can be serialized to/from JSON for use in the
+/// `claim` field of an [`Attestation`] with
+/// `attestation_type: AttestationType::IdentityLink`.
+///
+/// See spec §3.5 (Identity Attestations) and §7.4.2 (Attestation Types).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityLinkClaim {
+    /// The external platform name (e.g., `"x"`, `"github"`, `"google"`).
+    pub platform: String,
+    /// The user's handle or identifier on the external platform.
+    pub platform_handle: String,
+    /// The verification method used to prove ownership of the external
+    /// identity (e.g., `"oauth"`, `"signed-post"`, `"dns-record"`).
+    pub verification_method: String,
+    /// URL or reference to the verification proof, if publicly accessible
+    /// (e.g., a signed post URL, DNS TXT record location).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_url: Option<String>,
+}
+
+impl IdentityLinkClaim {
+    /// Serialize this claim to a `serde_json::Value` for use in [`Attestation::claim`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails (should not happen for this type).
+    pub fn to_claim_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(self)
+    }
+
+    /// Deserialize an `IdentityLinkClaim` from the `claim` field of an [`Attestation`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the JSON value does not match the expected structure.
+    pub fn from_claim_value(value: &serde_json::Value) -> Result<Self, serde_json::Error> {
+        serde_json::from_value(value.clone())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RevocationStatus
 // ---------------------------------------------------------------------------
 

@@ -1267,6 +1267,8 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
             test_vectors: vec![],
             operator_did: scp_identity::DID("did:key:placeholder".to_owned()),
             economic_metadata: None,
+            registered_at: 0,
+            signature: Vec::new(),
         })
         .collect();
 
@@ -1286,6 +1288,7 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
         economic_policy: None,
         metadata_visibility: scp_core::context::params::MetadataVisibilityPolicy::default(),
         projection_policy: None,
+        max_chain_depth: None,
     }
 }
 

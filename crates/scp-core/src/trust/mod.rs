@@ -103,9 +103,13 @@ pub use custody_violation::{
     ActionCategory, CounterAttestation, CustodyViolationError, CustodyViolationResult,
     CustodyViolationType, ScpCustodyViolationAttestation, classify_action, enforce_category_a,
 };
-pub use participation::ParticipationRecord;
 #[cfg(feature = "testing")]
 pub use participation::compute_participation_record;
+pub use participation::{
+    ParticipationAdmissionError, ParticipationFact, ParticipationProfile, ParticipationRecord,
+    ParticipationThreshold, RequireParticipation, derive_participation_signing_key,
+    verify_participation_requirements,
+};
 pub use renewal::{DefaultRenewalChecker, RenewalChecker, RenewalError, renew_attestation};
 
 // ---------------------------------------------------------------------------

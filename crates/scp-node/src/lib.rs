@@ -1691,6 +1691,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
     /// Returns [`NodeError::Identity`] if identity creation or DID
     /// publication fails. Returns [`NodeError::Relay`] if the relay server
     /// fails to start.
+    #[allow(clippy::too_many_lines)]
     pub async fn build(self) -> Result<ApplicationNode<S>, NodeError> {
         let domain = self.domain.ok_or(NodeError::MissingField("domain"))?;
         let identity_source = self

@@ -307,6 +307,75 @@ pub struct PskRotationParams {
 }
 
 // ---------------------------------------------------------------------------
+// RecoveryBackend — trait for platform-specific recovery operations
+// ---------------------------------------------------------------------------
+
+/// Backend trait for platform-specific recovery operations.
+///
+/// The orchestrator defines step ordering and failure isolation; the backend
+/// provides the concrete MLS, UCAN, KeyPackage, notification, and PSK
+/// operations. Each method corresponds to one recovery step (2–6).
+///
+/// SDK integration layers implement this trait to wire the orchestrator into
+/// the actual MLS group manager, UCAN store, relay transport, etc.
+///
+/// See spec §9.12.
+pub trait RecoveryBackend {
+    /// Step 2: Issue an MLS `Update` proposal in the given context.
+    ///
+    /// The MLS `Update` provides post-compromise security: new epoch keys are
+    /// derived from the new key material, making the compromised old key
+    /// useless for future messages.
+    ///
+    /// If the member has been offline too long (Tier 3 per ADR-029), return
+    /// a `RecoveryStepError` with `description` containing "requires rejoin".
+    fn mls_update(
+        &self,
+        context_id: &str,
+        key_rotation: &KeyRotationOutcome,
+    ) -> Result<(), RecoveryStepError>;
+
+    /// Step 3: Revoke all UCAN tokens issued by the compromised key.
+    ///
+    /// For agent key compromise: revoke only tokens with
+    /// `fct.scp_key_scope: "#agent"`. The `key_rotation.rotated_key_scopes`
+    /// field indicates which scopes to revoke.
+    ///
+    /// Adds revocations to the context's `RevocationList` and distributes
+    /// via MLS application messages (§9.5). Issues new tokens signed by the
+    /// new key.
+    fn revoke_ucans(
+        &self,
+        context_id: &str,
+        key_rotation: &KeyRotationOutcome,
+    ) -> Result<(), RecoveryStepError>;
+
+    /// Step 4: Delete old `KeyPackages` and publish new ones.
+    ///
+    /// Prevents new group additions using old key material.
+    fn rotate_key_packages(&self, context_id: &str) -> Result<(), RecoveryStepError>;
+
+    /// Step 5: Send key-change notification to contacts.
+    ///
+    /// Contacts who completed Key Continuity Verification (§9.11) are alerted
+    /// that re-verification is needed. Returns `true` if notifications were
+    /// successfully sent.
+    fn notify_contacts(
+        &self,
+        did: &DID,
+        tier: CompromiseTier,
+        key_rotation: &KeyRotationOutcome,
+        contacts: &HashSet<DID>,
+    ) -> bool;
+
+    /// Step 6: Rotate the PSK and re-encrypt identity private state.
+    ///
+    /// If the compromise involved a device, that device is excluded from the
+    /// new PSK distribution. Returns `true` if PSK rotation succeeded.
+    fn rotate_psk(&self, params: &PskRotationParams) -> bool;
+}
+
+// ---------------------------------------------------------------------------
 // CompromiseRecoveryOrchestrator
 // ---------------------------------------------------------------------------
 
@@ -316,9 +385,14 @@ pub struct PskRotationParams {
 /// `KeyPackage` rotation, contact notification, and PSK re-encryption in
 /// dependency order. Failure in one context does not block recovery in others.
 ///
+/// Step operations are delegated to a [`RecoveryBackend`] implementation,
+/// which provides the platform-specific MLS, UCAN, relay, and notification
+/// primitives.
+///
 /// # Usage
 ///
 /// ```rust,ignore
+/// let backend = MyRecoveryBackend::new(/* ... */);
 /// let orchestrator = CompromiseRecoveryOrchestrator::new(
 ///     did.clone(),
 ///     context_ids.clone(),
@@ -328,6 +402,7 @@ pub struct PskRotationParams {
 ///     &key_rotation_outcome,
 ///     &contact_dids,
 ///     None, // no PSK rotation for agent key compromise
+///     &backend,
 /// ).await?;
 /// ```
 ///
@@ -362,8 +437,9 @@ impl CompromiseRecoveryOrchestrator {
     /// lives in `scp-identity`) from the protocol-level orchestration (which
     /// lives here in `scp-core`).
     ///
-    /// Steps 2–4 execute per-context with failure isolation. Steps 5–6 are
-    /// cleanup and run after all per-context steps.
+    /// Steps 2–4 execute per-context with failure isolation via the
+    /// [`RecoveryBackend`]. Steps 5–6 are cleanup and run after all
+    /// per-context steps.
     ///
     /// # Arguments
     ///
@@ -372,6 +448,7 @@ impl CompromiseRecoveryOrchestrator {
     /// * `contact_dids` — DIDs to notify in step 5. Empty set skips notification.
     /// * `psk_params` — Parameters for step 6. `None` skips PSK re-encryption
     ///   (appropriate for agent key compromise where PSK is unaffected).
+    /// * `backend` — Platform-specific implementation of recovery operations.
     ///
     /// # Errors
     ///
@@ -385,6 +462,7 @@ impl CompromiseRecoveryOrchestrator {
         key_rotation: &KeyRotationOutcome,
         contact_dids: &HashSet<DID>,
         psk_params: Option<&PskRotationParams>,
+        backend: &dyn RecoveryBackend,
     ) -> Result<RecoveryResult, RecoveryError> {
         let initiated_at = time::now_millis()?;
 
@@ -397,7 +475,7 @@ impl CompromiseRecoveryOrchestrator {
             let mut state = ContextRecoveryState::new(context_id.clone());
 
             // Step 2: MLS Update.
-            match Self::execute_mls_update(context_id, key_rotation) {
+            match backend.mls_update(context_id, key_rotation) {
                 Ok(()) => {
                     state.mls_updated = true;
                 }
@@ -417,7 +495,7 @@ impl CompromiseRecoveryOrchestrator {
             }
 
             // Step 3: UCAN revocation (depends on step 2).
-            match Self::execute_ucan_revocation(context_id, key_rotation) {
+            match backend.revoke_ucans(context_id, key_rotation) {
                 Ok(()) => {
                     state.ucan_revoked = true;
                 }
@@ -429,7 +507,7 @@ impl CompromiseRecoveryOrchestrator {
             }
 
             // Step 4: KeyPackage rotation (depends on step 3).
-            match Self::execute_key_package_rotation(context_id) {
+            match backend.rotate_key_packages(context_id) {
                 Ok(()) => {
                     state.key_packages_rotated = true;
                 }
@@ -449,21 +527,18 @@ impl CompromiseRecoveryOrchestrator {
         // They can execute in any order (or parallel).
 
         // Step 5: Contact notification.
-        let contacts_notified = Self::execute_contact_notification(
-            &self.did,
-            tier,
-            key_rotation,
-            contact_dids,
-        );
+        let contacts_notified = if contact_dids.is_empty() {
+            true // Nothing to do.
+        } else {
+            backend.notify_contacts(&self.did, tier, key_rotation, contact_dids)
+        };
 
         // Step 6: Identity private state re-encryption.
         // Only for ActiveSigning and IdentityKey tiers.
         let private_state_reencrypted = match tier {
             CompromiseTier::Agent => true, // PSK unaffected for agent-only compromise.
             CompromiseTier::ActiveSigning | CompromiseTier::IdentityKey => {
-                psk_params.is_some_and(|params| {
-                    Self::execute_psk_rotation(params)
-                })
+                psk_params.is_some_and(|params| backend.rotate_psk(params))
             }
         };
 
@@ -486,161 +561,6 @@ impl CompromiseRecoveryOrchestrator {
             initiated_at,
             completed_at,
         })
-    }
-
-    // -----------------------------------------------------------------------
-    // Step 2: MLS Update — per-context
-    // -----------------------------------------------------------------------
-
-    /// Executes step 2: issues an MLS `Update` proposal in the given context.
-    ///
-    /// The MLS `Update` provides post-compromise security: new epoch keys are
-    /// derived from the new key material, making the compromised old key
-    /// useless for future messages.
-    ///
-    /// If the MLS `Update` cannot succeed (member offline too long, requires
-    /// Tier 3 re-join per ADR-029), returns a step error with "requires rejoin".
-    #[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
-    fn execute_mls_update(
-        _context_id: &str,
-        _key_rotation: &KeyRotationOutcome,
-    ) -> Result<(), RecoveryStepError> {
-        // MLS Update is issued using the new key material from step 1.
-        // The actual MLS group operations (proposal + commit) are delegated
-        // to the MLS group manager. This orchestrator coordinates the
-        // sequencing but the caller provides the MLS primitives.
-        //
-        // In the orchestrator model, the caller hooks this into their MLS
-        // group manager. The orchestrator signals success/failure/rejoin.
-        // The concrete MLS operations happen at the SDK integration layer,
-        // not in the core orchestrator — the orchestrator defines the protocol
-        // contract and step ordering.
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // Step 3: UCAN revocation — per-context
-    // -----------------------------------------------------------------------
-
-    /// Executes step 3: revokes all UCAN tokens issued by the compromised key.
-    ///
-    /// For agent key compromise: revokes only tokens with
-    /// `fct.scp_key_scope: "#agent"`.
-    ///
-    /// Adds revocations to each context's `RevocationList` and distributes
-    /// via MLS application messages (§9.5). Issues new tokens signed by the
-    /// new key.
-    #[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
-    fn execute_ucan_revocation(
-        _context_id: &str,
-        _key_rotation: &KeyRotationOutcome,
-    ) -> Result<(), RecoveryStepError> {
-        // UCAN revocation uses the RevocationList from crypto::ucan::revoke.
-        // The orchestrator coordinates scoping (agent-only vs all) based on
-        // the compromise tier and key_rotation.rotated_key_scopes.
-        //
-        // Concrete UCAN enumeration, revocation, and re-issuance happen at
-        // the SDK integration layer. The orchestrator defines which scopes
-        // to revoke and signals completion.
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // Step 4: KeyPackage rotation — per-context
-    // -----------------------------------------------------------------------
-
-    /// Executes step 4: deletes old `KeyPackages` and publishes new ones.
-    ///
-    /// Prevents new group additions using old key material.
-    #[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
-    fn execute_key_package_rotation(
-        _context_id: &str,
-    ) -> Result<(), RecoveryStepError> {
-        // KeyPackage deletion and publication are relay operations.
-        // The orchestrator signals that old KeyPackages for this context
-        // must be deleted from the relay and new ones published.
-        //
-        // Concrete relay operations happen at the SDK integration layer.
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // Step 5: Contact notification
-    // -----------------------------------------------------------------------
-
-    /// Executes step 5: sends key-change notification to all known contacts.
-    ///
-    /// Contacts who completed Key Continuity Verification (§9.11) are alerted
-    /// that re-verification is needed.
-    ///
-    /// Returns `true` if notifications were successfully generated.
-    fn execute_contact_notification(
-        did: &DID,
-        tier: CompromiseTier,
-        key_rotation: &KeyRotationOutcome,
-        contact_dids: &HashSet<DID>,
-    ) -> bool {
-        if contact_dids.is_empty() {
-            return true; // Nothing to do.
-        }
-
-        // Build the notification payload.
-        let _notification = ContactNotification {
-            did: did.clone(),
-            new_did: if key_rotation.did_changed {
-                Some(key_rotation.did_after.clone())
-            } else {
-                None
-            },
-            tier,
-            timestamp: key_rotation.rotated_at,
-            kcv_reverification_required: true, // Always true on key change.
-        };
-
-        // Notification distribution happens at the SDK integration layer.
-        // The orchestrator constructs the notification payload; the SDK
-        // sends it through the appropriate transport channel.
-        true
-    }
-
-    // -----------------------------------------------------------------------
-    // Step 6: Identity private state re-encryption
-    // -----------------------------------------------------------------------
-
-    /// Executes step 6: rotates the PSK and re-encrypts identity private state.
-    ///
-    /// If the compromise involved a device, that device is excluded from the
-    /// new PSK distribution.
-    ///
-    /// Returns `true` if PSK rotation was successfully initiated.
-    fn execute_psk_rotation(
-        params: &PskRotationParams,
-    ) -> bool {
-        // Validate that there are devices to distribute the new PSK to.
-        let target_count = params.compromised_device_pubkey.as_ref().map_or(
-            params.enrolled_device_pubkeys.len(),
-            |compromised| {
-                params.enrolled_device_pubkeys
-                    .iter()
-                    .filter(|pk| pk.as_slice() != compromised.as_slice())
-                    .count()
-            },
-        );
-
-        if target_count == 0 {
-            return false; // No devices to distribute to.
-        }
-
-        // PSK generation, HPKE wrapping, and distribution happen at the
-        // SDK integration layer. The orchestrator validates parameters and
-        // signals that rotation should proceed.
-        //
-        // The concrete flow (§3.7.2):
-        // 1. Generate new PSK (32 random bytes via CSPRNG).
-        // 2. Wrap PSK to each target device's X25519 pubkey via HPKE.
-        // 3. Append PskRotated event to identity private state.
-        // 4. Destroy old PSK on all compliant devices.
-        true
     }
 
     /// Returns the DID this orchestrator is recovering.
@@ -721,6 +641,88 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Mock backend for testing
+    // -----------------------------------------------------------------------
+
+    /// A mock `RecoveryBackend` that succeeds for all operations by default.
+    /// Individual steps can be configured to fail.
+    struct MockRecoveryBackend {
+        /// If set, `mls_update` returns this error for the matching context.
+        mls_update_error: Option<(String, RecoveryStepError)>,
+        /// If set, `revoke_ucans` returns this error for the matching context.
+        revoke_ucans_error: Option<(String, RecoveryStepError)>,
+        /// If set, `rotate_key_packages` returns this error for the matching context.
+        rotate_key_packages_error: Option<(String, RecoveryStepError)>,
+        /// Whether `notify_contacts` succeeds.
+        notify_contacts_result: bool,
+        /// Whether `rotate_psk` succeeds.
+        rotate_psk_result: bool,
+    }
+
+    impl MockRecoveryBackend {
+        fn new() -> Self {
+            Self {
+                mls_update_error: None,
+                revoke_ucans_error: None,
+                rotate_key_packages_error: None,
+                notify_contacts_result: true,
+                rotate_psk_result: true,
+            }
+        }
+    }
+
+    impl RecoveryBackend for MockRecoveryBackend {
+        fn mls_update(
+            &self,
+            context_id: &str,
+            _key_rotation: &KeyRotationOutcome,
+        ) -> Result<(), RecoveryStepError> {
+            if let Some((ref ctx, ref err)) = self.mls_update_error {
+                if ctx == context_id {
+                    return Err(err.clone());
+                }
+            }
+            Ok(())
+        }
+
+        fn revoke_ucans(
+            &self,
+            context_id: &str,
+            _key_rotation: &KeyRotationOutcome,
+        ) -> Result<(), RecoveryStepError> {
+            if let Some((ref ctx, ref err)) = self.revoke_ucans_error {
+                if ctx == context_id {
+                    return Err(err.clone());
+                }
+            }
+            Ok(())
+        }
+
+        fn rotate_key_packages(&self, context_id: &str) -> Result<(), RecoveryStepError> {
+            if let Some((ref ctx, ref err)) = self.rotate_key_packages_error {
+                if ctx == context_id {
+                    return Err(err.clone());
+                }
+            }
+            Ok(())
+        }
+
+        fn notify_contacts(
+            &self,
+            _did: &DID,
+            _tier: CompromiseTier,
+            _key_rotation: &KeyRotationOutcome,
+            _contacts: &HashSet<DID>,
+        ) -> bool {
+            self.notify_contacts_result
+        }
+
+        fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
+            self.rotate_psk_result
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // CompromiseTier tests
     // -----------------------------------------------------------------------
 
@@ -774,18 +776,12 @@ mod tests {
 
     #[test]
     fn identity_key_rotation_outcome_changes_did() {
-        let outcome = identity_key_rotation_outcome(
-            &did("did:dht:alice"),
-            did("did:dht:alice-new"),
-            3000,
-        );
+        let outcome =
+            identity_key_rotation_outcome(&did("did:dht:alice"), did("did:dht:alice-new"), 3000);
         assert_eq!(outcome.tier, CompromiseTier::IdentityKey);
         assert_eq!(outcome.did_after, did("did:dht:alice-new"));
         assert!(outcome.did_changed);
-        assert_eq!(
-            outcome.rotated_key_scopes,
-            vec!["#active", "#agent"]
-        );
+        assert_eq!(outcome.rotated_key_scopes, vec!["#active", "#agent"]);
     }
 
     // -----------------------------------------------------------------------
@@ -914,9 +910,16 @@ mod tests {
 
         let key_rotation = agent_key_rotation_outcome(&did("did:dht:alice"), 1000);
         let contacts = HashSet::new();
+        let backend = MockRecoveryBackend::new();
 
         let result = orch
-            .execute_recovery(CompromiseTier::Agent, &key_rotation, &contacts, None)
+            .execute_recovery(
+                CompromiseTier::Agent,
+                &key_rotation,
+                &contacts,
+                None,
+                &backend,
+            )
             .await
             .unwrap();
 
@@ -935,10 +938,8 @@ mod tests {
 
     #[tokio::test]
     async fn active_signing_key_recovery_with_psk_rotation() {
-        let orch = CompromiseRecoveryOrchestrator::new(
-            did("did:dht:alice"),
-            vec!["ctx-1".to_owned()],
-        );
+        let orch =
+            CompromiseRecoveryOrchestrator::new(did("did:dht:alice"), vec!["ctx-1".to_owned()]);
 
         let key_rotation = active_key_rotation_outcome(&did("did:dht:alice"), 2000);
         let contacts = HashSet::from([did("did:dht:bob"), did("did:dht:carol")]);
@@ -946,6 +947,7 @@ mod tests {
             enrolled_device_pubkeys: vec![vec![1u8; 32], vec![2u8; 32]],
             compromised_device_pubkey: None,
         };
+        let backend = MockRecoveryBackend::new();
 
         let result = orch
             .execute_recovery(
@@ -953,6 +955,7 @@ mod tests {
                 &key_rotation,
                 &contacts,
                 Some(&psk_params),
+                &backend,
             )
             .await
             .unwrap();
@@ -965,21 +968,17 @@ mod tests {
 
     #[tokio::test]
     async fn identity_key_recovery_changes_did() {
-        let orch = CompromiseRecoveryOrchestrator::new(
-            did("did:dht:alice"),
-            vec!["ctx-1".to_owned()],
-        );
+        let orch =
+            CompromiseRecoveryOrchestrator::new(did("did:dht:alice"), vec!["ctx-1".to_owned()]);
 
-        let key_rotation = identity_key_rotation_outcome(
-            &did("did:dht:alice"),
-            did("did:dht:alice-new"),
-            3000,
-        );
+        let key_rotation =
+            identity_key_rotation_outcome(&did("did:dht:alice"), did("did:dht:alice-new"), 3000);
         let contacts = HashSet::from([did("did:dht:bob")]);
         let psk_params = PskRotationParams {
             enrolled_device_pubkeys: vec![vec![1u8; 32]],
             compromised_device_pubkey: None,
         };
+        let backend = MockRecoveryBackend::new();
 
         let result = orch
             .execute_recovery(
@@ -987,6 +986,7 @@ mod tests {
                 &key_rotation,
                 &contacts,
                 Some(&psk_params),
+                &backend,
             )
             .await
             .unwrap();
@@ -999,16 +999,20 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_with_no_contexts() {
-        let orch = CompromiseRecoveryOrchestrator::new(
-            did("did:dht:alice"),
-            vec![],
-        );
+        let orch = CompromiseRecoveryOrchestrator::new(did("did:dht:alice"), vec![]);
 
         let key_rotation = agent_key_rotation_outcome(&did("did:dht:alice"), 1000);
         let contacts = HashSet::new();
+        let backend = MockRecoveryBackend::new();
 
         let result = orch
-            .execute_recovery(CompromiseTier::Agent, &key_rotation, &contacts, None)
+            .execute_recovery(
+                CompromiseTier::Agent,
+                &key_rotation,
+                &contacts,
+                None,
+                &backend,
+            )
             .await
             .unwrap();
 
@@ -1020,16 +1024,21 @@ mod tests {
     #[tokio::test]
     async fn recovery_without_psk_params_for_active_tier() {
         // ActiveSigning without PSK params → private_state_reencrypted is false.
-        let orch = CompromiseRecoveryOrchestrator::new(
-            did("did:dht:alice"),
-            vec!["ctx-1".to_owned()],
-        );
+        let orch =
+            CompromiseRecoveryOrchestrator::new(did("did:dht:alice"), vec!["ctx-1".to_owned()]);
 
         let key_rotation = active_key_rotation_outcome(&did("did:dht:alice"), 2000);
         let contacts = HashSet::new();
+        let backend = MockRecoveryBackend::new();
 
         let result = orch
-            .execute_recovery(CompromiseTier::ActiveSigning, &key_rotation, &contacts, None)
+            .execute_recovery(
+                CompromiseTier::ActiveSigning,
+                &key_rotation,
+                &contacts,
+                None,
+                &backend,
+            )
             .await
             .unwrap();
 
@@ -1039,13 +1048,11 @@ mod tests {
 
     #[tokio::test]
     async fn psk_rotation_excludes_compromised_device() {
-        let orch = CompromiseRecoveryOrchestrator::new(
-            did("did:dht:alice"),
-            vec![],
-        );
+        let orch = CompromiseRecoveryOrchestrator::new(did("did:dht:alice"), vec![]);
 
         let key_rotation = active_key_rotation_outcome(&did("did:dht:alice"), 2000);
         let contacts = HashSet::new();
+        let backend = MockRecoveryBackend::new();
 
         // Device 2 is compromised.
         let psk_params = PskRotationParams {
@@ -1059,6 +1066,7 @@ mod tests {
                 &key_rotation,
                 &contacts,
                 Some(&psk_params),
+                &backend,
             )
             .await
             .unwrap();
@@ -1069,10 +1077,7 @@ mod tests {
     #[tokio::test]
     async fn psk_rotation_fails_with_no_remaining_devices() {
         // All devices compromised → PSK rotation fails.
-        let orch = CompromiseRecoveryOrchestrator::new(
-            did("did:dht:alice"),
-            vec![],
-        );
+        let orch = CompromiseRecoveryOrchestrator::new(did("did:dht:alice"), vec![]);
 
         let key_rotation = active_key_rotation_outcome(&did("did:dht:alice"), 2000);
         let contacts = HashSet::new();
@@ -1082,12 +1087,19 @@ mod tests {
             compromised_device_pubkey: Some(vec![1u8; 32]),
         };
 
+        // Backend reports PSK rotation failure (no remaining devices).
+        let backend = MockRecoveryBackend {
+            rotate_psk_result: false,
+            ..MockRecoveryBackend::new()
+        };
+
         let result = orch
             .execute_recovery(
                 CompromiseTier::ActiveSigning,
                 &key_rotation,
                 &contacts,
                 Some(&psk_params),
+                &backend,
             )
             .await
             .unwrap();
@@ -1097,16 +1109,21 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_result_serialization_roundtrip() {
-        let orch = CompromiseRecoveryOrchestrator::new(
-            did("did:dht:alice"),
-            vec!["ctx-1".to_owned()],
-        );
+        let orch =
+            CompromiseRecoveryOrchestrator::new(did("did:dht:alice"), vec!["ctx-1".to_owned()]);
 
         let key_rotation = agent_key_rotation_outcome(&did("did:dht:alice"), 1000);
         let contacts = HashSet::new();
+        let backend = MockRecoveryBackend::new();
 
         let result = orch
-            .execute_recovery(CompromiseTier::Agent, &key_rotation, &contacts, None)
+            .execute_recovery(
+                CompromiseTier::Agent,
+                &key_rotation,
+                &contacts,
+                None,
+                &backend,
+            )
             .await
             .unwrap();
 
@@ -1178,13 +1195,14 @@ mod tests {
             enrolled_device_pubkeys: vec![vec![1u8; 32], vec![2u8; 32]],
             compromised_device_pubkey: None,
         };
+        let backend = MockRecoveryBackend::new();
 
         // Tier 1: Agent key compromise (cheapest).
         {
             let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), contexts.clone());
             let kr = agent_key_rotation_outcome(&alice, 1000);
             let result = orch
-                .execute_recovery(CompromiseTier::Agent, &kr, &contacts, None)
+                .execute_recovery(CompromiseTier::Agent, &kr, &contacts, None, &backend)
                 .await
                 .unwrap();
 
@@ -1204,6 +1222,7 @@ mod tests {
                     &kr,
                     &contacts,
                     Some(&psk_params),
+                    &backend,
                 )
                 .await
                 .unwrap();
@@ -1216,17 +1235,14 @@ mod tests {
         // Tier 3: Identity key compromise (most severe).
         {
             let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), contexts.clone());
-            let kr = identity_key_rotation_outcome(
-                &alice,
-                did("did:dht:alice-new"),
-                3000,
-            );
+            let kr = identity_key_rotation_outcome(&alice, did("did:dht:alice-new"), 3000);
             let result = orch
                 .execute_recovery(
                     CompromiseTier::IdentityKey,
                     &kr,
                     &contacts,
                     Some(&psk_params),
+                    &backend,
                 )
                 .await
                 .unwrap();

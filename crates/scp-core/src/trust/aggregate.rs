@@ -578,7 +578,7 @@ mod tests {
                     sequence: 0,
                     reason: "lock poisoned".to_owned(),
                 })?;
-            let key = (context_id.to_owned(), result.responder_did.to_string());
+            let key = (context_id.to_owned(), result.subject_did.to_string());
             store.entry(key).or_default().push(result.clone());
             Ok(())
         }
@@ -658,16 +658,24 @@ mod tests {
     ) -> ChallengeVerification {
         use crate::trust::challenge::{ChallengeType, VerificationMethod};
         ChallengeVerification {
-            challenge_id: challenge_id.to_owned(),
-            challenger_did: "did:key:challenger".into(),
-            responder_did: responder.into(),
+            verification_id: challenge_id.to_owned(),
+            verifier_did: "did:key:challenger".into(),
+            subject_did: responder.into(),
+            capability_uri: String::new(),
             challenge_type: ChallengeType::SchemaValidation,
             verification_method: VerificationMethod::ChallengeVerified {
                 challenge_type: ChallengeType::SchemaValidation,
             },
+            passed: true,
+            score: None,
+            test_count: 1,
+            pass_count: 1,
             result: serde_json::json!({"passed": true}),
             completed_at,
             verified_at: completed_at + 1,
+            expires_at: completed_at + 86400,
+            context_id: None,
+            verifier_signature: vec![0u8; 64],
         }
     }
 
@@ -811,7 +819,7 @@ mod tests {
             .get_challenge_results("ctx-1", "did:key:alice")
             .unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].challenge_id, "ch-1");
+        assert_eq!(results[0].verification_id, "ch-1");
         assert_eq!(results[0].completed_at, 1000);
     }
 
@@ -978,7 +986,7 @@ mod tests {
 
         // Challenge results.
         assert_eq!(input.challenge_results.len(), 1);
-        assert_eq!(input.challenge_results[0].challenge_id, "ch-1");
+        assert_eq!(input.challenge_results[0].verification_id, "ch-1");
 
         // Consequence structure.
         assert_eq!(input.consequence_structure.len(), 1);

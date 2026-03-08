@@ -19,6 +19,8 @@
 //!
 //! Built-in roles are always available in every context:
 //! - `admin` -- all capabilities in the ceiling.
+//! - `moderator` -- `MessagesRead`, `MessagesWrite`, `ToolInvokeAll`,
+//!   `MemberRemove`, `GovernancePropose` (§5.9 elected moderators).
 //! - `member` -- `MessagesRead`, `MessagesWrite`, `ToolInvokeAll`.
 //! - `observer` -- `MessagesRead` only.
 //!
@@ -389,6 +391,31 @@ pub fn builtin_member(ceiling: &CapabilityCeiling) -> RoleDefinition {
     RoleDefinition::new_unchecked("member", capabilities)
 }
 
+/// Returns the `moderator` built-in role definition.
+///
+/// Moderators can read/write messages, invoke tools, remove members, and
+/// propose governance actions. This fills the gap between `member` (no
+/// moderation power) and `admin` (full control). Referenced in §5.9 as
+/// "elected moderators" governance pattern. Capabilities are intersected
+/// with the ceiling.
+///
+/// See ADR-009 acceptance criterion 2.
+#[must_use]
+pub fn builtin_moderator(ceiling: &CapabilityCeiling) -> RoleDefinition {
+    let desired = HashSet::from([
+        Capability::MessagesRead,
+        Capability::MessagesWrite,
+        Capability::ToolInvokeAll,
+        Capability::MemberRemove,
+        Capability::GovernancePropose,
+    ]);
+    let capabilities = desired
+        .into_iter()
+        .filter(|cap| ceiling.contains(cap))
+        .collect();
+    RoleDefinition::new_unchecked("moderator", capabilities)
+}
+
 /// Returns the `observer` built-in role definition.
 ///
 /// Observers can only read messages. The capability is intersected with the
@@ -444,11 +471,12 @@ pub fn builtin_subscriber(ceiling: &CapabilityCeiling) -> RoleDefinition {
 
 /// Returns all standard built-in role definitions for a given ceiling.
 ///
-/// Includes `admin`, `member`, and `observer`.
+/// Includes `admin`, `moderator`, `member`, and `observer`.
 #[must_use]
 pub fn builtin_roles(ceiling: &CapabilityCeiling) -> Vec<RoleDefinition> {
     vec![
         builtin_admin(ceiling),
+        builtin_moderator(ceiling),
         builtin_member(ceiling),
         builtin_observer(ceiling),
     ]
@@ -1160,6 +1188,41 @@ mod tests {
     }
 
     #[test]
+    fn builtin_moderator_has_expected_capabilities() {
+        let ceiling = test_ceiling();
+        let moderator = builtin_moderator(&ceiling);
+        assert_eq!(moderator.name, "moderator");
+        assert!(moderator.capabilities.contains(&Capability::MessagesRead));
+        assert!(moderator.capabilities.contains(&Capability::MessagesWrite));
+        assert!(moderator.capabilities.contains(&Capability::ToolInvokeAll));
+        assert!(moderator.capabilities.contains(&Capability::MemberRemove));
+        assert!(
+            moderator
+                .capabilities
+                .contains(&Capability::GovernancePropose)
+        );
+        assert_eq!(moderator.capabilities.len(), 5);
+    }
+
+    #[test]
+    fn builtin_moderator_respects_ceiling() {
+        // If GovernancePropose is not in the ceiling, moderator should not have it.
+        let ceiling = CapabilityCeiling::new([
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::ToolInvokeAll,
+            Capability::MemberRemove,
+        ]);
+        let moderator = builtin_moderator(&ceiling);
+        assert!(
+            !moderator
+                .capabilities
+                .contains(&Capability::GovernancePropose)
+        );
+        assert_eq!(moderator.capabilities.len(), 4);
+    }
+
+    #[test]
     fn builtin_author_has_expected_capabilities() {
         let ceiling = test_ceiling();
         let author = builtin_author(&ceiling);
@@ -1189,12 +1252,13 @@ mod tests {
     }
 
     #[test]
-    fn builtin_roles_returns_three_roles() {
+    fn builtin_roles_returns_four_roles() {
         let ceiling = test_ceiling();
         let roles = builtin_roles(&ceiling);
-        assert_eq!(roles.len(), 3);
+        assert_eq!(roles.len(), 4);
         let names: Vec<&str> = roles.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains(&"admin"));
+        assert!(names.contains(&"moderator"));
         assert!(names.contains(&"member"));
         assert!(names.contains(&"observer"));
     }

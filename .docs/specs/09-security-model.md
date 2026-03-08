@@ -691,19 +691,37 @@ Messages larger than 256KB are chunked into 256KB blocks. Padding happens below 
 
 Each participant derives a per-context keypair that replaces their DID in all outer-envelope fields:
 
+#### 9.10.4A Pseudonym Secret Derivation
+
+**CRITICAL PRIVACY REQUIREMENT:** Pseudonym derivation MUST NOT use Ed25519 public key bytes as the HMAC key. Public key bytes are known to all participants and would create a membership enumeration oracle: anyone who knows a member's public key could compute their pseudonym for any context_id and check relay subscriptions. Instead, a `pseudonym_secret` is derived from private key bytes via HKDF:
+
 ```
-context_seed = HMAC-SHA256(identity_key_material, context_id || "scp-pseudonym")
+pseudonym_secret = HKDF-SHA256(
+    ikm: ed25519_private_key_bytes,
+    salt: "scp-pseudonym-secret-v1",
+    info: "",
+    len: 32
+)
+```
+
+The `pseudonym_secret` is then used as the HMAC key for all pseudonym derivations (both v1 and v2):
+
+```
+context_seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")
 context_keypair = Ed25519_keygen(context_seed[0..32])
 context_pseudonym = context_keypair.public_key
 ```
 
+The `pseudonym_secret` is derived once per identity key and cached within the `KeyCustody` boundary. It never leaves the custody boundary. For hardware-backed keys where private key bytes are not exportable, the HSM computes the HKDF internally; the `pseudonym_secret` is stored as a derived symmetric key within the HSM.
+
 - **Per-DID, not per-VM.** The pseudonym is derived from `identity_key_material` (the DID's `#0` key), so human and agent share one pseudonym per context regardless of which signing key (`#active` or `#agent`) is used for individual messages (ADR-039). This prevents pseudonym divergence from leaking the human/agent distinction to relays.
 - **Deterministic:** Same identity + same context = same pseudonym.
 - **Unlinkable across contexts:** Different context_id = different pseudonym. Relays cannot correlate activity across contexts.
+- **Unlinkable from public keys:** The HKDF derivation ensures that knowing the public key is insufficient to compute the pseudonym. Only the key holder (or the HSM) can derive the `pseudonym_secret`.
 - **Verification:** Sender includes full DID inside MLS-encrypted payload. Group members verify pseudonym-to-DID mapping on first encounter and cache the association.
 - **No ZK proofs** — unnecessary complexity since only group members need to verify the mapping.
 - The SDK handles derivation, caching, and verification transparently.
-- **HSM compatibility.** Pseudonym derivation is performed via `KeyCustody::derive_pseudonym(identity_key_handle, context_id)` (ADR-006). The HMAC-SHA256 computation happens inside the custody boundary — the private key never leaves the HSM. For hardware-backed keys, the HSM computes the HMAC internally using an associated symmetric key derived during `generate_keypair`. For software keys, the HMAC uses the raw Ed25519 public key bytes (ADR-027 amendment: public key bytes ensure cross-platform determinism with hardware TEE keys that cannot export private bytes). All implementations produce identical output for the same identity key and context_id, regardless of custody type. See ADR-002 criterion 1 for the full derivation specification.
+- **HSM compatibility.** Pseudonym derivation is performed via `KeyCustody::derive_pseudonym(identity_key_handle, context_id)` (ADR-006). The HKDF and HMAC-SHA256 computations happen inside the custody boundary — the private key never leaves the HSM. For hardware-backed keys, the HSM computes the HKDF internally to derive the `pseudonym_secret`, then uses it for HMAC. For software keys, the HKDF uses the raw Ed25519 private key bytes. All implementations produce identical output for the same identity key and context_id, regardless of custody type. See ADR-002 criterion 1 for the full derivation specification.
 - **Pre-join context inspection.** Prospective members who know a `context_id` but have not joined the context can retrieve its publicly visible parameters (capability ceiling, governance model, roles, TTL, memory scope — see §5.7) from relays without joining. The relay indexes context metadata under a publicly derivable identifier: `metadata_routing_id = SHA-256(context_id || "scp-metadata")`. This identifier is distinct from the per-member pseudonyms used for message routing and does not reveal member identities or message content. It enables the "legibility before opt-in" tenet: any agent evaluating whether to join a context can inspect its parameters by querying the `metadata_routing_id` on the context's relays.
 
 #### 9.10.4.1 Pseudonym Rotation (BLACK-001 Mitigation)
@@ -711,9 +729,11 @@ context_pseudonym = context_keypair.public_key
 To mitigate long-term pseudonym-level traffic analysis by a compromised relay (BLACK-001), pseudonyms support epoch-based rotation. The v2 derivation includes a rotation epoch:
 
 ```
-context_seed_v2 = HMAC-SHA256(identity_key_material, context_id || epoch_BE || "scp-pseudonym-v2")
+context_seed_v2 = HMAC-SHA256(pseudonym_secret, context_id || epoch_BE || "scp-pseudonym-v2")
 context_keypair_v2 = Ed25519_keygen(context_seed_v2[0..32])
 ```
+
+where `pseudonym_secret` is derived from the identity key's private bytes as specified in §9.10.4A.
 
 where `epoch_BE` is a 64-bit big-endian pseudonym rotation epoch (distinct from MLS epochs).
 

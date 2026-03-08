@@ -81,7 +81,7 @@ pub enum ChallengeType {
 /// Issued by a challenger to verify a testable capability of the subject.
 /// The request is signed by the challenger's Ed25519 key for authenticity.
 ///
-/// See ADR-017 acceptance criterion 4.
+/// See ADR-017 acceptance criterion 4, spec §7.3.4.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChallengeRequest {
     /// Unique challenge identifier (UUID v4).
@@ -95,6 +95,14 @@ pub struct ChallengeRequest {
 
     /// DID of the entity being challenged.
     pub subject_did: DID,
+
+    /// The capability URI being tested (spec §7.3.4.1).
+    ///
+    /// Identifies which specific capability this challenge verifies, using the
+    /// structured URI format: `scp:capability:{name}/v{N}` for protocol
+    /// capabilities, or `did:{method}:{id}:capability:{name}/v{N}` for
+    /// DID-scoped custom capabilities.
+    pub capability_uri: String,
 
     /// Challenge-specific parameters (schema, test vectors, limits, etc.).
     pub parameters: serde_json::Value,
@@ -166,25 +174,45 @@ pub enum VerificationMethod {
 ///
 /// Produced by [`verify_challenge_response`]. Contains the verified challenge
 /// and response data along with metadata about how the verification was
-/// performed.
+/// performed. A signed record that demonstrates a specific verifier tested
+/// a capability and the agent passed — the verifier's signature prevents
+/// forgery (spec §7.3.4.2).
 ///
-/// See ADR-017 acceptance criterion 5.
+/// See ADR-017 acceptance criterion 5, spec §7.3.4.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChallengeVerification {
-    /// The challenge ID that was verified.
-    pub challenge_id: String,
+    /// Unique verification identifier (derived from the challenge ID).
+    #[serde(alias = "challenge_id")]
+    pub verification_id: String,
 
-    /// DID of the challenger who issued the challenge.
-    pub challenger_did: DID,
+    /// DID of the verifier who issued and verified the challenge.
+    #[serde(alias = "challenger_did")]
+    pub verifier_did: DID,
 
-    /// DID of the responder who answered the challenge.
-    pub responder_did: DID,
+    /// DID of the subject who answered the challenge.
+    #[serde(alias = "responder_did")]
+    pub subject_did: DID,
+
+    /// The capability URI that was verified (spec §7.3.4.1).
+    pub capability_uri: String,
 
     /// The type of challenge that was verified.
     pub challenge_type: ChallengeType,
 
     /// The verification method: self-attested or challenge-verified.
     pub verification_method: VerificationMethod,
+
+    /// Whether the subject passed the challenge overall.
+    pub passed: bool,
+
+    /// Optional numeric score (0–100) for graded challenges.
+    pub score: Option<u32>,
+
+    /// Total number of test cases in the challenge.
+    pub test_count: u32,
+
+    /// Number of test cases the subject passed.
+    pub pass_count: u32,
 
     /// The challenge-specific result from the response.
     pub result: serde_json::Value,
@@ -194,6 +222,20 @@ pub struct ChallengeVerification {
 
     /// Unix timestamp (seconds) when the verification was performed.
     pub verified_at: u64,
+
+    /// Unix timestamp (seconds) when this verification expires.
+    ///
+    /// Challenges are repeatable (spec §7.3.4) — an expired verification
+    /// means the capability should be re-challenged.
+    pub expires_at: u64,
+
+    /// Context in which the challenge was issued, if any.
+    pub context_id: Option<String>,
+
+    /// Ed25519 signature by the verifier over the verification record.
+    ///
+    /// Prevents forgery of verification results (spec §7.3.4.2).
+    pub verifier_signature: Ed25519Signature,
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +265,15 @@ const DOMAIN_CHALLENGE_REQ_V1: &[u8] = b"SCP-CHALLENGE-REQ-V1:";
 /// Domain separator for challenge response canonical bytes.
 const DOMAIN_CHALLENGE_RESP_V1: &[u8] = b"SCP-CHALLENGE-RESP-V1:";
 
+/// Domain separator for challenge verification canonical bytes.
+const DOMAIN_CHALLENGE_VERIFY_V1: &[u8] = b"SCP-CHALLENGE-VERIFY-V1:";
+
+/// Default verification validity period: 90 days in seconds.
+///
+/// Challenges are repeatable (spec §7.3.4). After this period the
+/// verification should be re-issued.
+const DEFAULT_VERIFICATION_TTL_SECS: u64 = 90 * 24 * 3600;
+
 // ---------------------------------------------------------------------------
 // Canonical byte construction
 // ---------------------------------------------------------------------------
@@ -230,10 +281,10 @@ const DOMAIN_CHALLENGE_RESP_V1: &[u8] = b"SCP-CHALLENGE-RESP-V1:";
 /// Builds the canonical byte representation of a challenge request for signing.
 ///
 /// The canonical form is: `"SCP-CHALLENGE-REQ-V1:" || challenge_id
-/// || challenge_type || challenger_did || subject_did || parameters
-/// || timeout_secs`. The domain separator prevents cross-protocol signature
-/// confusion. This ensures signatures cover all semantically meaningful
-/// fields.
+/// || challenge_type || challenger_did || subject_did || capability_uri
+/// || parameters || timeout_secs`. The domain separator prevents
+/// cross-protocol signature confusion. This ensures signatures cover all
+/// semantically meaningful fields.
 fn canonical_challenge_request_bytes(request: &ChallengeRequest) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(DOMAIN_CHALLENGE_REQ_V1);
@@ -241,6 +292,7 @@ fn canonical_challenge_request_bytes(request: &ChallengeRequest) -> Vec<u8> {
     bytes.extend_from_slice(challenge_type_tag(&request.challenge_type).as_bytes());
     bytes.extend_from_slice(request.challenger_did.as_bytes());
     bytes.extend_from_slice(request.subject_did.as_bytes());
+    bytes.extend_from_slice(request.capability_uri.as_bytes());
 
     // Deterministic JSON serialization for parameters.
     let params_bytes = serde_json::to_vec(&request.parameters).unwrap_or_default();
@@ -272,6 +324,28 @@ fn canonical_challenge_response_bytes(response: &ChallengeResponse) -> Vec<u8> {
     bytes
 }
 
+/// Builds the canonical byte representation of a challenge verification for signing.
+///
+/// The canonical form is: `"SCP-CHALLENGE-VERIFY-V1:" || verification_id
+/// || verifier_did || subject_did || capability_uri || challenge_type
+/// || passed || test_count || pass_count || verified_at || expires_at`.
+/// The domain separator prevents cross-protocol signature confusion.
+fn canonical_challenge_verification_bytes(verification: &ChallengeVerification) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(DOMAIN_CHALLENGE_VERIFY_V1);
+    bytes.extend_from_slice(verification.verification_id.as_bytes());
+    bytes.extend_from_slice(verification.verifier_did.as_bytes());
+    bytes.extend_from_slice(verification.subject_did.as_bytes());
+    bytes.extend_from_slice(verification.capability_uri.as_bytes());
+    bytes.extend_from_slice(challenge_type_tag(&verification.challenge_type).as_bytes());
+    bytes.push(u8::from(verification.passed));
+    bytes.extend_from_slice(&verification.test_count.to_be_bytes());
+    bytes.extend_from_slice(&verification.pass_count.to_be_bytes());
+    bytes.extend_from_slice(&verification.verified_at.to_be_bytes());
+    bytes.extend_from_slice(&verification.expires_at.to_be_bytes());
+    bytes
+}
+
 /// Returns a deterministic string tag for a challenge type.
 fn challenge_type_tag(ct: &ChallengeType) -> String {
     match ct {
@@ -297,6 +371,7 @@ fn challenge_type_tag(ct: &ChallengeType) -> String {
 /// - `challenger_did`: DID of the entity issuing the challenge.
 /// - `subject_did`: DID of the entity being challenged.
 /// - `challenge_type`: The type of challenge to issue.
+/// - `capability_uri`: The capability URI being tested (spec §7.3.4.1).
 /// - `params`: Challenge-specific parameters.
 /// - `timeout`: Maximum time allowed for the subject to respond.
 /// - `signer`: Signs the canonical challenge bytes.
@@ -310,6 +385,7 @@ pub fn issue_challenge(
     challenger_did: DID,
     subject_did: DID,
     challenge_type: ChallengeType,
+    capability_uri: String,
     params: serde_json::Value,
     timeout: Duration,
     signer: &impl ChallengeSigner,
@@ -323,6 +399,7 @@ pub fn issue_challenge(
         challenge_type,
         challenger_did,
         subject_did,
+        capability_uri,
         parameters: params,
         timeout,
         signature: vec![],
@@ -355,7 +432,7 @@ pub fn issue_challenge(
 ///    public key, resolved via the provided [`DidPublicKeyResolver`].
 ///
 /// On success, returns a [`ChallengeVerification`] with
-/// [`VerificationMethod::ChallengeVerified`].
+/// [`VerificationMethod::ChallengeVerified`], signed by the verifier.
 ///
 /// # Errors
 ///
@@ -366,12 +443,14 @@ pub fn issue_challenge(
 /// - [`TrustError::ChallengeTimeout`] if the response arrived too late
 /// - [`TrustError::ChallengeSignatureInvalid`] for signature failures
 ///
-/// See ADR-017 acceptance criterion 5.
+/// See ADR-017 acceptance criterion 5, spec §7.3.4.
 pub fn verify_challenge_response(
     request: &ChallengeRequest,
     response: &ChallengeResponse,
     resolver: &impl DidPublicKeyResolver,
     clock: &impl Clock,
+    verifier_signer: &impl ChallengeSigner,
+    context_id: Option<String>,
 ) -> Result<ChallengeVerification, TrustError> {
     // 1. Challenge ID must match.
     if request.challenge_id != response.challenge_id {
@@ -413,19 +492,55 @@ pub fn verify_challenge_response(
         },
     )?;
 
-    // Verification succeeded -- this is challenge-verified, not self-attested.
-    Ok(ChallengeVerification {
-        challenge_id: request.challenge_id.clone(),
-        challenger_did: request.challenger_did.clone(),
-        responder_did: response.responder_did.clone(),
+    // Extract test_count/pass_count from result if present (sketch §7.3.4).
+    let test_count = response
+        .result
+        .get("test_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as u32;
+    let pass_count = response
+        .result
+        .get("pass_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as u32;
+    let passed = response
+        .result
+        .get("passed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(pass_count > 0 && pass_count == test_count);
+
+    // Build the verification record (unsigned first, then sign).
+    let mut verification = ChallengeVerification {
+        verification_id: request.challenge_id.clone(),
+        verifier_did: request.challenger_did.clone(),
+        subject_did: response.responder_did.clone(),
+        capability_uri: request.capability_uri.clone(),
         challenge_type: request.challenge_type.clone(),
         verification_method: VerificationMethod::ChallengeVerified {
             challenge_type: request.challenge_type.clone(),
         },
+        passed,
+        score: response
+            .result
+            .get("score")
+            .and_then(serde_json::Value::as_u64)
+            .map(|s| s as u32),
+        test_count,
+        pass_count,
         result: response.result.clone(),
         completed_at: response.completed_at,
         verified_at: now,
-    })
+        expires_at: now + DEFAULT_VERIFICATION_TTL_SECS,
+        context_id,
+        verifier_signature: vec![],
+    };
+
+    // Sign the verification record (spec §7.3.4.2: verifier's signature
+    // prevents forgery).
+    let verify_canonical = canonical_challenge_verification_bytes(&verification);
+    verification.verifier_signature = verifier_signer.sign(&verify_canonical)?;
+
+    Ok(verification)
 }
 
 // ---------------------------------------------------------------------------
@@ -446,6 +561,9 @@ mod tests {
     // -----------------------------------------------------------------------
     // Test helpers
     // -----------------------------------------------------------------------
+
+    /// Default capability URI for tests.
+    const TEST_CAPABILITY_URI: &str = "scp:capability:schema-validation/v1";
 
     /// A test resolver that maps DIDs to public key bytes.
     struct TestResolver {
@@ -537,6 +655,7 @@ mod tests {
             "did:key:challenger".into(),
             "did:key:subject".into(),
             ChallengeType::SchemaValidation,
+            TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({"schema": "test"}),
             Duration::from_secs(300),
             &signer,
@@ -548,6 +667,7 @@ mod tests {
         assert_eq!(req.challenger_did, "did:key:challenger");
         assert_eq!(req.subject_did, "did:key:subject");
         assert_eq!(req.challenge_type, ChallengeType::SchemaValidation);
+        assert_eq!(req.capability_uri, TEST_CAPABILITY_URI);
         assert_eq!(req.parameters, serde_json::json!({"schema": "test"}));
         assert_eq!(req.timeout, Duration::from_secs(300));
         assert_eq!(req.signature.len(), 64);
@@ -562,6 +682,7 @@ mod tests {
             "did:key:challenger".into(),
             "did:key:subject".into(),
             ChallengeType::PromptInjectionResistance,
+            TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({}),
             Duration::from_secs(60),
             &signer,
@@ -572,6 +693,7 @@ mod tests {
             "did:key:challenger".into(),
             "did:key:subject".into(),
             ChallengeType::PromptInjectionResistance,
+            TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({}),
             Duration::from_secs(60),
             &signer,
@@ -596,6 +718,7 @@ mod tests {
                 "did:key:c".into(),
                 "did:key:s".into(),
                 ct.clone(),
+                TEST_CAPABILITY_URI.to_owned(),
                 serde_json::json!({}),
                 Duration::from_secs(60),
                 &signer,
@@ -623,6 +746,7 @@ mod tests {
             "did:key:challenger".into(),
             "did:key:subject".into(),
             ChallengeType::SchemaValidation,
+            TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({"schema": "test"}),
             Duration::from_secs(300),
             &signer,
@@ -637,13 +761,14 @@ mod tests {
             990,
         );
 
-        let result = verify_challenge_response(&request, &response, &resolver, &clock);
+        let result =
+            verify_challenge_response(&request, &response, &resolver, &clock, &signer, None);
         assert!(result.is_ok(), "expected Ok, got {result:?}");
 
         let verification = result.unwrap();
-        assert_eq!(verification.challenge_id, request.challenge_id);
-        assert_eq!(verification.challenger_did, "did:key:challenger");
-        assert_eq!(verification.responder_did, "did:key:subject");
+        assert_eq!(verification.verification_id, request.challenge_id);
+        assert_eq!(verification.verifier_did, "did:key:challenger");
+        assert_eq!(verification.subject_did, "did:key:subject");
         assert_eq!(verification.challenge_type, ChallengeType::SchemaValidation);
         assert_eq!(
             verification.verification_method,
@@ -670,6 +795,7 @@ mod tests {
             "did:key:challenger".into(),
             "did:key:subject".into(),
             ChallengeType::RateLimitCompliance,
+            TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({}),
             Duration::from_secs(600),
             &signer,
@@ -685,7 +811,8 @@ mod tests {
         );
 
         let verification =
-            verify_challenge_response(&request, &response, &resolver, &clock).unwrap();
+            verify_challenge_response(&request, &response, &resolver, &clock, &signer, None)
+                .unwrap();
 
         // Must be ChallengeVerified, not SelfAttested.
         assert_eq!(
@@ -714,6 +841,7 @@ mod tests {
             "did:key:challenger".into(),
             "did:key:subject".into(),
             ChallengeType::SchemaValidation,
+            TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({}),
             Duration::from_secs(300),
             &signer,
@@ -728,7 +856,8 @@ mod tests {
             990,
         );
 
-        let result = verify_challenge_response(&request, &response, &resolver, &clock);
+        let result =
+            verify_challenge_response(&request, &response, &resolver, &clock, &signer, None);
         assert!(result.is_err());
         match result {
             Err(TrustError::ChallengeIdMismatch { .. }) => {}
@@ -750,6 +879,7 @@ mod tests {
             "did:key:challenger".into(),
             "did:key:subject".into(),
             ChallengeType::SchemaValidation,
+            TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({}),
             Duration::from_secs(300),
             &signer,
@@ -765,7 +895,8 @@ mod tests {
             990,
         );
 
-        let result = verify_challenge_response(&request, &response, &resolver, &clock);
+        let result =
+            verify_challenge_response(&request, &response, &resolver, &clock, &signer, None);
         assert!(result.is_err());
         match result {
             Err(TrustError::ChallengeResponderMismatch { .. }) => {}
@@ -788,6 +919,7 @@ mod tests {
             "did:key:challenger".into(),
             "did:key:subject".into(),
             ChallengeType::SchemaValidation,
+            TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({}),
             Duration::from_secs(60), // 60 second timeout
             &signer,
@@ -804,7 +936,8 @@ mod tests {
             100,
         );
 
-        let result = verify_challenge_response(&request, &response, &resolver, &clock);
+        let result =
+            verify_challenge_response(&request, &response, &resolver, &clock, &signer, None);
         assert!(result.is_err());
         match result {
             Err(TrustError::ChallengeTimeout { .. }) => {}
@@ -826,6 +959,7 @@ mod tests {
             "did:key:challenger".into(),
             "did:key:subject".into(),
             ChallengeType::PromptInjectionResistance,
+            TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({}),
             Duration::from_secs(300), // 5-minute timeout
             &signer,
@@ -842,7 +976,8 @@ mod tests {
             800,
         );
 
-        let result = verify_challenge_response(&request, &response, &resolver, &clock);
+        let result =
+            verify_challenge_response(&request, &response, &resolver, &clock, &signer, None);
         assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
 
@@ -860,6 +995,7 @@ mod tests {
             "did:key:challenger".into(),
             "did:key:subject".into(),
             ChallengeType::SchemaValidation,
+            TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({}),
             Duration::from_secs(300),
             &signer,
@@ -877,7 +1013,8 @@ mod tests {
         // Corrupt the signature.
         response.signature[0] ^= 0xff;
 
-        let result = verify_challenge_response(&request, &response, &resolver, &clock);
+        let result =
+            verify_challenge_response(&request, &response, &resolver, &clock, &signer, None);
         assert!(result.is_err());
         match result {
             Err(TrustError::ChallengeSignatureInvalid { .. }) => {}
@@ -901,6 +1038,7 @@ mod tests {
             "did:key:challenger".into(),
             "did:key:subject".into(),
             ChallengeType::SchemaValidation,
+            TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({}),
             Duration::from_secs(300),
             &signer,
@@ -915,7 +1053,8 @@ mod tests {
             990,
         );
 
-        let result = verify_challenge_response(&request, &response, &resolver, &clock);
+        let result =
+            verify_challenge_response(&request, &response, &resolver, &clock, &signer, None);
         assert!(result.is_err());
         match result {
             Err(TrustError::ChallengeSignatureInvalid { .. }) => {}
@@ -937,6 +1076,7 @@ mod tests {
             "did:key:challenger".into(),
             "did:key:subject".into(),
             ChallengeType::SchemaValidation,
+            TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({}),
             Duration::from_secs(300),
             &signer,
@@ -951,7 +1091,8 @@ mod tests {
             990,
         );
 
-        let result = verify_challenge_response(&request, &response, &resolver, &clock);
+        let result =
+            verify_challenge_response(&request, &response, &resolver, &clock, &signer, None);
         assert!(result.is_err());
     }
 
@@ -987,6 +1128,7 @@ mod tests {
             challenge_type: ChallengeType::SchemaValidation,
             challenger_did: "did:key:c".into(),
             subject_did: "did:key:s".into(),
+            capability_uri: TEST_CAPABILITY_URI.to_owned(),
             parameters: serde_json::json!({"key": "value"}),
             timeout: Duration::from_secs(60),
             signature: vec![],

@@ -335,6 +335,8 @@ async fn phase2_end_to_end_integration() {
             test_vectors: vec![],
             operator_did: "did:dht:z6MkTestOperator".into(),
             economic_metadata: None,
+            registered_at: 0,
+            signature: Vec::new(),
         }],
         ttl: Some(Duration::from_secs(300)), // 5 minutes
         memory_scope: MemoryScope::Ephemeral,
@@ -383,6 +385,8 @@ async fn phase2_end_to_end_integration() {
         test_vectors: vec![],
         operator_did: alice_did.clone(),
         economic_metadata: None,
+        registered_at: 0,
+        signature: Vec::new(),
     };
     let (tool_id, _tool_registered_event) = register_tool(
         &mut tool_registry,

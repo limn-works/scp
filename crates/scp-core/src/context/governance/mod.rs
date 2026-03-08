@@ -1859,6 +1859,8 @@ mod tests {
                     test_vectors: vec![],
                     operator_did: "did:dht:z6MkTestOperator".into(),
                     economic_metadata: None,
+                    registered_at: 0,
+                    signature: Vec::new(),
                 }),
             },
             GovernanceAction::RemoveTool {
@@ -2413,6 +2415,8 @@ mod tests {
                     test_vectors: vec![],
                     operator_did: "did:dht:z6MkTestOperator".into(),
                     economic_metadata: None,
+                    registered_at: 0,
+                    signature: Vec::new(),
                 }),
             },
             GovernanceAction::RemoveTool {

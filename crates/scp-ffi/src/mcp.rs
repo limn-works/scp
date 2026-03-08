@@ -2306,6 +2306,8 @@ mod tests {
                     test_vectors: vec![],
                     operator_did: "did:dht:z6MkOperator".into(),
                     economic_metadata: None,
+                    registered_at: 0,
+                    signature: Vec::new(),
                 };
                 scp_core::context::tools::register_tool(
                     &mut rt.tool_registry,
