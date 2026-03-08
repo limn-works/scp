@@ -2649,23 +2649,13 @@ impl ContextManager {
         ),
         ContextError,
     > {
-        let (proposal, events, should_execute, invalidated_by_conflict, in_freeze, conflict_events) = {
+        let (proposal, events, should_execute) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
 
             require_active(&ctx.handle)?;
-
-            // SCP-272: Check and auto-resolve expired governance freezes (48-hour timeout).
-            let _ = self.check_and_resolve_expired_freezes(ctx);
-
-            // SCP-272: Block new proposals (except ResolveConflict) while governance is frozen.
-            if ctx.governance_freeze.is_some() && !matches!(action, GovernanceAction::ResolveConflict { .. }) {
-                return Err(ContextError::GovernanceFailed(
-                    "governance is frozen due to simultaneous conflict — only ResolveConflict proposals are accepted".into(),
-                ));
-            }
 
             let gov_ctx = Self::build_governance_context(ctx);
 
@@ -2676,42 +2666,12 @@ impl ContextManager {
 
             let should_execute = proposal.status == ProposalStatus::Approved;
 
-            let conflict_events = if should_execute {
-                self.detect_and_handle_conflicts(ctx, &proposal)
-            } else {
-                Vec::new()
-            };
-
-            // Check if the proposal was invalidated by conflict detection
-            let invalidated_by_conflict = conflict_events.iter().any(|e| {
-                matches!(e, GovernanceEvent::ConflictResolved { loser_id, .. } if *loser_id == proposal.proposal_id)
-            });
-
-            let in_freeze = ctx.governance_freeze.is_some();
-
-            (proposal, events, should_execute, invalidated_by_conflict, in_freeze, conflict_events)
+            (proposal, events, should_execute)
         };
         // Lock dropped.
 
-        // Emit conflict events to the event log.
-        if !conflict_events.is_empty() {
-            let context_id_bytes = context_id_to_bytes(context_id);
-            for event in &conflict_events {
-                match event {
-                    GovernanceEvent::ConflictDetected { .. } => {
-                        let _ = self.event_log.append_context_event(&context_id_bytes, "GovernanceConflictDetected");
-                    }
-                    GovernanceEvent::ConflictResolved { .. } => {
-                        let _ = self.event_log.append_context_event(&context_id_bytes, "GovernanceConflictResolved");
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // If the proposal was auto-approved (SingleAdmin), execute immediately
-        // — unless it was invalidated by conflict or governance is frozen.
-        let execution_result = if should_execute && !invalidated_by_conflict && !in_freeze {
+        // If the proposal was auto-approved (SingleAdmin), execute immediately.
+        let execution_result = if should_execute {
             Some(
                 self.execute_governance_action(context_id, &proposal)
                     .await?,
@@ -5007,105 +4967,6 @@ impl ContextManager {
         crate::trust::verify_challenge_response(request, response, &resolver, &clock).map_err(|e| {
             ContextError::PermissionDenied(format!("challenge verification failed: {e}"))
         })
-    }
-
-    // -----------------------------------------------------------------------
-    // Checkpoint cosignatures (SCP-273, ADR-031 §9)
-    // -----------------------------------------------------------------------
-
-    /// Creates a governance-aware checkpoint for a context.
-    ///
-    /// Constructs a [`ContextCheckpoint`] signed by the creator and queries
-    /// the governance engine for cosignature requirements. For `SingleAdmin`,
-    /// the checkpoint is immediately `FullyAttested`. For multi-admin models,
-    /// it starts as `PartiallyAttested` until sufficient cosignatures are
-    /// collected via [`add_checkpoint_cosignature`](Self::add_checkpoint_cosignature).
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-    /// - [`ContextError::MembershipFailed`] if the context is not registered.
-    pub async fn create_governance_checkpoint(
-        &self,
-        context_id: &str,
-        checkpoint_seq: u64,
-        merkle_root: [u8; 32],
-        event_count: u64,
-        last_event_hash: [u8; 32],
-        state_snapshot_hash: [u8; 32],
-        creator_did: &DID,
-        creator_signature: Vec<u8>,
-    ) -> Result<ContextCheckpoint, ContextError> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let contexts = self.contexts.lock().await;
-        let ctx = contexts
-            .get(context_id)
-            .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
-        require_active(&ctx.handle)?;
-
-        let (_, min_count) = ctx.governance_engine.checkpoint_cosignature_requirements();
-        let attestation_status = if min_count == 0 {
-            CheckpointAttestationStatus::FullyAttested
-        } else {
-            CheckpointAttestationStatus::PartiallyAttested
-        };
-
-        let created_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        Ok(ContextCheckpoint {
-            checkpoint_seq,
-            merkle_root,
-            event_count,
-            last_event_hash,
-            state_snapshot_hash,
-            created_at,
-            creator_did: creator_did.clone(),
-            creator_signature,
-            cosignatures: Vec::new(),
-            attestation_status,
-        })
-    }
-
-    /// Adds a cosignature to an existing checkpoint and re-evaluates attestation status.
-    ///
-    /// Validates the cosignature against the governance engine's requirements.
-    /// If the quorum is now met, the checkpoint transitions to `FullyAttested`.
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::MembershipFailed`] if the context is not registered.
-    /// - [`ContextError::GovernanceFailed`] if the cosignature validation fails.
-    pub async fn add_checkpoint_cosignature(
-        &self,
-        context_id: &str,
-        checkpoint: &mut ContextCheckpoint,
-        cosignature: CosignedCheckpoint,
-    ) -> Result<CheckpointAttestationStatus, ContextError> {
-        let contexts = self.contexts.lock().await;
-        let ctx = contexts
-            .get(context_id)
-            .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
-
-        checkpoint.cosignatures.push(cosignature);
-
-        // Compute checkpoint hash for verification
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(&checkpoint.merkle_root);
-        hasher.update(checkpoint.checkpoint_seq.to_be_bytes());
-        hasher.update(checkpoint.event_count.to_be_bytes());
-        let checkpoint_hash = hasher.finalize();
-
-        let status = ctx
-            .governance_engine
-            .validate_checkpoint_cosignatures(&checkpoint.cosignatures, &checkpoint_hash)
-            .map_err(|e| ContextError::GovernanceFailed(e))?;
-
-        checkpoint.attestation_status = status.clone();
-        Ok(status)
     }
 
     /// Detects and handles conflicts when a proposal becomes approved (ADR-031 §7).
