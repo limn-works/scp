@@ -3838,8 +3838,8 @@ pub fn trust_create_challenge(target_did: String) -> Result<ChallengeResult, Scp
     let request = scp_core::trust::issue_challenge(
         "did:key:ephemeral-challenger".into(),
         target_did.into(),
-        scp_core::trust::ChallengeType::SchemaValidation,
-        "scp:capability:schema-validation".to_owned(),
+        scp_core::trust::ChallengeType::schema_validation(),
+        "scp:capability:schema-validation/v1".to_string(),
         serde_json::json!({}),
         std::time::Duration::from_secs(300),
         &signer,
@@ -3883,24 +3883,89 @@ pub fn trust_verify_response(
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
     let clock = scp_identity::cache::SystemClock;
 
-    struct EphemeralVerifierSigner(ed25519_dalek::SigningKey);
-    impl scp_core::trust::ChallengeSigner for EphemeralVerifierSigner {
+    struct EphemeralVerifySigner(ed25519_dalek::SigningKey);
+    impl scp_core::trust::ChallengeSigner for EphemeralVerifySigner {
         fn sign(&self, data: &[u8]) -> Result<Vec<u8>, scp_core::trust::TrustError> {
             use ed25519_dalek::Signer;
             let sig = self.0.sign(data);
             Ok(sig.to_bytes().to_vec())
         }
     }
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let verifier_signer = EphemeralVerifierSigner(signing_key);
 
-    Ok(scp_core::trust::verify_challenge_response(
-        &request,
-        &response,
-        &resolver,
-        &clock,
-        &verifier_signer,
-        None,
-    )
-    .is_ok())
+    let verify_signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let verify_signer = EphemeralVerifySigner(verify_signing_key);
+
+    Ok(scp_core::trust::verify_challenge_response(&request, &response, &resolver, &clock, &verify_signer, None).is_ok())
+}
+
+// ---------------------------------------------------------------------------
+// Context export/import (#363)
+// ---------------------------------------------------------------------------
+
+/// Exports a context's full state as serialized MessagePack bytes.
+///
+/// Returns the serialized bytes of a `StoredValue<ContextExport>` envelope
+/// (§17.5), suitable for backup, migration, or transfer to another node.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` if the context does not exist, export fails,
+/// or serialization fails.
+#[uniffi::export]
+pub async fn context_export(handle: Arc<ContextHandle>) -> Result<Vec<u8>, ScpError> {
+    let ctx_id = handle.context_id.clone();
+    let creator_did = handle.creator_did.clone();
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager();
+            let export = manager
+                .export_context(&ctx_id, scp_identity::DID::from(creator_did))
+                .await
+                .map_err(ScpError::from)?;
+            scp_core::context::export_import::serialize_export(&export).map_err(|e| {
+                ScpError::Context {
+                    message: format!("export serialization failed: {e}"),
+                    code: "SCP-CTX-2030".to_owned(),
+                }
+            })
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            message: format!("tokio task join error during context export: {e}"),
+            code: "SCP-CTX-2031".to_owned(),
+        })?
+}
+
+/// Imports a context from serialized MessagePack bytes.
+///
+/// The bytes must be a `StoredValue<ContextExport>` envelope (§17.5), as
+/// produced by [`context_export`].
+///
+/// Returns the context ID of the imported context.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` if deserialization, validation, or import
+/// fails.
+#[uniffi::export]
+pub async fn context_import(data: Vec<u8>) -> Result<String, ScpError> {
+    runtime()
+        .spawn(async move {
+            let export =
+                scp_core::context::export_import::deserialize_export(&data).map_err(|e| {
+                    ScpError::Context {
+                        message: format!("invalid export data: {e}"),
+                        code: "SCP-CTX-2032".to_owned(),
+                    }
+                })?;
+            let context_id = export.snapshot.context_id.clone();
+            let manager = crate::runtime::context_manager();
+            manager.import_context(export).await.map_err(ScpError::from)?;
+            Ok(context_id)
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            message: format!("tokio task join error during context import: {e}"),
+            code: "SCP-CTX-2033".to_owned(),
+        })?
 }

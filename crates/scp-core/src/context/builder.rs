@@ -291,6 +291,52 @@ pub trait ContextEventLogProvider: Send + Sync {
         self.append_event(context_id, event)
             .map_err(|e| ContextError::EventLogFailed(e.to_string()))
     }
+
+    // -- Export/import for context state portability (#363) -------------------
+
+    /// Exports the event log entries for a context as serialized bytes
+    /// (MessagePack-encoded `Vec<EventLogEntry>`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if the context has no event
+    /// log or serialization fails.
+    fn export_event_log_data(&self, context_id: &[u8; 32]) -> Result<Vec<u8>, ContextError> {
+        let _ = context_id;
+        Err(ContextError::EventLogFailed(
+            "event log export not supported by this provider".into(),
+        ))
+    }
+
+    /// Imports serialized event log entries into this provider, replacing
+    /// any existing log for the context. The implementation must verify
+    /// Merkle chain integrity before accepting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if deserialization fails or
+    /// the Merkle chain is broken.
+    fn import_event_log_data(
+        &self,
+        context_id: &[u8; 32],
+        data: &[u8],
+    ) -> Result<(), ContextError> {
+        let _ = (context_id, data);
+        Err(ContextError::EventLogFailed(
+            "event log import not supported by this provider".into(),
+        ))
+    }
+
+    /// Returns the Merkle root hash of the event log for a context.
+    ///
+    /// Returns all zeros if the log is empty. Returns an error if no log
+    /// exists for the context.
+    fn event_log_merkle_root(&self, context_id: &[u8; 32]) -> Result<[u8; 32], ContextError> {
+        let _ = context_id;
+        Err(ContextError::EventLogFailed(
+            "merkle root not supported by this provider".into(),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------

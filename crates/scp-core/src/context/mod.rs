@@ -29,6 +29,7 @@
 pub mod broadcast;
 pub mod builder;
 pub mod close;
+pub mod export_import;
 pub mod governance;
 pub mod invitation;
 pub mod manager;
@@ -162,6 +163,12 @@ pub use broadcast::{
     SubscriberRegistration, SubscriptionResult, UnsubscribeResult,
 };
 
+// Re-export context export/import types (issue #363).
+pub use export_import::{
+    ContextExport, ExportScope, CURRENT_EXPORT_VERSION, create_export, deserialize_export,
+    serialize_export, validate_export_for_import, verify_merkle_chain,
+};
+
 // Re-export TTL management types (SCP-021, SCP-066).
 pub use ttl::{CloseResult, TtlExtension, TtlTimer};
 pub use ttl::{
@@ -287,6 +294,11 @@ pub enum ContextError {
     /// The specified member was not found in the context.
     #[error("member not found: {0}")]
     MemberNotFound(String),
+
+    /// An operation was attempted while the context or subcomponent is in an
+    /// unexpected state (e.g., summary window already disputed).
+    #[error("invalid state: {0}")]
+    InvalidState(String),
 
     /// A key package validation failed.
     #[error("invalid key package: {0}")]

@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::bridge::BridgeMode;
 use crate::economy::EconomicPolicy;
+use crate::trust::RequireParticipation;
+
+pub use super::close::IncompleteVerificationPolicy;
 
 // ---------------------------------------------------------------------------
 // Capability (unified type from roles module)
@@ -409,6 +412,22 @@ pub struct PublicMetadata {
     #[serde(default)]
     pub bridges: Vec<BridgeInfo>,
 
+    // --- Structural fields (runtime, always visible) ---
+    /// DIDs of active bridge operators registered in this context.
+    ///
+    /// Always visible (never filtered by `MetadataVisibilityPolicy`) because
+    /// bridge presence is a trust signal required for informed consent before
+    /// joining (spec §12.6.1: "Context metadata (§5.7) MUST include
+    /// `bridge_operator_did` when a bridge is registered").
+    ///
+    /// Empty when no bridges are registered. Multiple entries when multiple
+    /// bridges from different operators are active. Deduplicated — the same
+    /// operator DID appears only once even if they operate multiple bridges.
+    /// On bridge revocation, the operator's DID is removed if they have no
+    /// remaining active bridges.
+    #[serde(default)]
+    pub bridge_operator_dids: Vec<DID>,
+
     // --- Operational fields (governed by MetadataVisibilityPolicy) ---
     /// Current member count. `None` when hidden by `MemberOnly` or unavailable.
     pub member_count: Option<u64>,
@@ -452,6 +471,13 @@ pub struct RuntimeMetadata {
     /// Bridges are a structural metadata field -- always visible before opt-in.
     /// Defaults to empty when no bridges are registered.
     pub bridges: Vec<BridgeInfo>,
+    /// DIDs of active bridge operators registered in this context (spec §12.6.1).
+    ///
+    /// Populated from `BridgeRegistry::bridge_operator_dids()`. Empty vec means
+    /// no active bridges. This is always visible in `PublicMetadata` (structural,
+    /// not filtered by `MetadataVisibilityPolicy`).
+    #[allow(clippy::struct_field_names)]
+    pub bridge_operator_dids: Vec<DID>,
 }
 
 // ---------------------------------------------------------------------------
@@ -556,6 +582,24 @@ pub struct ContextParams {
     /// call chains originating from or passing through this context.
     #[serde(default)]
     pub max_chain_depth: Option<u8>,
+
+    /// Participation admission requirements (spec §7.3.2.1).
+    ///
+    /// When non-empty, joining members must present [`ParticipationProfile`]
+    /// attestations satisfying every entry. Empty means no participation
+    /// requirements (the default).
+    #[serde(default)]
+    pub participation_requirements: Vec<RequireParticipation>,
+
+    /// Policy for handling incomplete summary verification at window expiry.
+    ///
+    /// Only relevant for `MemoryScope::Summary` contexts. Determines whether
+    /// close proceeds or the window is extended when not all members have
+    /// verified. Defaults to [`IncompleteVerificationPolicy::Proceed`].
+    ///
+    /// See issue #365.
+    #[serde(default)]
+    pub incomplete_verification_policy: IncompleteVerificationPolicy,
 }
 
 impl Default for ContextParams {
@@ -575,6 +619,8 @@ impl Default for ContextParams {
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
             max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         }
     }
 }
@@ -607,6 +653,7 @@ impl ContextParams {
             memory_scope: self.memory_scope,
             metadata_visibility: self.metadata_visibility.clone(),
             bridges: runtime.bridges.clone(),
+            bridge_operator_dids: runtime.bridge_operator_dids.clone(),
 
             // Operational fields — filtered by visibility policy.
             member_count: filter_field(vis.member_count, runtime.member_count),
@@ -664,6 +711,7 @@ mod tests {
             MetadataVisibilityPolicy::default()
         );
         assert!(params.projection_policy.is_none());
+        assert!(params.participation_requirements.is_empty());
     }
 
     #[test]
@@ -712,6 +760,8 @@ mod tests {
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
             max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         };
 
         assert_eq!(params.mode, ContextMode::Broadcast);
@@ -824,6 +874,8 @@ mod tests {
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
             max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         };
 
         let json = serde_json::to_string(&params).ok();
@@ -876,6 +928,8 @@ mod tests {
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
             max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         };
 
         let json = serde_json::to_string(&params).unwrap();
@@ -908,6 +962,7 @@ mod tests {
             MetadataVisibilityPolicy::default()
         );
         assert!(params.projection_policy.is_none());
+        assert!(params.participation_requirements.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1026,6 +1081,7 @@ mod tests {
             tool_interface_count: Some(3),
             child_context_info: Some(vec!["child-1".to_owned(), "child-2".to_owned()]),
             bridges: Vec::new(),
+            bridge_operator_dids: Vec::new(),
         }
     }
 
@@ -1316,5 +1372,142 @@ mod tests {
         let json = serde_json::to_string(&meta).unwrap();
         let deserialized: PublicMetadata = serde_json::from_str(&json).unwrap();
         assert_eq!(meta, deserialized);
+    }
+
+    // -----------------------------------------------------------------------
+    // bridge_operator_dids in PublicMetadata (SCP-BCH-013, §12.6.1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn public_metadata_bridge_operator_dids_empty_by_default() {
+        let params = ContextParams::default();
+        let runtime = RuntimeMetadata::default();
+        let meta = params.public_metadata(&runtime);
+        assert!(
+            meta.bridge_operator_dids.is_empty(),
+            "bridge_operator_dids should be empty when no bridges registered"
+        );
+    }
+
+    #[test]
+    fn public_metadata_bridge_operator_dids_populated_from_runtime() {
+        let params = ContextParams::default();
+        let runtime = RuntimeMetadata {
+            bridge_operator_dids: vec![
+                DID::from("did:dht:z6MkOperator1"),
+                DID::from("did:dht:z6MkOperator2"),
+            ],
+            ..RuntimeMetadata::default()
+        };
+        let meta = params.public_metadata(&runtime);
+        assert_eq!(meta.bridge_operator_dids.len(), 2);
+        assert!(
+            meta.bridge_operator_dids
+                .contains(&DID::from("did:dht:z6MkOperator1"))
+        );
+        assert!(
+            meta.bridge_operator_dids
+                .contains(&DID::from("did:dht:z6MkOperator2"))
+        );
+    }
+
+    #[test]
+    fn public_metadata_bridge_operator_dids_always_visible() {
+        // bridge_operator_dids is a structural field — always visible
+        // regardless of MetadataVisibilityPolicy. Verify it's present even
+        // when all operational fields are MemberOnly.
+        let params = ContextParams {
+            metadata_visibility: MetadataVisibilityPolicy {
+                member_count: FieldVisibility::MemberOnly,
+                context_age: FieldVisibility::MemberOnly,
+                creator_identity: FieldVisibility::MemberOnly,
+                name: FieldVisibility::MemberOnly,
+                description: FieldVisibility::MemberOnly,
+                economic_policy: FieldVisibility::MemberOnly,
+                tool_interface_count: FieldVisibility::MemberOnly,
+                child_context_info: FieldVisibility::MemberOnly,
+            },
+            ..ContextParams::default()
+        };
+        let runtime = RuntimeMetadata {
+            bridge_operator_dids: vec![DID::from("did:dht:z6MkBridgeOp")],
+            member_count: Some(10),
+            ..RuntimeMetadata::default()
+        };
+        let meta = params.public_metadata(&runtime);
+
+        // Operational fields hidden.
+        assert!(meta.member_count.is_none());
+        // Bridge operator DIDs always visible.
+        assert_eq!(meta.bridge_operator_dids.len(), 1);
+        assert_eq!(
+            meta.bridge_operator_dids[0],
+            DID::from("did:dht:z6MkBridgeOp")
+        );
+    }
+
+    #[test]
+    fn public_metadata_bridge_operator_dids_serialization_roundtrip() {
+        let params = ContextParams::default();
+        let runtime = RuntimeMetadata {
+            bridge_operator_dids: vec![DID::from("did:dht:z6MkOp1"), DID::from("did:dht:z6MkOp2")],
+            ..RuntimeMetadata::default()
+        };
+        let meta = params.public_metadata(&runtime);
+
+        let json = serde_json::to_string(&meta).unwrap();
+        let deserialized: PublicMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(meta.bridge_operator_dids, deserialized.bridge_operator_dids);
+    }
+
+    // -----------------------------------------------------------------------
+    // participation_requirements (SCP-BA-002, §7.3.2.1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn participation_requirements_serde_roundtrip() {
+        use crate::trust::{ParticipationFact, ParticipationThreshold, RequireParticipation};
+
+        let params = ContextParams {
+            participation_requirements: vec![
+                RequireParticipation {
+                    fact: ParticipationFact::ToolInvocationCount,
+                    threshold: ParticipationThreshold::AtLeast(100),
+                    max_age_secs: 86400,
+                    min_contexts: 2,
+                },
+                RequireParticipation {
+                    fact: ParticipationFact::ParticipationDuration,
+                    threshold: ParticipationThreshold::GreaterThan(3600),
+                    max_age_secs: 172800,
+                    min_contexts: 1,
+                },
+            ],
+            ..ContextParams::default()
+        };
+
+        let json = serde_json::to_string(&params).unwrap();
+        let deserialized: ContextParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(params, deserialized);
+        assert_eq!(deserialized.participation_requirements.len(), 2);
+    }
+
+    #[test]
+    fn participation_requirements_backwards_compat() {
+        // JSON without participation_requirements field deserializes to empty vec.
+        let json = r#"{
+            "mode": "Encrypted",
+            "ceiling": [],
+            "ceiling_policy": "Immutable",
+            "promotion_policy": "NoPromotion",
+            "roles": [],
+            "tools": [],
+            "ttl": null,
+            "memory_scope": "Ephemeral",
+            "governance": "SingleAdmin",
+            "template_id": null
+        }"#;
+        let params: ContextParams = serde_json::from_str(json).unwrap();
+        assert!(params.participation_requirements.is_empty());
     }
 }

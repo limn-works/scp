@@ -23,10 +23,15 @@
 //! - [`shadow`] -- Shadow identity creation and role management.
 //! - [`claiming`] -- Shadow claiming via identity attestation.
 //! - [`provenance`] -- Provenance marking for bridged content.
+//! - [`credentials`] -- Bridge credential lifecycle (provision, retrieve,
+//!   rotate, revoke, list).
 //!
 //! See ADR-023 in `.docs/adrs/phase-5.md`.
 
 pub mod claiming;
+pub mod credentials;
+pub mod envelope;
+pub mod oauth;
 pub mod provenance;
 pub mod registration;
 pub mod shadow;

@@ -167,6 +167,16 @@ static PROTOCOL_REGISTRY: LazyLock<HashMap<String, RegistryEntry>> = LazyLock::n
         ),
     );
 
+    // -- Tool Integrity (1) --
+    m.insert(
+        "scp:capability:tool-integrity/v1".into(),
+        entry(
+            "schema-compliance",
+            "Schema-based tool output verification. Pass = outputs match expected structure.",
+            None,
+        ),
+    );
+
     // -- Behavioral Compliance (4) --
     m.insert(
         "scp:capability:rate-limit-compliance/v1".into(),
@@ -390,8 +400,8 @@ static PROTOCOL_REGISTRY: LazyLock<HashMap<String, RegistryEntry>> = LazyLock::n
     // the actual enumerated list contains 28 entries.)
     debug_assert_eq!(
         m.len(),
-        28,
-        "PROTOCOL_REGISTRY must contain exactly 28 entries"
+        29,
+        "PROTOCOL_REGISTRY must contain exactly 29 entries"
     );
     m
 });
@@ -569,8 +579,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn protocol_registry_contains_exactly_28_entries() {
-        assert_eq!(PROTOCOL_REGISTRY.len(), 28);
+    fn protocol_registry_contains_exactly_29_entries() {
+        assert_eq!(PROTOCOL_REGISTRY.len(), 29);
     }
 
     #[test]
@@ -582,7 +592,7 @@ mod tests {
     // All 27 protocol capability URIs (from §7.3.4.3)
     // -----------------------------------------------------------------------
 
-    const ALL_PROTOCOL_URIS: [&str; 28] = [
+    const ALL_PROTOCOL_URIS: [&str; 29] = [
         // Safety & Security (4)
         "scp:capability:prompt-injection-resistance/v1",
         "scp:capability:content-safety/v1",
@@ -592,6 +602,7 @@ mod tests {
         "scp:capability:schema-validation/v1",
         "scp:capability:tool-schema-compliance/v1",
         "scp:capability:output-format-compliance/v1",
+        "scp:capability:tool-integrity/v1",
         // Behavioral Compliance (4)
         "scp:capability:rate-limit-compliance/v1",
         "scp:capability:instruction-adherence/v1",
@@ -659,7 +670,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn is_known_protocol_capability_true_for_all_28() {
+    fn is_known_protocol_capability_true_for_all_29() {
         for uri in ALL_PROTOCOL_URIS {
             assert!(
                 is_known_protocol_capability(uri),
@@ -716,7 +727,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn validate_accepts_all_28_protocol_capabilities() {
+    fn validate_accepts_all_29_protocol_capabilities() {
         for uri in ALL_PROTOCOL_URIS {
             let result = validate_capability_uri(uri);
             assert!(
@@ -877,6 +888,7 @@ mod tests {
             "scp:capability:schema-validation/v1",
             "scp:capability:tool-schema-compliance/v1",
             "scp:capability:output-format-compliance/v1",
+            "scp:capability:tool-integrity/v1",
         ];
         for uri in uris {
             assert_eq!(
@@ -885,7 +897,7 @@ mod tests {
                 "wrong category for {uri}"
             );
         }
-        assert_eq!(uris.len(), 3);
+        assert_eq!(uris.len(), 4);
     }
 
     #[test]

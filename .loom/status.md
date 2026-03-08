@@ -1,99 +1,84 @@
-# Loom Status
+# Loom Status — Phase 10 Features
+
+**Branch:** `feat/phase-10-features`
+**Last commit:** `941a501e` — chore(loom): iteration 1 checkpoint
+**Date:** 2026-03-07
+**Iteration:** 3
 
 ## Failing Tests
-<<<<<<< HEAD
-None. All 3423+ tests pass (excluding pre-existing scp-ffi-napi linker error).
-=======
-None — full workspace test suite green (5228 tests, 0 failures). Clippy clean. NAPI linkage pre-existing (needs Node.js napi symbols).
->>>>>>> feat/spec-code-alignment
+
+Unknown — disk space exhaustion on `/private/tmp` prevented running any tests or git commands.
 
 ## Uncommitted Changes
-None on the main worktree.
+
+### Stashed changes
+- `git stash list` entry `phase10-iter1-363-partial` — partial #363 (context export/import) work from iteration 1. 276 lines across `context/builder.rs`, `context/manager.rs`, `context/mod.rs`, `context/providers/event_log.rs`. New file `context/export_import.rs` is untracked.
+
+### Agent worktrees with committed work (ready to merge)
+| Agent Branch | Story | Commit | Status |
+|---|---|---|---|
+| `worktree-agent-a7df9ffe` | SCP-ACR-005 | `d99f7860` | **COMMITTED** — ready to merge |
+
+### Agent worktrees with completed but uncommitted work
+| Agent Branch | Story | Status |
+|---|---|---|
+| `worktree-agent-afc4f71d` | SCP-ACR-004 | Hit usage limit. Tests passing (37/37) but no commit. |
+| `worktree-agent-a46ebe8f` | SCP-BCH-004 | Hit usage limit. Clippy error (function too long). No commit. |
+| `worktree-agent-aefbb407` | SCP-BCH-002 | Completed implementation. Commit status unknown (disk full). |
+| `worktree-agent-a663e8f9` | SCP-BA-002 | Completed. 2844 tests passing, clippy clean. Could not commit (disk full). |
+
+### Iteration 1 worktrees (confirmed 0 commits — work is lost)
+- `worktree-agent-a8c1f3e3` (SCP-BCH-009), `worktree-agent-adb8502a` (SCP-ACR-004), `worktree-agent-a1fe421a` (#365), `worktree-agent-a7bdfcde` (SCP-BA-006) — all 0 commits ahead.
 
 ## Fixed This Iteration
-<<<<<<< HEAD
-- 36+ compilation errors from SCP-272/273 subagent merge (trait methods outside block, KeyResolver calling convention, signature serialization, missing ContextSnapshot fields)
-- 6 checkpoint cosignature test failures (fake signatures replaced with real Ed25519 signatures, mock_resolver extended)
-- Conflict detection wiring into vote submission path (was in subagent working copy but not properly merged)
-- sha2::Sha256 import and GovernanceError-to-String conversion in cherry-picked code
+
+Nothing — disk space prevented any merges or test runs.
 
 ## Tests Added / Updated
-- 49 governance integration tests (SCP-274) — governance_integration.rs
-- 15 content access governance tests (SCP-CAC-007) — manager.rs
-- 6 broadcast wiring tests (SCP-CAC-008) — manager.rs
-- Fixed 6 checkpoint cosignature tests with real signatures
 
-## Work Summary
+None on the main branch. ACR-005 agent added 16 tests (on worktree branch). BA-002 agent added 3 tests (uncommitted in worktree).
 
-### Wave 1: SCP-CAC-007 + SCP-274 (parallel)
-- **SCP-CAC-007** (content access governance actions) — subagent completed, committed d2163551, merged ddb5bbae
-- **SCP-274** (governance integration tests) — subagent completed, committed d0e0cf69, merged 796ba7a8
+## Outcomes
 
-### Wave 2: SCP-CAC-009 + SCP-CAC-010 (parallel)
-Both subagents hit usage limits before starting implementation.
-- **SCP-CAC-009** (content access integration test) — failed, needs re-dispatch
-- **SCP-CAC-010** (governance content access integration test) — failed, needs re-dispatch
+### Completed (committed in worktrees, not yet merged)
+- **SCP-ACR-005:** PASS — CapabilityEntry uses CapabilityUri type (commit d99f7860)
 
-### Compilation Fix Commits
-- c23f0601 — fix(governance): resolve compilation errors from SCP-272/273 merge (27 files, 551 insertions)
-- c5a3165f — feat(governance): wire conflict detection into vote submission path
-- 09b058cf — re-applied conflict detection wiring after revert/merge cycle
+### Completed (work done, not committed — disk full / rate limit)
+- **SCP-BA-002:** PASS — 2844 tests passing, clippy clean, but disk full prevented commit
+- **SCP-BCH-002:** PASS — implementation complete, commit status unknown
+- **SCP-ACR-004:** PARTIAL — tests passing but hit usage limit before commit
+- **SCP-BCH-004:** PARTIAL — hit usage limit, had clippy error (function too long)
 
-### Merge Strategy Notes
-SCP-CAC-007 had 28 merge conflicts in manager.rs due to overlapping changes with SCP-272 conflict detection wiring. Resolved by:
-1. Reverting the conflict detection wiring commit
-2. Accepting CAC-007's version (which included the most comprehensive changes)
-3. Cherry-picking the conflict detection wiring back on top
-4. Resolving the single remaining conflict (keeping both presence-only check and freeze check)
+### Not Yet Started (Waves 2-6)
+- SCP-BCH-009, BCH-011, BA-003, BA-005, BA-006
+- SCP-ACR-006, ACR-007, #362, #363, #365, #367
+- SCP-BCH-003, BCH-005, BCH-006, BCH-012, #364
+- SCP-BA-004, SCP-038, SCP-092
+- SCP-BCH-007
 
-## Review Outcomes
-Review deferred — Phase 6 not yet complete (CAC-009, CAC-010 remaining).
+## Blockers
 
-## Phase Status Summary
-- **Phases 0-5**: COMPLETE
-- **Phase 6**: SCP-CAC-001–008 COMPLETE. Remaining: SCP-CAC-009, SCP-CAC-010
-- **Phase 7**: SCP-267–274 COMPLETE
-- **Phase 8**: Lanes C, E done. Lanes A, B, D remaining.
-- **Issue #398**: NOT STARTED
+1. **DISK FULL (`/private/tmp` and root filesystem):** CRITICAL. The Bash tool creates output files at `/private/tmp/claude-501/.../tasks/*.output` BEFORE executing any command. When disk is full, ALL bash commands fail — including cleanup commands. This is a chicken-and-egg deadlock. MUST be freed externally before any work can proceed. Agent worktrees with Rust build artifacts are likely the main consumer.
+
+2. **Rate limits:** 2 of 5 Wave 1 agents hit API usage limits.
+
+3. **Bash guard hook:** Blocks access to agent worktree directories.
+
+## Already Completed (merged into feat/phase-10-features)
+- SCP-ACR-001, ACR-002, ACR-003
+- SCP-BA-001
+- SCP-BCH-001, BCH-008, BCH-010, BCH-013
+- #366
 
 ## Next Iteration
 
-**Re-dispatch (all dependencies met):**
-- SCP-CAC-009 (Phase 6 — content access integration test)
-- SCP-CAC-010 (Phase 6 — governance content access integration test)
-
-**After Phase 6 completes:**
-- Run review cycle on Phase 6 + Phase 7 combined
-- Begin Phase 8: SCP-227 (Lane A), #334 (Lane B), #316/#323 (Lane D)
-
-**After Phase 8:**
-- Issue #398 (envelope version field)
-=======
-- #395: HPKE sender key wrapping missing context binding — added context_id/sender_did/epoch to info + AAD
-- #396: BroadcastEnvelope missing top-level nonce and expanded AAD — added nonce field, expanded AAD with context_id + sequence
-- Formatting: cargo fmt applied across workspace (21 files)
-- scp-node too_many_lines clippy error from cargo fmt expansion — reverted to HEAD (original formatting was within limit)
-
-## Tests Added / Updated
-- **#395**: 3 new tests (hpke_rejects_wrong_context_id, hpke_rejects_wrong_sender_did, hpke_rejects_wrong_epoch) + updated 2 existing call sites
-- **#396**: 2 new tests (open_with_tampered_context_id_fails, open_with_tampered_sequence_fails) + nonce separation tests
-
-## Work Summary
-
-### Issues Completed (from prior subagent runs, merged this iteration)
-
-| Issue | Description | Commit | Tests |
-|-------|-------------|--------|-------|
-| #395 | HPKE sender key wrapping context binding (info + AAD) | 1fe28a47 | 3 new + 2 updated |
-| #396 | BroadcastEnvelope top-level nonce + expanded AAD | b4b9161c | 2 new |
-| #397 | ResetRequest nonce + anti-replay validation | d6146a16 (prior iteration) | existing |
-
-### Spec-Code Alignment Status
-- **#395**: COMPLETE
-- **#396**: COMPLETE
-- **#397**: COMPLETE (merged prior iteration)
-- **#398**: NOT STARTED (envelope version field — assigned to different loom)
-
-## Next Iteration
-Spec-Code Alignment scope (#395, #396, #397) is COMPLETE. No further work in this worktree.
->>>>>>> feat/spec-code-alignment
+1. **PREREQUISITE:** Free disk space externally:
+   - `find /private/tmp -name "*.output" -delete`
+   - Remove agent worktree target/ directories or set shared CARGO_TARGET_DIR
+   - Prune old worktrees: `git worktree prune`
+2. Merge ACR-005 from `worktree-agent-a7df9ffe`
+3. Check BCH-002 (`worktree-agent-aefbb407`) and BA-002 (`worktree-agent-a663e8f9`) for commits
+4. Re-dispatch: ACR-004, BCH-004 (and BCH-002/BA-002 if no commits)
+5. Waves 2-6: 21 remaining stories (limit 3 agents parallel)
+6. Full test suite + review cycle
+7. Update exec plan to mark Phase 10 COMPLETE

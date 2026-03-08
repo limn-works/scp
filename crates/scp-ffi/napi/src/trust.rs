@@ -137,8 +137,8 @@ pub fn trust_create_challenge(target_did: String) -> napi::Result<NapiChallengeR
     let request = scp_core::trust::issue_challenge(
         "did:key:ephemeral-challenger".into(),
         target_did.into(),
-        scp_core::trust::ChallengeType::SchemaValidation,
-        "scp:capability:schema-validation".to_owned(),
+        scp_core::trust::ChallengeType::schema_validation(),
+        "scp:capability:schema-validation/v1".to_string(),
         serde_json::json!({}),
         std::time::Duration::from_secs(300),
         &signer,
@@ -166,26 +166,19 @@ pub fn trust_verify_response(challenge_json: String, response_json: String) -> n
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
     let clock = scp_identity::cache::SystemClock;
 
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    struct EphemeralVerifierSigner(ed25519_dalek::SigningKey);
-    impl scp_core::trust::ChallengeSigner for EphemeralVerifierSigner {
+    struct EphemeralSigner(ed25519_dalek::SigningKey);
+    impl scp_core::trust::ChallengeSigner for EphemeralSigner {
         fn sign(&self, data: &[u8]) -> Result<Vec<u8>, scp_core::trust::TrustError> {
             use ed25519_dalek::Signer;
             let sig = self.0.sign(data);
             Ok(sig.to_bytes().to_vec())
         }
     }
-    let verifier_signer = EphemeralVerifierSigner(signing_key);
 
-    Ok(scp_core::trust::verify_challenge_response(
-        &request,
-        &response,
-        &resolver,
-        &clock,
-        &verifier_signer,
-        None,
-    )
-    .is_ok())
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let signer = EphemeralSigner(signing_key);
+
+    Ok(scp_core::trust::verify_challenge_response(&request, &response, &resolver, &clock, &signer, None).is_ok())
 }
 
 // ---------------------------------------------------------------------------

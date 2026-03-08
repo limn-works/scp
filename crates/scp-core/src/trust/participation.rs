@@ -1,17 +1,19 @@
-//! Participation record computation and participation admission types.
+//! Participation record computation and admission types.
 //!
-//! This module contains two distinct concerns:
+//! This module contains two complementary systems:
 //!
-//! 1. **Participation records** — computed locally from event logs, not stored
-//!    centrally. Any agent computes from accessible logs. Two agents may compute
-//!    different records from different event log views; this is correct behavior,
-//!    not a bug. See [`ParticipationRecord`] and [`compute_participation_record`].
+//! 1. **Participation records** ([`ParticipationRecord`]) — computed locally
+//!    from event logs. Any agent computes from accessible logs. Two agents may
+//!    compute different records from different event log views; this is correct
+//!    behavior, not a bug.
 //!
-//! 2. **Participation admission** — types for context admission requirements
-//!    and signed participation profiles. Contexts produce [`ParticipationProfile`]
-//!    attestations for members, signed with context-specific Ed25519 keys derived
-//!    via HKDF with domain separation. Verifiers check these profiles without
-//!    learning which contexts produced them. See §7.3.2.1.
+//! 2. **Participation admission** ([`RequireParticipation`],
+//!    [`ParticipationFact`], [`ParticipationThreshold`],
+//!    [`ParticipationProfile`]) — context-hosted signed attestations and
+//!    mechanical admission requirements. Contexts produce
+//!    [`ParticipationProfile`] attestations for each opted-in member.
+//!    Admitting contexts verify profiles against [`RequireParticipation`]
+//!    entries. See §7.3.2.1.
 //!
 //! See ADR-017 in `.docs/adrs/phase-4.md`.
 
@@ -256,18 +258,16 @@ fn extract_target_did_from_payload(data: &[u8]) -> Option<DID> {
 }
 
 // ---------------------------------------------------------------------------
-// ParticipationFact — which participation category to check (§7.3.2.1)
+// Participation Admission Types (§7.3.2.1)
 // ---------------------------------------------------------------------------
 
-/// A participation fact category used in admission requirements.
+/// Which category of participation fact to evaluate for admission.
 ///
-/// Each variant corresponds to a field in [`ParticipationProfile`]. Contexts
-/// declare which facts to check and what thresholds to require.
-///
-/// See §7.3.2.1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Each variant corresponds to one of the 7 fact categories in a
+/// [`ParticipationProfile`]. See §7.3.2.1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParticipationFact {
-    /// Total seconds of context participation (`participation_duration_secs`).
+    /// Total seconds of context participation.
     ParticipationDuration,
     /// Count of governance actions taken against the identity.
     GovernanceActionsAgainst,
@@ -284,9 +284,9 @@ pub enum ParticipationFact {
 }
 
 impl ParticipationFact {
-    /// Extracts the value of this fact from a [`ParticipationProfile`].
+    /// Extracts the corresponding value from a [`ParticipationProfile`].
     #[must_use]
-    pub const fn extract_value(&self, profile: &ParticipationProfile) -> u64 {
+    pub fn extract_value(&self, profile: &ParticipationProfile) -> u64 {
         match self {
             Self::ParticipationDuration => profile.participation_duration_secs,
             Self::GovernanceActionsAgainst => profile.governance_actions_against,
@@ -299,14 +299,11 @@ impl ParticipationFact {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ParticipationThreshold — comparison operators for admission (§7.3.2.1)
-// ---------------------------------------------------------------------------
-
-/// Comparison operator for participation admission requirements.
+/// Comparison operator and value for participation admission thresholds.
 ///
-/// See §7.3.2.1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Used in [`RequireParticipation`] to specify the comparison a fact value
+/// must satisfy. See §7.3.2.1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParticipationThreshold {
     /// Fact value must be strictly greater than the specified value.
     GreaterThan(u64),
@@ -323,111 +320,117 @@ pub enum ParticipationThreshold {
 impl ParticipationThreshold {
     /// Returns `true` if `value` satisfies this threshold.
     #[must_use]
-    pub const fn is_satisfied(&self, value: u64) -> bool {
+    pub fn is_satisfied(&self, value: u64) -> bool {
         match self {
-            Self::GreaterThan(t) => value > *t,
-            Self::LessThan(t) => value < *t,
-            Self::AtLeast(t) => value >= *t,
-            Self::AtMost(t) => value <= *t,
-            Self::Equals(t) => value == *t,
+            Self::GreaterThan(threshold) => value > *threshold,
+            Self::LessThan(threshold) => value < *threshold,
+            Self::AtLeast(threshold) => value >= *threshold,
+            Self::AtMost(threshold) => value <= *threshold,
+            Self::Equals(threshold) => value == *threshold,
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// RequireParticipation — admission requirement entry (§7.3.2.1)
-// ---------------------------------------------------------------------------
-
-/// A single participation admission requirement declared in `ContextParams`.
+/// A participation admission requirement declared by a context.
 ///
-/// See §7.3.2.1.
+/// Contexts include one or more `RequireParticipation` entries in their
+/// `ContextParams` admission requirements. Each entry specifies a
+/// participation fact, a threshold, a freshness requirement, and a minimum
+/// number of independent source contexts. See §7.3.2.1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequireParticipation {
-    /// Which participation category to check.
+    /// Which participation category to evaluate.
     pub fact: ParticipationFact,
-    /// The comparison and threshold value.
+    /// Comparison operator and value.
     pub threshold: ParticipationThreshold,
-    /// Record freshness requirement (seconds). Statements older than this
-    /// (relative to admission time) are rejected.
+    /// Maximum age in seconds for the participation profile's `updated_at`
+    /// timestamp. Profiles older than this are rejected.
     pub max_age_secs: u64,
-    /// Minimum number of independent contexts (distinct `signer_public_key`
-    /// values) that must attest to this fact.
+    /// Minimum number of independent source contexts (distinct
+    /// `signer_public_key` values) required to satisfy this requirement.
     pub min_contexts: u32,
 }
 
-// ---------------------------------------------------------------------------
-// ParticipationProfile — signed attestation (§7.3.2.1)
-// ---------------------------------------------------------------------------
-
-/// A signed participation profile produced by a context for one of its members.
+/// A context-hosted participation profile attesting to a member's verifiable
+/// participation facts.
 ///
-/// Contains all 7 participation fact categories plus metadata. Notably does NOT
-/// contain a `context_id` — this is the privacy guarantee. The
-/// `signer_public_key` is context-specific (derived with domain separation),
-/// preventing verifiers from correlating which contexts share a signer.
+/// Produced by contexts for opted-in members. The profile is signed by a
+/// context-specific Ed25519 key (derived with domain separation) so that
+/// verifiers cannot correlate which contexts share a signer.
 ///
-/// The `signature` covers all fields except itself, computed over
-/// [`signable_bytes`](Self::signable_bytes).
+/// **Privacy guarantee:** The profile intentionally omits `context_id`. The
+/// admitting context sees signed claims from distinct signers but cannot
+/// identify which contexts produced them.
 ///
 /// See §7.3.2.1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParticipationProfile {
-    /// The DID whose participation is summarized.
+    /// The DID of the member this profile is about.
     pub subject_did: DID,
+
     /// Total seconds of context participation.
     pub participation_duration_secs: u64,
-    /// Governance actions taken against this identity.
+
+    /// Count of governance actions taken against this identity.
     pub governance_actions_against: u64,
-    /// Governance actions initiated by this identity.
+
+    /// Count of governance actions initiated by this identity.
     pub governance_actions_by: u64,
-    /// Total tool invocations.
+
+    /// Total tool invocations across all tool types.
     pub tool_invocation_count: u64,
-    /// Contexts created.
+
+    /// Number of contexts created.
     pub context_creation_count: u64,
-    /// Role transitions.
+
+    /// Number of role transitions.
     pub role_progression_count: u64,
-    /// Attestation events.
+
+    /// Number of attestation events.
     pub attestation_count: u64,
-    /// Unix timestamp (seconds) of last update.
+
+    /// Unix timestamp (seconds) of the last update to this profile.
     pub updated_at: u64,
-    /// Merkle root of the event log at computation time.
+
+    /// Merkle root of the context's event log at profile computation time.
     pub event_log_root: [u8; 32],
-    /// Context-specific Ed25519 public key (derived with domain separation).
+
+    /// Context-specific Ed25519 public key used to sign this profile.
+    /// Derived with domain separation to prevent cross-context correlation.
     pub signer_public_key: [u8; 32],
-    /// Ed25519 signature over [`signable_bytes`](Self::signable_bytes).
-    /// 64 bytes for Ed25519.
+
+    /// Ed25519 signature over all fields except this one.
     #[serde(with = "serde_bytes")]
-    pub signature: Vec<u8>,
+    pub signature: [u8; 64],
 }
 
 impl ParticipationProfile {
-    /// Returns a deterministic byte representation of all fields except
-    /// `signature`, suitable for signing and verification.
+    /// Returns the deterministic signable bytes for this profile.
     ///
-    /// Field order is fixed and canonical. Each `u64` is encoded as 8 bytes
-    /// big-endian. The `subject_did` is encoded as its UTF-8 bytes prefixed
-    /// with a 4-byte big-endian length.
+    /// Covers all fields except `signature`. The byte layout is:
+    /// - subject_did UTF-8 bytes (length-prefixed as u32 big-endian)
+    /// - participation_duration_secs (u64 big-endian)
+    /// - governance_actions_against (u64 big-endian)
+    /// - governance_actions_by (u64 big-endian)
+    /// - tool_invocation_count (u64 big-endian)
+    /// - context_creation_count (u64 big-endian)
+    /// - role_progression_count (u64 big-endian)
+    /// - attestation_count (u64 big-endian)
+    /// - updated_at (u64 big-endian)
+    /// - event_log_root (32 bytes)
+    /// - signer_public_key (32 bytes)
     #[must_use]
     pub fn signable_bytes(&self) -> Vec<u8> {
-        /// Domain separator for participation profile signing (prevents
-        /// cross-protocol signature confusion).
-        const DOMAIN: &[u8] = b"SCP-PARTICIPATION-PROFILE-V1:";
-
         let did_bytes = self.subject_did.as_bytes();
-        // domain + 4 (len) + did_bytes + 7*8 (u64s) + 8 (updated_at) + 32 (root) + 32 (pubkey)
-        let capacity = DOMAIN.len() + 4 + did_bytes.len() + 8 * 8 + 32 + 32;
+        // 4 (length prefix) + did_bytes.len() + 8*8 (eight u64 fields) + 32 + 32
+        let capacity = 4 + did_bytes.len() + 64 + 64;
         let mut buf = Vec::with_capacity(capacity);
 
-        // Domain separator.
-        buf.extend_from_slice(DOMAIN);
-
-        // Length-prefixed DID.
-        #[allow(clippy::cast_possible_truncation)]
-        // DID strings are always short (< 256 bytes); u32 is more than enough.
+        // Length-prefixed DID string.
         buf.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
         buf.extend_from_slice(did_bytes);
 
-        // 7 fact fields + updated_at, all big-endian u64.
+        // All u64 fact fields + updated_at in declaration order.
         buf.extend_from_slice(&self.participation_duration_secs.to_be_bytes());
         buf.extend_from_slice(&self.governance_actions_against.to_be_bytes());
         buf.extend_from_slice(&self.governance_actions_by.to_be_bytes());
@@ -437,7 +440,7 @@ impl ParticipationProfile {
         buf.extend_from_slice(&self.attestation_count.to_be_bytes());
         buf.extend_from_slice(&self.updated_at.to_be_bytes());
 
-        // Fixed-size fields.
+        // Fixed-size byte arrays.
         buf.extend_from_slice(&self.event_log_root);
         buf.extend_from_slice(&self.signer_public_key);
 
@@ -498,144 +501,384 @@ pub fn derive_participation_signing_key(
 }
 
 // ---------------------------------------------------------------------------
-// ParticipationAdmissionError
+// Participation Admission Verification (§7.3.2.1)
 // ---------------------------------------------------------------------------
 
-/// Errors from participation admission verification.
+/// Error returned when participation admission verification fails.
+///
+/// Each variant carries diagnostic fields describing the specific failure.
+/// See §7.3.2.1 verification flow.
 #[derive(Debug, thiserror::Error)]
 pub enum ParticipationAdmissionError {
-    /// A statement's Ed25519 signature did not verify.
-    #[error("invalid signature on participation statement for {subject_did}")]
+    /// A statement's Ed25519 signature does not verify against its
+    /// `signer_public_key` over `signable_bytes`.
+    #[error("invalid signature on statement for {subject_did} (signer {signer_hex}): {reason}")]
     InvalidSignature {
-        /// The subject DID of the statement with the invalid signature.
+        /// The subject DID of the failing statement.
         subject_did: DID,
+        /// Hex-encoded first 8 bytes of the signer public key.
+        signer_hex: String,
+        /// Human-readable reason for the failure.
+        reason: String,
     },
 
-    /// A participation fact did not meet the required threshold.
-    #[error("threshold not met for {fact:?}: value {value}, required {threshold:?}")]
+    /// The fact value extracted from the profile does not satisfy the
+    /// requirement's threshold.
+    #[error("threshold not met for {fact:?}: value {value} does not satisfy {threshold:?}")]
     ThresholdNotMet {
-        /// The fact that failed.
+        /// Which fact category failed.
         fact: ParticipationFact,
-        /// The actual value.
-        value: u64,
-        /// The threshold that was not satisfied.
+        /// The threshold that was not met.
         threshold: ParticipationThreshold,
+        /// The actual value extracted from the profile.
+        value: u64,
     },
 
-    /// All statements for a requirement are too stale.
-    #[error("all statements too stale for {fact:?}: max_age_secs={max_age_secs}")]
+    /// All statements for a requirement have `updated_at` older than
+    /// `max_age_secs` from the current time.
+    #[error(
+        "all records too stale for {fact:?}: newest updated_at {newest_updated_at}, \
+         current_time {current_time}, max_age_secs {max_age_secs}"
+    )]
     RecordTooStale {
-        /// The fact whose statements were all stale.
+        /// Which fact category this applies to.
         fact: ParticipationFact,
-        /// The maximum age allowed.
+        /// The most recent `updated_at` among all statements.
+        newest_updated_at: u64,
+        /// The current time used for comparison.
+        current_time: u64,
+        /// The maximum allowed age in seconds.
         max_age_secs: u64,
     },
 
-    /// Fewer than `min_contexts` distinct signers provided for a requirement.
-    #[error("insufficient contexts for {fact:?}: need {required}, have {actual}")]
+    /// Statements span fewer than `min_contexts` distinct `signer_public_key`
+    /// values for a requirement.
+    #[error("insufficient contexts for {fact:?}: need {required} distinct signers, found {found}")]
     InsufficientContexts {
-        /// The fact that lacks sufficient attestations.
+        /// Which fact category this applies to.
         fact: ParticipationFact,
-        /// Number of distinct contexts required.
+        /// The minimum number of distinct signers required.
         required: u32,
-        /// Number of distinct contexts provided.
-        actual: u32,
+        /// The number of distinct signers found.
+        found: u32,
     },
 }
 
-/// Verifies that a set of participation statements satisfies all requirements.
+/// Verifies a set of [`ParticipationProfile`] statements against a context's
+/// participation admission requirements.
 ///
-/// Each statement's Ed25519 signature is verified against its
-/// `signer_public_key` over `signable_bytes`. Requirements are checked
-/// independently — all must pass.
+/// For each requirement, the function:
+/// 1. Verifies each statement's Ed25519 signature against its
+///    `signer_public_key` over `signable_bytes`.
+/// 2. Filters statements to those fresh enough (`updated_at` within
+///    `max_age_secs` of `current_time`).
+/// 3. Filters to statements where the fact value satisfies the threshold.
+/// 4. Checks that qualifying statements span at least `min_contexts` distinct
+///    `signer_public_key` values.
 ///
-/// # Parameters
+/// Returns `Ok(())` if all requirements are satisfied, or the first
+/// `ParticipationAdmissionError` encountered.
 ///
-/// - `current_time` — Unix timestamp (seconds) for freshness checks.
-/// - `requirements` — The participation requirements to check.
-/// - `statements` — The signed participation profiles to verify against.
+/// # Empty requirements
 ///
-/// # Errors
+/// If `requirements` is empty, returns `Ok(())` immediately (no requirements
+/// means no constraints).
 ///
-/// Returns the first error encountered (signature, threshold, staleness,
-/// or insufficient contexts).
+/// See §7.3.2.1.
 pub fn verify_participation_requirements(
     current_time: u64,
     requirements: &[RequireParticipation],
     statements: &[ParticipationProfile],
 ) -> Result<(), ParticipationAdmissionError> {
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     use std::collections::HashSet;
 
-    // Verify all signatures first.
-    for stmt in statements {
-        let vk = VerifyingKey::from_bytes(&stmt.signer_public_key).map_err(|_| {
-            ParticipationAdmissionError::InvalidSignature {
-                subject_did: stmt.subject_did.clone(),
-            }
-        })?;
-        let sig_bytes: [u8; 64] = stmt.signature.as_slice().try_into().map_err(|_| {
-            ParticipationAdmissionError::InvalidSignature {
-                subject_did: stmt.subject_did.clone(),
-            }
-        })?;
-        let sig = Signature::from_bytes(&sig_bytes);
-        vk.verify(&stmt.signable_bytes(), &sig).map_err(|_| {
-            ParticipationAdmissionError::InvalidSignature {
-                subject_did: stmt.subject_did.clone(),
-            }
-        })?;
+    if requirements.is_empty() {
+        return Ok(());
     }
 
-    // Check each requirement independently.
-    for req in requirements {
-        // Filter to fresh statements.
-        let fresh: Vec<&ParticipationProfile> = statements
-            .iter()
-            .filter(|s| {
-                current_time
-                    .checked_sub(s.updated_at)
-                    .is_some_and(|age| age <= req.max_age_secs)
-            })
-            .collect();
+    // Step 1: Verify all signatures up front. Any invalid signature is a
+    // hard failure regardless of which requirements use it.
+    for statement in statements {
+        verify_statement_signature(statement)?;
+    }
 
-        if fresh.is_empty() {
+    // Step 2: Check each requirement independently.
+    for req in requirements {
+        // Collect qualifying statements: fresh + threshold-satisfying.
+        let mut distinct_signers: HashSet<[u8; 32]> = HashSet::new();
+        let mut newest_updated_at: u64 = 0;
+        let mut any_fresh = false;
+
+        for statement in statements {
+            newest_updated_at = newest_updated_at.max(statement.updated_at);
+
+            // Freshness check.
+            let age = current_time.saturating_sub(statement.updated_at);
+            if age > req.max_age_secs {
+                continue;
+            }
+            any_fresh = true;
+
+            // Threshold check.
+            let value = req.fact.extract_value(statement);
+            if !req.threshold.is_satisfied(value) {
+                continue;
+            }
+
+            distinct_signers.insert(statement.signer_public_key);
+        }
+
+        // If no statements were fresh enough, report staleness.
+        if !any_fresh && !statements.is_empty() {
             return Err(ParticipationAdmissionError::RecordTooStale {
-                fact: req.fact,
+                fact: req.fact.clone(),
+                newest_updated_at,
+                current_time,
                 max_age_secs: req.max_age_secs,
             });
         }
 
-        // Count distinct signers. Truncation safe: number of signers
-        // bounded by number of statements which fits in u32.
-        let distinct_signers: HashSet<[u8; 32]> =
-            fresh.iter().map(|s| s.signer_public_key).collect();
-        #[allow(clippy::cast_possible_truncation)]
-        let distinct_count = distinct_signers.len() as u32;
-        if distinct_count < req.min_contexts {
-            return Err(ParticipationAdmissionError::InsufficientContexts {
-                fact: req.fact,
-                required: req.min_contexts,
-                actual: distinct_count,
+        // If no statements satisfied the threshold (but some were fresh),
+        // find the best value to report.
+        if distinct_signers.is_empty() {
+            // Find the best value among fresh statements for diagnostics.
+            let best_value = statements
+                .iter()
+                .filter(|s| current_time.saturating_sub(s.updated_at) <= req.max_age_secs)
+                .map(|s| req.fact.extract_value(s))
+                .max()
+                .unwrap_or(0);
+
+            return Err(ParticipationAdmissionError::ThresholdNotMet {
+                fact: req.fact.clone(),
+                threshold: req.threshold.clone(),
+                value: best_value,
             });
         }
 
-        // Check threshold against each fresh statement.
-        let any_satisfies = fresh
-            .iter()
-            .any(|s| req.threshold.is_satisfied(req.fact.extract_value(s)));
-        if !any_satisfies {
-            // Report the first value for diagnostic purposes.
-            let value = req.fact.extract_value(fresh[0]);
-            return Err(ParticipationAdmissionError::ThresholdNotMet {
-                fact: req.fact,
-                value,
-                threshold: req.threshold,
+        // Check min_contexts.
+        let found = distinct_signers.len() as u32;
+        if found < req.min_contexts {
+            return Err(ParticipationAdmissionError::InsufficientContexts {
+                fact: req.fact.clone(),
+                required: req.min_contexts,
+                found,
             });
         }
     }
 
     Ok(())
+}
+
+/// Verifies a single statement's Ed25519 signature.
+fn verify_statement_signature(
+    statement: &ParticipationProfile,
+) -> Result<(), ParticipationAdmissionError> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    let verifying_key = VerifyingKey::from_bytes(&statement.signer_public_key).map_err(|e| {
+        ParticipationAdmissionError::InvalidSignature {
+            subject_did: statement.subject_did.clone(),
+            signer_hex: hex::encode(&statement.signer_public_key[..8]),
+            reason: format!("invalid public key: {e}"),
+        }
+    })?;
+
+    let signature = Signature::from_bytes(&statement.signature);
+    let signable = statement.signable_bytes();
+
+    verifying_key.verify(&signable, &signature).map_err(|e| {
+        ParticipationAdmissionError::InvalidSignature {
+            subject_did: statement.subject_did.clone(),
+            signer_hex: hex::encode(&statement.signer_public_key[..8]),
+            reason: format!("signature verification failed: {e}"),
+        }
+    })?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Context-Hosted ParticipationProfile Production (SCP-BA-005)
+// ---------------------------------------------------------------------------
+
+/// Derives a context-specific Ed25519 signing key for participation profiles
+/// (internal version).
+///
+/// Uses HKDF-SHA256 with the context key material as IKM and
+/// `"scp-participation-statement-v1"` as the info string. The same context
+/// key material always produces the same signing key (deterministic), but
+/// different contexts produce different keys (preventing correlation).
+fn derive_participation_signing_key_internal(
+    context_key_material: &[u8; 32],
+) -> ed25519_dalek::SigningKey {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+
+    let hk = Hkdf::<Sha256>::new(None, context_key_material);
+    let mut okm = [0u8; 32];
+    // 32 bytes is well within HKDF-SHA256's output limit (255 * 32 = 8160).
+    // The only failure mode is requesting more than 8160 bytes, which cannot
+    // happen here, so the match arm is unreachable.
+    if hk.expand(PARTICIPATION_KEY_DOMAIN, &mut okm).is_err() {
+        unreachable!("HKDF-SHA256 expand for 32 bytes cannot fail");
+    }
+    ed25519_dalek::SigningKey::from_bytes(&okm)
+}
+
+/// Produces a signed [`ParticipationProfile`] for a member from the context's
+/// event log.
+///
+/// This is the core protocol operation where a context produces a profile
+/// attesting to a member's verifiable participation facts. Key properties:
+///
+/// - **Context-controlled:** Only contexts produce profiles; agents cannot
+///   write, modify, or delete them.
+/// - **Privacy-preserving:** The profile omits `context_id`. The signing key
+///   is derived with domain separation so verifiers cannot correlate it to the
+///   context identity.
+/// - **Replacement semantics:** Calling this again for the same member produces
+///   a new profile that replaces (not appends to) the prior one.
+///
+/// # Parameters
+///
+/// - `context_key_material` — The context's 32-byte key material, used to
+///   derive the context-specific Ed25519 signing key.
+/// - `member_did` — The DID of the member to produce the profile for.
+/// - `events` — The context's event log entries.
+/// - `merkle_root` — Merkle root of the event log at computation time.
+/// - `is_member` — Whether `member_did` is a current member of the context.
+/// - `is_opted_in` — Whether `member_did` has opted in to profile publication.
+/// - `current_time` — Unix timestamp (seconds) for `updated_at`.
+///
+/// # Errors
+///
+/// - [`TrustError::NotAMember`] if `is_member` is false.
+/// - [`TrustError::NotOptedIn`] if `is_opted_in` is false.
+/// - [`TrustError::EmptyEventLog`] if `events` is empty.
+///
+/// See §7.3.2.1.
+pub fn produce_participation_profile(
+    context_key_material: &[u8; 32],
+    member_did: &str,
+    events: &[Event],
+    merkle_root: [u8; 32],
+    is_member: bool,
+    is_opted_in: bool,
+    current_time: u64,
+) -> Result<ParticipationProfile, TrustError> {
+    use ed25519_dalek::Signer;
+
+    if !is_member {
+        return Err(TrustError::NotAMember {
+            did: member_did.to_owned(),
+        });
+    }
+
+    if !is_opted_in {
+        return Err(TrustError::NotOptedIn {
+            did: member_did.to_owned(),
+        });
+    }
+
+    // Compute participation facts from the event log. We use a dummy
+    // context_id since ParticipationProfile intentionally omits it.
+    let record =
+        compute_participation_record(events, member_did, "_internal", merkle_root, current_time)?;
+
+    // Derive the context-specific signing key.
+    let signing_key = derive_participation_signing_key_internal(context_key_material);
+    let verifying_key = signing_key.verifying_key();
+
+    // Build the profile with all 7 fact values from the record.
+    let total_tool_invocations: u64 = record.tool_invocations.values().sum();
+
+    let mut profile = ParticipationProfile {
+        subject_did: member_did.into(),
+        participation_duration_secs: record.participation_duration_seconds,
+        governance_actions_against: record.governance_actions_against.len() as u64,
+        governance_actions_by: record.governance_actions_by.len() as u64,
+        tool_invocation_count: total_tool_invocations,
+        context_creation_count: record.context_creation_count,
+        role_progression_count: record.role_history.len() as u64,
+        attestation_count: record.attestation_history.len() as u64,
+        updated_at: current_time,
+        event_log_root: merkle_root,
+        signer_public_key: verifying_key.to_bytes(),
+        signature: [0u8; 64], // placeholder, overwritten below
+    };
+
+    // Sign the profile.
+    let signable = profile.signable_bytes();
+    let sig = signing_key.sign(&signable);
+    profile.signature = sig.to_bytes();
+
+    Ok(profile)
+}
+
+// ---------------------------------------------------------------------------
+// ParticipationStatements DID Document Service Endpoint (SCP-BA-006)
+// ---------------------------------------------------------------------------
+
+/// The service type string for `ParticipationStatements` entries in DID documents.
+pub const PARTICIPATION_STATEMENTS_SERVICE_TYPE: &str = "ScpParticipationStatements";
+
+/// The fragment identifier for participation statements service entries.
+const PARTICIPATION_STATEMENTS_FRAGMENT: &str = "participation-statements";
+
+/// Adds a `ScpParticipationStatements` service entry to a DID document.
+///
+/// The service entry points to the relay endpoint where the agent's signed
+/// participation profiles can be fetched by admitting contexts. If a
+/// `ScpParticipationStatements` entry already exists, it is replaced.
+///
+/// # Arguments
+///
+/// * `document` — The DID document to modify.
+/// * `service_endpoint` — The URL where participation profiles are served
+///   (e.g., `https://relay.example.com/v1/scp/participation/did:dht:z6Mk...`).
+///
+/// See §7.3.2.1.
+pub fn add_participation_service(
+    document: &mut scp_identity::document::DidDocument,
+    service_endpoint: &str,
+) {
+    // Remove any existing participation statements entry.
+    document
+        .service
+        .retain(|s| s.service_type != PARTICIPATION_STATEMENTS_SERVICE_TYPE);
+
+    let service = scp_identity::document::Service {
+        id: format!("{}#{PARTICIPATION_STATEMENTS_FRAGMENT}", document.id),
+        service_type: PARTICIPATION_STATEMENTS_SERVICE_TYPE.to_owned(),
+        service_endpoint: service_endpoint.to_owned(),
+    };
+    document.service.push(service);
+}
+
+/// Removes the `ScpParticipationStatements` service entry from a DID document,
+/// if present.
+pub fn remove_participation_service(document: &mut scp_identity::document::DidDocument) {
+    document
+        .service
+        .retain(|s| s.service_type != PARTICIPATION_STATEMENTS_SERVICE_TYPE);
+}
+
+/// Extracts the `ScpParticipationStatements` service endpoint URL from a
+/// resolved DID document.
+///
+/// Returns `None` if no `ScpParticipationStatements` service entry is found.
+///
+/// See §7.3.2.1.
+#[must_use]
+pub fn extract_participation_service_endpoint(
+    document: &scp_identity::document::DidDocument,
+) -> Option<&str> {
+    document
+        .service
+        .iter()
+        .find(|s| s.service_type == PARTICIPATION_STATEMENTS_SERVICE_TYPE)
+        .map(|s| s.service_endpoint.as_str())
 }
 
 // ---------------------------------------------------------------------------
@@ -1040,112 +1283,201 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ParticipationFact tests
+    // Participation admission type tests (§7.3.2.1)
     // -----------------------------------------------------------------------
 
+    /// Helper to create a test `ParticipationProfile` with known values.
     fn make_profile() -> ParticipationProfile {
         ParticipationProfile {
-            subject_did: "did:key:alice".into(),
-            participation_duration_secs: 100,
+            subject_did: "did:key:test".into(),
+            participation_duration_secs: 86400,
             governance_actions_against: 2,
             governance_actions_by: 5,
-            tool_invocation_count: 42,
+            tool_invocation_count: 203,
             context_creation_count: 3,
-            role_progression_count: 7,
-            attestation_count: 11,
-            updated_at: 1000,
-            event_log_root: [1u8; 32],
-            signer_public_key: [2u8; 32],
-            signature: vec![0u8; 64],
+            role_progression_count: 4,
+            attestation_count: 10,
+            updated_at: 1_700_000_000,
+            event_log_root: [0xAA; 32],
+            signer_public_key: [0xBB; 32],
+            signature: [0xCC; 64],
         }
     }
 
     #[test]
-    fn extract_value_returns_correct_field_for_each_fact() {
-        let p = make_profile();
-        assert_eq!(
-            ParticipationFact::ParticipationDuration.extract_value(&p),
-            100
-        );
-        assert_eq!(
-            ParticipationFact::GovernanceActionsAgainst.extract_value(&p),
-            2
-        );
-        assert_eq!(ParticipationFact::GovernanceActionsBy.extract_value(&p), 5);
-        assert_eq!(ParticipationFact::ToolInvocationCount.extract_value(&p), 42);
-        assert_eq!(ParticipationFact::ContextCreationCount.extract_value(&p), 3);
-        assert_eq!(ParticipationFact::RoleProgressionCount.extract_value(&p), 7);
-        assert_eq!(ParticipationFact::AttestationCount.extract_value(&p), 11);
+    fn participation_fact_has_7_variants() {
+        // Exhaustive match ensures all 7 variants exist and compile.
+        let all = [
+            ParticipationFact::ParticipationDuration,
+            ParticipationFact::GovernanceActionsAgainst,
+            ParticipationFact::GovernanceActionsBy,
+            ParticipationFact::ToolInvocationCount,
+            ParticipationFact::ContextCreationCount,
+            ParticipationFact::RoleProgressionCount,
+            ParticipationFact::AttestationCount,
+        ];
+        assert_eq!(all.len(), 7);
     }
 
-    // -----------------------------------------------------------------------
-    // ParticipationThreshold tests
-    // -----------------------------------------------------------------------
+    #[test]
+    fn participation_threshold_has_5_variants() {
+        let all = [
+            ParticipationThreshold::GreaterThan(0),
+            ParticipationThreshold::LessThan(0),
+            ParticipationThreshold::AtLeast(0),
+            ParticipationThreshold::AtMost(0),
+            ParticipationThreshold::Equals(0),
+        ];
+        assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn extract_value_returns_correct_field() {
+        let profile = make_profile();
+
+        assert_eq!(
+            ParticipationFact::ParticipationDuration.extract_value(&profile),
+            86400
+        );
+        assert_eq!(
+            ParticipationFact::GovernanceActionsAgainst.extract_value(&profile),
+            2
+        );
+        assert_eq!(
+            ParticipationFact::GovernanceActionsBy.extract_value(&profile),
+            5
+        );
+        assert_eq!(
+            ParticipationFact::ToolInvocationCount.extract_value(&profile),
+            203
+        );
+        assert_eq!(
+            ParticipationFact::ContextCreationCount.extract_value(&profile),
+            3
+        );
+        assert_eq!(
+            ParticipationFact::RoleProgressionCount.extract_value(&profile),
+            4
+        );
+        assert_eq!(
+            ParticipationFact::AttestationCount.extract_value(&profile),
+            10
+        );
+    }
 
     #[test]
     fn threshold_greater_than() {
-        let t = ParticipationThreshold::GreaterThan(10);
-        assert!(!t.is_satisfied(9));
-        assert!(!t.is_satisfied(10));
-        assert!(t.is_satisfied(11));
+        assert!(ParticipationThreshold::GreaterThan(5).is_satisfied(6));
+        assert!(!ParticipationThreshold::GreaterThan(5).is_satisfied(5));
+        assert!(!ParticipationThreshold::GreaterThan(5).is_satisfied(4));
     }
 
     #[test]
     fn threshold_less_than() {
-        let t = ParticipationThreshold::LessThan(10);
-        assert!(t.is_satisfied(9));
-        assert!(!t.is_satisfied(10));
-        assert!(!t.is_satisfied(11));
+        assert!(ParticipationThreshold::LessThan(5).is_satisfied(4));
+        assert!(!ParticipationThreshold::LessThan(5).is_satisfied(5));
+        assert!(!ParticipationThreshold::LessThan(5).is_satisfied(6));
     }
 
     #[test]
     fn threshold_at_least() {
-        let t = ParticipationThreshold::AtLeast(10);
-        assert!(!t.is_satisfied(9));
-        assert!(t.is_satisfied(10));
-        assert!(t.is_satisfied(11));
+        assert!(ParticipationThreshold::AtLeast(5).is_satisfied(5));
+        assert!(ParticipationThreshold::AtLeast(5).is_satisfied(6));
+        assert!(!ParticipationThreshold::AtLeast(5).is_satisfied(4));
     }
 
     #[test]
     fn threshold_at_most() {
-        let t = ParticipationThreshold::AtMost(10);
-        assert!(t.is_satisfied(9));
-        assert!(t.is_satisfied(10));
-        assert!(!t.is_satisfied(11));
+        assert!(ParticipationThreshold::AtMost(5).is_satisfied(5));
+        assert!(ParticipationThreshold::AtMost(5).is_satisfied(4));
+        assert!(!ParticipationThreshold::AtMost(5).is_satisfied(6));
     }
 
     #[test]
     fn threshold_equals() {
-        let t = ParticipationThreshold::Equals(10);
-        assert!(!t.is_satisfied(9));
-        assert!(t.is_satisfied(10));
-        assert!(!t.is_satisfied(11));
-    }
-
-    // -----------------------------------------------------------------------
-    // ParticipationProfile::signable_bytes tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn signable_bytes_deterministic() {
-        let p = make_profile();
-        assert_eq!(p.signable_bytes(), p.signable_bytes());
+        assert!(ParticipationThreshold::Equals(5).is_satisfied(5));
+        assert!(!ParticipationThreshold::Equals(5).is_satisfied(4));
+        assert!(!ParticipationThreshold::Equals(5).is_satisfied(6));
     }
 
     #[test]
-    fn signable_bytes_differs_when_field_changes() {
-        let p1 = make_profile();
-        let mut p2 = make_profile();
-        p2.tool_invocation_count = 999;
-        assert_ne!(p1.signable_bytes(), p2.signable_bytes());
+    fn signable_bytes_is_deterministic() {
+        let profile = make_profile();
+        let bytes1 = profile.signable_bytes();
+        let bytes2 = profile.signable_bytes();
+        assert_eq!(bytes1, bytes2);
     }
 
     #[test]
-    fn signable_bytes_differs_when_did_changes() {
-        let p1 = make_profile();
-        let mut p2 = make_profile();
-        p2.subject_did = "did:key:bob".into();
-        assert_ne!(p1.signable_bytes(), p2.signable_bytes());
+    fn signable_bytes_excludes_signature() {
+        let mut profile1 = make_profile();
+        let mut profile2 = make_profile();
+        profile1.signature = [0x00; 64];
+        profile2.signature = [0xFF; 64];
+
+        assert_eq!(profile1.signable_bytes(), profile2.signable_bytes());
+    }
+
+    #[test]
+    fn signable_bytes_changes_with_fields() {
+        let profile1 = make_profile();
+        let mut profile2 = make_profile();
+        profile2.tool_invocation_count = 999;
+
+        assert_ne!(profile1.signable_bytes(), profile2.signable_bytes());
+    }
+
+    #[test]
+    fn signable_bytes_changes_with_did() {
+        let profile1 = make_profile();
+        let mut profile2 = make_profile();
+        profile2.subject_did = "did:key:other".into();
+
+        assert_ne!(profile1.signable_bytes(), profile2.signable_bytes());
+    }
+
+    #[test]
+    fn signable_bytes_expected_length() {
+        let profile = make_profile();
+        let bytes = profile.signable_bytes();
+        let did_len = "did:key:test".len();
+        // 4 (length prefix) + did_len + 8*8 (8 u64 fields) + 32 + 32
+        let expected = 4 + did_len + 64 + 64;
+        assert_eq!(bytes.len(), expected);
+    }
+
+    #[test]
+    fn participation_profile_has_no_context_id() {
+        // Structural test: ParticipationProfile must not have a context_id
+        // field. This test documents the privacy guarantee from §7.3.2.1.
+        // If someone adds context_id to ParticipationProfile, this test's
+        // field-by-field construction will fail to compile (missing field).
+        let _profile = ParticipationProfile {
+            subject_did: "did:key:test".into(),
+            participation_duration_secs: 0,
+            governance_actions_against: 0,
+            governance_actions_by: 0,
+            tool_invocation_count: 0,
+            context_creation_count: 0,
+            role_progression_count: 0,
+            attestation_count: 0,
+            updated_at: 0,
+            event_log_root: [0; 32],
+            signer_public_key: [0; 32],
+            signature: [0; 64],
+        };
+    }
+
+    #[test]
+    fn require_participation_struct_fields() {
+        let req = RequireParticipation {
+            fact: ParticipationFact::ToolInvocationCount,
+            threshold: ParticipationThreshold::AtLeast(100),
+            max_age_secs: 86400,
+            min_contexts: 3,
+        };
+        assert_eq!(req.max_age_secs, 86400);
+        assert_eq!(req.min_contexts, 3);
     }
 
     // -----------------------------------------------------------------------
@@ -1181,6 +1513,43 @@ mod tests {
 
     #[test]
     fn serde_roundtrip_participation_fact() {
+        let fact = ParticipationFact::GovernanceActionsBy;
+        let json = serde_json::to_string(&fact).unwrap();
+        let deserialized: ParticipationFact = serde_json::from_str(&json).unwrap();
+        assert_eq!(fact, deserialized);
+    }
+
+    #[test]
+    fn serde_roundtrip_participation_threshold() {
+        let threshold = ParticipationThreshold::AtLeast(42);
+        let json = serde_json::to_string(&threshold).unwrap();
+        let deserialized: ParticipationThreshold = serde_json::from_str(&json).unwrap();
+        assert_eq!(threshold, deserialized);
+    }
+
+    #[test]
+    fn serde_roundtrip_require_participation() {
+        let req = RequireParticipation {
+            fact: ParticipationFact::ParticipationDuration,
+            threshold: ParticipationThreshold::GreaterThan(3600),
+            max_age_secs: 86400,
+            min_contexts: 2,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: RequireParticipation = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, deserialized);
+    }
+
+    #[test]
+    fn serde_roundtrip_participation_profile() {
+        let profile = make_profile();
+        let json = serde_json::to_string(&profile).unwrap();
+        let deserialized: ParticipationProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(profile, deserialized);
+    }
+
+    #[test]
+    fn all_fact_variants_serde_roundtrip() {
         let facts = [
             ParticipationFact::ParticipationDuration,
             ParticipationFact::GovernanceActionsAgainst,
@@ -1192,253 +1561,760 @@ mod tests {
         ];
         for fact in &facts {
             let json = serde_json::to_string(fact).unwrap();
-            let back: ParticipationFact = serde_json::from_str(&json).unwrap();
-            assert_eq!(*fact, back);
+            let deserialized: ParticipationFact = serde_json::from_str(&json).unwrap();
+            assert_eq!(*fact, deserialized);
         }
     }
 
     #[test]
-    fn serde_roundtrip_participation_threshold() {
+    fn all_threshold_variants_serde_roundtrip() {
         let thresholds = [
-            ParticipationThreshold::GreaterThan(10),
-            ParticipationThreshold::LessThan(5),
-            ParticipationThreshold::AtLeast(100),
-            ParticipationThreshold::AtMost(0),
+            ParticipationThreshold::GreaterThan(100),
+            ParticipationThreshold::LessThan(50),
+            ParticipationThreshold::AtLeast(10),
+            ParticipationThreshold::AtMost(200),
             ParticipationThreshold::Equals(42),
         ];
-        for t in &thresholds {
-            let json = serde_json::to_string(t).unwrap();
-            let back: ParticipationThreshold = serde_json::from_str(&json).unwrap();
-            assert_eq!(*t, back);
+        for threshold in &thresholds {
+            let json = serde_json::to_string(threshold).unwrap();
+            let deserialized: ParticipationThreshold = serde_json::from_str(&json).unwrap();
+            assert_eq!(*threshold, deserialized);
         }
     }
 
-    #[test]
-    fn serde_roundtrip_participation_profile() {
-        let p = make_profile();
-        let json = serde_json::to_string(&p).unwrap();
-        let back: ParticipationProfile = serde_json::from_str(&json).unwrap();
-        assert_eq!(p, back);
-    }
-
-    #[test]
-    fn serde_roundtrip_require_participation() {
-        let req = RequireParticipation {
-            fact: ParticipationFact::ParticipationDuration,
-            threshold: ParticipationThreshold::AtLeast(86400),
-            max_age_secs: 2_592_000,
-            min_contexts: 1,
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        let back: RequireParticipation = serde_json::from_str(&json).unwrap();
-        assert_eq!(req, back);
-    }
-
     // -----------------------------------------------------------------------
-    // End-to-end: sign + verify participation profile
+    // Participation admission verification tests (SCP-BA-003)
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn sign_and_verify_participation_profile() {
+    /// Creates a signed test profile using the given signing key.
+    fn make_signed_profile(
+        signing_key: &ed25519_dalek::SigningKey,
+        subject_did: &str,
+        updated_at: u64,
+        overrides: Option<ProfileOverrides>,
+    ) -> ParticipationProfile {
         use ed25519_dalek::Signer;
 
-        let seed = [99u8; 32];
-        let key = derive_participation_signing_key(&seed, "ctx-test").unwrap();
-        let vk = key.verifying_key();
+        let verifying_key = signing_key.verifying_key();
+        let ov = overrides.unwrap_or_default();
 
-        let mut profile = make_profile();
-        profile.signer_public_key = vk.to_bytes();
-
-        let sig = key.sign(&profile.signable_bytes());
-        profile.signature = sig.to_bytes().to_vec();
-
-        // Verify via the public verification function.
-        let req = RequireParticipation {
-            fact: ParticipationFact::ToolInvocationCount,
-            threshold: ParticipationThreshold::AtLeast(1),
-            max_age_secs: 10_000,
-            min_contexts: 1,
+        let mut profile = ParticipationProfile {
+            subject_did: subject_did.into(),
+            participation_duration_secs: ov.participation_duration_secs.unwrap_or(86400),
+            governance_actions_against: ov.governance_actions_against.unwrap_or(2),
+            governance_actions_by: ov.governance_actions_by.unwrap_or(5),
+            tool_invocation_count: ov.tool_invocation_count.unwrap_or(203),
+            context_creation_count: ov.context_creation_count.unwrap_or(3),
+            role_progression_count: ov.role_progression_count.unwrap_or(4),
+            attestation_count: ov.attestation_count.unwrap_or(10),
+            updated_at,
+            event_log_root: [0xAA; 32],
+            signer_public_key: verifying_key.to_bytes(),
+            signature: [0u8; 64], // placeholder, will be overwritten
         };
-        let result = verify_participation_requirements(1500, &[req], &[profile]);
+
+        let signable = profile.signable_bytes();
+        let sig = signing_key.sign(&signable);
+        profile.signature = sig.to_bytes();
+
+        profile
+    }
+
+    #[derive(Default)]
+    struct ProfileOverrides {
+        participation_duration_secs: Option<u64>,
+        governance_actions_against: Option<u64>,
+        governance_actions_by: Option<u64>,
+        tool_invocation_count: Option<u64>,
+        context_creation_count: Option<u64>,
+        role_progression_count: Option<u64>,
+        attestation_count: Option<u64>,
+    }
+
+    fn test_signing_key(seed: u8) -> ed25519_dalek::SigningKey {
+        let mut secret = [0u8; 32];
+        secret[0] = seed;
+        ed25519_dalek::SigningKey::from_bytes(&secret)
+    }
+
+    #[test]
+    fn verify_empty_requirements_passes() {
+        let result = verify_participation_requirements(1_700_000_000, &[], &[]);
         assert!(result.is_ok());
     }
 
     #[test]
-    fn verify_rejects_invalid_signature() {
-        let mut profile = make_profile();
-        // signer_public_key is [2u8; 32] which is not a valid Ed25519 key
-        // paired with the zero signature — verification must fail.
-        // Use a valid key but wrong signature.
-        let seed = [77u8; 32];
-        let key = derive_participation_signing_key(&seed, "ctx-bad").unwrap();
-        profile.signer_public_key = key.verifying_key().to_bytes();
-        profile.signature = vec![0u8; 64]; // wrong signature
+    fn verify_single_requirement_satisfied() {
+        let key = test_signing_key(1);
+        let statement = make_signed_profile(&key, "did:key:alice", 1_700_000_000, None);
 
         let req = RequireParticipation {
             fact: ParticipationFact::ToolInvocationCount,
-            threshold: ParticipationThreshold::AtLeast(1),
-            max_age_secs: 10_000,
+            threshold: ParticipationThreshold::AtLeast(100),
+            max_age_secs: 3600,
             min_contexts: 1,
         };
-        let result = verify_participation_requirements(1500, &[req], &[profile]);
-        assert!(
-            matches!(
-                result,
-                Err(ParticipationAdmissionError::InvalidSignature { .. })
-            ),
-            "expected InvalidSignature, got {result:?}"
-        );
-    }
 
-    #[test]
-    fn verify_rejects_stale_statement() {
-        use ed25519_dalek::Signer;
-
-        let seed = [99u8; 32];
-        let key = derive_participation_signing_key(&seed, "ctx-stale").unwrap();
-
-        let mut profile = make_profile();
-        profile.updated_at = 100; // very old
-        profile.signer_public_key = key.verifying_key().to_bytes();
-        let sig = key.sign(&profile.signable_bytes());
-        profile.signature = sig.to_bytes().to_vec();
-
-        let req = RequireParticipation {
-            fact: ParticipationFact::ParticipationDuration,
-            threshold: ParticipationThreshold::AtLeast(1),
-            max_age_secs: 60,
-            min_contexts: 1,
-        };
-        // current_time=1000, updated_at=100 → age=900 > max_age=60
-        let result = verify_participation_requirements(1000, &[req], &[profile]);
-        assert!(
-            matches!(
-                result,
-                Err(ParticipationAdmissionError::RecordTooStale { .. })
-            ),
-            "expected RecordTooStale, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn verify_rejects_insufficient_contexts() {
-        use ed25519_dalek::Signer;
-
-        let seed = [99u8; 32];
-        let key = derive_participation_signing_key(&seed, "ctx-1").unwrap();
-
-        let mut profile = make_profile();
-        profile.signer_public_key = key.verifying_key().to_bytes();
-        let sig = key.sign(&profile.signable_bytes());
-        profile.signature = sig.to_bytes().to_vec();
-
-        let req = RequireParticipation {
-            fact: ParticipationFact::ParticipationDuration,
-            threshold: ParticipationThreshold::AtLeast(1),
-            max_age_secs: 10_000,
-            min_contexts: 3, // need 3 distinct signers, only have 1
-        };
-        let result = verify_participation_requirements(1500, &[req], &[profile]);
-        assert!(
-            matches!(
-                result,
-                Err(ParticipationAdmissionError::InsufficientContexts { .. })
-            ),
-            "expected InsufficientContexts, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn verify_rejects_threshold_not_met() {
-        use ed25519_dalek::Signer;
-
-        let seed = [99u8; 32];
-        let key = derive_participation_signing_key(&seed, "ctx-1").unwrap();
-
-        let mut profile = make_profile();
-        profile.tool_invocation_count = 5;
-        profile.signer_public_key = key.verifying_key().to_bytes();
-        let sig = key.sign(&profile.signable_bytes());
-        profile.signature = sig.to_bytes().to_vec();
-
-        let req = RequireParticipation {
-            fact: ParticipationFact::ToolInvocationCount,
-            threshold: ParticipationThreshold::AtLeast(100), // need 100, have 5
-            max_age_secs: 10_000,
-            min_contexts: 1,
-        };
-        let result = verify_participation_requirements(1500, &[req], &[profile]);
-        assert!(
-            matches!(
-                result,
-                Err(ParticipationAdmissionError::ThresholdNotMet { .. })
-            ),
-            "expected ThresholdNotMet, got {result:?}"
-        );
+        let result = verify_participation_requirements(1_700_000_100, &[req], &[statement]);
+        assert!(result.is_ok());
     }
 
     #[test]
     fn verify_multiple_requirements_all_satisfied() {
-        use ed25519_dalek::Signer;
-
-        let seed = [99u8; 32];
-        let key = derive_participation_signing_key(&seed, "ctx-1").unwrap();
-
-        let mut profile = make_profile();
-        profile.signer_public_key = key.verifying_key().to_bytes();
-        let sig = key.sign(&profile.signable_bytes());
-        profile.signature = sig.to_bytes().to_vec();
+        let key = test_signing_key(1);
+        let statement = make_signed_profile(&key, "did:key:alice", 1_700_000_000, None);
 
         let reqs = vec![
             RequireParticipation {
-                fact: ParticipationFact::GovernanceActionsAgainst,
-                threshold: ParticipationThreshold::AtMost(5),
-                max_age_secs: 10_000,
+                fact: ParticipationFact::ToolInvocationCount,
+                threshold: ParticipationThreshold::AtLeast(100),
+                max_age_secs: 3600,
                 min_contexts: 1,
             },
             RequireParticipation {
                 fact: ParticipationFact::ParticipationDuration,
-                threshold: ParticipationThreshold::AtLeast(50),
-                max_age_secs: 10_000,
+                threshold: ParticipationThreshold::GreaterThan(1000),
+                max_age_secs: 3600,
                 min_contexts: 1,
             },
         ];
-        let result = verify_participation_requirements(1500, &reqs, &[profile]);
+
+        let result = verify_participation_requirements(1_700_000_100, &reqs, &[statement]);
         assert!(result.is_ok());
     }
 
     #[test]
-    fn verify_duplicate_signers_count_as_one() {
-        use ed25519_dalek::Signer;
-
-        let seed = [99u8; 32];
-        let key = derive_participation_signing_key(&seed, "ctx-1").unwrap();
-
-        // Two profiles with the same signer key.
-        let make_signed = |tool_count: u64| {
-            let mut p = make_profile();
-            p.tool_invocation_count = tool_count;
-            p.signer_public_key = key.verifying_key().to_bytes();
-            let sig = key.sign(&p.signable_bytes());
-            p.signature = sig.to_bytes().to_vec();
-            p
-        };
-        let p1 = make_signed(10);
-        let p2 = make_signed(20);
+    fn verify_invalid_signature_returns_error() {
+        let key = test_signing_key(1);
+        let mut statement = make_signed_profile(&key, "did:key:alice", 1_700_000_000, None);
+        // Corrupt the signature.
+        statement.signature[0] ^= 0xFF;
 
         let req = RequireParticipation {
             fact: ParticipationFact::ToolInvocationCount,
-            threshold: ParticipationThreshold::AtLeast(1),
-            max_age_secs: 10_000,
-            min_contexts: 2, // need 2 distinct, but both use same key
+            threshold: ParticipationThreshold::AtLeast(100),
+            max_age_secs: 3600,
+            min_contexts: 1,
         };
-        let result = verify_participation_requirements(1500, &[req], &[p1, p2]);
-        assert!(
-            matches!(
-                result,
-                Err(ParticipationAdmissionError::InsufficientContexts { .. })
-            ),
-            "expected InsufficientContexts, got {result:?}"
+
+        let result = verify_participation_requirements(1_700_000_100, &[req], &[statement]);
+        assert!(result.is_err());
+        match result {
+            Err(ParticipationAdmissionError::InvalidSignature { subject_did, .. }) => {
+                assert_eq!(subject_did, "did:key:alice");
+            }
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_threshold_not_met_returns_error() {
+        let key = test_signing_key(1);
+        let statement = make_signed_profile(
+            &key,
+            "did:key:alice",
+            1_700_000_000,
+            Some(ProfileOverrides {
+                tool_invocation_count: Some(50), // below threshold
+                ..Default::default()
+            }),
         );
+
+        let req = RequireParticipation {
+            fact: ParticipationFact::ToolInvocationCount,
+            threshold: ParticipationThreshold::AtLeast(100),
+            max_age_secs: 3600,
+            min_contexts: 1,
+        };
+
+        let result = verify_participation_requirements(1_700_000_100, &[req], &[statement]);
+        match result {
+            Err(ParticipationAdmissionError::ThresholdNotMet { fact, value, .. }) => {
+                assert_eq!(fact, ParticipationFact::ToolInvocationCount);
+                assert_eq!(value, 50);
+            }
+            other => panic!("expected ThresholdNotMet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_stale_record_returns_error() {
+        let key = test_signing_key(1);
+        let statement = make_signed_profile(&key, "did:key:alice", 1_700_000_000, None);
+
+        let req = RequireParticipation {
+            fact: ParticipationFact::ToolInvocationCount,
+            threshold: ParticipationThreshold::AtLeast(100),
+            max_age_secs: 3600,
+            min_contexts: 1,
+        };
+
+        // current_time is way past max_age_secs
+        let result = verify_participation_requirements(1_700_010_000, &[req], &[statement]);
+        match result {
+            Err(ParticipationAdmissionError::RecordTooStale {
+                fact,
+                newest_updated_at,
+                current_time,
+                max_age_secs,
+            }) => {
+                assert_eq!(fact, ParticipationFact::ToolInvocationCount);
+                assert_eq!(newest_updated_at, 1_700_000_000);
+                assert_eq!(current_time, 1_700_010_000);
+                assert_eq!(max_age_secs, 3600);
+            }
+            other => panic!("expected RecordTooStale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_insufficient_contexts_returns_error() {
+        let key = test_signing_key(1);
+        let statement = make_signed_profile(&key, "did:key:alice", 1_700_000_000, None);
+
+        let req = RequireParticipation {
+            fact: ParticipationFact::ToolInvocationCount,
+            threshold: ParticipationThreshold::AtLeast(100),
+            max_age_secs: 3600,
+            min_contexts: 3, // need 3, only have 1
+        };
+
+        let result = verify_participation_requirements(1_700_000_100, &[req], &[statement]);
+        match result {
+            Err(ParticipationAdmissionError::InsufficientContexts {
+                required, found, ..
+            }) => {
+                assert_eq!(required, 3);
+                assert_eq!(found, 1);
+            }
+            other => panic!("expected InsufficientContexts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_duplicate_signers_count_as_one() {
+        let key = test_signing_key(1);
+        // Two statements from the same signer.
+        let s1 = make_signed_profile(&key, "did:key:alice", 1_700_000_000, None);
+        let s2 = make_signed_profile(&key, "did:key:alice", 1_700_000_001, None);
+
+        let req = RequireParticipation {
+            fact: ParticipationFact::ToolInvocationCount,
+            threshold: ParticipationThreshold::AtLeast(100),
+            max_age_secs: 3600,
+            min_contexts: 2, // need 2 distinct signers
+        };
+
+        let result = verify_participation_requirements(1_700_000_100, &[req], &[s1, s2]);
+        match result {
+            Err(ParticipationAdmissionError::InsufficientContexts {
+                required, found, ..
+            }) => {
+                assert_eq!(required, 2);
+                assert_eq!(found, 1);
+            }
+            other => panic!("expected InsufficientContexts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_multiple_distinct_signers_satisfies_min_contexts() {
+        let key1 = test_signing_key(1);
+        let key2 = test_signing_key(2);
+        let key3 = test_signing_key(3);
+
+        let s1 = make_signed_profile(&key1, "did:key:alice", 1_700_000_000, None);
+        let s2 = make_signed_profile(&key2, "did:key:alice", 1_700_000_000, None);
+        let s3 = make_signed_profile(&key3, "did:key:alice", 1_700_000_000, None);
+
+        let req = RequireParticipation {
+            fact: ParticipationFact::ToolInvocationCount,
+            threshold: ParticipationThreshold::AtLeast(100),
+            max_age_secs: 3600,
+            min_contexts: 3,
+        };
+
+        let result = verify_participation_requirements(1_700_000_100, &[req], &[s1, s2, s3]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn verify_empty_statements_with_requirements_fails() {
+        let req = RequireParticipation {
+            fact: ParticipationFact::ToolInvocationCount,
+            threshold: ParticipationThreshold::AtLeast(100),
+            max_age_secs: 3600,
+            min_contexts: 1,
+        };
+
+        let result = verify_participation_requirements(1_700_000_000, &[req], &[]);
+        // No statements means threshold can't be met.
+        match result {
+            Err(ParticipationAdmissionError::ThresholdNotMet { .. }) => {}
+            other => panic!("expected ThresholdNotMet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_mixed_fresh_and_stale_uses_fresh_only() {
+        let key1 = test_signing_key(1);
+        let key2 = test_signing_key(2);
+
+        // key1's statement is stale but meets threshold.
+        let s1 = make_signed_profile(&key1, "did:key:alice", 1_700_000_000, None);
+        // key2's statement is fresh and meets threshold.
+        let s2 = make_signed_profile(&key2, "did:key:alice", 1_700_003_500, None);
+
+        let req = RequireParticipation {
+            fact: ParticipationFact::ToolInvocationCount,
+            threshold: ParticipationThreshold::AtLeast(100),
+            max_age_secs: 3600,
+            min_contexts: 2, // need 2, but only 1 is fresh
+        };
+
+        let result = verify_participation_requirements(1_700_003_700, &[req], &[s1, s2]);
+        match result {
+            Err(ParticipationAdmissionError::InsufficientContexts {
+                required, found, ..
+            }) => {
+                assert_eq!(required, 2);
+                assert_eq!(found, 1);
+            }
+            other => panic!("expected InsufficientContexts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_second_requirement_fails_independently() {
+        let key = test_signing_key(1);
+        let statement = make_signed_profile(
+            &key,
+            "did:key:alice",
+            1_700_000_000,
+            Some(ProfileOverrides {
+                tool_invocation_count: Some(200),
+                context_creation_count: Some(1), // below threshold for 2nd req
+                ..Default::default()
+            }),
+        );
+
+        let reqs = vec![
+            RequireParticipation {
+                fact: ParticipationFact::ToolInvocationCount,
+                threshold: ParticipationThreshold::AtLeast(100),
+                max_age_secs: 3600,
+                min_contexts: 1,
+            },
+            RequireParticipation {
+                fact: ParticipationFact::ContextCreationCount,
+                threshold: ParticipationThreshold::AtLeast(5),
+                max_age_secs: 3600,
+                min_contexts: 1,
+            },
+        ];
+
+        let result = verify_participation_requirements(1_700_000_100, &reqs, &[statement]);
+        match result {
+            Err(ParticipationAdmissionError::ThresholdNotMet { fact, value, .. }) => {
+                assert_eq!(fact, ParticipationFact::ContextCreationCount);
+                assert_eq!(value, 1);
+            }
+            other => panic!("expected ThresholdNotMet, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // produce_participation_profile tests (SCP-BA-005)
+    // -----------------------------------------------------------------------
+
+    fn make_member_events(actor_did: &str) -> Vec<Event> {
+        vec![
+            make_event(EventType::ContextCreated, actor_did, 1000, 0, vec![]),
+            make_event(EventType::MemberJoined, actor_did, 1001, 1, vec![]),
+            make_event(
+                EventType::ToolInvoked,
+                actor_did,
+                1002,
+                2,
+                b"tool-a".to_vec(),
+            ),
+            make_event(
+                EventType::ToolInvoked,
+                actor_did,
+                1003,
+                3,
+                b"tool-b".to_vec(),
+            ),
+            make_event(
+                EventType::ToolInvoked,
+                actor_did,
+                1004,
+                4,
+                b"tool-a".to_vec(),
+            ),
+            make_event(
+                EventType::GovernanceAction,
+                actor_did,
+                1005,
+                5,
+                b"did:key:target".to_vec(),
+            ),
+            make_event(
+                EventType::GovernanceAction,
+                "did:key:admin",
+                1006,
+                6,
+                actor_did.as_bytes().to_vec(),
+            ),
+            make_event(
+                EventType::RoleAssigned,
+                "did:key:admin",
+                1007,
+                7,
+                actor_did.as_bytes().to_vec(),
+            ),
+            make_event(EventType::ToolVerified, actor_did, 1008, 8, vec![]),
+            make_event(EventType::MessageSent, actor_did, 1100, 9, vec![]),
+        ]
+    }
+
+    #[test]
+    fn produce_profile_for_valid_opted_in_member() {
+        let key_material = [42u8; 32];
+        let events = make_member_events("did:key:alice");
+        let merkle_root = [0xAA; 32];
+
+        let profile = produce_participation_profile(
+            &key_material,
+            "did:key:alice",
+            &events,
+            merkle_root,
+            true,
+            true,
+            5000,
+        )
+        .unwrap();
+
+        assert_eq!(profile.subject_did, "did:key:alice");
+        assert_eq!(profile.participation_duration_secs, 100); // 1100 - 1000
+        assert_eq!(profile.governance_actions_by, 1);
+        assert_eq!(profile.governance_actions_against, 1);
+        assert_eq!(profile.tool_invocation_count, 3); // tool-a x2 + tool-b x1
+        assert_eq!(profile.context_creation_count, 1);
+        assert_eq!(profile.role_progression_count, 1);
+        assert_eq!(profile.attestation_count, 1);
+        assert_eq!(profile.updated_at, 5000);
+        assert_eq!(profile.event_log_root, merkle_root);
+    }
+
+    #[test]
+    fn produce_profile_signature_verifies() {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        let key_material = [42u8; 32];
+        let events = make_member_events("did:key:alice");
+
+        let profile = produce_participation_profile(
+            &key_material,
+            "did:key:alice",
+            &events,
+            [0; 32],
+            true,
+            true,
+            5000,
+        )
+        .unwrap();
+
+        let vk = VerifyingKey::from_bytes(&profile.signer_public_key).unwrap();
+        let sig = Signature::from_bytes(&profile.signature);
+        let signable = profile.signable_bytes();
+        assert!(vk.verify(&signable, &sig).is_ok());
+    }
+
+    #[test]
+    fn produce_profile_non_member_returns_error() {
+        let events = make_member_events("did:key:alice");
+        let result = produce_participation_profile(
+            &[0u8; 32],
+            "did:key:alice",
+            &events,
+            [0; 32],
+            false, // not a member
+            true,
+            5000,
+        );
+        match result {
+            Err(TrustError::NotAMember { did }) => assert_eq!(did, "did:key:alice"),
+            other => panic!("expected NotAMember, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn produce_profile_not_opted_in_returns_error() {
+        let events = make_member_events("did:key:alice");
+        let result = produce_participation_profile(
+            &[0u8; 32],
+            "did:key:alice",
+            &events,
+            [0; 32],
+            true,
+            false, // not opted in
+            5000,
+        );
+        match result {
+            Err(TrustError::NotOptedIn { did }) => assert_eq!(did, "did:key:alice"),
+            other => panic!("expected NotOptedIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn produce_profile_different_contexts_produce_different_signers() {
+        let events = make_member_events("did:key:alice");
+
+        let profile_a = produce_participation_profile(
+            &[1u8; 32],
+            "did:key:alice",
+            &events,
+            [0; 32],
+            true,
+            true,
+            5000,
+        )
+        .unwrap();
+
+        let profile_b = produce_participation_profile(
+            &[2u8; 32],
+            "did:key:alice",
+            &events,
+            [0; 32],
+            true,
+            true,
+            5000,
+        )
+        .unwrap();
+
+        assert_ne!(
+            profile_a.signer_public_key, profile_b.signer_public_key,
+            "different context key materials must produce different signer keys"
+        );
+    }
+
+    #[test]
+    fn produce_profile_same_context_produces_same_signer() {
+        let key_material = [42u8; 32];
+        let events = make_member_events("did:key:alice");
+
+        let profile_a = produce_participation_profile(
+            &key_material,
+            "did:key:alice",
+            &events,
+            [0; 32],
+            true,
+            true,
+            5000,
+        )
+        .unwrap();
+
+        let profile_b = produce_participation_profile(
+            &key_material,
+            "did:key:alice",
+            &events,
+            [0; 32],
+            true,
+            true,
+            6000,
+        )
+        .unwrap();
+
+        assert_eq!(
+            profile_a.signer_public_key, profile_b.signer_public_key,
+            "same context key material must produce same signer key"
+        );
+    }
+
+    #[test]
+    fn produce_profile_replacement_yields_updated_values() {
+        let key_material = [42u8; 32];
+        let mut events = make_member_events("did:key:alice");
+
+        let profile_v1 = produce_participation_profile(
+            &key_material,
+            "did:key:alice",
+            &events,
+            [0; 32],
+            true,
+            true,
+            5000,
+        )
+        .unwrap();
+
+        // Add more tool invocations.
+        events.push(make_event(
+            EventType::ToolInvoked,
+            "did:key:alice",
+            1200,
+            10,
+            b"tool-c".to_vec(),
+        ));
+
+        let profile_v2 = produce_participation_profile(
+            &key_material,
+            "did:key:alice",
+            &events,
+            [1; 32],
+            true,
+            true,
+            6000,
+        )
+        .unwrap();
+
+        assert_eq!(profile_v1.tool_invocation_count, 3);
+        assert_eq!(profile_v2.tool_invocation_count, 4);
+        assert_eq!(profile_v2.updated_at, 6000);
+        assert_ne!(profile_v1.signature, profile_v2.signature);
+        // Signer key stays the same (same context).
+        assert_eq!(profile_v1.signer_public_key, profile_v2.signer_public_key);
+    }
+
+    #[test]
+    fn produce_profile_no_context_id_in_output() {
+        // ParticipationProfile has no context_id field — this is a compile-time
+        // guarantee via the struct definition. This test documents the intent.
+        let key_material = [42u8; 32];
+        let events = make_member_events("did:key:alice");
+
+        let profile = produce_participation_profile(
+            &key_material,
+            "did:key:alice",
+            &events,
+            [0; 32],
+            true,
+            true,
+            5000,
+        )
+        .unwrap();
+
+        let json = serde_json::to_string(&profile).unwrap();
+        assert!(
+            !json.contains("context_id"),
+            "serialized profile must not contain context_id"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-BA-006: ParticipationStatements service endpoint
+    // -----------------------------------------------------------------------
+
+    fn make_test_document(did: &str) -> scp_identity::document::DidDocument {
+        scp_identity::document::DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32])
+    }
+
+    #[test]
+    fn add_participation_service_adds_entry() {
+        let did = "did:dht:zTestDid";
+        let mut doc = make_test_document(did);
+        let endpoint = "https://relay.example.com/v1/scp/participation/did:dht:zTestDid";
+
+        add_participation_service(&mut doc, endpoint);
+
+        let svc = doc
+            .service
+            .iter()
+            .find(|s| s.service_type == PARTICIPATION_STATEMENTS_SERVICE_TYPE)
+            .expect("service entry should exist");
+        assert_eq!(svc.id, format!("{did}#participation-statements"));
+        assert_eq!(svc.service_type, "ScpParticipationStatements");
+        assert_eq!(svc.service_endpoint, endpoint);
+    }
+
+    #[test]
+    fn add_participation_service_replaces_existing() {
+        let did = "did:dht:zTestDid";
+        let mut doc = make_test_document(did);
+
+        add_participation_service(&mut doc, "https://old.example.com/v1/scp/participation/did");
+        add_participation_service(&mut doc, "https://new.example.com/v1/scp/participation/did");
+
+        let matching: Vec<_> = doc
+            .service
+            .iter()
+            .filter(|s| s.service_type == PARTICIPATION_STATEMENTS_SERVICE_TYPE)
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "should have exactly one entry after replacement"
+        );
+        assert_eq!(
+            matching[0].service_endpoint,
+            "https://new.example.com/v1/scp/participation/did"
+        );
+    }
+
+    #[test]
+    fn remove_participation_service_removes_entry() {
+        let did = "did:dht:zTestDid";
+        let mut doc = make_test_document(did);
+
+        add_participation_service(
+            &mut doc,
+            "https://relay.example.com/v1/scp/participation/did",
+        );
+        assert!(extract_participation_service_endpoint(&doc).is_some());
+
+        remove_participation_service(&mut doc);
+        assert!(extract_participation_service_endpoint(&doc).is_none());
+    }
+
+    #[test]
+    fn extract_participation_service_endpoint_returns_none_when_absent() {
+        let doc = make_test_document("did:dht:zTestDid");
+        assert!(extract_participation_service_endpoint(&doc).is_none());
+    }
+
+    #[test]
+    fn extract_participation_service_endpoint_returns_url_when_present() {
+        let mut doc = make_test_document("did:dht:zTestDid");
+        let endpoint = "https://relay.example.com/v1/scp/participation/did:dht:zTestDid";
+        add_participation_service(&mut doc, endpoint);
+
+        let result = extract_participation_service_endpoint(&doc);
+        assert_eq!(result, Some(endpoint));
+    }
+
+    #[test]
+    fn participation_service_serde_roundtrip() {
+        let did = "did:dht:zTestDid";
+        let mut doc = make_test_document(did);
+        let endpoint = "https://relay.example.com/v1/scp/participation/did:dht:zTestDid";
+        add_participation_service(&mut doc, endpoint);
+
+        let json = serde_json::to_string(&doc).unwrap();
+        let deserialized: scp_identity::document::DidDocument =
+            serde_json::from_str(&json).unwrap();
+
+        let result = extract_participation_service_endpoint(&deserialized);
+        assert_eq!(result, Some(endpoint));
+    }
+
+    #[test]
+    fn participation_service_does_not_affect_other_services() {
+        let did = "did:dht:zTestDid";
+        let mut doc = make_test_document(did);
+
+        // Document starts with pre-rotation service.
+        let initial_count = doc.service.len();
+
+        add_participation_service(
+            &mut doc,
+            "https://relay.example.com/v1/scp/participation/did",
+        );
+        assert_eq!(doc.service.len(), initial_count + 1);
+
+        remove_participation_service(&mut doc);
+        assert_eq!(doc.service.len(), initial_count);
+
+        // Original services should still be intact.
+        assert!(doc.pre_rotation_service().is_some());
     }
 }

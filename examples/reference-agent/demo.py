@@ -36,7 +36,7 @@ def send_request(agent: McpAgent, method: str, params: dict | None = None) -> di
     Raises:
         RuntimeError: If the response contains an error.
     """
-    request: dict = {
+    request = {
         "jsonrpc": "2.0",
         "id": 1,
         "method": method,
@@ -118,9 +118,7 @@ def main() -> int:
     identity_data = extract_tool_result(result)
     did = identity_data["did"]
     print(f"  DID: {did}")
-    if not did.startswith("did:"):
-        print(f"  ERROR: Expected DID prefix, got: {did}")
-        return 1
+    assert did.startswith("did:"), f"Expected DID, got: {did}"
 
     # Step 2: Create a context.
     print("\nStep 2: Creating context...")
@@ -135,9 +133,7 @@ def main() -> int:
     context_data = extract_tool_result(result)
     context_id = context_data["context_id"]
     print(f"  Context ID: {context_id}")
-    if not context_id:
-        print("  ERROR: Expected non-empty context_id")
-        return 1
+    assert context_id, "Expected non-empty context_id"
 
     # Step 3: Send a message.
     print("\nStep 3: Sending message...")
@@ -155,12 +151,8 @@ def main() -> int:
     )
     send_data = extract_tool_result(result)
     print(f"  Sent: {send_data['content']}")
-    if send_data["content"] != message_content:
-        print("  ERROR: Message content mismatch")
-        return 1
-    if send_data["sender_did"] != did:
-        print("  ERROR: Sender DID mismatch")
-        return 1
+    assert send_data["content"] == message_content
+    assert send_data["sender_did"] == did
 
     # Step 4: Receive messages.
     print("\nStep 4: Receiving messages...")
@@ -175,15 +167,9 @@ def main() -> int:
     receive_data = extract_tool_result(result)
     messages = receive_data["messages"]
     print(f"  Received {len(messages)} message(s)")
-    if len(messages) < 1:
-        print("  ERROR: Expected at least 1 message")
-        return 1
-    if messages[-1]["content"] != message_content:
-        print("  ERROR: Received message content mismatch")
-        return 1
-    if messages[-1]["sender_did"] != did:
-        print("  ERROR: Received message sender mismatch")
-        return 1
+    assert len(messages) >= 1, f"Expected at least 1 message, got {len(messages)}"
+    assert messages[-1]["content"] == message_content
+    assert messages[-1]["sender_did"] == did
     print(f"  Last message: [{messages[-1]['sender_did']}] {messages[-1]['content']}")
 
     # Step 5: Verify tools/list with capability filtering.
@@ -192,16 +178,10 @@ def main() -> int:
     tools = list_result.get("tools", [])
     tool_names = [t["name"] for t in tools]
     print(f"  Available tools: {tool_names}")
-    expected_tools = {
-        "identity_create",
-        "context_create",
-        "context_send",
-        "context_receive",
-    }
-    missing = expected_tools - set(tool_names)
-    if missing:
-        print(f"  ERROR: Missing expected tools: {missing}")
-        return 1
+    assert "identity_create" in tool_names
+    assert "context_create" in tool_names
+    assert "context_send" in tool_names
+    assert "context_receive" in tool_names
 
     print("\n" + "=" * 60)
     print("Demo completed successfully!")

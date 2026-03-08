@@ -33,17 +33,6 @@ from typing import Any
 logger = logging.getLogger("scp_reference_agent")
 
 # ---------------------------------------------------------------------------
-# JSON-RPC 2.0 error codes
-# ---------------------------------------------------------------------------
-
-#: Standard JSON-RPC 2.0 error codes.
-PARSE_ERROR = -32700
-INVALID_REQUEST = -32600
-METHOD_NOT_FOUND = -32601
-INVALID_PARAMS = -32602
-INTERNAL_ERROR = -32603
-
-# ---------------------------------------------------------------------------
 # JSON Schema definitions for MCP tools (spec section 8.5)
 # ---------------------------------------------------------------------------
 
@@ -556,10 +545,6 @@ class McpAgent:
     def handle_request(self, request: dict[str, Any]) -> dict[str, Any] | None:
         """Route a JSON-RPC 2.0 request to the appropriate handler.
 
-        Enforces the MCP pre-initialization guard: only ``initialize`` and
-        ``ping`` are allowed before the handshake completes. Other methods
-        receive an ``INVALID_REQUEST`` error.
-
         Args:
             request: Parsed JSON-RPC 2.0 request dict.
 
@@ -569,20 +554,6 @@ class McpAgent:
         method = request.get("method", "")
         request_id = request.get("id")
         params = request.get("params", {})
-
-        # Pre-initialization guard: only initialize, ping, and the
-        # initialized notification are allowed before the handshake.
-        if (
-            not self.initialized
-            and method != "initialize"
-            and method != "ping"
-            and method != "notifications/initialized"
-        ):
-            return make_error(
-                request_id,
-                INVALID_REQUEST,
-                "Server not initialized: send initialize first.",
-            )
 
         if method == "initialize":
             return self._handle_initialize(request_id, params)
@@ -595,7 +566,7 @@ class McpAgent:
         if method == "tools/call":
             return self._handle_tools_call(request_id, params)
 
-        return make_error(request_id, METHOD_NOT_FOUND, f"Method not found: {method}")
+        return make_error(request_id, -32601, f"Method not found: {method}")
 
     def _handle_initialize(
         self,
@@ -644,7 +615,7 @@ class McpAgent:
 
         handler = TOOL_HANDLERS.get(tool_name)
         if handler is None:
-            return make_error(request_id, INVALID_PARAMS, f"Unknown tool: {tool_name}")
+            return make_error(request_id, -32602, f"Unknown tool: {tool_name}")
 
         try:
             result = handler(self.state, arguments)
@@ -681,7 +652,7 @@ class McpAgent:
             try:
                 request = json.loads(line)
             except json.JSONDecodeError as exc:
-                response = make_error(None, PARSE_ERROR, f"Parse error: {exc}")
+                response = make_error(None, -32700, f"Parse error: {exc}")
                 sys.stdout.write(json.dumps(response) + "\n")
                 sys.stdout.flush()
                 continue

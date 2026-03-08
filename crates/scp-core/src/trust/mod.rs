@@ -47,7 +47,10 @@
 //! - [`ChallengeRequest`] -- Challenge request for capability verification.
 //! - [`ChallengeResponse`] -- Response to a challenge request.
 //! - [`ChallengeVerification`] -- Result of verifying a challenge response.
-//! - [`ChallengeType`] -- Standard and custom challenge types.
+//! - [`CapabilityUri`] -- Validated agent capability URI (ADR-041).
+//! - [`CapabilityUriError`] -- Error type for capability URI parsing.
+//! - [`RegistryEntry`] -- Metadata for a registered protocol capability.
+//! - [`ChallengeType`] -- URI-based challenge types (unified with `CapabilityUri`).
 //! - [`VerificationMethod`] -- Self-attested vs challenge-verified.
 //! - [`ChallengeSigner`] -- Trait for signing challenge requests.
 //! - [`RenewalError`] -- Error type for attestation renewal.
@@ -59,7 +62,12 @@
 //! - [`CounterAttestation`] -- Counter-evidence for reputation restoration.
 //! - [`CustodyViolationError`] -- Validation errors for custody violation types.
 //! - [`CustodyViolationResult`] -- Result of a Category A enforcement check.
+//! - [`ParticipationFact`] -- Participation fact categories for admission (§7.3.2.1).
+//! - [`ParticipationThreshold`] -- Comparison operators for admission thresholds.
+//! - [`RequireParticipation`] -- Participation admission requirement.
+//! - [`ParticipationProfile`] -- Context-hosted signed participation attestation.
 
+pub mod admission;
 pub mod aggregate;
 pub mod attestation;
 pub mod capability_registry;
@@ -77,6 +85,9 @@ use serde::{Deserialize, Serialize};
 use scp_identity::DID;
 
 // Re-export all public types from submodules.
+pub use admission::{
+    AdmissionError, CapabilityRequirement, VerificationLevel, check_capability_requirements,
+};
 pub use attestation::{
     Attestation, AttestationEvidence, AttestorInfo, DidPublicKeyResolver, FreshnessStatus,
     IdentityDidPublicKeyResolver, RevocationStatus, ThresholdRequirement, ThresholdResult,
@@ -106,9 +117,11 @@ pub use custody_violation::{
 #[cfg(feature = "testing")]
 pub use participation::compute_participation_record;
 pub use participation::{
-    ParticipationAdmissionError, ParticipationFact, ParticipationProfile, ParticipationRecord,
-    ParticipationThreshold, RequireParticipation, derive_participation_signing_key,
-    verify_participation_requirements,
+    PARTICIPATION_STATEMENTS_SERVICE_TYPE, ParticipationAdmissionError, ParticipationFact,
+    ParticipationProfile, ParticipationRecord, ParticipationThreshold, RequireParticipation,
+    add_participation_service, derive_participation_signing_key,
+    extract_participation_service_endpoint, produce_participation_profile,
+    remove_participation_service, verify_participation_requirements,
 };
 pub use renewal::{DefaultRenewalChecker, RenewalChecker, RenewalError, renew_attestation};
 
@@ -231,6 +244,48 @@ pub enum TrustError {
     ChallengeSigningFailed {
         /// Human-readable description of the failure.
         reason: String,
+    },
+
+    /// The challenge type URI is not a known protocol capability and is not
+    /// DID-scoped.
+    #[error("unknown challenge capability URI: {uri}")]
+    UnknownChallengeCapability {
+        /// The unrecognized URI string.
+        uri: String,
+    },
+
+    /// The challenge parameters do not conform to the capability's parameter
+    /// schema.
+    #[error("invalid challenge parameters for {uri}: {reason}")]
+    InvalidChallengeParameters {
+        /// The capability URI whose schema was violated.
+        uri: String,
+        /// Human-readable description of the validation failure.
+        reason: String,
+    },
+
+    /// The capability URI refers to a system capability (`scp:system:*`),
+    /// which is a protocol feature flag and not challenge-testable.
+    #[error(
+        "system capability '{uri}' is not challengeable — system capabilities are feature flags, not testable capabilities"
+    )]
+    NotChallengeable {
+        /// The system capability URI that was rejected.
+        uri: String,
+    },
+
+    /// The requested DID is not a member of the context.
+    #[error("DID is not a member of this context: {did}")]
+    NotAMember {
+        /// The DID that is not a member.
+        did: String,
+    },
+
+    /// The member has not opted in to participation profile publication.
+    #[error("member has not opted in to participation profile publication: {did}")]
+    NotOptedIn {
+        /// The DID that has not opted in.
+        did: String,
     },
 }
 

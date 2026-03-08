@@ -160,8 +160,8 @@ pub fn py_trust_create_challenge(py: Python<'_>, target_did: &str) -> PyResult<P
     let request = scp_core::trust::issue_challenge(
         challenger_did.into(),
         target_did.into(),
-        scp_core::trust::ChallengeType::SchemaValidation,
-        "scp:capability:schema-validation".to_owned(),
+        scp_core::trust::ChallengeType::schema_validation(),
+        "scp:capability:schema-validation/v1".to_owned(),
         serde_json::json!({}),
         std::time::Duration::from_secs(300),
         &signer,

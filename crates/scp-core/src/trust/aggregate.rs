@@ -662,9 +662,9 @@ mod tests {
             verifier_did: "did:key:challenger".into(),
             subject_did: responder.into(),
             capability_uri: String::new(),
-            challenge_type: ChallengeType::SchemaValidation,
+            challenge_type: ChallengeType::schema_validation(),
             verification_method: VerificationMethod::ChallengeVerified {
-                challenge_type: ChallengeType::SchemaValidation,
+                challenge_type: ChallengeType::schema_validation(),
             },
             passed: true,
             score: None,
