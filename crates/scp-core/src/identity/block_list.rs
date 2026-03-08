@@ -920,15 +920,35 @@ mod tests {
         state.block_did_in_context(target.clone(), ctx.to_owned(), 1000);
         let governance_revoked = true;
 
-        assert!(is_effectively_blocked(&state, &target, ctx, governance_revoked));
-        assert!(!is_access_restored(&state, &target, ctx, governance_revoked));
+        assert!(is_effectively_blocked(
+            &state,
+            &target,
+            ctx,
+            governance_revoked
+        ));
+        assert!(!is_access_restored(
+            &state,
+            &target,
+            ctx,
+            governance_revoked
+        ));
 
         state.unblock_did_in_context(target.clone(), ctx.to_owned(), 2000);
 
         // Identity tier clear, but governance still blocks.
         assert!(!state.is_identity_blocked(&target, ctx));
-        assert!(is_effectively_blocked(&state, &target, ctx, governance_revoked));
-        assert!(!is_access_restored(&state, &target, ctx, governance_revoked));
+        assert!(is_effectively_blocked(
+            &state,
+            &target,
+            ctx,
+            governance_revoked
+        ));
+        assert!(!is_access_restored(
+            &state,
+            &target,
+            ctx,
+            governance_revoked
+        ));
     }
 
     #[test]

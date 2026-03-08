@@ -84,7 +84,11 @@ pub struct RegistryEntry {
 // Helper to build registry entries
 // ---------------------------------------------------------------------------
 
-fn entry(category: &str, description: &str, parameter_schema: Option<serde_json::Value>) -> RegistryEntry {
+fn entry(
+    category: &str,
+    description: &str,
+    parameter_schema: Option<serde_json::Value>,
+) -> RegistryEntry {
     RegistryEntry {
         category: category.to_owned(),
         description: description.to_owned(),
@@ -320,11 +324,7 @@ static PROTOCOL_REGISTRY: LazyLock<HashMap<String, RegistryEntry>> = LazyLock::n
     );
     m.insert(
         "scp:capability:code-review/v1".into(),
-        entry(
-            "code",
-            "Identify planted bugs with explanations.",
-            None,
-        ),
+        entry("code", "Identify planted bugs with explanations.", None),
     );
 
     // -- Recall / Fidelity (2) --
@@ -382,17 +382,17 @@ static PROTOCOL_REGISTRY: LazyLock<HashMap<String, RegistryEntry>> = LazyLock::n
     );
     m.insert(
         "scp:capability:source-attribution/v1".into(),
-        entry(
-            "factual-hallucination",
-            "Real, verifiable citations.",
-            None,
-        ),
+        entry("factual-hallucination", "Real, verifiable citations.", None),
     );
 
     // The spec §7.3.4.3 and ADR-041 list 28 capabilities across 10 categories.
     // (The "27" stated in prose is a counting error in the source documents;
     // the actual enumerated list contains 28 entries.)
-    debug_assert_eq!(m.len(), 28, "PROTOCOL_REGISTRY must contain exactly 28 entries");
+    debug_assert_eq!(
+        m.len(),
+        28,
+        "PROTOCOL_REGISTRY must contain exactly 28 entries"
+    );
     m
 });
 
@@ -409,43 +409,23 @@ static SYSTEM_REGISTRY: LazyLock<HashMap<String, RegistryEntry>> = LazyLock::new
 
     m.insert(
         "scp:system:mls-group-management".into(),
-        entry(
-            "system",
-            "MLS epoch transitions.",
-            None,
-        ),
+        entry("system", "MLS epoch transitions.", None),
     );
     m.insert(
         "scp:system:key-rotation".into(),
-        entry(
-            "system",
-            "Key rotation operations.",
-            None,
-        ),
+        entry("system", "Key rotation operations.", None),
     );
     m.insert(
         "scp:system:governance-participation".into(),
-        entry(
-            "system",
-            "Governance proposal/vote.",
-            None,
-        ),
+        entry("system", "Governance proposal/vote.", None),
     );
     m.insert(
         "scp:system:relay-operation".into(),
-        entry(
-            "system",
-            "Relay node.",
-            None,
-        ),
+        entry("system", "Relay node.", None),
     );
     m.insert(
         "scp:system:bridge-operation".into(),
-        entry(
-            "system",
-            "Platform bridge.",
-            None,
-        ),
+        entry("system", "Platform bridge.", None),
     );
 
     debug_assert_eq!(m.len(), 5, "SYSTEM_REGISTRY must contain exactly 5 entries");
@@ -690,7 +670,9 @@ mod tests {
 
     #[test]
     fn is_known_protocol_capability_false_for_unknown() {
-        assert!(!is_known_protocol_capability("scp:capability:nonexistent/v1"));
+        assert!(!is_known_protocol_capability(
+            "scp:capability:nonexistent/v1"
+        ));
     }
 
     #[test]
@@ -1104,8 +1086,8 @@ mod tests {
 
     #[test]
     fn registry_entry_has_required_fields() {
-        let entry = lookup_protocol_capability("scp:capability:prompt-injection-resistance/v1")
-            .unwrap();
+        let entry =
+            lookup_protocol_capability("scp:capability:prompt-injection-resistance/v1").unwrap();
         // category is a String
         assert!(!entry.category.is_empty());
         // description is a String

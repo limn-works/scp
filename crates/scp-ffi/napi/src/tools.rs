@@ -166,8 +166,9 @@ pub async fn tool_invoke(
 
     crate::runtime::with_context(&context_id, |rt| {
         let production_resolver = crate::runtime::did_resolver();
-        let did_resolver =
-            scp_ffi_common::DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
+        let did_resolver = scp_ffi_common::DispatchDidResolver::new(
+            production_resolver.map(std::convert::AsRef::as_ref),
+        );
         let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
             revocation_list: &rt.revocation_list,
         };

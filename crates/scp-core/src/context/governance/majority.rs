@@ -29,9 +29,10 @@
 use std::collections::HashMap;
 
 use super::{
-    GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
-    GovernanceModelConfig, GovernanceProposal, KeyResolver, ProposalId, ProposalStatus,
-    RejectionReason, VoteType, compute_proposal_id, sign_vote, verify_vote, CheckpointAttestationStatus, CosignedCheckpoint,
+    CheckpointAttestationStatus, CosignedCheckpoint, GovernanceAction, GovernanceContext,
+    GovernanceEngine, GovernanceError, GovernanceEvent, GovernanceModelConfig, GovernanceProposal,
+    KeyResolver, ProposalId, ProposalStatus, RejectionReason, VoteType, compute_proposal_id,
+    sign_vote, verify_vote,
 };
 use scp_identity::DID;
 
@@ -656,8 +657,8 @@ impl GovernanceEngine for MajorityVoteEngine {
 
     fn checkpoint_cosignature_requirements(&self) -> (Vec<DID>, usize) {
         // Majority: require >50% cosignatures from eligible voters (ADR-031 §9)
-        let majority_count = (self.eligible_voters().len() / 2) + 1;
-        (self.eligible_voters().clone(), majority_count)
+        let majority_count = (self.eligible_voter_dids.len() / 2) + 1;
+        (self.eligible_voter_dids.clone(), majority_count)
     }
 
     fn validate_checkpoint_cosignatures(
@@ -665,36 +666,41 @@ impl GovernanceEngine for MajorityVoteEngine {
         cosignatures: &[CosignedCheckpoint],
         checkpoint_hash: &[u8; 32],
     ) -> Result<CheckpointAttestationStatus, GovernanceError> {
-        use ed25519_dalek::{Signature, VerifyingKey};
-        
         // Verify all cosignatures are from eligible voters and valid
         let mut valid_cosignatures = 0;
         for cosig in cosignatures {
-            if !self.eligible_voters().contains(&cosig.signer_did) {
+            if !self.eligible_voter_dids.contains(&cosig.signer_did) {
                 return Err(GovernanceError::NotEligible(format!(
-                    "Cosigner {} not in eligible voter set", cosig.signer_did
+                    "Cosigner {} not in eligible voter set",
+                    cosig.signer_did
                 )));
             }
-            
+
             // Get public key for this voter
-            let public_key = match self.key_resolver.resolve(&cosig.signer_did) {
+            let verifying_key = match (self.key_resolver)(&cosig.signer_did) {
                 Some(key) => key,
-                None => return Err(GovernanceError::NotEligible(format!(
-                    "Cannot resolve public key for cosigner {}", cosig.signer_did
-                ))),
+                None => {
+                    return Err(GovernanceError::NotEligible(format!(
+                        "Cannot resolve public key for cosigner {}",
+                        cosig.signer_did
+                    )));
+                }
             };
-            
+
             // Verify signature
-            let verifying_key = VerifyingKey::from_bytes(&public_key)
+            let sig_bytes: [u8; 64] = cosig.signature.as_slice().try_into().map_err(|_| {
+                GovernanceError::VerificationFailed("invalid signature length".to_string())
+            })?;
+            let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+            verifying_key
+                .verify_strict(checkpoint_hash, &signature)
                 .map_err(|e| GovernanceError::VerificationFailed(e.to_string()))?;
-            verifying_key.verify_strict(checkpoint_hash, &cosig.signature)
-                .map_err(|e| GovernanceError::VerificationFailed(e.to_string()))?;
-                
+
             valid_cosignatures += 1;
         }
-        
+
         // Check if we have majority (>50%) for full attestation
-        let majority_count = (self.eligible_voters().len() / 2) + 1;
+        let majority_count = (self.eligible_voter_dids.len() / 2) + 1;
         if valid_cosignatures >= majority_count {
             Ok(CheckpointAttestationStatus::FullyAttested)
         } else {
@@ -2303,8 +2309,8 @@ mod tests {
     #[test]
     fn majority_set_economic_policy() {
         let voters = vec![alice(), bob(), carol()];
-        let mut engine =
-            MajorityVoteEngine::new(voters.clone(), 86_400, 5000, mock_resolver()).expect("valid config");
+        let mut engine = MajorityVoteEngine::new(voters.clone(), 86_400, 5000, mock_resolver())
+            .expect("valid config");
         let ctx = test_context(&voters, 1_700_000_000);
 
         let action = GovernanceAction::SetEconomicPolicy {
@@ -2332,8 +2338,8 @@ mod tests {
     #[test]
     fn majority_approve_spend() {
         let voters = vec![alice(), bob()];
-        let mut engine =
-            MajorityVoteEngine::new(voters.clone(), 86_400, 5000, mock_resolver()).expect("valid config");
+        let mut engine = MajorityVoteEngine::new(voters.clone(), 86_400, 5000, mock_resolver())
+            .expect("valid config");
         let ctx = test_context(&voters, 1_700_000_000);
 
         let action = GovernanceAction::ApproveSpend {
@@ -2349,8 +2355,8 @@ mod tests {
     #[test]
     fn majority_lock_economic_policy() {
         let voters = vec![alice(), bob()];
-        let mut engine =
-            MajorityVoteEngine::new(voters.clone(), 86_400, 5000, mock_resolver()).expect("valid config");
+        let mut engine = MajorityVoteEngine::new(voters.clone(), 86_400, 5000, mock_resolver())
+            .expect("valid config");
         let ctx = test_context(&voters, 1_700_000_000);
 
         let action = GovernanceAction::LockEconomicPolicy;

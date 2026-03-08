@@ -307,9 +307,7 @@ pub fn py_event_log_verify(
         .get("type")
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
-            ScpPyError::validation(
-                "claim must include 'type' field ('inclusion' or 'absence')",
-            )
+            ScpPyError::validation("claim must include 'type' field ('inclusion' or 'absence')")
         })?;
 
     match claim_type {
@@ -318,17 +316,13 @@ pub fn py_event_log_verify(
                 .get("leaf_index")
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| {
-                    ScpPyError::validation(
-                        "inclusion claim must include 'leaf_index' (integer)",
-                    )
+                    ScpPyError::validation("inclusion claim must include 'leaf_index' (integer)")
                 })?;
 
             // Generate and verify the inclusion proof via scp-core.
             let proof_result = crate::runtime::with_context(context_id, |rt| {
                 let proof = scp_event_log::proof::prove_inclusion(&rt.event_log, leaf_index)
-                    .map_err(|e| {
-                        ScpPyError::context(format!("inclusion proof failed: {e}"))
-                    })?;
+                    .map_err(|e| ScpPyError::context(format!("inclusion proof failed: {e}")))?;
                 let verified = scp_event_log::proof::verify_inclusion(&proof);
 
                 let path_steps: Vec<serde_json::Value> = proof
@@ -371,9 +365,7 @@ pub fn py_event_log_verify(
                 .get("event_hash")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    ScpPyError::validation(
-                        "absence claim must include 'event_hash' (hex string)",
-                    )
+                    ScpPyError::validation("absence claim must include 'event_hash' (hex string)")
                 })?;
 
             // Decode the hex event hash.
@@ -381,45 +373,44 @@ pub fn py_event_log_verify(
                 .map_err(|e| ScpPyError::validation(format!("invalid event_hash: {e}")))?;
 
             // Generate the absence proof via scp-core.
-            let proof_result = crate::runtime::with_context(context_id, |rt| {
-                let proof = scp_event_log::proof::prove_absence(&rt.event_log, &event_hash)
-                    .map_err(|e| ScpPyError::context(format!("absence proof failed: {e}")))?;
+            let proof_result =
+                crate::runtime::with_context(context_id, |rt| {
+                    let proof = scp_event_log::proof::prove_absence(&rt.event_log, &event_hash)
+                        .map_err(|e| ScpPyError::context(format!("absence proof failed: {e}")))?;
 
-                let lower = proof.lower.as_ref().map(|lwp| {
-                    serde_json::json!({
-                        "leaf_hash": encode_hex(&lwp.leaf_hash),
-                        "leaf_index": lwp.leaf_index,
-                    })
-                });
+                    let lower = proof.lower.as_ref().map(|lwp| {
+                        serde_json::json!({
+                            "leaf_hash": encode_hex(&lwp.leaf_hash),
+                            "leaf_index": lwp.leaf_index,
+                        })
+                    });
 
-                let upper = proof.upper.as_ref().map(|uwp| {
-                    serde_json::json!({
-                        "leaf_hash": encode_hex(&uwp.leaf_hash),
-                        "leaf_index": uwp.leaf_index,
-                    })
-                });
+                    let upper = proof.upper.as_ref().map(|uwp| {
+                        serde_json::json!({
+                            "leaf_hash": encode_hex(&uwp.leaf_hash),
+                            "leaf_index": uwp.leaf_index,
+                        })
+                    });
 
-                // Verify the neighbor inclusion proofs.
-                let lower_verified = proof
-                    .lower
-                    .as_ref()
-                    .is_none_or(|lwp| scp_event_log::proof::verify_inclusion(&lwp.inclusion_proof));
-                let upper_verified = proof
-                    .upper
-                    .as_ref()
-                    .is_none_or(|uwp| scp_event_log::proof::verify_inclusion(&uwp.inclusion_proof));
-                let verified = lower_verified && upper_verified;
+                    // Verify the neighbor inclusion proofs.
+                    let lower_verified = proof.lower.as_ref().is_none_or(|lwp| {
+                        scp_event_log::proof::verify_inclusion(&lwp.inclusion_proof)
+                    });
+                    let upper_verified = proof.upper.as_ref().is_none_or(|uwp| {
+                        scp_event_log::proof::verify_inclusion(&uwp.inclusion_proof)
+                    });
+                    let verified = lower_verified && upper_verified;
 
-                let details = serde_json::json!({
-                    "query_hash": encode_hex(&proof.query_hash),
-                    "root": encode_hex(&proof.root),
-                    "leaf_count": proof.leaf_count,
-                    "lower": lower,
-                    "upper": upper,
-                });
+                    let details = serde_json::json!({
+                        "query_hash": encode_hex(&proof.query_hash),
+                        "root": encode_hex(&proof.root),
+                        "leaf_count": proof.leaf_count,
+                        "lower": lower,
+                        "upper": upper,
+                    });
 
-                Ok((verified, details))
-            })?;
+                    Ok((verified, details))
+                })?;
 
             let (verified, details_json) = proof_result;
             let details = json_to_py_dict(py, &details_json)?;
@@ -494,8 +485,7 @@ pub fn py_event_log_checkpoint(
                 .await
             });
 
-            result
-                .map_err(|e| ScpPyError::context(format!("checkpoint generation failed: {e}")))
+            result.map_err(|e| ScpPyError::context(format!("checkpoint generation failed: {e}")))
         })
     })?;
 

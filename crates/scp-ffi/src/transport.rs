@@ -177,9 +177,10 @@ pub fn py_transport_connect(relay_url: &str, source: &str) -> PyResult<()> {
 pub fn py_transport_disconnect() -> PyResult<()> {
     crate::runtime::clear_relay_connection()?;
 
-    *connected_url_state().write().map_err(|_| {
-        ScpPyError::transport("connected relay URL lock is poisoned".to_owned())
-    })? = None;
+    *connected_url_state()
+        .write()
+        .map_err(|_| ScpPyError::transport("connected relay URL lock is poisoned".to_owned()))? =
+        None;
 
     Ok(())
 }

@@ -240,7 +240,7 @@ pub fn verify_vote(
         ))
     })?;
 
-    let signature = [u8; 64]::from_bytes(&sig_bytes);
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
 
     voter_public_key
         .verify_strict(&hash, &signature)
@@ -362,7 +362,6 @@ pub struct CheckpointSchedule {
     pub min_events_since_last: u64,
 }
 
-
 // ---------------------------------------------------------------------------
 // Checkpoint cosignature types (ADR-031 §9)
 // ---------------------------------------------------------------------------
@@ -372,8 +371,9 @@ pub struct CheckpointSchedule {
 pub struct CosignedCheckpoint {
     /// The DID of the signer.
     pub signer_did: DID,
-    /// Ed25519 signature over the checkpoint hash.
-    pub signature: [u8; 64],
+    /// Ed25519 signature over the checkpoint hash (64 bytes).
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
 }
 
 /// Attestation status for a checkpoint (ADR-031 §9).
@@ -402,8 +402,9 @@ pub struct ContextCheckpoint {
     pub created_at: u64,
     /// Creator's DID and signature.
     pub creator_did: DID,
-    /// Creator's Ed25519 signature over checkpoint data.
-    pub creator_signature: [u8; 64],
+    /// Creator's Ed25519 signature over checkpoint data (64 bytes).
+    #[serde(with = "serde_bytes")]
+    pub creator_signature: Vec<u8>,
     /// Governance quorum cosignatures (ADR-031 §9).
     /// Empty for SingleAdmin contexts, populated for multi-admin contexts.
     pub cosignatures: Vec<CosignedCheckpoint>,
@@ -1221,7 +1222,6 @@ pub trait GovernanceEngine: Send + Sync {
         proposal_id: &ProposalId,
         reason: String,
     ) -> Result<Vec<GovernanceEvent>, GovernanceError>;
-}
 
     /// Get checkpoint cosignature requirements for this governance model (ADR-031 §9).
     ///
@@ -1264,7 +1264,7 @@ pub trait GovernanceEngine: Send + Sync {
         cosignatures: &[CosignedCheckpoint],
         checkpoint_hash: &[u8; 32],
     ) -> Result<CheckpointAttestationStatus, GovernanceError>;
-
+}
 
 // ---------------------------------------------------------------------------
 // SingleAdminEngine
@@ -1561,21 +1561,30 @@ pub fn actions_conflict(
 
     match (action_a, action_b) {
         // Mutual RemoveMember (each targeting the other's proposer)
-        (
-            RemoveMember { did: target_a, .. },
-            RemoveMember { did: target_b, .. },
-        ) => target_a == proposer_b && target_b == proposer_a,
+        (RemoveMember { did: target_a, .. }, RemoveMember { did: target_b, .. }) => {
+            target_a == proposer_b && target_b == proposer_a
+        }
 
         // Competing ChangeRole proposals for the same DID with different roles
         (
-            ChangeRole { did: did_a, new_role: role_a },
-            ChangeRole { did: did_b, new_role: role_b },
+            ChangeRole {
+                did: did_a,
+                new_role: role_a,
+            },
+            ChangeRole {
+                did: did_b,
+                new_role: role_b,
+            },
         ) => did_a == did_b && role_a != role_b,
 
         // Competing ModifyCeiling proposals with different ceiling sets
         (
-            ModifyCeiling { new_ceiling: ceiling_a },
-            ModifyCeiling { new_ceiling: ceiling_b },
+            ModifyCeiling {
+                new_ceiling: ceiling_a,
+            },
+            ModifyCeiling {
+                new_ceiling: ceiling_b,
+            },
         ) => ceiling_a != ceiling_b,
 
         // RemoveMember + ChangeRole for the same DID
@@ -1583,35 +1592,37 @@ pub fn actions_conflict(
         | (ChangeRole { did: did_a, .. }, RemoveMember { did: did_b, .. }) => did_a == did_b,
 
         // RevokeReadAccess + RestoreReadAccess for the same DID (mutually contradictory)
-        (
-            RevokeReadAccess { did: did_a, .. },
-            RestoreReadAccess { did: did_b },
-        )
-        | (
-            RestoreReadAccess { did: did_a },
-            RevokeReadAccess { did: did_b, .. },
-        ) => did_a == did_b,
+        (RevokeReadAccess { did: did_a, .. }, RestoreReadAccess { did: did_b })
+        | (RestoreReadAccess { did: did_a }, RevokeReadAccess { did: did_b, .. }) => did_a == did_b,
 
         // RevokeWriteAccess + RestoreWriteAccess for the same DID (mutually contradictory)
-        (
-            RevokeWriteAccess { did: did_a, .. },
-            RestoreWriteAccess { did: did_b },
-        )
-        | (
-            RestoreWriteAccess { did: did_a },
-            RevokeWriteAccess { did: did_b, .. },
-        ) => did_a == did_b,
+        (RevokeWriteAccess { did: did_a, .. }, RestoreWriteAccess { did: did_b })
+        | (RestoreWriteAccess { did: did_a }, RevokeWriteAccess { did: did_b, .. }) => {
+            did_a == did_b
+        }
 
         // Two RevokeReadAccess for same DID with different scopes
         (
-            RevokeReadAccess { did: did_a, scope: scope_a },
-            RevokeReadAccess { did: did_b, scope: scope_b },
+            RevokeReadAccess {
+                did: did_a,
+                scope: scope_a,
+            },
+            RevokeReadAccess {
+                did: did_b,
+                scope: scope_b,
+            },
         ) => did_a == did_b && scope_a != scope_b,
 
         // Two RevokeWriteAccess for same DID with different scopes
         (
-            RevokeWriteAccess { did: did_a, scope: scope_a },
-            RevokeWriteAccess { did: did_b, scope: scope_b },
+            RevokeWriteAccess {
+                did: did_a,
+                scope: scope_a,
+            },
+            RevokeWriteAccess {
+                did: did_b,
+                scope: scope_b,
+            },
         ) => did_a == did_b && scope_a != scope_b,
 
         // All other combinations are not conflicting
@@ -1626,6 +1637,9 @@ pub fn actions_conflict(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use super::majority::MajorityVoteEngine;
+    use super::multisig::ThresholdEngine;
+    use super::unanimity::UnanimityEngine;
     use super::*;
 
     fn alice() -> DID {
@@ -1654,21 +1668,30 @@ mod tests {
         ed25519_dalek::SigningKey::from_bytes(&[2u8; 32])
     }
 
+    /// Returns the signing key for the given seed byte (deterministic).
+    fn sk_for(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// Signs `data` with the signing key seeded by `seed` and returns the
+    /// signature bytes as a `Vec<u8>`.
+    fn sign_with(seed: u8, data: &[u8]) -> Vec<u8> {
+        use ed25519_dalek::Signer;
+        sk_for(seed).sign(data).to_bytes().to_vec()
+    }
+
     /// Mock key resolver that maps test DIDs to their corresponding signing
-    /// key's verifying key. Alice -> [1u8;32], Bob -> [2u8;32].
+    /// key's verifying key. Alice -> [1u8;32], Bob -> [2u8;32], etc.
     fn mock_resolver() -> KeyResolver {
         Arc::new(|did: &DID| {
             let did_str: &str = did.as_ref();
             match did_str {
-                "did:dht:z6MkAlice" => {
-                    Some(ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]).verifying_key())
-                }
-                "did:dht:z6MkBob" => {
-                    Some(ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]).verifying_key())
-                }
-                "did:dht:z6MkCarol" => {
-                    Some(ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]).verifying_key())
-                }
+                "did:dht:z6MkAlice" => Some(sk_for(1).verifying_key()),
+                "did:dht:z6MkBob" => Some(sk_for(2).verifying_key()),
+                "did:dht:z6MkCarol" => Some(sk_for(3).verifying_key()),
+                "did:dht:z6MkCharlie" => Some(sk_for(4).verifying_key()),
+                "did:dht:z6MkDavid" => Some(sk_for(5).verifying_key()),
+                "did:dht:z6MkEve" => Some(sk_for(6).verifying_key()),
                 _ => None,
             }
         })
@@ -3076,13 +3099,12 @@ mod tests {
         assert_eq!(proposal.status, ProposalStatus::Approved);
         assert_eq!(events.len(), 3);
     }
-}
 
     #[test]
     fn single_admin_checkpoint_cosignature_requirements() {
         let admin = alice();
         let engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
-        
+
         let (required_signers, minimum_count) = engine.checkpoint_cosignature_requirements();
         assert_eq!(required_signers.len(), 0);
         assert_eq!(minimum_count, 0);
@@ -3092,11 +3114,13 @@ mod tests {
     fn single_admin_checkpoint_empty_cosignatures() {
         let admin = alice();
         let engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
-        
+
         let checkpoint_hash = [0u8; 32];
         let cosignatures = vec![];
-        
-        let status = engine.validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash).unwrap();
+
+        let status = engine
+            .validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash)
+            .unwrap();
         assert_eq!(status, CheckpointAttestationStatus::FullyAttested);
     }
 
@@ -3104,15 +3128,13 @@ mod tests {
     fn single_admin_checkpoint_rejects_cosignatures() {
         let admin = alice();
         let engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
-        
+
         let checkpoint_hash = [0u8; 32];
-        let cosignatures = vec![
-            CosignedCheckpoint {
-                signer_did: bob(),
-                signature: [u8; 64]::from([0u8; 64]),
-            }
-        ];
-        
+        let cosignatures = vec![CosignedCheckpoint {
+            signer_did: bob(),
+            signature: vec![0u8; 64],
+        }];
+
         let result = engine.validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash);
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -3127,8 +3149,9 @@ mod tests {
     fn threshold_checkpoint_cosignature_requirements() {
         let signers = vec![alice(), bob(), charlie()];
         let threshold = 2;
-        let engine = ThresholdEngine::new(signers.clone(), threshold, 86_400, mock_resolver()).unwrap();
-        
+        let engine =
+            ThresholdEngine::new(signers.clone(), threshold, 86_400, mock_resolver()).unwrap();
+
         let (required_signers, minimum_count) = engine.checkpoint_cosignature_requirements();
         assert_eq!(required_signers, signers);
         assert_eq!(minimum_count, 2);
@@ -3139,23 +3162,22 @@ mod tests {
         let signers = vec![alice(), bob(), charlie()];
         let threshold = 2;
         let engine = ThresholdEngine::new(signers, threshold, 86_400, mock_resolver()).unwrap();
-        
+
         let checkpoint_hash = [1u8; 32];
         let cosignatures = vec![
             CosignedCheckpoint {
                 signer_did: alice(),
-                signature: [u8; 64]::from([1u8; 64]),
+                signature: sign_with(1, &checkpoint_hash),
             },
             CosignedCheckpoint {
                 signer_did: bob(),
-                signature: [u8; 64]::from([2u8; 64]),
+                signature: sign_with(2, &checkpoint_hash),
             },
         ];
-        
-        // Mock the key resolver to return valid keys for signature verification
-        // Note: In real tests, we'd use actual signed data, but for this test structure
-        // we'll test the logic assuming signature verification passes
-        let status = engine.validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash).unwrap();
+
+        let status = engine
+            .validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash)
+            .unwrap();
         assert_eq!(status, CheckpointAttestationStatus::FullyAttested);
     }
 
@@ -3164,24 +3186,25 @@ mod tests {
         let signers = vec![alice(), bob(), charlie()];
         let threshold = 2;
         let engine = ThresholdEngine::new(signers, threshold, 86_400, mock_resolver()).unwrap();
-        
+
         let checkpoint_hash = [1u8; 32];
-        let cosignatures = vec![
-            CosignedCheckpoint {
-                signer_did: alice(),
-                signature: [u8; 64]::from([1u8; 64]),
-            },
-        ];
-        
-        let status = engine.validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash).unwrap();
+        let cosignatures = vec![CosignedCheckpoint {
+            signer_did: alice(),
+            signature: sign_with(1, &checkpoint_hash),
+        }];
+
+        let status = engine
+            .validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash)
+            .unwrap();
         assert_eq!(status, CheckpointAttestationStatus::PartiallyAttested);
     }
 
     #[test]
     fn majority_checkpoint_cosignature_requirements() {
         let voters = vec![alice(), bob(), charlie(), david(), eve()]; // 5 voters
-        let engine = MajorityVoteEngine::new(voters.clone(), 86_400, 5000, mock_resolver()).unwrap();
-        
+        let engine =
+            MajorityVoteEngine::new(voters.clone(), 86_400, 5000, mock_resolver()).unwrap();
+
         let (required_signers, minimum_count) = engine.checkpoint_cosignature_requirements();
         assert_eq!(required_signers, voters);
         assert_eq!(minimum_count, 3); // (5 / 2) + 1 = 3
@@ -3191,24 +3214,26 @@ mod tests {
     fn majority_checkpoint_fully_attested() {
         let voters = vec![alice(), bob(), charlie(), david(), eve()];
         let engine = MajorityVoteEngine::new(voters, 86_400, 5000, mock_resolver()).unwrap();
-        
+
         let checkpoint_hash = [1u8; 32];
         let cosignatures = vec![
             CosignedCheckpoint {
                 signer_did: alice(),
-                signature: [u8; 64]::from([1u8; 64]),
+                signature: sign_with(1, &checkpoint_hash),
             },
             CosignedCheckpoint {
                 signer_did: bob(),
-                signature: [u8; 64]::from([2u8; 64]),
+                signature: sign_with(2, &checkpoint_hash),
             },
             CosignedCheckpoint {
                 signer_did: charlie(),
-                signature: [u8; 64]::from([3u8; 64]),
+                signature: sign_with(4, &checkpoint_hash), // charlie = seed 4
             },
         ];
-        
-        let status = engine.validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash).unwrap();
+
+        let status = engine
+            .validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash)
+            .unwrap();
         assert_eq!(status, CheckpointAttestationStatus::FullyAttested);
     }
 
@@ -3216,20 +3241,22 @@ mod tests {
     fn majority_checkpoint_partially_attested() {
         let voters = vec![alice(), bob(), charlie(), david(), eve()];
         let engine = MajorityVoteEngine::new(voters, 86_400, 5000, mock_resolver()).unwrap();
-        
+
         let checkpoint_hash = [1u8; 32];
         let cosignatures = vec![
             CosignedCheckpoint {
                 signer_did: alice(),
-                signature: [u8; 64]::from([1u8; 64]),
+                signature: sign_with(1, &checkpoint_hash),
             },
             CosignedCheckpoint {
                 signer_did: bob(),
-                signature: [u8; 64]::from([2u8; 64]),
+                signature: sign_with(2, &checkpoint_hash),
             },
         ];
-        
-        let status = engine.validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash).unwrap();
+
+        let status = engine
+            .validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash)
+            .unwrap();
         assert_eq!(status, CheckpointAttestationStatus::PartiallyAttested);
     }
 
@@ -3237,7 +3264,7 @@ mod tests {
     fn unanimity_checkpoint_cosignature_requirements() {
         let voters = vec![alice(), bob(), charlie()];
         let engine = UnanimityEngine::new(voters.clone(), 172_800, mock_resolver()).unwrap();
-        
+
         let (required_signers, minimum_count) = engine.checkpoint_cosignature_requirements();
         assert_eq!(required_signers, voters);
         assert_eq!(minimum_count, 3); // All voters
@@ -3247,24 +3274,26 @@ mod tests {
     fn unanimity_checkpoint_fully_attested() {
         let voters = vec![alice(), bob(), charlie()];
         let engine = UnanimityEngine::new(voters, 172_800, mock_resolver()).unwrap();
-        
+
         let checkpoint_hash = [1u8; 32];
         let cosignatures = vec![
             CosignedCheckpoint {
                 signer_did: alice(),
-                signature: [u8; 64]::from([1u8; 64]),
+                signature: sign_with(1, &checkpoint_hash),
             },
             CosignedCheckpoint {
                 signer_did: bob(),
-                signature: [u8; 64]::from([2u8; 64]),
+                signature: sign_with(2, &checkpoint_hash),
             },
             CosignedCheckpoint {
                 signer_did: charlie(),
-                signature: [u8; 64]::from([3u8; 64]),
+                signature: sign_with(4, &checkpoint_hash), // charlie = seed 4
             },
         ];
-        
-        let status = engine.validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash).unwrap();
+
+        let status = engine
+            .validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash)
+            .unwrap();
         assert_eq!(status, CheckpointAttestationStatus::FullyAttested);
     }
 
@@ -3272,29 +3301,35 @@ mod tests {
     fn unanimity_checkpoint_partially_attested() {
         let voters = vec![alice(), bob(), charlie()];
         let engine = UnanimityEngine::new(voters, 172_800, mock_resolver()).unwrap();
-        
+
         let checkpoint_hash = [1u8; 32];
         let cosignatures = vec![
             CosignedCheckpoint {
                 signer_did: alice(),
-                signature: [u8; 64]::from([1u8; 64]),
+                signature: sign_with(1, &checkpoint_hash),
             },
             CosignedCheckpoint {
                 signer_did: bob(),
-                signature: [u8; 64]::from([2u8; 64]),
+                signature: sign_with(2, &checkpoint_hash),
             },
             // Missing charlie() - not unanimous
         ];
-        
-        let status = engine.validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash).unwrap();
+
+        let status = engine
+            .validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash)
+            .unwrap();
         assert_eq!(status, CheckpointAttestationStatus::PartiallyAttested);
     }
 
-    // Helper function for test DIDs
+    fn charlie() -> DID {
+        DID::from("did:dht:z6MkCharlie")
+    }
+
     fn david() -> DID {
-        DID::from("did:dht:z6MkTestDavid")
+        DID::from("did:dht:z6MkDavid")
     }
 
     fn eve() -> DID {
-        DID::from("did:dht:z6MkTestEve")
+        DID::from("did:dht:z6MkEve")
     }
+}

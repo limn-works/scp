@@ -2753,7 +2753,8 @@ impl ContextManager {
             // Check if we're in governance freeze before executing
             let in_freeze = {
                 let contexts = self.contexts.lock().await;
-                contexts.get(context_id)
+                contexts
+                    .get(context_id)
                     .map(|ctx| ctx.governance_freeze.is_some())
                     .unwrap_or(false)
             };
@@ -4925,37 +4926,51 @@ impl ContextManager {
     ///
     /// # Returns
     /// A vector of governance events to emit (empty if no conflicts)
-    fn detect_and_handle_conflicts(&self, ctx: &mut PerContextState, new_proposal: &GovernanceProposal) -> Vec<GovernanceEvent> {
-        use super::governance::{actions_conflict, GovernanceEvent};
+    fn detect_and_handle_conflicts(
+        &self,
+        ctx: &mut PerContextState,
+        new_proposal: &GovernanceProposal,
+    ) -> Vec<GovernanceEvent> {
+        use super::governance::{GovernanceEvent, actions_conflict};
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let mut events = Vec::new();
         let current_timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         // Check for conflicts with existing approved proposals
         let mut conflicts = Vec::new();
-        for (existing_id, (existing_proposal, existing_seq, existing_timestamp)) in &ctx.approved_proposals {
+        for (existing_id, (existing_proposal, existing_seq, existing_timestamp)) in
+            &ctx.approved_proposals
+        {
             if actions_conflict(
                 &new_proposal.action,
                 &new_proposal.proposer_did,
                 &existing_proposal.action,
                 &existing_proposal.proposer_did,
             ) {
-                conflicts.push((*existing_id, *existing_seq, *existing_timestamp, existing_proposal.clone()));
+                conflicts.push((
+                    *existing_id,
+                    *existing_seq,
+                    *existing_timestamp,
+                    existing_proposal.clone(),
+                ));
             }
         }
 
         // Handle conflicts
-        for (conflicting_id, conflicting_seq, conflicting_timestamp, conflicting_proposal) in conflicts {
+        for (conflicting_id, conflicting_seq, _conflicting_timestamp, _conflicting_proposal) in
+            conflicts
+        {
             // Assign sequence numbers - for now, use timestamp as sequence
             let new_seq = current_timestamp;
 
             if new_seq == conflicting_seq {
                 // Simultaneous conflict - enter governance freeze
-                ctx.governance_freeze = Some((new_proposal.proposal_id, conflicting_id, current_timestamp));
+                ctx.governance_freeze =
+                    Some((new_proposal.proposal_id, conflicting_id, current_timestamp));
                 events.push(GovernanceEvent::ConflictDetected {
                     proposal_a: new_proposal.proposal_id,
                     proposal_b: conflicting_id,
@@ -5008,7 +5023,7 @@ impl ContextManager {
 
         let current_timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         if let Some((proposal_a, proposal_b, freeze_start)) = ctx.governance_freeze {
@@ -5044,7 +5059,6 @@ const fn _assert_send_sync() {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<ContextManager>();
 }
-
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -7658,6 +7672,8 @@ mod tests {
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
+            approved_proposals: HashMap::new(),
+            governance_freeze: None,
         };
 
         let bc_snapshot = test_broadcast_snapshot("persist-ctx-2");
@@ -7750,6 +7766,8 @@ mod tests {
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
+            approved_proposals: HashMap::new(),
+            governance_freeze: None,
         };
 
         persistence
@@ -7830,6 +7848,8 @@ mod tests {
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
+            approved_proposals: HashMap::new(),
+            governance_freeze: None,
         };
 
         persistence.persist_context("ttl-ctx", &snapshot).unwrap();
@@ -7889,6 +7909,8 @@ mod tests {
                 pruning_policy: None,
                 governance_model_config: None,
                 economic_policy: None,
+                approved_proposals: HashMap::new(),
+                governance_freeze: None,
             };
             persistence.persist_context(ctx_name, &snapshot).unwrap();
         }
@@ -7947,6 +7969,8 @@ mod tests {
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
+            approved_proposals: HashMap::new(),
+            governance_freeze: None,
         };
 
         let bc_snapshot = test_broadcast_snapshot("dup-ctx");
@@ -8933,6 +8957,8 @@ mod tests {
                 },
             ),
             economic_policy: None,
+            approved_proposals: HashMap::new(),
+            governance_freeze: None,
         };
 
         let json = serde_json::to_string(&snapshot).expect("serialize");

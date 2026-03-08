@@ -177,8 +177,7 @@ fn resolve_storage_key(storage_dir: &std::path::Path) -> Result<Zeroizing<[u8; 3
     // Check env var first.
     if let Ok(hex_key) = env::var("SCP_STORAGE_KEY") {
         let bytes = Zeroizing::new(
-            hex::decode(&hex_key)
-                .map_err(|e| format!("SCP_STORAGE_KEY is not valid hex: {e}"))?,
+            hex::decode(&hex_key).map_err(|e| format!("SCP_STORAGE_KEY is not valid hex: {e}"))?,
         );
         if bytes.len() != 32 {
             return Err(format!(
@@ -546,7 +545,12 @@ fn open_sqlite_or_exit(dir: &std::path::Path, key: &Zeroizing<[u8; 32]>) -> Sqli
 /// persistent node. Returns `(storage_dir, storage_key, node_storage, custody)`.
 async fn init_persistent_storage(
     storage_path: Option<&PathBuf>,
-) -> (PathBuf, Zeroizing<[u8; 32]>, SqliteStorage, Arc<SqliteKeyCustody>) {
+) -> (
+    PathBuf,
+    Zeroizing<[u8; 32]>,
+    SqliteStorage,
+    Arc<SqliteKeyCustody>,
+) {
     let storage_dir = resolve_storage_path(storage_path);
 
     let storage_key = match resolve_storage_key(&storage_dir) {

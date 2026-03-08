@@ -439,8 +439,8 @@ mod tests {
     async fn sender_key_request_response_with_wrapping_key() {
         use crate::crypto::sender_keys::generate_sender_key;
         use crate::crypto::sender_keys::key_protocol::{
-            handle_sender_key_request, open_sender_key_response, request_sender_key,
-            HandleRequestParams, NonceDedup,
+            HandleRequestParams, NonceDedup, handle_sender_key_request, open_sender_key_response,
+            request_sender_key,
         };
         use scp_platform::testing::InMemoryKeyCustody;
         use scp_platform::traits::{KeyCustody, KeyType};
@@ -508,8 +508,8 @@ mod tests {
     async fn tampered_wrapping_key_prevents_decryption() {
         use crate::crypto::sender_keys::generate_sender_key;
         use crate::crypto::sender_keys::key_protocol::{
-            generate_wrapping_keypair, handle_sender_key_request, request_sender_key,
-            HandleRequestParams, NonceDedup,
+            HandleRequestParams, NonceDedup, generate_wrapping_keypair, handle_sender_key_request,
+            request_sender_key,
         };
         use scp_platform::testing::InMemoryKeyCustody;
         use scp_platform::traits::{KeyCustody, KeyType};

@@ -181,6 +181,8 @@ mod tests {
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
+            approved_proposals: std::collections::HashMap::new(),
+            governance_freeze: None,
         }
     }
 
