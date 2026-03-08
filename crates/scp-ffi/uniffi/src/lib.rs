@@ -1,3 +1,13 @@
+// UniFFI requires owned types for exported functions (no &str, no &[u8]).
+// These lints are framework constraints, not code quality issues.
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::missing_errors_doc,
+    clippy::items_after_statements,
+    clippy::significant_drop_tightening,
+    clippy::too_many_lines
+)]
+
 //! `UniFFI` FFI bridge for SCP — generates Swift and Kotlin bindings.
 //!
 //! This crate is the Rust half of the Swift and Kotlin SDKs. It uses `UniFFI`'s
@@ -81,6 +91,8 @@ pub use bridge::{
     TrustInput,
     UcanToken,
     UcanTokenData,
+    // Free functions — bridge connector (#370)
+    bridge_evaluate_trust,
     broadcast_admission,
     broadcast_block_subscriber,
     broadcast_handle_key_request,
@@ -107,6 +119,10 @@ pub use bridge::{
     context_reset_ttl_timer,
     context_send,
     context_subscribe,
+    // Free functions — discovery (#370)
+    discovery_create_query,
+    discovery_normalize_address,
+    discovery_parse_address,
     evaluate_provenance_quality,
     // Free functions — event log
     event_log_query,
@@ -119,8 +135,14 @@ pub use bridge::{
     identity_load,
     identity_resolve,
     is_local_did,
+    // Free functions — provenance (#370)
+    provenance_attach,
+    provenance_check_chain_depth,
     // Free functions — local DID management (#387)
     register_local_did,
+    // Free functions — sync (#370)
+    sync_classify_offline,
+    sync_classify_offline_custom,
     // Free functions — tools
     tool_invoke,
     tool_invoke_cross_context,

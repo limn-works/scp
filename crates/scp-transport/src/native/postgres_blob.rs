@@ -287,7 +287,7 @@ impl BlobStorage for PostgresBlobStore {
             .fetch_one(&self.pool)
             .await
             .map_err(|e| StorageError::Internal(format!("postgres count: {e}")))?;
-        #[allow(clippy::cast_sign_loss)]
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         Ok(row.0 as usize)
     }
 }

@@ -166,8 +166,9 @@ pub async fn tool_invoke(
 
     crate::runtime::with_context(&context_id, |rt| {
         let production_resolver = crate::runtime::did_resolver();
-        let did_resolver =
-            scp_ffi_common::DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
+        let did_resolver = scp_ffi_common::DispatchDidResolver::new(
+            production_resolver.map(std::convert::AsRef::as_ref),
+        );
         let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
             revocation_list: &rt.revocation_list,
         };
@@ -422,12 +423,13 @@ pub async fn tool_session_invoke(
     crate::runtime::ensure_registered(handle)?;
 
     let output = crate::runtime::with_context(&context_id, |rt| {
-        let session = rt.session_store.get(&session_id).ok_or_else(|| {
-            ScpNapiError::Tool {
+        let session = rt
+            .session_store
+            .get(&session_id)
+            .ok_or_else(|| ScpNapiError::Tool {
                 message: format!("session '{session_id}' not found"),
                 code: "SCP-TOOL-6018".to_owned(),
-            }
-        })?;
+            })?;
 
         // Check expiry.
         let now_ms = scp_core::time::now_millis().map_err(|e| ScpNapiError::Tool {

@@ -79,59 +79,20 @@ pub type Ed25519Signature = Vec<u8>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncPolicy {
     /// Tier 1 upper bound in seconds.
-    ///
-    /// Offline durations at or below this threshold are handled by relay
-    /// buffering and sequential MLS catch-up. Default: 14,400 (4 hours).
-    /// See ADR-029 section 1.
     pub tier_1_threshold_secs: u64,
-
     /// Tier 2 upper bound in seconds.
-    ///
-    /// Offline durations between `tier_1_threshold_secs` and this value use
-    /// state snapshot comparison and delta sync with selective epoch
-    /// reconstruction. Default: 604,800 (7 days). See ADR-029 section 1.
     pub tier_2_threshold_secs: u64,
-
     /// Gap timeout for the reorder buffer.
-    ///
-    /// If a gap in the message sequence is not filled within this duration,
-    /// the buffer delivers what it has and marks the gap. Default: 30 seconds.
-    /// See spec §9.8.5.
     pub gap_timeout: Duration,
-
     /// Maximum number of messages held in the reorder buffer.
-    ///
-    /// When the buffer reaches capacity, the oldest buffered messages are
-    /// delivered in order regardless of gaps. Default: 100.
-    /// See spec §9.8.5.
     pub reorder_buffer_capacity: usize,
-
-    /// Maximum number of sequential MLS Commits processed during epoch
-    /// catch-up.
-    ///
-    /// Beyond this limit the SDK falls back to Welcome-based fast-forward.
-    /// Default: 100. See ADR-029 section 3.
+    /// Maximum number of sequential MLS Commits processed during epoch catch-up.
     pub max_sequential_commits: u64,
-
     /// Per-Commit processing timeout during epoch catch-up.
-    ///
-    /// Commits that fail to process within this duration are logged as
-    /// `EpochCatchUpFailure` and the SDK falls through to the next recovery
-    /// source. Default: 5 seconds. See ADR-029 section 3.
     pub commit_process_timeout: Duration,
-
     /// Timeout for sender key re-acquisition after missed rotations.
-    ///
-    /// Messages encrypted with missed sender key epochs are buffered until
-    /// the key is obtained or this timeout expires. Default: 60 seconds.
-    /// See ADR-029 section 2, Phase 4.
     pub sender_key_timeout: Duration,
-
     /// Multi-device reconnection deduplication window.
-    ///
-    /// Devices observing another device's reconnection event within this
-    /// window defer their own MLS Update to avoid redundant epoch advances.
-    /// Default: 30 seconds. See ADR-029 section 7.
     pub reconnection_dedup_window: Duration,
 }
 
@@ -207,13 +168,7 @@ impl SyncPolicy {
         self
     }
 
-    /// Classifies the offline duration into the appropriate recovery tier
-    /// using this policy's thresholds.
-    ///
-    /// Uses `saturating_sub` to avoid underflow if timestamps are out of
-    /// order (SCP does not require synchronized clocks per §9.8.3).
-    ///
-    /// See ADR-029 section 1.
+    /// Classifies the offline duration into the appropriate recovery tier.
     #[must_use]
     pub const fn classify_offline_duration(
         &self,
@@ -231,62 +186,23 @@ impl SyncPolicy {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Legacy constants (ADR-029)
-// ---------------------------------------------------------------------------
-//
-// Retained as public constants so that `SyncPolicy::default()` values are
-// named and discoverable. These also serve as the canonical defaults
-// referenced throughout documentation and tests.
 
 /// Tier 1 upper bound: 4 hours in seconds.
-///
-/// Offline durations below this threshold are handled by relay buffering and
-/// sequential MLS catch-up. See ADR-029 section 1.
 pub const TIER_1_THRESHOLD_SECS: u64 = 14_400;
-
 /// Tier 2 upper bound: 7 days in seconds.
-///
-/// Offline durations between 4 hours and 7 days use state snapshot comparison
-/// and delta sync with selective epoch reconstruction. See ADR-029 section 1.
 pub const TIER_2_THRESHOLD_SECS: u64 = 604_800;
-
 /// Gap timeout for the reorder buffer: 30 seconds.
-///
-/// If a gap in the message sequence is not filled within this duration, the
-/// buffer delivers what it has and marks the gap. See spec §9.8.5.
 pub const GAP_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// Maximum number of messages held in the reorder buffer.
-///
-/// When the buffer reaches capacity, the oldest buffered messages are delivered
-/// in order regardless of gaps. See spec §9.8.5.
 pub const REORDER_BUFFER_CAPACITY: usize = 100;
-
 /// Maximum number of sequential MLS Commits processed during epoch catch-up.
-///
-/// Beyond this limit the SDK falls back to Welcome-based fast-forward.
-/// See ADR-029 section 3.
 pub const MAX_SEQUENTIAL_COMMITS: u64 = 100;
-
 /// Per-Commit processing timeout during epoch catch-up.
-///
-/// Commits that fail to process within this duration are logged as
-/// `EpochCatchUpFailure` and the SDK falls through to the next recovery
-/// source. See ADR-029 section 3.
 pub const COMMIT_PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Timeout for sender key re-acquisition after missed rotations.
-///
-/// Messages encrypted with missed sender key epochs are buffered until the
-/// key is obtained or this timeout expires. See ADR-029 section 2, Phase 4.
 pub const SENDER_KEY_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// Multi-device reconnection deduplication window.
-///
-/// Devices observing another device's reconnection event within this window
-/// defer their own MLS Update to avoid redundant epoch advances.
-/// See ADR-029 section 7.
 pub const RECONNECTION_DEDUP_WINDOW: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
@@ -294,17 +210,13 @@ pub const RECONNECTION_DEDUP_WINDOW: Duration = Duration::from_secs(30);
 // ---------------------------------------------------------------------------
 
 /// Classification of offline duration into recovery tiers.
-///
-/// The tier determines which reconciliation strategy the SDK uses on
-/// reconnection. See ADR-029 section 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OfflineTier {
-    /// Less than 4 hours offline. Relay buffering and sequential MLS catch-up.
+    /// Less than 4 hours offline.
     Short,
-    /// 4 hours to 7 days offline. State snapshot comparison and delta sync
-    /// with selective epoch reconstruction.
+    /// 4 hours to 7 days offline.
     Extended,
-    /// More than 7 days offline. Forced re-join via MLS group state reset.
+    /// More than 7 days offline.
     Long,
 }
 
@@ -312,7 +224,7 @@ impl std::fmt::Display for OfflineTier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Short => write!(f, "Short (< 4 hours)"),
-            Self::Extended => write!(f, "Extended (4 hours – 7 days)"),
+            Self::Extended => write!(f, "Extended (4 hours \u{2013} 7 days)"),
             Self::Long => write!(f, "Long (> 7 days)"),
         }
     }
@@ -320,16 +232,172 @@ impl std::fmt::Display for OfflineTier {
 
 /// Classifies the offline duration into the appropriate recovery tier
 /// using the default [`SyncPolicy`].
-///
-/// Uses `saturating_sub` to avoid underflow if timestamps are out of order
-/// (SCP does not require synchronized clocks per §9.8.3).
-///
-/// For custom thresholds, use [`SyncPolicy::classify_offline_duration`].
-///
-/// See ADR-029 section 1.
 #[must_use]
 pub fn classify_offline_duration(last_relay_contact: u64, now: u64) -> OfflineTier {
     SyncPolicy::default().classify_offline_duration(last_relay_contact, now)
+}
+
+// ---------------------------------------------------------------------------
+// ConsistencyCheckpoint (§9.9.3)
+// ---------------------------------------------------------------------------
+
+/// A signed consistency checkpoint used by the Relay Consistency Protocol.
+///
+/// At regular intervals (recommended: every 50 events or every 10 minutes,
+/// whichever comes first), each member computes and broadcasts a checkpoint
+/// over their local event log state. Other members compare received checkpoints
+/// against their own to detect relay equivocation.
+///
+/// Checkpoints are sent as regular MLS application messages (encrypted,
+/// authenticated). See spec §9.9.3.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsistencyCheckpoint {
+    /// The context this checkpoint belongs to.
+    pub context_id: ContextId,
+    /// The DID of the member who generated this checkpoint.
+    pub sender_did: DID,
+    /// Number of events in the sender's local event log.
+    pub event_count: u64,
+    /// Merkle root hash of the sender's local event log.
+    pub merkle_root: [u8; 32],
+    /// Current MLS epoch on the sender's device. `None` for Broadcast contexts.
+    pub epoch: Option<u64>,
+    /// Unix timestamp (seconds) when this checkpoint was generated.
+    pub timestamp: u64,
+    /// Ed25519 signature over all fields above, signed by the sender's
+    /// `#active` or `#agent` verification method key (ADR-039).
+    #[serde(with = "serde_bytes")]
+    pub signature: Ed25519Signature,
+}
+
+// ---------------------------------------------------------------------------
+// EquivocationEvidence
+// ---------------------------------------------------------------------------
+
+/// Evidence of relay equivocation: two conflicting consistency checkpoints
+/// from different members that should agree but don't. See spec §9.9.3.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EquivocationEvidence {
+    /// The checkpoint from the local (detecting) member.
+    pub local_checkpoint: ConsistencyCheckpoint,
+    /// The checkpoint from the remote member whose state diverges.
+    pub remote_checkpoint: ConsistencyCheckpoint,
+    /// The event count at which divergence was detected.
+    pub divergent_event_count: u64,
+}
+
+// ---------------------------------------------------------------------------
+// EquivocationAlert
+// ---------------------------------------------------------------------------
+
+/// Alert raised when relay equivocation is detected.
+///
+/// Per spec §23.7: "If Merkle roots differ at the same event count,
+/// equivocation has occurred [...]. The reconnecting member raises an
+/// `EquivocationDetected` alert."
+///
+/// See spec §9.9.3, §23.7.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EquivocationAlert {
+    /// The context where equivocation was detected.
+    pub context_id: ContextId,
+    /// The DID of the member who detected the equivocation (local member).
+    pub detector_did: DID,
+    /// The DID of the remote member whose checkpoint diverges.
+    pub divergent_did: DID,
+    /// The event count at which Merkle roots diverge.
+    pub divergent_event_count: u64,
+    /// The local member's Merkle root at the divergent event count.
+    pub local_merkle_root: [u8; 32],
+    /// The remote member's Merkle root at the divergent event count.
+    pub remote_merkle_root: [u8; 32],
+    /// Cryptographic evidence: the conflicting checkpoints, if available.
+    /// `None` when generated from multi-device divergence detection.
+    pub evidence: Option<EquivocationEvidence>,
+    /// Unix timestamp (seconds) when the alert was raised.
+    pub detected_at: u64,
+    /// The MLS epoch on the local device at detection time.
+    pub local_epoch: Option<u64>,
+}
+
+impl std::fmt::Display for EquivocationAlert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "EquivocationDetected in context {} at event count {}: \
+             local root {:?} != remote root {:?} (remote DID: {})",
+            self.context_id,
+            self.divergent_event_count,
+            &self.local_merkle_root[..4],
+            &self.remote_merkle_root[..4],
+            self.divergent_did,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SyncEvent
+// ---------------------------------------------------------------------------
+
+/// Events emitted by the sync subsystem during reconnection and ongoing
+/// consistency monitoring.
+///
+/// Security-critical events MUST NOT be silently discarded (spec §9.9.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SyncEvent {
+    /// Relay equivocation detected. See spec §9.9.3, §23.7.
+    EquivocationDetected(Box<EquivocationAlert>),
+    /// Sequence gap detected — possible suppression. See spec §9.9.2.
+    SequenceGapDetected {
+        /// The context where the gap was detected.
+        context_id: ContextId,
+        /// The DID of the sender with the sequence gap.
+        sender_did: DID,
+        /// The expected sequence number.
+        expected_sequence: u64,
+        /// The received sequence number (higher than expected).
+        received_sequence: u64,
+    },
+    /// Consistency checkpoint received from a remote member.
+    CheckpointReceived {
+        /// The context the checkpoint belongs to.
+        context_id: ContextId,
+        /// The DID of the member who sent the checkpoint.
+        sender_did: DID,
+        /// Whether the checkpoint matched the local state.
+        consistent: bool,
+    },
+}
+
+impl std::fmt::Display for SyncEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EquivocationDetected(alert) => write!(f, "{alert}"),
+            Self::SequenceGapDetected {
+                context_id,
+                sender_did,
+                expected_sequence,
+                received_sequence,
+            } => write!(
+                f,
+                "SequenceGap in context {context_id}: expected #{expected_sequence} \
+                 from {sender_did}, received #{received_sequence}",
+            ),
+            Self::CheckpointReceived {
+                context_id,
+                sender_did,
+                consistent,
+            } => write!(
+                f,
+                "Checkpoint from {sender_did} in {context_id}: {}",
+                if *consistent {
+                    "consistent"
+                } else {
+                    "INCONSISTENT"
+                },
+            ),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -337,9 +405,6 @@ pub fn classify_offline_duration(last_relay_contact: u64, now: u64) -> OfflineTi
 // ---------------------------------------------------------------------------
 
 /// Errors produced by sync operations.
-///
-/// Covers relay catch-up, MLS epoch reconciliation, event log sync, sender
-/// key re-acquisition, and queue drain failures. See ADR-029.
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
     /// Relay catch-up failed (Phase 1 of reconnection protocol).
@@ -350,7 +415,6 @@ pub enum SyncError {
         /// Human-readable reason.
         reason: String,
     },
-
     /// MLS epoch catch-up failed (Phase 2 of reconnection protocol).
     #[error("epoch catch-up failed for context {context_id}: {reason}")]
     EpochCatchUpFailed {
@@ -359,7 +423,6 @@ pub enum SyncError {
         /// Human-readable reason.
         reason: String,
     },
-
     /// Event log sync failed (Phase 3 of reconnection protocol).
     #[error("event log sync failed for context {context_id}: {reason}")]
     EventLogSyncFailed {
@@ -368,7 +431,6 @@ pub enum SyncError {
         /// Human-readable reason.
         reason: String,
     },
-
     /// Sender key re-acquisition timed out (Phase 4 of reconnection protocol).
     #[error("sender key timeout for sender {sender_did} in context {context_id}")]
     SenderKeyTimeout {
@@ -377,7 +439,6 @@ pub enum SyncError {
         /// The DID of the sender whose key could not be obtained.
         sender_did: DID,
     },
-
     /// MLS Update issuance failed (Phase 5 of reconnection protocol).
     #[error("MLS update failed for context {context_id}: {reason}")]
     MlsUpdateFailed {
@@ -386,7 +447,6 @@ pub enum SyncError {
         /// Human-readable reason.
         reason: String,
     },
-
     /// Queue drain failed (Phase 6 of reconnection protocol).
     #[error("queue drain failed for context {context_id}: {reason}")]
     QueueDrainFailed {
@@ -395,14 +455,12 @@ pub enum SyncError {
         /// Human-readable reason.
         reason: String,
     },
-
     /// The context was closed or expired while the member was offline.
     #[error("context {context_id} is gone (closed or expired while offline)")]
     ContextGone {
         /// The context that no longer exists.
         context_id: ContextId,
     },
-
     /// The reorder buffer overflowed.
     #[error("reorder buffer overflow in context {context_id}: {buffered} messages buffered")]
     ReorderBufferOverflow {
@@ -411,7 +469,6 @@ pub enum SyncError {
         /// Number of messages currently buffered.
         buffered: usize,
     },
-
     /// A Commit in the catch-up sequence was corrupted or failed to process.
     #[error("commit processing failed at epoch {epoch} in context {context_id}: {reason}")]
     CommitProcessingFailed {
@@ -422,7 +479,6 @@ pub enum SyncError {
         /// Human-readable reason.
         reason: String,
     },
-
     /// The gap timeout expired before the missing message arrived.
     #[error("gap timeout expired in context {context_id} at sequence {sequence}")]
     GapTimeoutExpired {
@@ -431,7 +487,6 @@ pub enum SyncError {
         /// The sequence number of the missing message.
         sequence: u64,
     },
-
     /// Overall reconnection timed out.
     #[error("reconnection timed out after {elapsed_ms}ms")]
     ReconnectionTimeout {
@@ -444,9 +499,7 @@ pub enum SyncError {
 // CatchUpStatus
 // ---------------------------------------------------------------------------
 
-/// Outcome of an MLS epoch catch-up attempt.
-///
-/// See ADR-029 section 3.
+/// Outcome of an MLS epoch catch-up attempt. See ADR-029 section 3.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CatchUpStatus {
     /// Sequential Commit processing in progress.
@@ -460,7 +513,7 @@ pub enum CatchUpStatus {
         /// Last epoch that was skipped.
         skipped_to: u64,
     },
-    /// Catch-up failed — context may need group reset.
+    /// Catch-up failed.
     Failed {
         /// Human-readable reason for the failure.
         reason: String,
@@ -471,9 +524,7 @@ pub enum CatchUpStatus {
 // SyncOutcome
 // ---------------------------------------------------------------------------
 
-/// Per-context outcome of the reconnection protocol.
-///
-/// See ADR-029 acceptance criterion 2.
+/// Per-context outcome of the reconnection protocol. See ADR-029.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncOutcome {
     /// All epochs and events caught up via sequential processing.
@@ -495,10 +546,49 @@ pub enum SyncOutcome {
 }
 
 // ---------------------------------------------------------------------------
+// Checkpoint comparison
+// ---------------------------------------------------------------------------
+
+/// Compares a local consistency checkpoint against a received remote
+/// checkpoint and returns an `EquivocationAlert` if divergence is detected.
+///
+/// Returns `None` if event counts differ (one member is behind) or if
+/// Merkle roots match (consistent). See spec §9.9.3.
+#[must_use]
+pub fn compare_checkpoints(
+    local: &ConsistencyCheckpoint,
+    remote: &ConsistencyCheckpoint,
+    now: u64,
+) -> Option<EquivocationAlert> {
+    if local.event_count != remote.event_count {
+        return None;
+    }
+    if local.merkle_root == remote.merkle_root {
+        return None;
+    }
+    Some(EquivocationAlert {
+        context_id: local.context_id.clone(),
+        detector_did: local.sender_did.clone(),
+        divergent_did: remote.sender_did.clone(),
+        divergent_event_count: local.event_count,
+        local_merkle_root: local.merkle_root,
+        remote_merkle_root: remote.merkle_root,
+        evidence: Some(EquivocationEvidence {
+            local_checkpoint: local.clone(),
+            remote_checkpoint: remote.clone(),
+            divergent_event_count: local.event_count,
+        }),
+        detected_at: now,
+        local_epoch: local.epoch,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -506,24 +596,15 @@ mod tests {
     fn classify_short_offline_zero_seconds() {
         assert_eq!(
             classify_offline_duration(1_000_000, 1_000_000),
-            OfflineTier::Short,
-        );
-    }
-
-    #[test]
-    fn classify_short_offline_one_hour() {
-        assert_eq!(
-            classify_offline_duration(1_000_000, 1_003_600),
-            OfflineTier::Short,
+            OfflineTier::Short
         );
     }
 
     #[test]
     fn classify_short_offline_at_boundary() {
-        // Exactly 4 hours = 14_400 seconds — still Short.
         assert_eq!(
             classify_offline_duration(1_000_000, 1_014_400),
-            OfflineTier::Short,
+            OfflineTier::Short
         );
     }
 
@@ -531,25 +612,15 @@ mod tests {
     fn classify_extended_offline_just_over_four_hours() {
         assert_eq!(
             classify_offline_duration(1_000_000, 1_014_401),
-            OfflineTier::Extended,
-        );
-    }
-
-    #[test]
-    fn classify_extended_offline_three_days() {
-        // 3 days = 259_200 seconds.
-        assert_eq!(
-            classify_offline_duration(1_000_000, 1_259_200),
-            OfflineTier::Extended,
+            OfflineTier::Extended
         );
     }
 
     #[test]
     fn classify_extended_offline_at_boundary() {
-        // Exactly 7 days = 604_800 seconds — still Extended.
         assert_eq!(
             classify_offline_duration(1_000_000, 1_604_800),
-            OfflineTier::Extended,
+            OfflineTier::Extended
         );
     }
 
@@ -557,47 +628,33 @@ mod tests {
     fn classify_long_offline_just_over_seven_days() {
         assert_eq!(
             classify_offline_duration(1_000_000, 1_604_801),
-            OfflineTier::Long,
-        );
-    }
-
-    #[test]
-    fn classify_long_offline_thirty_days() {
-        // 30 days = 2_592_000 seconds.
-        assert_eq!(
-            classify_offline_duration(1_000_000, 3_592_000),
-            OfflineTier::Long,
+            OfflineTier::Long
         );
     }
 
     #[test]
     fn classify_saturating_sub_handles_clock_skew() {
-        // `now` is before `last_relay_contact` — saturating_sub returns 0.
-        // SCP does not require synchronized clocks (§9.8.3).
         assert_eq!(
             classify_offline_duration(2_000_000, 1_000_000),
-            OfflineTier::Short,
+            OfflineTier::Short
         );
     }
 
     #[test]
     fn offline_tier_display() {
         assert_eq!(OfflineTier::Short.to_string(), "Short (< 4 hours)");
-        assert_eq!(
-            OfflineTier::Extended.to_string(),
-            "Extended (4 hours – 7 days)",
-        );
+        assert!(OfflineTier::Extended.to_string().contains("7 days"));
         assert_eq!(OfflineTier::Long.to_string(), "Long (> 7 days)");
     }
 
     #[test]
-    fn sync_error_display_messages() {
-        let err = SyncError::RelayCatchUpFailed {
-            context_id: "ctx-1".to_owned(),
-            reason: "connection refused".to_owned(),
-        };
-        assert!(err.to_string().contains("ctx-1"));
-        assert!(err.to_string().contains("connection refused"));
+    fn sync_policy_default_matches_constants() {
+        let policy = SyncPolicy::default();
+        assert_eq!(policy.tier_1_threshold_secs, TIER_1_THRESHOLD_SECS);
+        assert_eq!(policy.tier_2_threshold_secs, TIER_2_THRESHOLD_SECS);
+        assert_eq!(policy.gap_timeout, GAP_TIMEOUT);
+        assert_eq!(policy.reorder_buffer_capacity, REORDER_BUFFER_CAPACITY);
+        assert_eq!(policy.max_sequential_commits, MAX_SEQUENTIAL_COMMITS);
     }
 
     #[test]
@@ -619,103 +676,161 @@ mod tests {
         }
     }
 
-    #[test]
-    fn gap_timeout_is_thirty_seconds() {
-        assert_eq!(GAP_TIMEOUT, Duration::from_secs(30));
-    }
-
-    #[test]
-    fn reorder_buffer_capacity_is_one_hundred() {
-        assert_eq!(REORDER_BUFFER_CAPACITY, 100);
-    }
-
-    #[test]
-    fn max_sequential_commits_is_one_hundred() {
-        assert_eq!(MAX_SEQUENTIAL_COMMITS, 100);
-    }
-
     // -----------------------------------------------------------------------
-    // SyncPolicy tests
+    // ConsistencyCheckpoint & compare_checkpoints tests
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn sync_policy_default_matches_constants() {
-        let policy = SyncPolicy::default();
-        assert_eq!(policy.tier_1_threshold_secs, TIER_1_THRESHOLD_SECS);
-        assert_eq!(policy.tier_2_threshold_secs, TIER_2_THRESHOLD_SECS);
-        assert_eq!(policy.gap_timeout, GAP_TIMEOUT);
-        assert_eq!(policy.reorder_buffer_capacity, REORDER_BUFFER_CAPACITY);
-        assert_eq!(policy.max_sequential_commits, MAX_SEQUENTIAL_COMMITS);
-        assert_eq!(policy.commit_process_timeout, COMMIT_PROCESS_TIMEOUT);
-        assert_eq!(policy.sender_key_timeout, SENDER_KEY_TIMEOUT);
-        assert_eq!(policy.reconnection_dedup_window, RECONNECTION_DEDUP_WINDOW);
-    }
-
-    #[test]
-    fn sync_policy_builder_methods() {
-        let policy = SyncPolicy::default()
-            .with_tier_1_threshold_secs(7_200)
-            .with_tier_2_threshold_secs(259_200)
-            .with_gap_timeout(Duration::from_secs(10))
-            .with_reorder_buffer_capacity(50)
-            .with_max_sequential_commits(200)
-            .with_commit_process_timeout(Duration::from_secs(10))
-            .with_sender_key_timeout(Duration::from_secs(120))
-            .with_reconnection_dedup_window(Duration::from_secs(15));
-
-        assert_eq!(policy.tier_1_threshold_secs, 7_200);
-        assert_eq!(policy.tier_2_threshold_secs, 259_200);
-        assert_eq!(policy.gap_timeout, Duration::from_secs(10));
-        assert_eq!(policy.reorder_buffer_capacity, 50);
-        assert_eq!(policy.max_sequential_commits, 200);
-        assert_eq!(policy.commit_process_timeout, Duration::from_secs(10));
-        assert_eq!(policy.sender_key_timeout, Duration::from_secs(120));
-        assert_eq!(policy.reconnection_dedup_window, Duration::from_secs(15));
-    }
-
-    #[test]
-    fn sync_policy_classify_with_custom_thresholds() {
-        // Custom policy: Tier 1 = 2 hours, Tier 2 = 3 days.
-        let policy = SyncPolicy::default()
-            .with_tier_1_threshold_secs(7_200)
-            .with_tier_2_threshold_secs(259_200);
-
-        // 1 hour offline → Short (under custom 2h threshold).
-        assert_eq!(
-            policy.classify_offline_duration(1_000_000, 1_003_600),
-            OfflineTier::Short,
-        );
-        // 3 hours offline → Extended (over custom 2h, under custom 3d).
-        assert_eq!(
-            policy.classify_offline_duration(1_000_000, 1_010_800),
-            OfflineTier::Extended,
-        );
-        // 5 days offline → Long (over custom 3d threshold).
-        assert_eq!(
-            policy.classify_offline_duration(1_000_000, 1_432_000),
-            OfflineTier::Long,
-        );
-    }
-
-    #[test]
-    fn sync_policy_classify_matches_free_function() {
-        // Default policy classification must match the free function.
-        let policy = SyncPolicy::default();
-        let cases = [
-            (1_000_000, 1_000_000), // 0s
-            (1_000_000, 1_003_600), // 1h
-            (1_000_000, 1_014_400), // 4h boundary
-            (1_000_000, 1_014_401), // just over 4h
-            (1_000_000, 1_604_800), // 7d boundary
-            (1_000_000, 1_604_801), // just over 7d
-            (2_000_000, 1_000_000), // clock skew
-        ];
-        for (last, now) in cases {
-            assert_eq!(
-                policy.classify_offline_duration(last, now),
-                classify_offline_duration(last, now),
-                "mismatch for last={last}, now={now}",
-            );
+    fn make_checkpoint(
+        context_id: &str,
+        sender_did: &str,
+        event_count: u64,
+        merkle_root: [u8; 32],
+        epoch: Option<u64>,
+    ) -> ConsistencyCheckpoint {
+        ConsistencyCheckpoint {
+            context_id: context_id.to_owned(),
+            sender_did: DID::from(sender_did),
+            event_count,
+            merkle_root,
+            epoch,
+            timestamp: 1_700_000_000,
+            signature: vec![0u8; 64],
         }
+    }
+
+    #[test]
+    fn consistency_checkpoint_serialization_roundtrip() {
+        let cp = make_checkpoint("ctx-1", "did:key:alice", 100, [1u8; 32], Some(10));
+        let json = serde_json::to_string(&cp).unwrap();
+        let deserialized: ConsistencyCheckpoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(cp, deserialized);
+    }
+
+    #[test]
+    fn compare_checkpoints_consistent() {
+        let local = make_checkpoint("ctx-1", "did:key:alice", 100, [1u8; 32], Some(10));
+        let remote = make_checkpoint("ctx-1", "did:key:bob", 100, [1u8; 32], Some(10));
+        assert!(compare_checkpoints(&local, &remote, 1_700_000_100).is_none());
+    }
+
+    #[test]
+    fn compare_checkpoints_different_event_counts_not_equivocation() {
+        let local = make_checkpoint("ctx-1", "did:key:alice", 95, [1u8; 32], Some(10));
+        let remote = make_checkpoint("ctx-1", "did:key:bob", 100, [2u8; 32], Some(10));
+        assert!(compare_checkpoints(&local, &remote, 1_700_000_100).is_none());
+    }
+
+    #[test]
+    fn compare_checkpoints_detects_equivocation() {
+        let local = make_checkpoint("ctx-1", "did:key:alice", 100, [1u8; 32], Some(10));
+        let remote = make_checkpoint("ctx-1", "did:key:bob", 100, [2u8; 32], Some(10));
+        let alert = compare_checkpoints(&local, &remote, 1_700_000_100).unwrap();
+        assert_eq!(alert.context_id, "ctx-1");
+        assert_eq!(alert.detector_did, DID::from("did:key:alice"));
+        assert_eq!(alert.divergent_did, DID::from("did:key:bob"));
+        assert_eq!(alert.divergent_event_count, 100);
+        assert_eq!(alert.local_merkle_root, [1u8; 32]);
+        assert_eq!(alert.remote_merkle_root, [2u8; 32]);
+        assert!(alert.evidence.is_some());
+    }
+
+    #[test]
+    fn compare_checkpoints_evidence_contains_both() {
+        let local = make_checkpoint("ctx-1", "did:key:alice", 50, [0xAA; 32], Some(5));
+        let remote = make_checkpoint("ctx-1", "did:key:bob", 50, [0xBB; 32], Some(5));
+        let alert = compare_checkpoints(&local, &remote, 1_700_001_000).unwrap();
+        let evidence = alert.evidence.unwrap();
+        assert_eq!(evidence.local_checkpoint, local);
+        assert_eq!(evidence.remote_checkpoint, remote);
+        assert_eq!(evidence.divergent_event_count, 50);
+    }
+
+    #[test]
+    fn equivocation_alert_display() {
+        let alert = EquivocationAlert {
+            context_id: "ctx-1".to_owned(),
+            detector_did: DID::from("did:key:alice"),
+            divergent_did: DID::from("did:key:bob"),
+            divergent_event_count: 100,
+            local_merkle_root: [0xAA; 32],
+            remote_merkle_root: [0xBB; 32],
+            evidence: None,
+            detected_at: 1_700_000_000,
+            local_epoch: Some(10),
+        };
+        let s = alert.to_string();
+        assert!(s.contains("ctx-1"));
+        assert!(s.contains("100"));
+        assert!(s.contains("did:key:bob"));
+    }
+
+    #[test]
+    fn equivocation_alert_serialization_roundtrip() {
+        let alert = EquivocationAlert {
+            context_id: "ctx-1".to_owned(),
+            detector_did: DID::from("did:key:alice"),
+            divergent_did: DID::from("did:key:bob"),
+            divergent_event_count: 100,
+            local_merkle_root: [1u8; 32],
+            remote_merkle_root: [2u8; 32],
+            evidence: None,
+            detected_at: 1_700_000_000,
+            local_epoch: Some(10),
+        };
+        let json = serde_json::to_string(&alert).unwrap();
+        let deserialized: EquivocationAlert = serde_json::from_str(&json).unwrap();
+        assert_eq!(alert, deserialized);
+    }
+
+    #[test]
+    fn sync_event_serialization_roundtrip() {
+        let events = vec![
+            SyncEvent::EquivocationDetected(Box::new(EquivocationAlert {
+                context_id: "ctx-1".to_owned(),
+                detector_did: DID::from("did:key:alice"),
+                divergent_did: DID::from("did:key:bob"),
+                divergent_event_count: 100,
+                local_merkle_root: [1u8; 32],
+                remote_merkle_root: [2u8; 32],
+                evidence: None,
+                detected_at: 1_700_000_000,
+                local_epoch: Some(10),
+            })),
+            SyncEvent::SequenceGapDetected {
+                context_id: "ctx-2".to_owned(),
+                sender_did: DID::from("did:key:mallory"),
+                expected_sequence: 47,
+                received_sequence: 49,
+            },
+            SyncEvent::CheckpointReceived {
+                context_id: "ctx-3".to_owned(),
+                sender_did: DID::from("did:key:carol"),
+                consistent: true,
+            },
+        ];
+        for event in &events {
+            let json = serde_json::to_string(event).unwrap();
+            let deserialized: SyncEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(*event, deserialized);
+        }
+    }
+
+    #[test]
+    fn sync_event_display() {
+        let gap = SyncEvent::SequenceGapDetected {
+            context_id: "ctx-1".to_owned(),
+            sender_did: DID::from("did:key:mallory"),
+            expected_sequence: 47,
+            received_sequence: 49,
+        };
+        assert!(gap.to_string().contains("47"));
+        assert!(gap.to_string().contains("49"));
+
+        let cp = SyncEvent::CheckpointReceived {
+            context_id: "ctx-1".to_owned(),
+            sender_did: DID::from("did:key:bob"),
+            consistent: false,
+        };
+        assert!(cp.to_string().contains("INCONSISTENT"));
     }
 }

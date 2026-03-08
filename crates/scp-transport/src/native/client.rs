@@ -10,10 +10,14 @@
 //!
 //! # Connection recovery
 //!
-//! On abnormal close, the client reconnects with exponential backoff:
-//! 1s, 2s, 4s, 8s, 16s, 30s cap. On reconnect, the adapter re-issues
-//! SUBSCRIBE for each routing ID with `since = last_stored_at - 5s` overlap.
-//! The client deduplicates received blobs via `blob_id`.
+//! On abnormal close, the client reconnects with exponential backoff and
+//! random jitter (up to 25% of each delay) to prevent thundering herd
+//! when multiple clients reconnect after a relay failure: ~1s, ~2s, ~4s,
+//! ~8s, ~16s, ~30s cap (each with jitter). Uses the shared
+//! [`ReconnectBackoff`](crate::backoff::ReconnectBackoff) implementation.
+//! On reconnect, the adapter re-issues SUBSCRIBE for each routing ID with
+//! `since = last_stored_at - 5s` overlap. The client deduplicates received
+//! blobs via `blob_id`.
 //!
 //! See ADR-004 in `.docs/adrs/phase-1.md` for the full specification.
 //!
@@ -33,23 +37,19 @@ use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::protocol::{ClientMessage, RelayMessage};
+use crate::backoff::ReconnectBackoff;
 use crate::error::TransportError;
 
 /// Keepalive interval: client sends PING every 30 seconds.
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Backoff durations for reconnection: 1s, 2s, 4s, 8s, 16s, 30s cap.
+/// Maximum number of reconnection attempts before giving up.
 ///
-/// Used by [`NativeRelayClient::reconnect`] on connection loss.
+/// With exponential backoff (1s, 2s, 4s, 8s, 16s, 30s cap), 6 attempts
+/// cover the same range as the previous fixed backoff steps but with
+/// random jitter on each delay to prevent thundering herd (BLACK-001).
 #[allow(dead_code)]
-const BACKOFF_STEPS: &[Duration] = &[
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-    Duration::from_secs(4),
-    Duration::from_secs(8),
-    Duration::from_secs(16),
-    Duration::from_secs(30),
-];
+const MAX_RECONNECT_ATTEMPTS: u32 = 6;
 
 /// Overlap subtracted from local receive time for reconnect backfill (5 seconds).
 ///
@@ -128,7 +128,7 @@ struct ClientInner {
 /// WebSocket client for the SCP native relay.
 ///
 /// Manages the connection lifecycle including keepalive PINGs and
-/// reconnection with exponential backoff. Send operations use
+/// reconnection with exponential backoff + jitter. Send operations use
 /// request-response correlation via `ref_id`. Subscription streams
 /// are delivered via channels.
 ///
@@ -736,10 +736,15 @@ impl NativeRelayClient {
             *self.shutdown_tx.lock().await = Some(new_tx);
         }
 
-        // Try reconnecting with exponential backoff.
+        // Try reconnecting with exponential backoff + jitter.
+        // Uses ReconnectBackoff (shared with QUIC) to add random jitter
+        // (up to 25% of each delay) preventing thundering herd when
+        // multiple clients reconnect after a relay failure (BLACK-001).
+        let mut backoff = ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(30));
         let mut last_err = None;
-        for delay in BACKOFF_STEPS {
-            tokio::time::sleep(*delay).await;
+        while backoff.attempts() < MAX_RECONNECT_ATTEMPTS {
+            let delay = backoff.next_delay();
+            tokio::time::sleep(delay).await;
 
             match self.establish_connection().await {
                 Ok(()) => {
@@ -908,16 +913,41 @@ mod tests {
     }
 
     #[test]
-    fn backoff_steps_are_monotonically_increasing() {
-        for window in BACKOFF_STEPS.windows(2) {
-            assert!(window[1] > window[0]);
-        }
+    fn backoff_uses_jittered_exponential() {
+        // Verify the WebSocket client uses ReconnectBackoff (with jitter)
+        // instead of fixed deterministic backoff steps.
+        let mut backoff = ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(30));
+
+        // First delay: 1s + up to 25% jitter.
+        let d1 = backoff.next_delay();
+        assert!(d1 >= Duration::from_secs(1));
+        assert!(d1 <= Duration::from_millis(1250));
+
+        // Second delay: 2s + jitter (doubled from 1s).
+        let d2 = backoff.next_delay();
+        assert!(d2 >= Duration::from_secs(2));
+        assert!(d2 <= Duration::from_millis(2500));
+
+        // Delays should be monotonically increasing (ignoring jitter variance).
+        assert!(d2 > d1);
     }
 
     #[test]
     fn backoff_cap_is_30_seconds() {
-        let last = BACKOFF_STEPS.last().unwrap();
-        assert_eq!(*last, Duration::from_secs(30));
+        let mut backoff = ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(30));
+        // Exhaust to cap: 1, 2, 4, 8, 16, 30, 30, 30...
+        for _ in 0..10 {
+            let _ = backoff.next_delay();
+        }
+        // After many iterations, the base delay is capped at 30s.
+        assert_eq!(backoff.current_delay(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn max_reconnect_attempts_matches_legacy_step_count() {
+        // The old BACKOFF_STEPS had 6 entries. Ensure the new constant
+        // preserves the same number of reconnection attempts.
+        assert_eq!(MAX_RECONNECT_ATTEMPTS, 6);
     }
 
     #[test]

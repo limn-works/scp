@@ -56,6 +56,21 @@ pub enum EnvelopeError {
         max: usize,
     },
 
+    /// The serialized envelope exceeds [`MAX_ENVELOPE_SIZE`] (#347).
+    ///
+    /// Checked *before* deserialization to reject obviously oversized inputs
+    /// without allocating memory for parsing. This is the first line of
+    /// defense against OOM denial-of-service from oversized payloads.
+    ///
+    /// [`MAX_ENVELOPE_SIZE`]: crate::serde_util::MAX_ENVELOPE_SIZE
+    #[error("envelope too large: {size} bytes, maximum is {max}")]
+    EnvelopeTooLarge {
+        /// Actual wire size in bytes.
+        size: usize,
+        /// Maximum allowed wire size in bytes.
+        max: usize,
+    },
+
     /// Padding data is malformed and cannot be stripped.
     #[error("invalid padding: {0}")]
     InvalidPadding(String),

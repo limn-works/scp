@@ -706,8 +706,8 @@ impl ContextRoleState {
             .and_then(|assignment| self.role_definitions.get(&assignment.role_name))
             .map(|def| def.capabilities.clone());
 
-        if let Some(role_caps) = role_caps {
-            if let Some(caps) = self.member_capabilities.get_mut(did_str) {
+        if let Some(role_caps) = role_caps
+            && let Some(caps) = self.member_capabilities.get_mut(did_str) {
                 if role_caps.contains(&Capability::GovernanceVote)
                     && self.ceiling.contains(&Capability::GovernanceVote)
                 {
@@ -719,7 +719,6 @@ impl ContextRoleState {
                     caps.insert(Capability::GovernancePropose);
                 }
             }
-        }
     }
 }
 

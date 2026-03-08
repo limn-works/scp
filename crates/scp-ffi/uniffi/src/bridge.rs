@@ -30,9 +30,9 @@ use std::sync::Arc;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_identity::{DidCache, IdentityError, InMemoryDhtClient};
 use scp_identity::{DidDht, DidDocument as CoreDidDocument, DidMethod, ScpIdentity};
+use scp_platform::error::PlatformError;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
-use scp_platform::error::PlatformError;
 use scp_platform::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
     Signature,
@@ -113,11 +113,11 @@ fn make_dht_with_signer(
 // See SCP-214 acceptance criteria 2-3 and ADR-006.
 // ---------------------------------------------------------------------------
 
-/// Concrete [`KeyCustody`] adapter that delegates to a UniFFI
+/// Concrete [`KeyCustody`] adapter that delegates to a `UniFFI`
 /// [`KeyCustodyProvider`](crate::KeyCustodyProvider) callback.
 ///
 /// This bridges the gap between scp-platform's `KeyCustody` trait (which uses
-/// RPITIT and is not object-safe) and the UniFFI callback interface (which
+/// RPITIT and is not object-safe) and the `UniFFI` callback interface (which
 /// is `dyn`-dispatched via `Box<dyn KeyCustodyProvider>`).
 pub(crate) struct CallbackKeyCustody {
     provider: Box<dyn crate::KeyCustodyProvider>,
@@ -983,7 +983,7 @@ impl Identity {
                 .await
                 .map_err(ScpError::from)?;
 
-            let handle = Arc::new(Identity {
+            let handle = Arc::new(Self {
                 did: new_identity.did.clone(),
                 custody_type: self.custody_type.clone(),
                 core_id: Some(new_identity),
@@ -1004,7 +1004,7 @@ impl Identity {
                 .await
                 .map_err(ScpError::from)?;
 
-            let handle = Arc::new(Identity {
+            let handle = Arc::new(Self {
                 did: new_identity.did.clone(),
                 custody_type: CustodyMethod::InMemory,
                 core_id: Some(new_identity),
@@ -3882,4 +3882,301 @@ pub fn trust_verify_response(
     let clock = scp_identity::cache::SystemClock;
 
     Ok(scp_core::trust::verify_challenge_response(&request, &response, &resolver, &clock).is_ok())
+}
+
+// ---------------------------------------------------------------------------
+// Provenance — attach and chain depth (#370)
+// ---------------------------------------------------------------------------
+
+/// Attaches provenance metadata when data crosses a context boundary.
+///
+/// Returns a JSON string with the attached provenance record.
+///
+/// See ADR-019 acceptance criteria 2-3, 6.
+#[uniffi::export]
+pub fn provenance_attach(
+    source_context_id: String,
+    source_type: String,
+    memory_scope_str: String,
+    members: Vec<String>,
+    target_context_id: String,
+    existing_chain_depth: Option<u8>,
+) -> Result<String, ScpError> {
+    let st = match source_type.as_str() {
+        "persistent" => scp_core::provenance::SourceType::Persistent,
+        "ephemeral" => scp_core::provenance::SourceType::Ephemeral,
+        "summary" => scp_core::provenance::SourceType::Summary,
+        other => {
+            return Err(ScpError::Validation {
+                message: format!("invalid source_type '{other}'"),
+                code: "SCP-VALID-6020".to_owned(),
+            });
+        }
+    };
+    let ms = match memory_scope_str.as_str() {
+        "full" => scp_core::context::MemoryScope::Full,
+        "summary" => scp_core::context::MemoryScope::Summary,
+        "ephemeral" => scp_core::context::MemoryScope::Ephemeral,
+        other => {
+            return Err(ScpError::Validation {
+                message: format!("invalid memory_scope '{other}'"),
+                code: "SCP-VALID-6021".to_owned(),
+            });
+        }
+    };
+
+    let source_info = scp_core::provenance::attach::SourceContextInfo {
+        context_id: source_context_id,
+        source_type: st,
+        memory_scope: ms,
+        members: members.into_iter().map(scp_identity::DID::from).collect(),
+        discovery_method: scp_core::provenance::DiscoveryMethod::None,
+        data_age: std::time::Duration::from_secs(0),
+        purpose: None,
+    };
+
+    let existing_prov = existing_chain_depth.map(|depth| scp_core::provenance::DataProvenance {
+        source_context: String::new(),
+        source_type: scp_core::provenance::SourceType::Persistent,
+        counterparties: vec![],
+        purpose: None,
+        discovery_method: scp_core::provenance::DiscoveryMethod::None,
+        age: std::time::Duration::from_secs(0),
+        memory_scope: scp_core::context::MemoryScope::Full,
+        chain_depth: depth,
+        chain_path: None,
+        payment_amount: None,
+        payment_adapter: None,
+        payment_receipt_id: None,
+    });
+
+    let prov = scp_core::provenance::attach::attach_provenance(
+        &source_info,
+        &target_context_id,
+        existing_prov.as_ref(),
+    );
+
+    let result = serde_json::json!({
+        "source_context": prov.source_context,
+        "source_type": format!("{:?}", prov.source_type),
+        "chain_depth": prov.chain_depth,
+        "counterparties": prov.counterparties.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "age_secs": prov.age.as_secs(),
+        "memory_scope": format!("{:?}", prov.memory_scope),
+        "chain_path": prov.chain_path,
+        "purpose": prov.purpose,
+    });
+
+    serde_json::to_string(&result).map_err(|e| ScpError::Validation {
+        message: format!("failed to serialize provenance: {e}"),
+        code: "SCP-VALID-6022".to_owned(),
+    })
+}
+
+/// Checks whether the provenance chain depth is within the allowed limit.
+#[uniffi::export]
+#[must_use] 
+pub fn provenance_check_chain_depth(chain_depth: u8, max_depth: Option<u8>) -> bool {
+    let max = max_depth.unwrap_or(scp_core::provenance::attach::DEFAULT_MAX_CHAIN_DEPTH);
+    let prov = scp_core::provenance::DataProvenance {
+        source_context: String::new(),
+        source_type: scp_core::provenance::SourceType::Persistent,
+        counterparties: vec![],
+        purpose: None,
+        discovery_method: scp_core::provenance::DiscoveryMethod::None,
+        age: std::time::Duration::from_secs(0),
+        memory_scope: scp_core::context::MemoryScope::Full,
+        chain_depth,
+        chain_path: None,
+        payment_amount: None,
+        payment_adapter: None,
+        payment_receipt_id: None,
+    };
+    scp_core::provenance::attach::check_chain_depth(&prov, max).is_ok()
+}
+
+// ---------------------------------------------------------------------------
+// Bridge connector — trust evaluation (#370)
+// ---------------------------------------------------------------------------
+
+/// Evaluates the trust level for an action based on bridge provenance.
+///
+/// Returns an integer (0-3) representing the trust tier.
+#[uniffi::export]
+pub fn bridge_evaluate_trust(
+    is_bridged: bool,
+    is_native_transport: bool,
+    shadow_status: String,
+) -> Result<u8, ScpError> {
+    if !is_bridged {
+        let level = scp_core::bridge::provenance::evaluate_trust_level(None, is_native_transport);
+        return Ok(level as u8);
+    }
+
+    let status = match shadow_status.as_str() {
+        "shadow" => scp_core::bridge::ShadowProvenanceStatus::Shadow,
+        "claimed" => scp_core::bridge::ShadowProvenanceStatus::Claimed,
+        other => {
+            return Err(ScpError::Validation {
+                message: format!("invalid shadow_status '{other}': expected 'shadow' or 'claimed'"),
+                code: "SCP-VALID-6030".to_owned(),
+            });
+        }
+    };
+
+    let base = scp_core::provenance::DataProvenance {
+        source_context: String::new(),
+        source_type: scp_core::provenance::SourceType::Persistent,
+        counterparties: vec![],
+        purpose: None,
+        discovery_method: scp_core::provenance::DiscoveryMethod::None,
+        age: std::time::Duration::from_secs(0),
+        memory_scope: scp_core::context::MemoryScope::Full,
+        chain_depth: 0,
+        chain_path: None,
+        payment_amount: None,
+        payment_adapter: None,
+        payment_receipt_id: None,
+    };
+
+    let connector = scp_core::bridge::BridgeConnector {
+        bridge_id: String::new(),
+        operator_did: "did:key:unused".into(),
+        platform: String::new(),
+        mode: scp_core::bridge::BridgeMode::Relay,
+        status: scp_core::bridge::BridgeStatus::Active,
+        registration_context: String::new(),
+        registered_at: 0,
+    };
+
+    let shadow = scp_core::bridge::ShadowIdentity {
+        shadow_id: String::new(),
+        platform_handle: String::new(),
+        bridge_id: String::new(),
+        attributed_role: "observer".to_string(),
+        provenance_status: status,
+        created_at: 0,
+    };
+
+    let bp = scp_core::bridge::provenance::mark_bridge_provenance(base, &connector, &shadow);
+    let level = scp_core::bridge::provenance::evaluate_trust_level(Some(&bp), is_native_transport);
+    Ok(level as u8)
+}
+
+// ---------------------------------------------------------------------------
+// Sync — offline classification (#370)
+// ---------------------------------------------------------------------------
+
+/// Classifies an offline duration into the appropriate recovery tier.
+///
+/// Returns `"short"`, `"extended"`, or `"long"`.
+#[uniffi::export]
+#[must_use] 
+pub fn sync_classify_offline(last_relay_contact: u64, now: u64) -> String {
+    match scp_core::sync::classify_offline_duration(last_relay_contact, now) {
+        scp_core::sync::OfflineTier::Short => "short".to_string(),
+        scp_core::sync::OfflineTier::Extended => "extended".to_string(),
+        scp_core::sync::OfflineTier::Long => "long".to_string(),
+    }
+}
+
+/// Classifies an offline duration using custom policy thresholds.
+///
+/// Returns `"short"`, `"extended"`, or `"long"`.
+#[uniffi::export]
+#[must_use] 
+pub fn sync_classify_offline_custom(
+    last_relay_contact: u64,
+    now: u64,
+    tier_1_threshold_secs: u64,
+    tier_2_threshold_secs: u64,
+) -> String {
+    let policy = scp_core::sync::SyncPolicy::default()
+        .with_tier_1_threshold_secs(tier_1_threshold_secs)
+        .with_tier_2_threshold_secs(tier_2_threshold_secs);
+
+    match policy.classify_offline_duration(last_relay_contact, now) {
+        scp_core::sync::OfflineTier::Short => "short".to_string(),
+        scp_core::sync::OfflineTier::Extended => "extended".to_string(),
+        scp_core::sync::OfflineTier::Long => "long".to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Discovery — address parsing and normalization (#370)
+// ---------------------------------------------------------------------------
+
+/// Parses an SCP address string into its components.
+///
+/// Returns a JSON string with the parsed address type and fields.
+#[uniffi::export]
+pub fn discovery_parse_address(address: String) -> Result<String, ScpError> {
+    let parsed =
+        scp_core::discovery::parse_address(&address).map_err(|e| ScpError::Validation {
+            message: format!("invalid address '{address}': {e}"),
+            code: "SCP-VALID-6040".to_owned(),
+        })?;
+
+    let result = match parsed {
+        scp_core::discovery::addressing::ParsedAddress::DiscoveryHandle { local_part, scope } => {
+            serde_json::json!({
+                "type": "discovery_handle",
+                "local_part": local_part,
+                "scope": scope,
+            })
+        }
+        scp_core::discovery::addressing::ParsedAddress::DomainHandle { local_part, domain } => {
+            serde_json::json!({
+                "type": "domain_handle",
+                "local_part": local_part,
+                "domain": domain,
+            })
+        }
+        scp_core::discovery::addressing::ParsedAddress::AttestationHandle { handle, platform } => {
+            serde_json::json!({
+                "type": "attestation_handle",
+                "handle": handle,
+                "platform": platform,
+            })
+        }
+        scp_core::discovery::addressing::ParsedAddress::Unscoped { name } => {
+            serde_json::json!({
+                "type": "unscoped",
+                "name": name,
+            })
+        }
+    };
+
+    serde_json::to_string(&result).map_err(|e| ScpError::Validation {
+        message: format!("failed to serialize parsed address: {e}"),
+        code: "SCP-VALID-6041".to_owned(),
+    })
+}
+
+/// Creates a discovery query as a JSON string.
+#[uniffi::export]
+pub fn discovery_create_query(
+    capabilities: Option<Vec<String>>,
+    keywords: Option<Vec<String>>,
+    min_history_secs: Option<u64>,
+) -> Result<String, ScpError> {
+    let query = scp_core::discovery::DiscoveryQuery {
+        capability_filter: capabilities,
+        keywords,
+        min_history: min_history_secs.map(std::time::Duration::from_secs),
+    };
+
+    serde_json::to_string(&query).map_err(|e| ScpError::Validation {
+        message: format!("failed to serialize query: {e}"),
+        code: "SCP-VALID-6042".to_owned(),
+    })
+}
+
+/// Normalizes an address string per SCP addressing rules.
+///
+/// Lowercases and trims whitespace.
+#[uniffi::export]
+#[must_use] 
+pub fn discovery_normalize_address(address: String) -> String {
+    scp_core::discovery::normalize_address(&address)
 }

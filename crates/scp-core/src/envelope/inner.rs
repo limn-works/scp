@@ -41,6 +41,16 @@ pub enum MessageType {
 
     /// WebRTC signaling message (SDP offer/answer, ICE candidate).
     Signaling,
+
+    /// Sender key distribution sub-protocol message (§9.16).
+    ///
+    /// The payload is a MessagePack-serialized
+    /// [`SenderKeyDistributionMessage`](crate::crypto::sender_keys::key_protocol::SenderKeyDistributionMessage)
+    /// carrying epoch advances, key requests, key responses, or block
+    /// notifications. This discriminator allows the transport layer to route
+    /// sender key protocol messages through the existing envelope pipeline
+    /// without adding new transport-level operations.
+    KeyDistribution,
 }
 
 impl MessageType {
@@ -50,6 +60,7 @@ impl MessageType {
         match self {
             Self::Content => 0,
             Self::Signaling => 1,
+            Self::KeyDistribution => 2,
         }
     }
 }
@@ -63,9 +74,16 @@ impl MessageType {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provenance {
     /// Human-readable description of the content origin.
+    /// Bounded to 1 KiB on deserialization to prevent OOM (#347).
+    #[serde(with = "crate::serde_util::serde_bounded_string")]
     pub source: String,
     /// Optional upstream content hash for chain-of-custody tracking.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Bounded to 1 KiB on deserialization to prevent OOM (#347).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::serde_util::serde_bounded_string_opt"
+    )]
     pub upstream_hash: Option<String>,
 }
 
@@ -78,9 +96,13 @@ pub struct Provenance {
 #[serde(deny_unknown_fields)]
 pub struct InnerEnvelope {
     /// The SCP context identifier.
+    /// Bounded to 1 KiB on deserialization to prevent OOM (#347).
+    #[serde(with = "crate::serde_util::serde_bounded_string")]
     pub context_id: String,
 
     /// The sender's full DID.
+    /// Bounded to 1 KiB on deserialization to prevent OOM (#347).
+    #[serde(with = "crate::serde_util::serde_bounded_string")]
     pub sender_did: String,
 
     /// MLS epoch number.

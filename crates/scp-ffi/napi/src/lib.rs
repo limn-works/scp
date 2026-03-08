@@ -1,3 +1,13 @@
+// napi-rs requires owned String/Vec parameters for #[napi] functions.
+// These lints are framework constraints, not code quality issues.
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::missing_errors_doc,
+    clippy::items_after_statements,
+    clippy::significant_drop_tightening,
+    clippy::too_many_lines
+)]
+
 //! `napi-rs` FFI bridge for SCP — the Node.js/Bun native addon.
 //!
 //! This crate is compiled to a native addon (`.node` file) via `napi build`
@@ -67,6 +77,7 @@ use std::time::Duration;
 use napi_derive::napi;
 
 pub mod context;
+pub mod discovery;
 pub mod error;
 pub mod event_log;
 pub mod identity;

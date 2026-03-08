@@ -41,7 +41,9 @@ use scp_identity::{
     NoOpRelayQuerier, ScpIdentity,
 };
 use scp_platform::file::FileKeyCustody;
+#[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
+use scp_platform::testing::InMemoryStorage;
 use scp_platform::traits::{KeyCustody, Storage};
 
 use crate::custody::FfiKeyCustody;
@@ -298,7 +300,7 @@ impl PyDIDDocument {
 /// - `"platform"` — Encrypted file-backed custody ([`FileKeyCustody`]) using
 ///   Argon2id + AES-256-GCM. This is the production default for desktop/server
 ///   platforms. Mobile platforms (iOS/Android) should use their native
-///   `KeyCustodyProvider` callback interface via UniFFI instead.
+///   `KeyCustodyProvider` callback interface via `UniFFI` instead.
 ///
 /// The `"platform"` path creates a [`FileKeyCustody`] at a default location
 /// (`$HOME/.scp/keys.bin`) with a passphrase from the `SCP_KEY_PASSPHRASE`
@@ -315,10 +317,15 @@ impl PyDIDDocument {
 /// See issue #323 and ADR-006.
 fn parse_custody(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
     match custody {
+        #[cfg(feature = "allow_in_memory_custody")]
         "in_memory" => {
             let kc = Arc::new(FfiKeyCustody::InMemory(InMemoryKeyCustody::new()));
             Ok((kc, custody.to_owned()))
         }
+        #[cfg(not(feature = "allow_in_memory_custody"))]
+        "in_memory" => Err(ScpPyError::validation(
+            "in_memory custody is not available in this build -- enable the              allow_in_memory_custody feature for dev/desktop use",
+        )),
         "platform" => {
             let passphrase = std::env::var("SCP_KEY_PASSPHRASE").map_err(|_| {
                 ScpPyError::validation(
@@ -356,9 +363,7 @@ fn parse_custody(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), ScpPyErr
 /// Falls back to the current directory if `$HOME` is not set (unlikely on
 /// any supported platform).
 fn dirs_home() -> std::path::PathBuf {
-    std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+    std::env::var("HOME").map_or_else(|_| std::path::PathBuf::from("."), std::path::PathBuf::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -494,10 +499,13 @@ fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
             );
 
             // Persist identity state if storage is initialized (SCP-217).
-            if let Ok(storage) = crate::runtime::get_storage() {
+            // Bind to &InMemoryStorage to resolve method ambiguity with the
+            // Arc<T>: Storage blanket impl (issue #329).
+            if let Ok(arc_storage) = crate::runtime::get_storage() {
+                let s: &InMemoryStorage = arc_storage.as_ref();
                 let key = identity_state_key(&did);
                 let data = serialize_identity_state(&did, &custody_str);
-                storage.store(&key, &data).await.map_err(|e| {
+                s.store(&key, &data).await.map_err(|e| {
                     ScpPyError::identity(format!("failed to persist identity state: {e}"))
                 })?;
             }
@@ -558,10 +566,13 @@ fn py_identity_create_with_agent_key(py: Python<'_>, custody: &str) -> PyResult<
             );
 
             // Persist identity state if storage is initialized (SCP-217).
-            if let Ok(storage) = crate::runtime::get_storage() {
+            // Bind to &InMemoryStorage to resolve method ambiguity with the
+            // Arc<T>: Storage blanket impl (issue #329).
+            if let Ok(arc_storage) = crate::runtime::get_storage() {
+                let s: &InMemoryStorage = arc_storage.as_ref();
                 let key = identity_state_key(&did);
                 let data = serialize_identity_state(&did, &custody_str);
-                storage.store(&key, &data).await.map_err(|e| {
+                s.store(&key, &data).await.map_err(|e| {
                     ScpPyError::identity(format!("failed to persist identity state: {e}"))
                 })?;
             }
@@ -625,11 +636,14 @@ fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
             ))));
         }
 
-        let storage = crate::runtime::get_storage().map_err(PyErr::from)?;
+        let arc_storage = crate::runtime::get_storage().map_err(PyErr::from)?;
 
         rt.block_on(async {
             let key = identity_state_key(&did_owned);
-            let data = storage
+            // Bind to &InMemoryStorage to resolve method ambiguity with the
+            // Arc<T>: Storage blanket impl (issue #329).
+            let s: &InMemoryStorage = arc_storage.as_ref();
+            let data = s
                 .retrieve(&key)
                 .await
                 .map_err(|e| {

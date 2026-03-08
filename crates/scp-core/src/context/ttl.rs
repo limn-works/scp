@@ -862,7 +862,8 @@ pub const fn expiry_notification() -> ContextEvent {
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::iter_on_single_items
+    clippy::iter_on_single_items,
+    clippy::significant_drop_tightening
 )]
 mod tests {
     use std::sync::Mutex;
@@ -1826,6 +1827,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)]
     async fn handle_ttl_expiry_with_transport_deletes_relay_data_for_ephemeral() {
         let handle = active_handle("ctx-eph-del", MemoryScope::Ephemeral);
         make_active(&handle).await;
@@ -1847,6 +1849,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)]
     async fn handle_ttl_expiry_with_transport_deletes_relay_data_for_summary() {
         let handle = active_handle("ctx-sum-del", MemoryScope::Summary);
         make_active(&handle).await;
@@ -1864,6 +1867,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)]
     async fn handle_ttl_expiry_with_transport_no_deletion_for_full() {
         let handle = active_handle("ctx-full-nodel", MemoryScope::Full);
         make_active(&handle).await;

@@ -110,11 +110,29 @@ impl OuterEnvelope {
 
     /// Deserializes an outer envelope from `MessagePack` binary format.
     ///
+    /// Performs a pre-deserialization size check against
+    /// [`MAX_ENVELOPE_SIZE`] to reject obviously oversized inputs before the
+    /// deserializer allocates memory (#347). Individual fields are further
+    /// bounded by serde-level helpers (e.g., `serde_bounded_bytes` for
+    /// `encrypted_blob`).
+    ///
+    /// [`MAX_ENVELOPE_SIZE`]: crate::serde_util::MAX_ENVELOPE_SIZE
+    ///
     /// # Errors
     ///
+    /// Returns [`EnvelopeError::EnvelopeTooLarge`] if `bytes.len()` exceeds
+    /// `MAX_ENVELOPE_SIZE`.
     /// Returns [`EnvelopeError::DeserializationFailed`] if the bytes are not
     /// a valid `MessagePack`-encoded `OuterEnvelope`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, EnvelopeError> {
+        use crate::serde_util::MAX_ENVELOPE_SIZE;
+
+        if bytes.len() > MAX_ENVELOPE_SIZE {
+            return Err(EnvelopeError::EnvelopeTooLarge {
+                size: bytes.len(),
+                max: MAX_ENVELOPE_SIZE,
+            });
+        }
         rmp_serde::from_slice(bytes)
             .map_err(|e| EnvelopeError::DeserializationFailed(e.to_string()))
     }
@@ -262,7 +280,19 @@ pub fn open_envelope(
     let plaintext = decrypt_sender_layer(sender_key, &mls_plaintext)
         .map_err(|e| EnvelopeError::SenderKeyDecryptionFailed(e.to_string()))?;
 
-    // 3. Deserialize inner envelope.
+    // 3. Size-check then deserialize inner envelope (#347).
+    //    Defense in depth: reject oversized decrypted payloads before
+    //    deserializing. The BOUNDED_BYTES_MAX limit on `encrypted_blob`
+    //    bounds the decrypted size transitively, but we check explicitly.
+    {
+        use crate::serde_util::BOUNDED_BYTES_MAX;
+        if plaintext.len() > BOUNDED_BYTES_MAX {
+            return Err(EnvelopeError::EnvelopeTooLarge {
+                size: plaintext.len(),
+                max: BOUNDED_BYTES_MAX,
+            });
+        }
+    }
     let inner: InnerEnvelope = rmp_serde::from_slice(&plaintext)
         .map_err(|e| EnvelopeError::DeserializationFailed(e.to_string()))?;
 
@@ -385,6 +415,42 @@ mod tests {
         let restored = OuterEnvelope::from_bytes(&bytes).unwrap();
 
         assert!(restored.recipient_hint.is_none());
+    }
+
+    /// #347: `from_bytes` rejects input exceeding `MAX_ENVELOPE_SIZE` before
+    /// invoking the deserializer.
+    #[test]
+    fn from_bytes_rejects_oversized_input() {
+        use crate::serde_util::MAX_ENVELOPE_SIZE;
+
+        let oversized = vec![0u8; MAX_ENVELOPE_SIZE + 1];
+        let result = OuterEnvelope::from_bytes(&oversized);
+        assert!(result.is_err());
+
+        let err_msg = format!("{result:?}");
+        assert!(
+            err_msg.contains("EnvelopeTooLarge"),
+            "error should be EnvelopeTooLarge, got: {err_msg}"
+        );
+    }
+
+    /// #347: `from_bytes` accepts input at exactly `MAX_ENVELOPE_SIZE` (the
+    /// size check is not off-by-one). The deserialization itself will fail
+    /// because the bytes are not valid `MessagePack`, but the size check passes.
+    #[test]
+    fn from_bytes_accepts_at_limit() {
+        use crate::serde_util::MAX_ENVELOPE_SIZE;
+
+        let at_limit = vec![0u8; MAX_ENVELOPE_SIZE];
+        let result = OuterEnvelope::from_bytes(&at_limit);
+        // Should fail with DeserializationFailed (invalid msgpack), not
+        // EnvelopeTooLarge.
+        assert!(result.is_err());
+        let err_msg = format!("{result:?}");
+        assert!(
+            err_msg.contains("DeserializationFailed"),
+            "should be DeserializationFailed at the limit, got: {err_msg}"
+        );
     }
 }
 

@@ -216,7 +216,7 @@ impl<S: Storage> ProtocolStore<S> {
     /// version, returns `StoreError::IncompatibleVersion`. Otherwise
     /// deserializes and returns the inner data.
     ///
-    /// Handles both named (map) and positional (array) MessagePack formats
+    /// Handles both named (map) and positional (array) `MessagePack` formats
     /// for backward compatibility with data serialized before the switch
     /// to `rmp_serde::to_vec_named`.
     fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, StoreError> {

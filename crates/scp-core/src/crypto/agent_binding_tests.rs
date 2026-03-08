@@ -10,7 +10,8 @@
     clippy::expect_used,
     clippy::panic,
     clippy::cast_possible_truncation,
-    clippy::similar_names
+    clippy::similar_names,
+    clippy::type_complexity
 )]
 mod tests {
     use std::collections::HashSet;
@@ -332,6 +333,7 @@ mod tests {
         let admin_vk = admin_signing_key.verifying_key();
         let voter_vk = signing_key.verifying_key();
         let third_vk = ed25519_dalek::SigningKey::from_bytes(&[0xCC; 32]).verifying_key();
+        #[allow(clippy::type_complexity)]
         let resolver: std::sync::Arc<
             dyn Fn(&scp_identity::DID) -> Option<ed25519_dalek::VerifyingKey> + Send + Sync,
         > = {

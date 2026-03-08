@@ -570,8 +570,8 @@ impl BroadcastReplayDetector {
         }
 
         // New author — evict oldest if at capacity.
-        if self.last_seen.len() >= REPLAY_DETECTOR_MAX_AUTHORS {
-            if let Some(oldest_key) = self
+        if self.last_seen.len() >= REPLAY_DETECTOR_MAX_AUTHORS
+            && let Some(oldest_key) = self
                 .last_seen
                 .iter()
                 .min_by_key(|(_, (_, ts))| *ts)
@@ -579,7 +579,6 @@ impl BroadcastReplayDetector {
             {
                 self.last_seen.remove(&oldest_key);
             }
-        }
 
         self.last_seen
             .insert(author_did.to_owned(), (sequence, timestamp));

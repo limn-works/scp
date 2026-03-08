@@ -632,14 +632,14 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
 
         // Step 6: Post-resolve hook (TOFU key tracking, spec §9.11).
         // Errors are logged but do not prevent resolution from succeeding.
-        if let Some(hook) = &self.post_resolve_hook {
-            if let Err(e) = hook.on_resolve(did_string, &document).await {
-                tracing::warn!(
-                    did = %did_string,
-                    error = %e,
-                    "post-resolve hook failed (TOFU key tracking may be unavailable)"
-                );
-            }
+        if let Some(hook) = &self.post_resolve_hook
+            && let Err(e) = hook.on_resolve(did_string, &document).await
+        {
+            tracing::warn!(
+                did = %did_string,
+                error = %e,
+                "post-resolve hook failed (TOFU key tracking may be unavailable)"
+            );
         }
 
         // Step 7: Update cache.
@@ -992,6 +992,48 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         };
 
         Ok((updated_identity, updated_doc))
+    }
+
+    /// Attaches a device attestation token to a DID document.
+    ///
+    /// Calls [`DeviceAttestation::attest()`] to generate a platform-specific
+    /// attestation token, then stores it as an `ScpDeviceAttestation` service
+    /// entry in the DID document (§9.3). The token is base64-encoded in the
+    /// `serviceEndpoint` field. The service entry uses the ID format
+    /// `{did}#device-attestation`.
+    ///
+    /// Device attestation is a Sybil resistance signal -- the protocol carries
+    /// the proof but does not prescribe interpretation. Contexts MAY require
+    /// device attestation for admission via `ContextParams`.
+    ///
+    /// When `DeviceAttestation` is not available (e.g., desktop platforms
+    /// without hardware attestation), callers should skip this method. The
+    /// absence of an `ScpDeviceAttestation` service entry is a valid state.
+    ///
+    /// # Arguments
+    ///
+    /// * `document` - The DID document to attach the attestation to.
+    /// * `attestation` - A platform `DeviceAttestation` implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::Platform`] if the attestation service is
+    /// unavailable or attestation generation fails.
+    ///
+    /// See §9.3, issue #362, BLACK-006.
+    pub async fn attach_device_attestation(
+        &self,
+        document: &DidDocument,
+        attestation: &impl scp_platform::traits::DeviceAttestation,
+    ) -> Result<DidDocument, IdentityError> {
+        let token = attestation
+            .attest()
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        let mut updated_doc = document.clone();
+        updated_doc.set_device_attestation_token(token.as_bytes());
+        Ok(updated_doc)
     }
 
     /// Migrates an identity to a new DID (Layer 2).
@@ -3623,5 +3665,170 @@ mod tests {
         let (identity, _document) = dht.create(&*custody).await.unwrap();
         dht.initialize_sequence(&identity.did).await.unwrap();
         assert_eq!(dht.current_sequence(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Device attestation integration tests (issue #362)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn attach_device_attestation_adds_service_entry() {
+        use scp_platform::testing::InMemoryDeviceAttestation;
+
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+        let attestation = InMemoryDeviceAttestation::new();
+
+        let (_identity, document) = dht.create(&*custody).await.unwrap();
+
+        // Before attaching: no device attestation service entry.
+        assert!(!document.has_device_attestation());
+        assert!(document.device_attestation_token().unwrap().is_none());
+
+        // Attach device attestation.
+        let updated_doc = dht
+            .attach_device_attestation(&document, &attestation)
+            .await
+            .unwrap();
+
+        // After attaching: device attestation service entry present.
+        assert!(updated_doc.has_device_attestation());
+        let token = updated_doc.device_attestation_token().unwrap().unwrap();
+        assert!(
+            token.starts_with(b"scp-test-attestation-v1:"),
+            "token should have synthetic prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn device_attestation_roundtrip_verify() {
+        use scp_platform::testing::InMemoryDeviceAttestation;
+        use scp_platform::traits::DeviceAttestation;
+
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+        let attestation = InMemoryDeviceAttestation::new();
+
+        let (_identity, document) = dht.create(&*custody).await.unwrap();
+
+        // Attach device attestation.
+        let updated_doc = dht
+            .attach_device_attestation(&document, &attestation)
+            .await
+            .unwrap();
+
+        // Extract token from service entry and verify it.
+        let token_bytes = updated_doc.device_attestation_token().unwrap().unwrap();
+        let token = scp_platform::traits::DeviceAttestationToken::new(token_bytes);
+        let verified = attestation.verify(&token).await.unwrap();
+        assert!(verified, "roundtrip token should verify successfully");
+    }
+
+    #[tokio::test]
+    async fn device_attestation_tampered_token_does_not_verify() {
+        use scp_platform::testing::InMemoryDeviceAttestation;
+        use scp_platform::traits::DeviceAttestation;
+
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+        let attestation = InMemoryDeviceAttestation::new();
+
+        let (_identity, document) = dht.create(&*custody).await.unwrap();
+
+        // Attach device attestation.
+        let updated_doc = dht
+            .attach_device_attestation(&document, &attestation)
+            .await
+            .unwrap();
+
+        // Extract and tamper with the token.
+        let mut token_bytes = updated_doc.device_attestation_token().unwrap().unwrap();
+        assert!(!token_bytes.is_empty());
+        // Bitflip the first byte (in the prefix) so the synthetic prefix check
+        // fails. The InMemoryDeviceAttestation verifier checks the prefix, so
+        // corrupting a prefix byte produces a verifiable false result.
+        token_bytes[0] ^= 0xFF;
+
+        let tampered_token = scp_platform::traits::DeviceAttestationToken::new(token_bytes);
+        let result = attestation.verify(&tampered_token).await;
+        // Should return Ok(false) or an error -- never panic.
+        if let Ok(verified) = result {
+            assert!(!verified, "tampered token should not verify");
+        } // Err is acceptable — tampered token may fail to parse
+    }
+
+    #[tokio::test]
+    async fn create_without_device_attestation_has_no_service_entry() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (_identity, document) = dht.create(&*custody).await.unwrap();
+
+        // No device attestation service entry when not explicitly attached.
+        assert!(!document.has_device_attestation());
+        assert!(document.device_attestation_token().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn device_attestation_service_entry_format() {
+        use base64::Engine;
+        use scp_platform::testing::InMemoryDeviceAttestation;
+
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+        let attestation = InMemoryDeviceAttestation::new();
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+
+        let updated_doc = dht
+            .attach_device_attestation(&document, &attestation)
+            .await
+            .unwrap();
+
+        // Find the service entry and verify format.
+        let service = updated_doc
+            .service
+            .iter()
+            .find(|s| s.service_type == "ScpDeviceAttestation")
+            .expect("ScpDeviceAttestation service entry should exist");
+
+        assert_eq!(
+            service.id,
+            format!("{}#device-attestation", identity.did),
+            "service ID should use {{did}}#device-attestation format"
+        );
+        assert_eq!(service.service_type, "ScpDeviceAttestation");
+        // Endpoint should be valid base64.
+        assert!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&service.service_endpoint)
+                .is_ok(),
+            "service endpoint should be valid base64"
+        );
+    }
+
+    #[tokio::test]
+    async fn device_attestation_json_roundtrip() {
+        use scp_platform::testing::InMemoryDeviceAttestation;
+
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+        let attestation = InMemoryDeviceAttestation::new();
+
+        let (_identity, document) = dht.create(&*custody).await.unwrap();
+
+        let updated_doc = dht
+            .attach_device_attestation(&document, &attestation)
+            .await
+            .unwrap();
+
+        // Serialize to JSON and back.
+        let json = updated_doc.to_json().unwrap();
+        let parsed = DidDocument::from_json(&json).unwrap();
+
+        assert!(parsed.has_device_attestation());
+        let original_token = updated_doc.device_attestation_token().unwrap().unwrap();
+        let parsed_token = parsed.device_attestation_token().unwrap().unwrap();
+        assert_eq!(original_token, parsed_token);
     }
 }

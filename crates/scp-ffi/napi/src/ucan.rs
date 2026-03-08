@@ -293,58 +293,75 @@ pub async fn ucan_mint(
     member_did: String,
     capabilities: Vec<String>,
 ) -> napi::Result<NapiUcanToken> {
-    // Extract key custody and signing key from the context handle (RED-102).
-    let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
-        napi::Error::from(ScpNapiError::Permission {
-            message: "UCAN minting requires key custody — create the context with an \
+    // In-memory custody is only available when `allow_in_memory_custody` is enabled.
+    #[cfg(not(feature = "allow_in_memory_custody"))]
+    {
+        let _ = (&handle, &member_did, &capabilities);
+        return Err(napi::Error::from(ScpNapiError::Permission {
+            message: "UCAN minting requires key custody -- the in_memory custody path                       is not available in this build. Enable allow_in_memory_custody                       for dev/desktop use.".to_owned(),
+            code: "SCP-PERM-3023".to_owned(),
+        }));
+    }
+
+    #[cfg(feature = "allow_in_memory_custody")]
+    {
+        // Extract key custody and signing key from the context handle (RED-102).
+        let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
+            napi::Error::from(ScpNapiError::Permission {
+                message: "UCAN minting requires key custody — create the context with an \
                       in_memory identity (identity_create(\"in_memory\"))"
-                .to_owned(),
-            code: "SCP-PERM-3023".to_owned(),
-        })
-    })?;
-    let signing_key = handle.signing_key.ok_or_else(|| {
-        napi::Error::from(ScpNapiError::Permission {
-            message: "UCAN minting requires a signing key — the context creator identity \
+                    .to_owned(),
+                code: "SCP-PERM-3023".to_owned(),
+            })
+        })?;
+        let signing_key = handle.signing_key.ok_or_else(|| {
+            napi::Error::from(ScpNapiError::Permission {
+                message: "UCAN minting requires a signing key — the context creator identity \
                       must have an active signing key"
-                .to_owned(),
-            code: "SCP-PERM-3023".to_owned(),
-        })
-    })?;
+                    .to_owned(),
+                code: "SCP-PERM-3023".to_owned(),
+            })
+        })?;
 
-    let creator_did = handle.creator_did();
-    let context_id = handle.context_id();
+        let creator_did = handle.creator_did();
+        let context_id = handle.context_id();
 
-    // Get ceiling from the context handle for mint-time enforcement (#339).
-    // Empty ceiling means unrestricted — pass None, not Some(empty_set).
-    let ceiling_strings: std::collections::HashSet<String> = handle.ceiling().into_iter().collect();
-    let ceiling = if ceiling_strings.is_empty() { None } else { Some(ceiling_strings) };
+        // Get ceiling from the context handle for mint-time enforcement (#339).
+        // Empty ceiling means unrestricted — pass None, not Some(empty_set).
+        let ceiling_strings: std::collections::HashSet<String> =
+            handle.ceiling().into_iter().collect();
+        let ceiling = if ceiling_strings.is_empty() {
+            None
+        } else {
+            Some(ceiling_strings)
+        };
 
-    let params = MintParams {
-        issuer_did: &creator_did,
-        issuer_key: &signing_key,
-        audience_did: &member_did,
-        context_id: &context_id,
-        capabilities: &capabilities,
-        lifetime_secs: 3600, // 1 hour default
-        not_before: None,
-        proofs: vec![],
-        facts: None,
-        key_scope: None,
-        signing_key_id: None,
-        ceiling,
-    };
+        let params = MintParams {
+            issuer_did: &creator_did,
+            issuer_key: &signing_key,
+            audience_did: &member_did,
+            context_id: &context_id,
+            capabilities: &capabilities,
+            lifetime_secs: 3600, // 1 hour default
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling,
+        };
 
-    // Sign the token using the real InMemoryKeyCustody via scp-core.
-    // napi-rs async functions already run on the tokio runtime, so we
-    // can await directly without spawning a separate task.
-    let token = mint_ucan(&params, &custody.0).await.map_err(|e| {
-        napi::Error::from(ScpNapiError::Permission {
-            message: format!("UCAN minting failed: {e}"),
-            code: "SCP-PERM-3023".to_owned(),
-        })
-    })?;
+        // Sign the token using the real InMemoryKeyCustody via scp-core.
+        // napi-rs async functions already run on the tokio runtime, so we
+        // can await directly without spawning a separate task.
+        let token = mint_ucan(&params, &custody.0).await.map_err(|e| {
+            napi::Error::from(ScpNapiError::Permission {
+                message: format!("UCAN minting failed: {e}"),
+                code: "SCP-PERM-3023".to_owned(),
+            })
+        })?;
 
-    let data = NapiUcanTokenData {
+        let data = NapiUcanTokenData {
         token_id: token.payload.nnc.clone(),
         issuer: token.payload.iss.clone(),
         audience: token.payload.aud.clone(),
@@ -358,11 +375,12 @@ pub async fn ucan_mint(
         expires_at: Some(token.payload.exp as f64),
     };
 
-    increment_handle_count();
-    Ok(NapiUcanToken {
-        data,
-        encoded: token.encoded,
-    })
+        increment_handle_count();
+        Ok(NapiUcanToken {
+            data,
+            encoded: token.encoded,
+        })
+    }
 }
 
 /// Revokes a UCAN token.
@@ -428,7 +446,7 @@ pub(crate) fn build_proof_resolver(
     Ok(BridgeProofResolver { proofs })
 }
 
-/// Convenience alias that mirrors the PyO3 bridge naming convention.
+/// Convenience alias that mirrors the `PyO3` bridge naming convention.
 ///
 /// Builds a [`BridgeProofResolver`] from optional encoded proof token strings.
 pub(crate) fn build_proof_resolver_from_tokens(

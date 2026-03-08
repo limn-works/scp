@@ -18,10 +18,13 @@ use scp_core::context::{ContextHandle, ContextParams, ContextState};
 use scp_identity::DID;
 use uuid::Uuid;
 
+#[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::traits::KeyCustody;
 
 use crate::error::ScpNapiError;
-use crate::identity::{NapiIdentity, OpaqueInMemoryKeyCustody};
+use crate::identity::NapiIdentity;
+#[cfg(feature = "allow_in_memory_custody")]
+use crate::identity::OpaqueInMemoryKeyCustody;
 use crate::runtime::context_manager;
 use crate::{decrement_handle_count, increment_handle_count};
 
@@ -69,6 +72,7 @@ pub struct NapiContextHandle {
     /// Optional economic policy string.
     economic_policy: Option<String>,
     /// Retained [`InMemoryKeyCustody`] for UCAN signing (RED-102).
+    #[cfg(feature = "allow_in_memory_custody")]
     pub(crate) in_memory_custody: Option<Arc<OpaqueInMemoryKeyCustody>>,
     /// Handle to the creator's active signing key for UCAN minting (RED-102).
     pub(crate) signing_key: Option<scp_platform::traits::KeyHandle>,
@@ -246,10 +250,8 @@ pub struct NapiMessage {
 ///
 /// Returns `Ok(())` on success or if no custody/identity is available
 /// (graceful no-op). Errors are logged but not propagated.
-async fn derive_context_pseudonym(
-    identity: &NapiIdentity,
-    context_id: &str,
-) {
+#[cfg(feature = "allow_in_memory_custody")]
+async fn derive_context_pseudonym(identity: &NapiIdentity, context_id: &str) {
     if let (Some(scp_id), Some(custody)) = (
         identity.inner.scp_identity.as_ref(),
         &identity.inner.in_memory_custody,
@@ -311,6 +313,7 @@ pub async fn context_create(
     let economic_policy = params["economicPolicy"].as_str().map(str::to_owned);
 
     // Extract key custody and signing key from the identity handle (RED-102).
+    #[cfg(feature = "allow_in_memory_custody")]
     let in_memory_custody = identity.inner.in_memory_custody.clone();
     let signing_key = identity
         .inner
@@ -376,6 +379,7 @@ pub async fn context_create(
     manager.register_local_did(DID(creator_did.clone())).await;
 
     // Derive the context-scoped pseudonym routing ID (SCP-214 criterion 5).
+    #[cfg(feature = "allow_in_memory_custody")]
     derive_context_pseudonym(identity, &context_id).await;
 
     let handle = NapiContextHandle {
@@ -390,6 +394,7 @@ pub async fn context_create(
         governance,
         member_count: 1,
         economic_policy,
+        #[cfg(feature = "allow_in_memory_custody")]
         in_memory_custody,
         signing_key,
         core_handle: Some(core_handle),
@@ -543,9 +548,8 @@ pub async fn context_send(
     // Validate inner envelope signing via the retained KeyCustody
     // (SCP-214 criterion 6). Ensures the identity's active signing key
     // can produce a valid Ed25519 signature before sending.
-    if let (Some(custody), Some(signing_key)) =
-        (&handle.in_memory_custody, handle.signing_key)
-    {
+    #[cfg(feature = "allow_in_memory_custody")]
+    if let (Some(custody), Some(signing_key)) = (&handle.in_memory_custody, handle.signing_key) {
         let context_id = handle.context_id.clone();
         let sender_did_str = identity_did.clone();
         let now_ms = scp_core::time::now_millis().map_err(|e| {

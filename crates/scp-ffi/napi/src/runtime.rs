@@ -27,9 +27,9 @@ use scp_core::context::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
 };
 use scp_core::context::manager::{ContextManager, ContextPersistence, ContextSnapshot};
+use scp_core::context::tools::{SessionStore, ToolRegistry};
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
-use scp_core::context::tools::{SessionStore, ToolRegistry};
 use scp_event_log::EventLog;
 use scp_identity::cache::SystemClock;
 

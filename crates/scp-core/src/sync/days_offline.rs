@@ -36,7 +36,9 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::{ContextId, Ed25519Signature, SyncError, SyncOutcome, SyncPolicy};
+use super::{
+    ContextId, Ed25519Signature, EquivocationAlert, SyncError, SyncEvent, SyncOutcome, SyncPolicy,
+};
 use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
@@ -721,30 +723,59 @@ pub fn detect_device_divergence(
     }
 }
 
+/// Creates an [`EquivocationAlert`] from a detected device divergence.
+///
+/// When [`detect_device_divergence`] returns [`DeviceDivergence::Divergent`],
+/// this function converts it into a structured alert for the application layer.
+/// Per spec §23.7: "The reconnecting member raises an `EquivocationDetected` alert."
+///
+/// Returns `None` if the divergence is `Consistent` or `Behind`.
+#[must_use]
+pub fn equivocation_alert_from_divergence(
+    context_id: &str,
+    device_a: &DeviceSyncState,
+    device_b: &DeviceSyncState,
+    divergence: &DeviceDivergence,
+    now: u64,
+) -> Option<SyncEvent> {
+    match divergence {
+        DeviceDivergence::Divergent { event_count, .. } => {
+            let alert = EquivocationAlert {
+                context_id: context_id.to_owned(),
+                detector_did: device_a.owner_did.clone(),
+                divergent_did: device_b.owner_did.clone(),
+                divergent_event_count: *event_count,
+                local_merkle_root: device_a.local_merkle_root,
+                remote_merkle_root: device_b.local_merkle_root,
+                evidence: None,
+                detected_at: now,
+                local_epoch: device_a.last_known_epoch,
+            };
+            Some(SyncEvent::EquivocationDetected(Box::new(alert)))
+        }
+        DeviceDivergence::Consistent | DeviceDivergence::Behind { .. } => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DaysOfflineSyncResult
 // ---------------------------------------------------------------------------
 
 /// Result of a days-scale offline sync attempt for a single context.
-///
-/// Returned by the high-level sync orchestration (not part of this module's
-/// public API — the orchestrator lives in the reconnection coordinator).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaysOfflineSyncResult {
     /// The context that was synced.
     pub context_id: ContextId,
-
     /// The delta that was applied (if any).
     pub delta_applied: Option<SnapshotDelta>,
-
     /// The MLS recovery action taken.
     pub mls_recovery: MlsRecoveryAction,
-
     /// Number of events recovered.
     pub events_recovered: u64,
-
     /// Overall sync outcome.
     pub outcome: SyncOutcome,
+    /// Security-relevant events detected during sync (spec §9.9.2, §23.7).
+    pub sync_events: Vec<SyncEvent>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1756,8 +1787,90 @@ mod tests {
             mls_recovery: MlsRecoveryAction::NoAction,
             events_recovered: 0,
             outcome: SyncOutcome::FullyCaughtUp,
+            sync_events: vec![],
         };
+        let json = serde_json::to_string(&result).unwrap();
+        let deserialized: DaysOfflineSyncResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(result, deserialized);
+    }
 
+    #[test]
+    fn equivocation_alert_from_divergent_devices() {
+        let device_a = DeviceSyncState {
+            device_id: "device-1".to_owned(),
+            owner_did: DID::from("did:key:alice"),
+            last_relay_contact: 1_700_000_000,
+            last_known_epoch: Some(10),
+            local_merkle_root: [0xAA; 32],
+            local_event_count: 100,
+        };
+        let device_b = DeviceSyncState {
+            device_id: "device-2".to_owned(),
+            owner_did: DID::from("did:key:bob"),
+            last_relay_contact: 1_700_000_000,
+            last_known_epoch: Some(10),
+            local_merkle_root: [0xBB; 32],
+            local_event_count: 100,
+        };
+        let divergence = detect_device_divergence(&device_a, &device_b);
+        let event = equivocation_alert_from_divergence(
+            "ctx-1",
+            &device_a,
+            &device_b,
+            &divergence,
+            1_700_001_000,
+        );
+        assert!(event.is_some());
+        match event.unwrap() {
+            SyncEvent::EquivocationDetected(alert) => {
+                assert_eq!(alert.context_id, "ctx-1");
+                assert_eq!(alert.detector_did, DID::from("did:key:alice"));
+                assert_eq!(alert.divergent_did, DID::from("did:key:bob"));
+                assert_eq!(alert.divergent_event_count, 100);
+                assert!(alert.evidence.is_none());
+            }
+            _ => panic!("expected EquivocationDetected"),
+        }
+    }
+
+    #[test]
+    fn equivocation_alert_from_consistent_returns_none() {
+        let d_a = make_device_state("d1", 100, [1u8; 32]);
+        let d_b = make_device_state("d2", 100, [1u8; 32]);
+        let div = detect_device_divergence(&d_a, &d_b);
+        assert!(equivocation_alert_from_divergence("ctx-1", &d_a, &d_b, &div, 0).is_none());
+    }
+
+    #[test]
+    fn equivocation_alert_from_behind_returns_none() {
+        let d_a = make_device_state("d1", 90, [1u8; 32]);
+        let d_b = make_device_state("d2", 100, [2u8; 32]);
+        let div = detect_device_divergence(&d_a, &d_b);
+        assert!(equivocation_alert_from_divergence("ctx-1", &d_a, &d_b, &div, 0).is_none());
+    }
+
+    #[test]
+    fn days_offline_sync_result_with_equivocation_event() {
+        let alert = super::EquivocationAlert {
+            context_id: "ctx-1".to_owned(),
+            detector_did: DID::from("did:key:alice"),
+            divergent_did: DID::from("did:key:bob"),
+            divergent_event_count: 100,
+            local_merkle_root: [0xAA; 32],
+            remote_merkle_root: [0xBB; 32],
+            evidence: None,
+            detected_at: 1_700_000_000,
+            local_epoch: Some(10),
+        };
+        let result = DaysOfflineSyncResult {
+            context_id: "ctx-1".to_owned(),
+            delta_applied: None,
+            mls_recovery: MlsRecoveryAction::NoAction,
+            events_recovered: 50,
+            outcome: SyncOutcome::FullyCaughtUp,
+            sync_events: vec![SyncEvent::EquivocationDetected(Box::new(alert))],
+        };
+        assert_eq!(result.sync_events.len(), 1);
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: DaysOfflineSyncResult = serde_json::from_str(&json).unwrap();
         assert_eq!(result, deserialized);

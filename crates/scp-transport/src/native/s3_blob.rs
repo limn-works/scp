@@ -731,20 +731,6 @@ impl BlobStorage for S3BlobStore {
         use std::pin::Pin;
         use std::task::{Context, Poll};
 
-        let stored_at = self.now();
-        let expires_at = stored_at.saturating_add(u64::from(blob_ttl));
-
-        // Build metadata map for S3 object user metadata.
-        let mut metadata = HashMap::new();
-        metadata.insert("routing_id".to_owned(), hex::encode(routing_id));
-        metadata.insert("blob_id".to_owned(), hex::encode(blob_id));
-        metadata.insert("blob_ttl".to_owned(), blob_ttl.to_string());
-        metadata.insert("stored_at".to_owned(), stored_at.to_string());
-        metadata.insert("expires_at".to_owned(), expires_at.to_string());
-        if let Some(hint) = &recipient_hint {
-            metadata.insert("recipient_hint".to_owned(), hex::encode(hint));
-        }
-
         // Adapt BlobBodyStream → http_body::Body → ByteStream for S3 PutObject.
         // This streams directly to S3 without collecting the full blob in memory.
         //
@@ -774,6 +760,20 @@ impl BlobStorage for S3BlobStore {
                     Poll::Pending => Poll::Pending,
                 }
             }
+        }
+
+        let stored_at = self.now();
+        let expires_at = stored_at.saturating_add(u64::from(blob_ttl));
+
+        // Build metadata map for S3 object user metadata.
+        let mut metadata = HashMap::new();
+        metadata.insert("routing_id".to_owned(), hex::encode(routing_id));
+        metadata.insert("blob_id".to_owned(), hex::encode(blob_id));
+        metadata.insert("blob_ttl".to_owned(), blob_ttl.to_string());
+        metadata.insert("stored_at".to_owned(), stored_at.to_string());
+        metadata.insert("expires_at".to_owned(), expires_at.to_string());
+        if let Some(hint) = &recipient_hint {
+            metadata.insert("recipient_hint".to_owned(), hex::encode(hint));
         }
 
         let adapter = StreamBody(std::sync::Mutex::new(body));

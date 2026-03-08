@@ -325,10 +325,9 @@ pub fn tool_session_invoke(
             .into_js()
         })?;
 
-        let result = with_manager(|mgr| {
-            mgr.session_invoke(&context_id, &session_id, &input, &invoker_did)
-        })
-        .map_err(ScpWasmError::into_js)?;
+        let result =
+            with_manager(|mgr| mgr.session_invoke(&context_id, &session_id, &input, &invoker_did))
+                .map_err(ScpWasmError::into_js)?;
 
         let json_str = serde_json::to_string(&result).map_err(|e| {
             ScpWasmError::Tool {

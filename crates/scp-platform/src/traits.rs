@@ -519,3 +519,56 @@ pub trait Storage: Send + Sync {
     /// Returns [`PlatformError::StorageError`] if the operation fails.
     fn exists(&self, key: &str) -> impl Future<Output = Result<bool, PlatformError>> + Send;
 }
+
+// ---------------------------------------------------------------------------
+// Arc<T> blanket impl for Storage
+// ---------------------------------------------------------------------------
+
+/// Blanket implementation of [`Storage`] for `Arc<T>` where `T: Storage`.
+///
+/// Enables sharing a single storage backend across multiple owners (e.g.,
+/// `ProtocolStore`, identity layer, and FFI bridge) via `Arc`. Delegates all
+/// operations to the inner `T` via `Deref`.
+///
+/// This is essential for `ProtocolStore<Arc<S>>` to work when the storage
+/// backend is shared via `Arc` (e.g., the FFI bridge's global
+/// `STORAGE_PROVIDER`). See issue #329.
+#[allow(clippy::manual_async_fn)]
+impl<T: Storage> Storage for std::sync::Arc<T> {
+    fn store(
+        &self,
+        key: &str,
+        data: &[u8],
+    ) -> impl Future<Output = Result<(), PlatformError>> + Send {
+        (**self).store(key, data)
+    }
+
+    fn retrieve(
+        &self,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, PlatformError>> + Send {
+        (**self).retrieve(key)
+    }
+
+    fn delete(&self, key: &str) -> impl Future<Output = Result<(), PlatformError>> + Send {
+        (**self).delete(key)
+    }
+
+    fn list_keys(
+        &self,
+        prefix: &str,
+    ) -> impl Future<Output = Result<Vec<String>, PlatformError>> + Send {
+        (**self).list_keys(prefix)
+    }
+
+    fn delete_prefix(
+        &self,
+        prefix: &str,
+    ) -> impl Future<Output = Result<u64, PlatformError>> + Send {
+        (**self).delete_prefix(prefix)
+    }
+
+    fn exists(&self, key: &str) -> impl Future<Output = Result<bool, PlatformError>> + Send {
+        (**self).exists(key)
+    }
+}

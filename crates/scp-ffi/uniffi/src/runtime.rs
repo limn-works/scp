@@ -211,7 +211,7 @@ impl ContextEventLogProvider for FfiBridgeEventLog {
 ///
 /// Returns `(0, 0)` if the context is not registered.
 #[must_use]
-pub fn query_trust_event_counts(_context_id: &str, _did: &str) -> (u64, u64) {
+pub const fn query_trust_event_counts(_context_id: &str, _did: &str) -> (u64, u64) {
     // UniFFI bridge: ContextManager owns context state but does not expose
     // per-context event log leaf counts directly. Return (0, 0) as a stub.
     // Full trust scoring requires ContextManager event log integration.

@@ -22,11 +22,29 @@
 /// multi-gigabyte allocations from malicious input.
 pub const BOUNDED_BYTES_MAX: usize = 512 * 1024;
 
+/// Maximum total wire size for an outer envelope (576 KiB).
+///
+/// This is `BOUNDED_BYTES_MAX` (512 KiB for the encrypted blob) plus 64 KiB
+/// of overhead for `MessagePack` framing, `routing_id` (32 bytes), optional
+/// `recipient_hint` (32 bytes), `blob_ttl`, and structural overhead. Checked
+/// *before* deserialization in `OuterEnvelope::from_bytes` to reject
+/// obviously oversized inputs without invoking the deserializer.
+pub const MAX_ENVELOPE_SIZE: usize = BOUNDED_BYTES_MAX + 64 * 1024;
+
+/// Maximum size for bounded string fields (1 KiB / 1024 bytes).
+///
+/// DID strings (e.g., `did:dht:z6Mk...`) are typically 50-100 bytes. Context
+/// IDs are 64-character hex strings. A 1 KiB cap is generous for any
+/// legitimate SCP identifier while preventing multi-gigabyte string
+/// allocations from malicious input.
+pub const BOUNDED_STRING_MAX: usize = 1024;
+
 /// Serde module for `[u8; 64]` fields (Ed25519 signatures).
 ///
 /// Serializes via `serde_bytes` for compact binary representation and
 /// validates exact length on deserialization. Rejects anything other than
 /// exactly 64 bytes.
+#[allow(clippy::missing_errors_doc)] // Serde trait impls — error semantics are self-evident.
 pub mod serde_signature_64 {
     use serde::{self, Deserializer, Serializer};
 
@@ -51,6 +69,7 @@ pub mod serde_signature_64 {
 /// Serde module for `[u8; 32]` fields (SHA-256 hashes, X25519 public keys).
 ///
 /// Same pattern as [`serde_signature_64`] but for 32-byte values.
+#[allow(clippy::missing_errors_doc)] // Serde trait impls — error semantics are self-evident.
 pub mod serde_hash_32 {
     use serde::{self, Deserializer, Serializer};
 
@@ -75,6 +94,7 @@ pub mod serde_hash_32 {
 /// Serde module for `[u8; 32]` fields (X25519 / Ed25519 public keys).
 ///
 /// Same pattern as [`serde_hash_32`] but with a domain-specific error message.
+#[allow(clippy::missing_errors_doc)] // Serde trait impls — error semantics are self-evident.
 pub mod serde_pubkey_32 {
     use serde::{self, Deserializer, Serializer};
 
@@ -104,6 +124,7 @@ pub mod serde_pubkey_32 {
 /// The HPKE-sealed sender key is exactly 60 bytes: AES-128-GCM nonce (12) +
 /// encrypted sender key (32) + authentication tag (16). Using a fixed-size
 /// array prevents allocation of arbitrarily large buffers from malicious input.
+#[allow(clippy::missing_errors_doc)] // Serde trait impls — error semantics are self-evident.
 pub mod serde_hpke_sealed_60 {
     use serde::{self, Deserializer, Serializer};
 
@@ -133,6 +154,7 @@ pub mod serde_hpke_sealed_60 {
 /// Serializes identically to `serde_bytes` but rejects payloads larger than
 /// [`BOUNDED_BYTES_MAX`] on deserialization. This prevents OOM from untrusted
 /// input while remaining compatible with legitimate SCP payloads.
+#[allow(clippy::missing_errors_doc)] // Serde trait impls — error semantics are self-evident.
 pub mod serde_bounded_bytes {
     use serde::de::Visitor;
     use serde::{self, Deserializer, Serializer};
@@ -156,7 +178,7 @@ pub mod serde_bounded_bytes {
             type Value = Vec<u8>;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "binary data up to {} bytes", BOUNDED_BYTES_MAX)
+                write!(f, "binary data up to {BOUNDED_BYTES_MAX} bytes")
             }
 
             fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
@@ -190,16 +212,14 @@ pub mod serde_bounded_bytes {
                 let hint = seq.size_hint().unwrap_or(0);
                 if hint > BOUNDED_BYTES_MAX {
                     return Err(serde::de::Error::custom(format!(
-                        "binary field exceeds {} byte limit (declared {} bytes)",
-                        BOUNDED_BYTES_MAX, hint
+                        "binary field exceeds {BOUNDED_BYTES_MAX} byte limit (declared {hint} bytes)"
                     )));
                 }
                 let mut buf = Vec::with_capacity(hint);
                 while let Some(byte) = seq.next_element::<u8>()? {
                     if buf.len() >= BOUNDED_BYTES_MAX {
                         return Err(serde::de::Error::custom(format!(
-                            "binary field exceeds {} byte limit",
-                            BOUNDED_BYTES_MAX
+                            "binary field exceeds {BOUNDED_BYTES_MAX} byte limit"
                         )));
                     }
                     buf.push(byte);
@@ -212,8 +232,149 @@ pub mod serde_bounded_bytes {
     }
 }
 
+/// Serde module for `String` fields with a [`BOUNDED_STRING_MAX`] cap.
+///
+/// Serializes identically to the default `String` serializer but rejects
+/// strings longer than [`BOUNDED_STRING_MAX`] on deserialization. This
+/// prevents OOM from malicious input containing gigabyte-length identifiers
+/// in `context_id`, `sender_did`, or provenance `source` fields.
+#[allow(clippy::missing_errors_doc)] // Serde trait impls — error semantics are self-evident.
+pub mod serde_bounded_string {
+    use serde::de::Visitor;
+    use serde::{self, Deserializer, Serializer};
+
+    use super::BOUNDED_STRING_MAX;
+
+    pub fn serialize<S>(s: &str, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(s)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<String, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BoundedStringVisitor;
+
+        impl Visitor<'_> for BoundedStringVisitor {
+            type Value = String;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "a string up to {BOUNDED_STRING_MAX} bytes")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                if v.len() > BOUNDED_STRING_MAX {
+                    return Err(E::custom(format!(
+                        "string field exceeds {} byte limit (got {} bytes)",
+                        BOUNDED_STRING_MAX,
+                        v.len()
+                    )));
+                }
+                Ok(v.to_owned())
+            }
+
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                if v.len() > BOUNDED_STRING_MAX {
+                    return Err(E::custom(format!(
+                        "string field exceeds {} byte limit (got {} bytes)",
+                        BOUNDED_STRING_MAX,
+                        v.len()
+                    )));
+                }
+                Ok(v)
+            }
+        }
+
+        deserializer.deserialize_string(BoundedStringVisitor)
+    }
+}
+
+/// Serde module for `Option<String>` fields with a [`BOUNDED_STRING_MAX`] cap.
+///
+/// Same semantics as [`serde_bounded_string`] but for optional string fields.
+/// `None` is preserved through serialization/deserialization roundtrips.
+#[allow(clippy::missing_errors_doc)] // Serde trait impls — error semantics are self-evident.
+pub mod serde_bounded_string_opt {
+    use serde::de::Visitor;
+    use serde::{self, Deserializer, Serializer};
+
+    use super::BOUNDED_STRING_MAX;
+
+    pub fn serialize<S>(s: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match s {
+            Some(v) => serializer.serialize_some(v),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BoundedOptStringVisitor;
+
+        impl<'de> Visitor<'de> for BoundedOptStringVisitor {
+            type Value = Option<String>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "an optional string up to {BOUNDED_STRING_MAX} bytes")
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_some<D2: Deserializer<'de>>(
+                self,
+                deserializer: D2,
+            ) -> Result<Self::Value, D2::Error> {
+                super::serde_bounded_string::deserialize(deserializer).map(Some)
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                if v.len() > BOUNDED_STRING_MAX {
+                    return Err(E::custom(format!(
+                        "string field exceeds {} byte limit (got {} bytes)",
+                        BOUNDED_STRING_MAX,
+                        v.len()
+                    )));
+                }
+                Ok(Some(v.to_owned()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                if v.len() > BOUNDED_STRING_MAX {
+                    return Err(E::custom(format!(
+                        "string field exceeds {} byte limit (got {} bytes)",
+                        BOUNDED_STRING_MAX,
+                        v.len()
+                    )));
+                }
+                Ok(Some(v))
+            }
+        }
+
+        deserializer.deserialize_option(BoundedOptStringVisitor)
+    }
+}
+
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::assertions_on_constants
+)]
 mod tests {
     use super::*;
 
@@ -230,7 +391,7 @@ mod tests {
     fn bounded_bytes_rejects_over_limit() {
         // Serialize a payload over the limit (just above 512 KiB)
         let data = vec![0xABu8; BOUNDED_BYTES_MAX + 1];
-        let serialized = rmp_serde::to_vec_named(&BoundedWrapper { data: data.clone() }).unwrap();
+        let serialized = rmp_serde::to_vec_named(&BoundedWrapper { data }).unwrap();
         let result = rmp_serde::from_slice::<BoundedWrapper>(&serialized);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -410,5 +571,99 @@ mod tests {
         let serialized_long = rmp_serde::to_vec_named(&bad_long).unwrap();
         let result = rmp_serde::from_slice::<HpkeSealed60Wrapper>(&serialized_long);
         assert!(result.is_err());
+    }
+
+    // --- bounded_string tests ---
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct BoundedStringWrapper {
+        #[serde(with = "serde_bounded_string")]
+        name: String,
+    }
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct BoundedStringOptWrapper {
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "serde_bounded_string_opt"
+        )]
+        name: Option<String>,
+    }
+
+    #[test]
+    fn bounded_string_accepts_within_limit() {
+        let wrapper = BoundedStringWrapper {
+            name: "a".repeat(BOUNDED_STRING_MAX),
+        };
+        let serialized = rmp_serde::to_vec_named(&wrapper).unwrap();
+        let deserialized: BoundedStringWrapper = rmp_serde::from_slice(&serialized).unwrap();
+        assert_eq!(deserialized.name.len(), BOUNDED_STRING_MAX);
+    }
+
+    #[test]
+    fn bounded_string_rejects_over_limit() {
+        let wrapper = BoundedStringWrapper {
+            name: "a".repeat(BOUNDED_STRING_MAX + 1),
+        };
+        let serialized = rmp_serde::to_vec_named(&wrapper).unwrap();
+        let result = rmp_serde::from_slice::<BoundedStringWrapper>(&serialized);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("exceeds"),
+            "error should mention exceeds: {err}"
+        );
+    }
+
+    #[test]
+    fn bounded_string_roundtrip() {
+        let wrapper = BoundedStringWrapper {
+            name: "did:dht:z6MkTest".into(),
+        };
+        let serialized = rmp_serde::to_vec_named(&wrapper).unwrap();
+        let deserialized: BoundedStringWrapper = rmp_serde::from_slice(&serialized).unwrap();
+        assert_eq!(deserialized.name, "did:dht:z6MkTest");
+    }
+
+    #[test]
+    fn bounded_string_opt_roundtrip_some() {
+        let wrapper = BoundedStringOptWrapper {
+            name: Some("hello".into()),
+        };
+        let serialized = rmp_serde::to_vec_named(&wrapper).unwrap();
+        let deserialized: BoundedStringOptWrapper = rmp_serde::from_slice(&serialized).unwrap();
+        assert_eq!(deserialized.name.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn bounded_string_opt_roundtrip_none() {
+        let wrapper = BoundedStringOptWrapper { name: None };
+        let serialized = rmp_serde::to_vec_named(&wrapper).unwrap();
+        let deserialized: BoundedStringOptWrapper = rmp_serde::from_slice(&serialized).unwrap();
+        assert!(deserialized.name.is_none());
+    }
+
+    #[test]
+    fn bounded_string_opt_rejects_over_limit() {
+        let wrapper = BoundedStringOptWrapper {
+            name: Some("a".repeat(BOUNDED_STRING_MAX + 1)),
+        };
+        let serialized = rmp_serde::to_vec_named(&wrapper).unwrap();
+        let result = rmp_serde::from_slice::<BoundedStringOptWrapper>(&serialized);
+        assert!(result.is_err());
+    }
+
+    // --- constant value tests ---
+
+    #[test]
+    fn max_envelope_size_exceeds_bounded_bytes_max() {
+        const { assert!(MAX_ENVELOPE_SIZE > BOUNDED_BYTES_MAX) };
+        assert_eq!(MAX_ENVELOPE_SIZE, BOUNDED_BYTES_MAX + 64 * 1024);
+    }
+
+    #[test]
+    fn bounded_string_max_is_1024() {
+        assert_eq!(BOUNDED_STRING_MAX, 1024);
     }
 }

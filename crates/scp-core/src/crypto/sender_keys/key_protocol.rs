@@ -216,6 +216,74 @@ pub struct BlockNotification {
     pub signature: [u8; 64],
 }
 
+/// Tagged-union envelope for sender key distribution sub-protocol messages.
+///
+/// Wraps the four sender key wire types ([`SenderKeyEpochAdvance`],
+/// [`SenderKeyRequest`], [`SenderKeyResponse`], [`BlockNotification`]) with a
+/// `msg_type` discriminator so they can ride as the payload of an inner
+/// envelope with [`MessageType::KeyDistribution`].
+///
+/// Serialized with `MessagePack` via `rmp-serde`. The `msg_type` tag is a
+/// string discriminator (`"epoch_advance"`, `"key_request"`, `"key_response"`,
+/// `"block_notification"`) for forward-compatible decoding.
+///
+/// # Transport Path
+///
+/// In **Encrypted** contexts, sender key messages travel inside MLS application
+/// messages: the caller serializes a `SenderKeyDistributionMessage` as the
+/// `payload` of an [`InnerEnvelope`] with
+/// `message_type: MessageType::KeyDistribution`, then seals it into an
+/// [`OuterEnvelope`] via the normal MLS pipeline.
+///
+/// In **Broadcast** contexts, where MLS is not used, the same serialized
+/// `SenderKeyDistributionMessage` is published as a relay blob on the
+/// context's routing ID, with the `recipient_hint` set for directed messages
+/// (key requests and responses).
+///
+/// [`MessageType::KeyDistribution`]: crate::envelope::inner::MessageType::KeyDistribution
+/// [`InnerEnvelope`]: crate::envelope::inner::InnerEnvelope
+/// [`OuterEnvelope`]: crate::envelope::OuterEnvelope
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "msg_type")]
+pub enum SenderKeyDistributionMessage {
+    /// A sender rotated their key to a new epoch (§9.16.2 step 1).
+    #[serde(rename = "epoch_advance")]
+    EpochAdvance(SenderKeyEpochAdvance),
+
+    /// A member requests a sender's key at a specific epoch (§9.16.2 step 2).
+    #[serde(rename = "key_request")]
+    KeyRequest(SenderKeyRequest),
+
+    /// A sender responds with HPKE-encrypted key material (§9.16.2 step 3).
+    #[serde(rename = "key_response")]
+    KeyResponse(SenderKeyResponse),
+
+    /// A block notification triggering mutual key rotation (§9.16.3).
+    #[serde(rename = "block_notification")]
+    BlockNotification(BlockNotification),
+}
+
+impl SenderKeyDistributionMessage {
+    /// Serializes this message to `MessagePack` bytes for transmission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SenderKeyError::SerializationFailed`] if serialization fails.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, SenderKeyError> {
+        rmp_serde::to_vec_named(self)
+            .map_err(|e| SenderKeyError::SerializationFailed(e.to_string()))
+    }
+
+    /// Deserializes a `SenderKeyDistributionMessage` from `MessagePack` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SenderKeyError::SerializationFailed`] if deserialization fails.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, SenderKeyError> {
+        rmp_serde::from_slice(bytes).map_err(|e| SenderKeyError::SerializationFailed(e.to_string()))
+    }
+}
+
 /// Result of [`rotate_sender_key_for_block`], containing the new key,
 /// updated epoch, and the serialized epoch advance notification.
 #[derive(Debug)]
@@ -1214,7 +1282,12 @@ fn current_timestamp_ms() -> Result<u64, crate::time::ClockError> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::items_after_statements
+)]
 mod tests {
     use std::collections::HashSet;
 
@@ -1375,6 +1448,16 @@ mod tests {
 
     #[tokio::test]
     async fn epoch_advance_serde_defaults_signer_key_ref_to_active() {
+        // Simulate an old-format message without signer_key_ref by
+        // constructing a minimal struct that omits the field.
+        #[derive(Serialize)]
+        struct LegacyAdvance {
+            sender_did: String,
+            epoch: u64,
+            #[serde(with = "serde_bytes")]
+            signature: Vec<u8>,
+        }
+
         let (custody, signing_key) = setup().await;
 
         let message = publish_sender_key_epoch_advance(
@@ -1388,17 +1471,6 @@ mod tests {
         .await
         .unwrap();
 
-        // Simulate an old-format message without signer_key_ref by
-        // constructing a minimal struct that omits the field.
-        // Simulate an old-format message without signer_key_ref by
-        // constructing a minimal struct that omits the field.
-        #[derive(Serialize)]
-        struct LegacyAdvance {
-            sender_did: String,
-            epoch: u64,
-            #[serde(with = "serde_bytes")]
-            signature: Vec<u8>,
-        }
         let advance: SenderKeyEpochAdvance = rmp_serde::from_slice(&message).unwrap();
         let legacy = LegacyAdvance {
             sender_did: advance.sender_did.clone(),
@@ -2780,5 +2852,246 @@ mod tests {
             err.contains("64-byte signature"),
             "error should mention 64-byte: {err}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // MessagePack wire-format round-trip serde tests (#335)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn sender_key_epoch_advance_msgpack_roundtrip() {
+        let advance = SenderKeyEpochAdvance {
+            sender_did: "did:dht:alice".to_owned(),
+            epoch: 42,
+            signer_key_ref: SigningKeyId::Active,
+            signature: [0xAB; 64],
+        };
+        let bytes = rmp_serde::to_vec_named(&advance).unwrap();
+        let deserialized: SenderKeyEpochAdvance = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(deserialized.sender_did, advance.sender_did);
+        assert_eq!(deserialized.epoch, advance.epoch);
+        assert_eq!(deserialized.signer_key_ref, advance.signer_key_ref);
+        assert_eq!(deserialized.signature, advance.signature);
+    }
+
+    #[test]
+    fn sender_key_epoch_advance_agent_key_roundtrip() {
+        let advance = SenderKeyEpochAdvance {
+            sender_did: "did:dht:bob".to_owned(),
+            epoch: 1,
+            signer_key_ref: SigningKeyId::Agent,
+            signature: [0xCD; 64],
+        };
+        let bytes = rmp_serde::to_vec_named(&advance).unwrap();
+        let deserialized: SenderKeyEpochAdvance = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(deserialized.signer_key_ref, SigningKeyId::Agent);
+        assert_eq!(deserialized.signature, advance.signature);
+    }
+
+    #[test]
+    fn sender_key_request_msgpack_roundtrip() {
+        let request = SenderKeyRequest {
+            requester_did: "did:dht:bob".to_owned(),
+            sender_did: "did:dht:alice".to_owned(),
+            epoch: 7,
+            wrapping_pubkey: [0x11; 32],
+            nonce: [0x22; REQUEST_NONCE_SIZE],
+            timestamp: 1_700_000_000,
+            signature: [0x33; 64],
+        };
+        let bytes = rmp_serde::to_vec_named(&request).unwrap();
+        let deserialized: SenderKeyRequest = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(deserialized.requester_did, request.requester_did);
+        assert_eq!(deserialized.sender_did, request.sender_did);
+        assert_eq!(deserialized.epoch, request.epoch);
+        assert_eq!(deserialized.wrapping_pubkey, request.wrapping_pubkey);
+        assert_eq!(deserialized.nonce, request.nonce);
+        assert_eq!(deserialized.timestamp, request.timestamp);
+        assert_eq!(deserialized.signature, request.signature);
+    }
+
+    #[test]
+    fn sender_key_response_msgpack_roundtrip() {
+        let response = SenderKeyResponse {
+            sender_did: "did:dht:alice".to_owned(),
+            epoch: 3,
+            hpke_sealed_key: [0x44; 60],
+            ephemeral_pubkey: [0x55; 32],
+            request_nonce: [0x66; REQUEST_NONCE_SIZE],
+        };
+        let bytes = rmp_serde::to_vec_named(&response).unwrap();
+        let deserialized: SenderKeyResponse = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(deserialized.sender_did, response.sender_did);
+        assert_eq!(deserialized.epoch, response.epoch);
+        assert_eq!(deserialized.hpke_sealed_key, response.hpke_sealed_key);
+        assert_eq!(deserialized.ephemeral_pubkey, response.ephemeral_pubkey);
+        assert_eq!(deserialized.request_nonce, response.request_nonce);
+    }
+
+    #[test]
+    fn block_notification_msgpack_roundtrip() {
+        let notification = BlockNotification {
+            notification_type: "block_notification".to_owned(),
+            blocker: "did:dht:alice".to_owned(),
+            blocked: "did:dht:dave".to_owned(),
+            signing_key_id: SigningKeyId::Active,
+            timestamp: 1_700_000_000_000,
+            signature: [0x77; 64],
+        };
+        let bytes = rmp_serde::to_vec_named(&notification).unwrap();
+        let deserialized: BlockNotification = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(
+            deserialized.notification_type,
+            notification.notification_type
+        );
+        assert_eq!(deserialized.blocker, notification.blocker);
+        assert_eq!(deserialized.blocked, notification.blocked);
+        assert_eq!(deserialized.signing_key_id, notification.signing_key_id);
+        assert_eq!(deserialized.timestamp, notification.timestamp);
+        assert_eq!(deserialized.signature, notification.signature);
+    }
+
+    // -------------------------------------------------------------------
+    // SenderKeyDistributionMessage transport envelope tests (#335)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn distribution_message_epoch_advance_roundtrip() {
+        let advance = SenderKeyEpochAdvance {
+            sender_did: "did:dht:alice".to_owned(),
+            epoch: 5,
+            signer_key_ref: SigningKeyId::Active,
+            signature: [0xAA; 64],
+        };
+        let msg = SenderKeyDistributionMessage::EpochAdvance(advance);
+        let bytes = msg.to_bytes().unwrap();
+        let deserialized = SenderKeyDistributionMessage::from_bytes(&bytes).unwrap();
+        match deserialized {
+            SenderKeyDistributionMessage::EpochAdvance(a) => {
+                assert_eq!(a.sender_did, "did:dht:alice");
+                assert_eq!(a.epoch, 5);
+            }
+            other => panic!("expected EpochAdvance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn distribution_message_key_request_roundtrip() {
+        let request = SenderKeyRequest {
+            requester_did: "did:dht:bob".to_owned(),
+            sender_did: "did:dht:alice".to_owned(),
+            epoch: 1,
+            wrapping_pubkey: [0xBB; 32],
+            nonce: [0xCC; REQUEST_NONCE_SIZE],
+            timestamp: 1_700_000_000,
+            signature: [0xDD; 64],
+        };
+        let msg = SenderKeyDistributionMessage::KeyRequest(request);
+        let bytes = msg.to_bytes().unwrap();
+        let deserialized = SenderKeyDistributionMessage::from_bytes(&bytes).unwrap();
+        match deserialized {
+            SenderKeyDistributionMessage::KeyRequest(r) => {
+                assert_eq!(r.requester_did, "did:dht:bob");
+                assert_eq!(r.sender_did, "did:dht:alice");
+                assert_eq!(r.epoch, 1);
+            }
+            other => panic!("expected KeyRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn distribution_message_key_response_roundtrip() {
+        let response = SenderKeyResponse {
+            sender_did: "did:dht:alice".to_owned(),
+            epoch: 2,
+            hpke_sealed_key: [0xEE; 60],
+            ephemeral_pubkey: [0xFF; 32],
+            request_nonce: [0x11; REQUEST_NONCE_SIZE],
+        };
+        let msg = SenderKeyDistributionMessage::KeyResponse(response);
+        let bytes = msg.to_bytes().unwrap();
+        let deserialized = SenderKeyDistributionMessage::from_bytes(&bytes).unwrap();
+        match deserialized {
+            SenderKeyDistributionMessage::KeyResponse(r) => {
+                assert_eq!(r.sender_did, "did:dht:alice");
+                assert_eq!(r.epoch, 2);
+                assert_eq!(r.hpke_sealed_key, [0xEE; 60]);
+            }
+            other => panic!("expected KeyResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn distribution_message_block_notification_roundtrip() {
+        let notification = BlockNotification {
+            notification_type: "block_notification".to_owned(),
+            blocker: "did:dht:alice".to_owned(),
+            blocked: "did:dht:dave".to_owned(),
+            signing_key_id: SigningKeyId::Active,
+            timestamp: 1_700_000_000_000,
+            signature: [0x99; 64],
+        };
+        let msg = SenderKeyDistributionMessage::BlockNotification(notification);
+        let bytes = msg.to_bytes().unwrap();
+        let deserialized = SenderKeyDistributionMessage::from_bytes(&bytes).unwrap();
+        match deserialized {
+            SenderKeyDistributionMessage::BlockNotification(n) => {
+                assert_eq!(n.blocker, "did:dht:alice");
+                assert_eq!(n.blocked, "did:dht:dave");
+            }
+            other => panic!("expected BlockNotification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn distribution_message_discriminator_preserved_in_wire_format() {
+        // Verify that the msg_type tag is correctly set for each variant.
+        let advance = SenderKeyDistributionMessage::EpochAdvance(SenderKeyEpochAdvance {
+            sender_did: "did:dht:alice".to_owned(),
+            epoch: 1,
+            signer_key_ref: SigningKeyId::Active,
+            signature: [0; 64],
+        });
+        let request = SenderKeyDistributionMessage::KeyRequest(SenderKeyRequest {
+            requester_did: "did:dht:bob".to_owned(),
+            sender_did: "did:dht:alice".to_owned(),
+            epoch: 1,
+            wrapping_pubkey: [0; 32],
+            nonce: [0; REQUEST_NONCE_SIZE],
+            timestamp: 0,
+            signature: [0; 64],
+        });
+        let response = SenderKeyDistributionMessage::KeyResponse(SenderKeyResponse {
+            sender_did: "did:dht:alice".to_owned(),
+            epoch: 1,
+            hpke_sealed_key: [0; 60],
+            ephemeral_pubkey: [0; 32],
+            request_nonce: [0; REQUEST_NONCE_SIZE],
+        });
+        let block = SenderKeyDistributionMessage::BlockNotification(BlockNotification {
+            notification_type: "block_notification".to_owned(),
+            blocker: "did:dht:alice".to_owned(),
+            blocked: "did:dht:dave".to_owned(),
+            signing_key_id: SigningKeyId::Active,
+            timestamp: 0,
+            signature: [0; 64],
+        });
+
+        // All four variants should serialize and deserialize back to the same
+        // variant (discriminator is preserved in wire format).
+        for (msg, expected_variant) in [
+            (&advance, "EpochAdvance"),
+            (&request, "KeyRequest"),
+            (&response, "KeyResponse"),
+            (&block, "BlockNotification"),
+        ] {
+            let bytes = msg.to_bytes().unwrap();
+            let restored = SenderKeyDistributionMessage::from_bytes(&bytes).unwrap();
+            let variant = format!("{restored:?}");
+            assert!(
+                variant.starts_with(expected_variant),
+                "expected {expected_variant} variant, got: {variant}"
+            );
+        }
     }
 }

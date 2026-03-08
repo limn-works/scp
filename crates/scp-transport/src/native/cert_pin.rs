@@ -12,7 +12,7 @@
 //! the stored pin. A mismatch rejects the connection.
 //!
 //! Pins are stored as serializable [`CertificatePin`] values. The storage
-//! backend is provided by the caller (in-memory, SQLite, etc.) — this
+//! backend is provided by the caller (in-memory, `SQLite`, etc.) — this
 //! module provides types and comparison logic only.
 //!
 //! See spec section 9.13 (Transport Security Requirements).

@@ -278,6 +278,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             economic_policy: None,
             metadata_visibility: private_encrypted_visibility(),
             projection_policy: None,
+            discoverable: false,
         },
         TemplateId::BilateralPersistent => ContextParams {
             mode: ContextMode::Encrypted,
@@ -293,6 +294,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             economic_policy: None,
             metadata_visibility: private_encrypted_visibility(),
             projection_policy: None,
+            discoverable: false,
         },
         TemplateId::Coordination => ContextParams {
             mode: ContextMode::Encrypted,
@@ -308,6 +310,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             economic_policy: None,
             metadata_visibility: private_encrypted_visibility(),
             projection_policy: None,
+            discoverable: false,
         },
         TemplateId::GroupDiscussion => ContextParams {
             mode: ContextMode::Encrypted,
@@ -323,6 +326,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             economic_policy: None,
             metadata_visibility: group_discussion_visibility(),
             projection_policy: None,
+            discoverable: false,
         },
         TemplateId::PublicBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
@@ -341,6 +345,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
                 default_rule: ProjectionRule::Public,
                 overrides: vec![],
             }),
+            discoverable: false,
         },
         TemplateId::GatedBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
@@ -359,6 +364,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
                 default_rule: ProjectionRule::Gated,
                 overrides: vec![],
             }),
+            discoverable: false,
         },
         TemplateId::ToolInterfaceTemplate => ContextParams {
             mode: ContextMode::Encrypted,
@@ -374,6 +380,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             economic_policy: None,
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
+            discoverable: false,
         },
         // Extends scp:template/tool-interface -- same ceiling and governance,
         // but economic_policy is caller-provided and validated separately.
@@ -391,6 +398,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             economic_policy: None,
             metadata_visibility: member_count_hidden_visibility(),
             projection_policy: None,
+            discoverable: false,
         },
         // Extends scp:template/gated-broadcast -- broadcast mode with gated
         // subscriber admission. economic_policy is caller-provided.
@@ -411,6 +419,26 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
                 default_rule: ProjectionRule::Gated,
                 overrides: vec![],
             }),
+            discoverable: false,
+        },
+        // Discovery context: encrypted mode with messaging + tool invocation
+        // ceiling. Discoverable by default so it can be found via DHT. Used
+        // to bootstrap agent discovery via standardized tool schemas (ADR-020).
+        TemplateId::DiscoveryContext => ContextParams {
+            mode: ContextMode::Encrypted,
+            ceiling: messaging_tool_invoke_ban_ceiling(),
+            ceiling_policy: CeilingPolicy::Immutable,
+            promotion_policy: PromotionPolicy::NoPromotion,
+            roles: Vec::new(),
+            tools: Vec::new(),
+            ttl: None,
+            memory_scope: MemoryScope::Full,
+            governance: GovernanceModel::SingleAdmin,
+            template_id: Some(TemplateId::DiscoveryContext),
+            economic_policy: None,
+            metadata_visibility: MetadataVisibilityPolicy::default(),
+            projection_policy: None,
+            discoverable: true,
         },
     }
 }
@@ -457,7 +485,8 @@ const fn ttl_policy(template_id: TemplateId) -> TtlPolicy {
         | TemplateId::GatedBroadcast
         | TemplateId::ToolInterfaceTemplate
         | TemplateId::PaidService
-        | TemplateId::PaidBroadcast => TtlPolicy::Optional,
+        | TemplateId::PaidBroadcast
+        | TemplateId::DiscoveryContext => TtlPolicy::Optional,
     }
 }
 
@@ -587,6 +616,16 @@ pub fn validate_against_template(params: &ContextParams) -> Result<(), TemplateE
 
     // Governance-gaps fields: metadata visibility and projection policy.
     validate_governance_gaps_fields(*template_id, params, &expected)?;
+
+    // Discoverable flag
+    if params.discoverable != expected.discoverable {
+        return Err(TemplateError::Mismatch {
+            template: *template_id,
+            field: "discoverable",
+            expected: format!("{}", expected.discoverable),
+            actual: format!("{}", params.discoverable),
+        });
+    }
 
     // TTL policy enforcement
     match ttl_policy(*template_id) {
@@ -1187,6 +1226,7 @@ mod tests {
             TemplateId::ToolInterfaceTemplate,
             TemplateId::PaidService,
             TemplateId::PaidBroadcast,
+            TemplateId::DiscoveryContext,
         ];
         for variant in &variants {
             let params = template_params(variant);
@@ -1277,6 +1317,10 @@ mod tests {
             template_params(&TemplateId::PaidService).mode,
             ContextMode::Encrypted
         );
+        assert_eq!(
+            template_params(&TemplateId::DiscoveryContext).mode,
+            ContextMode::Encrypted
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1319,6 +1363,7 @@ mod tests {
             TemplateId::ToolInterfaceTemplate,
             TemplateId::PaidService,
             TemplateId::PaidBroadcast,
+            TemplateId::DiscoveryContext,
         ];
         for variant in &variants {
             let from_method = ContextParams::from_template(*variant);
@@ -1818,6 +1863,7 @@ mod tests {
             TemplateId::GroupDiscussion,
             TemplateId::ToolInterfaceTemplate,
             TemplateId::PaidService,
+            TemplateId::DiscoveryContext,
         ];
         for tid in &encrypted_templates {
             let params = template_params(tid);
@@ -1943,6 +1989,7 @@ mod tests {
             TemplateId::GroupDiscussion,
             TemplateId::ToolInterfaceTemplate,
             TemplateId::PaidService,
+            TemplateId::DiscoveryContext,
         ];
         for tid in &encrypted_templates {
             let params = template_params(tid);

@@ -99,12 +99,16 @@ impl SubscriberRegistration {
     ) -> Vec<u8> {
         let ctx_bytes = context_id.as_bytes();
         let did_bytes = subscriber_did.0.as_bytes();
-        let mut input =
-            Vec::with_capacity(4 + ctx_bytes.len() + 4 + did_bytes.len() + wrapping_pubkey.len() + 8);
+        let mut input = Vec::with_capacity(
+            4 + ctx_bytes.len() + 4 + did_bytes.len() + wrapping_pubkey.len() + 8,
+        );
         // Length-prefix variable-length fields to prevent ambiguous concatenation
         // (e.g. context_id="a" + did="bc" vs context_id="ab" + did="c").
+        // Context IDs and DIDs are short strings — lengths will never exceed u32::MAX.
+        #[allow(clippy::cast_possible_truncation)]
         input.extend_from_slice(&(ctx_bytes.len() as u32).to_be_bytes());
         input.extend_from_slice(ctx_bytes);
+        #[allow(clippy::cast_possible_truncation)]
         input.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
         input.extend_from_slice(did_bytes);
         // wrapping_pubkey is fixed-size (32 bytes) and timestamp is fixed-size (8 bytes)
@@ -1383,7 +1387,12 @@ where
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::items_after_statements
+)]
 mod tests {
     use super::*;
     use crate::context::governance::RevocationScope;
@@ -3640,7 +3649,7 @@ mod tests {
     }
 
     /// Helper to create a subscriber keypair and register its DID in the
-    /// resolver. Returns (signing_key, DID string, wrapping_pubkey).
+    /// resolver. Returns (`signing_key`, DID string, `wrapping_pubkey`).
     fn make_subscriber_identity(
         seed: [u8; 32],
         did_str: &str,
@@ -3868,6 +3877,8 @@ mod tests {
 
     #[test]
     fn register_subscriber_rejects_invalid_wrapping_key_length() {
+        use ed25519_dalek::Signer;
+
         let mut ctx = make_open_ctx();
 
         let mut setup = GatedTestSetup::new();
@@ -3883,7 +3894,6 @@ mod tests {
             &bad_pubkey,
             1_700_000_000,
         );
-        use ed25519_dalek::Signer;
         let signature = sub_key.sign(&signing_input);
 
         let reg = SubscriberRegistration {
@@ -4037,7 +4047,7 @@ mod tests {
                 nbf: Some(now_secs.saturating_sub(7200)),
                 nnc: format!("{now_millis}-expired11223344expired11223344"),
                 att: vec![Attenuation {
-                    with: format!("scp:ctx:ctx-gated-1/messages:read"),
+                    with: "scp:ctx:ctx-gated-1/messages:read".to_string(),
                     can: "read".to_owned(),
                 }],
                 prf: vec![],

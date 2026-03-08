@@ -250,6 +250,11 @@ pub enum TemplateId {
     /// See spec section 19.10 and ADR-033.
     #[serde(rename = "scp:template/paid-broadcast")]
     PaidBroadcast,
+    /// Discovery context template. Encrypted mode with messaging + tool invocation
+    /// ceiling, discoverable by default. Used to bootstrap agent discovery via
+    /// standardized tool schemas (ADR-020, §22).
+    #[serde(rename = "scp:template/discovery-context")]
+    DiscoveryContext,
 }
 
 // ---------------------------------------------------------------------------
@@ -510,6 +515,16 @@ pub struct ContextParams {
     /// per-author overrides. `None` for non-broadcast contexts.
     #[serde(default)]
     pub projection_policy: Option<ProjectionPolicy>,
+
+    /// Whether this context should be published for discovery (§5.14.11).
+    ///
+    /// When `true` and the context is a broadcast context, the creator's DID
+    /// document will include an `SCPBroadcastContext` service entry advertising
+    /// this context. Encrypted context IDs MUST NOT be published (§9.10).
+    ///
+    /// Defaults to `false`.
+    #[serde(default)]
+    pub discoverable: bool,
 }
 
 impl Default for ContextParams {
@@ -528,6 +543,7 @@ impl Default for ContextParams {
             economic_policy: None,
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
+            discoverable: false,
         }
     }
 }
@@ -661,6 +677,7 @@ mod tests {
             economic_policy: None,
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
+            discoverable: false,
         };
 
         assert_eq!(params.mode, ContextMode::Broadcast);
@@ -732,6 +749,7 @@ mod tests {
             TemplateId::GatedBroadcast,
             TemplateId::PaidService,
             TemplateId::PaidBroadcast,
+            TemplateId::DiscoveryContext,
         ];
         for (i, a) in variants.iter().enumerate() {
             for (j, b) in variants.iter().enumerate() {
@@ -770,6 +788,7 @@ mod tests {
             economic_policy: None,
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
+            discoverable: false,
         };
 
         let json = serde_json::to_string(&params).ok();
@@ -821,6 +840,7 @@ mod tests {
             }),
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
+            discoverable: false,
         };
 
         let json = serde_json::to_string(&params).unwrap();

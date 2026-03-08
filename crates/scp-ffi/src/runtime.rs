@@ -61,12 +61,14 @@ use dashmap::DashMap;
 use scp_core::context::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
 };
-use scp_core::context::manager::ContextManager;
+use scp_core::context::manager::{ContextManager, ContextPersistence};
+use scp_core::context::providers::ProtocolStorePersistence;
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
 use scp_core::context::tools::ToolRegistry;
 use scp_core::context::{ContextError, ContextParams};
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
+use scp_core::store::ProtocolStore;
 use scp_event_log::EventLog;
 use scp_identity::cache::SystemClock;
 use scp_identity::{DidDocument, ScpIdentity};
@@ -126,15 +128,22 @@ pub fn context_manager() -> Result<&'static Arc<ContextManager>, ScpPyError> {
 /// remain in [`FfiBridgeState`] for subsystem operations (tools.rs, ucan.rs,
 /// `event_log.rs`).
 ///
-/// This function is idempotent — subsequent calls are no-ops.
+/// When the global storage provider ([`STORAGE_PROVIDER`]) has been
+/// initialized via [`init_storage`], a [`ProtocolStorePersistence`] is
+/// constructed from it and injected into the `ContextManager`. This enables
+/// context state persistence across process restarts without requiring
+/// callers to manually wire persistence. See issue #329.
+///
+/// This function is idempotent -- subsequent calls are no-ops.
 pub fn init_context_manager() {
     let _ = CONTEXT_MANAGER.get_or_init(|| {
-        Arc::new(ContextManager::new(
+        let persistence = build_persistence_provider();
+        build_context_manager(
             Box::new(NoOpCryptoProvider),
             Box::new(NoOpTransportProvider),
             Box::new(NoOpEventLogProvider),
-            noop_key_resolver(),
-        ))
+            persistence,
+        )
     });
 }
 
@@ -142,19 +151,62 @@ pub fn init_context_manager() {
 ///
 /// Allows injecting real or custom provider implementations. If the manager
 /// is already initialized, this is a no-op (first call wins).
+///
+/// When `persistence` is `None` but the global storage provider has been
+/// initialized, a [`ProtocolStorePersistence`] is automatically constructed
+/// from it. Pass `Some(...)` to override with a custom implementation.
 pub fn init_context_manager_with(
     crypto: Box<dyn ContextCryptoProvider>,
     transport: Box<dyn ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
+    persistence: Option<Box<dyn ContextPersistence>>,
 ) {
     let _ = CONTEXT_MANAGER.get_or_init(|| {
-        Arc::new(ContextManager::new(
+        let persistence = persistence.or_else(build_persistence_provider);
+        build_context_manager(crypto, transport, event_log, persistence)
+    });
+}
+
+/// Constructs a [`ProtocolStorePersistence`] from the global storage provider,
+/// if it has been initialized.
+///
+/// Returns `None` if [`init_storage`] has not been called yet. This is
+/// expected during early initialization -- the `ContextManager` will operate
+/// without persistence until the storage provider is available.
+///
+/// Uses `Arc<InMemoryStorage>` as the storage backend for
+/// `ProtocolStore`, sharing the same underlying storage instance as the
+/// identity layer. This ensures that identity and context data coexist in
+/// the same store, matching the `ApplicationNode` pattern in `scp-node`.
+fn build_persistence_provider() -> Option<Box<dyn ContextPersistence>> {
+    STORAGE_PROVIDER.get().map(|storage| {
+        let protocol_store = Arc::new(ProtocolStore::new(Arc::clone(storage)));
+        Box::new(ProtocolStorePersistence::new(protocol_store)) as Box<dyn ContextPersistence>
+    })
+}
+
+/// Constructs a `ContextManager` with or without persistence.
+fn build_context_manager(
+    crypto: Box<dyn ContextCryptoProvider>,
+    transport: Box<dyn ContextTransportProvider>,
+    event_log: Box<dyn ContextEventLogProvider>,
+    persistence: Option<Box<dyn ContextPersistence>>,
+) -> Arc<ContextManager> {
+    match persistence {
+        Some(p) => Arc::new(ContextManager::with_persistence(
+            crypto,
+            transport,
+            event_log,
+            p,
+            noop_key_resolver(),
+        )),
+        None => Arc::new(ContextManager::new(
             crypto,
             transport,
             event_log,
             noop_key_resolver(),
-        ))
-    });
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -558,7 +610,7 @@ pub fn remove_ffi_state(context_id: &str) {
 /// `ContextManager`.
 ///
 /// Must be called after any governance action that modifies role state
-/// (ChangeRole, ModifyCeiling, AddMember, RemoveMember, etc.) so that the
+/// (`ChangeRole`, `ModifyCeiling`, `AddMember`, `RemoveMember`, etc.) so that the
 /// FFI-side copy used by UCAN/tool capability checks stays current.
 ///
 /// # Errors

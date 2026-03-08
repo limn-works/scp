@@ -313,15 +313,16 @@ pub fn detect_deadlock(
             }
         }
         GovernanceModelConfig::Majority {
-            min_participation_bps, ..
+            min_participation_bps,
+            ..
         } => {
             // Deadlock: fewer than ceil(eligible * min_participation_bps / 10000) responsive
             // over 3 consecutive windows.
             let eligible = engine.eligible_voters(context);
             // Convert basis points to integer ceiling count.
-            let min_participants =
-                ((eligible.len() as u64 * u64::from(min_participation_bps) + 9999) / 10000)
-                    as usize;
+            // Voter count * basis points fits comfortably in u64; result fits in usize on 64-bit.
+            #[allow(clippy::cast_possible_truncation)]
+            let min_participants = (eligible.len() as u64 * u64::from(min_participation_bps)).div_ceil(10000) as usize;
             let unresponsive: Vec<(DID, u32)> = eligible
                 .iter()
                 .filter_map(|did| {
@@ -576,7 +577,8 @@ mod tests {
 
     #[test]
     fn threshold_proposal_expires_after_deadline() {
-        let mut engine = ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 300, mock_resolver()).unwrap();
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 300, mock_resolver()).unwrap();
 
         let now = 1_000_000;
         let ctx = threshold_context(now);
@@ -612,8 +614,13 @@ mod tests {
 
     #[test]
     fn majority_proposal_expires_insufficient_participation() {
-        let mut engine =
-            MajorityVoteEngine::new(vec![alice(), bob(), carol(), dave()], 300, 5000, mock_resolver()).unwrap();
+        let mut engine = MajorityVoteEngine::new(
+            vec![alice(), bob(), carol(), dave()],
+            300,
+            5000,
+            mock_resolver(),
+        )
+        .unwrap();
 
         let now = 1_000_000;
         let ctx = majority_context(now);
@@ -652,7 +659,8 @@ mod tests {
 
     #[test]
     fn unanimity_proposal_expires_after_deadline() {
-        let mut engine = UnanimityEngine::new(vec![alice(), bob(), carol()], 300, mock_resolver()).unwrap();
+        let mut engine =
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 300, mock_resolver()).unwrap();
 
         let now = 1_000_000;
         let ctx = unanimity_context(now);
@@ -686,7 +694,8 @@ mod tests {
 
     #[test]
     fn proposer_departure_invalidates_pending_proposal() {
-        let mut engine = ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 300, mock_resolver()).unwrap();
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 300, mock_resolver()).unwrap();
 
         let now = 1_000_000;
         let ctx = threshold_context(now);
@@ -721,7 +730,8 @@ mod tests {
 
     #[test]
     fn voter_departure_recalculates_quorum_threshold() {
-        let mut engine = ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 300, mock_resolver()).unwrap();
+        let mut engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 300, mock_resolver()).unwrap();
 
         let now = 1_000_000;
         let ctx = threshold_context(now);
@@ -788,7 +798,8 @@ mod tests {
 
     #[test]
     fn threshold_deadlock_detected_when_too_few_active_signers() {
-        let engine = ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 300, mock_resolver()).unwrap();
+        let engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 300, mock_resolver()).unwrap();
 
         let now = 1_000_000;
         // Only Alice is an active member (bob and carol departed).
@@ -820,7 +831,8 @@ mod tests {
 
     #[test]
     fn unanimity_deadlock_detected_when_voter_offline_7_days() {
-        let engine = UnanimityEngine::new(vec![alice(), bob(), carol()], 300, mock_resolver()).unwrap();
+        let engine =
+            UnanimityEngine::new(vec![alice(), bob(), carol()], 300, mock_resolver()).unwrap();
 
         let now = 1_000_000;
         let ctx = unanimity_context(now);
@@ -845,8 +857,13 @@ mod tests {
 
     #[test]
     fn majority_deadlock_detected_when_insufficient_responsive() {
-        let engine =
-            MajorityVoteEngine::new(vec![alice(), bob(), carol(), dave()], 300, 7500, mock_resolver()).unwrap();
+        let engine = MajorityVoteEngine::new(
+            vec![alice(), bob(), carol(), dave()],
+            300,
+            7500,
+            mock_resolver(),
+        )
+        .unwrap();
 
         let now = 1_000_000;
         let ctx = majority_context(now);
@@ -913,7 +930,9 @@ mod tests {
 
     #[test]
     fn update_detection_state_tracks_missed_windows() {
-        let engine = MajorityVoteEngine::new(vec![alice(), bob(), carol()], 300, 5000, mock_resolver()).unwrap();
+        let engine =
+            MajorityVoteEngine::new(vec![alice(), bob(), carol()], 300, 5000, mock_resolver())
+                .unwrap();
 
         let now = 1_000_000;
         let ctx = majority_context(now);
@@ -952,7 +971,8 @@ mod tests {
 
     #[test]
     fn no_deadlock_when_sufficient_signers_active() {
-        let engine = ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 300, mock_resolver()).unwrap();
+        let engine =
+            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 300, mock_resolver()).unwrap();
 
         let ctx = threshold_context(1_000_000);
         let state = DeadlockDetectionState::default();

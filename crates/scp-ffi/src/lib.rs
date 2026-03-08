@@ -1,3 +1,13 @@
+// PyO3 bridge functions use owned types at the FFI boundary.
+// These lints are framework constraints, not code quality issues.
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::missing_errors_doc,
+    clippy::items_after_statements,
+    clippy::significant_drop_tightening,
+    clippy::ref_option_ref
+)]
+
 //! `PyO3` FFI bridge for SCP — the `_scp_core` Python extension module.
 //!
 //! This crate is the Rust half of the Python SDK. It exposes a flat set of
@@ -44,6 +54,7 @@ use pyo3::prelude::*;
 
 pub mod bridge_adapters;
 pub mod custody;
+pub mod discovery;
 pub mod error;
 pub mod event_log;
 pub mod identity;
@@ -195,6 +206,7 @@ fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Step 6: Register domain bridge modules.
     context::register_context(m)?;
+    discovery::register_discovery(m)?;
     tools::register_tools(m)?;
     transport::register_transport(m)?;
     ucan::register_ucan(m)?;

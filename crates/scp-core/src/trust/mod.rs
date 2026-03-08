@@ -69,6 +69,7 @@ pub mod consequence;
 pub mod custody_violation;
 pub(crate) mod participation;
 pub mod renewal;
+pub mod sybil;
 
 use std::collections::HashMap;
 
@@ -88,8 +89,8 @@ pub use capability_registry::{
     validate_capability_uri,
 };
 pub use capability_uri::{CapabilityUri, CapabilityUriError};
-// ParticipationRecord and compute_participation_record are not part of
-// the public API. The module is pub(crate); the testing feature gate
+// ParticipationRecord, compute_participation_record, and the admission
+// types are re-exported here. The testing feature gate additionally
 // re-exports compute_participation_record for integration tests.
 pub use challenge::{
     ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,
@@ -103,10 +104,14 @@ pub use custody_violation::{
     ActionCategory, CounterAttestation, CustodyViolationError, CustodyViolationResult,
     CustodyViolationType, ScpCustodyViolationAttestation, classify_action, enforce_category_a,
 };
-pub use participation::ParticipationRecord;
-#[cfg(feature = "testing")]
-pub use participation::compute_participation_record;
+pub use participation::{ParticipationRecord, compute_participation_record};
 pub use renewal::{DefaultRenewalChecker, RenewalChecker, RenewalError, renew_attestation};
+pub use sybil::{
+    CapacityTierPolicy, CapacityTierThreshold, ContextSybilPolicy, EarnedCapacityLevel,
+    EarnedCapacityPolicy, FreshnessWeight, IdentityDepthAssessment, RequiredSignal,
+    SybilResistanceError, TrustSignal, TrustSignalCategory, evaluate_earned_capacity,
+    evaluate_sybil_resistance,
+};
 
 // ---------------------------------------------------------------------------
 // Type aliases

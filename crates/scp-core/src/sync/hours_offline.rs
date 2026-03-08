@@ -29,7 +29,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CatchUpStatus, ContextId, Ed25519Signature, OfflineTier, SyncError, SyncOutcome, SyncPolicy,
+    CatchUpStatus, ContextId, Ed25519Signature, OfflineTier, SyncError, SyncEvent, SyncOutcome,
+    SyncPolicy,
 };
 use scp_identity::DID;
 
@@ -608,6 +609,8 @@ pub struct ContextSyncResult {
     pub mls_update_issued: bool,
     /// The sync outcome.
     pub outcome: SyncOutcome,
+    /// Sync events detected during this context's sync (e.g., equivocation alerts).
+    pub sync_events: Vec<SyncEvent>,
 }
 
 /// Report produced by the reconnection coordinator after completing the
@@ -769,6 +772,7 @@ impl ReconnectionCoordinator {
                     messages_unrecoverable: 0,
                     mls_update_issued: false,
                     outcome: SyncOutcome::FullyCaughtUp, // Placeholder until sync runs.
+                    sync_events: Vec::new(),
                 }
             })
             .collect()
@@ -1408,6 +1412,7 @@ mod tests {
             messages_unrecoverable: 0,
             mls_update_issued: false,
             outcome: SyncOutcome::FullyCaughtUp,
+            sync_events: vec![],
         };
         assert!(!result.mls_update_issued);
         ReconnectionCoordinator::record_mls_update(&mut result);
@@ -1424,6 +1429,7 @@ mod tests {
             messages_unrecoverable: 2,
             mls_update_issued: true,
             outcome: SyncOutcome::FullyCaughtUp,
+            sync_events: vec![],
         }];
         let report = ReconnectionCoordinator::build_report(results, 15, 3, 2500);
         assert_eq!(report.contexts_synced.len(), 1);
@@ -1693,6 +1699,7 @@ mod tests {
             messages_unrecoverable: 0,
             mls_update_issued: false,
             outcome: SyncOutcome::FullyCaughtUp,
+            sync_events: vec![],
         };
         ReconnectionCoordinator::record_mls_update(&mut sync_result);
         assert!(sync_result.mls_update_issued);

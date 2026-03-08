@@ -28,6 +28,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod backoff;
 #[cfg(feature = "coap")]
 pub mod coap;
 pub mod config;
@@ -53,6 +54,7 @@ pub mod udp;
 pub mod webtransport;
 
 // Re-export primary types at the crate level for convenience.
+pub use backoff::ReconnectBackoff;
 pub use config::{DefaultRelayResolver, ResolveRelays, TransportConfig};
 pub use cover_traffic::{
     CoverAction, CoverTrafficConfig, CoverTrafficGenerator, CoverTrafficSender, pad_to_bucket,

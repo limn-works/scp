@@ -17,6 +17,7 @@
 //! # Modules
 //!
 //! - [`did_capabilities`] -- DID document capability resolution via `did:dht`.
+//! - [`dht_context`] -- DHT-based context discovery via DID document service endpoints (§5.14.11, §18.2.2).
 //! - [`addressing`] -- Address format types, trust levels, and unified resolution (§22).
 //! - [`handles`] -- Discovery context handle tools: register, lookup, deregister (§22.3).
 //! - [`petnames`] -- Petname storage in identity private state (§22.4).
@@ -39,6 +40,7 @@
 pub mod addressing;
 pub mod bootstrap;
 pub mod context;
+pub mod dht_context;
 pub mod did_capabilities;
 pub mod handles;
 pub mod petnames;
@@ -60,6 +62,10 @@ pub use context::{
     AgentSearchParams, AgentSearchResult, DiscoveryContext, DiscoveryContextError, MAX_WRITERS,
     MembershipTier, RegistrationEvent, TOOL_AGENT_DEREGISTER, TOOL_AGENT_REGISTER,
     TOOL_AGENT_SEARCH,
+};
+pub use dht_context::{
+    ContextDiscoveryResult, ContextDiscoverySource, publish_context_to_did_document,
+    resolve_context_uri, resolve_contexts_from_did, unpublish_context_from_did_document,
 };
 pub use did_capabilities::{CapabilityEntry, resolve_capabilities};
 pub use handles::{

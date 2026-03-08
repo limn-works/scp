@@ -243,7 +243,7 @@ pub struct PublishableKeyDestructionAttestation {
 impl PublishableKeyDestructionAttestation {
     /// Validates that the signature field is the correct length (64 bytes).
     #[must_use]
-    pub fn has_valid_signature_length(&self) -> bool {
+    pub const fn has_valid_signature_length(&self) -> bool {
         self.signature.len() == 64
     }
 

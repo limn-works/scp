@@ -89,9 +89,12 @@ pub enum DiscoveryContextError {
         did: String,
     },
 
-    /// The requester DID does not match the entry owner DID.
-    #[error("DID mismatch: requester \"{requester}\" does not own entry for \"{owner}\"")]
-    OwnershipMismatch {
+    /// The requester DID does not match the entry owner DID and the requester
+    /// is not a context admin. Per §6.2.2B self-service update rule 5.
+    #[error(
+        "ownership violation: requester \"{requester}\" does not own entry for \"{owner}\" and is not a context admin"
+    )]
+    OwnershipViolation {
         /// The DID of the requester.
         requester: String,
         /// The DID of the entry owner.
@@ -267,6 +270,8 @@ pub struct DiscoveryContext {
     writers: Vec<DID>,
     /// Reader-tier members (DID-authenticated).
     readers: Vec<DID>,
+    /// Admin-tier members (can delete any entry, manage membership).
+    admins: Vec<DID>,
     /// Registered agent entries, keyed by DID.
     registry: HashMap<DID, RegistrationEntry>,
     /// Event log of all registration operations, in order.
@@ -286,8 +291,9 @@ impl DiscoveryContext {
     pub fn new(context_id: ContextId, creator_did: DID) -> Self {
         Self {
             context_id,
-            writers: vec![creator_did],
+            writers: vec![creator_did.clone()],
             readers: Vec::new(),
+            admins: vec![creator_did],
             registry: HashMap::new(),
             events: Vec::new(),
             custom_tools: Vec::new(),
@@ -348,6 +354,36 @@ impl DiscoveryContext {
     #[must_use]
     pub fn is_writer(&self, did: &str) -> bool {
         self.writers.iter().any(|w| w == did)
+    }
+
+    /// Returns whether the given DID is an admin.
+    #[must_use]
+    pub fn is_admin(&self, did: &str) -> bool {
+        self.admins.iter().any(|a| a == did)
+    }
+
+    /// Returns the current admin DIDs.
+    #[must_use]
+    pub fn admin_dids(&self) -> &[DID] {
+        &self.admins
+    }
+
+    /// Adds an admin DID. Deduplicates if already present.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DiscoveryContextError::DidNotAuthenticated` if the DID is
+    /// malformed.
+    pub fn add_admin(&mut self, did: DID) -> Result<(), DiscoveryContextError> {
+        if !did.starts_with("did:") {
+            return Err(DiscoveryContextError::DidNotAuthenticated {
+                did: did.to_string(),
+            });
+        }
+        if !self.admins.iter().any(|a| a == &did) {
+            self.admins.push(did);
+        }
+        Ok(())
     }
 
     /// Returns a registration entry by DID, if it exists.
@@ -526,22 +562,32 @@ impl DiscoveryContext {
 
     /// Updates a registered agent's entry via DID-authenticated request.
     ///
-    /// Writers verify DID matches entry owner before applying update. The
-    /// agent can publish different capability subsets to different registries.
+    /// Per §6.2.2B self-service update rules:
+    /// 1. Entries are owned by their creator DID.
+    /// 2. Only the owner can update their own entries.
+    /// 3. Context admins can update any entry (admin bypass).
+    /// 4. All requests carry a valid DID signature (caller responsibility).
+    /// 5. Rejection with `OwnershipViolation` on mismatch, logged in event log.
     ///
-    /// See ADR-020 acceptance criterion 6.
+    /// The `requester_did` is the DID of the agent making the request.
+    /// The `target_did` is the DID of the entry to update (may differ from
+    /// `requester_did` if the requester is an admin).
+    ///
+    /// See ADR-020 acceptance criterion 6 and §6.2.2B.
     ///
     /// # Errors
     ///
     /// Returns [`DiscoveryContextError::WriterRequired`] if `writer_did` is
     /// not a writer.
-    /// Returns [`DiscoveryContextError::NotRegistered`] if the agent is not
-    /// registered.
-    /// Returns [`DiscoveryContextError::OwnershipMismatch`] if the requester
-    /// DID does not match the entry owner.
+    /// Returns [`DiscoveryContextError::NotRegistered`] if `target_did` is
+    /// not registered.
+    /// Returns [`DiscoveryContextError::OwnershipViolation`] if the requester
+    /// DID does not match the entry owner and the requester is not a context
+    /// admin.
     pub fn agent_update(
         &mut self,
         requester_did: &str,
+        target_did: &str,
         capabilities: Vec<String>,
         metadata: serde_json::Value,
         writer_did: &str,
@@ -553,15 +599,16 @@ impl DiscoveryContext {
         }
 
         // Look up existing entry.
-        let entry = self.registry.get(requester_did).ok_or_else(|| {
-            DiscoveryContextError::NotRegistered {
-                did: requester_did.into(),
-            }
-        })?;
+        let entry =
+            self.registry
+                .get(target_did)
+                .ok_or_else(|| DiscoveryContextError::NotRegistered {
+                    did: target_did.into(),
+                })?;
 
-        // Verify ownership.
-        if entry.did != requester_did {
-            return Err(DiscoveryContextError::OwnershipMismatch {
+        // Verify ownership: owner can update own entries, admins can update any entry.
+        if entry.did != requester_did && !self.is_admin(requester_did) {
+            return Err(DiscoveryContextError::OwnershipViolation {
                 requester: requester_did.to_owned(),
                 owner: entry.did.to_string(),
             });
@@ -569,9 +616,9 @@ impl DiscoveryContext {
 
         let entry_id = entry.entry_id.clone();
 
-        // Apply update.
+        // Apply update (entry DID stays the same).
         let updated_entry = RegistrationEntry {
-            did: requester_did.into(),
+            did: DID::from(target_did),
             capabilities,
             metadata,
             entry_id,
@@ -584,8 +631,7 @@ impl DiscoveryContext {
             processed_by: writer_did.into(),
         });
 
-        self.registry
-            .insert(DID::from(requester_did), updated_entry);
+        self.registry.insert(DID::from(target_did), updated_entry);
 
         Ok(())
     }
@@ -594,10 +640,14 @@ impl DiscoveryContext {
 
     /// Executes the `agent_deregister` standard tool.
     ///
-    /// Privacy: registration is opt-in per discovery context and withdrawable
-    /// via this tool. The agent must authenticate as the entry owner.
+    /// Per §6.2.2B self-service update rules:
+    /// 1. Entries are owned by their creator DID.
+    /// 2. Only the owner can delete their own entries.
+    /// 3. Context admins can delete any entry (admin bypass).
+    /// 4. All requests carry a valid DID signature (caller responsibility).
+    /// 5. Rejection with `OwnershipViolation` on mismatch, logged in event log.
     ///
-    /// See ADR-020 acceptance criterion 9.
+    /// See ADR-020 acceptance criterion 9 and §6.2.2B.
     ///
     /// # Errors
     ///
@@ -605,8 +655,9 @@ impl DiscoveryContext {
     /// not a writer.
     /// Returns [`DiscoveryContextError::NotRegistered`] if the agent is not
     /// registered.
-    /// Returns [`DiscoveryContextError::OwnershipMismatch`] if the requester
-    /// DID does not match the entry owner.
+    /// Returns [`DiscoveryContextError::OwnershipViolation`] if the requester
+    /// DID does not match the entry owner and the requester is not a context
+    /// admin.
     pub fn agent_deregister(
         &mut self,
         params: &AgentDeregisterParams,
@@ -626,9 +677,9 @@ impl DiscoveryContext {
                     did: params.did.to_string(),
                 })?;
 
-        // Verify ownership.
-        if entry.did != requester_did {
-            return Err(DiscoveryContextError::OwnershipMismatch {
+        // Verify ownership: owner can delete own entries, admins can delete any entry.
+        if entry.did != requester_did && !self.is_admin(requester_did) {
+            return Err(DiscoveryContextError::OwnershipViolation {
                 requester: requester_did.to_owned(),
                 owner: entry.did.to_string(),
             });
@@ -791,13 +842,15 @@ mod tests {
     // -- DiscoveryContext creation -----------------------------------------
 
     #[test]
-    fn new_context_has_creator_as_writer() {
+    fn new_context_has_creator_as_writer_and_admin() {
         let ctx = new_ctx();
         assert_eq!(ctx.writers().len(), 1);
         assert_eq!(ctx.writers()[0], WRITER_DID);
         assert!(ctx.readers().is_empty());
         assert_eq!(ctx.registry_len(), 0);
         assert_eq!(ctx.context_id(), CTX_ID);
+        assert!(ctx.is_admin(WRITER_DID));
+        assert_eq!(ctx.admin_dids().len(), 1);
     }
 
     #[test]
@@ -814,6 +867,41 @@ mod tests {
             Some(MembershipTier::Reader)
         );
         assert_eq!(ctx.membership_tier("did:dht:z6MkUnknown"), None);
+    }
+
+    // -- Admin management -------------------------------------------------
+
+    #[test]
+    fn add_admin_succeeds() {
+        let mut ctx = new_ctx();
+        let admin2 = "did:dht:z6MkAdmin2";
+        ctx.add_admin(admin2.into()).unwrap();
+        assert_eq!(ctx.admin_dids().len(), 2);
+        assert!(ctx.is_admin(admin2));
+    }
+
+    #[test]
+    fn add_admin_deduplicates() {
+        let mut ctx = new_ctx();
+        ctx.add_admin(WRITER_DID.into()).unwrap();
+        assert_eq!(ctx.admin_dids().len(), 1);
+    }
+
+    #[test]
+    fn add_admin_rejects_invalid_did() {
+        let mut ctx = new_ctx();
+        let result = ctx.add_admin("bad-did".into());
+        assert!(matches!(
+            result,
+            Err(DiscoveryContextError::DidNotAuthenticated { .. })
+        ));
+    }
+
+    #[test]
+    fn is_admin_false_for_non_admin() {
+        let ctx = new_ctx();
+        assert!(!ctx.is_admin(READER_DID));
+        assert!(!ctx.is_admin(AGENT_A_DID));
     }
 
     // -- Writer management ------------------------------------------------
@@ -1126,6 +1214,7 @@ mod tests {
 
         ctx.agent_update(
             AGENT_A_DID,
+            AGENT_A_DID,
             vec!["code_review".to_owned(), "testing".to_owned()],
             serde_json::json!({"updated": true}),
             WRITER_DID,
@@ -1145,6 +1234,7 @@ mod tests {
         ctx.agent_register(&params, WRITER_DID, 100).unwrap();
 
         ctx.agent_update(
+            AGENT_A_DID,
             AGENT_A_DID,
             vec!["testing".to_owned()],
             serde_json::json!({}),
@@ -1174,6 +1264,7 @@ mod tests {
 
         let result = ctx.agent_update(
             AGENT_A_DID,
+            AGENT_A_DID,
             vec![],
             serde_json::json!({}),
             "did:dht:z6MkNotWriter",
@@ -1185,7 +1276,14 @@ mod tests {
     #[test]
     fn agent_update_rejects_non_registered() {
         let mut ctx = new_ctx();
-        let result = ctx.agent_update(AGENT_A_DID, vec![], serde_json::json!({}), WRITER_DID, 200);
+        let result = ctx.agent_update(
+            AGENT_A_DID,
+            AGENT_A_DID,
+            vec![],
+            serde_json::json!({}),
+            WRITER_DID,
+            200,
+        );
         assert!(matches!(
             result,
             Err(DiscoveryContextError::NotRegistered { .. })
@@ -1193,17 +1291,48 @@ mod tests {
     }
 
     #[test]
-    fn agent_update_rejects_ownership_mismatch() {
+    fn agent_update_rejects_ownership_violation() {
         let mut ctx = new_ctx();
         let params = register_params(AGENT_A_DID, &["code_review"]);
         ctx.agent_register(&params, WRITER_DID, 100).unwrap();
 
-        // Agent B tries to update Agent A's entry.
-        let result = ctx.agent_update(AGENT_B_DID, vec![], serde_json::json!({}), WRITER_DID, 200);
+        // Agent B (non-admin) tries to update Agent A's entry.
+        let result = ctx.agent_update(
+            AGENT_B_DID,
+            AGENT_A_DID,
+            vec![],
+            serde_json::json!({}),
+            WRITER_DID,
+            200,
+        );
         assert!(matches!(
             result,
-            Err(DiscoveryContextError::NotRegistered { .. })
+            Err(DiscoveryContextError::OwnershipViolation { .. })
         ));
+    }
+
+    #[test]
+    fn agent_update_admin_bypass_succeeds() {
+        let mut ctx = new_ctx();
+        let admin_did = "did:dht:z6MkAdmin";
+        ctx.add_admin(admin_did.into()).unwrap();
+
+        let params = register_params(AGENT_A_DID, &["code_review"]);
+        ctx.agent_register(&params, WRITER_DID, 100).unwrap();
+
+        ctx.agent_update(
+            admin_did,
+            AGENT_A_DID,
+            vec!["code_review".to_owned(), "admin_updated".to_owned()],
+            serde_json::json!({"admin_updated": true}),
+            WRITER_DID,
+            200,
+        )
+        .unwrap();
+
+        let entry = ctx.get_entry(AGENT_A_DID).unwrap();
+        assert_eq!(entry.capabilities, vec!["code_review", "admin_updated"]);
+        assert_eq!(entry.did, AGENT_A_DID);
     }
 
     // -- agent_deregister -------------------------------------------------
@@ -1279,7 +1408,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_deregister_rejects_ownership_mismatch() {
+    fn agent_deregister_rejects_ownership_violation() {
         let mut ctx = new_ctx();
         let params = register_params(AGENT_A_DID, &["testing"]);
         ctx.agent_register(&params, WRITER_DID, 100).unwrap();
@@ -1287,12 +1416,46 @@ mod tests {
         let deregister_params = AgentDeregisterParams {
             did: AGENT_A_DID.into(),
         };
-        // Agent B tries to deregister Agent A.
+        // Agent B (non-admin) tries to deregister Agent A.
         let result = ctx.agent_deregister(&deregister_params, AGENT_B_DID, WRITER_DID);
         assert!(matches!(
             result,
-            Err(DiscoveryContextError::OwnershipMismatch { .. })
+            Err(DiscoveryContextError::OwnershipViolation { .. })
         ));
+    }
+
+    #[test]
+    fn agent_deregister_admin_bypass_succeeds() {
+        let mut ctx = new_ctx();
+        let admin_did = "did:dht:z6MkAdmin";
+        ctx.add_admin(admin_did.into()).unwrap();
+
+        let params = register_params(AGENT_A_DID, &["testing"]);
+        ctx.agent_register(&params, WRITER_DID, 100).unwrap();
+
+        let deregister_params = AgentDeregisterParams {
+            did: AGENT_A_DID.into(),
+        };
+        let result = ctx
+            .agent_deregister(&deregister_params, admin_did, WRITER_DID)
+            .unwrap();
+        assert!(result.removed);
+        assert!(ctx.get_entry(AGENT_A_DID).is_none());
+    }
+
+    #[test]
+    fn creator_admin_can_deregister_any_entry() {
+        let mut ctx = new_ctx();
+        let params = register_params(AGENT_A_DID, &["testing"]);
+        ctx.agent_register(&params, WRITER_DID, 100).unwrap();
+
+        let deregister_params = AgentDeregisterParams {
+            did: AGENT_A_DID.into(),
+        };
+        let result = ctx
+            .agent_deregister(&deregister_params, WRITER_DID, WRITER_DID)
+            .unwrap();
+        assert!(result.removed);
     }
 
     // -- Custom tools -----------------------------------------------------
@@ -1477,7 +1640,7 @@ mod tests {
         };
         assert!(err.to_string().contains(AGENT_A_DID));
 
-        let err = DiscoveryContextError::OwnershipMismatch {
+        let err = DiscoveryContextError::OwnershipViolation {
             requester: AGENT_B_DID.to_owned(),
             owner: AGENT_A_DID.to_owned(),
         };
@@ -1560,6 +1723,7 @@ mod tests {
 
         // Update capabilities.
         ctx.agent_update(
+            AGENT_A_DID,
             AGENT_A_DID,
             vec!["code_review".to_owned(), "testing".to_owned()],
             serde_json::json!({"version": 2}),

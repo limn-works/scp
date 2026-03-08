@@ -207,7 +207,7 @@ pub struct ProposalOutcome {
     /// ADR-031 section 4a).
     pub status: ProposalStatus,
     /// The result of executing the approved action. `Some` when the
-    /// proposal was auto-approved and executed (SingleAdmin), `None`
+    /// proposal was auto-approved and executed (`SingleAdmin`), `None`
     /// when the proposal is pending votes (multi-admin models).
     pub execution_result: Option<GovernanceActionResult>,
 }
@@ -1298,6 +1298,7 @@ impl ContextManager {
     ///
     /// Returns [`ContextCreationError`] if any validation or execution step
     /// fails.
+    #[cfg(test)]
     pub(crate) async fn create_context_bare(
         &self,
         context_id: String,
@@ -3228,12 +3229,10 @@ impl ContextManager {
             }
 
             // Broadcast mode: also unban via broadcast-specific subscriber registry.
-            let bc_snap = if let Some(ref mut bc) = ctx.broadcast_context {
+            let bc_snap = ctx.broadcast_context.as_mut().map(|bc| {
                 bc.governance_unban_subscriber(&did.0);
-                Some(bc.to_snapshot())
-            } else {
-                None
-            };
+                bc.to_snapshot()
+            });
 
             // Emit restoration events to receive buffer.
             ctx.receive_buffer
@@ -4253,10 +4252,9 @@ impl ContextManager {
             };
 
             // Emit content keys rotated event to receive buffer.
-            ctx.receive_buffer
-                .push(ContextEvent::ContentKeysRotated {
-                    reason: reason.map(String::from),
-                });
+            ctx.receive_buffer.push(ContextEvent::ContentKeysRotated {
+                reason: reason.map(String::from),
+            });
 
             (Self::snapshot_context(ctx), bc_snap)
         };
@@ -4987,7 +4985,8 @@ const fn _assert_send_sync() {
     clippy::panic,
     clippy::needless_collect,
     clippy::significant_drop_tightening,
-    clippy::match_same_arms
+    clippy::match_same_arms,
+    clippy::type_complexity
 )]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -6613,6 +6612,7 @@ mod tests {
 
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
         let vk = signing_key.verifying_key();
+        #[allow(clippy::type_complexity)]
         let resolver: std::sync::Arc<
             dyn Fn(&scp_identity::DID) -> Option<ed25519_dalek::VerifyingKey> + Send + Sync,
         > = std::sync::Arc::new(move |_| Some(vk));
@@ -7130,6 +7130,7 @@ mod tests {
 
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
         let vk = signing_key.verifying_key();
+        #[allow(clippy::type_complexity)]
         let resolver: std::sync::Arc<
             dyn Fn(&scp_identity::DID) -> Option<ed25519_dalek::VerifyingKey> + Send + Sync,
         > = std::sync::Arc::new(move |_| Some(vk));
@@ -7432,11 +7433,7 @@ mod tests {
         };
 
         let _handle = manager
-            .create_context(
-                "encrypted-ban-ctx".into(),
-                params,
-                "did:key:alice".into(),
-            )
+            .create_context("encrypted-ban-ctx".into(), params, "did:key:alice".into())
             .await
             .unwrap();
 
@@ -7535,9 +7532,7 @@ mod tests {
             action,
         );
         proposal2.proposal_id = [2u8; 32]; // distinct from first proposal
-        let result = manager
-            .execute_governance_action(&ctx_id, &proposal2)
-            .await;
+        let result = manager.execute_governance_action(&ctx_id, &proposal2).await;
         assert!(
             result.is_ok(),
             "redundant RevokeWriteAccess should succeed (no-op)"
@@ -7627,7 +7622,10 @@ mod tests {
         );
 
         let result = manager.execute_governance_action(&ctx_id, &proposal).await;
-        assert!(result.is_err(), "RestoreWriteAccess on never-revoked should fail");
+        assert!(
+            result.is_err(),
+            "RestoreWriteAccess on never-revoked should fail"
+        );
         assert!(
             matches!(
                 result.unwrap_err(),
@@ -7679,8 +7677,14 @@ mod tests {
         {
             let contexts = manager.contexts.lock().await;
             let ctx = contexts.get(&ctx_id).unwrap();
-            assert!(ctx.write_revoked_members.contains(&DID("did:key:bob".into())));
-            assert!(ctx.read_revoked_members.contains(&DID("did:key:bob".into())));
+            assert!(
+                ctx.write_revoked_members
+                    .contains(&DID("did:key:bob".into()))
+            );
+            assert!(
+                ctx.read_revoked_members
+                    .contains(&DID("did:key:bob".into()))
+            );
         }
     }
 
@@ -7734,7 +7738,10 @@ mod tests {
         );
 
         let result = manager.execute_governance_action(&ctx_id, &proposal).await;
-        assert!(result.is_ok(), "RotateContentKeys with no reason should succeed");
+        assert!(
+            result.is_ok(),
+            "RotateContentKeys with no reason should succeed"
+        );
 
         match result.unwrap() {
             super::GovernanceActionResult::ContentKeysRotated(r) => {
@@ -7773,7 +7780,10 @@ mod tests {
         );
 
         let result = manager.execute_governance_action(&ctx_id, &proposal).await;
-        assert!(result.is_ok(), "RevokeWriteAccess Full in broadcast should succeed");
+        assert!(
+            result.is_ok(),
+            "RevokeWriteAccess Full in broadcast should succeed"
+        );
 
         // Verify WriteAccessRevoked event.
         let events = manager.drain_events(&ctx_id).await;
@@ -7786,7 +7796,7 @@ mod tests {
         assert!(has_event, "WriteAccessRevoked event should be emitted");
     }
 
-    /// SCP-CAC-007: `RevokeWriteAccess` fails without MemberBan in ceiling.
+    /// SCP-CAC-007: `RevokeWriteAccess` fails without `MemberBan` in ceiling.
     #[tokio::test]
     async fn revoke_write_access_rejected_without_member_ban() {
         let manager = ContextManager::new(
@@ -7824,7 +7834,7 @@ mod tests {
         };
         let proposal = approved_governance_proposal(
             &"did:key:alice".into(),
-            &"no-ban-write-ctx".to_owned(),
+            "no-ban-write-ctx",
             &"did:key:bob".into(),
             action,
         );
@@ -7855,7 +7865,10 @@ mod tests {
         );
 
         let result = manager.execute_governance_action(&ctx_id, &proposal).await;
-        assert!(result.is_err(), "RevokeWriteAccess on non-member should fail");
+        assert!(
+            result.is_err(),
+            "RevokeWriteAccess on non-member should fail"
+        );
         assert!(
             matches!(result.unwrap_err(), ContextError::MemberNotFound(_)),
             "error should be MemberNotFound"
@@ -7878,7 +7891,10 @@ mod tests {
         );
 
         let result = manager.execute_governance_action(&ctx_id, &proposal).await;
-        assert!(result.is_ok(), "RotateContentKeys in broadcast should succeed");
+        assert!(
+            result.is_ok(),
+            "RotateContentKeys in broadcast should succeed"
+        );
 
         match result.unwrap() {
             super::GovernanceActionResult::ContentKeysRotated(r) => {
@@ -10527,7 +10543,7 @@ mod tests {
     // SCP-270: auto-execution, unanimity overrides, governance bypass
     // -------------------------------------------------------------------
 
-    /// Helper: ContextParams with governance-compatible ceiling.
+    /// Helper: `ContextParams` with governance-compatible ceiling.
     fn governance_params() -> ContextParams {
         ContextParams {
             ceiling: vec![
@@ -10578,7 +10594,7 @@ mod tests {
         }
     }
 
-    /// SCP-270 AC14: each GovernanceAction variant executes through governance.
+    /// SCP-270 AC14: each `GovernanceAction` variant executes through governance.
     /// Covered by the existing `single_admin_propose_auto_executes` and
     /// per-action tests. This test verifies the dispatch returns typed results.
     #[tokio::test]
@@ -10659,7 +10675,7 @@ mod tests {
         );
     }
 
-    /// SCP-270 AC15: auto-execution on Approved status for SingleAdmin.
+    /// SCP-270 AC15: auto-execution on Approved status for `SingleAdmin`.
     #[tokio::test]
     async fn governance_auto_execution_single_admin() {
         let (manager, _handle, ctx_id) = setup_governance_context().await;
@@ -10740,7 +10756,7 @@ mod tests {
         );
     }
 
-    /// SCP-270 AC16: close_context through governance for Threshold model.
+    /// SCP-270 AC16: `close_context` through governance for Threshold model.
     #[tokio::test]
     async fn close_context_through_governance_threshold() {
         let creator: DID = "did:key:creator".into();
@@ -10775,7 +10791,7 @@ mod tests {
         assert_eq!(handle.state().await, ContextState::Active);
     }
 
-    /// SCP-270 AC17: ExtendTtl unanimity override — partial approval rejected.
+    /// SCP-270 AC17: `ExtendTtl` unanimity override — partial approval rejected.
     #[tokio::test]
     async fn extend_ttl_rejects_without_unanimity() {
         let manager = ContextManager::new(
@@ -10825,7 +10841,7 @@ mod tests {
         );
     }
 
-    /// SCP-270 AC17: ExtendTtl unanimity override — unanimous approval succeeds.
+    /// SCP-270 AC17: `ExtendTtl` unanimity override — unanimous approval succeeds.
     #[tokio::test]
     async fn extend_ttl_succeeds_with_unanimity() {
         let manager = ContextManager::new(
@@ -10878,7 +10894,7 @@ mod tests {
         ));
     }
 
-    /// SCP-270 AC18: PromoteContext unanimity override.
+    /// SCP-270 AC18: `PromoteContext` unanimity override.
     #[tokio::test]
     async fn promote_context_requires_unanimity() {
         use crate::context::governance::{GovernanceProposal, SignedVote, VoteType};
@@ -10960,7 +10976,7 @@ mod tests {
         );
     }
 
-    /// SCP-270 AC19: governance bypass prevention — standalone close_context
+    /// SCP-270 AC19: governance bypass prevention — standalone `close_context`
     /// returns error for multi-admin models.
     #[tokio::test]
     async fn governance_bypass_prevented_for_multi_admin_close() {
@@ -10991,7 +11007,7 @@ mod tests {
         );
     }
 
-    /// SCP-270 AC5: close_context for SingleAdmin goes through engine (auto-approve).
+    /// SCP-270 AC5: `close_context` for `SingleAdmin` goes through engine (auto-approve).
     #[tokio::test]
     async fn close_context_single_admin_succeeds() {
         let (manager, handle, _ctx_id) = setup_governance_context().await;
@@ -11004,7 +11020,7 @@ mod tests {
         );
     }
 
-    /// SCP-270 AC11: AddSigner mints GovernanceVote + GovernancePropose UCANs.
+    /// SCP-270 AC11: `AddSigner` mints `GovernanceVote` + `GovernancePropose` UCANs.
     #[tokio::test]
     async fn add_signer_mints_governance_ucans() {
         let manager = ContextManager::new(
@@ -11063,7 +11079,7 @@ mod tests {
         assert!(caps.contains(&Capability::GovernanceVote));
     }
 
-    /// SCP-270 AC12: RemoveSigner revokes governance UCANs and validates threshold.
+    /// SCP-270 AC12: `RemoveSigner` revokes governance UCANs and validates threshold.
     #[tokio::test]
     async fn remove_signer_revokes_governance_ucans() {
         let manager = ContextManager::new(

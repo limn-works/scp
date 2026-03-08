@@ -459,6 +459,10 @@ async fn run_relay_only() {
 // ---------------------------------------------------------------------------
 
 /// Runs the full node with all in-memory subsystems (no persistence).
+///
+/// In ephemeral mode, ALL subsystems use in-memory implementations regardless
+/// of environment variable overrides. No mixed mode is permitted — if you want
+/// persistent storage or production DHT, omit the `--ephemeral` flag.
 async fn run_full_node_ephemeral() {
     let domain = require_domain();
     let http_addr = node_http_addr();
@@ -467,53 +471,28 @@ async fn run_full_node_ephemeral() {
         domain = %domain,
         bind_addr = %http_addr,
         mode = "ephemeral",
-        "starting scp-node with in-memory storage"
+        "starting scp-node with all in-memory subsystems (nothing persists across restarts)"
     );
 
     eprintln!(
-        "WARNING: Using in-memory key custody. Private keys are not persisted \
-         and will be lost on restart. Use persistent mode (default) for production."
+        "WARNING: Ephemeral mode — ALL subsystems use in-memory implementations.\n\
+         Private keys, storage, and DID documents will be LOST on restart.\n\
+         Use persistent mode (default, without --ephemeral) for production."
     );
     tracing::warn!(
         "using InMemoryKeyCustody — private keys exist only in memory and are \
          not persisted. This mode is for development/testing only."
     );
+    tracing::warn!("using InMemoryDhtClient — DID documents will NOT be published to the network");
+
     let custody = Arc::new(InMemoryKeyCustody::new());
     let cache = Arc::new(DidCache::new());
     let sequence_store = Arc::new(InMemorySequenceStore::new());
 
-    let dht_mode = env::var("SCP_NODE_DHT_MODE").unwrap_or_else(|_| "production".into());
-
-    if dht_mode == "memory" {
-        tracing::warn!(
-            "using InMemoryDhtClient — DID documents will NOT be published to the network"
-        );
-        let dht_client = Arc::new(InMemoryDhtClient::new());
-        let sign_fn = DidDht::<InMemoryDhtClient, SystemClock>::make_sign_fn(Arc::clone(&custody));
-        let did_method = Arc::new(DidDht::with_client_signer_and_store(
-            dht_client,
-            cache,
-            sign_fn,
-            sequence_store,
-        ));
-
-        let seq_init_method = Arc::clone(&did_method);
-        let seq_init = make_seq_init(seq_init_method);
-        run_node_with(
-            domain,
-            http_addr,
-            custody,
-            seq_init,
-            did_method,
-            InMemoryStorage::new(),
-        )
-        .await;
-        return;
-    }
-
-    // Production DHT.
-    let dht_client = build_pkarr_client();
-    let sign_fn = DidDht::<PkarrDhtClient, SystemClock>::make_sign_fn(Arc::clone(&custody));
+    // Ephemeral mode: always use in-memory DHT. Ignore SCP_NODE_DHT_MODE to
+    // prevent mixed mode (in-memory storage + production DHT is inconsistent).
+    let dht_client = Arc::new(InMemoryDhtClient::new());
+    let sign_fn = DidDht::<InMemoryDhtClient, SystemClock>::make_sign_fn(Arc::clone(&custody));
     let did_method = Arc::new(DidDht::with_client_signer_and_store(
         dht_client,
         cache,
@@ -583,10 +562,56 @@ async fn init_persistent_storage(
     (storage_dir, storage_key, node_storage, custody)
 }
 
+/// Validates that the storage directory can be created and is writable.
+/// Produces a clear error message and exits on failure.
+fn validate_storage_path(dir: &std::path::Path) {
+    // Attempt to create the directory tree. If it already exists, this is a no-op.
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::error!(
+            error = %e,
+            path = %dir.display(),
+            "storage path is not usable: failed to create directory"
+        );
+        eprintln!(
+            "ERROR: Cannot create storage directory '{}': {e}\n\
+             Ensure the parent directory exists and is writable, \
+             or specify a different path with --storage-path.",
+            dir.display()
+        );
+        std::process::exit(1);
+    }
+
+    // Verify the directory is writable by creating and removing a probe file.
+    let probe = dir.join(".scp-write-probe");
+    match std::fs::write(&probe, b"probe") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                path = %dir.display(),
+                "storage path is not writable"
+            );
+            eprintln!(
+                "ERROR: Storage directory '{}' is not writable: {e}\n\
+                 Ensure the directory has write permissions, \
+                 or specify a different path with --storage-path.",
+                dir.display()
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Runs the full node with persistent `SQLite` storage (production default).
 async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     let domain = require_domain();
     let http_addr = node_http_addr();
+
+    // Validate the storage path upfront before attempting to open databases.
+    let resolved_path = resolve_storage_path(storage_path);
+    validate_storage_path(&resolved_path);
 
     let (storage_dir, storage_key, node_storage, custody) =
         init_persistent_storage(storage_path).await;

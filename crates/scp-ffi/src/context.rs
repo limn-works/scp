@@ -525,9 +525,9 @@ impl PyMessage {
 }
 
 impl PyMessage {
-    /// Creates a new `PyMessage`. Used internally by the receive pipeline.
+    /// Creates a new `PyMessage`. Used by `drain_and_deliver` and
+    /// `deliver_message` to feed messages into the receive channel.
     #[must_use]
-    #[allow(dead_code)] // Will be used when transport wiring is connected.
     pub const fn new(
         sender_did: String,
         payload: Vec<u8>,
@@ -887,6 +887,10 @@ fn py_context_join(handle: &PyContextHandle, identity_did: &str) -> PyResult<()>
             Ok(())
         })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        // Bridge: drain events (MemberJoined) from ContextManager's receive
+        // buffer and deliver to the FFI receive channel (#332).
+        drain_and_deliver(&context_id);
     }
 
     Ok(())
@@ -946,6 +950,10 @@ fn py_context_leave(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
             st.role_state.members.remove(identity_did);
             Ok(())
         });
+
+        // Bridge: drain events (MemberLeft) from ContextManager's receive
+        // buffer and deliver BEFORE closing the channel (#332).
+        drain_and_deliver(&context_id);
     }
 
     // Close the receive channel so any active PyMessageReceiver raises
@@ -1004,7 +1012,7 @@ fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
         let mgr = mgr.clone();
 
         let core_params = build_core_context_params(&handle.params);
-        let temp_handle = scp_core::context::ContextHandle::new(context_id.clone(), core_params);
+        let temp_handle = scp_core::context::ContextHandle::new(context_id, core_params);
         let close_result = rt.block_on(async {
             let _ = temp_handle
                 .transition_to(&scp_core::context::ContextState::Active)
@@ -1028,6 +1036,10 @@ fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
     // layer -- the full runtime will implement the cooperative closing window).
     "closed".clone_into(&mut state);
     drop(state);
+
+    // Bridge: drain events (SystemClose) from ContextManager before
+    // removing FFI state, so any active receiver gets the close event (#332).
+    drain_and_deliver(&handle.context_id);
 
     // Remove context from the FFI state registry to free resources.
     crate::runtime::remove_context(&handle.context_id);
@@ -1121,6 +1133,7 @@ fn py_context_send(
     .map_err(|e: crate::error::ScpPyError| -> PyErr { e.into() })?;
 
     // Delegate to ContextManager for message delivery through the transport.
+    let context_id_for_drain = context_id.clone();
     {
         let sender_did = scp_identity::DID(identity_did_owned);
         let mgr = crate::runtime::context_manager()
@@ -1139,7 +1152,109 @@ fn py_context_send(
         .map_err(|e| PyRuntimeError::new_err(format!("ContextManager send_message failed: {e}")))?;
     }
 
+    // Bridge: drain events from ContextManager's receive buffer and deliver
+    // them to the FFI bridge's mpsc channel so that py_context_receive yields
+    // them to Python consumers. This is the producer half of #332.
+    drain_and_deliver(&context_id_for_drain);
+
     Ok(())
+}
+
+/// Drains events from the [`ContextManager`]'s receive buffer and delivers
+/// them to the FFI bridge's receive channel via [`deliver_message`].
+///
+/// This is the bridge between the `ContextManager`'s internal event buffer
+/// (`ReceiveBuffer`) and the `PyO3` bridge's `tokio::sync::mpsc` channel that
+/// feeds `PyMessageReceiver`. Without this, events pushed by
+/// `ContextManager::send_message` (e.g., `MessageSent`, `MemberJoined`)
+/// would accumulate in the `ReceiveBuffer` but never reach the Python
+/// `async for msg in context.receive()` consumer.
+///
+/// Called after any `ContextManager` operation that may produce events:
+/// - `py_context_send` (produces `MessageSent`)
+/// - `py_context_join` (produces `MemberJoined`)
+/// - `py_context_leave` (produces `MemberLeft`)
+///
+/// Events are converted from [`ContextEvent`] to [`PyMessage`]:
+/// - `MessageSent` -> payload is the message bytes, `sender_did` is the sender.
+/// - `MemberJoined` -> payload is `"member_joined:{did}:{role}"`.
+/// - `MemberLeft` -> payload is `"member_left:{did}"`.
+/// - `SystemClose` -> payload is `"system_close:{did}"`.
+/// - Other events -> payload is a debug representation.
+///
+/// If no receive channel is open (i.e., `py_context_receive` has not been
+/// called), events are silently discarded. This is intentional: the channel
+/// is demand-driven, and events before subscription are lost (consistent
+/// with the subscription model in `TransportAdapter::subscribe`).
+fn drain_and_deliver(context_id: &str) {
+    let Ok(rt) = crate::runtime() else {
+        return;
+    };
+    let mgr = match crate::runtime::context_manager() {
+        Ok(mgr) => mgr.clone(),
+        Err(_) => return,
+    };
+
+    let events = rt.block_on(mgr.drain_events(context_id));
+
+    for event in events {
+        let (sender_did, payload, timestamp) = match event {
+            scp_core::context::membership::ContextEvent::MessageSent {
+                sender_did,
+                payload,
+                ..
+            } => {
+                #[allow(clippy::cast_precision_loss)]
+                let ts = scp_core::time::now_secs().map_or(0.0, |s| s as f64);
+                (sender_did.to_string(), payload, ts)
+            }
+            scp_core::context::membership::ContextEvent::MemberJoined {
+                member_did,
+                role_name,
+            } => {
+                #[allow(clippy::cast_precision_loss)]
+                let ts = scp_core::time::now_secs().map_or(0.0, |s| s as f64);
+                (
+                    "scp:system".to_owned(),
+                    format!("member_joined:{member_did}:{role_name}").into_bytes(),
+                    ts,
+                )
+            }
+            scp_core::context::membership::ContextEvent::MemberLeft { member_did } => {
+                #[allow(clippy::cast_precision_loss)]
+                let ts = scp_core::time::now_secs().map_or(0.0, |s| s as f64);
+                (
+                    "scp:system".to_owned(),
+                    format!("member_left:{member_did}").into_bytes(),
+                    ts,
+                )
+            }
+            scp_core::context::membership::ContextEvent::SystemClose { initiator_did } => {
+                #[allow(clippy::cast_precision_loss)]
+                let ts = scp_core::time::now_secs().map_or(0.0, |s| s as f64);
+                (
+                    "scp:system".to_owned(),
+                    format!("system_close:{initiator_did}").into_bytes(),
+                    ts,
+                )
+            }
+            other => {
+                #[allow(clippy::cast_precision_loss)]
+                let ts = scp_core::time::now_secs().map_or(0.0, |s| s as f64);
+                (
+                    "scp:system".to_owned(),
+                    format!("{other:?}").into_bytes(),
+                    ts,
+                )
+            }
+        };
+
+        let msg = PyMessage::new(sender_did, payload, timestamp, context_id.to_owned());
+        // Best-effort: if no channel is open or the channel is full, the
+        // event is dropped. This matches the subscription model where
+        // events before subscribe are lost.
+        let _ = crate::runtime::deliver_message(context_id, msg);
+    }
 }
 
 /// Returns an async iterator of incoming messages for a context.
@@ -1259,8 +1374,8 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
             name: name.clone(),
             description: String::new(),
             schema: scp_core::context::tools::ToolSchema {
-                input_schema: serde_json::Value::Object(Default::default()),
-                output_schema: serde_json::Value::Object(Default::default()),
+                input_schema: serde_json::Value::Object(serde_json::Map::default()),
+                output_schema: serde_json::Value::Object(serde_json::Map::default()),
             },
             implementation_hash: [0u8; 32],
             test_vectors: vec![],
@@ -1285,6 +1400,7 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
         economic_policy: None,
         metadata_visibility: scp_core::context::params::MetadataVisibilityPolicy::default(),
         projection_policy: None,
+        discoverable: false,
     }
 }
 
@@ -1319,8 +1435,8 @@ fn py_set_economic_policy(handle: &mut PyContextHandle, policy_json: &str) -> Py
 /// Returns `PyErr` if the context handle is not valid.
 #[pyfunction]
 #[pyo3(signature = (handle,))]
-fn py_get_economic_policy(handle: &PyContextHandle) -> PyResult<Option<String>> {
-    Ok(handle.params.economic_policy.clone())
+fn py_get_economic_policy(handle: &PyContextHandle) -> Option<String> {
+    handle.params.economic_policy.clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -1896,7 +2012,7 @@ mod tests {
             "did:test:creator".to_owned(),
             default_params(),
         );
-        let result = py_get_economic_policy(&handle).unwrap();
+        let result = py_get_economic_policy(&handle);
         assert!(result.is_none());
     }
 
@@ -1911,7 +2027,7 @@ mod tests {
                 ..default_params()
             },
         );
-        let result = py_get_economic_policy(&handle).unwrap();
+        let result = py_get_economic_policy(&handle);
         assert_eq!(result.as_deref(), Some(json));
     }
 }

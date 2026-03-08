@@ -858,9 +858,7 @@ impl WasmContextManager {
         // Validate chain depth (max 3 per spec section 6.2).
         if chain_depth > 3 {
             return Err(ScpWasmError::Tool {
-                message: format!(
-                    "cross-context chain depth {chain_depth} exceeds maximum 3"
-                ),
+                message: format!("cross-context chain depth {chain_depth} exceeds maximum 3"),
                 code: "SCP-TOOL-6012".to_owned(),
             });
         }
@@ -914,8 +912,7 @@ impl WasmContextManager {
         if current >= WASM_SESSION_CAP_PER_CALLER {
             return Err(ScpWasmError::Tool {
                 message: format!(
-                    "session cap exceeded for caller '{}': {} active (max {})",
-                    source_context_id, current, WASM_SESSION_CAP_PER_CALLER
+                    "session cap exceeded for caller '{source_context_id}': {current} active (max {WASM_SESSION_CAP_PER_CALLER})"
                 ),
                 code: "SCP-TOOL-6015".to_owned(),
             });
@@ -930,6 +927,7 @@ impl WasmContextManager {
             source_context: source_context_id.to_owned(),
             state: serde_json::Value::Null,
             created_at_ms: now,
+            #[allow(clippy::cast_precision_loss)] // JS numbers are f64; TTL values are small
             ttl_ms: (ttl_seconds as f64) * 1000.0,
             call_count: 0,
         };
@@ -952,12 +950,13 @@ impl WasmContextManager {
     ) -> Result<serde_json::Value, ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
-        let session = ctx.sessions.get(session_id).ok_or_else(|| {
-            ScpWasmError::Tool {
+        let session = ctx
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| ScpWasmError::Tool {
                 message: format!("session '{session_id}' not found"),
                 code: "SCP-TOOL-6018".to_owned(),
-            }
-        })?;
+            })?;
 
         if session.is_expired() {
             ctx.sessions.remove(session_id);
@@ -1703,10 +1702,7 @@ impl WasmContextManager {
     }
 
     /// Returns a mutable reference to context state, or an error if not found.
-    fn require_active_context(
-        &self,
-        context_id: &str,
-    ) -> Result<&PerContextState, ScpWasmError> {
+    fn require_active_context(&self, context_id: &str) -> Result<&PerContextState, ScpWasmError> {
         let ctx = self.require_context(context_id)?;
         if ctx.state != "active" {
             return Err(ScpWasmError::Context {

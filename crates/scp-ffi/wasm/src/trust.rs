@@ -13,7 +13,7 @@
 //! with `wasm32-unknown-unknown`). Trust functions that require Ed25519
 //! signature verification (`trust_verify_attestation`, `trust_verify_response`)
 //! are bridge stubs that return typed errors documenting the JS-side
-//! implementation pattern (WebCrypto). The query and challenge creation
+//! implementation pattern (`WebCrypto`). The query and challenge creation
 //! functions work fully using WASM-local state.
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md`.
@@ -75,7 +75,7 @@ pub fn trust_query_score(did: String, context_id: String) -> Promise {
 /// Verifies an attestation (bridge stub).
 ///
 /// Full attestation verification requires Ed25519 signature verification via
-/// WebCrypto, which must be injected from the TypeScript wrapper layer.
+/// `WebCrypto`, which must be injected from the TypeScript wrapper layer.
 /// Returns a JSON string indicating the stub status.
 ///
 /// # JS usage
@@ -100,12 +100,12 @@ pub fn trust_verify_attestation(attestation_json: String) -> Promise {
             ))
         })?;
 
-        // Signature verification requires WebCrypto (Ed25519) — must be
+        // Signature verification requires `WebCrypto` (Ed25519) — must be
         // implemented in the TypeScript wrapper layer.
         let result = serde_json::json!({
             "valid": false,
             "chain_depth": 0,
-            "error": "attestation signature verification requires WebCrypto — implement in TypeScript wrapper",
+            "error": "attestation signature verification requires `WebCrypto` — implement in TypeScript wrapper",
         });
 
         Ok(JsValue::from_str(&result.to_string()))
@@ -120,7 +120,7 @@ pub fn trust_verify_attestation(attestation_json: String) -> Promise {
 ///
 /// Generates a UUID v4 challenge ID and returns a JSON object with the
 /// challenge metadata. The challenge is not signed (signing requires
-/// WebCrypto Ed25519 from the TypeScript wrapper).
+/// `WebCrypto` Ed25519 from the TypeScript wrapper).
 ///
 /// # JS usage
 ///
@@ -162,7 +162,7 @@ pub fn trust_create_challenge(target_did: String) -> Promise {
 /// Verifies a challenge response (bridge stub).
 ///
 /// Full response verification requires Ed25519 signature verification via
-/// WebCrypto, which must be injected from the TypeScript wrapper layer.
+/// `WebCrypto`, which must be injected from the TypeScript wrapper layer.
 ///
 /// # JS usage
 ///
@@ -190,7 +190,7 @@ pub fn trust_verify_response(challenge_json: String, response_json: String) -> P
             ))
         })?;
 
-        // Signature verification requires WebCrypto — must be implemented in
+        // Signature verification requires `WebCrypto` — must be implemented in
         // the TypeScript wrapper layer.
         Ok(JsValue::from_bool(false))
     })

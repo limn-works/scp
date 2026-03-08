@@ -1,4 +1,4 @@
-//! Enum dispatch for [`KeyCustody`] in the PyO3 FFI bridge.
+//! Enum dispatch for [`KeyCustody`] in the `PyO3` FFI bridge.
 //!
 //! The [`KeyCustody`] trait uses RPITIT (return-position `impl Trait` in trait),
 //! which makes it NOT object-safe. This module provides [`FfiKeyCustody`], an
@@ -17,6 +17,7 @@
 
 use scp_platform::error::PlatformError;
 use scp_platform::file::FileKeyCustody;
+#[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
@@ -24,7 +25,7 @@ use scp_platform::traits::{
 };
 
 /// Enum dispatch wrapper for [`KeyCustody`] implementations used by the
-/// PyO3 FFI bridge.
+/// `PyO3` FFI bridge.
 ///
 /// Since [`KeyCustody`] uses RPITIT and is not object-safe, we cannot use
 /// `Arc<dyn KeyCustody>`. Instead, this enum wraps the concrete types and
@@ -32,6 +33,7 @@ use scp_platform::traits::{
 pub enum FfiKeyCustody {
     /// Test/development in-memory custody. Keys are lost on process exit.
     /// Available because `scp-ffi` enables `scp-platform/testing`.
+    #[cfg(feature = "allow_in_memory_custody")]
     InMemory(InMemoryKeyCustody),
     /// Encrypted file-backed custody (Argon2id + AES-256-GCM).
     /// Production default for desktop/server platforms.
@@ -41,6 +43,7 @@ pub enum FfiKeyCustody {
 impl KeyCustody for FfiKeyCustody {
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
         match self {
+            #[cfg(feature = "allow_in_memory_custody")]
             Self::InMemory(kc) => kc.generate_keypair(key_type).await,
             Self::File(kc) => kc.generate_keypair(key_type).await,
         }
@@ -48,6 +51,7 @@ impl KeyCustody for FfiKeyCustody {
 
     async fn sign(&self, key: &KeyHandle, data: &[u8]) -> Result<Signature, PlatformError> {
         match self {
+            #[cfg(feature = "allow_in_memory_custody")]
             Self::InMemory(kc) => kc.sign(key, data).await,
             Self::File(kc) => kc.sign(key, data).await,
         }
@@ -55,6 +59,7 @@ impl KeyCustody for FfiKeyCustody {
 
     async fn public_key(&self, key: &KeyHandle) -> Result<PublicKey, PlatformError> {
         match self {
+            #[cfg(feature = "allow_in_memory_custody")]
             Self::InMemory(kc) => kc.public_key(key).await,
             Self::File(kc) => kc.public_key(key).await,
         }
@@ -62,6 +67,7 @@ impl KeyCustody for FfiKeyCustody {
 
     async fn destroy_key(&self, key: &KeyHandle) -> Result<(), PlatformError> {
         match self {
+            #[cfg(feature = "allow_in_memory_custody")]
             Self::InMemory(kc) => kc.destroy_key(key).await,
             Self::File(kc) => kc.destroy_key(key).await,
         }
@@ -73,6 +79,7 @@ impl KeyCustody for FfiKeyCustody {
         peer_public: &[u8; 32],
     ) -> Result<SharedSecret, PlatformError> {
         match self {
+            #[cfg(feature = "allow_in_memory_custody")]
             Self::InMemory(kc) => kc.dh_agree(key, peer_public).await,
             Self::File(kc) => kc.dh_agree(key, peer_public).await,
         }
@@ -84,6 +91,7 @@ impl KeyCustody for FfiKeyCustody {
         context_id: &[u8],
     ) -> Result<PseudonymKeypair, PlatformError> {
         match self {
+            #[cfg(feature = "allow_in_memory_custody")]
             Self::InMemory(kc) => kc.derive_pseudonym(key, context_id).await,
             Self::File(kc) => kc.derive_pseudonym(key, context_id).await,
         }
@@ -96,6 +104,7 @@ impl KeyCustody for FfiKeyCustody {
         pseudonym_epoch: u64,
     ) -> Result<PseudonymKeypair, PlatformError> {
         match self {
+            #[cfg(feature = "allow_in_memory_custody")]
             Self::InMemory(kc) => {
                 kc.derive_rotatable_pseudonym(key, context_id, pseudonym_epoch)
                     .await
@@ -109,6 +118,7 @@ impl KeyCustody for FfiKeyCustody {
 
     fn custody_type(&self, key: &KeyHandle) -> CustodyType {
         match self {
+            #[cfg(feature = "allow_in_memory_custody")]
             Self::InMemory(kc) => kc.custody_type(key),
             Self::File(kc) => kc.custody_type(key),
         }

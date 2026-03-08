@@ -949,7 +949,7 @@ pub enum GovernanceEvent {
     ProposalCreated {
         proposal_id: ProposalId,
         proposer_did: DID,
-        action: GovernanceAction,
+        action: Box<GovernanceAction>,
         voting_deadline: u64,
     },
     /// A vote was cast on a proposal.
@@ -1133,6 +1133,11 @@ pub trait GovernanceEngine: Send + Sync {
     /// the tally. This may change the resolution (ADR-031 §5). Returns the
     /// updated status and any events produced by automatic resolution.
     ///
+    /// # Errors
+    ///
+    /// Returns [`GovernanceError`] if the proposal cannot be found or
+    /// the voter state is invalid.
+    ///
     /// # Default implementation
     ///
     /// Returns `Ok(None)` for engines that do not support voter departure
@@ -1151,6 +1156,11 @@ pub trait GovernanceEngine: Send + Sync {
     ///
     /// Used for proposer departure and epoch reset scenarios (ADR-031 §5).
     /// Transitions a `Pending` proposal to `Invalidated` with the given reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GovernanceError`] if the proposal cannot be found or is
+    /// not in `Pending` status.
     fn invalidate_proposal(
         &mut self,
         proposal_id: &ProposalId,
@@ -1274,7 +1284,7 @@ impl GovernanceEngine for SingleAdminEngine {
             GovernanceEvent::ProposalCreated {
                 proposal_id,
                 proposer_did: proposer.clone(),
-                action,
+                action: Box::new(action),
                 voting_deadline: context.now,
             },
             GovernanceEvent::VoteCast {
@@ -1399,7 +1409,12 @@ impl GovernanceEngine for SingleAdminEngine {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::doc_markdown
+)]
 mod tests {
     use super::*;
 
@@ -1573,8 +1588,8 @@ mod tests {
     // GovernanceAction serialization
     // -----------------------------------------------------------------------
 
-    /// Returns all 28 `GovernanceAction` variants (24 per ADR-031 + `BlockAuthor`
-    /// + 3 economic: `SetEconomicPolicy`, `ApproveSpend`, `LockEconomicPolicy`)
+    /// Returns all 28 `GovernanceAction` variants (24 per ADR-031, `BlockAuthor`,
+    /// and 3 economic: `SetEconomicPolicy`, `ApproveSpend`, `LockEconomicPolicy`)
     /// for serialization testing. Split into two helpers to stay within the
     /// function line limit.
     fn all_governance_actions() -> Vec<GovernanceAction> {
@@ -1585,7 +1600,7 @@ mod tests {
 
     /// Core governance actions (membership, tools, settings, access control).
     fn governance_actions_core() -> Vec<GovernanceAction> {
-        use crate::context::tools::interface::ToolInterface;
+        
 
         vec![
             GovernanceAction::AddMember {
@@ -1780,10 +1795,10 @@ mod tests {
             GovernanceEvent::ProposalCreated {
                 proposal_id: [1u8; 32],
                 proposer_did: alice(),
-                action: GovernanceAction::AddMember {
+                action: Box::new(GovernanceAction::AddMember {
                     did: bob(),
                     role: "member".to_owned(),
-                },
+                }),
                 voting_deadline: 1_700_000_000,
             },
             GovernanceEvent::VoteCast {

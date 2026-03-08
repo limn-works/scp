@@ -265,7 +265,7 @@ pub struct WrappedContent {
 // Helper: compute_member_id
 // ---------------------------------------------------------------------------
 
-/// Computes the member_id for a DID: first 8 bytes of SHA-256(member_did).
+/// Computes the `member_id` for a DID: first 8 bytes of SHA-256(member_did).
 #[must_use]
 pub fn compute_member_id(member_did: &str) -> [u8; 8] {
     let hash = Sha256::digest(member_did.as_bytes());

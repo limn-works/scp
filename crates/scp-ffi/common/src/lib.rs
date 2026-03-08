@@ -105,7 +105,7 @@ impl DidResolver for BridgeDidResolver {
 /// Typed error for production DID resolution failures.
 ///
 /// Maps to `UcanError` and `TrustError` variants at the consumer boundary.
-/// See acceptance criteria: NotFound, InvalidDocument, NetworkUnavailable,
+/// See acceptance criteria: `NotFound`, `InvalidDocument`, `NetworkUnavailable`,
 /// Revoked.
 #[derive(Debug)]
 pub enum ResolutionError {
@@ -134,13 +134,13 @@ impl std::error::Error for ResolutionError {}
 
 impl From<ResolutionError> for CoreUcanError {
     fn from(e: ResolutionError) -> Self {
-        CoreUcanError::MalformedToken(e.to_string())
+        Self::MalformedToken(e.to_string())
     }
 }
 
 impl From<ResolutionError> for TrustError {
     fn from(e: ResolutionError) -> Self {
-        TrustError::AttestationSignatureInvalid {
+        Self::AttestationSignatureInvalid {
             attestation_id: String::new(),
             reason: e.to_string(),
         }
@@ -207,7 +207,7 @@ pub struct DidRotatedEvent {
 /// The underlying resolver is async (network I/O). The `validate::DidResolver`
 /// trait is sync. This struct bridges via `tokio::task::block_in_place` (when
 /// called from within a tokio multi-thread runtime) or `Handle::block_on`
-/// (when called from a non-tokio thread, e.g., PyO3).
+/// (when called from a non-tokio thread, e.g., `PyO3`).
 ///
 /// See §3.10.10, §9.5 (UCAN validation), §7.4.1 (attestation verification).
 /// Closes #311.
@@ -265,11 +265,12 @@ impl IdentityBackedDidResolver {
     /// Callers should periodically drain this to detect DID rotations and
     /// take appropriate action (e.g., re-fetching UCAN tokens, updating
     /// MLS credentials).
+    #[must_use] 
     pub fn drain_rotation_events(&self) -> Vec<DidRotatedEvent> {
         let mut events = self
             .rotation_events
             .write()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::mem::take(&mut *events)
     }
 
@@ -287,27 +288,21 @@ impl IdentityBackedDidResolver {
         match result {
             Ok(Some(doc)) => Ok(doc),
             Ok(None) => Err(ResolutionError::NotFound(did.to_owned())),
-            Err(IdentityError::Bep44SignatureInvalid(msg)) => {
-                Err(ResolutionError::InvalidDocument(msg))
-            }
-            Err(IdentityError::SelfCertificationFailed(msg)) => {
-                Err(ResolutionError::InvalidDocument(msg))
-            }
-            Err(IdentityError::DocumentDeserializationError(msg)) => {
-                Err(ResolutionError::InvalidDocument(msg))
-            }
+            Err(
+                IdentityError::Bep44SignatureInvalid(msg)
+                | IdentityError::SelfCertificationFailed(msg)
+                | IdentityError::DocumentDeserializationError(msg),
+            ) => Err(ResolutionError::InvalidDocument(msg)),
             Err(IdentityError::StaleSequenceNumber {
                 received,
                 last_known,
             }) => Err(ResolutionError::Revoked(format!(
                 "stale sequence for {did}: received {received}, last known {last_known}"
             ))),
-            Err(IdentityError::DhtResolveFailed(msg)) => {
-                Err(ResolutionError::NetworkUnavailable(msg))
-            }
-            Err(IdentityError::RelayQueryFailed(msg)) => {
-                Err(ResolutionError::NetworkUnavailable(msg))
-            }
+            Err(
+                IdentityError::DhtResolveFailed(msg)
+                | IdentityError::RelayQueryFailed(msg),
+            ) => Err(ResolutionError::NetworkUnavailable(msg)),
             Err(IdentityError::DhtNotFound(msg)) => Err(ResolutionError::NotFound(msg)),
             Err(e) => Err(ResolutionError::InvalidDocument(e.to_string())),
         }
@@ -336,11 +331,12 @@ impl IdentityBackedDidResolver {
     ///
     /// Returns `Err` if the sequence number is lower than previously seen
     /// (downgrade attack). Emits a rotation event if higher.
+    #[allow(clippy::significant_drop_tightening)] // RwLock guard lifetime is intentional.
     fn check_sequence(&self, did: &str, seq: u64) -> Result<(), ResolutionError> {
         let mut sequences = self
             .seen_sequences
             .write()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if let Some(&prev_seq) = sequences.get(did) {
             match seq.cmp(&prev_seq) {
@@ -480,7 +476,8 @@ pub enum DispatchDidResolver<'a> {
 impl DispatchDidResolver<'_> {
     /// Creates a dispatch resolver that uses the production resolver if
     /// available, otherwise falls back to `BridgeDidResolver`.
-    pub fn new(production: Option<&IdentityBackedDidResolver>) -> DispatchDidResolver<'_> {
+    #[must_use] 
+    pub const fn new(production: Option<&IdentityBackedDidResolver>) -> DispatchDidResolver<'_> {
         match production {
             Some(resolver) => DispatchDidResolver::Identity(resolver),
             None => DispatchDidResolver::Bridge(BridgeDidResolver),
@@ -697,7 +694,7 @@ mod tests {
             .unwrap();
 
         let resolved = ResolvedDidDocument {
-            document: document.clone(),
+            document,
             seq: 1,
             source: ResolutionSource::Cache,
         };

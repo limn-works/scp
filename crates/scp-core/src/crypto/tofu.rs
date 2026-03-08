@@ -61,7 +61,7 @@ pub struct KeyChanges {
 impl KeyChanges {
     /// Returns `true` if any verification method key changed.
     #[must_use]
-    pub fn any_changed(&self) -> bool {
+    pub const fn any_changed(&self) -> bool {
         self.identity_key_changed || self.active_key_changed || self.agent_key_changed
     }
 }
@@ -85,7 +85,7 @@ pub enum TofuResult {
     /// or completes re-verification (spec §9.11).
     Changed {
         /// The previously stored keys.
-        old_record: TofuRecord,
+        old_record: Box<TofuRecord>,
         /// The newly observed keys (not yet stored).
         new_keys: ObservedKeys,
         /// Which specific verification methods changed.
@@ -136,7 +136,7 @@ pub fn check_tofu(stored: Option<&TofuRecord>, observed: &ObservedKeys) -> TofuR
 
     if changes.any_changed() {
         TofuResult::Changed {
-            old_record: record.clone(),
+            old_record: Box::new(record.clone()),
             new_keys: observed.clone(),
             changes,
         }
@@ -150,7 +150,7 @@ pub fn check_tofu(stored: Option<&TofuRecord>, observed: &ObservedKeys) -> TofuR
 /// Used when [`TofuResult::FirstSeen`] is returned, or when the user
 /// explicitly accepts a key change.
 #[must_use]
-pub fn create_tofu_record(observed: &ObservedKeys, now_secs: u64) -> TofuRecord {
+pub const fn create_tofu_record(observed: &ObservedKeys, now_secs: u64) -> TofuRecord {
     TofuRecord {
         identity_key: observed.identity_key,
         active_key: observed.active_key,
@@ -192,7 +192,7 @@ pub fn mark_verified_out_of_band(record: &TofuRecord, now_secs: u64) -> TofuReco
 /// Resets `verified_out_of_band` to `false` (spec §9.11: key change
 /// invalidates previous verification). Preserves `first_seen_at`.
 #[must_use]
-pub fn accept_key_change(
+pub const fn accept_key_change(
     old_record: &TofuRecord,
     new_keys: &ObservedKeys,
     now_secs: u64,

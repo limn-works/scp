@@ -243,14 +243,16 @@ fn validate_tool_ucan(
     tool_id: &str,
     ucan_token: &str,
     identity_did: &str,
-    proof_tokens: &Option<Vec<String>>,
+    proof_tokens: Option<&Vec<String>>,
 ) -> PyResult<()> {
-    let proof_resolver = crate::ucan::build_proof_resolver_from_tokens(proof_tokens.as_deref())?;
+    let proof_resolver =
+        crate::ucan::build_proof_resolver_from_tokens(proof_tokens.map(Vec::as_slice))?;
 
     crate::runtime::with_context(context_id, |rt| {
         let production_resolver = crate::runtime::did_resolver();
-        let did_resolver =
-            crate::bridge_adapters::DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
+        let did_resolver = crate::bridge_adapters::DispatchDidResolver::new(
+            production_resolver.map(std::convert::AsRef::as_ref),
+        );
         let revocation_checker = crate::bridge_adapters::BridgeRevocationChecker {
             revocation_list: &rt.revocation_list,
         };
@@ -354,7 +356,7 @@ pub fn py_tool_invoke(
 
     // Primary authorization: UCAN token validation via the full 11-step
     // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
-    validate_tool_ucan(context_id, tool_id, ucan_token, identity_did, &proof_tokens)?;
+    validate_tool_ucan(context_id, tool_id, ucan_token, identity_did, proof_tokens.as_ref())?;
 
     // Validates tool existence, input schema, capability, dispatches to handler,
     // validates output schema, and builds a ToolInvokedEvent for provenance.
@@ -566,9 +568,9 @@ fn extract_economic_metadata(
         _ => return Ok(None),
     };
 
-    let dict = meta_obj.downcast::<PyDict>().map_err(|_| {
-        ScpPyError::validation("'economic_metadata' must be a dict".to_owned())
-    })?;
+    let dict = meta_obj
+        .downcast::<PyDict>()
+        .map_err(|_| ScpPyError::validation("'economic_metadata' must be a dict".to_owned()))?;
 
     let cost_per_invoke: u64 = dict
         .get_item("cost_per_invoke")?
@@ -613,9 +615,9 @@ fn extract_test_vectors(
 
     let mut result = Vec::with_capacity(vectors_list.len());
     for item in vectors_list.iter() {
-        let dict = item.downcast::<PyDict>().map_err(|_| {
-            ScpPyError::validation("each test vector must be a dict".to_owned())
-        })?;
+        let dict = item
+            .downcast::<PyDict>()
+            .map_err(|_| ScpPyError::validation("each test vector must be a dict".to_owned()))?;
         let tv_json = py_dict_to_json(dict)?;
 
         let input = tv_json
@@ -688,14 +690,13 @@ pub fn py_tool_invoke_cross_context(
     let input_json = py_dict_to_json(input)?;
 
     // Validate the source context has the invoker's capability.
-    let source_has_capability =
-        crate::runtime::with_context(source_context_id, |rt| {
-            Ok(scp_core::context::tools::has_tool_invoke_capability(
-                &rt.role_state,
-                invoker_did,
-                tool_id,
-            ))
-        })?;
+    let source_has_capability = crate::runtime::with_context(source_context_id, |rt| {
+        Ok(scp_core::context::tools::has_tool_invoke_capability(
+            &rt.role_state,
+            invoker_did,
+            tool_id,
+        ))
+    })?;
 
     if !source_has_capability {
         return Err(ScpPyError::ucan(format!(
@@ -823,9 +824,8 @@ pub fn py_tool_session_create(
         }
 
         let session_id = uuid::Uuid::new_v4().to_string();
-        let now_ms = scp_core::time::now_millis().map_err(|e| {
-            ScpPyError::context(format!("clock error: {e}"))
-        })?;
+        let now_ms = scp_core::time::now_millis()
+            .map_err(|e| ScpPyError::context(format!("clock error: {e}")))?;
 
         let session = scp_core::context::tools::ToolSession {
             session_id: session_id.clone(),
@@ -880,14 +880,14 @@ pub fn py_tool_session_invoke(
 
     let output_json = crate::runtime::with_context(context_id, |rt| {
         // Look up session.
-        let session = rt.session_store.get(session_id).ok_or_else(|| {
-            ScpPyError::context(format!("session '{session_id}' not found"))
-        })?;
+        let session = rt
+            .session_store
+            .get(session_id)
+            .ok_or_else(|| ScpPyError::context(format!("session '{session_id}' not found")))?;
 
         // Check expiry.
-        let now_ms = scp_core::time::now_millis().map_err(|e| {
-            ScpPyError::context(format!("clock error: {e}"))
-        })?;
+        let now_ms = scp_core::time::now_millis()
+            .map_err(|e| ScpPyError::context(format!("clock error: {e}")))?;
         if session.is_expired(now_ms) {
             rt.session_store.remove(session_id);
             return Err(ScpPyError::context(format!(
@@ -922,9 +922,7 @@ pub fn py_tool_session_invoke(
         let (new_state, output) = if let Some(handler) = rt.tool_handlers.get(&tool_id) {
             let handler = handler.clone();
             let out = handler(input_json.clone()).map_err(|e| {
-                ScpPyError::context(format!(
-                    "tool handler for '{tool_id}' failed: {e}"
-                ))
+                ScpPyError::context(format!("tool handler for '{tool_id}' failed: {e}"))
             })?;
             (current_state, out)
         } else {
