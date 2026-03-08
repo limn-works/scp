@@ -283,6 +283,26 @@ pub enum ContextEvent {
         /// The DID whose read access was restored.
         did: DID,
     },
+    /// A member's write access was revoked via governance (ADR-038, §9.17).
+    ///
+    /// The member remains in the context for governance/presence purposes
+    /// but cannot publish new content. Full scope additionally destroys
+    /// the member's sender/broadcast key.
+    WriteAccessRevoked {
+        /// The DID whose write access was revoked.
+        did: DID,
+    },
+    /// A member's write access was restored via governance (ADR-038, §9.17).
+    ///
+    /// Forward-only: the member can publish new content but previously
+    /// suppressed content remains suppressed.
+    WriteAccessRestored {
+        /// The DID whose write access was restored.
+        did: DID,
+    },
+    /// Context-wide content key rotation was performed via governance
+    /// (ADR-038, §9.17). All members should refresh their access keys.
+    ContentKeysRotated,
     /// The context expired due to TTL.
     ///
     /// Replaces the former sentinel DID string `"__ttl_expiry_notification"`.

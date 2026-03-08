@@ -1501,6 +1501,8 @@ mod tests {
             ttl_remaining_secs: Some(300),
             registered_tools: Vec::new(),
             write_revoked_members: std::collections::HashSet::new(),
+            read_revoked_members: std::collections::HashSet::new(),
+            read_exclusion_list: std::collections::HashSet::new(),
             tool_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,

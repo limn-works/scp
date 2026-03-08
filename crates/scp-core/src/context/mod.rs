@@ -331,6 +331,12 @@ pub enum ContextError {
     /// Context creation failed due to invalid parameters or internal error.
     #[error("creation failed: {0}")]
     CreationFailed(String),
+
+    /// A restore governance action was attempted on a member whose access
+    /// was never revoked. Per §5.9: restore-when-never-revoked returns this
+    /// error instead of silently succeeding.
+    #[error("nothing to restore: {0}")]
+    NothingToRestore(String),
 }
 
 // ---------------------------------------------------------------------------

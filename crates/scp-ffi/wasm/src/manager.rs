@@ -280,6 +280,10 @@ struct PerContextState {
     executed_proposals: HashSet<String>,
     /// Write-revoked member DIDs (§9.17, ADR-038).
     write_revoked_members: HashSet<String>,
+    /// Read-revoked member DIDs (ADR-038, §9.17).
+    read_revoked_members: HashSet<String>,
+    /// Members excluded from future CEK wrapping (FutureOnly read revocation).
+    read_exclusion_list: HashSet<String>,
     /// Broadcast context state (only for Broadcast mode).
     broadcast: Option<BroadcastState>,
 }
@@ -454,6 +458,8 @@ impl WasmContextManager {
             event_buffer: Vec::new(),
             executed_proposals: HashSet::new(),
             write_revoked_members: HashSet::new(),
+            read_revoked_members: HashSet::new(),
+            read_exclusion_list: HashSet::new(),
             broadcast,
         };
 
@@ -1131,7 +1137,12 @@ impl WasmContextManager {
             }
             WasmGovernanceAction::RestoreWriteAccess { did } => {
                 let ctx = self.require_active_context_mut(context_id)?;
-                ctx.write_revoked_members.remove(did);
+                if !ctx.write_revoked_members.remove(did) {
+                    return Err(ScpWasmError::Context {
+                        message: format!("write access not revoked for {did}"),
+                        code: "SCP-CTX-2001".to_owned(),
+                    });
+                }
                 Ok(serde_json::json!({"action": "RestoreWriteAccess", "did": did}))
             }
             WasmGovernanceAction::BlockAuthor { did } => {
@@ -1151,27 +1162,25 @@ impl WasmContextManager {
             }
             WasmGovernanceAction::RevokeReadAccess { did } => {
                 let ctx = self.require_active_context_mut(context_id)?;
-                let bc = ctx
-                    .broadcast
-                    .as_mut()
-                    .ok_or_else(|| ScpWasmError::Context {
-                        message: "not a broadcast context".to_owned(),
-                        code: "SCP-CTX-2001".to_owned(),
-                    })?;
-                bc.subscribers.remove(did);
-                bc.blocked_subscribers.insert(did.clone());
+                ctx.read_revoked_members.insert(did.clone());
+                if let Some(bc) = ctx.broadcast.as_mut() {
+                    bc.subscribers.remove(did);
+                    bc.blocked_subscribers.insert(did.clone());
+                }
                 Ok(serde_json::json!({"action": "RevokeReadAccess", "did": did}))
             }
             WasmGovernanceAction::RestoreReadAccess { did } => {
                 let ctx = self.require_active_context_mut(context_id)?;
-                let bc = ctx
-                    .broadcast
-                    .as_mut()
-                    .ok_or_else(|| ScpWasmError::Context {
-                        message: "not a broadcast context".to_owned(),
+                if !ctx.read_revoked_members.remove(did) {
+                    return Err(ScpWasmError::Context {
+                        message: format!("read access not revoked for {did}"),
                         code: "SCP-CTX-2001".to_owned(),
-                    })?;
-                bc.blocked_subscribers.remove(did);
+                    });
+                }
+                ctx.read_exclusion_list.remove(did);
+                if let Some(bc) = ctx.broadcast.as_mut() {
+                    bc.blocked_subscribers.remove(did);
+                }
                 Ok(serde_json::json!({"action": "RestoreReadAccess", "did": did}))
             }
             _ => {
