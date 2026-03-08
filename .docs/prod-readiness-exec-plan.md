@@ -376,7 +376,10 @@ SCP-CAC-004 — **COMPLETE** → 8c38383
 SCP-CAC-002 — **COMPLETE** → 586e025
 SCP-CAC-005 — **COMPLETE** → 7ede865
 SCP-CAC-003 — **COMPLETE** → abb9873
-SCP-CAC-006 → SCP-CAC-007 → SCP-CAC-008 → SCP-CAC-009 → SCP-CAC-010
+SCP-CAC-006 — **COMPLETE** → 44210e41
+SCP-CAC-007 — **COMPLETE** → d2163551
+SCP-CAC-008 — **COMPLETE** → 1d7824c2
+SCP-CAC-009 → SCP-CAC-010
 
 ### Phase 7: Governance Integration (depends on Phase 2 + Phase 5)
 
@@ -388,6 +391,10 @@ SCP-267 → SCP-268 → SCP-269 → SCP-270 → SCP-271 → SCP-272 → SCP-273 
 - SCP-269 — **COMPLETE** → a758149
 - SCP-270 — **COMPLETE** → 6a5cea5
 - SCP-271 — **COMPLETE** → 6ae5dc2
+- SCP-272 — **COMPLETE** → 09b0d838 + c5a3165f (conflict detection + vote submission wiring)
+- SCP-273 — **COMPLETE** → 2df9cd8b + 6ff7c953 (checkpoint cosignatures)
+- SCP-274 — **COMPLETE** → d0e0cf69 (governance integration tests, 49 tests)
+- Compilation fixes → c23f0601 (36+ errors from SCP-272/273 merge)
 - SCP-267–268 need #356 (ContextManager wiring)
 - SCP-269–270 need #320 (GovernanceModel enum expansion + proposal lifecycle — all 24 actions already dispatched per PR #296)
 - SCP-272 needs #354 (conflict detection)
