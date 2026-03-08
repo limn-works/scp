@@ -420,17 +420,28 @@ fn build_signing_payload(
 
 /// Computes the provenance hash for the signing payload.
 ///
-/// Returns `SHA-256(serialized_provenance)` if provenance is present, or
-/// `SHA-256(0x00)` sentinel if absent per §9.5.1.
+/// Uses the canonical hash construction (§9.5.1) for deterministic,
+/// cross-implementation provenance hashing. Returns the absent sentinel
+/// `SHA-256(0x00)` when provenance is `None`.
 fn compute_provenance_hash(provenance: &Option<crate::provenance::DataProvenance>) -> [u8; 32] {
+    use crate::crypto::canonical::{CanonicalField, canonical_hash};
+
     match provenance {
         Some(prov) => {
-            // Serialize provenance to JSON for hashing. This is deterministic
-            // because serde_json produces canonical field ordering for structs.
-            let serialized = serde_json::to_vec(prov).unwrap_or_else(|_| vec![0x00]);
-            let mut hasher = Sha256::new();
-            hasher.update(&serialized);
-            hasher.finalize().into()
+            // Use canonical hash with length-prefixed fields for deterministic
+            // cross-implementation serialization, instead of serde_json which
+            // has no guaranteed field ordering across implementations.
+            canonical_hash(
+                "SCP-PROVENANCE-HASH-V1:",
+                &[
+                    CanonicalField::VarBytes(prov.source_context.as_bytes()),
+                    CanonicalField::VarBytes(format!("{:?}", prov.source_type).as_bytes()),
+                    CanonicalField::U64(prov.chain_depth.into()),
+                    CanonicalField::U64(prov.age.as_secs()),
+                    CanonicalField::VarBytes(format!("{:?}", prov.memory_scope).as_bytes()),
+                    CanonicalField::VarBytes(format!("{:?}", prov.discovery_method).as_bytes()),
+                ],
+            )
         }
         None => {
             let mut hasher = Sha256::new();

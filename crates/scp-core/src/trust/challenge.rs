@@ -286,21 +286,23 @@ const DEFAULT_VERIFICATION_TTL_SECS: u64 = 90 * 24 * 3600;
 /// cross-protocol signature confusion. This ensures signatures cover all
 /// semantically meaningful fields.
 fn canonical_challenge_request_bytes(request: &ChallengeRequest) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(DOMAIN_CHALLENGE_REQ_V1);
-    bytes.extend_from_slice(request.challenge_id.as_bytes());
-    bytes.extend_from_slice(challenge_type_tag(&request.challenge_type).as_bytes());
-    bytes.extend_from_slice(request.challenger_did.as_bytes());
-    bytes.extend_from_slice(request.subject_did.as_bytes());
-    bytes.extend_from_slice(request.capability_uri.as_bytes());
+    use crate::crypto::canonical::{CanonicalField, canonical_hash_bytes};
 
-    // Deterministic JSON serialization for parameters.
+    let type_tag = challenge_type_tag(&request.challenge_type);
     let params_bytes = serde_json::to_vec(&request.parameters).unwrap_or_default();
-    bytes.extend_from_slice(&params_bytes);
 
-    // Timeout as seconds (u64, big-endian).
-    bytes.extend_from_slice(&request.timeout.as_secs().to_be_bytes());
-    bytes
+    canonical_hash_bytes(
+        DOMAIN_CHALLENGE_REQ_V1,
+        &[
+            CanonicalField::VarBytes(request.challenge_id.as_bytes()),
+            CanonicalField::VarBytes(type_tag.as_bytes()),
+            CanonicalField::VarBytes(request.challenger_did.as_bytes()),
+            CanonicalField::VarBytes(request.subject_did.as_bytes()),
+            CanonicalField::VarBytes(request.capability_uri.as_bytes()),
+            CanonicalField::VarBytes(&params_bytes),
+            CanonicalField::U64(request.timeout.as_secs()),
+        ],
+    )
 }
 
 /// Builds the canonical byte representation of a challenge response for signing.
@@ -310,18 +312,19 @@ fn canonical_challenge_request_bytes(request: &ChallengeRequest) -> Vec<u8> {
 /// prevents cross-protocol signature confusion. This ensures signatures
 /// cover all semantically meaningful fields.
 fn canonical_challenge_response_bytes(response: &ChallengeResponse) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(DOMAIN_CHALLENGE_RESP_V1);
-    bytes.extend_from_slice(response.challenge_id.as_bytes());
-    bytes.extend_from_slice(response.responder_did.as_bytes());
+    use crate::crypto::canonical::{CanonicalField, canonical_hash_bytes};
 
-    // Deterministic JSON serialization for result.
     let result_bytes = serde_json::to_vec(&response.result).unwrap_or_default();
-    bytes.extend_from_slice(&result_bytes);
 
-    // completed_at as u64, big-endian.
-    bytes.extend_from_slice(&response.completed_at.to_be_bytes());
-    bytes
+    canonical_hash_bytes(
+        DOMAIN_CHALLENGE_RESP_V1,
+        &[
+            CanonicalField::VarBytes(response.challenge_id.as_bytes()),
+            CanonicalField::VarBytes(response.responder_did.as_bytes()),
+            CanonicalField::VarBytes(&result_bytes),
+            CanonicalField::U64(response.completed_at),
+        ],
+    )
 }
 
 /// Builds the canonical byte representation of a challenge verification for signing.
@@ -331,19 +334,25 @@ fn canonical_challenge_response_bytes(response: &ChallengeResponse) -> Vec<u8> {
 /// || passed || test_count || pass_count || verified_at || expires_at`.
 /// The domain separator prevents cross-protocol signature confusion.
 fn canonical_challenge_verification_bytes(verification: &ChallengeVerification) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(DOMAIN_CHALLENGE_VERIFY_V1);
-    bytes.extend_from_slice(verification.verification_id.as_bytes());
-    bytes.extend_from_slice(verification.verifier_did.as_bytes());
-    bytes.extend_from_slice(verification.subject_did.as_bytes());
-    bytes.extend_from_slice(verification.capability_uri.as_bytes());
-    bytes.extend_from_slice(challenge_type_tag(&verification.challenge_type).as_bytes());
-    bytes.push(u8::from(verification.passed));
-    bytes.extend_from_slice(&verification.test_count.to_be_bytes());
-    bytes.extend_from_slice(&verification.pass_count.to_be_bytes());
-    bytes.extend_from_slice(&verification.verified_at.to_be_bytes());
-    bytes.extend_from_slice(&verification.expires_at.to_be_bytes());
-    bytes
+    use crate::crypto::canonical::{CanonicalField, canonical_hash_bytes};
+
+    let type_tag = challenge_type_tag(&verification.challenge_type);
+
+    canonical_hash_bytes(
+        DOMAIN_CHALLENGE_VERIFY_V1,
+        &[
+            CanonicalField::VarBytes(verification.verification_id.as_bytes()),
+            CanonicalField::VarBytes(verification.verifier_did.as_bytes()),
+            CanonicalField::VarBytes(verification.subject_did.as_bytes()),
+            CanonicalField::VarBytes(verification.capability_uri.as_bytes()),
+            CanonicalField::VarBytes(type_tag.as_bytes()),
+            CanonicalField::U8(u8::from(verification.passed)),
+            CanonicalField::U32(verification.test_count),
+            CanonicalField::U32(verification.pass_count),
+            CanonicalField::U64(verification.verified_at),
+            CanonicalField::U64(verification.expires_at),
+        ],
+    )
 }
 
 /// Returns a deterministic string tag for a challenge type.
