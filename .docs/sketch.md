@@ -344,6 +344,28 @@ SCP.Context.leave(
 ) → void
 ```
 
+### Add Member
+
+Governance action. Requires admin role or governance approval. The invitee's KeyPackage is fetched from the relay and used for MLS Welcome message construction.
+
+```
+SCP.Context.addMember(
+  context: contextID,
+  identity: DID,                     // DID of the member to add
+  role: String,                      // role to assign (must exist in context's role map)
+  as: Identity,                      // must have admin role or governance authority
+  attestations: [Attestation]?       // optional attestations on behalf of the invitee
+) → MembershipResult {
+  contextID: ContextId,
+  memberDID: DID,
+  role: String,
+  capabilityTokens: [UCANToken],     // UCAN tokens scoped to this context and role
+  eventID: EventID                   // MemberJoined event in the event log
+}
+```
+
+Admission requirements are checked mechanically against the invitee's profile. The MLS Welcome message is delivered to the invitee via the relay. The invitee's SDK processes the Welcome to join the MLS group. A `MemberJoined` event is appended to the context's event log.
+
 ### Remove Member
 
 Governance action. Requires admin role or governance approval.
@@ -387,6 +409,118 @@ SCP.Context.receive(
 The stream primitive provides real-time delivery of all context activity. Transport-level details (reconnection, backoff, multi-relay fanout) are handled by the SDK. The stream respects the participant's role — events outside their capability ceiling are filtered.
 
 **Buffer semantics:** The receive stream buffers up to 1,000 events. When the buffer is full, the oldest unconsumed event is dropped and a `BufferOverflow` warning event is emitted on the stream. SDKs MAY expose buffer size as a configuration parameter (minimum: 100, maximum: 10,000, default: 1,000). The `BufferOverflow` event includes the count of dropped events since the last successful consumption, enabling consumers to detect and respond to backpressure.
+
+### Broadcast Context: Create (§5.14)
+
+Broadcast contexts use per-author AES-256 keys instead of MLS. No group key management — authors manage their own broadcast keys.
+
+```
+SCP.Context.createBroadcast(
+  template: "public-broadcast" | "gated-broadcast",
+  name: String,
+  as: Identity,
+  params: {
+    description: String?,
+    projectionPolicy: ProjectionPolicy?,   // HTTP projection settings (§18.11)
+    ttl: Duration?
+  }
+) → Context { contextID, mode: .broadcast, role: "author" }
+```
+
+### Broadcast Context: Subscribe (§5.14.3)
+
+Subscribers register via DID-signed requests. Open broadcasts grant access on registration; gated broadcasts require a `messagesRead` UCAN from the context admin.
+
+```
+SCP.Broadcast.subscribe(
+  context: contextID,
+  as: Identity,
+  wrappingPubkey: X25519PublicKey,          // for HPKE-sealed key delivery
+  ucan: UcanToken?                          // required for gated contexts
+) → Subscription {
+  contextID,
+  role: "subscriber",
+  authors: [{ did: DID, keyEpoch: u64 }]   // current author key epochs
+}
+```
+
+### Broadcast Context: Request Author Key (§5.14.2, §5.14.3)
+
+Pull-based key distribution. Subscriber requests a specific author's broadcast key for a given epoch. Author SDK checks block list (and UCAN for gated contexts) before responding.
+
+```
+SCP.Broadcast.requestKey(
+  context: contextID,
+  authorDid: DID,
+  epoch: u64,
+  as: Identity
+) → BroadcastKey {
+  authorDid: DID,
+  epoch: u64,
+  key: AES256Key                            // HPKE-sealed with subscriber's wrapping pubkey
+}
+```
+
+### Broadcast Context: Publish (§5.14.5)
+
+Authors publish messages as `BroadcastEnvelope`s — signed and encrypted with the author's current broadcast key.
+
+```
+SCP.Broadcast.publish(
+  context: contextID,
+  content: Data,
+  as: Identity,
+  provenance: DataProvenance?
+) → BroadcastReceipt {
+  sequence: u64,
+  keyEpoch: u64,
+  contentHash: [u8; 32],
+  timestamp: u64
+}
+```
+
+Send path: validate UCAN (`messagesWrite`) -> assign sequence -> generate nonce -> hash plaintext -> sign (Ed25519 over `context_id || sender_did || sequence || key_epoch || timestamp || nonce || content_hash || provenance_hash`) -> AES-256-GCM encrypt with author broadcast key -> wrap in OuterEnvelope -> relay PUBLISH.
+
+### Broadcast Context: Receive (§5.14.5)
+
+```
+SCP.Broadcast.receive(
+  context: contextID,
+  as: Identity,
+  filter: .all | .byAuthor(DID)
+) → AsyncStream<BroadcastMessage> {
+  senderDid: DID,
+  sequence: u64,
+  keyEpoch: u64,
+  content: Data,
+  provenance: DataProvenance?,
+  timestamp: u64,
+  verified: Bool                            // signature + AEAD tag both valid
+}
+```
+
+Receive path: transport receive -> dedup by blob hash -> deserialize -> verify Ed25519 signature -> decrypt with cached author broadcast key -> verify content_hash -> verify author UCAN -> replay check (sequence number) -> deliver.
+
+### Broadcast Context: Rotate Key / Block (§5.14.2, §5.14.8)
+
+On block, the author increments their key epoch and generates a new broadcast key. Blocked subscribers cannot request the new key.
+
+```
+SCP.Broadcast.block(
+  context: contextID,
+  targetDid: DID,
+  as: Identity                              // must be the author
+) → BlockResult {
+  newKeyEpoch: u64                          // epoch advanced automatically on block
+}
+
+SCP.Broadcast.unblock(
+  context: contextID,
+  targetDid: DID,
+  as: Identity
+) → void
+// Unblocked subscriber can request the current key on next pull
+```
 
 ---
 
@@ -588,6 +722,26 @@ SCP.ToolInterface.call(
 }
 // Per-caller session cap (default: 5) prevents exhaustion. Optional session TTL.
 ```
+
+### Revoke Tool Interface
+
+Either side can revoke a cross-context tool interface. Revocation is a governance action — it requires admin role or governance approval in the revoking context. Active sessions on the interface are terminated. Revocation is recorded in the event logs of both contexts.
+
+```
+SCP.ToolInterface.revoke(
+  interface: InterfaceID,
+  as: Identity,                      // must have admin role or governance authority
+  reason: String?                    // recorded in event log
+) → ToolInterfaceRevocationResult {
+  interfaceID: InterfaceID,
+  revokedBy: DID,
+  revokedAt: Timestamp,
+  terminatedSessions: Int,           // count of active sessions terminated
+  eventID: EventID                   // InterfaceRevoked event in the event log
+}
+```
+
+Revocation is permanent for the given `InterfaceID`. To re-establish the interface, a new `SCP.ToolInterface.expose()` call is required, producing a new `InterfaceID`. Both contexts must opt in again.
 
 **Two cross-context mechanisms** (§6.1). Tool interfaces are asymmetric (caller/tool). Multi-parent child contexts (§5.13) are symmetric — a shared space where members from different parent contexts interact as peers. Use tool interfaces for service calls; use multi-parent children for collaboration.
 
@@ -1493,7 +1647,7 @@ Implementation specifics that require Tier 1/Tier 2 design work:
 
 - **~~Context key management.~~** ✅ **Resolved.** MLS (RFC 9420) selected. One MLS group per context. Full specification in .docs/specs/ §9.7 (MLS integration), §9.5 (cryptographic primitives), §9.8 (message security). Security APIs in §16 below.
 - **~~DID method selection.~~** ✅ **Resolved.** did:dht selected as primary method (self-certifying, key rotation via DID document versioning). did:web exists as contingency fallback only if did:dht libraries prove unusable — not a planned deployment path. See .docs/specs/ §9.6 for security properties of each.
-- **~~Transport abstraction interface.~~** ✅ **Resolved.** ADR-005 specifies the `TransportAdapter` trait (connect, send, subscribe, query, disconnect). Envelope format specified in .docs/specs/ §9.10.2 (minimal outer envelope).
+- **~~Transport abstraction interface.~~** ✅ **Resolved.** ADR-005 specifies the `TransportAdapter` trait (send, subscribe, unsubscribe, query, delete). Envelope format specified in .docs/specs/ §9.10.2 (minimal outer envelope).
 - **~~SCP native relay protocol.~~** ✅ **Resolved.** ADR-004 specifies the relay: PUBLISH/SUBSCRIBE/UNSUBSCRIBE over WebSocket, blob TTL enforcement, recipient_hint for directed delivery.
 - **~~Sender-side key layer protocol (§9.16).~~** ✅ **Resolved.** Full specification in .docs/specs/ §9.16 (5 subsections). ADR-007 specifies implementation. AES-256-GCM sender keys, HPKE-wrapped per-recipient distribution using stable wrapping keypairs, block protocol, forward secrecy interaction.
 - **~~Per-context pseudonym derivation and verification protocol.~~** ✅ **Resolved.** Specified in .docs/specs/ §9.10.4. HMAC-SHA256 derivation, inside-encryption verification, caching.

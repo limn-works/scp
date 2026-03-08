@@ -23,6 +23,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use scp_platform::traits::Storage;
 
 use crate::error::ScpPyError;
 use crate::types::{encode_hex, json_to_py_dict};
@@ -176,9 +177,9 @@ impl PyCheckpoint {
 
 /// Queries the context event log.
 ///
-/// Returns metadata about the event log: current event count and the Merkle
-/// root hash. Direct event replay requires the full transport layer; this
-/// function provides verifiable log state information.
+/// Returns actual event data from the `ProtocolStore` when available,
+/// falling back to a `LogSummary` metadata event when storage is not
+/// initialized or no event payloads have been persisted.
 ///
 /// # Arguments
 ///
@@ -194,10 +195,9 @@ impl PyCheckpoint {
 ///
 /// # Returns
 ///
-/// A list of [`PyEvent`] objects. Currently returns a single summary event
-/// with the log's Merkle root and event count, since full event replay
-/// requires transport-layer event storage (events are hashed into the Merkle
-/// tree but the raw events are not stored in the in-memory tree structure).
+/// A list of [`PyEvent`] objects. Returns deserialized real events when
+/// event payloads have been persisted via `ProtocolStore`, or a single
+/// `LogSummary` event with Merkle root and event count as fallback.
 ///
 /// # Errors
 ///
@@ -205,6 +205,7 @@ impl PyCheckpoint {
 /// or if the query fails.
 ///
 /// See ADR-013 §7: `py_event_log_query(handle, filter) -> list[PyEvent]`.
+/// See GitHub issue #303.
 #[pyfunction]
 #[pyo3(name = "event_log_query", signature = (context_id, filter=None))]
 pub fn py_event_log_query(
@@ -220,21 +221,94 @@ pub fn py_event_log_query(
         Ok((count, encode_hex(&root)))
     })?;
 
-    // Apply limit filter if provided.
-    let limit = if let Some(f) = filter {
-        f.get_item("limit")?.and_then(|v| v.extract::<usize>().ok())
-    } else {
-        None
-    };
-
     // If the log is empty, return an empty list.
     if event_count == 0 {
         return Ok(Vec::new());
     }
 
-    // Build a summary event with log metadata. The Merkle tree stores leaf
-    // hashes, not raw events, so we return log state information. Full event
-    // replay will be available when events are persisted via the transport layer.
+    // Parse filter parameters from the Python dict.
+    let query_filter = parse_event_query_filter(filter)?;
+
+    // Attempt to load real events from storage if available.
+    // Uses the Storage trait directly because the global storage is
+    // Arc<InMemoryStorage> and ProtocolStore requires an owned Storage
+    // impl. The key convention matches ProtocolStore's event_data key
+    // format (GitHub issue #303).
+    if let Ok(storage) = crate::runtime::get_storage() {
+        let rt = crate::runtime()?;
+        let prefix = format!("context/{context_id}/event_data/");
+        let keys_result = rt.block_on(storage.list_keys(&prefix));
+
+        if let Ok(keys) = keys_result {
+            let seq_start = query_filter.sequence_start.unwrap_or(0);
+            let seq_end = query_filter.sequence_end.unwrap_or(event_count);
+            let start_suffix = format!("{seq_start:020}");
+            let end_suffix = format!("{seq_end:020}");
+
+            let mut py_events = Vec::new();
+            for key in &keys {
+                if let Some(seq_str) = key.strip_prefix(&prefix) {
+                    if seq_str >= end_suffix.as_str() {
+                        break;
+                    }
+                    if seq_str < start_suffix.as_str() {
+                        continue;
+                    }
+                    if let Ok(Some(data)) = rt.block_on(storage.retrieve(key)) {
+                        if let Ok(event) = rmp_serde::from_slice::<scp_event_log::Event>(&data) {
+                            // Apply additional filters.
+                            if let Some(ref et) = query_filter.event_type {
+                                if format!("{:?}", event.event_type) != *et {
+                                    continue;
+                                }
+                            }
+                            if let Some(ref actor) = query_filter.actor_did {
+                                if event.actor_did.0 != *actor {
+                                    continue;
+                                }
+                            }
+                            if let Some(ts_start) = query_filter.timestamp_start {
+                                if event.timestamp < ts_start {
+                                    continue;
+                                }
+                            }
+                            if let Some(ts_end) = query_filter.timestamp_end {
+                                if event.timestamp >= ts_end {
+                                    continue;
+                                }
+                            }
+
+                            let payload_json = serde_json::json!({
+                                "data": serde_json::to_value(&event.payload.data).unwrap_or_default(),
+                            });
+                            let payload = json_to_py_dict(py, &payload_json)?;
+
+                            #[allow(clippy::cast_precision_loss)]
+                            py_events.push(PyEvent {
+                                event_type: format!("{:?}", event.event_type),
+                                actor_did: event.actor_did.0.clone(),
+                                timestamp: event.timestamp as f64,
+                                payload,
+                                sequence: event.sequence,
+                            });
+
+                            if let Some(limit) = query_filter.limit {
+                                if py_events.len() >= limit {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !py_events.is_empty() {
+                return Ok(py_events);
+            }
+        }
+    }
+
+    // Fallback: Build a summary event with log metadata when ProtocolStore
+    // is unavailable or contains no event payloads for this context.
     let payload_json = serde_json::json!({
         "event_count": event_count,
         "merkle_root": merkle_root_hex,
@@ -256,11 +330,53 @@ pub fn py_event_log_query(
     let events = vec![summary_event];
 
     // Apply limit if specified.
-    if let Some(lim) = limit {
+    if let Some(lim) = query_filter.limit {
         Ok(events.into_iter().take(lim).collect())
     } else {
         Ok(events)
     }
+}
+
+/// Parses an `EventQueryFilter` from an optional Python dict.
+///
+/// Extracts filter fields from the dict if provided, mapping Python key
+/// names to the `EventQueryFilter` struct fields.
+fn parse_event_query_filter(
+    filter: Option<&Bound<'_, PyDict>>,
+) -> PyResult<scp_core::store::event_log::EventQueryFilter> {
+    let mut query_filter = scp_core::store::event_log::EventQueryFilter::default();
+
+    if let Some(f) = filter {
+        if let Some(v) = f.get_item("event_type")? {
+            query_filter.event_type = Some(v.extract::<String>()?);
+        }
+        if let Some(v) = f.get_item("actor_did")? {
+            query_filter.actor_did = Some(v.extract::<String>()?);
+        }
+        if let Some(v) = f.get_item("after_sequence")? {
+            query_filter.sequence_start = Some(v.extract::<u64>()?);
+        }
+        if let Some(v) = f.get_item("before_sequence")? {
+            query_filter.sequence_end = Some(v.extract::<u64>()?);
+        }
+        if let Some(v) = f.get_item("after_timestamp")? {
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            {
+                query_filter.timestamp_start = Some(v.extract::<f64>()? as u64);
+            }
+        }
+        if let Some(v) = f.get_item("before_timestamp")? {
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            {
+                query_filter.timestamp_end = Some(v.extract::<f64>()? as u64);
+            }
+        }
+        if let Some(v) = f.get_item("limit")? {
+            query_filter.limit = Some(v.extract::<usize>()?);
+        }
+    }
+
+    Ok(query_filter)
 }
 
 /// Verifies a claim against the context event log.
