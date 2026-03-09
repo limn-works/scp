@@ -808,7 +808,7 @@ Messages larger than 256KB are chunked. Padding happens below the application la
 
 ```
 ChunkEnvelope {
-  message_id:    [u8; 32]   // SHA-256(payload || sender_did || timestamp_be), unique per logical message
+  message_id:    [u8; 32]   // SHA-256("SCP-CHUNK-MSG-ID-V1:" || len(payload) || payload || len(sender_did) || sender_did || timestamp_be), unique per logical message
   chunk_index:   u32         // 0-indexed chunk position
   total_chunks:  u32         // total number of chunks in this message
   payload_hash:  [u8; 32]   // SHA-256 of the complete pre-chunked payload
@@ -818,7 +818,7 @@ ChunkEnvelope {
 
 _Rationale: `message_id` uses deterministic SHA-256 derivation (32 bytes) rather than random 16-byte generation. Deterministic derivation requires no coordination, enables idempotent retransmission detection, and 32 bytes provides full collision resistance. The `payload_hash` field enables the receiver to verify integrity of the reassembled payload without relying on application-layer checks. Field names (`message_id`, `chunk_index`, `data`) were chosen for clarity over the original (`chunk_id`, `sequence`, `payload`)._
 
-1. **Splitting.** The SDK derives `message_id = SHA-256(payload || sender_did_bytes || timestamp_be_bytes)` and `payload_hash = SHA-256(payload)`. The plaintext payload is split into fragments of at most `MAX_CHUNK_PAYLOAD_SIZE` bytes (largest bucket size minus 4-byte length suffix = 262,140 bytes). Each fragment is wrapped in a `ChunkEnvelope` with its `chunk_index` and the `total_chunks` count.
+1. **Splitting.** The SDK derives `message_id = SHA-256("SCP-CHUNK-MSG-ID-V1:" || BE32(len(payload)) || payload || BE32(len(sender_did_bytes)) || sender_did_bytes || timestamp_be_bytes)` and `payload_hash = SHA-256(payload)`. The domain separator `"SCP-CHUNK-MSG-ID-V1:"` prevents cross-protocol hash collisions, and the BE32 length prefixes on variable-length fields (`payload`, `sender_did_bytes`) prevent ambiguous concatenation. The plaintext payload is split into fragments of at most `MAX_CHUNK_PAYLOAD_SIZE` bytes (largest bucket size minus 4-byte length suffix = 262,140 bytes). Each fragment is wrapped in a `ChunkEnvelope` with its `chunk_index` and the `total_chunks` count.
 2. **Individual encryption.** Each `ChunkEnvelope` is independently encrypted as a separate MLS application message (in encrypted contexts) or a separate sender-key-encrypted message (in broadcast contexts). This means each chunk is individually authenticated (inner signature + MLS membership_tag or sender key AEAD) and individually padded to the nearest bucket boundary (§9.10.3). Individual encryption ensures that a relay cannot correlate chunks by ciphertext similarity — each chunk is an opaque, independently-sized blob.
 3. **Transmission.** Chunks are published as separate relay blobs. The relay treats each chunk as an independent message. Chunks MAY be published to different relays in the context's relay set for redundancy.
 4. **Reassembly.** The recipient decrypts each chunk individually, then reassembles by `message_id` + `chunk_index` ordering. The recipient maintains a per-`message_id` reassembly buffer. After concatenation, the receiver verifies `SHA-256(reassembled_payload) == payload_hash`; mismatches indicate corruption or tampering and MUST cause the message to be discarded.
