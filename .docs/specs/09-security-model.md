@@ -1391,3 +1391,183 @@ The content access key layer interacts with forward secrecy as follows:
 | Storage overhead | 40 bytes per recipient per message | Wrapped CEK = 32-byte CEK + 8-byte KW check value |
 
 For a context with 100 members, each message adds ~4KB of wrapped CEKs (100 × 40 bytes). For broadcast contexts with thousands of subscribers, the wrapped CEK map scales linearly but remains small relative to content size. Contexts with >10,000 members SHOULD use batched CEK wrapping (wrap once per batch of messages, not per message) to amortize the per-recipient cost.
+
+## 9.18 Protocol Constants Registry
+
+This section consolidates all protocol-level constants that independent implementations must agree on. Using different values for any of these constants will cause interoperability failures. Constants are grouped by subsystem with source references for traceability.
+
+### 9.18.1 Cryptographic Primitives
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Signature algorithm | Ed25519 (RFC 8032) | All DID keys, envelope signatures, UCAN, MLS leaf credentials | §9.5 |
+| MLS ciphersuite | MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 | RFC 9420 §17.1 | §9.5 |
+| HPKE suite (DID-to-DID) | DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM | RFC 9180 Base mode | §9.5 |
+| Key distribution HPKE | DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM | Same suite for sender key, access key, broadcast key | §9.5 |
+| Merkle tree hash | SHA-256 | RFC 6962 §2 construction | §9.5 |
+| Merkle leaf prefix | `0x00` | `SHA-256(0x00 \|\| event_data)` | §9.5 |
+| Merkle interior prefix | `0x01` | `SHA-256(0x01 \|\| left \|\| right)` | §9.5 |
+| Empty tree root | `SHA-256("")` = `e3b0c442...7852b855` | Hash of empty string | §9.5 |
+| CEK size | 32 bytes | AES-256 key for content encryption | §9.17 |
+| CEK wrapped overhead | 8 bytes | AES-256-KW check value | §9.17.7 |
+| HPKE nonce size | 12 bytes | Managed internally by RFC 9180 | §9.5 |
+| Ed25519 signature size | 64 bytes | Fixed | §9.5 |
+| Ed25519 public key size | 32 bytes | Fixed | §9.5 |
+| X25519 public key size | 32 bytes | Fixed | §9.5 |
+
+### 9.18.2 Domain Separators
+
+All domain separators are UTF-8 strings used as prefixes in canonical hash constructions (§9.5.1). Each separator identifies the struct type being hashed to prevent cross-protocol hash confusion.
+
+| Domain Separator | Used For | Spec Reference |
+|------------------|----------|----------------|
+| `"SCP-INNER-ENVELOPE-V1:"` | InnerEnvelope signing | §9.5.2 |
+| `"SCP-BROADCAST-ENVELOPE-V1:"` | BroadcastEnvelope signing | §9.5.2 |
+| `"SCP-EPOCH-ADVANCE-V1:"` | SenderKeyEpochAdvance signing | §9.5.2 |
+| `"SCP-KEY-REQUEST-V1:"` | SenderKeyRequest signing | §9.5.2 |
+| `"SCP-ATTESTATION-V1:"` | Attestation signing | §9.5.2 |
+| `"SCP-PARTICIPATION-V1:"` | ParticipationProfile signing | §9.5.2 |
+| `"SCP-PARTICIPATION-PROFILE-V1:"` | ParticipationProfile canonical hash | §9.5.2 |
+| `"SCP-BLOCK-NOTIFICATION-V1:"` | BlockNotification signing | §9.5.2 |
+| `"SCP-ACCESS-KEY-REQUEST-V1:"` | AccessKeyRequest signing | §9.5.2 |
+| `"SCP-VOTE-V1:"` | Governance vote signing | §6.4 |
+| `"SCP-PROPOSAL-V1:"` | Governance proposal ID computation | §6.4 |
+| `"SCP-MIGRATION-V1:"` | DID migration proof | §9.12 |
+| `"SCP-RESET-REQUEST-V1:"` | Sync reset request signing | §23.5.2 |
+| `"SCP-KEY-CONTINUITY-V1:"` | Key continuity fingerprint hash | §9.11 |
+| `"SCP-ABSENT-AGENT-KEY"` | Sentinel for absent `#agent` key in continuity fingerprint — `SHA-256("SCP-ABSENT-AGENT-KEY")` | §9.11 |
+| `"SCP-CHECKPOINT-V1:"` | Event log checkpoint hash | §11 |
+| `"SCP-EVENT-V1:"` | Event log entry hash | §11 |
+| `"SCP-EXPORT-ENTRY-V1:"` | Context export chain hash | §5.13 |
+| `"SCP-TOOL-REGISTRATION-V1:"` | Tool registration integrity hash | §6.2 |
+| `"SCP-KEY-DESTRUCTION-V1:"` | Key destruction proof | §9.15 |
+| `"SCP-CLAIM-V1:"` | Shadow identity claim validation | §12.3 |
+
+### 9.18.3 HPKE Info Strings
+
+HPKE `info` strings provide domain separation for key encapsulation operations. Each key distribution protocol uses a distinct prefix to prevent cross-protocol key confusion.
+
+| Info Prefix | Used For | Full Format | Spec Reference |
+|-------------|----------|-------------|----------------|
+| `"scp-sender-key-v1"` | Sender key HPKE encapsulation | `"scp-sender-key-v1" \|\| context_id \|\| sender_did \|\| epoch_BE` | §9.16.2 |
+| `"scp-access-key-v1"` | Access key HPKE encapsulation | `"scp-access-key-v1" \|\| BE32(len(context_id)) \|\| context_id \|\| BE32(len(member_did)) \|\| member_did \|\| epoch_bytes` | §9.17.1 |
+| `"scp-handle-tool-v1:"` | Handle tool request signing | `"scp-handle-tool-v1:" \|\| tool_name \|\| ":" \|\| canonical_json_bytes` | §22.3.1 |
+
+### 9.18.4 Key and Nonce Sizes
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Access key nonce size | 16 bytes | CSPRNG, prevents replay in access key requests | §9.17 |
+| Sender key request nonce size | 16 bytes | CSPRNG, prevents replay in key requests | §9.16.2 |
+| Member ID size | 8 bytes | Truncated SHA-256 of member DID | §9.17 |
+| AES-GCM nonce size | 12 bytes | For sender key and access key AEAD | §9.16, §9.17 |
+| Sender key size | 32 bytes | AES-256-GCM key | §9.16 |
+| Access key size | 32 bytes | AES-256 wrapping key | §9.17 |
+
+### 9.18.5 Envelope and Padding
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Padding bucket sizes | `[256, 1024, 4096, 16384, 65536, 262144]` | Payloads padded to next bucket boundary | §9.10 |
+| Max chunk payload size | 262140 bytes | Largest bucket (262144) minus 4-byte length suffix | §9.10 |
+| Length suffix size | 4 bytes | BE u32, appended before padding | §9.10 |
+
+### 9.18.6 Context and Governance
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Max nesting depth | 3 | Maximum parent-child context nesting levels | §5.13.8 |
+| Max tool interfaces per context | 256 | Hard cap on registered tool interfaces | §6.2 |
+| Ceiling change notification period | 86,400s (24h) | Members notified before ceiling change takes effect | §5.6 |
+| Freeze timeout | 172,800s (48h) | Frozen context auto-unfreezes after this period | §5.6 |
+| Default context verification window | 300s (5 min) | Grace period for context close verification | §5.6 |
+| Default session cap per caller | 5 | Max concurrent tool sessions per source context | §6.2 |
+| Tool lifecycle default timeout | 30,000ms (30s) | Default tool invocation timeout | §6.2 |
+| Tool lifecycle max timeout | 300,000ms (5 min) | Hard protocol maximum for tool invocation timeout | §6.2 |
+| Min active voters for fallback | 2 | Minimum voters for governance timeout fallback | §6.4 |
+
+### 9.18.7 MLS and UCAN
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Max grace epochs | 100 | Maximum MLS epochs retained for grace-period decryption | §9.7 |
+| Grace window duration | 30s | Time window for accepting messages from prior epochs | §9.7 |
+| UCAN max expiry | 86,400s (24h) | Maximum UCAN token lifetime; matches nonce dedup cache | §9.8.2 |
+| UCAN nonce freshness tolerance | 300,000ms (5 min) | Clock skew tolerance for UCAN nonce timestamps | §9.8.2 |
+| UCAN nonce prune expiry grace | 300s (5 min) | Grace period before expired nonces are garbage collected | §9.8.2 |
+| Default UCAN revocation TTL | 30s | Default TTL for revocation propagation confirmation | §9.8.2 |
+| CID version | CIDv1 (prefix `0x01`) | For UCAN token identification | §9.5 |
+| CID hash algorithm | SHA-256 (multihash `0x12`) | 32-byte digest | §9.5 |
+| CID content codec | DAG-CBOR (`0x71`) | Canonical CBOR encoding | §9.5 |
+| CID multibase encoding | base32lower (prefix `b`) | For display; raw bytes on wire | §9.5 |
+
+### 9.18.8 Sender Key Protocol
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Sender key grace period | 30s | Window for accepting messages with pre-rotation keys | §9.16 |
+| Sender key timeout | 60s | Timeout for sender key request/response exchange | §9.16.2 |
+
+### 9.18.9 Sync and Offline Recovery
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Tier 1 threshold (minutes offline) | 14,400s (4h) | Below: sequential commit replay | §23 |
+| Tier 2 threshold (days offline) | 604,800s (7d) | Below: snapshot + delta; above: full reset | §23 |
+| Max sequential commits | 100 epochs | Maximum epochs replayed sequentially in Tier 1 | §23 |
+| Commit process timeout | 5s | Timeout for individual commit processing | §23 |
+| Reconnection dedup window | 30s | Deduplication window for reconnection messages | §23 |
+| Gap timeout | 30s | Timeout waiting for missing epochs before escalating | §23 |
+| Default snapshot interval | 14,400s (4h) | How often Tier 2 snapshots are generated | §23 |
+| Reset welcome timeout | 60s | Timeout for receiving MLS Welcome after reset request | §23.5 |
+| Max epoch drift (Tier 3) | 1,000 epochs | Maximum epoch gap before requiring full reset | §23.5 |
+| Reset request nonce cache | 10,000 entries | Anti-replay cache for reset request nonces | §23.5 |
+| Max inflight reset queue | 500 | Maximum concurrent pending reset requests | §23.5 |
+
+### 9.18.10 Event Log
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Checkpoint event interval | 50 events | Events between automatic checkpoints | §11 |
+| Checkpoint time interval | 600s (10 min) | Time between automatic checkpoints | §11 |
+| Hot tier age threshold | 604,800s (7d) | Events older than this move to cold tier | §11 |
+| Max hot events | 10,000 | Maximum events retained in hot tier | §11 |
+| Max hot bytes | 52,428,800 (50 MiB) | Maximum bytes retained in hot tier | §11 |
+| Min retention (prune) | 2,592,000s (30d) | Minimum event retention before pruning is allowed | §11 |
+
+### 9.18.11 Transport and Relay
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Default blob TTL | 3,600s (1h) | Default time-to-live for stored blobs | §10.5 |
+| Min blob TTL | 1s | Minimum allowable blob TTL | §10.5 |
+| Max blob TTL | 604,800s (7d) | Maximum allowable blob TTL | §10.5 |
+| Max ref ID length | 64 bytes | Maximum length of message reference IDs | §10.5 |
+| Default query limit | 100 messages | Default message batch size for queries | §10.5 |
+| Max query limit | 1,000 messages | Maximum message batch size for queries | §10.5 |
+| Ping interval | 30s | Client-to-relay keepalive interval | §10.5 |
+| Max reconnect attempts | 6 | Maximum consecutive reconnection attempts | §10.5 |
+| Reconnect overlap | 5s | Overlap window during relay reconnection for gap-filling | §10.5 |
+| Relay timestamp deviation threshold | 60s | Maximum acceptable clock skew between client and relay | §10.5 |
+
+### 9.18.12 Bridge
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Max shadows per bridge | 10,000 | Maximum shadow identities per bridge connector | §12.3 |
+
+### 9.18.13 Discovery and Addressing
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Handle max length | 64 characters | Maximum `local-part` length for handles | §22.2 |
+| Handle charset | `[a-z0-9._-]` | Allowed characters in handle local-part | §22.2 |
+| Domain handle cache TTL | 3,600s (1h) | Resolution cache lifetime for domain handles | §22.8.4 |
+| Discovery handle cache TTL | 900s (15 min) | Resolution cache lifetime for discovery context handles | §22.8.4 |
+| Petname cache TTL | 31,536,000s (1 year) | Resolution cache lifetime for petnames | §22.8.4 |
+| Attestation handle cache TTL | 86,400s (24h) | Resolution cache lifetime for attestation handles | §22.8.4 |
+| Discovery cache default capacity | 10,000 entries | Default capacity for the resolution cache | §22.8.4 |
+| Max discovery context writers | 500 | Maximum writer members in a discovery context | §22.3 |
+| Push platform tag: APNS | `0x01` | Platform tag byte for Apple Push Notification Service | §10.7.1 |
+| Push platform tag: FCM | `0x02` | Platform tag byte for Firebase Cloud Messaging | §10.7.1 |
+| Push platform tag: WebPush | `0x03` | Platform tag byte for Web Push API | §10.7.1 |
