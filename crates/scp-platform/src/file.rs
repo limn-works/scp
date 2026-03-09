@@ -379,7 +379,10 @@ impl FileKeyCustody {
         key_type: StoredKeyType,
         private_key: &[u8; KEY_LEN],
     ) -> Result<usize, PlatformError> {
-        let _lock = self.file_write_lock.lock().expect("file write lock poisoned");
+        let _lock = self
+            .file_write_lock
+            .lock()
+            .expect("file write lock poisoned");
         let mut data = self.read_file()?;
 
         // Read current entry count.
