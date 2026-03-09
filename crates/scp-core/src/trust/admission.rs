@@ -169,7 +169,7 @@ mod tests {
         s.parse().unwrap()
     }
 
-    /// A current time that is before the verification's expires_at.
+    /// A current time that is before the verification's `expires_at`.
     const NOW: u64 = 1_700_000_100;
 
     #[test]

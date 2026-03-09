@@ -123,6 +123,8 @@ impl ContextCryptoProvider for MockCrypto {
         _ctx_id: &[u8; 32],
         _sender_did: &str,
         payload: &[u8],
+        _epoch: u64,
+        _sequence: u64,
     ) -> Result<Vec<u8>, ContextError> {
         self.messages_encrypted
             .lock()

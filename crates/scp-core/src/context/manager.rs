@@ -1643,67 +1643,16 @@ impl ContextManager {
             None
         };
 
-        // Extract threshold signers and value from GovernanceModelConfig before
-        // it is consumed by build_governance_engine (ADR-031).
-        let (initial_threshold_signers, initial_threshold_value) = match &governance_config {
-            GovernanceModelConfig::Threshold { signers, threshold, .. } => {
-                (signers.clone(), *threshold)
-            }
-            _ => (Vec::new(), 0),
-        };
-
-        // Construct the governance engine from the explicit config (SCP-267).
-        let governance_engine = build_governance_engine(
-            governance_config,
-            vec![creator_did.clone()],
-            self.key_resolver.clone(),
-        )?;
-
-        // Mint GovernancePropose and GovernanceVote UCAN tokens for designated
-        // voters per ADR-031 §6 and store them in role_state so voters have
-        // GovernancePropose/GovernanceVote capabilities.
-        let governance_tokens =
-            mint_governance_tokens(&context_id, &creator_did, governance_engine.as_ref());
-
-        let mut role_state = role_state;
-        for token in &governance_tokens {
-            let caps = role_state
-                .member_capabilities
-                .entry(token.aud.clone())
-                .or_default();
-            for att in &token.att {
-                if att.with.ends_with("/GovernancePropose") {
-                    caps.insert(Capability::GovernancePropose);
-                } else if att.with.ends_with("/GovernanceVote") {
-                    caps.insert(Capability::GovernanceVote);
-                }
-            }
-        }
-
-        let per_context = PerContextState {
-            handle: handle.clone(),
+        let per_context = self.build_governed_context_state(
+            handle.clone(),
+            &context_id,
+            &params,
+            &creator_did,
             membership,
             role_state,
-            receive_buffer: ReceiveBuffer::new(),
-            ttl_timer: TtlTimer::new(),
-            ttl_extension: None,
             broadcast_context,
-            executed_proposals: HashSet::new(),
-            registered_tools: Vec::new(),
-            write_revoked_members: HashSet::new(),
-            read_revoked_members: HashSet::new(),
-            read_exclusion_list: HashSet::new(),
-            tool_interfaces: Vec::new(),
-            threshold_signers: initial_threshold_signers,
-            threshold_value: initial_threshold_value,
-            pruning_policy: None,
-            approved_proposals: HashMap::new(),
-            governance_freeze: None,
-            governance_engine,
-            economic_policy: params.economic_policy.clone(),
-            governance_timeout_task: GovernanceTimeoutTask::new(),
-            pending_ceiling_modification: None,
-        };
+            governance_config,
+        )?;
 
         // Atomic duplicate check + insert under lock.
         {
@@ -1742,6 +1691,83 @@ impl ContextManager {
         Ok(handle)
     }
 
+    /// Builds a [`PerContextState`] with governance engine, tokens, and threshold
+    /// signers extracted from the governance config. Helper for
+    /// [`create_context_with_governance`] to stay under the line-count lint.
+    #[allow(clippy::too_many_arguments)] // internal helper, not public API
+    fn build_governed_context_state(
+        &self,
+        handle: ContextHandle,
+        context_id: &str,
+        params: &ContextParams,
+        creator_did: &DID,
+        membership: MembershipState,
+        role_state: ContextRoleState,
+        broadcast_context: Option<BroadcastContext>,
+        governance_config: GovernanceModelConfig,
+    ) -> Result<PerContextState, ContextCreationError> {
+        // Extract threshold signers and value from GovernanceModelConfig before
+        // it is consumed by build_governance_engine (ADR-031).
+        let (initial_threshold_signers, initial_threshold_value) = match &governance_config {
+            GovernanceModelConfig::Threshold { signers, threshold, .. } => {
+                (signers.clone(), *threshold)
+            }
+            _ => (Vec::new(), 0),
+        };
+
+        // Construct the governance engine from the explicit config (SCP-267).
+        let governance_engine = build_governance_engine(
+            governance_config,
+            vec![creator_did.clone()],
+            self.key_resolver.clone(),
+        )?;
+
+        // Mint GovernancePropose and GovernanceVote UCAN tokens for designated
+        // voters per ADR-031 §6 and store them in role_state.
+        let governance_tokens =
+            mint_governance_tokens(context_id, creator_did, governance_engine.as_ref());
+
+        let mut role_state = role_state;
+        for token in &governance_tokens {
+            let caps = role_state
+                .member_capabilities
+                .entry(token.aud.clone())
+                .or_default();
+            for att in &token.att {
+                if att.with.ends_with("/GovernancePropose") {
+                    caps.insert(Capability::GovernancePropose);
+                } else if att.with.ends_with("/GovernanceVote") {
+                    caps.insert(Capability::GovernanceVote);
+                }
+            }
+        }
+
+        Ok(PerContextState {
+            handle,
+            membership,
+            role_state,
+            receive_buffer: ReceiveBuffer::new(),
+            ttl_timer: TtlTimer::new(),
+            ttl_extension: None,
+            broadcast_context,
+            executed_proposals: HashSet::new(),
+            registered_tools: Vec::new(),
+            write_revoked_members: HashSet::new(),
+            read_revoked_members: HashSet::new(),
+            read_exclusion_list: HashSet::new(),
+            tool_interfaces: Vec::new(),
+            threshold_signers: initial_threshold_signers,
+            threshold_value: initial_threshold_value,
+            pruning_policy: None,
+            approved_proposals: HashMap::new(),
+            governance_freeze: None,
+            governance_engine,
+            economic_policy: params.economic_policy.clone(),
+            governance_timeout_task: GovernanceTimeoutTask::new(),
+            pending_ceiling_modification: None,
+        })
+    }
+
     /// Joins a member to a context.
     ///
     /// Validates the joiner's key package, adds to MLS group (ADR-001),
@@ -1772,6 +1798,30 @@ impl ContextManager {
             .add_member(&context_id_bytes, &member_did, kp_bytes)?;
         self.crypto
             .distribute_sender_key(&context_id_bytes, &member_did)?;
+
+        // Drain pending HPKE-sealed sender key distribution messages.
+        // These are SenderKeyResponse payloads that need to be delivered
+        // to the target member via transport (§9.16.2).
+        let pending = self
+            .crypto
+            .drain_pending_sender_key_messages(&context_id_bytes)?;
+        for (target_did, message) in pending {
+            tracing::debug!(
+                target_did = %target_did,
+                context_id = %context_id,
+                message_len = message.len(),
+                "sending sender key distribution message"
+            );
+            if let Err(e) = self.transport.send_message(&context_id_bytes, &message) {
+                tracing::warn!(
+                    target_did = %target_did,
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to send sender key distribution message — \
+                     recipient must request key via SenderKeyRequest"
+                );
+            }
+        }
 
         // Atomic state check + mutation: verify Active, then role assignment +
         // membership + event buffer, all within a single lock acquisition.
@@ -2985,13 +3035,10 @@ impl ContextManager {
             if !freeze_events.is_empty() {
                 let cid_bytes = context_id_to_bytes(context_id);
                 for event in &freeze_events {
-                    match event {
-                        GovernanceEvent::ConflictResolved { .. } => {
-                            let _ = self
-                                .event_log
-                                .append_context_event(&cid_bytes, "GovernanceFreezeExpired");
-                        }
-                        _ => {}
+                    if let GovernanceEvent::ConflictResolved { .. } = event {
+                        let _ = self
+                            .event_log
+                            .append_context_event(&cid_bytes, "GovernanceFreezeExpired");
                     }
                 }
             }
@@ -4147,16 +4194,14 @@ impl ContextManager {
 
             // Extend the TTL deadline and compute the remaining duration
             // for the replacement timer task.
-            let remaining_secs = if let Some(ref mut deadline) = ctx.ttl_timer.deadline_unix_secs {
+            let remaining_secs = ctx.ttl_timer.deadline_unix_secs.as_mut().map(|deadline| {
                 *deadline = deadline.saturating_add(additional_secs);
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                Some(deadline.saturating_sub(now))
-            } else {
-                None
-            };
+                deadline.saturating_sub(now)
+            });
 
             // Reset the cancel signal so the replacement timer task can be
             // cancelled independently of the old one.
@@ -12639,21 +12684,22 @@ mod tests {
             noop_key_resolver(),
         );
         let mut params = governance_params();
+        // Only creator is an initial signer; signer3 will be added dynamically.
         params.governance = GovernanceModel::Threshold {
             threshold: 1,
-            signers: vec!["did:key:creator".into(), "did:key:signer2".into()],
+            signers: vec!["did:key:creator".into()],
         };
         let _handle = manager
             .create_context("rm-signer-ctx".into(), params, "did:key:creator".into())
             .await
             .unwrap();
 
-        // Add signer2 as member, then grant signer role.
+        // Add signer3 as member, then grant signer role.
         let add = approved_proposal(
             [50u8; 32],
             "rm-signer-ctx",
             GovernanceAction::AddMember {
-                did: "did:key:signer2".into(),
+                did: "did:key:signer3".into(),
                 role: "member".to_owned(),
             },
             &["did:key:creator"],
@@ -12667,7 +12713,7 @@ mod tests {
             [51u8; 32],
             "rm-signer-ctx",
             GovernanceAction::AddSigner {
-                did: "did:key:signer2".into(),
+                did: "did:key:signer3".into(),
             },
             &["did:key:creator"],
         );
@@ -12676,24 +12722,24 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify signer2 has governance capabilities.
+        // Verify signer3 has governance capabilities.
         {
             let contexts = manager.contexts.lock().await;
             let ctx = contexts.get("rm-signer-ctx").unwrap();
             let caps = ctx
                 .role_state
                 .member_capabilities
-                .get("did:key:signer2")
-                .expect("signer2 should have capabilities");
+                .get("did:key:signer3")
+                .expect("signer3 should have capabilities");
             assert!(caps.contains(&Capability::GovernanceVote));
         }
 
-        // Remove signer2.
+        // Remove signer3.
         let rm = approved_proposal(
             [52u8; 32],
             "rm-signer-ctx",
             GovernanceAction::RemoveSigner {
-                did: "did:key:signer2".into(),
+                did: "did:key:signer3".into(),
             },
             &["did:key:creator"],
         );
@@ -12705,12 +12751,12 @@ mod tests {
         // Verify governance capabilities were revoked.
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("rm-signer-ctx").unwrap();
-        if let Some(caps) = ctx.role_state.member_capabilities.get("did:key:signer2") {
+        if let Some(caps) = ctx.role_state.member_capabilities.get("did:key:signer3") {
             assert!(!caps.contains(&Capability::GovernancePropose));
             assert!(!caps.contains(&Capability::GovernanceVote));
         }
         assert!(
-            ctx.membership.contains("did:key:signer2"),
+            ctx.membership.contains("did:key:signer3"),
             "should remain a member"
         );
     }

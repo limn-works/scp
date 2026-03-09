@@ -727,6 +727,23 @@ fn verify_statement_signature(
 /// This is the core protocol operation where a context produces a profile
 /// attesting to a member's verifiable participation facts. Key properties:
 ///
+/// Inputs for [`produce_participation_profile`].
+///
+/// Groups the event log snapshot and membership preconditions to keep the
+/// function signature under the 7-argument clippy limit.
+pub struct ParticipationInput<'a> {
+    /// The context's event log entries.
+    pub events: &'a [Event],
+    /// Merkle root of the event log at computation time.
+    pub merkle_root: [u8; 32],
+    /// Whether `member_did` is a current member of the context.
+    pub is_member: bool,
+    /// Whether `member_did` has opted in to profile publication.
+    pub is_opted_in: bool,
+    /// Unix timestamp (seconds) for `updated_at`.
+    pub current_time: u64,
+}
+
 /// - **Context-controlled:** Only contexts produce profiles; agents cannot
 ///   write, modify, or delete them.
 /// - **Privacy-preserving:** The profile omits `context_id`. The signing key
@@ -743,17 +760,13 @@ fn verify_statement_signature(
 ///   This ensures the same key material produces different signing keys for
 ///   different contexts, preventing cross-context signer correlation.
 /// - `member_did` — The DID of the member to produce the profile for.
-/// - `events` — The context's event log entries.
-/// - `merkle_root` — Merkle root of the event log at computation time.
-/// - `is_member` — Whether `member_did` is a current member of the context.
-/// - `is_opted_in` — Whether `member_did` has opted in to profile publication.
-/// - `current_time` — Unix timestamp (seconds) for `updated_at`.
+/// - `input` — Event log snapshot and membership preconditions.
 ///
 /// # Errors
 ///
-/// - [`TrustError::NotAMember`] if `is_member` is false.
-/// - [`TrustError::NotOptedIn`] if `is_opted_in` is false.
-/// - [`TrustError::EmptyEventLog`] if `events` is empty.
+/// - [`TrustError::NotAMember`] if `input.is_member` is false.
+/// - [`TrustError::NotOptedIn`] if `input.is_opted_in` is false.
+/// - [`TrustError::EmptyEventLog`] if `input.events` is empty.
 /// - [`TrustError::InvalidEventData`] if HKDF key derivation fails.
 ///
 /// See §7.3.2.1.
@@ -761,21 +774,17 @@ pub fn produce_participation_profile(
     context_key_material: &[u8; 32],
     context_id: &str,
     member_did: &str,
-    events: &[Event],
-    merkle_root: [u8; 32],
-    is_member: bool,
-    is_opted_in: bool,
-    current_time: u64,
+    input: &ParticipationInput<'_>,
 ) -> Result<ParticipationProfile, TrustError> {
     use ed25519_dalek::Signer;
 
-    if !is_member {
+    if !input.is_member {
         return Err(TrustError::NotAMember {
             did: member_did.to_owned(),
         });
     }
 
-    if !is_opted_in {
+    if !input.is_opted_in {
         return Err(TrustError::NotOptedIn {
             did: member_did.to_owned(),
         });
@@ -784,8 +793,13 @@ pub fn produce_participation_profile(
     // Compute participation facts from the event log. We use a dummy
     // context_id for the record since ParticipationProfile intentionally
     // omits it — the real context_id is only used for key derivation.
-    let record =
-        compute_participation_record(events, member_did, "_internal", merkle_root, current_time)?;
+    let record = compute_participation_record(
+        input.events,
+        member_did,
+        "_internal",
+        input.merkle_root,
+        input.current_time,
+    )?;
 
     // Derive the context-specific signing key using the unified public API.
     // This uses HKDF-SHA256 with context_id as salt, ensuring the same
@@ -805,8 +819,8 @@ pub fn produce_participation_profile(
         context_creation_count: record.context_creation_count,
         role_progression_count: record.role_history.len() as u64,
         attestation_count: record.attestation_history.len() as u64,
-        updated_at: current_time,
-        event_log_root: merkle_root,
+        updated_at: input.current_time,
+        event_log_root: input.merkle_root,
         signer_public_key: verifying_key.to_bytes(),
         signature: [0u8; 64], // placeholder, overwritten below
     };
@@ -1992,11 +2006,13 @@ mod tests {
             &key_material,
             "ctx-test",
             "did:key:alice",
-            &events,
-            merkle_root,
-            true,
-            true,
-            5000,
+            &ParticipationInput {
+                events: &events,
+                merkle_root,
+                is_member: true,
+                is_opted_in: true,
+                current_time: 5000,
+            },
         )
         .unwrap();
 
@@ -2023,11 +2039,13 @@ mod tests {
             &key_material,
             "ctx-test",
             "did:key:alice",
-            &events,
-            [0; 32],
-            true,
-            true,
-            5000,
+            &ParticipationInput {
+                events: &events,
+                merkle_root: [0; 32],
+                is_member: true,
+                is_opted_in: true,
+                current_time: 5000,
+            },
         )
         .unwrap();
 
@@ -2044,11 +2062,13 @@ mod tests {
             &[0u8; 32],
             "ctx-test",
             "did:key:alice",
-            &events,
-            [0; 32],
-            false, // not a member
-            true,
-            5000,
+            &ParticipationInput {
+                events: &events,
+                merkle_root: [0; 32],
+                is_member: false, // not a member
+                is_opted_in: true,
+                current_time: 5000,
+            },
         );
         match result {
             Err(TrustError::NotAMember { did }) => assert_eq!(did, "did:key:alice"),
@@ -2063,11 +2083,13 @@ mod tests {
             &[0u8; 32],
             "ctx-test",
             "did:key:alice",
-            &events,
-            [0; 32],
-            true,
-            false, // not opted in
-            5000,
+            &ParticipationInput {
+                events: &events,
+                merkle_root: [0; 32],
+                is_member: true,
+                is_opted_in: false, // not opted in
+                current_time: 5000,
+            },
         );
         match result {
             Err(TrustError::NotOptedIn { did }) => assert_eq!(did, "did:key:alice"),
@@ -2084,11 +2106,13 @@ mod tests {
             &key_material,
             "ctx-alpha",
             "did:key:alice",
-            &events,
-            [0; 32],
-            true,
-            true,
-            5000,
+            &ParticipationInput {
+                events: &events,
+                merkle_root: [0; 32],
+                is_member: true,
+                is_opted_in: true,
+                current_time: 5000,
+            },
         )
         .unwrap();
 
@@ -2096,11 +2120,13 @@ mod tests {
             &key_material,
             "ctx-beta",
             "did:key:alice",
-            &events,
-            [0; 32],
-            true,
-            true,
-            5000,
+            &ParticipationInput {
+                events: &events,
+                merkle_root: [0; 32],
+                is_member: true,
+                is_opted_in: true,
+                current_time: 5000,
+            },
         )
         .unwrap();
 
@@ -2119,11 +2145,13 @@ mod tests {
             &key_material,
             "ctx-test",
             "did:key:alice",
-            &events,
-            [0; 32],
-            true,
-            true,
-            5000,
+            &ParticipationInput {
+                events: &events,
+                merkle_root: [0; 32],
+                is_member: true,
+                is_opted_in: true,
+                current_time: 5000,
+            },
         )
         .unwrap();
 
@@ -2131,11 +2159,13 @@ mod tests {
             &key_material,
             "ctx-test",
             "did:key:alice",
-            &events,
-            [0; 32],
-            true,
-            true,
-            6000,
+            &ParticipationInput {
+                events: &events,
+                merkle_root: [0; 32],
+                is_member: true,
+                is_opted_in: true,
+                current_time: 6000,
+            },
         )
         .unwrap();
 
@@ -2154,11 +2184,13 @@ mod tests {
             &key_material,
             "ctx-test",
             "did:key:alice",
-            &events,
-            [0; 32],
-            true,
-            true,
-            5000,
+            &ParticipationInput {
+                events: &events,
+                merkle_root: [0; 32],
+                is_member: true,
+                is_opted_in: true,
+                current_time: 5000,
+            },
         )
         .unwrap();
 
@@ -2175,11 +2207,13 @@ mod tests {
             &key_material,
             "ctx-test",
             "did:key:alice",
-            &events,
-            [1; 32],
-            true,
-            true,
-            6000,
+            &ParticipationInput {
+                events: &events,
+                merkle_root: [1; 32],
+                is_member: true,
+                is_opted_in: true,
+                current_time: 6000,
+            },
         )
         .unwrap();
 
@@ -2202,11 +2236,13 @@ mod tests {
             &key_material,
             "ctx-test",
             "did:key:alice",
-            &events,
-            [0; 32],
-            true,
-            true,
-            5000,
+            &ParticipationInput {
+                events: &events,
+                merkle_root: [0; 32],
+                is_member: true,
+                is_opted_in: true,
+                current_time: 5000,
+            },
         )
         .unwrap();
 

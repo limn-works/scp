@@ -261,6 +261,8 @@ impl ContextCryptoProvider for FfiBridgeCrypto {
         _context_id: &[u8; 32],
         _sender_did: &str,
         payload: &[u8],
+        _epoch: u64,
+        _sequence: u64,
     ) -> Result<Vec<u8>, ContextError> {
         // Pass-through: real encryption is handled by MLS/sender key layer.
         Ok(payload.to_vec())

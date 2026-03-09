@@ -694,6 +694,7 @@ fn extract_test_vectors(
 #[pyo3(name = "tool_invoke_cross_context")]
 #[pyo3(signature = (source_context_id, target_context_id, tool_id, input, invoker_did, ucan_token, chain_depth, proof_tokens=None))]
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
+#[allow(clippy::too_many_arguments)] // FFI boundary: PyO3 requires explicit params
 pub fn py_tool_invoke_cross_context(
     py: Python<'_>,
     source_context_id: &str,

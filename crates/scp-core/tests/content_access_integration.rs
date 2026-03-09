@@ -124,6 +124,8 @@ impl ContextCryptoProvider for MockCrypto {
         _id: &[u8; 32],
         _sender_did: &str,
         _payload: &[u8],
+        _epoch: u64,
+        _sequence: u64,
     ) -> Result<Vec<u8>, ContextError> {
         Ok(vec![0xAA])
     }

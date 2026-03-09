@@ -41,7 +41,7 @@ const KEY_TYPE_X25519: u8 = 1;
 /// Consolidated in-memory key store protected by a single mutex.
 ///
 /// Eliminates TOCTOU gaps and lock-ordering deadlock risks that arise from
-/// three independent mutexes (key_types, ed25519_keys, x25519_keys).
+/// three independent mutexes (`key_types`, `ed25519_keys`, `x25519_keys`).
 struct SqliteKeyStore {
     /// Key type lookup, indexed by handle ID.
     key_types: HashMap<u64, u8>,
@@ -213,7 +213,7 @@ impl SqliteKeyCustody {
 
 // Trait uses RPITIT with explicit `+ Send` bound; async fn in trait
 // does not guarantee Send futures, so manual impl Future is required.
-#[allow(clippy::manual_async_fn)]
+#[allow(clippy::manual_async_fn, clippy::significant_drop_tightening)]
 impl KeyCustody for SqliteKeyCustody {
     fn generate_keypair(
         &self,

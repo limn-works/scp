@@ -194,7 +194,7 @@ impl StdioMcpTransport {
     fn spawn(command: &[String]) -> Result<Self, String> {
         let (cmd, args) = command
             .split_first()
-            .ok_or("command list is empty".to_owned())?;
+            .ok_or_else(|| "command list is empty".to_owned())?;
 
         // Validate the command against the stdio allowlist (defense-in-depth).
         // Uses the validated basename for Command::new to prevent path bypass.

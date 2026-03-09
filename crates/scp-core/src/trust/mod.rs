@@ -121,7 +121,7 @@ pub use participation::{
     PARTICIPATION_STATEMENTS_SERVICE_TYPE, ParticipationAdmissionError, ParticipationFact,
     ParticipationProfile, ParticipationRecord, ParticipationThreshold, RequireParticipation,
     add_participation_service, derive_participation_signing_key,
-    extract_participation_service_endpoint, produce_participation_profile,
+    ParticipationInput, extract_participation_service_endpoint, produce_participation_profile,
     remove_participation_service, verify_participation_requirements,
 };
 pub use renewal::{DefaultRenewalChecker, RenewalChecker, RenewalError, renew_attestation};
@@ -283,7 +283,7 @@ pub enum TrustError {
 
     /// The challenge request's Ed25519 signature is invalid, indicating the
     /// request may have been tampered with (e.g., extended timeout, changed
-    /// subject_did).
+    /// `subject_did`).
     #[error("challenge request signature invalid: {reason}")]
     ChallengeRequestSignatureInvalid {
         /// Human-readable description of the failure.

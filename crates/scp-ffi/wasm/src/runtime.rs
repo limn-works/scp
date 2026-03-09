@@ -226,7 +226,8 @@ impl WasmEventLog {
                 if i + 1 < current_layer.len() {
                     parents.push(hash_pair(&current_layer[i], &current_layer[i + 1]));
                 } else {
-                    parents.push(hash_pair(&current_layer[i], &current_layer[i]));
+                    // RFC 6962: odd node is promoted, not duplicated.
+                    parents.push(current_layer[i]);
                 }
                 i += 2;
             }
@@ -357,12 +358,8 @@ pub fn prove_inclusion(log: &WasmEventLog, leaf_index: u64) -> Result<InclusionP
             sibling_hash: leaves[sibling_idx],
             direction,
         });
-    } else {
-        path.push(ProofStep {
-            sibling_hash: leaves[idx],
-            direction: Direction::Right,
-        });
     }
+    // Odd node: no proof step needed — node is promoted per RFC 6962.
 
     idx /= 2;
 
@@ -379,12 +376,8 @@ pub fn prove_inclusion(log: &WasmEventLog, leaf_index: u64) -> Result<InclusionP
                 sibling_hash: layer[sibling_idx],
                 direction,
             });
-        } else {
-            path.push(ProofStep {
-                sibling_hash: layer[idx],
-                direction: Direction::Right,
-            });
         }
+        // Odd node: no proof step needed — node is promoted per RFC 6962.
         idx /= 2;
     }
 

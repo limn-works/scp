@@ -331,6 +331,8 @@ impl ContextCryptoProvider for NoOpCryptoProvider {
         _context_id: &[u8; 32],
         _sender_did: &str,
         payload: &[u8],
+        _epoch: u64,
+        _sequence: u64,
     ) -> Result<Vec<u8>, ContextError> {
         // Return payload as-is (no real encryption at bridge layer).
         Ok(payload.to_vec())

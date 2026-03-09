@@ -36,7 +36,7 @@ use super::padding::BUCKET_SIZES;
 pub const MAX_CHUNK_PAYLOAD_SIZE: usize = BUCKET_SIZES[BUCKET_SIZES.len() - 1] - 4;
 
 /// Maximum number of chunks per message. Limits total reassembled message size
-/// to approximately 64 GB (MAX_CHUNK_PAYLOAD_SIZE * 262_144), which is far
+/// to approximately 64 GB (`MAX_CHUNK_PAYLOAD_SIZE` * 262,144), which is far
 /// beyond any realistic protocol message.
 pub const MAX_TOTAL_CHUNKS: u32 = 262_144;
 
@@ -86,7 +86,7 @@ pub struct ChunkEnvelope {
     pub payload_hash: [u8; 32],
 
     /// The chunk's payload bytes. At most [`MAX_CHUNK_PAYLOAD_SIZE`] bytes.
-    /// Uses `serde_bytes` for efficient MessagePack binary encoding.
+    /// Uses `serde_bytes` for efficient `MessagePack` binary encoding.
     #[serde(with = "crate::serde_util::serde_bounded_bytes")]
     pub data: Vec<u8>,
 }
@@ -152,7 +152,9 @@ pub fn split_into_chunks(
         .chunks(MAX_CHUNK_PAYLOAD_SIZE)
         .enumerate()
         .map(|(i, chunk_data)| {
-            let chunk_index = i as u32; // Safe: total_chunks <= MAX_TOTAL_CHUNKS < u32::MAX.
+            // Safety: total_chunks <= MAX_TOTAL_CHUNKS (262,144) < u32::MAX
+            #[allow(clippy::cast_possible_truncation)]
+            let chunk_index = i as u32;
             ChunkEnvelope {
                 message_id,
                 chunk_index,
@@ -177,7 +179,7 @@ pub fn split_into_chunks(
 /// - All chunks must share the same `message_id`.
 /// - All chunks must agree on `total_chunks` and `payload_hash`.
 /// - Exactly `total_chunks` distinct `chunk_index` values must be present
-///   (0..total_chunks).
+///   `(0..total_chunks)`.
 /// - No duplicate `chunk_index` values.
 ///
 /// After concatenation the reassembled payload's SHA-256 hash is verified
@@ -284,7 +286,7 @@ pub fn reassemble_chunks(chunks: &[ChunkEnvelope]) -> Result<Vec<u8>, EnvelopeEr
 /// Returns `true` if `payload` is too large for a single bucket and must be
 /// chunked before transmission.
 #[must_use]
-pub fn needs_chunking(payload: &[u8]) -> bool {
+pub const fn needs_chunking(payload: &[u8]) -> bool {
     // pad_to_bucket requires payload + 4-byte length suffix to fit in the
     // largest bucket (256 KB). If it doesn't fit, chunking is needed.
     payload.len() + 4 > BUCKET_SIZES[BUCKET_SIZES.len() - 1]
@@ -341,10 +343,12 @@ mod tests {
     fn split_large_payload_produces_correct_chunks() {
         // 2.5 * MAX_CHUNK_PAYLOAD_SIZE => 3 chunks.
         let payload_size = MAX_CHUNK_PAYLOAD_SIZE * 2 + MAX_CHUNK_PAYLOAD_SIZE / 2;
+        #[allow(clippy::cast_possible_truncation)]
         let payload: Vec<u8> = (0..payload_size).map(|i| (i % 256) as u8).collect();
         let chunks = split_into_chunks(&payload, TEST_DID, TEST_TIMESTAMP).unwrap();
 
         assert_eq!(chunks.len(), 3);
+        #[allow(clippy::cast_possible_truncation)]
         for (i, chunk) in chunks.iter().enumerate() {
             assert_eq!(chunk.chunk_index, i as u32);
             assert_eq!(chunk.total_chunks, 3);
@@ -370,7 +374,7 @@ mod tests {
 
     #[test]
     fn roundtrip_split_reassemble() {
-        let payload: Vec<u8> = (0..500_000_u32).flat_map(|i| i.to_le_bytes()).collect();
+        let payload: Vec<u8> = (0..500_000_u32).flat_map(u32::to_le_bytes).collect();
         let chunks = split_into_chunks(&payload, TEST_DID, TEST_TIMESTAMP).unwrap();
         let reassembled = reassemble_chunks(&chunks).unwrap();
         assert_eq!(reassembled, payload);
@@ -429,7 +433,7 @@ mod tests {
 
     #[test]
     fn reassemble_out_of_order_succeeds() {
-        let payload: Vec<u8> = (0..500_000_u32).flat_map(|i| i.to_le_bytes()).collect();
+        let payload: Vec<u8> = (0..500_000_u32).flat_map(u32::to_le_bytes).collect();
         let mut chunks = split_into_chunks(&payload, TEST_DID, TEST_TIMESTAMP).unwrap();
         chunks.reverse(); // Deliver in reverse order.
         let reassembled = reassemble_chunks(&chunks).unwrap();
