@@ -804,25 +804,28 @@ Pad plaintext to the next bucket boundary before encryption to prevent message s
 
 Messages larger than 256KB are chunked. Padding happens below the application layer and above the transport layer — the SDK handles it transparently. Application developers never see it. Relay operators see uniform bucket-sized blobs.
 
-**Chunking protocol.** When a padded message exceeds the relay's `max_blob_size` (or 256KB if the relay does not advertise a limit), the SDK splits it into chunks before encryption:
+**Chunking protocol.** When a message payload exceeds the largest bucket size (256KB minus the 4-byte length suffix used by bucket padding), the SDK splits it into chunks before encryption:
 
 ```
 ChunkEnvelope {
-  chunk_id:      [u8; 16]   // random, unique per logical message
-  sequence:      u32         // 0-indexed chunk position
+  message_id:    [u8; 32]   // SHA-256(payload || sender_did || timestamp_be), unique per logical message
+  chunk_index:   u32         // 0-indexed chunk position
   total_chunks:  u32         // total number of chunks in this message
-  payload:       Vec<u8>     // chunk payload (plaintext fragment)
+  payload_hash:  [u8; 32]   // SHA-256 of the complete pre-chunked payload
+  data:          Vec<u8>     // chunk payload (plaintext fragment)
 }
 ```
 
-1. **Splitting.** The SDK generates a random 16-byte `chunk_id` per logical message. The padded plaintext is split into fragments whose size does not exceed the relay's `max_blob_size`. Each fragment is wrapped in a `ChunkEnvelope` with its `sequence` index and the `total_chunks` count.
+_Rationale: `message_id` uses deterministic SHA-256 derivation (32 bytes) rather than random 16-byte generation. Deterministic derivation requires no coordination, enables idempotent retransmission detection, and 32 bytes provides full collision resistance. The `payload_hash` field enables the receiver to verify integrity of the reassembled payload without relying on application-layer checks. Field names (`message_id`, `chunk_index`, `data`) were chosen for clarity over the original (`chunk_id`, `sequence`, `payload`)._
+
+1. **Splitting.** The SDK derives `message_id = SHA-256(payload || sender_did_bytes || timestamp_be_bytes)` and `payload_hash = SHA-256(payload)`. The plaintext payload is split into fragments of at most `MAX_CHUNK_PAYLOAD_SIZE` bytes (largest bucket size minus 4-byte length suffix = 262,140 bytes). Each fragment is wrapped in a `ChunkEnvelope` with its `chunk_index` and the `total_chunks` count.
 2. **Individual encryption.** Each `ChunkEnvelope` is independently encrypted as a separate MLS application message (in encrypted contexts) or a separate sender-key-encrypted message (in broadcast contexts). This means each chunk is individually authenticated (inner signature + MLS membership_tag or sender key AEAD) and individually padded to the nearest bucket boundary (§9.10.3). Individual encryption ensures that a relay cannot correlate chunks by ciphertext similarity — each chunk is an opaque, independently-sized blob.
 3. **Transmission.** Chunks are published as separate relay blobs. The relay treats each chunk as an independent message. Chunks MAY be published to different relays in the context's relay set for redundancy.
-4. **Reassembly.** The recipient decrypts each chunk individually, then reassembles by `chunk_id` + `sequence` ordering. The recipient maintains a per-`chunk_id` reassembly buffer.
-5. **Reassembly timeout.** The recipient MUST discard incomplete chunk sets (not all `total_chunks` received) after 60 seconds from receipt of the first chunk in the set. This prevents resource exhaustion from partial chunk deliveries.
-6. **Maximum chunks per message.** A single logical message MUST NOT exceed 256 chunks. Messages requiring more than 256 chunks MUST use out-of-band blob storage with an in-band reference (§10.6). This bounds the reassembly buffer to 256 entries per in-flight message.
-7. **Maximum chunk payload size.** Each chunk's `payload` size MUST NOT exceed the relay's advertised `max_blob_size` (from `.well-known/scp` relay_config, §10.5.1). If the relay does not advertise a limit, the default maximum chunk payload size is 256KB.
-8. **Chunk authentication.** Because each chunk is a separate MLS/sender-key message, chunk forgery and chunk replay are prevented by the same mechanisms as regular messages (§9.8.1, §9.8.2). A chunk with a mismatched `total_chunks` (e.g., an attacker injects a chunk claiming `total_chunks: 1` with a valid `chunk_id`) is detected because the reassembled plaintext will fail application-layer integrity checks (the original message includes a content hash in the envelope metadata).
+4. **Reassembly.** The recipient decrypts each chunk individually, then reassembles by `message_id` + `chunk_index` ordering. The recipient maintains a per-`message_id` reassembly buffer. After concatenation, the receiver verifies `SHA-256(reassembled_payload) == payload_hash`; mismatches indicate corruption or tampering and MUST cause the message to be discarded.
+5. **Reassembly timeout.** The SDK MUST discard incomplete chunk sets (not all `total_chunks` received) after 60 seconds from receipt of the first chunk in the set. This prevents resource exhaustion from partial chunk deliveries. The timeout is enforced by the SDK session layer that manages reassembly buffers, not by the `ChunkEnvelope` type itself.
+6. **Maximum chunks per message.** `MAX_TOTAL_CHUNKS = 262,144`. A single logical message MUST NOT exceed 262,144 chunks, bounding total reassembled message size to approximately 64 GB (`MAX_CHUNK_PAYLOAD_SIZE` * 262,144). _Rationale: the original limit of 256 chunks (64 MB max) was overly restrictive for large file transfers and media streaming. The 262,144 limit allows payloads up to ~64 GB while still bounding reassembly buffer metadata (each buffer entry is a small index + data pointer). For relay-constrained scenarios, relay-advertised `max_blob_size` independently limits per-chunk size._
+7. **Maximum chunk payload size.** Each chunk's `data` MUST NOT exceed `MAX_CHUNK_PAYLOAD_SIZE` (262,140 bytes = 256KB minus 4-byte length suffix). This ensures each chunk, after padding, fits in the largest bucket (256KB). If the relay advertises a smaller `max_blob_size` (from `.well-known/scp` relay_config, §10.5.1), the SDK MUST use the smaller limit.
+8. **Chunk authentication.** Because each chunk is a separate MLS/sender-key message, chunk forgery and chunk replay are prevented by the same mechanisms as regular messages (§9.8.1, §9.8.2). Additionally, the `payload_hash` field provides end-to-end integrity verification of the reassembled payload — a tampered or injected chunk will cause the hash check to fail at reassembly time.
 
 ### 9.10.4 Per-Context Pseudonyms
 

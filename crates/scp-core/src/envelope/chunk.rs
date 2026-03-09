@@ -259,8 +259,9 @@ pub fn reassemble_chunks(chunks: &[ChunkEnvelope]) -> Result<Vec<u8>, EnvelopeEr
         slots[idx] = Some(&chunk.data);
     }
 
-    // Concatenate in order.
-    let mut reassembled = Vec::new();
+    // Concatenate in order. Pre-allocate based on total data size.
+    let total_size: usize = slots.iter().filter_map(|s| s.map(<[u8]>::len)).sum();
+    let mut reassembled = Vec::with_capacity(total_size);
     for (i, slot) in slots.iter().enumerate() {
         match slot {
             Some(data) => reassembled.extend_from_slice(data),
