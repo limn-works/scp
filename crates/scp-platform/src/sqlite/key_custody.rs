@@ -38,6 +38,19 @@ const KEY_TYPE_ED25519: u8 = 0;
 /// Key type discriminant for X25519 keys.
 const KEY_TYPE_X25519: u8 = 1;
 
+/// Consolidated in-memory key store protected by a single mutex.
+///
+/// Eliminates TOCTOU gaps and lock-ordering deadlock risks that arise from
+/// three independent mutexes (key_types, ed25519_keys, x25519_keys).
+struct SqliteKeyStore {
+    /// Key type lookup, indexed by handle ID.
+    key_types: HashMap<u64, u8>,
+    /// In-memory cache of Ed25519 signing keys, indexed by handle ID.
+    ed25519_keys: HashMap<u64, SigningKey>,
+    /// In-memory cache of X25519 static secrets, indexed by handle ID.
+    x25519_keys: HashMap<u64, StaticSecret>,
+}
+
 /// Persistent [`KeyCustody`] backed by [`SqliteStorage`] with `SQLCipher` encryption.
 ///
 /// On construction, loads all previously persisted keys into an in-memory cache
@@ -58,12 +71,10 @@ const KEY_TYPE_X25519: u8 = 1;
 pub struct SqliteKeyCustody {
     /// The underlying encrypted `SQLite` storage.
     storage: SqliteStorage,
-    /// In-memory cache of Ed25519 signing keys, indexed by handle ID.
-    ed25519_keys: Mutex<HashMap<u64, SigningKey>>,
-    /// In-memory cache of X25519 static secrets, indexed by handle ID.
-    x25519_keys: Mutex<HashMap<u64, StaticSecret>>,
-    /// Key type lookup, indexed by handle ID.
-    key_types: Mutex<HashMap<u64, u8>>,
+    /// Consolidated in-memory key store. A single mutex protects all key maps
+    /// to eliminate TOCTOU gaps between type lookup and key access, and to
+    /// prevent lock-ordering deadlocks.
+    store: Mutex<SqliteKeyStore>,
     /// Monotonically increasing handle counter.
     next_id: AtomicU64,
 }
@@ -152,9 +163,11 @@ impl SqliteKeyCustody {
 
         Ok(Self {
             storage,
-            ed25519_keys: Mutex::new(ed25519_keys),
-            x25519_keys: Mutex::new(x25519_keys),
-            key_types: Mutex::new(key_types),
+            store: Mutex::new(SqliteKeyStore {
+                key_types,
+                ed25519_keys,
+                x25519_keys,
+            }),
             next_id: AtomicU64::new(next_id),
         })
     }
@@ -174,14 +187,12 @@ impl SqliteKeyCustody {
         private_key: &[u8; 32],
         key_type: u8,
     ) -> Result<(), PlatformError> {
-        let mut blob = [0u8; 33];
+        let mut blob = Zeroizing::new([0u8; 33]);
         blob[0] = key_type;
         blob[1..33].copy_from_slice(private_key);
         let key_path = format!("{KEY_PREFIX}{id}");
-        let result = self.storage.store(&key_path, &blob).await;
-        // Zeroize the blob containing key material.
-        blob.fill(0);
-        result
+        self.storage.store(&key_path, blob.as_ref()).await
+        // blob automatically zeroed on drop via Zeroizing
     }
 
     /// Removes a key from `SQLite` storage.
@@ -191,8 +202,9 @@ impl SqliteKeyCustody {
     }
 
     /// Returns the stored key type for a handle, or an error if not found.
-    fn lookup_type(key_types: &HashMap<u64, u8>, handle: KeyHandle) -> Result<u8, PlatformError> {
-        key_types
+    fn lookup_type(store: &SqliteKeyStore, handle: KeyHandle) -> Result<u8, PlatformError> {
+        store
+            .key_types
             .get(&handle.id())
             .copied()
             .ok_or(PlatformError::KeyNotFound)
@@ -220,25 +232,17 @@ impl KeyCustody for SqliteKeyCustody {
             // Persist to storage before adding to cache.
             self.persist_key(handle.id(), &key_bytes, type_byte).await?;
 
+            let mut store = self.store.lock().await;
             match key_type {
                 KeyType::Ed25519 => {
                     let signing_key = SigningKey::from_bytes(&key_bytes);
-                    self.ed25519_keys
-                        .lock()
-                        .await
-                        .insert(handle.id(), signing_key);
-                    self.key_types
-                        .lock()
-                        .await
-                        .insert(handle.id(), KEY_TYPE_ED25519);
+                    store.ed25519_keys.insert(handle.id(), signing_key);
+                    store.key_types.insert(handle.id(), KEY_TYPE_ED25519);
                 }
                 KeyType::X25519 => {
                     let secret = StaticSecret::from(*key_bytes);
-                    self.x25519_keys.lock().await.insert(handle.id(), secret);
-                    self.key_types
-                        .lock()
-                        .await
-                        .insert(handle.id(), KEY_TYPE_X25519);
+                    store.x25519_keys.insert(handle.id(), secret);
+                    store.key_types.insert(handle.id(), KEY_TYPE_X25519);
                 }
             }
 
@@ -253,9 +257,8 @@ impl KeyCustody for SqliteKeyCustody {
     ) -> impl Future<Output = Result<Signature, PlatformError>> + Send {
         let key_id = key.id();
         async move {
-            let key_types = self.key_types.lock().await;
-            let kt = Self::lookup_type(&key_types, KeyHandle::new(key_id))?;
-            drop(key_types);
+            let store = self.store.lock().await;
+            let kt = Self::lookup_type(&store, KeyHandle::new(key_id))?;
 
             if kt != KEY_TYPE_ED25519 {
                 return Err(PlatformError::WrongKeyType {
@@ -264,11 +267,12 @@ impl KeyCustody for SqliteKeyCustody {
                 });
             }
 
-            let ed_keys = self.ed25519_keys.lock().await;
-            let signing_key = ed_keys.get(&key_id).ok_or(PlatformError::KeyNotFound)?;
-
+            let signing_key = store
+                .ed25519_keys
+                .get(&key_id)
+                .ok_or(PlatformError::KeyNotFound)?;
             let signature = signing_key.sign(data);
-            drop(ed_keys);
+            drop(store);
             Ok(Signature::new(signature.to_bytes().to_vec()))
         }
     }
@@ -279,23 +283,24 @@ impl KeyCustody for SqliteKeyCustody {
     ) -> impl Future<Output = Result<PublicKey, PlatformError>> + Send {
         let key_id = key.id();
         async move {
-            let key_types = self.key_types.lock().await;
-            let kt = Self::lookup_type(&key_types, KeyHandle::new(key_id))?;
-            drop(key_types);
+            let store = self.store.lock().await;
+            let kt = Self::lookup_type(&store, KeyHandle::new(key_id))?;
 
             match kt {
                 KEY_TYPE_ED25519 => {
-                    let ed_keys = self.ed25519_keys.lock().await;
-                    let signing_key = ed_keys.get(&key_id).ok_or(PlatformError::KeyNotFound)?;
+                    let signing_key = store
+                        .ed25519_keys
+                        .get(&key_id)
+                        .ok_or(PlatformError::KeyNotFound)?;
                     let verifying_key: VerifyingKey = signing_key.verifying_key();
-                    drop(ed_keys);
                     Ok(PublicKey::new(verifying_key.to_bytes().to_vec()))
                 }
                 KEY_TYPE_X25519 => {
-                    let x_keys = self.x25519_keys.lock().await;
-                    let secret = x_keys.get(&key_id).ok_or(PlatformError::KeyNotFound)?;
+                    let secret = store
+                        .x25519_keys
+                        .get(&key_id)
+                        .ok_or(PlatformError::KeyNotFound)?;
                     let public = X25519PublicKey::from(secret);
-                    drop(x_keys);
                     Ok(PublicKey::new(public.to_bytes().to_vec()))
                 }
                 _ => Err(PlatformError::KeyNotFound),
@@ -309,20 +314,20 @@ impl KeyCustody for SqliteKeyCustody {
     ) -> impl Future<Output = Result<(), PlatformError>> + Send {
         let key_id = key.id();
         async move {
-            let mut key_types = self.key_types.lock().await;
-            let kt = Self::lookup_type(&key_types, KeyHandle::new(key_id))?;
+            let mut store = self.store.lock().await;
+            let kt = Self::lookup_type(&store, KeyHandle::new(key_id))?;
 
             match kt {
                 KEY_TYPE_ED25519 => {
-                    self.ed25519_keys.lock().await.remove(&key_id);
+                    store.ed25519_keys.remove(&key_id);
                 }
                 KEY_TYPE_X25519 => {
-                    self.x25519_keys.lock().await.remove(&key_id);
+                    store.x25519_keys.remove(&key_id);
                 }
                 _ => {}
             }
-            key_types.remove(&key_id);
-            drop(key_types);
+            store.key_types.remove(&key_id);
+            drop(store);
 
             // Remove from persistent storage.
             self.remove_persisted_key(key_id).await?;
@@ -339,9 +344,8 @@ impl KeyCustody for SqliteKeyCustody {
         let key_id = key.id();
         let peer = *peer_public;
         async move {
-            let key_types = self.key_types.lock().await;
-            let kt = Self::lookup_type(&key_types, KeyHandle::new(key_id))?;
-            drop(key_types);
+            let store = self.store.lock().await;
+            let kt = Self::lookup_type(&store, KeyHandle::new(key_id))?;
 
             if kt != KEY_TYPE_X25519 {
                 return Err(PlatformError::WrongKeyType {
@@ -350,12 +354,13 @@ impl KeyCustody for SqliteKeyCustody {
                 });
             }
 
-            let x_keys = self.x25519_keys.lock().await;
-            let secret = x_keys.get(&key_id).ok_or(PlatformError::KeyNotFound)?;
-
+            let secret = store
+                .x25519_keys
+                .get(&key_id)
+                .ok_or(PlatformError::KeyNotFound)?;
             let peer_key = X25519PublicKey::from(peer);
             let shared = secret.diffie_hellman(&peer_key);
-            drop(x_keys);
+            drop(store);
             let shared_bytes = Zeroizing::new(shared.to_bytes());
             Ok(SharedSecret::new(*shared_bytes))
         }
@@ -369,9 +374,8 @@ impl KeyCustody for SqliteKeyCustody {
         let key_id = key.id();
         let context_id = context_id.to_vec();
         async move {
-            let key_types = self.key_types.lock().await;
-            let kt = Self::lookup_type(&key_types, KeyHandle::new(key_id))?;
-            drop(key_types);
+            let mut store = self.store.lock().await;
+            let kt = Self::lookup_type(&store, KeyHandle::new(key_id))?;
 
             if kt != KEY_TYPE_ED25519 {
                 return Err(PlatformError::WrongKeyType {
@@ -380,8 +384,10 @@ impl KeyCustody for SqliteKeyCustody {
                 });
             }
 
-            let mut ed_keys = self.ed25519_keys.lock().await;
-            let signing_key = ed_keys.get(&key_id).ok_or(PlatformError::KeyNotFound)?;
+            let signing_key = store
+                .ed25519_keys
+                .get(&key_id)
+                .ok_or(PlatformError::KeyNotFound)?;
 
             // HMAC-SHA256(ed25519_public_key_bytes, context_id || "scp-pseudonym")
             // ADR-027 amendment: uses verifying (public) key bytes.
@@ -401,12 +407,10 @@ impl KeyCustody for SqliteKeyCustody {
             // Store the derived signing key in the cache only (not persisted —
             // pseudonyms are deterministically re-derivable from the identity key).
             let handle = KeyHandle::new(self.next_id.fetch_add(1, Ordering::Relaxed));
-            ed_keys.insert(handle.id(), pseudonym_signing_key);
-            drop(ed_keys);
-            self.key_types
-                .lock()
-                .await
-                .insert(handle.id(), KEY_TYPE_ED25519);
+            store
+                .ed25519_keys
+                .insert(handle.id(), pseudonym_signing_key);
+            store.key_types.insert(handle.id(), KEY_TYPE_ED25519);
 
             Ok(PseudonymKeypair {
                 public_key: PublicKey::new(pseudonym_verifying_key.to_bytes().to_vec()),
@@ -424,9 +428,8 @@ impl KeyCustody for SqliteKeyCustody {
         let key_id = key.id();
         let context_id = context_id.to_vec();
         async move {
-            let key_types = self.key_types.lock().await;
-            let kt = Self::lookup_type(&key_types, KeyHandle::new(key_id))?;
-            drop(key_types);
+            let mut store = self.store.lock().await;
+            let kt = Self::lookup_type(&store, KeyHandle::new(key_id))?;
 
             if kt != KEY_TYPE_ED25519 {
                 return Err(PlatformError::WrongKeyType {
@@ -435,8 +438,10 @@ impl KeyCustody for SqliteKeyCustody {
                 });
             }
 
-            let mut ed_keys = self.ed25519_keys.lock().await;
-            let signing_key = ed_keys.get(&key_id).ok_or(PlatformError::KeyNotFound)?;
+            let signing_key = store
+                .ed25519_keys
+                .get(&key_id)
+                .ok_or(PlatformError::KeyNotFound)?;
 
             // HMAC-SHA256(ed25519_public_key_bytes, context_id || epoch_BE || "scp-pseudonym-v2")
             let verifying_key = signing_key.verifying_key();
@@ -454,12 +459,10 @@ impl KeyCustody for SqliteKeyCustody {
             let pseudonym_verifying_key = pseudonym_signing_key.verifying_key();
 
             let handle = KeyHandle::new(self.next_id.fetch_add(1, Ordering::Relaxed));
-            ed_keys.insert(handle.id(), pseudonym_signing_key);
-            drop(ed_keys);
-            self.key_types
-                .lock()
-                .await
-                .insert(handle.id(), KEY_TYPE_ED25519);
+            store
+                .ed25519_keys
+                .insert(handle.id(), pseudonym_signing_key);
+            store.key_types.insert(handle.id(), KEY_TYPE_ED25519);
 
             Ok(PseudonymKeypair {
                 public_key: PublicKey::new(pseudonym_verifying_key.to_bytes().to_vec()),
