@@ -477,6 +477,21 @@ pub async fn ucan_delegate(
         // Parse the parent token.
         let parsed_parent = parse_ucan(&parent_token).map_err(ScpNapiError::from)?;
 
+        // Defense-in-depth: verify delegator DID matches parent token's audience.
+        // The delegator must be the audience of the parent token to form a valid
+        // delegation chain (iss/aud linkage). scp-core enforces this too, but
+        // catching it at the bridge level provides clearer error messages and
+        // matches the WASM bridge's defense-in-depth check.
+        if delegator_did != parsed_parent.payload.aud {
+            return Err(napi::Error::from(ScpNapiError::Permission {
+                message: format!(
+                    "delegator DID '{}' does not match parent token audience '{}'",
+                    delegator_did, parsed_parent.payload.aud
+                ),
+                code: "SCP-PERM-3023".to_owned(),
+            }));
+        }
+
         // Build attenuated capabilities from the capability URI strings.
         let attenuations: Vec<Attenuation> = capabilities
             .iter()
