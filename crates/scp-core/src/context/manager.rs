@@ -3003,7 +3003,7 @@ impl ContextManager {
     /// Used when appending governance events to the Merkle event log. Each
     /// variant maps to a deterministic string label so event consumers can
     /// filter by type without deserializing the full event.
-    fn governance_event_label(event: &GovernanceEvent) -> &'static str {
+    const fn governance_event_label(event: &GovernanceEvent) -> &'static str {
         match event {
             GovernanceEvent::ProposalCreated { .. } => "GovernanceProposalCreated",
             GovernanceEvent::VoteCast { .. } => "GovernanceVoteCast",
@@ -3554,10 +3554,9 @@ impl ContextManager {
 
         let context_id_bytes = context_id_to_bytes(context_id);
         for event in &events {
-            let _ = self.event_log.append_context_event(
-                &context_id_bytes,
-                Self::governance_event_label(event),
-            );
+            let _ = self
+                .event_log
+                .append_context_event(&context_id_bytes, Self::governance_event_label(event));
         }
 
         // Persist context state after withdrawal.

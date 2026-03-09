@@ -378,10 +378,16 @@ pub enum BridgeDirectionality {
 
 /// Capabilities a bridge connector can exercise in a context (spec §5.7).
 ///
-/// These are the four protocol-defined bridge capabilities. A bridge's
-/// `capabilities` field declares which of these it exercises, providing
-/// legibility to prospective members before they join.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// The four protocol-defined bridge capabilities plus an extensibility
+/// variant. A bridge's `capabilities` field declares which of these it
+/// exercises, providing legibility to prospective members before they join.
+///
+/// # Serde
+///
+/// Protocol-defined variants serialize as lowercase `snake_case` strings.
+/// The `Custom` variant serializes as an arbitrary string, enabling
+/// forward-compatible extension without protocol changes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BridgeCapability {
     /// Relay messages between SCP and the external platform.
@@ -392,6 +398,37 @@ pub enum BridgeCapability {
     AttestIdentities,
     /// Forward presence/typing indicators.
     ForwardPresence,
+    /// Platform-specific or experimental capability not yet standardized.
+    ///
+    /// The contained string is the capability identifier, e.g.,
+    /// `"custom_reactions"` or `"thread_sync"`. Implementations SHOULD
+    /// use `snake_case` identifiers to align with the serde convention
+    /// used by protocol-defined variants.
+    Custom(String),
+}
+
+impl std::fmt::Display for BridgeCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RelayMessages => f.write_str("relay_messages"),
+            Self::CreateShadows => f.write_str("create_shadows"),
+            Self::AttestIdentities => f.write_str("attest_identities"),
+            Self::ForwardPresence => f.write_str("forward_presence"),
+            Self::Custom(s) => f.write_str(s),
+        }
+    }
+}
+
+impl From<&str> for BridgeCapability {
+    fn from(s: &str) -> Self {
+        match s {
+            "relay_messages" => Self::RelayMessages,
+            "create_shadows" => Self::CreateShadows,
+            "attest_identities" => Self::AttestIdentities,
+            "forward_presence" => Self::ForwardPresence,
+            other => Self::Custom(other.to_owned()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
