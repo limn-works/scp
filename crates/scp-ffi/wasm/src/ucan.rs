@@ -198,16 +198,16 @@ fn parse_ucan(encoded: &str) -> Result<ParsedUcanToken, String> {
 // Revocation CID computation
 // ---------------------------------------------------------------------------
 
-fn compute_revocation_cid(payload: &UcanPayload) -> Result<String, String> {
-    let payload_bytes = serde_json::to_vec(payload)
-        .map_err(|e| format!("revocation CID serialization failed: {e}"))?;
-    let hash = Sha256::digest(&payload_bytes);
-    let hex = hash.iter().fold(String::with_capacity(64), |mut acc, b| {
+/// Computes a revocation CID as the hex-encoded SHA-256 hash of the raw
+/// encoded JWT string. This MUST match the algorithm in
+/// `scp-core::crypto::ucan::revoke::compute_revocation_cid`.
+fn compute_revocation_cid(encoded_token: &str) -> String {
+    let hash = Sha256::digest(encoded_token.as_bytes());
+    hash.iter().fold(String::with_capacity(64), |mut acc, b| {
         use std::fmt::Write;
         let _ = write!(acc, "{b:02x}");
         acc
-    });
-    Ok(hex)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -417,7 +417,7 @@ fn validate_ucan_full(params: &UcanValidationParams<'_>) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     // Step 10: Revocation check.
-    let revocation_cid = compute_revocation_cid(&token.payload)?;
+    let revocation_cid = compute_revocation_cid(&token.encoded);
     if revoked_cids.contains(&revocation_cid) {
         return Err(format!("token revoked: {revocation_cid}"));
     }
@@ -521,7 +521,7 @@ fn verify_chain_recursive(
 
         verify_time_bounds(parent)?;
 
-        let parent_revocation_cid = compute_revocation_cid(&parent.payload)?;
+        let parent_revocation_cid = compute_revocation_cid(&parent.encoded);
         if revoked_cids.contains(&parent_revocation_cid) {
             return Err(format!("token revoked: {parent_revocation_cid}"));
         }
@@ -859,14 +859,17 @@ pub fn validate_tool_ucan_wasm(
 
 /// Revokes a UCAN token.
 ///
-/// Delegates to `WasmContextManager::ucan_revoke`. Computes the token CID
-/// from the full JWT string and adds it to the context's revocation list.
+/// Delegates to `WasmContextManager::ucan_revoke`. Computes the revocation
+/// CID from the full JWT string (SHA-256 hex) and adds it to the context's
+/// revocation list. This MUST use `compute_revocation_cid` (not
+/// `compute_token_cid`) to match the format used in `ucan_validate` step 10.
 #[wasm_bindgen]
 pub fn ucan_revoke(context: &WasmContextHandle, token: String) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
-        // Compute the token CID from the full JWT string — matches validation.
-        let token_cid = compute_token_cid(&token);
+        // Compute the revocation CID from the full JWT string — matches
+        // validation step 10.
+        let token_cid = compute_revocation_cid(&token);
 
         with_manager(|mgr| mgr.ucan_revoke(&context_id, &token_cid))
             .map_err(ScpWasmError::into_js)?;

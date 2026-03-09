@@ -3383,13 +3383,6 @@ pub async fn ucan_revoke(handle: Arc<ContextHandle>, token: String) -> Result<()
     runtime()
         .spawn(async move {
             use scp_core::crypto::ucan::revoke::compute_revocation_cid;
-            use scp_core::crypto::ucan::validate::parse_ucan;
-
-            // Parse the token to extract its payload for CID computation.
-            let parsed = parse_ucan(&token).map_err(|e| ScpError::Permission {
-                message: format!("malformed UCAN token: {e}"),
-                code: "SCP-PERM-3006".to_owned(),
-            })?;
 
             // Ensure UCAN state is registered for this context.
             crate::runtime::ensure_ucan_registered(
@@ -3398,10 +3391,10 @@ pub async fn ucan_revoke(handle: Arc<ContextHandle>, token: String) -> Result<()
                 &handle.ceiling_strings,
             );
 
-            // Compute the content-hash CID matching scp-core's format and add
-            // it to the context's revocation list.
+            // Compute the revocation CID from the raw JWT string (SHA-256 of
+            // the encoded token), matching scp-core's format.
             crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
-                let token_cid = compute_revocation_cid(&parsed.payload);
+                let token_cid = compute_revocation_cid(&token);
                 ucan_state.revocation_list.revoke(token_cid);
             })
             .ok_or_else(|| ScpError::Permission {

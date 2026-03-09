@@ -438,12 +438,10 @@ pub fn py_ucan_delegate(
 pub fn py_ucan_revoke(context_id: &str, token: &str) -> PyResult<()> {
     validate::validate_context_id(context_id)?;
     validate::validate_ucan_token(token)?;
-    // Parse the token to extract its payload for CID computation.
-    let parsed = parse_ucan(token).map_err(ScpPyError::from)?;
-
     crate::runtime::with_context(context_id, |rt| {
-        // Compute the content-hash CID matching scp-core's format.
-        let token_cid = compute_revocation_cid(&parsed.payload);
+        // Compute the revocation CID from the raw JWT string, matching
+        // scp-core's format (SHA-256 of the encoded token).
+        let token_cid = compute_revocation_cid(token);
         rt.revocation_list.revoke(token_cid);
         Ok(())
     })?;
