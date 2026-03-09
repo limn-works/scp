@@ -380,6 +380,59 @@ pub struct WasmContextManager {
     contexts: HashMap<String, PerContextState>,
 }
 
+// ---------------------------------------------------------------------------
+// Import validation helpers
+// ---------------------------------------------------------------------------
+
+/// Validates a string field from imported (untrusted) data.
+fn validate_imported_string(
+    value: &str,
+    field_name: &str,
+    max_len: usize,
+) -> Result<(), ScpWasmError> {
+    if value.is_empty() {
+        return Err(ScpWasmError::Context {
+            message: format!("{field_name} must not be empty"),
+            code: "SCP-CTX-2032".to_owned(),
+        });
+    }
+    if value.len() > max_len {
+        return Err(ScpWasmError::Context {
+            message: format!(
+                "{field_name} exceeds maximum length ({} > {max_len})",
+                value.len()
+            ),
+            code: "SCP-CTX-2032".to_owned(),
+        });
+    }
+    if value.chars().any(char::is_control) {
+        return Err(ScpWasmError::Context {
+            message: format!("{field_name} contains control characters"),
+            code: "SCP-CTX-2032".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Validates a DID string from imported (untrusted) data.
+fn validate_imported_did(value: &str, field_name: &str) -> Result<(), ScpWasmError> {
+    validate_imported_string(value, field_name, 512)?;
+    if !value.starts_with("did:") {
+        return Err(ScpWasmError::Context {
+            message: format!("{field_name} must start with 'did:': got '{value}'"),
+            code: "SCP-CTX-2032".to_owned(),
+        });
+    }
+    // Must have at least did:method:id (3 colon-separated parts)
+    if value.splitn(4, ':').count() < 3 {
+        return Err(ScpWasmError::Context {
+            message: format!("{field_name} must have format 'did:method:id': got '{value}'"),
+            code: "SCP-CTX-2032".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 impl Default for WasmContextManager {
     fn default() -> Self {
         Self::new()
@@ -1883,6 +1936,192 @@ impl WasmContextManager {
         }
         Ok(ctx)
     }
+
+    // -----------------------------------------------------------------------
+    // Context export/import (#424)
+    // -----------------------------------------------------------------------
+
+    /// Exports a context's full state as serialized JSON bytes.
+    ///
+    /// Returns a `WasmContextExportEnvelope` serialized as JSON bytes. The
+    /// envelope contains a version number and a snapshot of all context state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not registered or serialization fails.
+    pub fn export_context(
+        &self,
+        context_id: &str,
+        exporter_did: &str,
+    ) -> Result<Vec<u8>, ScpWasmError> {
+        let ctx = self.require_context(context_id)?;
+
+        let members: Vec<WasmExportMember> = ctx
+            .members
+            .iter()
+            .map(|(did, entry)| WasmExportMember {
+                did: did.clone(),
+                role: entry.role.clone(),
+                sequence_number: entry.sequence_number,
+            })
+            .collect();
+
+        let broadcast = ctx.broadcast.as_ref().map(|bc| WasmExportBroadcast {
+            authors: bc.authors.iter().cloned().collect(),
+            subscribers: bc.subscribers.iter().cloned().collect(),
+            blocked_subscribers: bc.blocked_subscribers.iter().cloned().collect(),
+            admission: bc.admission.clone(),
+        });
+
+        let snapshot = WasmContextExportSnapshot {
+            context_id: context_id.to_owned(),
+            state: ctx.state.clone(),
+            params_json: ctx.params_json.clone(),
+            creator_did: ctx.creator_did.clone(),
+            mode: ctx.mode.clone(),
+            ceiling_strings: ctx.ceiling_strings.iter().cloned().collect(),
+            ceiling_policy: ctx.ceiling_policy.clone(),
+            ttl_seconds: ctx.ttl_seconds,
+            promotion_policy: ctx.promotion_policy.clone(),
+            governance: ctx.governance.clone(),
+            economic_policy: ctx.economic_policy.clone(),
+            members,
+            write_revoked_members: ctx.write_revoked_members.iter().cloned().collect(),
+            read_revoked_members: ctx.read_revoked_members.iter().cloned().collect(),
+            read_exclusion_list: ctx.read_exclusion_list.iter().cloned().collect(),
+            broadcast,
+        };
+
+        let now_ms = js_sys::Date::now();
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let exported_at = (now_ms / 1000.0) as u64;
+
+        let envelope = WasmContextExportEnvelope {
+            version: WASM_EXPORT_VERSION,
+            exported_at,
+            exporter_did: exporter_did.to_owned(),
+            snapshot,
+        };
+
+        serde_json::to_vec(&envelope).map_err(|e| ScpWasmError::Context {
+            message: format!("export serialization failed: {e}"),
+            code: "SCP-CTX-2030".to_owned(),
+        })
+    }
+
+    /// Imports a context from serialized JSON bytes produced by [`export_context`].
+    ///
+    /// Deserializes the envelope, validates the version, and reconstructs
+    /// the context state in the manager.
+    ///
+    /// # Returns
+    ///
+    /// The context ID of the imported context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deserialization fails, version is incompatible,
+    /// or the context already exists.
+    pub fn import_context(&mut self, data: &[u8]) -> Result<String, ScpWasmError> {
+        let envelope: WasmContextExportEnvelope =
+            serde_json::from_slice(data).map_err(|e| ScpWasmError::Context {
+                message: format!("invalid export data: {e}"),
+                code: "SCP-CTX-2032".to_owned(),
+            })?;
+
+        if envelope.version > WASM_EXPORT_VERSION {
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "incompatible export version: got {}, max supported is {WASM_EXPORT_VERSION}",
+                    envelope.version
+                ),
+                code: "SCP-CTX-2032".to_owned(),
+            });
+        }
+
+        let snap = &envelope.snapshot;
+        let context_id = snap.context_id.clone();
+
+        // Validate imported fields from untrusted data (defense-in-depth)
+        validate_imported_string(&context_id, "context_id", 256)?;
+        validate_imported_did(&snap.creator_did, "creator_did")?;
+        for m in &snap.members {
+            validate_imported_did(&m.did, "member DID")?;
+            if m.role.is_empty() || m.role.len() > 64 {
+                return Err(ScpWasmError::Context {
+                    message: format!("invalid member role '{}': must be 1-64 chars", m.role),
+                    code: "SCP-CTX-2032".to_owned(),
+                });
+            }
+        }
+        let valid_states = ["active", "closed", "suspended", "archived"];
+        if !valid_states.contains(&snap.state.as_str()) {
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "invalid context state '{}': must be one of {valid_states:?}",
+                    snap.state
+                ),
+                code: "SCP-CTX-2032".to_owned(),
+            });
+        }
+
+        if self.contexts.contains_key(&context_id) {
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "context '{context_id}' already exists — cannot import over existing context"
+                ),
+                code: "SCP-CTX-2000".to_owned(),
+            });
+        }
+
+        let mut members = HashMap::new();
+        for m in &snap.members {
+            members.insert(
+                m.did.clone(),
+                MemberEntry {
+                    did: m.did.clone(),
+                    role: m.role.clone(),
+                    sequence_number: m.sequence_number,
+                },
+            );
+        }
+
+        let broadcast = snap.broadcast.as_ref().map(|bc| BroadcastState {
+            authors: bc.authors.iter().cloned().collect(),
+            subscribers: bc.subscribers.iter().cloned().collect(),
+            blocked_subscribers: bc.blocked_subscribers.iter().cloned().collect(),
+            admission: bc.admission.clone(),
+        });
+
+        let ctx = PerContextState {
+            state: snap.state.clone(),
+            params_json: snap.params_json.clone(),
+            creator_did: snap.creator_did.clone(),
+            mode: snap.mode.clone(),
+            ceiling_strings: snap.ceiling_strings.iter().cloned().collect(),
+            ceiling_policy: snap.ceiling_policy.clone(),
+            ttl_seconds: snap.ttl_seconds,
+            promotion_policy: snap.promotion_policy.clone(),
+            governance: snap.governance.clone(),
+            economic_policy: snap.economic_policy.clone(),
+            tool_registry: ToolRegistry::new(),
+            tool_handlers: HashMap::new(),
+            event_log: WasmEventLog::new(context_id.clone()),
+            revoked_tokens: HashSet::new(),
+            seen_nonces: HashSet::new(),
+            members,
+            event_buffer: Vec::new(),
+            executed_proposals: HashSet::new(),
+            write_revoked_members: snap.write_revoked_members.iter().cloned().collect(),
+            read_revoked_members: snap.read_revoked_members.iter().cloned().collect(),
+            read_exclusion_list: snap.read_exclusion_list.iter().cloned().collect(),
+            broadcast,
+            sessions: HashMap::new(),
+        };
+
+        self.contexts.insert(context_id.clone(), ctx);
+        Ok(context_id)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1902,6 +2141,72 @@ pub struct ContextMetadata {
     pub governance: String,
     pub member_count: u64,
     pub economic_policy: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Context export/import types (#424)
+// ---------------------------------------------------------------------------
+
+/// Current version of the WASM context export format.
+const WASM_EXPORT_VERSION: u32 = 1;
+
+/// Versioned envelope for context exports.
+///
+/// Serialized as JSON bytes. The version field enables forward-compatible
+/// deserialization: import rejects exports with version > `WASM_EXPORT_VERSION`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WasmContextExportEnvelope {
+    /// Export format version.
+    version: u32,
+    /// Unix timestamp (seconds) when the export was created.
+    exported_at: u64,
+    /// DID of the identity that performed the export.
+    exporter_did: String,
+    /// The context state snapshot.
+    snapshot: WasmContextExportSnapshot,
+}
+
+/// Snapshot of a context's state for export.
+///
+/// Contains all fields needed to reconstruct a `PerContextState` on import.
+/// Tool registry, event log, and UCAN state are NOT exported (they can be
+/// re-registered after import). Membership, roles, governance, broadcast,
+/// and revocation state are preserved.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WasmContextExportSnapshot {
+    context_id: String,
+    state: String,
+    params_json: serde_json::Value,
+    creator_did: String,
+    mode: String,
+    ceiling_strings: Vec<String>,
+    ceiling_policy: String,
+    ttl_seconds: Option<u64>,
+    promotion_policy: Option<String>,
+    governance: String,
+    economic_policy: Option<String>,
+    members: Vec<WasmExportMember>,
+    write_revoked_members: Vec<String>,
+    read_revoked_members: Vec<String>,
+    read_exclusion_list: Vec<String>,
+    broadcast: Option<WasmExportBroadcast>,
+}
+
+/// Serializable member entry for export.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WasmExportMember {
+    did: String,
+    role: String,
+    sequence_number: u64,
+}
+
+/// Serializable broadcast state for export.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WasmExportBroadcast {
+    authors: Vec<String>,
+    subscribers: Vec<String>,
+    blocked_subscribers: Vec<String>,
+    admission: String,
 }
 
 // ---------------------------------------------------------------------------

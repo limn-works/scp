@@ -789,6 +789,258 @@ pub async fn context_broadcast_admission(
 }
 
 // ---------------------------------------------------------------------------
+// No-op UCAN validation trait stubs for subscribe_broadcast
+//
+// Minimal implementations satisfying the generic bounds on
+// ContextManager::subscribe_broadcast. Broadcast subscription in open mode
+// does not require UCAN validation; gated mode validation will be wired
+// when the full UCAN pipeline is integrated with the NAPI bridge.
+// ---------------------------------------------------------------------------
+
+struct NoOpDidResolver;
+impl scp_core::crypto::ucan::validate::DidResolver for NoOpDidResolver {
+    fn resolve_public_key(
+        &self,
+        _did: &str,
+    ) -> Result<[u8; 32], scp_core::crypto::ucan::UcanError> {
+        Err(scp_core::crypto::ucan::UcanError::MalformedToken(
+            "NoOpDidResolver: no DID resolution available".into(),
+        ))
+    }
+}
+
+/// Fail-closed nonce tracker: rejects all nonces when no real tracker is
+/// available. Used as a type parameter only — never reached when token is
+/// `None`, but rejects by default if accidentally called.
+struct RejectAllNonceTracker;
+impl scp_core::crypto::ucan::validate::NonceTracker for RejectAllNonceTracker {
+    fn check_and_record(
+        &mut self,
+        nonce: &str,
+        _token_expiry: u64,
+    ) -> Result<(), scp_core::crypto::ucan::UcanError> {
+        Err(scp_core::crypto::ucan::UcanError::NonceReused(
+            nonce.to_owned(),
+        ))
+    }
+}
+
+/// Fail-closed revocation checker: treats all tokens as revoked when no real
+/// checker is available. Used as a type parameter only — never reached when
+/// token is `None`, but rejects by default if accidentally called.
+struct RejectAllRevocationChecker;
+impl scp_core::crypto::ucan::validate::RevocationChecker for RejectAllRevocationChecker {
+    fn is_revoked(&self, _token_cid: &str) -> bool {
+        true
+    }
+}
+
+/// Fail-closed proof resolver: rejects all proof lookups. Used as a type
+/// parameter only — never reached when token is `None`.
+struct RejectAllProofResolver;
+impl scp_core::crypto::ucan::validate::ProofResolver for RejectAllProofResolver {
+    fn resolve_proof(
+        &self,
+        cid: &str,
+    ) -> Result<scp_core::crypto::ucan::UcanToken, scp_core::crypto::ucan::UcanError> {
+        Err(scp_core::crypto::ucan::UcanError::DelegationChainBroken(
+            format!("RejectAllProofResolver: no proof available for CID {cid}"),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bridge functions — broadcast mutations (delegated to ContextManager)
+// ---------------------------------------------------------------------------
+
+/// Subscribes a DID to a broadcast context.
+///
+/// Delegates to [`ContextManager::subscribe_broadcast`].
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2001` if the context is not active or not broadcast.
+#[napi(js_name = "broadcastSubscribe")]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub async fn broadcast_subscribe(
+    handle: &NapiContextHandle,
+    subscriber_did: String,
+) -> napi::Result<()> {
+    validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    let manager = context_manager();
+    let context_id = handle.context_id.clone();
+    let did: DID = DID(subscriber_did);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    manager
+        .subscribe_broadcast::<
+            NoOpDidResolver,
+            RejectAllNonceTracker,
+            RejectAllRevocationChecker,
+            RejectAllProofResolver,
+            std::hash::RandomState,
+        >(&context_id, &did, None, timestamp, None)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    Ok(())
+}
+
+/// Unsubscribes a DID from a broadcast context.
+///
+/// When `rotate_keys` is `true`, all authors rotate their broadcast keys
+/// for forward secrecy.
+///
+/// Delegates to [`ContextManager::unsubscribe_broadcast`].
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2001` if the context is not active or not broadcast.
+#[napi(js_name = "broadcastUnsubscribe")]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub async fn broadcast_unsubscribe(
+    handle: &NapiContextHandle,
+    subscriber_did: String,
+    rotate_keys: Option<bool>,
+) -> napi::Result<()> {
+    validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    let manager = context_manager();
+    let context_id = handle.context_id.clone();
+    let did: DID = DID(subscriber_did);
+
+    manager
+        .unsubscribe_broadcast(&context_id, &did, rotate_keys.unwrap_or(false))
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    Ok(())
+}
+
+/// Publishes a message to a broadcast context.
+///
+/// The payload is encrypted with the author's broadcast key. The author's
+/// identity must have been previously created via `identityCreate` so
+/// that the key custody provider and signing key handle are available.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2001` if the context is not active, not broadcast,
+///   or the sender is not an author.
+/// - Rejects with `SCP-PERM-3020` if the context has no custody provider.
+#[napi(js_name = "broadcastPublish")]
+pub async fn broadcast_publish(handle: &NapiContextHandle, payload: Vec<u8>) -> napi::Result<()> {
+    let manager = context_manager();
+    let context_id = handle.context_id.clone();
+    let author_did = DID(handle.creator_did.clone());
+
+    #[cfg(feature = "allow_in_memory_custody")]
+    {
+        let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
+            NapiError::from(ScpNapiError::Permission {
+                message: "broadcast publish requires key custody — create the identity with \
+                          identityCreate(\"in_memory\")"
+                    .to_owned(),
+                code: "SCP-PERM-3020".to_owned(),
+            })
+        })?;
+        let signing_key = handle.signing_key.ok_or_else(|| {
+            NapiError::from(ScpNapiError::Permission {
+                message: "broadcast publish requires a signing key — identity has no active \
+                          signing key handle"
+                    .to_owned(),
+                code: "SCP-PERM-3021".to_owned(),
+            })
+        })?;
+
+        manager
+            .publish_broadcast(&context_id, &author_did, &payload, &custody.0, &signing_key)
+            .await
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    }
+
+    #[cfg(not(feature = "allow_in_memory_custody"))]
+    {
+        let _ = (manager, context_id, author_did, payload);
+        return Err(NapiError::from(ScpNapiError::Permission {
+            message: "broadcast publish requires key custody — in_memory custody feature is \
+                      not enabled"
+                .to_owned(),
+            code: "SCP-PERM-3022".to_owned(),
+        }));
+    }
+
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
+/// Blocks a subscriber's read access in a broadcast context.
+///
+/// The subscriber is removed from the registry and added to all authors'
+/// block lists; all author keys are rotated.
+///
+/// Delegates to [`ContextManager::block_broadcast_subscriber`].
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2001` if the operation fails.
+#[napi(js_name = "broadcastBlockSubscriber")]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub async fn broadcast_block_subscriber(
+    handle: &NapiContextHandle,
+    subscriber_did: String,
+    blocker_did: String,
+) -> napi::Result<()> {
+    validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_did(&blocker_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    let manager = context_manager();
+    let context_id = handle.context_id.clone();
+    let subscriber: DID = DID(subscriber_did);
+    let blocker: DID = DID(blocker_did);
+
+    manager
+        .block_broadcast_subscriber(&context_id, &subscriber, &blocker)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    Ok(())
+}
+
+/// Handles a broadcast key request from a subscriber.
+///
+/// Validates the author DID is locally controlled and processes the key
+/// distribution request.
+///
+/// Delegates to [`ContextManager::handle_broadcast_key_request`].
+///
+/// # Returns
+///
+/// A debug string describing the key request decision.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-CTX-2001` if the operation fails.
+#[napi(js_name = "broadcastHandleKeyRequest")]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub async fn broadcast_handle_key_request(
+    handle: &NapiContextHandle,
+    author_did: String,
+    requester_did: String,
+) -> napi::Result<String> {
+    validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_did(&requester_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    let manager = context_manager();
+    let context_id = handle.context_id.clone();
+    let author: DID = DID(author_did);
+    let requester: DID = DID(requester_did);
+
+    let decision = manager
+        .handle_broadcast_key_request(&context_id, &author, &requester)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    Ok(format!("{decision:?}"))
+}
+
+// ---------------------------------------------------------------------------
 // Bridge functions — governance (delegated to ContextManager)
 // ---------------------------------------------------------------------------
 

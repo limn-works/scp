@@ -853,6 +853,32 @@ pub struct Proof {
     pub details_json: String,
 }
 
+/// A signed consistency checkpoint from the context event log.
+///
+/// Checkpoints are signed snapshots of the event log state at a point in time.
+/// Members exchange checkpoints to detect relay equivocation: if two members
+/// have different Merkle roots for the same event count, the relay is showing
+/// different histories to different members.
+///
+/// See ADR-011 acceptance criterion 8 and ADR-030 (pruning/checkpointing).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct Checkpoint {
+    /// The context this checkpoint belongs to.
+    pub context_id: String,
+    /// The DID of the member who generated this checkpoint.
+    pub sender_did: String,
+    /// The number of events in the log at checkpoint time.
+    pub event_count: u64,
+    /// The Merkle root hash at checkpoint time, hex-encoded.
+    pub merkle_root: String,
+    /// Current MLS epoch. `None` for Broadcast contexts.
+    pub epoch: Option<u64>,
+    /// Unix timestamp (seconds) when the checkpoint was generated.
+    pub timestamp: u64,
+    /// Ed25519 signature over the canonical checkpoint fields, hex-encoded.
+    pub signature: String,
+}
+
 /// A UCAN token with metadata accessible to SDK consumers.
 ///
 /// See ADR-016 (UCAN Enforcement) and spec §10 (UCAN).
@@ -1840,6 +1866,161 @@ pub async fn identity_resolve(did: String) -> Result<DIDDocument, ScpError> {
             message: format!("tokio task join error during DID resolution: {e}"),
             code: "SCP-IDENT-1006".to_owned(),
         })?
+}
+
+// ---------------------------------------------------------------------------
+// Free functions — device attestation (#419)
+//
+// See §9.3 (Sybil Resistance and Identity Uniqueness).
+// ---------------------------------------------------------------------------
+
+/// Generates a device attestation token for an identity.
+///
+/// Uses [`InMemoryDeviceAttestation`] to produce a synthetic attestation token,
+/// then attaches it to the identity's DID document.
+///
+/// # Arguments
+///
+/// * `identity` — The identity to attest (must have been created with
+///   `identity_create`, not `identity_load`).
+///
+/// # Returns
+///
+/// The attestation token as a base64-encoded string.
+///
+/// # Errors
+///
+/// Returns `ScpError::Identity` if the identity was externally loaded (no
+/// retained crypto state) or if attestation generation fails.
+///
+/// See §9.3, issue #362, #419.
+#[uniffi::export]
+pub async fn identity_attest_device(identity: Arc<Identity>) -> Result<String, ScpError> {
+    identity_attest_device_impl(identity).await
+}
+
+#[cfg(feature = "allow_in_memory_custody")]
+async fn identity_attest_device_impl(identity: Arc<Identity>) -> Result<String, ScpError> {
+    runtime()
+        .spawn(async move {
+            use scp_platform::testing::InMemoryDeviceAttestation;
+            use scp_platform::traits::DeviceAttestation;
+
+            let _core_id = identity
+                .core_id
+                .as_ref()
+                .ok_or_else(|| ScpError::Identity {
+                    message: "device attestation requires retained identity state — the identity \
+                          was externally loaded via identity_load"
+                        .to_owned(),
+                    code: "SCP-IDENT-1007".to_owned(),
+                })?;
+
+            let attestation = InMemoryDeviceAttestation::new();
+            let token = attestation.attest().await.map_err(|e| ScpError::Identity {
+                message: format!("device attestation failed: {e}"),
+                code: "SCP-IDENT-1010".to_owned(),
+            })?;
+
+            use base64::Engine;
+            Ok(base64::engine::general_purpose::STANDARD.encode(token.as_bytes()))
+        })
+        .await
+        .map_err(|e| ScpError::Identity {
+            message: format!("tokio task join error during device attestation: {e}"),
+            code: "SCP-IDENT-1007".to_owned(),
+        })?
+}
+
+#[cfg(not(feature = "allow_in_memory_custody"))]
+#[allow(clippy::unused_async)]
+async fn identity_attest_device_impl(_identity: Arc<Identity>) -> Result<String, ScpError> {
+    Err(ScpError::Identity {
+        message: "device attestation requires in-memory custody — the in_memory custody \
+                  path is not available in this build. Enable the \
+                  \"allow_in_memory_custody\" feature for dev/desktop use."
+            .to_owned(),
+        code: "SCP-IDENT-1010".to_owned(),
+    })
+}
+
+/// Verifies a device attestation token.
+///
+/// Uses [`InMemoryDeviceAttestation`] to check the token format.
+///
+/// # Arguments
+///
+/// * `did` — The DID string (unused in verification but kept for API
+///   consistency).
+/// * `token_base64` — The base64-encoded attestation token to verify.
+///
+/// # Returns
+///
+/// `true` if the token is valid, `false` otherwise.
+///
+/// # Errors
+///
+/// Returns `ScpError::Identity` if base64 decoding fails or if verification
+/// encounters an error.
+///
+/// See §9.3, issue #362, #419.
+#[uniffi::export]
+pub async fn identity_verify_device_attestation(
+    did: String,
+    token_base64: String,
+) -> Result<bool, ScpError> {
+    identity_verify_device_attestation_impl(did, token_base64).await
+}
+
+#[cfg(feature = "allow_in_memory_custody")]
+async fn identity_verify_device_attestation_impl(
+    _did: String,
+    token_base64: String,
+) -> Result<bool, ScpError> {
+    runtime()
+        .spawn(async move {
+            use base64::Engine;
+            use scp_platform::testing::InMemoryDeviceAttestation;
+            use scp_platform::traits::DeviceAttestation;
+
+            let token_bytes = base64::engine::general_purpose::STANDARD
+                .decode(&token_base64)
+                .map_err(|e| ScpError::Identity {
+                    message: format!("invalid base64 attestation token: {e}"),
+                    code: "SCP-IDENT-1011".to_owned(),
+                })?;
+
+            let token = scp_platform::traits::DeviceAttestationToken::new(token_bytes);
+            let attestation = InMemoryDeviceAttestation::new();
+
+            attestation
+                .verify(&token)
+                .await
+                .map_err(|e| ScpError::Identity {
+                    message: format!("device attestation verification failed: {e}"),
+                    code: "SCP-IDENT-1012".to_owned(),
+                })
+        })
+        .await
+        .map_err(|e| ScpError::Identity {
+            message: format!("tokio task join error during device attestation verification: {e}"),
+            code: "SCP-IDENT-1007".to_owned(),
+        })?
+}
+
+#[cfg(not(feature = "allow_in_memory_custody"))]
+#[allow(clippy::unused_async)]
+async fn identity_verify_device_attestation_impl(
+    _did: String,
+    _token_base64: String,
+) -> Result<bool, ScpError> {
+    Err(ScpError::Identity {
+        message: "device attestation verification requires in-memory custody — the in_memory \
+                  custody path is not available in this build. Enable the \
+                  \"allow_in_memory_custody\" feature for dev/desktop use."
+            .to_owned(),
+        code: "SCP-IDENT-1010".to_owned(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3506,6 +3687,183 @@ pub async fn ucan_revoke(handle: Arc<ContextHandle>, token: String) -> Result<()
         })?
 }
 
+/// Delegates a UCAN token to another member.
+///
+/// Creates a delegated UCAN from an existing parent token, signed with the
+/// delegator's Ed25519 key via the retained [`KeyCustody`] provider.
+/// Delegation enforces attenuation (capabilities can only narrow, never widen).
+///
+/// # Arguments
+///
+/// * `handle` — The context the token belongs to.
+/// * `delegator_did` — The DID of the entity delegating (must match parent
+///   token's audience).
+/// * `delegatee_did` — The DID of the entity receiving the delegation.
+/// * `parent_token` — The encoded parent UCAN token (JWT format).
+/// * `capabilities` — List of capability URI strings to delegate (must be
+///   subset of parent's capabilities).
+///
+/// # Returns
+///
+/// A `UcanToken` handle with the delegated token's metadata.
+///
+/// # Errors
+///
+/// Returns `ScpError::Permission` if delegation fails: delegator not matching
+/// parent audience, capabilities wider than parent, signing failure, etc.
+///
+/// See ADR-016 criterion 4.
+#[uniffi::export]
+pub async fn ucan_delegate(
+    handle: Arc<ContextHandle>,
+    delegator_did: String,
+    delegatee_did: String,
+    parent_token: String,
+    capabilities: Vec<String>,
+) -> Result<Arc<UcanToken>, ScpError> {
+    validate_did(&delegator_did)?;
+    validate_did(&delegatee_did)?;
+    validate_ucan_token(&parent_token)?;
+    for cap in &capabilities {
+        validate_capability_uri(cap)?;
+    }
+    ucan_delegate_impl(
+        handle,
+        delegator_did,
+        delegatee_did,
+        parent_token,
+        capabilities,
+    )
+    .await
+}
+
+/// Inner implementation of [`ucan_delegate`], split out for cfg-gating clarity.
+#[cfg(feature = "allow_in_memory_custody")]
+async fn ucan_delegate_impl(
+    handle: Arc<ContextHandle>,
+    delegator_did: String,
+    delegatee_did: String,
+    parent_token: String,
+    capabilities: Vec<String>,
+) -> Result<Arc<UcanToken>, ScpError> {
+    runtime()
+        .spawn(async move {
+            use scp_core::crypto::ucan::Attenuation;
+            use scp_core::crypto::ucan::mint::{DelegateParams, delegate_ucan};
+            use scp_core::crypto::ucan::validate::parse_ucan;
+
+            // Extract key custody and signing key from the context handle.
+            let custody =
+                handle
+                    .in_memory_custody
+                    .as_ref()
+                    .ok_or_else(|| ScpError::Permission {
+                        message: "UCAN delegation requires key custody — create the context with \
+                              an in_memory identity (identity_create(\"in_memory\"))"
+                            .to_owned(),
+                        code: "SCP-PERM-3004".to_owned(),
+                    })?;
+            let signing_key = handle.signing_key.ok_or_else(|| ScpError::Permission {
+                message: "UCAN delegation requires a signing key — the context creator identity \
+                          must have an active signing key"
+                    .to_owned(),
+                code: "SCP-PERM-3004".to_owned(),
+            })?;
+
+            // Parse the parent token.
+            let parsed_parent = parse_ucan(&parent_token).map_err(|e| ScpError::Permission {
+                message: format!("malformed parent UCAN token: {e}"),
+                code: "SCP-PERM-3002".to_owned(),
+            })?;
+
+            // Build attenuated capabilities from the capability URI strings.
+            let context_id = &handle.context_id;
+            let attenuations: Vec<Attenuation> = capabilities
+                .iter()
+                .map(|cap| {
+                    let cap_uri = if cap.starts_with("scp:ctx:") {
+                        cap.clone()
+                    } else {
+                        format!("scp:ctx:{context_id}/{cap}")
+                    };
+                    let action = cap_uri.rsplit_once('/').map_or_else(
+                        || cap.clone(),
+                        |(_, a)| {
+                            a.split_once(':')
+                                .map_or_else(|| a.to_owned(), |(_, act)| act.to_owned())
+                        },
+                    );
+                    Attenuation {
+                        with: cap_uri,
+                        can: action,
+                    }
+                })
+                .collect();
+
+            // Get ceiling from handle for delegation-time enforcement (#339).
+            let ceiling = if handle.ceiling_strings.is_empty() {
+                None
+            } else {
+                Some(handle.ceiling_strings.iter().cloned().collect())
+            };
+
+            let params = DelegateParams {
+                parent_token: &parsed_parent,
+                delegator_did: &delegator_did,
+                delegator_key: &signing_key,
+                delegatee_did: &delegatee_did,
+                attenuated_capabilities: &attenuations,
+                lifetime_secs: 3600,
+                facts: None,
+                key_scope: None,
+                signing_key_id: None,
+                ceiling,
+            };
+
+            let token = delegate_ucan(&params, &custody.0)
+                .await
+                .map_err(ScpError::from)?;
+
+            let data = UcanTokenData {
+                token_id: token.payload.nnc.clone(),
+                issuer: token.payload.iss.clone(),
+                audience: token.payload.aud.clone(),
+                capabilities: token.payload.att.iter().map(|a| a.with.clone()).collect(),
+                expires_at: Some(token.payload.exp),
+            };
+
+            increment_handle_count();
+            Ok(Arc::new(UcanToken {
+                data,
+                encoded: token.encoded,
+            }))
+        })
+        .await
+        .map_err(|e| ScpError::Permission {
+            message: format!("tokio task join error during UCAN delegation: {e}"),
+            code: "SCP-PERM-3005".to_owned(),
+        })?
+}
+
+#[cfg(not(feature = "allow_in_memory_custody"))]
+#[allow(clippy::unused_async)] // Must be async to match the cfg(feature) variant's signature.
+async fn ucan_delegate_impl(
+    _handle: Arc<ContextHandle>,
+    _delegator_did: String,
+    _delegatee_did: String,
+    _parent_token: String,
+    _capabilities: Vec<String>,
+) -> Result<Arc<UcanToken>, ScpError> {
+    Err(ScpError::Permission {
+        message: "UCAN delegation requires key custody — the in_memory custody path \
+                  is not available in this build. Enable the \
+                  \"allow_in_memory_custody\" feature for dev/desktop use, or wire \
+                  a KeyCustodyProvider for production."
+            .to_owned(),
+        code: "SCP-PERM-3004".to_owned(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Free functions — event log operations
 //
@@ -3889,6 +4247,138 @@ pub async fn event_log_verify(
             message: format!("tokio task join error during event log verification: {e}"),
             code: "SCP-CTX-2026".to_owned(),
         })?
+}
+
+/// Generates a signed consistency checkpoint from the current event log state.
+///
+/// Creates a snapshot of the event log's Merkle root and event count, signs it
+/// with the caller's identity key, and returns the checkpoint. Checkpoints
+/// enable equivocation detection: members exchange signed Merkle roots and
+/// compare them to detect relay misbehavior.
+///
+/// # Arguments
+///
+/// * `handle` — The context whose event log to checkpoint.
+/// * `identity` — The identity generating the checkpoint (used for signing).
+/// * `epoch` — The current MLS epoch (pass 0 for Broadcast contexts).
+///
+/// # Returns
+///
+/// A [`Checkpoint`] containing the signed checkpoint data.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` if the context is not found in the UCAN
+/// registry. Returns `ScpError::Permission` if key custody is not available.
+///
+/// See ADR-011 acceptance criterion 8 and ADR-030.
+#[uniffi::export]
+pub async fn event_log_checkpoint(
+    handle: Arc<ContextHandle>,
+    identity: Arc<Identity>,
+    epoch: u64,
+) -> Result<Checkpoint, ScpError> {
+    event_log_checkpoint_impl(handle, identity, epoch).await
+}
+
+#[cfg(feature = "allow_in_memory_custody")]
+async fn event_log_checkpoint_impl(
+    handle: Arc<ContextHandle>,
+    identity: Arc<Identity>,
+    epoch: u64,
+) -> Result<Checkpoint, ScpError> {
+    runtime()
+        .spawn(async move {
+            let custody =
+                identity
+                    .in_memory_custody
+                    .as_ref()
+                    .ok_or_else(|| ScpError::Permission {
+                        message: "event log checkpoint requires key custody — create the identity \
+                              with in_memory custody (identity_create(\"in_memory\"))"
+                            .to_owned(),
+                        code: "SCP-PERM-3008".to_owned(),
+                    })?;
+            let core_id = identity
+                .core_id
+                .as_ref()
+                .ok_or_else(|| ScpError::Identity {
+                    message:
+                        "event log checkpoint requires retained identity state — the identity \
+                          was externally loaded"
+                            .to_owned(),
+                    code: "SCP-IDENT-1007".to_owned(),
+                })?;
+
+            // Ensure UCAN state (which contains the event log) is registered.
+            crate::runtime::ensure_ucan_registered(
+                &handle.context_id,
+                &handle.creator_did,
+                &handle.ceiling_strings,
+            );
+
+            let sender_did = scp_identity::DID(identity.did.clone());
+            let context_id = handle.context_id.clone();
+
+            let checkpoint = crate::runtime::with_ucan_state(&context_id, |ucan_state| {
+                let signer = scp_core::event_log::KeyCustodySigner {
+                    custody: &custody.0,
+                    key: &core_id.active_signing_key,
+                };
+                // generate_checkpoint is async — use the tokio handle since we
+                // are already inside a spawned task.
+                let handle = tokio::runtime::Handle::current();
+                handle.block_on(async {
+                    scp_event_log::checkpoint::generate_checkpoint(
+                        &ucan_state.event_log,
+                        &sender_did,
+                        epoch,
+                        &signer,
+                    )
+                    .await
+                    .map_err(|e| ScpError::Context {
+                        message: format!("checkpoint generation failed: {e}"),
+                        code: "SCP-CTX-2027".to_owned(),
+                    })
+                })
+            })
+            .ok_or_else(|| ScpError::Context {
+                message: format!("context '{context_id}' not found in UCAN registry"),
+                code: "SCP-CTX-2027".to_owned(),
+            })??;
+
+            Ok(Checkpoint {
+                context_id: checkpoint.context_id,
+                sender_did: checkpoint.sender_did.0,
+                event_count: checkpoint.event_count,
+                merkle_root: hex::encode(checkpoint.merkle_root),
+                epoch: checkpoint.epoch,
+                timestamp: checkpoint.timestamp,
+                signature: hex::encode(checkpoint.signature),
+            })
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            message: format!("tokio task join error during event log checkpoint: {e}"),
+            code: "SCP-CTX-2028".to_owned(),
+        })?
+}
+
+#[cfg(not(feature = "allow_in_memory_custody"))]
+#[allow(clippy::unused_async)]
+async fn event_log_checkpoint_impl(
+    _handle: Arc<ContextHandle>,
+    _identity: Arc<Identity>,
+    _epoch: u64,
+) -> Result<Checkpoint, ScpError> {
+    Err(ScpError::Permission {
+        message: "event log checkpoint requires key custody — the in_memory custody path \
+                  is not available in this build. Enable the \
+                  \"allow_in_memory_custody\" feature for dev/desktop use, or wire \
+                  a KeyCustodyProvider for production."
+            .to_owned(),
+        code: "SCP-PERM-3008".to_owned(),
+    })
 }
 
 // ---------------------------------------------------------------------------
