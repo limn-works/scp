@@ -4,6 +4,9 @@
 //! [`RegistryEntry`] metadata. The registry contains 28 protocol-defined
 //! challenge capabilities across 10 categories and 5 system capabilities.
 //!
+//! Note: `scp:capability:tool-integrity/v1` is NOT included — it is an
+//! attestation type (§7.4.2), not a challenge-testable capability. See #407.
+//!
 //! # SDK Enforcement (§7.3.4.2)
 //!
 //! [`validate_capability_uri`] is the SDK enforcement point: it accepts known
@@ -97,7 +100,7 @@ fn entry(
 }
 
 // ---------------------------------------------------------------------------
-// Protocol registry (27 challenge capabilities)
+// Protocol registry (28 challenge capabilities)
 // ---------------------------------------------------------------------------
 
 /// The protocol capability registry: 28 challenge capabilities across 10
@@ -105,6 +108,9 @@ fn entry(
 ///
 /// Per ADR-041 and §7.3.4.3.
 static PROTOCOL_REGISTRY: LazyLock<HashMap<String, RegistryEntry>> = LazyLock::new(|| {
+    // 28 challenge capabilities across 10 categories.
+    // tool-integrity/v1 is NOT included: it is an attestation type (§7.4.2),
+    // not a challenge-testable capability. See #407.
     let mut m = HashMap::with_capacity(28);
 
     // -- Safety & Security (4) --
@@ -163,16 +169,6 @@ static PROTOCOL_REGISTRY: LazyLock<HashMap<String, RegistryEntry>> = LazyLock::n
         entry(
             "schema-compliance",
             "Produce output in requested formats. Pass = valid format.",
-            None,
-        ),
-    );
-
-    // -- Tool Integrity (1) --
-    m.insert(
-        "scp:capability:tool-integrity/v1".into(),
-        entry(
-            "schema-compliance",
-            "Schema-based tool output verification. Pass = outputs match expected structure.",
             None,
         ),
     );
@@ -395,13 +391,13 @@ static PROTOCOL_REGISTRY: LazyLock<HashMap<String, RegistryEntry>> = LazyLock::n
         entry("factual-hallucination", "Real, verifiable citations.", None),
     );
 
-    // The spec §7.3.4.3 and ADR-041 list 28 capabilities across 10 categories.
-    // (The "27" stated in prose is a counting error in the source documents;
-    // the actual enumerated list contains 28 entries.)
+    // The spec §7.3.4.3 and ADR-041 list 28 challenge capabilities across
+    // 10 categories. tool-integrity/v1 is an attestation type (§7.4.2),
+    // not a challenge-testable capability — excluded per #407.
     debug_assert_eq!(
         m.len(),
-        29,
-        "PROTOCOL_REGISTRY must contain exactly 29 entries"
+        28,
+        "PROTOCOL_REGISTRY must contain exactly 28 entries"
     );
     m
 });
@@ -579,8 +575,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn protocol_registry_contains_exactly_29_entries() {
-        assert_eq!(PROTOCOL_REGISTRY.len(), 29);
+    fn protocol_registry_contains_exactly_28_entries() {
+        assert_eq!(PROTOCOL_REGISTRY.len(), 28);
     }
 
     #[test]
@@ -589,10 +585,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // All 27 protocol capability URIs (from §7.3.4.3)
+    // All 28 protocol capability URIs (from §7.3.4.3)
     // -----------------------------------------------------------------------
 
-    const ALL_PROTOCOL_URIS: [&str; 29] = [
+    const ALL_PROTOCOL_URIS: [&str; 28] = [
         // Safety & Security (4)
         "scp:capability:prompt-injection-resistance/v1",
         "scp:capability:content-safety/v1",
@@ -602,7 +598,6 @@ mod tests {
         "scp:capability:schema-validation/v1",
         "scp:capability:tool-schema-compliance/v1",
         "scp:capability:output-format-compliance/v1",
-        "scp:capability:tool-integrity/v1",
         // Behavioral Compliance (4)
         "scp:capability:rate-limit-compliance/v1",
         "scp:capability:instruction-adherence/v1",
@@ -670,7 +665,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn is_known_protocol_capability_true_for_all_29() {
+    fn is_known_protocol_capability_true_for_all_28() {
         for uri in ALL_PROTOCOL_URIS {
             assert!(
                 is_known_protocol_capability(uri),
@@ -727,7 +722,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn validate_accepts_all_29_protocol_capabilities() {
+    fn validate_accepts_all_28_protocol_capabilities() {
         for uri in ALL_PROTOCOL_URIS {
             let result = validate_capability_uri(uri);
             assert!(
@@ -888,7 +883,6 @@ mod tests {
             "scp:capability:schema-validation/v1",
             "scp:capability:tool-schema-compliance/v1",
             "scp:capability:output-format-compliance/v1",
-            "scp:capability:tool-integrity/v1",
         ];
         for uri in uris {
             assert_eq!(
@@ -897,7 +891,7 @@ mod tests {
                 "wrong category for {uri}"
             );
         }
-        assert_eq!(uris.len(), 4);
+        assert_eq!(uris.len(), 3);
     }
 
     #[test]
@@ -1095,6 +1089,21 @@ mod tests {
     // -----------------------------------------------------------------------
     // RegistryEntry struct fields
     // -----------------------------------------------------------------------
+
+    /// tool-integrity/v1 is an attestation type (§7.4.2), NOT a challenge-
+    /// testable capability. It must not appear in the protocol registry.
+    /// Guard against accidental re-addition (#407).
+    #[test]
+    fn tool_integrity_is_not_a_protocol_capability() {
+        assert!(
+            !is_known_protocol_capability("scp:capability:tool-integrity/v1"),
+            "tool-integrity/v1 is an attestation type, not a challenge capability"
+        );
+        assert!(
+            validate_capability_uri("scp:capability:tool-integrity/v1").is_err(),
+            "tool-integrity/v1 must be rejected by SDK validation"
+        );
+    }
 
     #[test]
     fn registry_entry_has_required_fields() {

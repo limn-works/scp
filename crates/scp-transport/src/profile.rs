@@ -214,6 +214,23 @@ impl TransportProfile {
         }
     }
 
+    /// Returns the minimum number of successful relay deliveries required
+    /// for a send to succeed.
+    ///
+    /// Derived from [`min_relays`](Self::min_relays): a majority of the
+    /// relay set must accept the envelope for the send to be considered
+    /// sufficiently redundant. For single-relay profiles (`Constrained`),
+    /// the minimum is 1 since no redundancy is available.
+    ///
+    /// - Server: 2 (majority of 3)
+    /// - Desktop: 2 (majority of 3)
+    /// - Mobile: 1 (at least 1 of 2; see §10.13.1 suppression trade-offs)
+    /// - Constrained: 1 (single relay, no redundancy)
+    #[must_use]
+    pub const fn min_successful_sends(&self) -> usize {
+        self.min_relays().div_ceil(2)
+    }
+
     /// Returns the maximum total connection count across all adapters.
     ///
     /// - Server: `usize::MAX` (unlimited)
@@ -519,6 +536,26 @@ mod tests {
     #[test]
     fn constrained_min_relays() {
         assert_eq!(TransportProfile::Constrained.min_relays(), 1);
+    }
+
+    #[test]
+    fn server_min_successful_sends() {
+        assert_eq!(TransportProfile::Server.min_successful_sends(), 2);
+    }
+
+    #[test]
+    fn desktop_min_successful_sends() {
+        assert_eq!(TransportProfile::Desktop.min_successful_sends(), 2);
+    }
+
+    #[test]
+    fn mobile_min_successful_sends() {
+        assert_eq!(TransportProfile::Mobile.min_successful_sends(), 1);
+    }
+
+    #[test]
+    fn constrained_min_successful_sends() {
+        assert_eq!(TransportProfile::Constrained.min_successful_sends(), 1);
     }
 
     #[test]

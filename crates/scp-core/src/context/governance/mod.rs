@@ -1569,16 +1569,17 @@ pub fn actions_conflict(
     proposer_b: &DID,
 ) -> bool {
     use GovernanceAction::{
-        ChangeRole, ModifyCeiling, RemoveMember, RestoreReadAccess, RestoreWriteAccess,
-        RevokeReadAccess, RevokeWriteAccess,
+        AddSigner, ChangeRole, ModifyCeiling, ModifyPruningPolicy, ModifyThreshold,
+        ReconfigureGovernance, RemoveMember, RemoveSigner, RestoreReadAccess, RestoreWriteAccess,
+        RevokeReadAccess, RevokeWriteAccess, RotateContentKeys,
     };
 
-    match (action_a, action_b) {
-        // Mutual RemoveMember (each targeting the other's proposer)
-        (RemoveMember { did: target_a, .. }, RemoveMember { did: target_b, .. }) => {
-            target_a == proposer_b && target_b == proposer_a
-        }
+    // This function MUST stay in sync with
+    // `sync::conflict_resolution::actions_conflict`. The canonical
+    // conflict matrix is defined here; the sync module re-uses the same
+    // logic for offline-merge conflict detection (ADR-029 / ADR-031).
 
+    match (action_a, action_b) {
         // Competing ChangeRole proposals for the same DID with different roles
         (
             ChangeRole {
@@ -1591,51 +1592,45 @@ pub fn actions_conflict(
             },
         ) => did_a == did_b && role_a != role_b,
 
-        // Competing ModifyCeiling proposals with different ceiling sets
-        (
-            ModifyCeiling {
-                new_ceiling: ceiling_a,
-            },
-            ModifyCeiling {
-                new_ceiling: ceiling_b,
-            },
-        ) => ceiling_a != ceiling_b,
+        // Any two concurrent modifications to the same global context property
+        // conflict — the values may or may not differ, but concurrent
+        // modification is unsafe (ADR-031 §7).
+        (ModifyCeiling { .. }, ModifyCeiling { .. })
+        | (ModifyThreshold { .. }, ModifyThreshold { .. })
+        | (ModifyPruningPolicy { .. }, ModifyPruningPolicy { .. })
+        | (ReconfigureGovernance { .. }, ReconfigureGovernance { .. })
+        // Concurrent context-wide key rotations conflict (global property mutation).
+        | (RotateContentKeys { .. }, RotateContentKeys { .. }) => true,
 
-        // RemoveMember + ChangeRole for the same DID
+        // Remove + role change for the same DID.
         (RemoveMember { did: did_a, .. }, ChangeRole { did: did_b, .. })
-        | (ChangeRole { did: did_a, .. }, RemoveMember { did: did_b, .. })
-        // RevokeReadAccess + RestoreReadAccess for the same DID (mutually contradictory)
+        | (ChangeRole { did: did_a, .. }, RemoveMember { did: did_b, .. }) => did_a == did_b,
+
+        // Two concurrent removals of the same member conflict (ADR-031 §7:
+        // concurrent modifications to the same membership state).
+        // Also catches mutual removal (each proposer removes the other).
+        (RemoveMember { did: did_a, .. }, RemoveMember { did: did_b, .. }) => {
+            did_a == did_b || (did_a == proposer_b && did_b == proposer_a)
+        }
+
+        // Two concurrent revocations of the same type targeting the same DID
+        // conflict (scope may differ, but concurrent revocation is unsafe —
+        // ADR-031 §7). Revoke and Restore for the same DID also conflict
+        // (contradictory intent on the same member's access state).
+        (RevokeReadAccess { did: did_a, .. }, RevokeReadAccess { did: did_b, .. })
+        | (RevokeWriteAccess { did: did_a, .. }, RevokeWriteAccess { did: did_b, .. })
         | (RevokeReadAccess { did: did_a, .. }, RestoreReadAccess { did: did_b })
         | (RestoreReadAccess { did: did_a }, RevokeReadAccess { did: did_b, .. })
-        // RevokeWriteAccess + RestoreWriteAccess for the same DID (mutually contradictory)
         | (RevokeWriteAccess { did: did_a, .. }, RestoreWriteAccess { did: did_b })
         | (RestoreWriteAccess { did: did_a }, RevokeWriteAccess { did: did_b, .. }) => {
             did_a == did_b
         }
 
-        // Two RevokeReadAccess or RevokeWriteAccess for same DID with different scopes
-        (
-            RevokeReadAccess {
-                did: did_a,
-                scope: scope_a,
-            },
-            RevokeReadAccess {
-                did: did_b,
-                scope: scope_b,
-            },
-        )
-        | (
-            RevokeWriteAccess {
-                did: did_a,
-                scope: scope_a,
-            },
-            RevokeWriteAccess {
-                did: did_b,
-                scope: scope_b,
-            },
-        ) => did_a == did_b && scope_a != scope_b,
+        // AddSigner and RemoveSigner for the same DID conflict.
+        (AddSigner { did: add_did }, RemoveSigner { did: remove_did })
+        | (RemoveSigner { did: remove_did }, AddSigner { did: add_did }) => add_did == remove_did,
 
-        // All other combinations are not conflicting
+        // All other action pairs are non-conflicting.
         _ => false,
     }
 }

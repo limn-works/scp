@@ -78,16 +78,23 @@ pub trait Storage: Send + Sync {
 All keys follow `{namespace}/{entity_id}/{sub_key}` with `/` as the hierarchy separator. Keys are UTF-8 strings. Entity IDs are deterministic (DIDs, context IDs, hashes). Sub-keys are type-specific.
 
 ```
+_meta/schema_version
+
 identity/{did}/document
 identity/{did}/active_signing_key
 identity/{did}/agent_signing_key
 identity/{did}/private_state/{seq:020d}
+identity/{did}/block_list_events
+identity/{did}/adapter_credentials/{adapter_id}
 
 context/{context_id}/state
 context/{context_id}/params
+context/{context_id}/full_snapshot
 context/{context_id}/membership/{did}
 context/{context_id}/sender_key/{did}
+context/{context_id}/role/{role_name}
 context/{context_id}/nonce/{nonce_hash}
+context/{context_id}/nonce/_last_prune
 context/{context_id}/event/{seq:020d}
 context/{context_id}/event_data/{seq:020d}
 context/{context_id}/event_meta/count
@@ -95,19 +102,33 @@ context/{context_id}/event_meta/root
 context/{context_id}/event_tree/{level}/{index}
 context/{context_id}/tool/{tool_id}
 context/{context_id}/tool_session/{session_id}
-context/{context_id}/role/{role_name}
+context/{context_id}/ucan_token/{token_id}
 context/{context_id}/ucan_revocation/{token_id}
+context/{context_id}/broadcast_state
+context/{context_id}/broadcast_block/{author_did}
+context/{context_id}/ephemeral_metadata
+
+context/{context_id}/governance/config
+context/{context_id}/governance/proposal/{proposal_id_hex}
+context/{context_id}/governance/proposal_index/pending
+context/{context_id}/governance/proposal_index/resolved
+context/{context_id}/governance/deadlock_state
+
+context/{context_id}/access_key/{did_hex}
+context/{context_id}/access_key/{did_hex}/epoch
 
 context/{context_id}/economic_policy
 context/{context_id}/payment_receipt/{receipt_id}
 context/{context_id}/spending_ucan/{token_id}
 
-identity/{did}/adapter_credentials/{adapter_id}
+wrapping_key/{context_id}/{did}/public
+wrapping_key/{context_id}/{did}/secret
 
 did_cache/{did}
 tofu/{did}
-key_package/{relay_url}/{index}
-relay_score/{relay_url}
+key_package/{sha256_hex(relay_url)}/{index}
+relay_score/{sha256_hex(relay_url)}
+cert_pin/{sha256_hex(relay_url)}
 
 tls/certificate_chain
 tls/private_key
