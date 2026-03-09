@@ -275,16 +275,17 @@ jobs:
   swift-lint:
     needs: changes
     if: needs.changes.outputs.swift == 'true'
-    name: Swift / swiftlint
+    name: Swift / lint + format
     runs-on: macos-latest
     defaults:
       run:
         working-directory: bindings/swift
     steps:
       - uses: actions/checkout@v4
-      - name: Install SwiftLint
-        run: brew install swiftlint
+      - name: Install SwiftLint and SwiftFormat
+        run: brew install swiftlint swiftformat
       - run: swiftlint lint --strict
+      - run: swiftformat --lint Sources/ Tests/
 
   swift-build-test:
     needs: changes
