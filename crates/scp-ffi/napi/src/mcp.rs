@@ -339,12 +339,12 @@ impl ContextProvider for McpNapiBridgeProvider {
         static WARN_ONCE: std::sync::Once = std::sync::Once::new();
         WARN_ONCE.call_once(|| {
             tracing::warn!(
-                "McpNapiBridgeProvider::agent_role always returns \"admin\" — \
+                "McpNapiBridgeProvider::agent_role returns None — \
                  wire a production ContextProvider that resolves real roles \
                  from ContextManager before exposing MCP in production."
             );
         });
-        Some("admin".to_owned())
+        None
     }
 
     fn agent_did(&self) -> &str {
@@ -359,12 +359,12 @@ impl ContextProvider for McpNapiBridgeProvider {
         static WARN_ONCE: std::sync::Once = std::sync::Once::new();
         WARN_ONCE.call_once(|| {
             tracing::warn!(
-                "McpNapiBridgeProvider::validate_capability always succeeds — \
+                "McpNapiBridgeProvider::validate_capability returns error — \
                  wire a production ContextProvider that checks UCAN capabilities \
                  against the context's role state before exposing MCP in production."
             );
         });
-        Ok(())
+        Err("capability validation not implemented — wire a production ContextProvider".to_owned())
     }
 
     fn invoke_tool(
