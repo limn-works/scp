@@ -1990,6 +1990,8 @@ impl WasmContextManager {
             read_revoked_members: ctx.read_revoked_members.iter().cloned().collect(),
             read_exclusion_list: ctx.read_exclusion_list.iter().cloned().collect(),
             broadcast,
+            revoked_tokens: ctx.revoked_tokens.iter().cloned().collect(),
+            seen_nonces: ctx.seen_nonces.iter().cloned().collect(),
         };
 
         let now_ms = js_sys::Date::now();
@@ -2107,8 +2109,8 @@ impl WasmContextManager {
             tool_registry: ToolRegistry::new(),
             tool_handlers: HashMap::new(),
             event_log: WasmEventLog::new(context_id.clone()),
-            revoked_tokens: HashSet::new(),
-            seen_nonces: HashSet::new(),
+            revoked_tokens: snap.revoked_tokens.iter().cloned().collect(),
+            seen_nonces: snap.seen_nonces.iter().cloned().collect(),
             members,
             event_buffer: Vec::new(),
             executed_proposals: HashSet::new(),
@@ -2169,9 +2171,9 @@ struct WasmContextExportEnvelope {
 /// Snapshot of a context's state for export.
 ///
 /// Contains all fields needed to reconstruct a `PerContextState` on import.
-/// Tool registry, event log, and UCAN state are NOT exported (they can be
+/// Tool registry, event log, and tool handlers are NOT exported (they can be
 /// re-registered after import). Membership, roles, governance, broadcast,
-/// and revocation state are preserved.
+/// UCAN revocation, and nonce replay state are preserved.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct WasmContextExportSnapshot {
     context_id: String,
@@ -2190,6 +2192,14 @@ struct WasmContextExportSnapshot {
     read_revoked_members: Vec<String>,
     read_exclusion_list: Vec<String>,
     broadcast: Option<WasmExportBroadcast>,
+    /// UCAN revocation CIDs. Preserves revocation state across export/import
+    /// so that previously revoked tokens remain rejected.
+    #[serde(default)]
+    revoked_tokens: Vec<String>,
+    /// Seen UCAN nonces. Preserves nonce replay protection across
+    /// export/import so that previously used nonces are still rejected.
+    #[serde(default)]
+    seen_nonces: Vec<String>,
 }
 
 /// Serializable member entry for export.
