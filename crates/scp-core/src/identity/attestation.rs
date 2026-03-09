@@ -354,11 +354,17 @@ impl IdentityLinkAttestation {
 
     /// Computes the deterministic attestation ID from its components.
     ///
-    /// `id = hex(SHA-256(issuer_did || platform || platform_handle || issued_at))`
+    /// `id = hex(SHA-256("SCP-ATTESTATION-ID-V1:" || len(issuer_did) || issuer_did || len(platform) || platform || len(platform_handle) || platform_handle || issued_at_be))`
     ///
-    /// The `issued_at` is encoded as its decimal string representation
-    /// to ensure deterministic cross-platform computation.
+    /// The domain separator `"SCP-ATTESTATION-ID-V1:"` ensures this hash
+    /// cannot collide with hashes from other SCP subsystems. Each string
+    /// field is length-prefixed with its byte length as a 4-byte big-endian
+    /// integer to prevent concatenation ambiguity (e.g., platform `"ab"` +
+    /// handle `"cd"` vs platform `"a"` + handle `"bcd"`). The `issued_at`
+    /// timestamp is encoded as 8-byte big-endian for deterministic
+    /// cross-platform computation.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // DID/platform strings are far below u32::MAX bytes.
     pub fn compute_id(
         issuer: &DID,
         platform: &str,
@@ -367,11 +373,16 @@ impl IdentityLinkAttestation {
     ) -> String {
         use sha2::{Digest, Sha256};
 
+        let issuer_bytes = (*issuer).as_bytes();
         let mut hasher = Sha256::new();
-        hasher.update((*issuer).as_bytes());
+        hasher.update(b"SCP-ATTESTATION-ID-V1:");
+        hasher.update((issuer_bytes.len() as u32).to_be_bytes());
+        hasher.update(issuer_bytes);
+        hasher.update((platform.len() as u32).to_be_bytes());
         hasher.update(platform.as_bytes());
+        hasher.update((platform_handle.len() as u32).to_be_bytes());
         hasher.update(platform_handle.as_bytes());
-        hasher.update(issued_at.to_string().as_bytes());
+        hasher.update(issued_at.to_be_bytes());
 
         let hash = hasher.finalize();
         hex::encode(hash)

@@ -50,9 +50,6 @@ pub const DEFAULT_PER_INTERFACE_CALLS_PER_MINUTE: u32 = 60;
 /// Default per-caller rate limit: 10 calls per minute (spec §6.2.0.2).
 pub const DEFAULT_PER_CALLER_CALLS_PER_MINUTE: u32 = 10;
 
-/// Default burst allowance: 5 calls above limit within 1 second (spec §6.2.0.2).
-pub const DEFAULT_BURST_ALLOWANCE: u32 = 5;
-
 /// Default sliding window duration: 60 seconds (spec §6.2.0.2).
 pub const DEFAULT_WINDOW_SECONDS: u64 = 60;
 
@@ -66,17 +63,30 @@ pub const OFFER_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// Policy set by the exposing context (Context A) for a tool interface.
 ///
 /// Controls who can call through the interface and under what constraints.
+/// All fields are enforced in [`invoke_cross_context`]:
+/// - `allowed_callers`: checked before execution (empty = any member).
+/// - `max_calls_per_minute`: enforced by the per-interface [`RateLimit`].
+/// - `max_payload_bytes`: request input size checked before execution.
+/// - `require_provenance`: advisory — signals to the caller that
+///   responses should carry provenance metadata. Enforcement is the
+///   caller's responsibility (the callee cannot force the caller to
+///   attach provenance to its own records).
+///
 /// See spec §6.2.0.1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboundPolicy {
     /// DIDs in the source context authorized to use this interface.
     /// Empty means any member with the `ToolInterface` capability.
+    /// Enforced in [`invoke_cross_context`].
     pub allowed_callers: Vec<DID>,
     /// Maximum calls per minute from the source context's perspective.
+    /// Enforced by the per-interface [`RateLimit`].
     pub max_calls_per_minute: u32,
     /// Maximum request payload size in bytes. Default: 65536 (64 KiB).
+    /// Enforced in [`invoke_cross_context`] by checking serialized input size.
     pub max_payload_bytes: u32,
     /// Whether responses must carry provenance. Default: true.
+    /// Advisory: signals expectation to the calling context.
     pub require_provenance: bool,
 }
 
@@ -98,16 +108,31 @@ impl Default for OutboundPolicy {
 /// Policy set by the consuming context (Context B) for a tool interface.
 ///
 /// Controls which roles in the source context can call and response constraints.
+/// Fields are enforced in [`invoke_cross_context`]:
+/// - `allowed_source_roles`: advisory — role-based filtering is enforced by
+///   the source context's governance engine (via `has_tool_invoke_capability`),
+///   not repeated here. The field signals the target's expectations.
+/// - `max_calls_per_minute`: enforced by the per-interface [`RateLimit`]
+///   (effective limit is `min(outbound, inbound)`).
+/// - `max_response_bytes`: response size checked after execution.
+/// - `require_spending_ucan`: advisory — UCAN validation happens at the
+///   governance layer before invocation reaches this function.
+///
 /// See spec §6.2.0.1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboundPolicy {
     /// Roles in the source context whose members can call. Empty means any role.
+    /// Advisory: role enforcement is the source context governance engine's
+    /// responsibility (it checks `has_tool_invoke_capability`).
     pub allowed_source_roles: Vec<String>,
     /// Maximum calls per minute from the target context's perspective.
+    /// Enforced by the per-interface [`RateLimit`].
     pub max_calls_per_minute: u32,
     /// Maximum response payload size in bytes. Default: 65536 (64 KiB).
+    /// Enforced in [`invoke_cross_context`] by checking serialized output size.
     pub max_response_bytes: u32,
     /// Whether callers must present spending UCANs. Default: false.
+    /// Advisory: UCAN validation happens at the governance layer.
     pub require_spending_ucan: bool,
 }
 
@@ -145,7 +170,8 @@ pub struct ProposeToolInterface {
 /// 7 days if not accepted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterfaceOffer {
-    /// `SHA-256(source_context_id || tool_id || target_context_id || timestamp)`.
+    /// `SHA-256("SCP-OFFER-ID-V1:" || len(source_context_id) || source_context_id || len(tool_id) || tool_id || len(target_context_id) || target_context_id || timestamp)`.
+    /// Domain-separated and length-prefixed (4-byte big-endian) to prevent collisions.
     pub offer_id: [u8; 32],
     /// The context exposing the tool.
     pub source_context: ContextId,
@@ -160,8 +186,15 @@ pub struct InterfaceOffer {
 }
 
 impl InterfaceOffer {
-    /// Computes the offer ID as `SHA-256(source_context || tool_id || target_context || timestamp)`.
+    /// Computes the offer ID as `SHA-256("SCP-OFFER-ID-V1:" || len(source_context) || source_context || len(tool_id) || tool_id || len(target_context) || target_context || timestamp)`.
+    ///
+    /// The domain separator `"SCP-OFFER-ID-V1:"` ensures this hash cannot
+    /// collide with hashes from other SCP subsystems. Each string field is
+    /// length-prefixed with its byte length as a 4-byte big-endian integer
+    /// to prevent concatenation ambiguity (e.g., `("ab", "cd")` vs
+    /// `("a", "bcd")`).
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // Protocol IDs are far below u32::MAX bytes.
     pub fn compute_offer_id(
         source_context: &str,
         tool_id: &str,
@@ -169,8 +202,12 @@ impl InterfaceOffer {
         timestamp: u64,
     ) -> [u8; 32] {
         let mut hasher = Sha256::new();
+        hasher.update(b"SCP-OFFER-ID-V1:");
+        hasher.update((source_context.len() as u32).to_be_bytes());
         hasher.update(source_context.as_bytes());
+        hasher.update((tool_id.len() as u32).to_be_bytes());
         hasher.update(tool_id.as_bytes());
+        hasher.update((target_context.len() as u32).to_be_bytes());
         hasher.update(target_context.as_bytes());
         hasher.update(timestamp.to_be_bytes());
         hasher.finalize().into()
@@ -300,11 +337,20 @@ impl RateLimit {
 // PerCallerRateLimit (§6.2.0.2)
 // ---------------------------------------------------------------------------
 
+/// Maximum number of distinct callers tracked before rejecting new callers.
+///
+/// Prevents unbounded memory growth from a large number of unique DIDs
+/// making single calls. When the limit is reached, expired entries are
+/// evicted first; if still at capacity, new callers are rejected.
+const MAX_TRACKED_CALLERS: usize = 10_000;
+
 /// Per-caller rate limiter for cross-context tool interfaces (spec §6.2.0.2).
 ///
 /// Tracks per-DID call counts independently of the per-interface limit.
 /// Default: 10 calls/minute per caller. Prevents a single caller from
-/// monopolizing an interface.
+/// monopolizing an interface. Expired entries are periodically evicted
+/// and the total number of tracked callers is capped at
+/// [`MAX_TRACKED_CALLERS`] to prevent unbounded memory growth.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerCallerRateLimit {
     /// Maximum calls per caller within the window.
@@ -326,10 +372,26 @@ impl PerCallerRateLimit {
         }
     }
 
+    /// Evicts all callers whose windows have expired.
+    ///
+    /// Called periodically during [`check_and_increment`] to reclaim memory
+    /// from callers who are no longer active within the current window.
+    #[allow(clippy::cast_possible_truncation)]
+    fn evict_expired(&mut self, now: u64) {
+        // Window durations are always far below u64::MAX milliseconds.
+        let window_ms = self.window.as_millis() as u64;
+        self.callers
+            .retain(|_, (_, window_start)| now.saturating_sub(*window_start) < window_ms);
+    }
+
     /// Checks whether a specific caller is within their per-caller rate limit.
     ///
+    /// Periodically evicts expired entries to prevent unbounded memory growth.
+    /// If the caller map is at capacity ([`MAX_TRACKED_CALLERS`]) after
+    /// eviction, new callers are rejected with a rate-limit error.
+    ///
     /// Returns `true` if the call is permitted, `false` if the caller has
-    /// exceeded their individual limit.
+    /// exceeded their individual limit or the caller map is at capacity.
     ///
     /// # Errors
     ///
@@ -342,6 +404,15 @@ impl PerCallerRateLimit {
         let now = crate::time::now_millis()?;
         // Window durations are always far below u64::MAX milliseconds.
         let window_ms = self.window.as_millis() as u64;
+
+        // Periodic eviction: run when approaching capacity to keep the map bounded.
+        if self.callers.len() >= MAX_TRACKED_CALLERS {
+            self.evict_expired(now);
+            // After eviction, if still at capacity and this is a new caller, reject.
+            if self.callers.len() >= MAX_TRACKED_CALLERS && !self.callers.contains_key(caller_did) {
+                return Ok(false);
+            }
+        }
 
         let (count, window_start) = self.callers.entry(caller_did.clone()).or_insert((0, now));
 
@@ -647,6 +718,12 @@ pub fn accept_tool_interface(
 /// approved the interface.
 /// Returns [`ToolError::InterfaceRateLimited`] if either the per-interface
 /// or per-caller rate limit is exceeded.
+/// Returns [`ToolError::InterfaceCallerNotAllowed`] if the invoker is not
+/// in the outbound policy's `allowed_callers` list.
+/// Returns [`ToolError::InterfacePayloadTooLarge`] if the serialized input
+/// exceeds the outbound policy's `max_payload_bytes`.
+/// Returns [`ToolError::InterfaceResponseTooLarge`] if the serialized output
+/// exceeds the inbound policy's `max_response_bytes`.
 /// Returns [`ToolError::InterfaceAdminRequired`] if the invoker lacks the
 /// required capability in the source context.
 #[allow(clippy::too_many_arguments)]
@@ -722,7 +799,26 @@ where
         });
     }
 
-    // 4. Source context governance: invoker must have tool invoke capability.
+    // 4. Outbound policy enforcement (§6.2.0.1): allowed_callers and payload size.
+    if let Some(ref outbound) = interface.outbound_policy {
+        // allowed_callers: empty means any member with ToolInterface capability.
+        if !outbound.allowed_callers.is_empty() && !outbound.allowed_callers.contains(invoker_did) {
+            return Err(ToolError::InterfaceCallerNotAllowed {
+                did: invoker_did.to_string(),
+            });
+        }
+
+        // max_payload_bytes: check serialized input size.
+        let input_bytes = serde_json::to_vec(input).unwrap_or_default();
+        if input_bytes.len() > outbound.max_payload_bytes as usize {
+            return Err(ToolError::InterfacePayloadTooLarge {
+                actual: input_bytes.len(),
+                max: outbound.max_payload_bytes,
+            });
+        }
+    }
+
+    // 5. Source context governance: invoker must have tool invoke capability.
     if !super::invoke::has_tool_invoke_capability(
         source_role_state,
         invoker_did,
@@ -734,21 +830,46 @@ where
         });
     }
 
-    // 5. Target context governance: tool must exist in target registry.
+    // 6. Target context governance: tool must exist in target registry.
     if !target_registry.contains(&interface.tool_id) {
         return Err(ToolError::ToolNotFound {
             tool_id: interface.tool_id.clone(),
         });
     }
 
-    // 6. Execute the tool.
+    // 7. Execute the tool.
     let output =
         executor(input).map_err(|msg| ToolError::InterfaceExecutionFailed { message: msg })?;
 
-    // 7. Build event payloads for both contexts.
+    // 8. Inbound policy enforcement (§6.2.0.1): response payload size.
+    if let Some(ref inbound) = interface.inbound_policy {
+        let response_bytes = serde_json::to_vec(&output).unwrap_or_default();
+        if response_bytes.len() > inbound.max_response_bytes as usize {
+            return Err(ToolError::InterfaceResponseTooLarge {
+                actual: response_bytes.len(),
+                max: inbound.max_response_bytes,
+            });
+        }
+    }
+
+    // 9. Build event payloads for both contexts.
+    let (source_event, target_event) =
+        build_cross_context_events(interface, input, &output, invoker_did);
+
+    Ok((output, source_event, target_event))
+}
+
+/// Builds matched event payloads for the source and target contexts of a
+/// cross-context tool invocation. Both events share the same `request_id`.
+fn build_cross_context_events(
+    interface: &ToolInterface,
+    input: &serde_json::Value,
+    output: &serde_json::Value,
+    invoker_did: &DID,
+) -> (CrossContextToolEvent, CrossContextToolEvent) {
     let request_id = uuid::Uuid::new_v4().to_string();
     let input_hash = sha256_json(input);
-    let output_hash = Some(sha256_json(&output));
+    let output_hash = Some(sha256_json(output));
 
     let source_event = CrossContextToolEvent {
         request_id: request_id.clone(),
@@ -772,7 +893,7 @@ where
         output_hash,
     };
 
-    Ok((output, source_event, target_event))
+    (source_event, target_event)
 }
 
 // ---------------------------------------------------------------------------
