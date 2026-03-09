@@ -179,7 +179,6 @@ pub struct FileKeyCustody {
     pseudonym_keys: Mutex<HashMap<u64, SigningKey>>,
     /// Serializes file read-modify-write operations to prevent data races
     /// when multiple tasks call `append_entry` concurrently.
-    #[allow(dead_code)] // Reserved for future concurrent write serialization
     file_write_lock: Mutex<()>,
 }
 
@@ -379,6 +378,7 @@ impl FileKeyCustody {
         key_type: StoredKeyType,
         private_key: &[u8; KEY_LEN],
     ) -> Result<usize, PlatformError> {
+        let _lock = self.file_write_lock.blocking_lock();
         let mut data = self.read_file()?;
 
         // Read current entry count.
