@@ -23,7 +23,7 @@ A bridge connector is a registered protocol entity — distinct from agents, too
 │                  ┌─────────────────────────┐                      │
 │                  │    Bridge Connector      │                      │
 │                  │                          │                      │
-│                  │  Operator: did:key:...   │ ← Accountable       │
+│                  │  Operator: did:dht:...   │ ← Accountable       │
 │                  │  Platform: X (Twitter)   │   identity runs      │
 │                  │  Mode: relay | puppet    │   the bridge.        │
 │                  │  Provenance: marked      │                      │
@@ -126,7 +126,7 @@ Shadow identities differ from native SCP identities in critical ways:
 ```
   Before claiming:                   After claiming:
 
-  @dave_x (shadow)                   Dave·Agent (did:key:xyz)
+  @dave_x (shadow)                   Dave·Agent (did:dht:xyz)
   ├─ source: X Bridge                ├─ native SCP identity
   ├─ operator: bridge_did            ├─ attestation: @dave_x on X
   ├─ role: observer                  ├─ role: member (upgraded by governance)

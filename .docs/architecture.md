@@ -1,6 +1,6 @@
 # SCP System Architecture — Build Document
 
-**Date:** February 21, 2026
+**Date:** March 9, 2026
 **Status:** Buildable design — this document is the engineering blueprint
 **Prerequisite reading:** specs/ (protocol design), sketch.md (API surfaces), planning-sessions/planning-session-04.md + planning-sessions/planning-session-06.md (technology decisions + resolved open questions)
 
@@ -27,7 +27,7 @@
 │  │                    SCP SDK                                    │  │
 │  │                                                               │  │
 │  │  ┌─────────────────────────────────────────────────────────┐ │  │
-│  │  │  PUBLIC API LAYER (~30 methods)                         │ │  │
+│  │  │  PUBLIC API LAYER (60+ methods)                          │ │  │
 │  │  │                                                         │ │  │
 │  │  │  Language bindings:                                     │ │  │
 │  │  │  • Python (PyO3)  — agent ecosystem                    │ │  │
@@ -259,7 +259,18 @@ scp/
 │   │   ├── envelope/          # SCP envelope creation, parsing, validation
 │   │   ├── provenance/        # Data provenance tagging
 │   │   ├── event_log/         # Append-only verifiable log
-│   │   └── store/             # ProtocolStore — typed domain storage (§17.4)
+│   │   ├── store/             # ProtocolStore — typed domain storage (§17.4)
+│   │   ├── bridge/            # Bridge connector protocol types (§12)
+│   │   ├── economy/           # Economic governance, pricing, spend auth (§19)
+│   │   └── sync/              # Offline/sync strategy (§23)
+│   │
+│   ├── scp-identity/          # DID, DHT, document, key management
+│   │
+│   ├── scp-event-log/         # Merkle event log
+│   │
+│   ├── scp-primitives/        # Pure utility crate — zero SCP dependencies (Layer 0)
+│   │   ├── time.rs            # Clock helpers (now_secs, now_millis) with ClockError
+│   │   └── crypto.rs          # Ed25519 signature verification helpers
 │   │
 │   ├── scp-transport/         # Transport abstraction + adapters
 │   │   ├── traits.rs          # TransportAdapter trait (5 methods)
@@ -273,48 +284,24 @@ scp/
 │   │   ├── nat/               # NAT traversal (STUN, port mapping)
 │   │   ├── native/            # SCP native relay adapter (Tier 1, mandatory baseline)
 │   │   │   └── server.rs      # Relay server — multi-transport listener
+│   │   ├── relay/             # Relay server infrastructure
 │   │   ├── quic/              # QUIC adapter (Tier 1, feature = "quic")
-│   │   │   ├── adapter.rs     # QuicAdapter implementing TransportAdapter
-│   │   │   ├── streams.rs     # Per-operation stream management
-│   │   │   ├── lifecycle.rs   # Connection lifecycle (0-RTT, migration, reconnect)
-│   │   │   └── listener.rs    # Relay-side QUIC listener
+│   │   ├── http3/             # HTTP/3 adapter (Tier 1, feature = "http3")
 │   │   ├── webtransport/      # WebTransport adapter (Tier 1, feature = "webtransport-wasm")
-│   │   │   ├── client.rs      # Client-side WebTransport adapter (WASM)
-│   │   │   ├── fallback.rs    # WebSocket fallback when WebTransport unavailable
-│   │   │   └── session.rs     # Server-side WebTransport session handling
 │   │   ├── udp/               # Constrained device transport (Tier 1, feature = "udp")
-│   │   │   ├── adapter.rs     # UdpDtlsAdapter — MessagePack-over-DTLS
-│   │   │   └── listener.rs    # Relay-side UDP/DTLS listener
 │   │   ├── coap/              # CoAP-over-DTLS adapter (Tier 1, feature = "coap")
-│   │   │   ├── adapter.rs     # CoapAdapter — CoAP framing over DTLS
-│   │   │   └── message.rs     # CoAP message encoding/decoding
 │   │   ├── nostr/             # Nostr adapter (Tier 2)
-│   │   ├── matrix/            # Matrix adapter (Tier 2)
-│   │   ├── hyperswarm/        # Holepunch/Hyperswarm adapter (Tier 2)
-│   │   ├── libp2p/            # libp2p adapter (Tier 2)
-│   │   ├── websocket/         # Direct WebSocket (testing/local)
 │   │   └── webrtc/            # WebRTC adapter (Tier 2)
 │   │
 │   ├── scp-platform/          # Platform-specific adapters (production impls in bindings/{swift,kotlin}/)
 │   │   ├── traits.rs          # KeyCustody, DeviceAttestation, Push, Storage traits
-│   │   ├── web/               # WebCrypto, ServiceWorker, IndexedDB (Phase 7+, location TBD)
 │   │   └── testing/           # In-memory implementations for tests
-│   │
-│   ├── scp-primitives/        # Pure utility crate — zero SCP dependencies (Layer 0)
-│   │   ├── time.rs            # Clock helpers (now_secs, now_millis) with ClockError
-│   │   └── crypto.rs          # Ed25519 signature verification helpers
 │   │
 │   ├── scp-mcp/               # MCP adapter
 │   │   ├── server.rs          # SCP agent as MCP server
 │   │   └── client.rs          # SCP agent as MCP client (consuming tools)
 │   │
-│   ├── scp-bridge/            # Bridge adapters
-│   │   ├── trait.rs           # BridgeAdapter trait
-│   │   ├── x/                 # X/Twitter bridge
-│   │   ├── bluesky/           # Bluesky/AT Protocol bridge
-│   │   └── shadow.rs          # Shadow identity management
-│   │
-│   ├── scp-testing/            # Network simulation test harness (§16, dev-dependency)
+│   ├── scp-testing/           # Network simulation test harness (§16, dev-dependency)
 │   │   ├── clock.rs           # SimulatedClock (manual time control)
 │   │   ├── relay/             # InMemoryRelay, BlobStore, BehaviorMode, SubscriptionRegistry
 │   │   ├── transport.rs       # InMemoryTransport (TransportAdapter over InMemoryRelay)
@@ -336,16 +323,11 @@ scp/
 │   ├── scp-media/             # Real-time media transport types (§10.9)
 │   │   └── lib.rs             # WebRTC signaling types, MLS key export for DTLS-SRTP
 │   │
-│   ├── scp-ffi/               # Foreign function interface layer
-│   │   ├── uniffi/            # UniFFI definitions → Swift, Kotlin
-│   │   └── pyo3/              # PyO3 definitions → Python
-│   │
-│   ├── scp-ffi-wasm/          # WebAssembly bridge (wasm-bindgen) → browser TypeScript
-│   │
-│   ├── scp-ffi-napi/          # Node.js bridge (napi-rs) → Node TypeScript
-│   │
-│   └── scp-cli/               # CLI tool for testing/development
-│       └── main.rs
+│   └── scp-ffi/               # Foreign function interface layer
+│       ├── src/               # PyO3 definitions → Python (the REFERENCE bridge)
+│       ├── uniffi/            # UniFFI definitions → Swift, Kotlin
+│       ├── napi/              # napi-rs → Node.js/Bun TypeScript
+│       └── wasm/              # wasm-bindgen → browser TypeScript (constrained per ADR-034)
 │
 ├── bindings/
 │   ├── python/                # Python package (scp-sdk)
@@ -374,33 +356,11 @@ scp/
 │       ├── scp-sdk-kotlin/    # Core JVM module
 │       └── scp-sdk-kotlin-android/  # Android platform adapter module
 │
-├── .docs/                     # Project knowledge (specs, ADRs, planning, standards)
-│   ├── specs/                 # Protocol specification (modular, one file per topic)
-│   ├── adrs/                  # Architecture Decision Records
-│   ├── architecture.md        # This document
-│   └── sketch.md              # API surface sketches
-│
-├── examples/
-│   ├── python/
-│   │   ├── hello_scp.py       # Minimal: create identity, create context
-│   │   └── mcp_agent.py       # Agent that exposes SCP tools via MCP
-│   │
-│   ├── typescript/
-│   │   └── hello_scp.ts
-│   │
-│   └── swift/
-│       └── ExampleContext.swift # Quest-style context example
-│
-└── tests/
-    ├── integration/           # Multi-party tests
-    │   ├── two_party_messaging.rs
-    │   ├── ephemeral_key_destruction.rs
-    │   └── mcp_bridge.rs
-    │
-    └── conformance/           # Protocol conformance tests
-        ├── envelope_format.rs
-        ├── ucan_validation.rs
-        └── merkle_integrity.rs
+└── .docs/                     # Project knowledge (specs, ADRs, planning, standards)
+    ├── specs/                 # Protocol specification (modular, one file per topic)
+    ├── adrs/                  # Architecture Decision Records
+    ├── architecture.md        # This document
+    └── sketch.md              # API surface sketches
 ```
 
 ### 2.2 Protocol Engine Components
@@ -602,27 +562,27 @@ State:
 ### 2.3 Dependency Graph
 
 ```
-                    scp-cli
-                      │
-                      ▼
-              ┌── scp-ffi ──┐
-              │   (PyO3 +   │
-              │   UniFFI)   │
-              └──────┬──────┘
+              ┌── scp-ffi ────────────┐
+              │   (PyO3, UniFFI,      │
+              │    napi-rs, wasm)      │
+              └──────┬────────────────┘
                      │
                      ▼
                scp-core ◄─────────── scp-mcp
               ╱    │    ╲
              ╱     │     ╲
             ▼      ▼      ▼
-    scp-transport  │  scp-bridge
+  scp-transport    │   scp-identity
             │      │      │
             ▼      ▼      ▼
          scp-platform (traits)
               │
               ▼
-     platform implementations
-     (testing/) — production adapters live in bindings/{swift,kotlin}/
+     scp-primitives (Layer 0)
+
+   scp-event-log (Merkle event log)
+        │
+        └──► scp-primitives
 
    scp-node (§18.6 — application deployment)
         │
@@ -643,6 +603,9 @@ State:
         ├──► scp-core
         ├──► scp-transport
         └──► scp-platform
+
+   Note: Bridge protocol types live in scp-core/bridge/,
+   not in a separate scp-bridge crate.
 ```
 
 Build order follows the dependency graph bottom-up: platform traits → transport → core → FFI → bindings.
@@ -684,8 +647,11 @@ Layer 0 ─ scp-primitives            Pure utility crate (time, encoding, hashin
            │                          Zero SCP dependencies — leaf crates.
            │
 Layer 1 ─ scp-core                  Protocol engine. Contexts, identity, trust, discovery,
-           │                          crypto, event log, store, envelope, provenance, economy.
-           │                          Depends on scp-primitives and scp-platform.
+           │  scp-identity            DID, DHT, document, key management.
+           │  scp-event-log           Merkle event log.
+           │                          crypto, event log, store, envelope, provenance,
+           │                          bridge, economy, sync.
+           │                          Depend on scp-primitives and scp-platform.
            │
 Layer 2 ─ scp-transport             Transport abstraction + native relay adapter.
            │  scp-mcp                 MCP bridge (server + client).
@@ -1136,17 +1102,16 @@ Deliverable: Trust model works. TypeScript SDK ships. Two languages supported.
 
 ```
 Build:
-  • bindings/swift/Sources/SCP/Platform/ — Secure Enclave, App Attest, APNs, Keychain
+  • bindings/swift/Sources/SCP/Platform/ — Keychain, App Attest, APNs, SQLCipher
   • bindings/swift/ — UniFFI-generated + Swift ergonomics layer
-  • scp-bridge/x/ — X bridge adapter (relay mode)
-  • scp-bridge/bluesky/ — Bluesky bridge adapter (API mode)
+  • scp-core/bridge/ — Bridge protocol types and per-platform adapters
   • scp-media/ — WebRTC adapter, MLS key export for DTLS-SRTP (§10.9.1), signaling via context messages
   • Reference app integration: quests as contexts, AI guide as agent
 
 Test:
-  • iOS app creates identity in Secure Enclave
+  • iOS app creates identity in Keychain (Secure Enclave supports P-256 only; SCP uses Ed25519)
   • Apple platform conformance: key_custody_conformance!(), attestation_conformance!(),
-    push_conformance!() pass for Secure Enclave/App Attest/APNs adapters (§16.12.3-5)
+    push_conformance!() pass for Keychain/App Attest/APNs adapters (§16.12.3-5)
   • Quest runs as SCP context
   • Bridge: X user participates in quest via bridge
   • End-to-end: Python agent ↔ Swift app via SCP
@@ -1260,5 +1225,5 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 - **Technology selection rationale.** See planning-session-04.md for why MLS over Sender Keys, why did:dht, etc.
 - **Context extension design.** See planning-session-03.md for the Moltbook analysis and context extension design (TTL, memory scope, templates).
 - **Adapter trait definitions.** See planning-session-04.md for full Rust trait definitions.
-- **Governance and deployment operations.** Undesigned. Needed before launch.
+- **Deployment operations.** Undesigned. Needed before launch. (Governance is designed — see ADR-031, GovernanceEngine trait with SingleAdmin, Threshold, Majority, and Unanimity models.)
 - **Pricing/business model.** Out of scope for this document.

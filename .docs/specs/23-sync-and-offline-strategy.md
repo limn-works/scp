@@ -146,7 +146,7 @@ Concurrent offline operations create conflicts when two or more members make inc
 
 ### 23.6.1 Resolution Strategies
 
-**Metadata conflicts (last-writer-wins).** "Last" is determined by Merkle tree leaf index (lower index = earlier = wins). This provides deterministic, clock-free ordering.
+**Metadata conflicts (first-writer-wins).** Conflicts are resolved by Merkle tree leaf index: lower index = earlier = wins. This provides deterministic, clock-free ordering. The first event to be appended to the log takes precedence.
 
 **Governance conflicts (Merkle-ordered).** The proposal with the lower event log sequence number wins. The losing proposal is invalidated. In the single-admin model, governance changes are serialized through the admin -- if the admin is offline, no governance changes can occur (by design).
 

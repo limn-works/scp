@@ -72,7 +72,7 @@ The **protocol boundary** encompasses everything that touches the network — co
 │  └─────────────────────────────────────────────────┘     │
 │                                                          │
 │  ┌─────────────────────────────────────────────────┐     │
-│  │ MEMBERS (one agent per human)                   │     │
+│  │ MEMBERS (one agent per DID per context)          │     │
 │  │                                                 │     │
 │  │  Alice·Agent ── role: admin                     │     │
 │  │  Bob·Agent ──── role: member                    │     │
