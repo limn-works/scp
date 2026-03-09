@@ -151,6 +151,7 @@ impl VerificationMethod {
 ///
 /// Records which external platform identity is being claimed by the issuer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttestationClaim {
     /// Platform identifier (e.g., "x.com", "github.com", "discord.com").
     pub platform: String,
@@ -198,6 +199,7 @@ impl AttestationClaim {
 /// Contains the verification method, method-specific proof data, the
 /// timestamp of last verification, and an optional third-party verifier DID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttestationEvidence {
     /// Verification method used to establish the link.
     pub method: VerificationMethod,
@@ -243,6 +245,7 @@ impl AttestationEvidence {
 /// DID document and check the `AttestationRevocations` service endpoint
 /// (§18.2.2) for the attestation's ID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttestationRevocation {
     /// Revocation check method. Currently always `"did_document"`.
     pub method: Cow<'static, str>,
