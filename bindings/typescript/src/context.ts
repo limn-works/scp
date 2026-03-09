@@ -15,7 +15,14 @@ import { ContextError, mapBridgeError } from "./errors.js";
 import type { Identity } from "./identity.js";
 import type { BridgeContextHandle } from "./internal/bridge.js";
 import { getBridge } from "./internal/bridge.js";
-import type { ContextParams, Message, ToolDefinition, ToolVerificationResult } from "./types.js";
+import type {
+  ContextParams,
+  GovernanceActionResult,
+  MemberRole,
+  Message,
+  ToolDefinition,
+  ToolVerificationResult,
+} from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Context
@@ -247,6 +254,235 @@ export class Context implements AsyncDisposable {
     try {
       const bridge = await getBridge();
       return await bridge.toolVerify(this._handle, toolId);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Membership queries
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Returns the number of members in this context.
+   *
+   * @returns The member count, or `null` if the context is not registered.
+   * @throws {ContextError} If the context has been disposed.
+   */
+  async memberCount(): Promise<number | null> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.contextMemberCount(this._handle);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Checks whether a DID is a member of this context.
+   *
+   * @param did - The DID to check.
+   * @returns `true` if the DID is a member.
+   * @throws {ContextError} If the context has been disposed.
+   */
+  async isMember(did: string): Promise<boolean> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.contextIsMember(this._handle, did);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Returns all member DIDs in this context.
+   *
+   * @returns An array of DID strings.
+   * @throws {ContextError} If the context has been disposed.
+   */
+  async memberDids(): Promise<readonly string[]> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.contextMemberDids(this._handle);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Returns the role of a member in this context.
+   *
+   * @param did - The DID of the member.
+   * @returns The role as a `MemberRole`, or `null` if the member is not found.
+   * @throws {ContextError} If the context has been disposed.
+   */
+  async memberRole(did: string): Promise<MemberRole | null> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.contextMemberRole(this._handle, did);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Broadcast operations
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Subscribes a DID to this broadcast context.
+   *
+   * @param subscriberDid - The DID subscribing to broadcasts.
+   * @throws {ContextError} If the context is not active or not broadcast.
+   */
+  async broadcastSubscribe(subscriberDid: string): Promise<void> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      await bridge.broadcastSubscribe(this._handle, subscriberDid);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Unsubscribes a DID from this broadcast context.
+   *
+   * @param subscriberDid - The DID to unsubscribe.
+   * @param rotateKeys - When `true`, all authors rotate their broadcast keys.
+   * @throws {ContextError} If the context is not active or not broadcast.
+   */
+  async broadcastUnsubscribe(subscriberDid: string, rotateKeys = false): Promise<void> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      await bridge.broadcastUnsubscribe(this._handle, subscriberDid, rotateKeys);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Publishes a message to this broadcast context.
+   *
+   * @param payload - The raw message payload.
+   * @throws {ContextError} If the context is not active or not broadcast.
+   */
+  async broadcastPublish(payload: Uint8Array): Promise<void> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      await bridge.broadcastPublish(this._handle, payload);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Blocks a subscriber's read access in this broadcast context.
+   *
+   * @param subscriberDid - The DID of the subscriber to block.
+   * @param blockerDid - The DID of the blocker.
+   * @throws {ContextError} If the operation fails.
+   */
+  async broadcastBlockSubscriber(subscriberDid: string, blockerDid: string): Promise<void> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      await bridge.broadcastBlockSubscriber(this._handle, subscriberDid, blockerDid);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Handles a broadcast key request from a subscriber.
+   *
+   * @param authorDid - The DID of the author handling the request.
+   * @param requesterDid - The DID of the requester.
+   * @returns A string describing the key request decision.
+   * @throws {ContextError} If the operation fails.
+   */
+  async broadcastHandleKeyRequest(authorDid: string, requesterDid: string): Promise<string> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.broadcastHandleKeyRequest(this._handle, authorDid, requesterDid);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Returns the number of broadcast subscribers for this context.
+   *
+   * @returns The subscriber count, or `null` if not a broadcast context.
+   * @throws {ContextError} If the context has been disposed.
+   */
+  async broadcastSubscriberCount(): Promise<number | null> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.broadcastSubscriberCount(this._handle);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Checks whether a DID is a broadcast subscriber.
+   *
+   * @param did - The DID to check.
+   * @returns `true` if the DID is a subscriber.
+   * @throws {ContextError} If the context has been disposed.
+   */
+  async broadcastIsSubscriber(did: string): Promise<boolean> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.broadcastIsSubscriber(this._handle, did);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Returns the broadcast admission policy for this context.
+   *
+   * @returns The policy (`"Open"` or `"Gated"`), or `null` if not broadcast.
+   * @throws {ContextError} If the context has been disposed.
+   */
+  async broadcastAdmission(): Promise<string | null> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.broadcastAdmission(this._handle);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Governance
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Executes a governance action on this context.
+   *
+   * @param proposalJson - JSON-serialized `GovernanceProposal`.
+   * @returns A `GovernanceActionResult` string describing the outcome.
+   * @throws {ContextError} If the context is not active or governance fails.
+   */
+  async executeGovernanceAction(proposalJson: string): Promise<GovernanceActionResult> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      const raw = await bridge.contextExecuteGovernanceAction(this._handle, proposalJson);
+      return raw as GovernanceActionResult;
     } catch (error) {
       throw mapBridgeError(error);
     }

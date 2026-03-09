@@ -36,6 +36,56 @@ export interface ContextParams {
 }
 
 // ---------------------------------------------------------------------------
+// Membership
+// ---------------------------------------------------------------------------
+
+/**
+ * Role assigned to a member within a context (spec section 5.5).
+ *
+ * Mirrors `scp_core::context::roles::Role`.
+ */
+export type MemberRole = "Admin" | "Member" | "Observer" | "Custom";
+
+// ---------------------------------------------------------------------------
+// Governance
+// ---------------------------------------------------------------------------
+
+/**
+ * Result of executing a governance action (ADR-031).
+ *
+ * Each variant corresponds to one of the 24+ governance action outcomes.
+ */
+export type GovernanceActionResult =
+  | "MemberAdded"
+  | "MemberRemoved"
+  | "RoleChanged"
+  | "ToolRegistered"
+  | "ToolRemoved"
+  | "CeilingModified"
+  | "ContextClosed"
+  | "TtlExtended"
+  | "PruningPolicyModified"
+  | "AdminTransferred"
+  | "SignerAdded"
+  | "SignerRemoved"
+  | "ThresholdModified"
+  | "ChildContextCreated"
+  | "ToolInterfaceEstablished"
+  | "MemberReset"
+  | "ConflictResolved"
+  | "ContextPromoted"
+  | "ReadAccessRevoked"
+  | "ReadAccessRestored"
+  | "WriteAccessRevoked"
+  | "WriteAccessRestored"
+  | "ContentKeysRotated"
+  | "GovernanceReconfigured"
+  | "AuthorBlocked"
+  | "SubscriberBanned"
+  | "SubscriberUnbanned"
+  | "Executed";
+
+// ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
 

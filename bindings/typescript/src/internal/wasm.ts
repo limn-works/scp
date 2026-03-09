@@ -18,6 +18,7 @@ import type {
   Event,
   EventClaim,
   EventFilter,
+  MemberRole,
   Proof,
   ToolDefinition,
   ToolVerificationResult,
@@ -314,6 +315,118 @@ export function createWasmBridge(): Bridge {
           callback.onComplete();
         },
       });
+    },
+
+    // Membership queries -- not yet available in WASM bridge (ADR-034 constraints)
+    async contextMemberCount(_handle: BridgeContextHandle): Promise<number | null> {
+      throw new TransportError(
+        "Membership queries are not available in the WASM bridge",
+        "SCP-CTX-2030",
+      );
+    },
+
+    async contextIsMember(_handle: BridgeContextHandle, _did: string): Promise<boolean> {
+      throw new TransportError(
+        "Membership queries are not available in the WASM bridge",
+        "SCP-CTX-2030",
+      );
+    },
+
+    async contextMemberDids(_handle: BridgeContextHandle): Promise<readonly string[]> {
+      throw new TransportError(
+        "Membership queries are not available in the WASM bridge",
+        "SCP-CTX-2030",
+      );
+    },
+
+    async contextMemberRole(
+      _handle: BridgeContextHandle,
+      _did: string,
+    ): Promise<MemberRole | null> {
+      throw new TransportError(
+        "Membership queries are not available in the WASM bridge",
+        "SCP-CTX-2030",
+      );
+    },
+
+    // Broadcast operations -- not yet available in WASM bridge (ADR-034 constraints)
+    async broadcastSubscribe(_handle: BridgeContextHandle, _subscriberDid: string): Promise<void> {
+      throw new TransportError(
+        "Broadcast operations are not available in the WASM bridge",
+        "SCP-CTX-2030",
+      );
+    },
+
+    async broadcastUnsubscribe(
+      _handle: BridgeContextHandle,
+      _subscriberDid: string,
+      _rotateKeys?: boolean,
+    ): Promise<void> {
+      throw new TransportError(
+        "Broadcast operations are not available in the WASM bridge",
+        "SCP-CTX-2030",
+      );
+    },
+
+    async broadcastPublish(_handle: BridgeContextHandle, _payload: Uint8Array): Promise<void> {
+      throw new TransportError(
+        "Broadcast operations are not available in the WASM bridge",
+        "SCP-CTX-2030",
+      );
+    },
+
+    async broadcastBlockSubscriber(
+      _handle: BridgeContextHandle,
+      _subscriberDid: string,
+      _blockerDid: string,
+    ): Promise<void> {
+      throw new TransportError(
+        "Broadcast operations are not available in the WASM bridge",
+        "SCP-CTX-2030",
+      );
+    },
+
+    async broadcastHandleKeyRequest(
+      _handle: BridgeContextHandle,
+      _authorDid: string,
+      _requesterDid: string,
+    ): Promise<string> {
+      throw new TransportError(
+        "Broadcast operations are not available in the WASM bridge",
+        "SCP-CTX-2030",
+      );
+    },
+
+    async broadcastSubscriberCount(_handle: BridgeContextHandle): Promise<number | null> {
+      throw new TransportError(
+        "Broadcast operations are not available in the WASM bridge",
+        "SCP-CTX-2030",
+      );
+    },
+
+    async broadcastIsSubscriber(_handle: BridgeContextHandle, _did: string): Promise<boolean> {
+      throw new TransportError(
+        "Broadcast operations are not available in the WASM bridge",
+        "SCP-CTX-2030",
+      );
+    },
+
+    async broadcastAdmission(_handle: BridgeContextHandle): Promise<string | null> {
+      throw new TransportError(
+        "Broadcast operations are not available in the WASM bridge",
+        "SCP-CTX-2030",
+      );
+    },
+
+    // Governance -- not yet available in WASM bridge (ADR-034 constraints)
+    async contextExecuteGovernanceAction(
+      _handle: BridgeContextHandle,
+      _proposalJson: string,
+    ): Promise<string> {
+      throw new TransportError(
+        "Governance operations are not available in the WASM bridge",
+        "SCP-CTX-2030",
+      );
     },
 
     // Tools -- delegates to WASM runtime registry
