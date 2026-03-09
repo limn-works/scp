@@ -2,7 +2,8 @@ import Foundation
 
 // MARK: - BridgeRegistration
 
-/// The result of registering a bridge connector with a context.
+/// Result of bridge registration. Forward-declared — UniFFI exports pending.
+/// Construct manually or await UniFFI bridge coverage.
 ///
 /// Contains the bridge's ID, operator DID, platform, mode, and status.
 ///
@@ -50,6 +51,8 @@ public nonisolated struct BridgeRegistrationResult: Sendable {
 // MARK: - ShadowIdentityResult
 
 /// A shadow identity representing an external platform participant.
+/// Forward-declared — UniFFI exports pending. Construct manually or await
+/// UniFFI bridge coverage.
 ///
 /// Shadow identities represent non-SCP participants in a bridged context.
 /// They carry provenance metadata indicating they are not native SCP

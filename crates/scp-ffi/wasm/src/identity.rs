@@ -55,12 +55,17 @@ use crate::error::ScpWasmError;
 /// Per-identity state stored in the WASM-local registry.
 #[derive(Debug, Clone)]
 struct IdentityEntry {
+    /// Ed25519 signing key bytes (32 bytes). Stored to produce real Ed25519
+    /// signatures for device attestation and other identity operations.
+    signing_key_bytes: [u8; 32],
     /// Ed25519 public key bytes (32 bytes).
     public_key_bytes: [u8; 32],
     /// Custody type string. Retained for future use when custody operations
     /// are wired (e.g., signing, key rotation).
     #[allow(dead_code)]
     custody_type: String,
+    /// Agent signing key bytes (32 bytes), if an agent key has been bound.
+    agent_signing_key_bytes: Option<[u8; 32]>,
 }
 
 thread_local! {
@@ -504,14 +509,17 @@ pub fn identity_create(custody: String) -> Promise {
         let did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
 
         // Store the signing key in the WASM-local identity registry so that
-        // identity_resolve can return the public key from the DID document.
+        // identity_resolve can return the public key from the DID document
+        // and identity_attest_device can produce real Ed25519 signatures.
         IDENTITY_REGISTRY.with(|reg| {
             let mut map = reg.borrow_mut();
             map.insert(
                 did.clone(),
                 IdentityEntry {
+                    signing_key_bytes: signing_key.to_bytes(),
                     public_key_bytes: pub_bytes,
                     custody_type: custody.clone(),
+                    agent_signing_key_bytes: None,
                 },
             );
         });
@@ -622,21 +630,23 @@ pub fn identity_create_with_agent_key(custody: String) -> Promise {
         let pub_bytes = verifying_key.to_bytes();
         let did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
 
+        // Generate agent Ed25519 keypair.
+        let agent_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let agent_pub = agent_key.verifying_key();
+        let agent_multibase = format!("z{}", zbase32_encode(&agent_pub.to_bytes()));
+
         IDENTITY_REGISTRY.with(|reg| {
             let mut map = reg.borrow_mut();
             map.insert(
                 did.clone(),
                 IdentityEntry {
+                    signing_key_bytes: signing_key.to_bytes(),
                     public_key_bytes: pub_bytes,
                     custody_type: custody.clone(),
+                    agent_signing_key_bytes: Some(agent_key.to_bytes()),
                 },
             );
         });
-
-        // Generate agent Ed25519 keypair.
-        let agent_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
-        let agent_pub = agent_key.verifying_key();
-        let agent_multibase = format!("z{}", zbase32_encode(&agent_pub.to_bytes()));
 
         Ok(JsValue::from(WasmIdentity {
             did,
@@ -649,7 +659,12 @@ pub fn identity_create_with_agent_key(custody: String) -> Promise {
 
 /// Adds an agent signing key to an existing identity (ADR-039).
 ///
-/// Generates a new Ed25519 agent keypair and returns an updated identity.
+/// Generates a new Ed25519 agent keypair, stores it in the identity registry,
+/// and returns an updated identity.
+///
+/// # Errors
+///
+/// Returns `[SCP-IDENT-1009]` if the identity already has an agent key.
 #[wasm_bindgen]
 pub fn identity_add_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsError> {
     if identity.has_agent_key {
@@ -663,8 +678,17 @@ pub fn identity_add_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, J
     let agent_pub = agent_key.verifying_key();
     let agent_multibase = format!("z{}", zbase32_encode(&agent_pub.to_bytes()));
 
+    // Store the agent signing key in the identity registry.
+    let did = identity.did.clone();
+    IDENTITY_REGISTRY.with(|reg| {
+        let mut map = reg.borrow_mut();
+        if let Some(entry) = map.get_mut(&did) {
+            entry.agent_signing_key_bytes = Some(agent_key.to_bytes());
+        }
+    });
+
     Ok(WasmIdentity {
-        did: identity.did.clone(),
+        did,
         custody_type: identity.custody_type.clone(),
         has_agent_key: true,
         agent_public_key_multibase: Some(agent_multibase),
@@ -673,7 +697,13 @@ pub fn identity_add_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, J
 
 /// Rotates the agent signing key for an identity (ADR-039).
 ///
-/// Generates a new Ed25519 agent keypair and returns an updated identity.
+/// Generates a new Ed25519 agent keypair, stores it in the identity registry,
+/// and returns an updated identity.
+///
+/// # Errors
+///
+/// Returns `[SCP-IDENT-1011]` if the identity has no agent key to rotate.
+/// Returns `[SCP-IDENT-1010]` if the new public key is empty.
 #[wasm_bindgen]
 pub fn identity_rotate_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsError> {
     if !identity.has_agent_key {
@@ -687,8 +717,17 @@ pub fn identity_rotate_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
     let agent_pub = agent_key.verifying_key();
     let agent_multibase = format!("z{}", zbase32_encode(&agent_pub.to_bytes()));
 
+    // Store the new agent signing key in the identity registry.
+    let did = identity.did.clone();
+    IDENTITY_REGISTRY.with(|reg| {
+        let mut map = reg.borrow_mut();
+        if let Some(entry) = map.get_mut(&did) {
+            entry.agent_signing_key_bytes = Some(agent_key.to_bytes());
+        }
+    });
+
     Ok(WasmIdentity {
-        did: identity.did.clone(),
+        did,
         custody_type: identity.custody_type.clone(),
         has_agent_key: true,
         agent_public_key_multibase: Some(agent_multibase),
@@ -696,6 +735,10 @@ pub fn identity_rotate_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
 }
 
 /// Removes the agent signing key from an identity (ADR-039).
+///
+/// # Errors
+///
+/// Returns `[SCP-IDENT-1011]` if the identity has no agent key to remove.
 #[wasm_bindgen]
 pub fn identity_remove_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsError> {
     if !identity.has_agent_key {
@@ -719,10 +762,14 @@ pub fn identity_remove_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
 /// Generates a new Ed25519 keypair, derives a new `did:dht` DID, and returns
 /// a new `WasmIdentity`. The old DID is stored in the `alsoKnownAs` field
 /// of the new identity's DID document (handled by `identity_resolve`).
+///
+/// If the source identity has an agent key, a new agent key is generated
+/// for the migrated identity (preserving the `has_agent_key` state).
 #[wasm_bindgen]
 pub fn identity_migrate(identity: &WasmIdentity) -> Promise {
     let old_did = identity.did.clone();
     let custody = identity.custody_type.clone();
+    let had_agent_key = identity.has_agent_key;
     future_to_promise(async move {
         // Generate new Ed25519 keypair for the new DID.
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
@@ -730,13 +777,25 @@ pub fn identity_migrate(identity: &WasmIdentity) -> Promise {
         let pub_bytes = verifying_key.to_bytes();
         let new_did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
 
+        // If the source identity had an agent key, generate a new one.
+        let (agent_signing_key_bytes, agent_public_key_multibase) = if had_agent_key {
+            let agent_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+            let agent_pub = agent_key.verifying_key();
+            let multibase = format!("z{}", zbase32_encode(&agent_pub.to_bytes()));
+            (Some(agent_key.to_bytes()), Some(multibase))
+        } else {
+            (None, None)
+        };
+
         IDENTITY_REGISTRY.with(|reg| {
             let mut map = reg.borrow_mut();
             map.insert(
                 new_did.clone(),
                 IdentityEntry {
+                    signing_key_bytes: signing_key.to_bytes(),
                     public_key_bytes: pub_bytes,
                     custody_type: custody.clone(),
+                    agent_signing_key_bytes,
                 },
             );
         });
@@ -750,19 +809,23 @@ pub fn identity_migrate(identity: &WasmIdentity) -> Promise {
         Ok(JsValue::from(WasmIdentity {
             did: new_did,
             custody_type: custody,
-            has_agent_key: false,
-            agent_public_key_multibase: None,
+            has_agent_key: had_agent_key,
+            agent_public_key_multibase,
         }))
     })
 }
 
 /// Generates a device attestation token for an identity.
 ///
-/// Signs a timestamped challenge with the identity's Ed25519 key. Returns
-/// the attestation token as a base64-encoded JSON string containing the
-/// DID, timestamp, and Ed25519 signature.
+/// Signs a timestamped challenge with the identity's Ed25519 signing key.
+/// Returns the attestation token as a base64-encoded JSON string containing
+/// the DID, timestamp, and a real Ed25519 signature over the attestation
+/// payload.
 #[wasm_bindgen]
 pub fn identity_attest_device(did: String) -> Promise {
+    use base64::Engine;
+    use ed25519_dalek::Signer;
+
     future_to_promise(async move {
         // Look up signing key from identity registry.
         let entry = IDENTITY_REGISTRY.with(|reg| {
@@ -781,25 +844,18 @@ pub fn identity_attest_device(did: String) -> Promise {
 
         // Create attestation payload: DID + timestamp.
         let timestamp_ms = js_sys::Date::now();
-        #[allow(clippy::cast_possible_truncation)]
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let timestamp_secs = (timestamp_ms / 1000.0) as u64;
-        let payload = format!("device-attestation:{}:{}", did, timestamp_secs);
+        let payload = format!("device-attestation:{did}:{timestamp_secs}");
 
-        // Sign with identity key (we only have public key in registry — generate
-        // a deterministic attestation using HMAC-like construction from pub key).
-        // Note: Real device attestation uses the private key. In WASM, identity
-        // keys are ephemeral (generated via OsRng), so we hash the public key
-        // with the payload for a verifiable binding.
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(&entry.public_key_bytes);
-        hasher.update(payload.as_bytes());
-        let signature_bytes = hasher.finalize();
+        // Produce a real Ed25519 signature over the attestation payload.
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&entry.signing_key_bytes);
+        let signature = signing_key.sign(payload.as_bytes());
 
         let token = serde_json::json!({
             "did": did,
             "timestamp": timestamp_secs,
-            "binding": hex::encode(&signature_bytes),
+            "signature": hex::encode(signature.to_bytes()),
         });
 
         // Base64-encode the token JSON.
@@ -812,7 +868,6 @@ pub fn identity_attest_device(did: String) -> Promise {
             .into()
         })?;
 
-        use base64::Engine;
         let encoded = base64::engine::general_purpose::STANDARD.encode(token_json.as_bytes());
         Ok(JsValue::from_str(&encoded))
     })
@@ -820,12 +875,15 @@ pub fn identity_attest_device(did: String) -> Promise {
 
 /// Verifies a device attestation token.
 ///
-/// Decodes the base64 token, extracts the DID and timestamp, and verifies
-/// the binding against the identity's public key in the registry.
+/// Decodes the base64 token, extracts the DID, timestamp, and Ed25519
+/// signature, then verifies the signature against the identity's public
+/// key in the registry.
 #[wasm_bindgen]
 pub fn identity_verify_device_attestation(did: String, token_base64: String) -> Promise {
+    use base64::Engine;
+    use ed25519_dalek::Verifier;
+
     future_to_promise(async move {
-        use base64::Engine;
         let token_bytes = base64::engine::general_purpose::STANDARD
             .decode(token_base64.as_bytes())
             .map_err(|e| -> JsValue {
@@ -849,7 +907,7 @@ pub fn identity_verify_device_attestation(did: String, token_base64: String) -> 
 
         let token_did = token["did"].as_str().unwrap_or("");
         let timestamp = token["timestamp"].as_u64().unwrap_or(0);
-        let binding = token["binding"].as_str().unwrap_or("");
+        let sig_hex = token["signature"].as_str().unwrap_or("");
 
         if token_did != did {
             return Ok(JsValue::from_bool(false));
@@ -861,20 +919,30 @@ pub fn identity_verify_device_attestation(did: String, token_base64: String) -> 
             map.get(&did).cloned()
         });
 
-        let entry = match entry {
-            Some(e) => e,
-            None => return Ok(JsValue::from_bool(false)),
+        let Some(entry) = entry else {
+            return Ok(JsValue::from_bool(false));
         };
 
-        // Recompute the binding.
-        let payload = format!("device-attestation:{}:{}", did, timestamp);
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(&entry.public_key_bytes);
-        hasher.update(payload.as_bytes());
-        let expected = hex::encode(hasher.finalize());
+        // Decode the signature from hex.
+        let Ok(sig_bytes) = hex::decode(sig_hex) else {
+            return Ok(JsValue::from_bool(false));
+        };
+        let sig_array: [u8; 64] = match sig_bytes.try_into() {
+            Ok(a) => a,
+            Err(_) => return Ok(JsValue::from_bool(false)),
+        };
 
-        Ok(JsValue::from_bool(binding == expected))
+        // Verify the Ed25519 signature against the public key.
+        let payload = format!("device-attestation:{did}:{timestamp}");
+        let Ok(verifying_key) =
+            ed25519_dalek::VerifyingKey::from_bytes(&entry.public_key_bytes)
+        else {
+            return Ok(JsValue::from_bool(false));
+        };
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_array);
+        let verified = verifying_key.verify(payload.as_bytes(), &signature).is_ok();
+
+        Ok(JsValue::from_bool(verified))
     })
 }
 

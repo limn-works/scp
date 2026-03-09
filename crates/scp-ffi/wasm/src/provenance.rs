@@ -208,14 +208,14 @@ pub fn provenance_check_chain_depth(depth: u32, max_depth_override: Option<u32>)
 /// # JS usage
 ///
 /// ```js
-/// const tier = evaluate_provenance_quality("Persistent", "Active", "true");
+/// const tier = evaluate_provenance_quality("Persistent", "Active", true);
 /// console.log(tier); // 3
 /// ```
 #[wasm_bindgen]
 pub fn evaluate_provenance_quality(
     source_type: Option<String>,
     context_state: String,
-    has_counterparties: String,
+    has_counterparties: bool,
 ) -> Result<u32, JsError> {
     let cs = ContextState::from_str(&context_state).ok_or_else(|| {
         JsError::new(&format!(
@@ -223,16 +223,19 @@ pub fn evaluate_provenance_quality(
         ))
     })?;
 
-    let has_cp = has_counterparties == "true";
-
     let Some(st_str) = source_type else {
-        return Ok(compute_quality(false, &SourceType::Persistent, cs, has_cp));
+        return Ok(compute_quality(
+            false,
+            &SourceType::Persistent,
+            cs,
+            has_counterparties,
+        ));
     };
 
     let st = SourceType::from_str(&st_str)
         .ok_or_else(|| JsError::new(&format!("[SCP-PROV-6101] invalid source_type: '{st_str}'")))?;
 
-    Ok(compute_quality(true, &st, cs, has_cp))
+    Ok(compute_quality(true, &st, cs, has_counterparties))
 }
 
 // ---------------------------------------------------------------------------
@@ -365,19 +368,15 @@ mod tests {
 
     #[test]
     fn evaluate_quality_persistent_active() {
-        let tier = evaluate_provenance_quality(
-            Some("Persistent".to_owned()),
-            "Active".to_owned(),
-            "true".to_owned(),
-        )
-        .unwrap();
+        let tier =
+            evaluate_provenance_quality(Some("Persistent".to_owned()), "Active".to_owned(), true)
+                .unwrap();
         assert_eq!(tier, 3);
     }
 
     #[test]
     fn evaluate_quality_no_provenance() {
-        let tier =
-            evaluate_provenance_quality(None, "Active".to_owned(), "false".to_owned()).unwrap();
+        let tier = evaluate_provenance_quality(None, "Active".to_owned(), false).unwrap();
         assert_eq!(tier, 0);
     }
 
@@ -386,7 +385,7 @@ mod tests {
         let tier = evaluate_provenance_quality(
             Some("Summary".to_owned()),
             "ClosedWithSummaryVerified".to_owned(),
-            "true".to_owned(),
+            true,
         )
         .unwrap();
         assert_eq!(tier, 2);
@@ -397,7 +396,7 @@ mod tests {
         let tier = evaluate_provenance_quality(
             Some("Ephemeral".to_owned()),
             "ClosedEphemeral".to_owned(),
-            "true".to_owned(),
+            true,
         )
         .unwrap();
         assert_eq!(tier, 1);
@@ -408,7 +407,7 @@ mod tests {
         let tier = evaluate_provenance_quality(
             Some("Ephemeral".to_owned()),
             "ClosedEphemeral".to_owned(),
-            "false".to_owned(),
+            false,
         )
         .unwrap();
         assert_eq!(tier, 0);
@@ -416,12 +415,9 @@ mod tests {
 
     #[test]
     fn evaluate_quality_unknown_state() {
-        let tier = evaluate_provenance_quality(
-            Some("Persistent".to_owned()),
-            "Unknown".to_owned(),
-            "true".to_owned(),
-        )
-        .unwrap();
+        let tier =
+            evaluate_provenance_quality(Some("Persistent".to_owned()), "Unknown".to_owned(), true)
+                .unwrap();
         assert_eq!(tier, 0);
     }
 
@@ -431,7 +427,7 @@ mod tests {
             evaluate_provenance_quality(
                 Some("Persistent".to_owned()),
                 "InvalidState".to_owned(),
-                "true".to_owned(),
+                true,
             )
             .is_err()
         );

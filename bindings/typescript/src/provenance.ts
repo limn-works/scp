@@ -14,15 +14,15 @@ import { getBridge } from "./internal/bridge.js";
 // Types
 // ---------------------------------------------------------------------------
 
-/** Provenance record returned by {@link attach}. */
+/** Provenance record returned by {@link provenanceAttach}. */
 export interface ProvenanceRecord {
-  readonly source_context: string;
-  readonly source_type: string;
-  readonly chain_depth: number;
+  readonly sourceContext: string;
+  readonly sourceType: string;
+  readonly chainDepth: number;
   readonly counterparties: readonly string[];
-  readonly age_secs: number;
-  readonly memory_scope: string;
-  readonly chain_path: string | null;
+  readonly ageSecs: number;
+  readonly memoryScope: string;
+  readonly chainPath: string | null;
   readonly purpose: string | null;
 }
 

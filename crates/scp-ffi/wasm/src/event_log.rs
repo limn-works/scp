@@ -102,7 +102,11 @@ impl WasmProof {
 // WasmCheckpoint
 // ---------------------------------------------------------------------------
 
-/// A signed consistency checkpoint from the context event log.
+/// An unsigned consistency checkpoint from the context event log.
+///
+/// The `signing_payload_hash` field contains the SHA-256 hash of the
+/// canonical signing payload. The TypeScript SDK wrapper must sign this
+/// hash via `SubtleCrypto` to produce the final signed checkpoint.
 ///
 /// See ADR-011 acceptance criterion 8 and ADR-030.
 #[wasm_bindgen]
@@ -114,7 +118,7 @@ pub struct WasmCheckpoint {
     merkle_root: String,
     epoch: Option<u64>,
     timestamp: f64,
-    signature: String,
+    signing_payload_hash: String,
 }
 
 #[wasm_bindgen]
@@ -156,9 +160,9 @@ impl WasmCheckpoint {
     }
 
     #[must_use]
-    #[wasm_bindgen(getter)]
-    pub fn signature(&self) -> String {
-        self.signature.clone()
+    #[wasm_bindgen(getter, js_name = "signingPayloadHash")]
+    pub fn signing_payload_hash(&self) -> String {
+        self.signing_payload_hash.clone()
     }
 }
 
@@ -329,9 +333,8 @@ pub fn event_log_checkpoint(
         signing_payload.extend_from_slice(&epoch_u64.to_be_bytes());
         signing_payload.extend_from_slice(&timestamp_secs.to_be_bytes());
 
-        // The signature field contains the hex-encoded signing payload.
-        // The TypeScript SDK wrapper must sign this payload via SubtleCrypto
-        // and replace this field with the actual signature.
+        // Compute SHA-256 hash of the canonical signing payload. The
+        // TypeScript SDK wrapper must sign this hash via SubtleCrypto.
         let payload_hash = sha2::Sha256::digest(&signing_payload);
         let payload_hex = payload_hash
             .iter()
@@ -349,7 +352,7 @@ pub fn event_log_checkpoint(
             epoch: Some(epoch_u64),
             #[allow(clippy::cast_precision_loss)]
             timestamp: timestamp_secs as f64,
-            signature: payload_hex,
+            signing_payload_hash: payload_hex,
         }))
     })
 }

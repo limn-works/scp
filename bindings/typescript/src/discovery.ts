@@ -40,13 +40,14 @@ export interface DiscoveryResult {
  * Parses an SCP address string into its components.
  *
  * @param address - The address string to parse (e.g., `"alice@cooking-community"`).
- * @returns JSON string with the parsed address.
+ * @returns The parsed address object.
  * @throws {ValidationError} If the address is malformed.
  */
-export async function parseAddress(address: string): Promise<string> {
+export async function parseAddress(address: string): Promise<ParsedAddress> {
   try {
     const bridge = await getBridge();
-    return bridge.discoveryParseAddress(address);
+    const result = await bridge.discoveryParseAddress(address);
+    return JSON.parse(result) as ParsedAddress;
   } catch (error) {
     throw mapBridgeError(error);
   }
