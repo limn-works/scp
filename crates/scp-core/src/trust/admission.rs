@@ -77,25 +77,36 @@ pub enum AdmissionError {
 ///   `agent_capabilities`, OR a matching [`ChallengeVerification`] record must
 ///   exist (challenge-verified implies self-attested).
 /// - [`VerificationLevel::ChallengeVerified`]: a [`ChallengeVerification`]
-///   record with a matching `challenge_type` must exist.
+///   record with a matching `challenge_type` must exist, the verification must
+///   have `passed == true`, and `expires_at` must be greater than
+///   `current_time`.
 ///
 /// Returns `Ok(())` if all requirements are met, or the first unmet
 /// requirement as an [`AdmissionError`].
+///
+/// # Parameters
+///
+/// - `requirements` — The capability requirements to check.
+/// - `agent_capabilities` — The agent's self-attested capability URIs.
+/// - `challenge_verifications` — The agent's challenge verification records.
+/// - `current_time` — Unix timestamp (seconds) for expiry comparison.
 ///
 /// # Errors
 ///
 /// Returns [`AdmissionError::MissingCapability`] if a self-attested capability
 /// is not declared, or [`AdmissionError::VerificationRequired`] if a
-/// challenge-verified capability lacks a matching verification record.
+/// challenge-verified capability lacks a valid (passed, non-expired)
+/// verification record.
 pub fn check_capability_requirements(
     requirements: &[CapabilityRequirement],
     agent_capabilities: &[CapabilityUri],
     challenge_verifications: &[ChallengeVerification],
+    current_time: u64,
 ) -> Result<(), AdmissionError> {
     for req in requirements {
         let has_verification = challenge_verifications.iter().any(|cv| {
             let ChallengeType::Uri(ref uri) = cv.challenge_type;
-            *uri == req.capability
+            *uri == req.capability && cv.passed && cv.expires_at > current_time
         });
 
         match req.verification_level {
@@ -158,9 +169,12 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// A current time that is before the verification's expires_at.
+    const NOW: u64 = 1_700_000_100;
+
     #[test]
     fn empty_requirements_always_passes() {
-        let result = check_capability_requirements(&[], &[], &[]);
+        let result = check_capability_requirements(&[], &[], &[], NOW);
         assert!(result.is_ok());
     }
 
@@ -172,7 +186,7 @@ mod tests {
             verification_level: VerificationLevel::SelfAttested,
         }];
 
-        let result = check_capability_requirements(&reqs, &[uri], &[]);
+        let result = check_capability_requirements(&reqs, &[uri], &[], NOW);
         assert!(result.is_ok());
     }
 
@@ -184,7 +198,7 @@ mod tests {
             verification_level: VerificationLevel::SelfAttested,
         }];
 
-        let result = check_capability_requirements(&reqs, &[], &[]);
+        let result = check_capability_requirements(&reqs, &[], &[], NOW);
         assert!(matches!(
             result,
             Err(AdmissionError::MissingCapability { ref uri })
@@ -201,7 +215,7 @@ mod tests {
         }];
 
         let verifications = vec![make_verification(&uri)];
-        let result = check_capability_requirements(&reqs, &[], &verifications);
+        let result = check_capability_requirements(&reqs, &[], &verifications, NOW);
         assert!(result.is_ok());
     }
 
@@ -214,7 +228,7 @@ mod tests {
         }];
 
         // Even if agent claims the capability, ChallengeVerified requires a record.
-        let result = check_capability_requirements(&reqs, &[uri], &[]);
+        let result = check_capability_requirements(&reqs, &[uri], &[], NOW);
         assert!(matches!(
             result,
             Err(AdmissionError::VerificationRequired { ref uri })
@@ -238,7 +252,7 @@ mod tests {
         ];
 
         // Agent has uri_a but not uri_b.
-        let result = check_capability_requirements(&reqs, &[uri_a], &[]);
+        let result = check_capability_requirements(&reqs, &[uri_a], &[], NOW);
         assert!(matches!(
             result,
             Err(AdmissionError::MissingCapability { ref uri })
@@ -256,7 +270,7 @@ mod tests {
 
         // Agent does NOT have it in capabilities, but has a verification record.
         let verifications = vec![make_verification(&uri)];
-        let result = check_capability_requirements(&reqs, &[], &verifications);
+        let result = check_capability_requirements(&reqs, &[], &verifications, NOW);
         assert!(result.is_ok());
     }
 
@@ -276,7 +290,59 @@ mod tests {
         ];
 
         let verifications = vec![make_verification(&uri_b)];
-        let result = check_capability_requirements(&reqs, &[uri_a], &verifications);
+        let result = check_capability_requirements(&reqs, &[uri_a], &verifications, NOW);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn expired_verification_is_rejected() {
+        let uri = cap("scp:capability:prompt-injection-resistance/v1");
+        let reqs = vec![CapabilityRequirement {
+            capability: uri.clone(),
+            verification_level: VerificationLevel::ChallengeVerified,
+        }];
+
+        let verifications = vec![make_verification(&uri)];
+        // expires_at is 1_700_086_400 — use a time after that.
+        let result = check_capability_requirements(&reqs, &[], &verifications, 1_700_086_401);
+        assert!(matches!(
+            result,
+            Err(AdmissionError::VerificationRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn failed_verification_is_rejected() {
+        let uri = cap("scp:capability:prompt-injection-resistance/v1");
+        let reqs = vec![CapabilityRequirement {
+            capability: uri.clone(),
+            verification_level: VerificationLevel::ChallengeVerified,
+        }];
+
+        let mut cv = make_verification(&uri);
+        cv.passed = false;
+        let result = check_capability_requirements(&reqs, &[], &[cv], NOW);
+        assert!(matches!(
+            result,
+            Err(AdmissionError::VerificationRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn failed_verification_does_not_satisfy_self_attested() {
+        let uri = cap("scp:capability:schema-validation/v1");
+        let reqs = vec![CapabilityRequirement {
+            capability: uri.clone(),
+            verification_level: VerificationLevel::SelfAttested,
+        }];
+
+        // Verification exists but passed=false — should NOT satisfy self-attested.
+        let mut cv = make_verification(&uri);
+        cv.passed = false;
+        let result = check_capability_requirements(&reqs, &[], &[cv], NOW);
+        assert!(matches!(
+            result,
+            Err(AdmissionError::MissingCapability { .. })
+        ));
     }
 }

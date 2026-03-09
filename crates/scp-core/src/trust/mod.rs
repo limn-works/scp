@@ -281,6 +281,15 @@ pub enum TrustError {
         uri: String,
     },
 
+    /// The challenge request's Ed25519 signature is invalid, indicating the
+    /// request may have been tampered with (e.g., extended timeout, changed
+    /// subject_did).
+    #[error("challenge request signature invalid: {reason}")]
+    ChallengeRequestSignatureInvalid {
+        /// Human-readable description of the failure.
+        reason: String,
+    },
+
     /// The requested DID is not a member of the context.
     #[error("DID is not a member of this context: {did}")]
     NotAMember {

@@ -404,10 +404,18 @@ pub struct ParticipationProfile {
     pub signature: [u8; 64],
 }
 
+/// Domain separator for participation profile signing.
+///
+/// Prepended to `signable_bytes` output to prevent cross-protocol signature
+/// confusion. Without this, a valid participation profile signature could
+/// potentially be replayed in a different protocol context.
+const DOMAIN_PARTICIPATION_V1: &[u8] = b"SCP-PARTICIPATION-V1:";
+
 impl ParticipationProfile {
     /// Returns the deterministic signable bytes for this profile.
     ///
     /// Covers all fields except `signature`. The byte layout is:
+    /// - `"SCP-PARTICIPATION-V1:"` domain separator
     /// - `subject_did` UTF-8 bytes (length-prefixed as u32 big-endian)
     /// - `participation_duration_secs` (u64 big-endian)
     /// - `governance_actions_against` (u64 big-endian)
@@ -422,9 +430,12 @@ impl ParticipationProfile {
     #[must_use]
     pub fn signable_bytes(&self) -> Vec<u8> {
         let did_bytes = self.subject_did.as_bytes();
-        // 4 (length prefix) + did_bytes.len() + 8*8 (eight u64 fields) + 32 + 32
-        let capacity = 4 + did_bytes.len() + 64 + 64;
+        // domain separator + 4 (length prefix) + did_bytes.len() + 8*8 (eight u64 fields) + 32 + 32
+        let capacity = DOMAIN_PARTICIPATION_V1.len() + 4 + did_bytes.len() + 64 + 64;
         let mut buf = Vec::with_capacity(capacity);
+
+        // Domain separator — prevents cross-protocol signature confusion.
+        buf.extend_from_slice(DOMAIN_PARTICIPATION_V1);
 
         // Length-prefixed DID string.
         #[allow(clippy::cast_possible_truncation)] // DID strings are well under u32::MAX bytes
@@ -710,30 +721,6 @@ fn verify_statement_signature(
 // Context-Hosted ParticipationProfile Production (SCP-BA-005)
 // ---------------------------------------------------------------------------
 
-/// Derives a context-specific Ed25519 signing key for participation profiles
-/// (internal version).
-///
-/// Uses HKDF-SHA256 with the context key material as IKM and
-/// `"scp-participation-statement-v1"` as the info string. The same context
-/// key material always produces the same signing key (deterministic), but
-/// different contexts produce different keys (preventing correlation).
-fn derive_participation_signing_key_internal(
-    context_key_material: &[u8; 32],
-) -> ed25519_dalek::SigningKey {
-    use hkdf::Hkdf;
-    use sha2::Sha256;
-
-    let hk = Hkdf::<Sha256>::new(None, context_key_material);
-    let mut okm = [0u8; 32];
-    // 32 bytes is well within HKDF-SHA256's output limit (255 * 32 = 8160).
-    // The only failure mode is requesting more than 8160 bytes, which cannot
-    // happen here, so the match arm is unreachable.
-    if hk.expand(PARTICIPATION_KEY_DOMAIN, &mut okm).is_err() {
-        unreachable!("HKDF-SHA256 expand for 32 bytes cannot fail");
-    }
-    ed25519_dalek::SigningKey::from_bytes(&okm)
-}
-
 /// Produces a signed [`ParticipationProfile`] for a member from the context's
 /// event log.
 ///
@@ -752,6 +739,9 @@ fn derive_participation_signing_key_internal(
 ///
 /// - `context_key_material` — The context's 32-byte key material, used to
 ///   derive the context-specific Ed25519 signing key.
+/// - `context_id` — The context ID, used as HKDF salt for key derivation.
+///   This ensures the same key material produces different signing keys for
+///   different contexts, preventing cross-context signer correlation.
 /// - `member_did` — The DID of the member to produce the profile for.
 /// - `events` — The context's event log entries.
 /// - `merkle_root` — Merkle root of the event log at computation time.
@@ -764,10 +754,12 @@ fn derive_participation_signing_key_internal(
 /// - [`TrustError::NotAMember`] if `is_member` is false.
 /// - [`TrustError::NotOptedIn`] if `is_opted_in` is false.
 /// - [`TrustError::EmptyEventLog`] if `events` is empty.
+/// - [`TrustError::InvalidEventData`] if HKDF key derivation fails.
 ///
 /// See §7.3.2.1.
 pub fn produce_participation_profile(
     context_key_material: &[u8; 32],
+    context_id: &str,
     member_did: &str,
     events: &[Event],
     merkle_root: [u8; 32],
@@ -790,12 +782,15 @@ pub fn produce_participation_profile(
     }
 
     // Compute participation facts from the event log. We use a dummy
-    // context_id since ParticipationProfile intentionally omits it.
+    // context_id for the record since ParticipationProfile intentionally
+    // omits it — the real context_id is only used for key derivation.
     let record =
         compute_participation_record(events, member_did, "_internal", merkle_root, current_time)?;
 
-    // Derive the context-specific signing key.
-    let signing_key = derive_participation_signing_key_internal(context_key_material);
+    // Derive the context-specific signing key using the unified public API.
+    // This uses HKDF-SHA256 with context_id as salt, ensuring the same
+    // construction used by derive_participation_signing_key.
+    let signing_key = derive_participation_signing_key(context_key_material, context_id)?;
     let verifying_key = signing_key.verifying_key();
 
     // Build the profile with all 7 fact values from the record.
@@ -1449,8 +1444,9 @@ mod tests {
         let profile = make_profile();
         let bytes = profile.signable_bytes();
         let did_len = "did:key:test".len();
-        // 4 (length prefix) + did_len + 8*8 (8 u64 fields) + 32 + 32
-        let expected = 4 + did_len + 64 + 64;
+        let domain_len = b"SCP-PARTICIPATION-V1:".len();
+        // domain separator + 4 (length prefix) + did_len + 8*8 (8 u64 fields) + 32 + 32
+        let expected = domain_len + 4 + did_len + 64 + 64;
         assert_eq!(bytes.len(), expected);
     }
 
@@ -1994,6 +1990,7 @@ mod tests {
 
         let profile = produce_participation_profile(
             &key_material,
+            "ctx-test",
             "did:key:alice",
             &events,
             merkle_root,
@@ -2024,6 +2021,7 @@ mod tests {
 
         let profile = produce_participation_profile(
             &key_material,
+            "ctx-test",
             "did:key:alice",
             &events,
             [0; 32],
@@ -2044,6 +2042,7 @@ mod tests {
         let events = make_member_events("did:key:alice");
         let result = produce_participation_profile(
             &[0u8; 32],
+            "ctx-test",
             "did:key:alice",
             &events,
             [0; 32],
@@ -2062,6 +2061,7 @@ mod tests {
         let events = make_member_events("did:key:alice");
         let result = produce_participation_profile(
             &[0u8; 32],
+            "ctx-test",
             "did:key:alice",
             &events,
             [0; 32],
@@ -2078,9 +2078,11 @@ mod tests {
     #[test]
     fn produce_profile_different_contexts_produce_different_signers() {
         let events = make_member_events("did:key:alice");
+        let key_material = [42u8; 32];
 
         let profile_a = produce_participation_profile(
-            &[1u8; 32],
+            &key_material,
+            "ctx-alpha",
             "did:key:alice",
             &events,
             [0; 32],
@@ -2091,7 +2093,8 @@ mod tests {
         .unwrap();
 
         let profile_b = produce_participation_profile(
-            &[2u8; 32],
+            &key_material,
+            "ctx-beta",
             "did:key:alice",
             &events,
             [0; 32],
@@ -2103,7 +2106,7 @@ mod tests {
 
         assert_ne!(
             profile_a.signer_public_key, profile_b.signer_public_key,
-            "different context key materials must produce different signer keys"
+            "different context IDs must produce different signer keys"
         );
     }
 
@@ -2114,6 +2117,7 @@ mod tests {
 
         let profile_a = produce_participation_profile(
             &key_material,
+            "ctx-test",
             "did:key:alice",
             &events,
             [0; 32],
@@ -2125,6 +2129,7 @@ mod tests {
 
         let profile_b = produce_participation_profile(
             &key_material,
+            "ctx-test",
             "did:key:alice",
             &events,
             [0; 32],
@@ -2147,6 +2152,7 @@ mod tests {
 
         let profile_v1 = produce_participation_profile(
             &key_material,
+            "ctx-test",
             "did:key:alice",
             &events,
             [0; 32],
@@ -2167,6 +2173,7 @@ mod tests {
 
         let profile_v2 = produce_participation_profile(
             &key_material,
+            "ctx-test",
             "did:key:alice",
             &events,
             [1; 32],
@@ -2193,6 +2200,7 @@ mod tests {
 
         let profile = produce_participation_profile(
             &key_material,
+            "ctx-test",
             "did:key:alice",
             &events,
             [0; 32],

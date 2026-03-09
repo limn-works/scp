@@ -653,6 +653,16 @@ pub fn verify_challenge_response(
         });
     }
 
+    // 2b. Verify the request's own signature to detect tampering.
+    //     A tampered request (e.g., extended timeout, changed subject_did)
+    //     would pass steps 1-2 but produce a forged verification record.
+    //     We resolve the challenger's public key and verify the request
+    //     signature against the canonical request bytes.
+    let challenger_pk = resolver.resolve_public_key(&request.challenger_did)?;
+    let request_canonical = canonical_challenge_request_bytes(request);
+    verify_ed25519_signature(&challenger_pk, &request_canonical, &request.signature)
+        .map_err(|reason| TrustError::ChallengeRequestSignatureInvalid { reason })?;
+
     // 3. Check timeout: response must not have been completed after the
     //    deadline. We define the deadline as now (verification time).
     //    The completed_at must be within the timeout window relative to the
@@ -1106,12 +1116,13 @@ mod tests {
 
     #[test]
     fn verify_challenge_response_succeeds_with_valid_response() {
-        let (challenger_key, _) = test_keypair();
+        let (challenger_key, challenger_pubkey) = test_keypair();
         let (subject_key, subject_pubkey) = test_keypair();
         let signer = TestSigner::new(challenger_key);
         let clock = TestClock::new(1000);
 
         let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:challenger", challenger_pubkey);
         resolver.add_key("did:key:subject", subject_pubkey);
 
         let request = issue_challenge(
@@ -1158,12 +1169,13 @@ mod tests {
 
     #[test]
     fn verify_challenge_response_distinguishes_challenge_verified() {
-        let (challenger_key, _) = test_keypair();
+        let (challenger_key, challenger_pubkey) = test_keypair();
         let (subject_key, subject_pubkey) = test_keypair();
         let signer = TestSigner::new(challenger_key);
         let clock = TestClock::new(1000);
 
         let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:challenger", challenger_pubkey);
         resolver.add_key("did:key:subject", subject_pubkey);
 
         let request = issue_challenge(
@@ -1204,12 +1216,13 @@ mod tests {
 
     #[test]
     fn verify_challenge_response_rejects_mismatched_challenge_id() {
-        let (challenger_key, _) = test_keypair();
+        let (challenger_key, challenger_pubkey) = test_keypair();
         let (subject_key, subject_pubkey) = test_keypair();
         let signer = TestSigner::new(challenger_key);
         let clock = TestClock::new(1000);
 
         let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:challenger", challenger_pubkey);
         resolver.add_key("did:key:subject", subject_pubkey);
 
         let request = issue_challenge(
@@ -1242,12 +1255,13 @@ mod tests {
 
     #[test]
     fn verify_challenge_response_rejects_wrong_responder() {
-        let (challenger_key, _) = test_keypair();
+        let (challenger_key, challenger_pubkey) = test_keypair();
         let (imposter_key, imposter_pubkey) = test_keypair();
         let signer = TestSigner::new(challenger_key);
         let clock = TestClock::new(1000);
 
         let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:challenger", challenger_pubkey);
         resolver.add_key("did:key:imposter", imposter_pubkey);
 
         let request = issue_challenge(
@@ -1281,13 +1295,14 @@ mod tests {
 
     #[test]
     fn verify_challenge_response_rejects_expired_response() {
-        let (challenger_key, _) = test_keypair();
+        let (challenger_key, challenger_pubkey) = test_keypair();
         let (subject_key, subject_pubkey) = test_keypair();
         let signer = TestSigner::new(challenger_key);
         // Clock is far ahead, response was completed long ago relative to timeout.
         let clock = TestClock::new(5000);
 
         let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:challenger", challenger_pubkey);
         resolver.add_key("did:key:subject", subject_pubkey);
 
         let request = issue_challenge(
@@ -1322,12 +1337,13 @@ mod tests {
 
     #[test]
     fn verify_challenge_response_accepts_response_within_timeout() {
-        let (challenger_key, _) = test_keypair();
+        let (challenger_key, challenger_pubkey) = test_keypair();
         let (subject_key, subject_pubkey) = test_keypair();
         let signer = TestSigner::new(challenger_key);
         let clock = TestClock::new(1000);
 
         let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:challenger", challenger_pubkey);
         resolver.add_key("did:key:subject", subject_pubkey);
 
         let request = issue_challenge(
@@ -1358,12 +1374,13 @@ mod tests {
 
     #[test]
     fn verify_challenge_response_rejects_invalid_signature() {
-        let (challenger_key, _) = test_keypair();
+        let (challenger_key, challenger_pubkey) = test_keypair();
         let (subject_key, subject_pubkey) = test_keypair();
         let signer = TestSigner::new(challenger_key);
         let clock = TestClock::new(1000);
 
         let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:challenger", challenger_pubkey);
         resolver.add_key("did:key:subject", subject_pubkey);
 
         let request = issue_challenge(
@@ -1399,13 +1416,14 @@ mod tests {
 
     #[test]
     fn verify_challenge_response_rejects_wrong_public_key() {
-        let (challenger_key, _) = test_keypair();
+        let (challenger_key, challenger_pubkey) = test_keypair();
         let (subject_key, _) = test_keypair();
         let (_, other_pubkey) = test_keypair();
         let signer = TestSigner::new(challenger_key);
         let clock = TestClock::new(1000);
 
         let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:challenger", challenger_pubkey);
         // Register a different key for the subject DID.
         resolver.add_key("did:key:subject", other_pubkey);
 
@@ -1469,6 +1487,48 @@ mod tests {
         let result =
             verify_challenge_response(&request, &response, &resolver, &clock, &signer, None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_challenge_response_rejects_tampered_request() {
+        let (challenger_key, challenger_pubkey) = test_keypair();
+        let (subject_key, subject_pubkey) = test_keypair();
+        let signer = TestSigner::new(challenger_key);
+        let clock = TestClock::new(1000);
+
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:challenger", challenger_pubkey);
+        resolver.add_key("did:key:subject", subject_pubkey);
+
+        let mut request = issue_challenge(
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
+            ChallengeType::schema_validation(),
+            TEST_CAPABILITY_URI.to_owned(),
+            serde_json::json!({}),
+            Duration::from_secs(60),
+            &signer,
+        )
+        .unwrap();
+
+        // Tamper with the request: extend the timeout after signing.
+        request.timeout = Duration::from_secs(9999);
+
+        let response = make_signed_response(
+            &subject_key,
+            &request.challenge_id,
+            "did:key:subject",
+            serde_json::json!({"passed": true}),
+            990,
+        );
+
+        let result =
+            verify_challenge_response(&request, &response, &resolver, &clock, &signer, None);
+        assert!(result.is_err());
+        match result {
+            Err(TrustError::ChallengeRequestSignatureInvalid { .. }) => {}
+            other => panic!("expected ChallengeRequestSignatureInvalid, got {other:?}"),
+        }
     }
 
     #[test]
