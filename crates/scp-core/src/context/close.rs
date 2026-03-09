@@ -236,6 +236,12 @@ impl SummaryVerificationWindow {
         if now >= self.deadline {
             return Err(ContextError::ContextClosed);
         }
+        if self.state != VerificationState::Verifying {
+            return Err(ContextError::InvalidState(format!(
+                "cannot verify summary: window is in {:?} state, expected Verifying",
+                self.state
+            )));
+        }
         Ok(self.verified_by.insert(participant_did.to_owned()))
     }
 

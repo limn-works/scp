@@ -542,14 +542,16 @@ pub async fn finalize_close(
     let context_id_bytes = context_id_to_bytes(&context_id);
     let memory_scope = handle.params().memory_scope;
 
-    crypto
-        .destroy_mls_group(&context_id_bytes)
-        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-    crypto
-        .destroy_sender_key(&context_id_bytes)
-        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-
+    // Full memory scope retains keys — content remains readable after close.
+    // Only destroy crypto material for Ephemeral and Summary scopes.
     if memory_scope == MemoryScope::Ephemeral || memory_scope == MemoryScope::Summary {
+        crypto
+            .destroy_mls_group(&context_id_bytes)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        crypto
+            .destroy_sender_key(&context_id_bytes)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
         let _ = transport.delete_published(&context_id_bytes);
     }
 
@@ -612,8 +614,20 @@ pub async fn handle_ttl_expiry_with_transport(
     handle.transition_to(&ContextState::Expired).await?;
 
     if memory_scope == MemoryScope::Ephemeral || memory_scope == MemoryScope::Summary {
-        let _ = crypto.destroy_mls_group(&context_id_bytes);
-        let _ = crypto.destroy_sender_key(&context_id_bytes);
+        if let Err(e) = crypto.destroy_mls_group(&context_id_bytes) {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to destroy MLS group after TTL expiry — keys may persist"
+            );
+        }
+        if let Err(e) = crypto.destroy_sender_key(&context_id_bytes) {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to destroy sender key after TTL expiry — keys may persist"
+            );
+        }
 
         // Best-effort relay ciphertext deletion (§5.11). Relay deletion is
         // non-blocking — even if the relay retains the encrypted blobs, the
@@ -682,7 +696,7 @@ impl TtlTimer {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        self.deadline_unix_secs = Some(now_secs + duration.as_secs());
+        self.deadline_unix_secs = Some(now_secs.saturating_add(duration.as_secs()));
 
         let cancel = self.cancel.clone();
 
