@@ -2518,9 +2518,17 @@ pub async fn tool_invoke(
         .spawn(async move {
             validate_tool_id(&tool_id)?;
             validate_did(&identity.did)?;
-            if let Some(ref token) = ucan_token {
-                validate_ucan_token(token)?;
-            }
+
+            // UCAN token is mandatory for tool invocation — all bridges
+            // enforce this. Reject early if missing (§6.2, ADR-016, #423).
+            let ucan_token = ucan_token.ok_or_else(|| ScpError::Permission {
+                message: "UCAN token is required for tool invocation — \
+                          pass a valid JWT-encoded UCAN with tool_invoke:{tool_id} \
+                          or tool_invoke:* capability"
+                    .to_owned(),
+                code: "SCP-PERM-3001".to_owned(),
+            })?;
+            validate_ucan_token(&ucan_token)?;
 
             let state = handle.state.lock().await;
 
@@ -2537,15 +2545,13 @@ pub async fn tool_invoke(
 
             // Primary authorization: UCAN token validation via the full 11-step
             // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
-            if let Some(ref token) = ucan_token {
-                validate_tool_ucan_uniffi(
-                    &handle,
-                    &tool_id,
-                    token,
-                    &identity.did,
-                    proof_tokens.as_ref(),
-                )?;
-            }
+            validate_tool_ucan_uniffi(
+                &handle,
+                &tool_id,
+                &ucan_token,
+                &identity.did,
+                proof_tokens.as_ref(),
+            )?;
 
             let registry = handle.tool_registry.lock().await;
             let registration = registry.get(&tool_id).ok_or_else(|| ScpError::Tool {
@@ -5221,4 +5227,70 @@ pub fn discovery_create_query(
 #[must_use]
 pub fn discovery_normalize_address(address: String) -> String {
     scp_core::discovery::normalize_address(&address)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn test_handle() -> Arc<ContextHandle> {
+        Arc::new(ContextHandle {
+            context_id: "ctx-test".to_owned(),
+            state: tokio::sync::Mutex::new(ContextState::Active),
+            creator_did: "did:dht:z6MkTestUser".to_owned(),
+            #[cfg(feature = "allow_in_memory_custody")]
+            in_memory_custody: None,
+            callback_custody: None,
+            signing_key: None,
+            ceiling_strings: Vec::new(),
+            tool_registry: tokio::sync::Mutex::new(
+                scp_core::context::tools::ToolRegistry::new(),
+            ),
+            tool_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            session_store: tokio::sync::Mutex::new(
+                scp_core::context::tools::SessionStore::new(),
+            ),
+        })
+    }
+
+    fn test_identity() -> Arc<Identity> {
+        Arc::new(Identity {
+            did: "did:dht:z6MkTestUser".to_owned(),
+            custody_type: CustodyMethod::InMemory,
+            core_id: None,
+            core_document: None,
+            #[cfg(feature = "allow_in_memory_custody")]
+            in_memory_custody: None,
+            callback_custody: None,
+        })
+    }
+
+    /// `UniFFI` `tool_invoke` must reject `None` `ucan_token` with a
+    /// `Permission` error. Matches `PyO3`/NAPI behavior where the token
+    /// is a required non-optional parameter. See issue #423.
+    #[tokio::test]
+    async fn tool_invoke_rejects_none_ucan_token() {
+        let result = tool_invoke(
+            test_handle(),
+            "test-tool".to_owned(),
+            "{}".to_owned(),
+            test_identity(),
+            None, // No UCAN token
+            None,
+        )
+        .await;
+
+        let err = result.expect_err("None ucan_token must be rejected");
+        match err {
+            ScpError::Permission { ref code, .. } => {
+                assert_eq!(code, "SCP-PERM-3001");
+            }
+            other => panic!("expected ScpError::Permission, got {other:?}"),
+        }
+    }
 }
