@@ -119,6 +119,36 @@ class ProvenanceQuality(enum.Enum):
     PERSISTENT_VERIFIABLE = 3
 
 
+class MemberRole(enum.Enum):
+    """Role assigned to a member within a context (spec section 5.5).
+
+    Mirrors ``scp_core::context::roles::Role``.
+    """
+
+    #: Context administrator with full governance capabilities.
+    ADMIN = "Admin"
+    #: Regular participant with standard capabilities.
+    MEMBER = "Member"
+    #: Read-only observer with no write capabilities.
+    OBSERVER = "Observer"
+    #: Custom role defined by context governance.
+    CUSTOM = "Custom"
+
+    @classmethod
+    def from_bridge(cls, raw: str) -> MemberRole:
+        """Parse a bridge-layer role string into a :class:`MemberRole`.
+
+        The bridge returns a Rust debug representation. This method
+        normalises known variants and falls back to :attr:`CUSTOM` for
+        unrecognised strings.
+        """
+        normalised = raw.strip().strip('"')
+        for member in cls:
+            if normalised == member.value or normalised.lower() == member.value.lower():
+                return member
+        return cls.CUSTOM
+
+
 class Capability(enum.Enum):
     """Protocol-defined capabilities within an SCP context.
 
@@ -231,6 +261,7 @@ __all__ = [
     "CeilingPolicy",
     "ContextMode",
     "DiscoveryMethod",
+    "MemberRole",
     "MemoryScope",
     "Message",
     "PromotionPolicy",

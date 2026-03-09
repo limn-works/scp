@@ -105,6 +105,7 @@ export {
 export type {
   AttestationSummary,
   BehavioralRecord,
+  BroadcastAdmissionPolicy,
   Capability,
   Checkpoint,
   ContextParams,
@@ -112,8 +113,10 @@ export type {
   Event,
   EventClaim,
   EventFilter,
+  GovernanceActionResult,
   McpClientConfig,
   McpServerConfig,
+  MemberRole,
   Message,
   Proof,
   Provenance,

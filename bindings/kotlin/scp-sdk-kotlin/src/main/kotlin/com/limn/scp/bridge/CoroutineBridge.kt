@@ -123,6 +123,84 @@ interface ContextBindings {
 }
 
 /**
+ * Native binding functions for membership queries.
+ *
+ * All methods are blocking JNA calls into Rust and must be dispatched on [Dispatchers.IO].
+ */
+interface MembershipBindings {
+    fun contextMemberCount(contextHandle: Long): Long?
+
+    fun contextIsMember(
+        contextHandle: Long,
+        did: String,
+    ): Boolean
+
+    fun contextMemberDids(contextHandle: Long): List<String>
+
+    fun contextMemberRole(
+        contextHandle: Long,
+        did: String,
+    ): String?
+}
+
+/**
+ * Native binding functions for governance operations.
+ *
+ * All methods are blocking JNA calls into Rust and must be dispatched on [Dispatchers.IO].
+ */
+interface GovernanceBindings {
+    fun governanceExecute(
+        contextHandle: Long,
+        proposalJson: String,
+    ): String
+}
+
+/**
+ * Native binding functions for broadcast operations.
+ *
+ * All methods are blocking JNA calls into Rust and must be dispatched on [Dispatchers.IO].
+ */
+interface BroadcastBindings {
+    fun broadcastSubscribe(
+        contextHandle: Long,
+        subscriberDid: String,
+    )
+
+    fun broadcastUnsubscribe(
+        contextHandle: Long,
+        subscriberDid: String,
+        rotateKeys: Boolean,
+    )
+
+    fun broadcastPublish(
+        contextHandle: Long,
+        authorDid: String,
+        payload: ByteArray,
+    )
+
+    fun broadcastBlockSubscriber(
+        contextHandle: Long,
+        subscriberDid: String,
+        blockerDid: String,
+    )
+
+    fun broadcastHandleKeyRequest(
+        contextHandle: Long,
+        authorDid: String,
+        requesterDid: String,
+    ): String
+
+    fun broadcastSubscriberCount(contextHandle: Long): Long?
+
+    fun broadcastIsSubscriber(
+        contextHandle: Long,
+        did: String,
+    ): Boolean
+
+    fun broadcastAdmission(contextHandle: Long): String?
+}
+
+/**
  * Native binding functions for tool operations.
  *
  * All methods are blocking JNA calls into Rust and must be dispatched on [Dispatchers.IO].
@@ -212,6 +290,9 @@ interface InfraBindings {
 interface NativeBindings :
     IdentityBindings,
     ContextBindings,
+    MembershipBindings,
+    GovernanceBindings,
+    BroadcastBindings,
     ToolBindings,
     UcanBindings,
     InfraBindings
@@ -265,6 +346,15 @@ class CoroutineBridge(
 
     /** UCAN operations — FFI on IO. */
     val ucan = UcanBridge(nativeBindings, this)
+
+    /** Membership query operations — FFI on IO. */
+    val membership = MembershipBridgeOps(nativeBindings, this)
+
+    /** Governance operations — FFI on IO. */
+    val governance = GovernanceBridgeOps(nativeBindings, this)
+
+    /** Broadcast operations — FFI on IO. */
+    val broadcast = BroadcastBridgeOps(nativeBindings, this)
 
     /** Event log and transport operations — FFI on IO. */
     val infra = InfraBridge(nativeBindings, this)
@@ -572,6 +662,184 @@ class UcanBridge internal constructor(
         identityHandle: Long,
         token: String,
     ): Unit = bridge.ffiCall { bindings.ucanRevoke(identityHandle, token) }
+}
+
+/**
+ * Membership query operations bridge. Wraps membership-related FFI calls as suspend functions.
+ */
+class MembershipBridgeOps internal constructor(
+    private val bindings: MembershipBindings,
+    private val bridge: CoroutineBridge,
+) {
+    /**
+     * Return the member count for a context.
+     *
+     * @param contextHandle Handle from context create or join.
+     * @return The member count, or null if the context is not registered.
+     */
+    suspend fun memberCount(contextHandle: Long): Long? =
+        bridge.ffiCall { bindings.contextMemberCount(contextHandle) }
+
+    /**
+     * Check whether a DID is a member of a context.
+     *
+     * @param contextHandle Handle from context create or join.
+     * @param did The DID to check.
+     * @return true if the DID is a member.
+     */
+    suspend fun isMember(
+        contextHandle: Long,
+        did: String,
+    ): Boolean = bridge.ffiCall { bindings.contextIsMember(contextHandle, did) }
+
+    /**
+     * Return all member DIDs in a context.
+     *
+     * @param contextHandle Handle from context create or join.
+     * @return List of DID strings.
+     */
+    suspend fun memberDids(contextHandle: Long): List<String> =
+        bridge.ffiCall { bindings.contextMemberDids(contextHandle) }
+
+    /**
+     * Return the role of a member in a context.
+     *
+     * @param contextHandle Handle from context create or join.
+     * @param did The DID of the member.
+     * @return The role string, or null if the member is not found.
+     */
+    suspend fun memberRole(
+        contextHandle: Long,
+        did: String,
+    ): String? = bridge.ffiCall { bindings.contextMemberRole(contextHandle, did) }
+}
+
+/**
+ * Governance operations bridge. Wraps governance-related FFI calls as suspend functions.
+ */
+class GovernanceBridgeOps internal constructor(
+    private val bindings: GovernanceBindings,
+    private val bridge: CoroutineBridge,
+) {
+    /**
+     * Execute a governance action on a context.
+     *
+     * @param contextHandle Handle from context create.
+     * @param proposalJson JSON-encoded governance proposal.
+     * @return A string describing the governance action result.
+     */
+    suspend fun execute(
+        contextHandle: Long,
+        proposalJson: String,
+    ): String = bridge.ffiCall { bindings.governanceExecute(contextHandle, proposalJson) }
+}
+
+/**
+ * Broadcast operations bridge. Wraps broadcast-related FFI calls as suspend functions.
+ */
+class BroadcastBridgeOps internal constructor(
+    private val bindings: BroadcastBindings,
+    private val bridge: CoroutineBridge,
+) {
+    /**
+     * Subscribe a DID to a broadcast context.
+     *
+     * @param contextHandle Handle from context create or join.
+     * @param subscriberDid The DID subscribing to broadcasts.
+     */
+    suspend fun subscribe(
+        contextHandle: Long,
+        subscriberDid: String,
+    ): Unit = bridge.ffiCall { bindings.broadcastSubscribe(contextHandle, subscriberDid) }
+
+    /**
+     * Unsubscribe a DID from a broadcast context.
+     *
+     * @param contextHandle Handle from context create or join.
+     * @param subscriberDid The DID to unsubscribe.
+     * @param rotateKeys Whether to rotate broadcast keys after unsubscription.
+     */
+    suspend fun unsubscribe(
+        contextHandle: Long,
+        subscriberDid: String,
+        rotateKeys: Boolean = false,
+    ): Unit = bridge.ffiCall {
+        bindings.broadcastUnsubscribe(contextHandle, subscriberDid, rotateKeys)
+    }
+
+    /**
+     * Publish a message to a broadcast context.
+     *
+     * @param contextHandle Handle from context create or join.
+     * @param authorDid The DID of the author publishing the message.
+     * @param payload Raw message bytes.
+     */
+    suspend fun publish(
+        contextHandle: Long,
+        authorDid: String,
+        payload: ByteArray,
+    ): Unit = bridge.ffiCall { bindings.broadcastPublish(contextHandle, authorDid, payload) }
+
+    /**
+     * Block a subscriber's read access in a broadcast context.
+     *
+     * @param contextHandle Handle from context create or join.
+     * @param subscriberDid The DID of the subscriber to block.
+     * @param blockerDid The DID of the blocker.
+     */
+    suspend fun blockSubscriber(
+        contextHandle: Long,
+        subscriberDid: String,
+        blockerDid: String,
+    ): Unit = bridge.ffiCall {
+        bindings.broadcastBlockSubscriber(contextHandle, subscriberDid, blockerDid)
+    }
+
+    /**
+     * Handle a broadcast key request from a subscriber.
+     *
+     * @param contextHandle Handle from context create or join.
+     * @param authorDid The DID of the author handling the request.
+     * @param requesterDid The DID of the requester.
+     * @return A string describing the key request decision.
+     */
+    suspend fun handleKeyRequest(
+        contextHandle: Long,
+        authorDid: String,
+        requesterDid: String,
+    ): String = bridge.ffiCall {
+        bindings.broadcastHandleKeyRequest(contextHandle, authorDid, requesterDid)
+    }
+
+    /**
+     * Return the number of broadcast subscribers for a context.
+     *
+     * @param contextHandle Handle from context create or join.
+     * @return The subscriber count, or null if not a broadcast context.
+     */
+    suspend fun subscriberCount(contextHandle: Long): Long? =
+        bridge.ffiCall { bindings.broadcastSubscriberCount(contextHandle) }
+
+    /**
+     * Check whether a DID is a broadcast subscriber.
+     *
+     * @param contextHandle Handle from context create or join.
+     * @param did The DID to check.
+     * @return true if the DID is a subscriber.
+     */
+    suspend fun isSubscriber(
+        contextHandle: Long,
+        did: String,
+    ): Boolean = bridge.ffiCall { bindings.broadcastIsSubscriber(contextHandle, did) }
+
+    /**
+     * Return the broadcast admission policy for a context.
+     *
+     * @param contextHandle Handle from context create or join.
+     * @return The policy string ("Open" or "Gated"), or null if not broadcast.
+     */
+    suspend fun admission(contextHandle: Long): String? =
+        bridge.ffiCall { bindings.broadcastAdmission(contextHandle) }
 }
 
 /**

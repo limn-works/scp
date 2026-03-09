@@ -31,6 +31,13 @@ from scp_sdk.errors import (
     ValidationError,
 )
 from scp_sdk.event_log import Checkpoint, Event, EventLog, Proof
+from scp_sdk.governance import (
+    GovernanceActionResult,
+    execute_governance_action,
+    handle_ttl_expiry,
+    propose_ttl_extension,
+    reset_ttl_timer,
+)
 from scp_sdk.identity import DIDDocument, Identity
 from scp_sdk.mcp import (
     McpClient,
@@ -64,6 +71,7 @@ from scp_sdk.types import (
     CeilingPolicy,
     ContextMode,
     DiscoveryMethod,
+    MemberRole,
     MemoryScope,
     Message,
     PromotionPolicy,
@@ -93,6 +101,7 @@ __all__ = [
     "Endorsement",
     "Event",
     "EventLog",
+    "GovernanceActionResult",
     "Identity",
     "IdentityError",
     "McpClient",
@@ -100,6 +109,7 @@ __all__ = [
     "McpServer",
     "McpToolDefinition",
     "McpToolResult",
+    "MemberRole",
     "Membership",
     "MemoryScope",
     "Message",
@@ -125,13 +135,17 @@ __all__ = [
     "delegate",
     "disable_stdio_allowlist",
     "evaluate_trust",
+    "execute_governance_action",
     "get_stdio_allowlist",
+    "handle_ttl_expiry",
     "mint",
+    "propose_ttl_extension",
     "register_tool_handler",
     "registry_cleanup",
     "registry_stats",
     "relay_status",
     "reset_stdio_allowlist",
+    "reset_ttl_timer",
     "revoke",
     "run_sync",
     "serve_mcp",

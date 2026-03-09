@@ -19,11 +19,13 @@
  */
 
 import type {
+  BroadcastAdmissionPolicy,
   Checkpoint,
   DIDDocument,
   Event,
   EventClaim,
   EventFilter,
+  MemberRole,
   Message,
   Proof,
   ToolDefinition,
@@ -75,6 +77,44 @@ export interface Bridge {
     identityDid: string,
     callback: MessageCallback,
   ): void;
+
+  // Membership queries
+  contextMemberCount(handle: BridgeContextHandle): Promise<number | null>;
+  contextIsMember(handle: BridgeContextHandle, did: string): Promise<boolean>;
+  contextMemberDids(handle: BridgeContextHandle): Promise<readonly string[]>;
+  contextMemberRole(handle: BridgeContextHandle, did: string): Promise<MemberRole | null>;
+
+  // Broadcast operations
+  broadcastSubscribe(handle: BridgeContextHandle, subscriberDid: string): Promise<void>;
+  broadcastUnsubscribe(
+    handle: BridgeContextHandle,
+    subscriberDid: string,
+    rotateKeys?: boolean,
+  ): Promise<void>;
+  broadcastPublish(
+    handle: BridgeContextHandle,
+    authorDid: string,
+    payload: Uint8Array,
+  ): Promise<void>;
+  broadcastBlockSubscriber(
+    handle: BridgeContextHandle,
+    subscriberDid: string,
+    blockerDid: string,
+  ): Promise<void>;
+  broadcastHandleKeyRequest(
+    handle: BridgeContextHandle,
+    authorDid: string,
+    requesterDid: string,
+  ): Promise<string>;
+  broadcastSubscriberCount(handle: BridgeContextHandle): Promise<number | null>;
+  broadcastIsSubscriber(handle: BridgeContextHandle, did: string): Promise<boolean>;
+  broadcastAdmission(handle: BridgeContextHandle): Promise<BroadcastAdmissionPolicy | null>;
+
+  // Governance
+  contextExecuteGovernanceAction(
+    handle: BridgeContextHandle,
+    proposalJson: string,
+  ): Promise<string>;
 
   // Tools
   toolRegister(handle: BridgeContextHandle, definition: ToolDefinition): Promise<string>;
