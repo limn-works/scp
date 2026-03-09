@@ -373,3 +373,117 @@ public func verifyChallengeResponse(
 ) throws -> Bool {
     try verifyResponseFn(challengeJson, responseJson)
 }
+
+// MARK: - Participation Types
+
+/// A verifiable participation fact type.
+///
+/// Participation facts represent quantifiable behavioral signals that can
+/// be observed from a context's event log. They are inputs to the trust
+/// model's behavioral validation layer (Layer 2).
+///
+/// ## Provenance
+///
+/// - ADR-017 Layer 2 (Behavioral Validation)
+/// - Spec section 23.7 (Participation Requirements)
+public enum ParticipationFact: String, Sendable, CaseIterable {
+    /// Number of messages sent by the participant.
+    case messagesSent = "messages_sent"
+
+    /// Number of tools invoked by the participant.
+    case toolsInvoked = "tools_invoked"
+
+    /// Number of governance actions taken by the participant.
+    case governanceActions = "governance_actions"
+
+    /// Number of contexts the participant has joined.
+    case contextsParticipated = "contexts_participated"
+
+    /// Number of attestations the participant has verified.
+    case attestationsVerified = "attestations_verified"
+}
+
+/// A minimum threshold for a specific participation fact.
+///
+/// Used in ``RequireParticipation`` to define the minimum observed value
+/// a participant must have for a given fact type.
+///
+/// ## Provenance
+///
+/// - ADR-017 Layer 2 (Behavioral Validation)
+/// - Spec section 23.7 (Participation Requirements)
+public nonisolated struct ParticipationThreshold: Sendable {
+    /// The participation fact to check.
+    public let fact: ParticipationFact
+
+    /// The minimum value required.
+    public let minimum: UInt64
+
+    /// Memberwise initializer.
+    public init(fact: ParticipationFact, minimum: UInt64) {
+        self.fact = fact
+        self.minimum = minimum
+    }
+}
+
+/// A participant's observed values for each participation fact.
+///
+/// Maps ``ParticipationFact`` cases to their observed counts. Missing
+/// keys are treated as zero when checked against thresholds.
+///
+/// ## Provenance
+///
+/// - ADR-017 Layer 2 (Behavioral Validation)
+/// - Spec section 23.7 (Participation Requirements)
+public typealias ParticipationProfile = [ParticipationFact: UInt64]
+
+/// A set of participation thresholds that must all be met.
+///
+/// Used as admission criteria or trust-gating requirements. All thresholds
+/// must be satisfied (conjunction) for the requirement to pass.
+///
+/// ## Provenance
+///
+/// - ADR-017 Layer 2 (Behavioral Validation)
+/// - Spec section 23.7 (Participation Requirements)
+public nonisolated struct RequireParticipation: Sendable {
+    /// The thresholds that must all be met.
+    public let thresholds: [ParticipationThreshold]
+
+    /// Memberwise initializer.
+    public init(thresholds: [ParticipationThreshold]) {
+        self.thresholds = thresholds
+    }
+}
+
+// MARK: - Participation Verification
+
+/// Verifies that a participation profile meets all required thresholds.
+///
+/// Returns `true` if every threshold in the requirement is met by the
+/// corresponding value in the profile. Missing profile entries are
+/// treated as zero.
+///
+/// This is a pure Swift function with no bridge dependency.
+///
+/// - Parameters:
+///   - requirement: The participation thresholds to check.
+///   - profile: The observed participation values.
+/// - Returns: `true` if all thresholds are met, `false` otherwise.
+///
+/// ## Provenance
+///
+/// - ADR-017 Layer 2 (Behavioral Validation)
+/// - Spec section 23.7 (Participation Requirements)
+public func verifyParticipationRequirements(
+    requirement: RequireParticipation,
+    profile: ParticipationProfile
+) -> Bool {
+    for threshold in requirement.thresholds {
+        let observed = profile[threshold.fact] ?? 0
+        if observed < threshold.minimum {
+            return false
+        }
+    }
+    return true
+}

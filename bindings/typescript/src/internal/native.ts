@@ -470,6 +470,163 @@ export function createNativeBridge(): Bridge {
       return checkpoint;
     },
 
+    // Bridge Connector
+    bridgeRegister(contextId: string, operatorDid: string, platform: string, mode: string) {
+      return (
+        addon.bridgeRegister as (
+          c: string,
+          o: string,
+          p: string,
+          m: string,
+        ) => ReturnType<Bridge["bridgeRegister"]>
+      )(contextId, operatorDid, platform, mode);
+    },
+
+    bridgeEvaluateTrust(isBridged: boolean, isNativeTransport: boolean, shadowStatus: string) {
+      return (addon.bridgeEvaluateTrust as (b: boolean, n: boolean, s: string) => number)(
+        isBridged,
+        isNativeTransport,
+        shadowStatus,
+      );
+    },
+
+    bridgeCreateShadow(
+      bridgeId: string,
+      platformHandle: string,
+      bridgeMode: string,
+      contextId: string | undefined,
+    ) {
+      return (
+        addon.bridgeCreateShadow as (
+          b: string,
+          p: string,
+          m: string,
+          c: string | undefined,
+        ) => ReturnType<Bridge["bridgeCreateShadow"]>
+      )(bridgeId, platformHandle, bridgeMode, contextId);
+    },
+
+    // Discovery
+    discoveryParseAddress(address: string) {
+      return (addon.discoveryParseAddress as (a: string) => string)(address);
+    },
+
+    discoveryCreateQuery(
+      capabilities: string[] | undefined,
+      keywords: string[] | undefined,
+      minHistorySecs: number | undefined,
+    ) {
+      return (
+        addon.discoveryCreateQuery as (
+          c: string[] | undefined,
+          k: string[] | undefined,
+          m: number | undefined,
+        ) => string
+      )(capabilities, keywords, minHistorySecs);
+    },
+
+    discoveryNormalizeAddress(address: string) {
+      return (addon.discoveryNormalizeAddress as (a: string) => string)(address);
+    },
+
+    async contextDiscover(query: string): Promise<string> {
+      return await (addon.contextDiscover as (q: string) => Promise<string>)(query);
+    },
+
+    // Provenance
+    async evaluateProvenanceQuality(
+      sourceContext: string | undefined,
+      sourceType: string,
+      contextState: string,
+      counterparties: string[] | undefined,
+    ): Promise<number> {
+      return await (
+        addon.evaluateProvenanceQuality as (
+          sc: string | undefined,
+          st: string,
+          cs: string,
+          cp: string[] | undefined,
+        ) => Promise<number>
+      )(sourceContext, sourceType, contextState, counterparties);
+    },
+
+    provenanceAttach(
+      sourceContextId: string,
+      sourceType: string,
+      memoryScope: string,
+      members: string[],
+      targetContextId: string,
+      existingChainDepth: number | undefined,
+    ) {
+      return (
+        addon.provenanceAttach as (
+          sc: string,
+          st: string,
+          ms: string,
+          m: string[],
+          tc: string,
+          e: number | undefined,
+        ) => string
+      )(sourceContextId, sourceType, memoryScope, members, targetContextId, existingChainDepth);
+    },
+
+    provenanceCheckChainDepth(chainDepth: number, maxDepth: number | undefined) {
+      return (addon.provenanceCheckChainDepth as (c: number, m: number | undefined) => boolean)(
+        chainDepth,
+        maxDepth,
+      );
+    },
+
+    // Sync
+    syncClassifyOffline(lastRelayContact: number, now: number) {
+      return (addon.syncClassifyOffline as (l: number, n: number) => string)(lastRelayContact, now);
+    },
+
+    syncGetPolicy() {
+      return (addon.syncGetPolicy as () => ReturnType<Bridge["syncGetPolicy"]>)();
+    },
+
+    // Identity Advanced
+    async identityCreateWithAgentKey(custody: string): Promise<BridgeIdentityHandle> {
+      return await (
+        addon.identityCreateWithAgentKey as (c: string) => Promise<BridgeIdentityHandle>
+      )(custody);
+    },
+
+    async identityAddAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      return await (
+        addon.identityAddAgentKey as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
+      )(handle);
+    },
+
+    async identityRotateAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      return await (
+        addon.identityRotateAgentKey as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
+      )(handle);
+    },
+
+    async identityRemoveAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      return await (
+        addon.identityRemoveAgentKey as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
+      )(handle);
+    },
+
+    async identityMigrate(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      return await (
+        addon.identityMigrate as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
+      )(handle);
+    },
+
+    async identityAttestDevice(did: string): Promise<string> {
+      return await (addon.identityAttestDevice as (d: string) => Promise<string>)(did);
+    },
+
+    async identityVerifyDeviceAttestation(did: string, tokenBase64: string): Promise<boolean> {
+      return await (
+        addon.identityVerifyDeviceAttestation as (d: string, t: string) => Promise<boolean>
+      )(did, tokenBase64);
+    },
+
     // Lifecycle
     version(): string {
       return (addon.scpVersion as () => string)();

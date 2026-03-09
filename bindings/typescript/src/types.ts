@@ -366,6 +366,48 @@ export interface AttestationSummary {
 }
 
 // ---------------------------------------------------------------------------
+// Participation (spec section 9.3, SCP-BA-004)
+// ---------------------------------------------------------------------------
+
+/** A verified participation fact used in admission evaluation. */
+export interface ParticipationFact {
+  /** Type of participation fact (e.g., `"context_membership"`). */
+  readonly factType: string;
+  /** DID of the participant this fact pertains to. */
+  readonly participantDid: string;
+  /** Context ID where the fact was observed. */
+  readonly contextId: string;
+  /** Numeric value of the fact (e.g., participation count). */
+  readonly value: number;
+}
+
+/** A threshold requirement for context admission. */
+export interface ParticipationThreshold {
+  /** The fact type this threshold applies to. */
+  readonly factType: string;
+  /** Minimum value required to satisfy the threshold. */
+  readonly minimum: number;
+  /** Optional maximum value constraint. */
+  readonly maximum?: number;
+}
+
+/** A participant's aggregated participation profile. */
+export interface ParticipationProfile {
+  /** DID of the participant. */
+  readonly participantDid: string;
+  /** Verified participation facts. */
+  readonly facts: readonly ParticipationFact[];
+}
+
+/** Participation-based admission requirement for a context. */
+export interface RequireParticipation {
+  /** Thresholds that must be met for admission. */
+  readonly thresholds: readonly ParticipationThreshold[];
+  /** Whether ALL thresholds must be met (true) or ANY (false). */
+  readonly requireAll: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // MCP
 // ---------------------------------------------------------------------------
 

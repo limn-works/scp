@@ -819,6 +819,7 @@ impl scp_core::crypto::ucan::validate::NonceTracker for RejectAllNonceTracker {
         nonce: &str,
         _token_expiry: u64,
     ) -> Result<(), scp_core::crypto::ucan::UcanError> {
+        // Fail-closed: reject all nonces when no real tracker is available.
         Err(scp_core::crypto::ucan::UcanError::NonceReused(
             nonce.to_owned(),
         ))
@@ -831,6 +832,7 @@ impl scp_core::crypto::ucan::validate::NonceTracker for RejectAllNonceTracker {
 struct RejectAllRevocationChecker;
 impl scp_core::crypto::ucan::validate::RevocationChecker for RejectAllRevocationChecker {
     fn is_revoked(&self, _token_cid: &str) -> bool {
+        // Fail-closed: treat all tokens as revoked when no real checker is available.
         true
     }
 }
