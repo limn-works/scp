@@ -71,8 +71,7 @@ class DiscoveryBridge internal constructor(
      * @param address The address string to parse.
      * @return JSON string with parsed address components.
      */
-    suspend fun parseAddress(address: String): String =
-        bridge.ffiCall { bindings.discoveryParseAddress(address) }
+    suspend fun parseAddress(address: String): String = bridge.ffiCall { bindings.discoveryParseAddress(address) }
 
     /**
      * Creates a discovery query as a JSON string.
@@ -86,9 +85,10 @@ class DiscoveryBridge internal constructor(
         capabilities: List<String>? = null,
         keywords: List<String>? = null,
         minHistorySecs: Long? = null,
-    ): String = bridge.ffiCall {
-        bindings.discoveryCreateQuery(capabilities, keywords, minHistorySecs)
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.discoveryCreateQuery(capabilities, keywords, minHistorySecs)
+        }
 
     /**
      * Normalizes an address string per SCP addressing rules.

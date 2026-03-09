@@ -80,9 +80,10 @@ class SyncBridge internal constructor(
     suspend fun classifyOffline(
         lastRelayContact: Long,
         now: Long,
-    ): String = bridge.ffiCall {
-        bindings.syncClassifyOffline(lastRelayContact, now)
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.syncClassifyOffline(lastRelayContact, now)
+        }
 
     /**
      * Returns the default sync policy parameters.

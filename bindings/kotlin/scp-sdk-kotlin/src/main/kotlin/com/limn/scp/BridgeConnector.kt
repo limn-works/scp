@@ -93,9 +93,10 @@ class BridgeConnectorBridge internal constructor(
         isBridged: Boolean,
         isNativeTransport: Boolean,
         shadowStatus: String,
-    ): Int = bridge.ffiCall {
-        bindings.bridgeEvaluateTrust(isBridged, isNativeTransport, shadowStatus)
-    }
+    ): Int =
+        bridge.ffiCall {
+            bindings.bridgeEvaluateTrust(isBridged, isNativeTransport, shadowStatus)
+        }
 
     /**
      * Registers a bridge connector with a context.
@@ -111,9 +112,10 @@ class BridgeConnectorBridge internal constructor(
         operatorDid: String,
         platform: String,
         mode: String,
-    ): String = bridge.ffiCall {
-        bindings.bridgeRegister(contextId, operatorDid, platform, mode)
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.bridgeRegister(contextId, operatorDid, platform, mode)
+        }
 
     /**
      * Creates a shadow identity for a bridged participant.
@@ -129,7 +131,8 @@ class BridgeConnectorBridge internal constructor(
         platformHandle: String,
         bridgeMode: String,
         contextId: String,
-    ): String = bridge.ffiCall {
-        bindings.bridgeCreateShadow(bridgeId, platformHandle, bridgeMode, contextId)
-    }
+    ): String =
+        bridge.ffiCall {
+            bindings.bridgeCreateShadow(bridgeId, platformHandle, bridgeMode, contextId)
+        }
 }

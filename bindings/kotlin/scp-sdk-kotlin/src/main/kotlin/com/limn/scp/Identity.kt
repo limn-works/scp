@@ -150,8 +150,7 @@ class IdentityAdvancedBridge internal constructor(
      * @param identityHandle Handle from identity create or load.
      * @return Updated opaque identity handle with new DID.
      */
-    suspend fun migrate(identityHandle: Long): Long =
-        bridge.ffiCall { bindings.identityMigrate(identityHandle) }
+    suspend fun migrate(identityHandle: Long): Long = bridge.ffiCall { bindings.identityMigrate(identityHandle) }
 
     /**
      * Generates a device attestation token for an identity.
@@ -172,7 +171,8 @@ class IdentityAdvancedBridge internal constructor(
     suspend fun verifyDeviceAttestation(
         did: String,
         tokenBase64: String,
-    ): Boolean = bridge.ffiCall {
-        bindings.identityVerifyDeviceAttestation(did, tokenBase64)
-    }
+    ): Boolean =
+        bridge.ffiCall {
+            bindings.identityVerifyDeviceAttestation(did, tokenBase64)
+        }
 }

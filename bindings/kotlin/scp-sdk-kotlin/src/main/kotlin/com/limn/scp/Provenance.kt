@@ -101,14 +101,15 @@ class ProvenanceBridge internal constructor(
         sourceType: String,
         contextState: String,
         counterparties: List<String> = emptyList(),
-    ): Int = bridge.ffiCall {
-        bindings.evaluateProvenanceQuality(
-            sourceContext,
-            sourceType,
-            contextState,
-            counterparties,
-        )
-    }
+    ): Int =
+        bridge.ffiCall {
+            bindings.evaluateProvenanceQuality(
+                sourceContext,
+                sourceType,
+                contextState,
+                counterparties,
+            )
+        }
 
     /**
      * Attaches provenance metadata when data crosses a context boundary.
@@ -116,8 +117,7 @@ class ProvenanceBridge internal constructor(
      * @param params Provenance attachment parameters.
      * @return JSON string with the attached provenance record.
      */
-    suspend fun attach(params: ProvenanceAttachParams): String =
-        bridge.ffiCall { bindings.provenanceAttach(params) }
+    suspend fun attach(params: ProvenanceAttachParams): String = bridge.ffiCall { bindings.provenanceAttach(params) }
 
     /**
      * Checks whether the provenance chain depth is within the allowed limit.
@@ -129,7 +129,8 @@ class ProvenanceBridge internal constructor(
     suspend fun checkChainDepth(
         chainDepth: Byte,
         maxDepth: Byte? = null,
-    ): Boolean = bridge.ffiCall {
-        bindings.provenanceCheckChainDepth(chainDepth, maxDepth)
-    }
+    ): Boolean =
+        bridge.ffiCall {
+            bindings.provenanceCheckChainDepth(chainDepth, maxDepth)
+        }
 }

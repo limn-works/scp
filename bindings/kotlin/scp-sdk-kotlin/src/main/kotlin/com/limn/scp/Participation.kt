@@ -93,9 +93,10 @@ fun verifyParticipationRequirements(
 ): Boolean {
     if (requirement.thresholds.isEmpty()) return true
 
-    val results = requirement.thresholds.map { threshold ->
-        checkThreshold(threshold, profile.facts)
-    }
+    val results =
+        requirement.thresholds.map { threshold ->
+            checkThreshold(threshold, profile.facts)
+        }
 
     return if (requirement.requireAll) {
         results.all { it }
@@ -115,9 +116,10 @@ private fun checkThreshold(
     threshold: ParticipationThreshold,
     facts: List<ParticipationFact>,
 ): Boolean {
-    val total = facts
-        .filter { it.factType == threshold.factType }
-        .sumOf { it.value }
+    val total =
+        facts
+            .filter { it.factType == threshold.factType }
+            .sumOf { it.value }
 
     if (total < threshold.minimum) return false
     if (threshold.maximum != null && total > threshold.maximum) return false
