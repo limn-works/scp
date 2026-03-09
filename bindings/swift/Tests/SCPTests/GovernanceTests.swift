@@ -1061,7 +1061,7 @@ struct GovernanceTests {
             Issue.record("Expected exportContext to throw on closed context")
         } catch let error as ScpError {
             if case let .Context(_, code) = error {
-                // SCP-CTX-2001 (not active) or SCP-CTX-2030 (default stub)
+                // SCP-CTX-2001 (context not active)
                 #expect(code == "SCP-CTX-2001")
             } else {
                 Issue.record("Expected ScpError.Context, got \(error)")
@@ -1082,23 +1082,6 @@ struct GovernanceTests {
             importFn: mockImport
         )
         #expect(contextId == "ctx-imported-123")
-    }
-
-    @Test("importContext default throws descriptive error")
-    func importContextDefaultThrows() async throws {
-        do {
-            _ = try await importContext(data: Data("invalid".utf8))
-            Issue.record("Expected default to throw")
-        } catch let error as ScpError {
-            if case let .Context(message, code) = error {
-                #expect(code == "SCP-CTX-2032")
-                #expect(message.contains("not yet available"))
-            } else {
-                Issue.record("Expected ScpError.Context, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
-        }
     }
 
     // MARK: - Local DID Management tests
@@ -1155,25 +1138,5 @@ struct GovernanceTests {
         #expect(result == true)
         #expect(receivedProfile == "[{}]")
         #expect(receivedRequirements == "[{}]")
-    }
-
-    @Test("verifyParticipationRequirementsBridge default throws descriptive error")
-    func verifyParticipationRequirementsBridgeDefaultThrows() throws {
-        do {
-            _ = try verifyParticipationRequirementsBridge(
-                profileJson: "[]",
-                requirementsJson: "[]"
-            )
-            Issue.record("Expected default to throw")
-        } catch let error as ScpError {
-            if case let .Validation(message, code) = error {
-                #expect(code == "SCP-VALID-7030")
-                #expect(message.contains("not yet available"))
-            } else {
-                Issue.record("Expected ScpError.Validation, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
-        }
     }
 } // end GovernanceTests

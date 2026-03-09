@@ -172,25 +172,6 @@ struct IdentityTests {
         }
     }
 
-    @Test("identityAttestDevice default throws descriptive error")
-    func identityAttestDeviceDefaultThrows() async throws {
-        let identity = MockIdentity(did: "did:dht:z6MkDefault", custodyType: "in_memory")
-
-        do {
-            _ = try await identityAttestDevice(identity)
-            Issue.record("Expected default to throw")
-        } catch let error as ScpError {
-            if case let .Identity(message, code) = error {
-                #expect(code == "SCP-IDENT-1010")
-                #expect(message.contains("not yet available"))
-            } else {
-                Issue.record("Expected ScpError.Identity, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
-        }
-    }
-
     @Test("identityVerifyDeviceAttestation calls bridge and returns result")
     func identityVerifyDeviceAttestationRoundtrip() async throws {
         var receivedDid: String?
@@ -252,25 +233,6 @@ struct IdentityTests {
         }
     }
 
-    @Test("identityVerifyDeviceAttestation default throws descriptive error")
-    func identityVerifyDeviceAttestationDefaultThrows() async throws {
-        do {
-            _ = try await identityVerifyDeviceAttestation(
-                did: "did:dht:z6MkDefault",
-                tokenBase64: "dGVzdA=="
-            )
-            Issue.record("Expected default to throw")
-        } catch let error as ScpError {
-            if case let .Identity(message, code) = error {
-                #expect(code == "SCP-IDENT-1012")
-                #expect(message.contains("not yet available"))
-            } else {
-                Issue.record("Expected ScpError.Identity, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
-        }
-    }
     // MARK: - Create Identity
 
     @Test("createIdentity calls bridge and returns identity")

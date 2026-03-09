@@ -138,30 +138,16 @@ enum ContextLifecycleBridge {
         await contextResetTtlTimer(handle: handle, newSeconds: newSeconds)
     }
 
-    /// Default export function.
-    ///
-    /// ``contextExport`` is not yet available in the UniFFI-generated bindings
-    /// (ScpBindings.swift). The default throws a descriptive error. Inject a
-    /// real closure in production once the UniFFI bridge is regenerated, or
-    /// in tests via the injectable parameter.
-    static let defaultExport: ExportFn = { _ in
-        throw ScpError.Context(
-            message: "contextExport is not yet available in the UniFFI-generated bindings. "
-                + "Regenerate ScpBindings.swift or inject a bridge function.",
-            code: "SCP-CTX-2030"
-        )
+    /// Default export function — delegates to UniFFI
+    /// ``contextExport(handle:)``.
+    static let defaultExport: ExportFn = { handle in
+        try await contextExport(handle: handle)
     }
 
-    /// Default import function.
-    ///
-    /// ``contextImport`` is not yet available in the UniFFI-generated bindings
-    /// (ScpBindings.swift). The default throws a descriptive error.
-    static let defaultImport: ImportFn = { _ in
-        throw ScpError.Context(
-            message: "contextImport is not yet available in the UniFFI-generated bindings. "
-                + "Regenerate ScpBindings.swift or inject a bridge function.",
-            code: "SCP-CTX-2032"
-        )
+    /// Default import function — delegates to UniFFI
+    /// ``contextImport(data:)``.
+    static let defaultImport: ImportFn = { data in
+        try await contextImport(data: data)
     }
 
     static let defaultRegisterLocalDid: RegisterLocalDidFn = { did in
@@ -172,20 +158,13 @@ enum ContextLifecycleBridge {
         await isLocalDid(did: did)
     }
 
-    /// Default verify participation requirements function.
+    /// Default verify participation requirements function — delegates to
+    /// UniFFI ``verifyParticipationRequirements(profileJson:requirementsJson:)``.
     ///
-    /// ``verifyParticipationRequirements`` is not yet available in the
-    /// UniFFI-generated bindings (ScpBindings.swift). The default throws
-    /// a descriptive error. Use the pure-Swift
-    /// ``verifyParticipationRequirements(requirement:profile:)`` in
-    /// Trust.swift for local verification.
-    static let defaultVerifyParticipationRequirements: VerifyParticipationRequirementsFn = { _, _ in
-        throw ScpError.Validation(
-            message: "verifyParticipationRequirements is not yet available in the UniFFI-generated "
-                + "bindings. Use the pure-Swift verifyParticipationRequirements(requirement:profile:) "
-                + "or regenerate ScpBindings.swift.",
-            code: "SCP-VALID-7030"
-        )
+    /// For a pure-Swift alternative using typed inputs, see
+    /// ``verifyParticipationRequirements(requirement:profile:)`` in Trust.swift.
+    static let defaultVerifyParticipationRequirements: VerifyParticipationRequirementsFn = { profileJson, requirementsJson in
+        try verifyParticipationRequirements(profileJson: profileJson, requirementsJson: requirementsJson)
     }
 }
 
