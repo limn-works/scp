@@ -671,19 +671,13 @@ pub fn ucan_validate(
     proof_tokens_json: Option<String>,
 ) -> Promise {
     if let Err(e) = validate_ucan_token(&token) {
-        return future_to_promise(async move {
-            Err(ScpWasmError::from(e).into_js().into())
-        });
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     if let Err(e) = validate_capability_uri(&capability) {
-        return future_to_promise(async move {
-            Err(ScpWasmError::from(e).into_js().into())
-        });
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     if let Err(e) = validate_did(&expected_aud_did) {
-        return future_to_promise(async move {
-            Err(ScpWasmError::from(e).into_js().into())
-        });
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     let context_id = context.context_id();
 
@@ -756,9 +750,7 @@ pub fn ucan_mint(
     capabilities_json: String,
 ) -> Promise {
     if let Err(e) = validate_did(&member_did) {
-        return future_to_promise(async move {
-            Err(ScpWasmError::from(e).into_js().into())
-        });
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     let context_id = context.context_id();
     future_to_promise(async move {

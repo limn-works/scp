@@ -2457,7 +2457,8 @@ mod tests {
         let recipient_public = X25519Pub::from(&recipient_secret);
 
         let (sealed, ephemeral_pub) =
-            hpke_seal_sender_key(&plaintext, &recipient_public.to_bytes(), ctx, sender, epoch).unwrap();
+            hpke_seal_sender_key(&plaintext, &recipient_public.to_bytes(), ctx, sender, epoch)
+                .unwrap();
 
         let ephemeral_key = X25519Pub::from(ephemeral_pub);
         let shared = recipient_secret.diffie_hellman(&ephemeral_key);
@@ -2482,7 +2483,8 @@ mod tests {
         let wrong_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
 
         let (sealed, ephemeral_pub) =
-            hpke_seal_sender_key(&plaintext, &recipient_public.to_bytes(), ctx, sender, epoch).unwrap();
+            hpke_seal_sender_key(&plaintext, &recipient_public.to_bytes(), ctx, sender, epoch)
+                .unwrap();
 
         let ephemeral_key = X25519Pub::from(ephemeral_pub);
         let shared = wrong_secret.diffie_hellman(&ephemeral_key);

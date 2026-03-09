@@ -9,7 +9,9 @@ use js_sys::Promise;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
-use scp_ffi_common::validate::{validate_did, validate_tool_id, validate_tool_name, validate_ucan_token};
+use scp_ffi_common::validate::{
+    validate_did, validate_tool_id, validate_tool_name, validate_ucan_token,
+};
 
 use crate::context::WasmContextHandle;
 use crate::error::ScpWasmError;
@@ -177,21 +179,15 @@ pub fn tool_invoke(
     ucan_token: Option<String>,
 ) -> Promise {
     if let Err(e) = validate_tool_id(&tool_id) {
-        return future_to_promise(async move {
-            Err(ScpWasmError::from(e).into_js().into())
-        });
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     if let Err(e) = validate_did(&identity_did) {
-        return future_to_promise(async move {
-            Err(ScpWasmError::from(e).into_js().into())
-        });
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     if let Some(ref token) = ucan_token
         && let Err(e) = validate_ucan_token(token)
     {
-        return future_to_promise(async move {
-            Err(ScpWasmError::from(e).into_js().into())
-        });
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     let context_id = context.context_id();
     future_to_promise(async move {
@@ -404,9 +400,8 @@ pub fn tool_session_invoke(
             .into());
         }
 
-        let tool_id_for_ucan =
-            with_manager(|mgr| mgr.session_tool_id(&context_id, &session_id))
-                .map_err(ScpWasmError::into_js)?;
+        let tool_id_for_ucan = with_manager(|mgr| mgr.session_tool_id(&context_id, &session_id))
+            .map_err(ScpWasmError::into_js)?;
 
         crate::ucan::validate_tool_ucan_wasm(
             &context_id,
@@ -416,9 +411,7 @@ pub fn tool_session_invoke(
         )
         .map_err(|e| {
             ScpWasmError::Permission {
-                message: format!(
-                    "UCAN authorization failed for tool '{tool_id_for_ucan}': {e}",
-                ),
+                message: format!("UCAN authorization failed for tool '{tool_id_for_ucan}': {e}",),
                 code: "SCP-PERM-3000".to_owned(),
             }
             .into_js()

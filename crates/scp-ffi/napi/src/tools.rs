@@ -9,7 +9,9 @@
 //! See ADR-022 in `.docs/adrs/phase-4.md`.
 
 use napi_derive::napi;
-use scp_ffi_common::validate::{validate_did, validate_tool_id, validate_tool_name, validate_ucan_token};
+use scp_ffi_common::validate::{
+    validate_did, validate_tool_id, validate_tool_name, validate_ucan_token,
+};
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;

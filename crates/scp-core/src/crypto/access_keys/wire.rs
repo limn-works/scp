@@ -315,8 +315,7 @@ pub fn handle_access_key_request(
         access_key.member_did(),
         access_key.epoch(),
     );
-    let (sealed, ephemeral_pub) =
-        hpke_seal(access_key.as_bytes(), &wrapping_bytes, &info, &aad)?;
+    let (sealed, ephemeral_pub) = hpke_seal(access_key.as_bytes(), &wrapping_bytes, &info, &aad)?;
 
     let response = AccessKeyResponse {
         context_id: access_key.context_id().to_owned(),
@@ -508,11 +507,7 @@ fn aes128gcm_encrypt(
 
 /// Decrypts AES-128-GCM ciphertext of the form `nonce || ciphertext || tag`,
 /// verifying `aad` as Additional Authenticated Data.
-fn aes128gcm_decrypt(
-    key: &[u8; 16],
-    sealed: &[u8],
-    aad: &[u8],
-) -> Result<Vec<u8>, AccessKeyError> {
+fn aes128gcm_decrypt(key: &[u8; 16], sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, AccessKeyError> {
     if sealed.len() < HPKE_NONCE_SIZE {
         return Err(AccessKeyError::HpkeDecryptionFailed(format!(
             "sealed data too short: {} bytes, minimum {HPKE_NONCE_SIZE}",
@@ -792,8 +787,13 @@ mod tests {
         let aad = build_hpke_aad("ctx-1", "did:dht:alice", 0);
 
         // Seal.
-        let (sealed, ephemeral_pub) =
-            hpke_seal(access_key.as_bytes(), &wrapping_public.to_bytes(), &info, &aad).unwrap();
+        let (sealed, ephemeral_pub) = hpke_seal(
+            access_key.as_bytes(),
+            &wrapping_public.to_bytes(),
+            &info,
+            &aad,
+        )
+        .unwrap();
 
         // Derive shared secret on the requester side.
         let ephemeral_key = X25519Pub::from(ephemeral_pub);

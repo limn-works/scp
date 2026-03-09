@@ -2856,7 +2856,8 @@ fn wasm_multi_proof_divergent_root_issuers_rejected() {
 #[test]
 fn wasm_and_core_revocation_cid_match_golden_value() {
     // Golden encoded token: a stable fake JWT string.
-    const GOLDEN_TOKEN: &str = "eyJhbGciOiJFZERTQSJ9.eyJpc3MiOiJkaWQ6ZGh0Ono2TWtHb2xkZW5UZXN0In0.dGVzdC1zaWc";
+    const GOLDEN_TOKEN: &str =
+        "eyJhbGciOiJFZERTQSJ9.eyJpc3MiOiJkaWQ6ZGh0Ono2TWtHb2xkZW5UZXN0In0.dGVzdC1zaWc";
 
     // --- Core computation ---
     let core_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(GOLDEN_TOKEN);
@@ -2865,8 +2866,16 @@ fn wasm_and_core_revocation_cid_match_golden_value() {
     let wasm_cid = wasm_ucan_mirror::compute_revocation_cid(GOLDEN_TOKEN);
 
     // Verify format: 64 hex chars.
-    assert_eq!(core_cid.len(), 64, "core revocation CID must be 64 hex chars");
-    assert_eq!(wasm_cid.len(), 64, "WASM revocation CID must be 64 hex chars");
+    assert_eq!(
+        core_cid.len(),
+        64,
+        "core revocation CID must be 64 hex chars"
+    );
+    assert_eq!(
+        wasm_cid.len(),
+        64,
+        "WASM revocation CID must be 64 hex chars"
+    );
 
     // --- Cross-check: core == WASM ---
     assert_eq!(
@@ -2888,9 +2897,18 @@ fn wasm_and_core_revocation_cid_different_tokens() {
     let wasm_a = wasm_ucan_mirror::compute_revocation_cid(token_a);
     let wasm_b = wasm_ucan_mirror::compute_revocation_cid(token_b);
 
-    assert_eq!(core_a, wasm_a, "core and WASM must agree on CID for token A");
-    assert_eq!(core_b, wasm_b, "core and WASM must agree on CID for token B");
-    assert_ne!(core_a, core_b, "different tokens must produce different CIDs");
+    assert_eq!(
+        core_a, wasm_a,
+        "core and WASM must agree on CID for token A"
+    );
+    assert_eq!(
+        core_b, wasm_b,
+        "core and WASM must agree on CID for token B"
+    );
+    assert_ne!(
+        core_a, core_b,
+        "different tokens must produce different CIDs"
+    );
 }
 
 /// Cross-bridge consistency: revocation CID from a round-tripped JWT.

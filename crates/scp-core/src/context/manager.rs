@@ -1709,9 +1709,9 @@ impl ContextManager {
         // Extract threshold signers and value from GovernanceModelConfig before
         // it is consumed by build_governance_engine (ADR-031).
         let (initial_threshold_signers, initial_threshold_value) = match &governance_config {
-            GovernanceModelConfig::Threshold { signers, threshold, .. } => {
-                (signers.clone(), *threshold)
-            }
+            GovernanceModelConfig::Threshold {
+                signers, threshold, ..
+            } => (signers.clone(), *threshold),
             _ => (Vec::new(), 0),
         };
 
@@ -4214,12 +4214,8 @@ impl ContextManager {
 
         // Respawn the TTL timer with the updated remaining duration.
         if let Some(secs) = new_remaining {
-            self.spawn_ttl_timer(
-                context_id,
-                std::time::Duration::from_secs(secs),
-                handle,
-            )
-            .await;
+            self.spawn_ttl_timer(context_id, std::time::Duration::from_secs(secs), handle)
+                .await;
         }
 
         self.persist_context_snapshot(context_id, &snapshot);
@@ -4801,13 +4797,17 @@ impl ContextManager {
             // historical content is suppressed and key requests return Deny.
             // FutureOnly scope: only block future writes via write_revoked_members.
             let bc_snap = match scope {
-                RevocationScope::Full => ctx.broadcast_context.as_mut().map(|bc| {
-                    match bc.block_author(&did.0) {
-                        Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
-                        Err(e) => return Err(e),
-                    }
-                    Ok(bc.to_snapshot())
-                }).transpose()?,
+                RevocationScope::Full => ctx
+                    .broadcast_context
+                    .as_mut()
+                    .map(|bc| {
+                        match bc.block_author(&did.0) {
+                            Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
+                            Err(e) => return Err(e),
+                        }
+                        Ok(bc.to_snapshot())
+                    })
+                    .transpose()?,
                 RevocationScope::FutureOnly => None,
             };
 

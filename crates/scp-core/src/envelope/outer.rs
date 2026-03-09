@@ -744,7 +744,16 @@ mod seal_open_tests {
         .unwrap();
 
         // Open (Bob receives) — no sender_public_key needed (SCP-177).
-        let recovered = open_envelope(&outer, &mut bob_group, &sender_key, &inner.context_id, &inner.sender_did, inner.epoch, inner.sequence).unwrap();
+        let recovered = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        )
+        .unwrap();
 
         // Verify all inner envelope fields match.
         assert_eq!(recovered.context_id, inner.context_id);
@@ -787,7 +796,16 @@ mod seal_open_tests {
             3600,
         )
         .unwrap();
-        let recovered = open_envelope(&outer, &mut bob_group, &sender_key, &inner.context_id, &inner.sender_did, inner.epoch, inner.sequence).unwrap();
+        let recovered = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        )
+        .unwrap();
 
         assert_eq!(recovered.provenance, Some(provenance));
         assert_eq!(recovered.provenance_hash, inner.provenance_hash);
@@ -817,7 +835,15 @@ mod seal_open_tests {
 
         // Previously OpenMLS panicked on AEAD decryption failure; the
         // catch_unwind guard now converts the panic to an error.
-        let result = open_envelope(&outer, &mut bob_group, &sender_key, &inner.context_id, &inner.sender_did, inner.epoch, inner.sequence);
+        let result = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        );
         assert!(
             result.is_err(),
             "open_envelope must reject tampered encrypted_blob"
@@ -883,7 +909,15 @@ mod seal_open_tests {
         )
         .unwrap();
 
-        let result = open_envelope(&outer, &mut bob_group, &sender_key, &inner.context_id, &inner.sender_did, inner.epoch, inner.sequence);
+        let result = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        );
         assert!(
             result.is_err(),
             "open_envelope must reject mismatched payload_hash"
@@ -926,7 +960,15 @@ mod seal_open_tests {
         )
         .unwrap();
 
-        let result = open_envelope(&outer, &mut bob_group, &sender_key, &inner.context_id, &inner.sender_did, inner.epoch, inner.sequence);
+        let result = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        );
         assert!(
             result.is_err(),
             "open_envelope must reject wrong sender public key"
@@ -957,11 +999,28 @@ mod seal_open_tests {
         .unwrap();
 
         // First open succeeds.
-        let _recovered = open_envelope(&outer, &mut bob_group, &sender_key, &inner.context_id, &inner.sender_did, inner.epoch, inner.sequence).unwrap();
+        let _recovered = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        )
+        .unwrap();
 
         // Second open with same ciphertext should fail (MLS generation
         // number replay prevention).
-        let replay_result = open_envelope(&outer, &mut bob_group, &sender_key, &inner.context_id, &inner.sender_did, inner.epoch, inner.sequence);
+        let replay_result = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        );
         assert!(
             replay_result.is_err(),
             "open_envelope must reject replayed ciphertext"
@@ -979,7 +1038,15 @@ mod seal_open_tests {
 
         // AAD values are irrelevant: MLS decrypt fails on garbage before
         // the sender key layer is reached.
-        let result = open_envelope(&outer, &mut bob_group, &sender_key, "ctx-1", "did:dht:z6MkDummy", 0, 0);
+        let result = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            "ctx-1",
+            "did:dht:z6MkDummy",
+            0,
+            0,
+        );
         assert!(
             result.is_err(),
             "open_envelope must reject garbage encrypted_blob"
@@ -1002,7 +1069,16 @@ mod seal_open_tests {
             3600,
         )
         .unwrap();
-        let recovered = open_envelope(&outer, &mut bob_group, &sender_key, &inner.context_id, &inner.sender_did, inner.epoch, inner.sequence).unwrap();
+        let recovered = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        )
+        .unwrap();
 
         let stripped = strip_padding(&recovered.payload).unwrap();
         assert!(stripped.is_empty(), "empty payload should roundtrip");
@@ -1041,7 +1117,16 @@ mod seal_open_tests {
         // Open all messages in order.
         for (i, outer) in outers.iter().enumerate() {
             let ref_inner = &inners[i];
-            let recovered = open_envelope(outer, &mut bob_group, &sender_key, &ref_inner.context_id, &ref_inner.sender_did, ref_inner.epoch, ref_inner.sequence).unwrap();
+            let recovered = open_envelope(
+                outer,
+                &mut bob_group,
+                &sender_key,
+                &ref_inner.context_id,
+                &ref_inner.sender_did,
+                ref_inner.epoch,
+                ref_inner.sequence,
+            )
+            .unwrap();
             let stripped = strip_padding(&recovered.payload).unwrap();
             assert_eq!(
                 stripped, messages[i],
@@ -1074,7 +1159,16 @@ mod seal_open_tests {
         .unwrap();
 
         // open_envelope resolves the sender key internally — no public key arg.
-        let recovered = open_envelope(&outer, &mut bob_group, &sender_key, &inner.context_id, &inner.sender_did, inner.epoch, inner.sequence).unwrap();
+        let recovered = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        )
+        .unwrap();
         let stripped = strip_padding(&recovered.payload).unwrap();
         assert_eq!(stripped, b"internally resolved key test");
     }
@@ -1126,7 +1220,15 @@ mod seal_open_tests {
         )
         .unwrap();
 
-        let result = open_envelope(&outer, &mut bob_group, &sender_key, &inner.context_id, &inner.sender_did, inner.epoch, inner.sequence);
+        let result = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        );
         assert!(
             result.is_err(),
             "open_envelope must reject unknown sender DID"
@@ -1167,7 +1269,15 @@ mod seal_open_tests {
 
         // Open with a different sender key — MLS decryption succeeds, but
         // sender key decryption must fail.
-        let result = open_envelope(&outer, &mut bob_group, &wrong_sender_key, &inner.context_id, &inner.sender_did, inner.epoch, inner.sequence);
+        let result = open_envelope(
+            &outer,
+            &mut bob_group,
+            &wrong_sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        );
         assert!(
             result.is_err(),
             "open_envelope must reject wrong sender key"
@@ -1201,7 +1311,15 @@ mod seal_open_tests {
         let serialized = rmp_serde::to_vec_named(&inner).unwrap();
 
         // Step 2: Encrypt with sender key.
-        let mut sender_encrypted = encrypt_sender_layer(&sender_key, &serialized, &inner.context_id, &inner.sender_did, inner.epoch, inner.sequence).unwrap();
+        let mut sender_encrypted = encrypt_sender_layer(
+            &sender_key,
+            &serialized,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        )
+        .unwrap();
 
         // Step 3: Tamper with the sender-key ciphertext (flip a byte in
         // the encrypted portion, after the 12-byte nonce).
@@ -1218,7 +1336,15 @@ mod seal_open_tests {
 
         // Step 6: Try to open — MLS decryption succeeds, but sender key
         // authentication tag verification must fail.
-        let result = open_envelope(&outer, &mut bob_group, &sender_key, &inner.context_id, &inner.sender_did, inner.epoch, inner.sequence);
+        let result = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        );
         assert!(
             result.is_err(),
             "open_envelope must reject tampered sender-key ciphertext"

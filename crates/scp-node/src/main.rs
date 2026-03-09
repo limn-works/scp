@@ -504,7 +504,9 @@ async fn blob_storage_from_env() -> BlobStorageBackend {
             BlobStorageBackend::in_memory()
         }
         other => {
-            eprintln!("error: unknown storage backend '{other}'. Valid options: {VALID_BLOB_BACKENDS}");
+            eprintln!(
+                "error: unknown storage backend '{other}'. Valid options: {VALID_BLOB_BACKENDS}"
+            );
             std::process::exit(1);
         }
     }

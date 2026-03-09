@@ -1536,7 +1536,8 @@ mod tests {
     #[test]
     fn revocation_cid_golden_value() {
         // Golden encoded token: a stable fake JWT string.
-        const GOLDEN_TOKEN: &str = "eyJhbGciOiJFZERTQSJ9.eyJpc3MiOiJkaWQ6ZGh0Ono2TWtHb2xkZW5UZXN0In0.dGVzdC1zaWc";
+        const GOLDEN_TOKEN: &str =
+            "eyJhbGciOiJFZERTQSJ9.eyJpc3MiOiJkaWQ6ZGh0Ono2TWtHb2xkZW5UZXN0In0.dGVzdC1zaWc";
 
         // Golden CID: SHA-256 hex of the raw JWT string above.
         //

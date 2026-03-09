@@ -584,11 +584,9 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })?;
 
         // Verify the request signature.
-        let valid = crate::crypto::sender_keys::verify_sender_key_request(
-            &request,
-            requester_public_key,
-        )
-        .map_err(|e| ContextError::CryptoFailed(format!("signature verification: {e}")))?;
+        let valid =
+            crate::crypto::sender_keys::verify_sender_key_request(&request, requester_public_key)
+                .map_err(|e| ContextError::CryptoFailed(format!("signature verification: {e}")))?;
         if !valid {
             return Err(ContextError::CryptoFailed(
                 "sender key request signature verification failed".to_string(),
@@ -618,10 +616,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             .map_err(|e| ContextError::CryptoFailed(format!("HPKE seal failed: {e}")))?;
 
         let sealed: [u8; 60] = sealed_vec.try_into().map_err(|v: Vec<u8>| {
-            ContextError::CryptoFailed(format!(
-                "HPKE seal produced {} bytes, expected 60",
-                v.len()
-            ))
+            ContextError::CryptoFailed(format!("HPKE seal produced {} bytes, expected 60", v.len()))
         })?;
 
         let response = SenderKeyResponse {
@@ -1193,8 +1188,7 @@ mod tests {
 
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
-        let (bob_kp_bundle, _bob_signer, _bob_provider) =
-            generate_key_package(&bob_cred).unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) = generate_key_package(&bob_cred).unwrap();
         let kp_bytes = bob_kp_bundle
             .key_package()
             .tls_serialize_detached()
@@ -1203,9 +1197,7 @@ mod tests {
             .add_member(&ctx_id, bob_did, Some(&kp_bytes))
             .unwrap();
 
-        provider
-            .distribute_sender_key(&ctx_id, bob_did)
-            .unwrap();
+        provider.distribute_sender_key(&ctx_id, bob_did).unwrap();
 
         {
             let contexts = provider.contexts.lock().unwrap();
@@ -1214,9 +1206,7 @@ mod tests {
             assert!(state.sender_key_store.get(&ctx_hex, TEST_DID).is_some());
         }
 
-        let pending = provider
-            .drain_pending_sender_key_messages(&ctx_id)
-            .unwrap();
+        let pending = provider.drain_pending_sender_key_messages(&ctx_id).unwrap();
         assert!(pending.is_empty());
     }
 
@@ -1235,12 +1225,11 @@ mod tests {
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
 
         let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
-        let (bob_kp_bundle, _bob_signer, _bob_mls) =
-            generate_key_package_with_wrapping_key(
-                &bob_cred,
-                Some(&bob_provider.wrapping_public_key),
-            )
-            .unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_mls) = generate_key_package_with_wrapping_key(
+            &bob_cred,
+            Some(&bob_provider.wrapping_public_key),
+        )
+        .unwrap();
         let kp_bytes = bob_kp_bundle
             .key_package()
             .tls_serialize_detached()
@@ -1287,17 +1276,13 @@ mod tests {
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
 
-        let pending = provider
-            .drain_pending_sender_key_messages(&ctx_id)
-            .unwrap();
+        let pending = provider.drain_pending_sender_key_messages(&ctx_id).unwrap();
         assert!(pending.is_empty());
 
         provider
             .distribute_sender_key(&ctx_id, "did:dht:z6MkBob")
             .unwrap();
-        let pending = provider
-            .drain_pending_sender_key_messages(&ctx_id)
-            .unwrap();
+        let pending = provider.drain_pending_sender_key_messages(&ctx_id).unwrap();
         assert!(pending.is_empty());
     }
 
@@ -1305,9 +1290,7 @@ mod tests {
     fn drain_pending_sender_key_messages_errors_without_context() {
         let provider = make_provider();
         let ctx_id = make_context_id();
-        assert!(provider
-            .drain_pending_sender_key_messages(&ctx_id)
-            .is_err());
+        assert!(provider.drain_pending_sender_key_messages(&ctx_id).is_err());
     }
 
     #[test]

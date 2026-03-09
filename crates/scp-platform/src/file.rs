@@ -382,7 +382,7 @@ impl FileKeyCustody {
         let _lock = self
             .file_write_lock
             .lock()
-            .expect("file write lock poisoned");
+            .map_err(|_| PlatformError::CustodyError("file write lock poisoned".into()))?;
         let mut data = self.read_file()?;
 
         // Read current entry count.

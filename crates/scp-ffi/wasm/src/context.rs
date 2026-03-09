@@ -204,9 +204,7 @@ impl WasmMessage {
 #[wasm_bindgen]
 pub fn context_create(identity_did: String, params_json: String) -> Promise {
     if let Err(e) = validate_did(&identity_did) {
-        return future_to_promise(async move {
-            Err(ScpWasmError::from(e).into_js().into())
-        });
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     future_to_promise(async move {
         let params: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
@@ -244,9 +242,7 @@ pub fn context_create(identity_did: String, params_json: String) -> Promise {
 #[wasm_bindgen]
 pub fn context_join(handle: &WasmContextHandle, identity_did: String) -> Promise {
     if let Err(e) = validate_did(&identity_did) {
-        return future_to_promise(async move {
-            Err(ScpWasmError::from(e).into_js().into())
-        });
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     let context_id = handle.context_id();
 
@@ -304,9 +300,7 @@ pub fn context_send(
     payload_base64: String,
 ) -> Promise {
     if let Err(e) = validate_did(&identity_did) {
-        return future_to_promise(async move {
-            Err(ScpWasmError::from(e).into_js().into())
-        });
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     let context_id = handle.context_id();
 
