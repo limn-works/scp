@@ -62,9 +62,11 @@ struct ConformanceTests {
             let encoded = input["encoded"] ?? ""
             let contextId = input["context_id"] ?? ""
             let presenterDid = input["presenter_did"] ?? ""
+            let handle = ContextHandle(noPointer: .init())
             do {
                 let result = try await validate(
                     encoded: encoded,
+                    handle: handle,
                     contextId: contextId,
                     presenterDid: presenterDid
                 )
@@ -81,8 +83,10 @@ struct ConformanceTests {
         case "ucan_mint":
             let issuer = input["issuer_did"] ?? ""
             let audience = input["audience_did"] ?? ""
+            let handle = ContextHandle(noPointer: .init())
             do {
                 let token = try await mint(
+                    handle: handle,
                     issuerDid: issuer,
                     audienceDid: audience,
                     capabilities: []
@@ -100,8 +104,9 @@ struct ConformanceTests {
         case "ucan_revoke":
             let encoded = input["encoded"] ?? ""
             let revoker = input["revoker_did"] ?? ""
+            let handle = ContextHandle(noPointer: .init())
             do {
-                try await revoke(encoded: encoded, revokerDid: revoker)
+                try await revoke(handle: handle, encoded: encoded, revokerDid: revoker)
                 return ["status": "revoked"]
             } catch let error as ScpError {
                 return ["error": errorCode(error)]

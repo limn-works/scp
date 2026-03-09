@@ -185,8 +185,8 @@ public func revokeUcanToken(
 
 /// Validates a UCAN token against the full 11-step validation pipeline.
 ///
-/// Legacy wrapper that creates a ``ContextHandle`` placeholder and delegates
-/// to ``validateUcanToken(handle:token:capability:validateFn:)``. Prefer the
+/// Legacy wrapper that delegates to
+/// ``validateUcanToken(handle:token:capability:validateFn:)``. Prefer the
 /// handle-based API for production use.
 ///
 /// ## Provenance
@@ -196,11 +196,11 @@ public func revokeUcanToken(
 /// - Story SCP-221
 public func validate(
     encoded: String,
+    handle: ContextHandle,
     contextId _: String,
     presenterDid: String,
     validateFn: UcanBridge.ValidateFn = UcanBridge.defaultValidate
 ) async throws -> UcanValidationResult {
-    let handle = ContextHandle(noPointer: .init())
     do {
         try await validateFn(handle, encoded, presenterDid, nil, nil)
         return UcanValidationResult(isValid: true, token: nil, failureReason: nil)
@@ -211,8 +211,8 @@ public func validate(
 
 /// Mints a new UCAN token with the specified capabilities.
 ///
-/// Legacy wrapper that creates a ``ContextHandle`` placeholder and delegates
-/// to ``mintUcanToken(handle:memberDid:capabilities:mintFn:)``. Prefer the
+/// Legacy wrapper that delegates to
+/// ``mintUcanToken(handle:memberDid:capabilities:mintFn:)``. Prefer the
 /// handle-based API for production use.
 ///
 /// ## Provenance
@@ -221,6 +221,7 @@ public func validate(
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
 /// - Story SCP-221
 public func mint(
+    handle: ContextHandle,
     issuerDid _: String,
     audienceDid: String,
     capabilities: [UcanCapability],
@@ -228,15 +229,14 @@ public func mint(
     proofs _: [String] = [],
     mintFn: UcanBridge.MintFn = UcanBridge.defaultMint
 ) async throws -> UcanToken {
-    let handle = ContextHandle(noPointer: .init())
     let capStrings = capabilities.map { "\($0.resource):\($0.action)" }
     return try await mintFn(handle, audienceDid, capStrings)
 }
 
 /// Revokes a UCAN token.
 ///
-/// Legacy wrapper that creates a ``ContextHandle`` placeholder and delegates
-/// to ``revokeUcanToken(handle:token:revokeFn:)``. Prefer the
+/// Legacy wrapper that delegates to
+/// ``revokeUcanToken(handle:token:revokeFn:)``. Prefer the
 /// handle-based API for production use.
 ///
 /// ## Provenance
@@ -245,10 +245,10 @@ public func mint(
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
 /// - Story SCP-221
 public func revoke(
+    handle: ContextHandle,
     encoded: String,
     revokerDid _: String,
     revokeFn: UcanBridge.RevokeFn = UcanBridge.defaultRevoke
 ) async throws {
-    let handle = ContextHandle(noPointer: .init())
     try await revokeFn(handle, encoded)
 }
