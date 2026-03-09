@@ -38,7 +38,7 @@ interface BridgeConnectorBindings {
      * @param contextId The context to register in.
      * @param operatorDid DID of the bridge operator.
      * @param platform Platform identifier (e.g., "slack", "discord").
-     * @param mode Bridge mode: "relay" or "proxy".
+     * @param mode Bridge mode: "relay", "puppet", "api", or "cooperative".
      * @return JSON string with the registration result.
      */
     fun bridgeRegister(
@@ -53,7 +53,7 @@ interface BridgeConnectorBindings {
      *
      * @param bridgeId The bridge connector ID.
      * @param platformHandle The participant's handle on the bridged platform.
-     * @param bridgeMode Bridge mode: "relay" or "proxy".
+     * @param bridgeMode Bridge mode: "relay", "puppet", "api", or "cooperative".
      * @param contextId The context the shadow will participate in.
      * @return JSON string with the shadow identity details.
      */
@@ -86,6 +86,25 @@ class BridgeConnectorBridge internal constructor(
      *
      * @param isBridged Whether the action originates from a bridge.
      * @param isNativeTransport Whether native SCP transport is used.
+     * @param shadowStatus Shadow provenance status.
+     * @return Trust tier integer (0-3).
+     */
+    suspend fun evaluateTrust(
+        isBridged: Boolean,
+        isNativeTransport: Boolean,
+        shadowStatus: ShadowStatus,
+    ): Int =
+        bridge.ffiCall {
+            bindings.bridgeEvaluateTrust(isBridged, isNativeTransport, shadowStatus.rawValue)
+        }
+
+    /**
+     * Evaluates the trust level for an action based on bridge provenance.
+     *
+     * Overload accepting a raw string for backward compatibility.
+     *
+     * @param isBridged Whether the action originates from a bridge.
+     * @param isNativeTransport Whether native SCP transport is used.
      * @param shadowStatus Shadow provenance status: "shadow" or "claimed".
      * @return Trust tier integer (0-3).
      */
@@ -104,7 +123,28 @@ class BridgeConnectorBridge internal constructor(
      * @param contextId The context to register in.
      * @param operatorDid DID of the bridge operator.
      * @param platform Platform identifier (e.g., "slack", "discord").
-     * @param mode Bridge mode: "relay" or "proxy".
+     * @param mode Bridge mode.
+     * @return JSON string with the registration result.
+     */
+    suspend fun register(
+        contextId: String,
+        operatorDid: String,
+        platform: String,
+        mode: BridgeMode,
+    ): String =
+        bridge.ffiCall {
+            bindings.bridgeRegister(contextId, operatorDid, platform, mode.rawValue)
+        }
+
+    /**
+     * Registers a bridge connector with a context.
+     *
+     * Overload accepting a raw string for backward compatibility.
+     *
+     * @param contextId The context to register in.
+     * @param operatorDid DID of the bridge operator.
+     * @param platform Platform identifier (e.g., "slack", "discord").
+     * @param mode Bridge mode: "relay", "puppet", "api", or "cooperative".
      * @return JSON string with the registration result.
      */
     suspend fun register(
@@ -122,7 +162,28 @@ class BridgeConnectorBridge internal constructor(
      *
      * @param bridgeId The bridge connector ID.
      * @param platformHandle The participant's handle on the bridged platform.
-     * @param bridgeMode Bridge mode: "relay" or "proxy".
+     * @param bridgeMode Bridge mode.
+     * @param contextId The context the shadow will participate in.
+     * @return JSON string with the shadow identity details.
+     */
+    suspend fun createShadow(
+        bridgeId: String,
+        platformHandle: String,
+        bridgeMode: BridgeMode,
+        contextId: String,
+    ): String =
+        bridge.ffiCall {
+            bindings.bridgeCreateShadow(bridgeId, platformHandle, bridgeMode.rawValue, contextId)
+        }
+
+    /**
+     * Creates a shadow identity for a bridged participant.
+     *
+     * Overload accepting a raw string for backward compatibility.
+     *
+     * @param bridgeId The bridge connector ID.
+     * @param platformHandle The participant's handle on the bridged platform.
+     * @param bridgeMode Bridge mode: "relay", "puppet", "api", or "cooperative".
      * @param contextId The context the shadow will participate in.
      * @return JSON string with the shadow identity details.
      */

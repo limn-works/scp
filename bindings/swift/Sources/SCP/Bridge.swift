@@ -21,8 +21,13 @@ public nonisolated struct BridgeRegistrationResult: Sendable {
     /// External platform name (e.g., "discord", "slack").
     public let platform: String
 
-    /// Bridge operating mode: "relay", "puppet", "api", or "cooperative".
+    /// Bridge operating mode.
     public let mode: String
+
+    /// Typed bridge mode, or `nil` if the raw string is unrecognized.
+    public var bridgeMode: BridgeMode? {
+        BridgeMode(rawValue: mode)
+    }
 
     /// Bridge status after registration (e.g., "active").
     public let status: String
@@ -77,6 +82,11 @@ public nonisolated struct ShadowIdentityResult: Sendable {
 
     /// Provenance status: "Shadow" or "Claimed".
     public let provenanceStatus: String
+
+    /// Typed shadow status, or `nil` if the raw string is unrecognized.
+    public var typedShadowStatus: ShadowStatus? {
+        ShadowStatus(rawValue: provenanceStatus.lowercased())
+    }
 
     /// Memberwise initializer.
     public init(
@@ -255,4 +265,73 @@ public func bridgeCreateShadow(
     createShadowFn: BridgeConnectorBridge.CreateShadowFn = BridgeConnectorBridge.defaultCreateShadow
 ) throws -> ShadowIdentityResult {
     try createShadowFn(bridgeId, platformHandle, bridgeMode, contextId)
+}
+
+// MARK: - Typed overloads
+
+/// Evaluates bridge trust using typed ``ShadowStatus``.
+///
+/// Convenience overload that accepts a ``ShadowStatus`` enum value
+/// instead of a raw string.
+///
+/// - Parameters:
+///   - isBridged: Whether the action originates from a bridge.
+///   - isNativeTransport: Whether native SCP transport is used.
+///   - shadowStatus: Shadow provenance status.
+///   - evaluateTrustFn: Bridge function override for testing.
+/// - Returns: Trust tier integer (0-3).
+/// - Throws: ``ScpError/Validation(message:code:)`` if evaluation fails.
+public func evaluateBridgeTrust(
+    isBridged: Bool,
+    isNativeTransport: Bool,
+    shadowStatus: ShadowStatus,
+    evaluateTrustFn: BridgeConnectorBridge.EvaluateTrustFn = BridgeConnectorBridge.defaultEvaluateTrust
+) throws -> UInt8 {
+    try evaluateTrustFn(isBridged, isNativeTransport, shadowStatus.rawValue)
+}
+
+/// Registers a bridge connector using typed ``BridgeMode``.
+///
+/// Convenience overload that accepts a ``BridgeMode`` enum value
+/// instead of a raw string.
+///
+/// - Parameters:
+///   - contextId: The context to register the bridge in.
+///   - operatorDid: DID of the human operator accountable for the bridge.
+///   - platform: External platform name (e.g., `"discord"`, `"slack"`).
+///   - mode: Bridge mode.
+///   - registerFn: Bridge function override for testing.
+/// - Returns: A ``BridgeRegistrationResult`` with the registration details.
+/// - Throws: ``ScpError`` if registration fails.
+public func bridgeRegister(
+    contextId: String,
+    operatorDid: String,
+    platform: String,
+    mode: BridgeMode,
+    registerFn: BridgeConnectorBridge.RegisterFn = BridgeConnectorBridge.defaultRegister
+) throws -> BridgeRegistrationResult {
+    try registerFn(contextId, operatorDid, platform, mode.rawValue)
+}
+
+/// Creates a shadow identity using typed ``BridgeMode``.
+///
+/// Convenience overload that accepts a ``BridgeMode`` enum value
+/// instead of a raw string.
+///
+/// - Parameters:
+///   - bridgeId: The bridge connector ID that owns this shadow.
+///   - platformHandle: External platform handle (e.g., `"@user#1234"`).
+///   - bridgeMode: Bridge mode.
+///   - contextId: Context the shadow is being created in.
+///   - createShadowFn: Bridge function override for testing.
+/// - Returns: A ``ShadowIdentityResult`` with the shadow identity details.
+/// - Throws: ``ScpError`` if shadow creation fails.
+public func bridgeCreateShadow(
+    bridgeId: String,
+    platformHandle: String,
+    bridgeMode: BridgeMode,
+    contextId: String,
+    createShadowFn: BridgeConnectorBridge.CreateShadowFn = BridgeConnectorBridge.defaultCreateShadow
+) throws -> ShadowIdentityResult {
+    try createShadowFn(bridgeId, platformHandle, bridgeMode.rawValue, contextId)
 }

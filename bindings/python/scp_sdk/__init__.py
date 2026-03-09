@@ -89,9 +89,11 @@ from scp_sdk.trust import (
     verify_participation_requirements,
 )
 from scp_sdk.types import (
+    BridgeMode,
     Capability,
     CeilingPolicy,
     ContextMode,
+    CustodyType,
     DiscoveryMethod,
     MemberRole,
     MemoryScope,
@@ -99,6 +101,7 @@ from scp_sdk.types import (
     PromotionPolicy,
     Provenance,
     ProvenanceQuality,
+    ShadowStatus,
     SourceType,
 )
 from scp_sdk.ucan import UcanToken, delegate, mint, revoke, validate
@@ -109,6 +112,7 @@ __all__ = [
     "BRIDGE_ERROR_MAP",
     "Attestation",
     "BehavioralRecord",
+    "BridgeMode",
     "Capability",
     "CapabilityValidation",
     "CeilingPolicy",
@@ -118,6 +122,7 @@ __all__ = [
     "ContextError",
     "ContextMode",
     "CryptoError",
+    "CustodyType",
     "DIDDocument",
     "DiscoveryMethod",
     "Endorsement",
@@ -144,6 +149,7 @@ __all__ = [
     "ProvenanceQuality",
     "RequireParticipation",
     "ScpError",
+    "ShadowStatus",
     "SourceType",
     "TestVector",
     "ToolDefinition",

@@ -490,7 +490,18 @@ class IdentityBridge internal constructor(
     /**
      * Create a new identity with the specified custody method.
      *
-     * @param custody Key custody method: "platform" or "in_memory".
+     * @param custody Key custody method.
+     * @return Opaque identity handle for use in subsequent operations.
+     */
+    suspend fun create(custody: com.limn.scp.CustodyType): Long =
+        bridge.ffiCall { bindings.identityCreate(custody.rawValue) }
+
+    /**
+     * Create a new identity with the specified custody method.
+     *
+     * Overload accepting a raw string for backward compatibility.
+     *
+     * @param custody Key custody method: "platform", "in_memory", or "software".
      * @return Opaque identity handle for use in subsequent operations.
      */
     suspend fun create(custody: String): Long = bridge.ffiCall { bindings.identityCreate(custody) }

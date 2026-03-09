@@ -25,7 +25,7 @@ interface IdentityAdvancedBindings {
      * Combines identity creation with immediate agent key generation
      * in a single operation.
      *
-     * @param custody Key custody method: "in_memory" or "platform".
+     * @param custody Key custody method: "in_memory", "platform", or "software".
      * @return Opaque identity handle with agent key.
      * @throws BridgeException if custody method is unsupported or creation fails.
      */
@@ -111,7 +111,18 @@ class IdentityAdvancedBridge internal constructor(
     /**
      * Creates a new identity with an agent signing key (ADR-039).
      *
-     * @param custody Key custody method: "in_memory" or "platform".
+     * @param custody Key custody method.
+     * @return Opaque identity handle with agent key.
+     */
+    suspend fun createWithAgentKey(custody: CustodyType): Long =
+        bridge.ffiCall { bindings.identityCreateWithAgentKey(custody.rawValue) }
+
+    /**
+     * Creates a new identity with an agent signing key (ADR-039).
+     *
+     * Overload accepting a raw string for backward compatibility.
+     *
+     * @param custody Key custody method: "in_memory", "platform", or "software".
      * @return Opaque identity handle with agent key.
      */
     suspend fun createWithAgentKey(custody: String = "in_memory"): Long =

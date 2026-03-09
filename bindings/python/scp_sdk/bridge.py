@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Any
 
 from scp_sdk.errors import ScpError
+from scp_sdk.types import BridgeMode, ShadowStatus
 
 
 def _bridge() -> Any:
@@ -34,7 +35,7 @@ def register(
     context_id: str,
     operator_did: str,
     platform: str,
-    mode: str,
+    mode: BridgeMode | str,
 ) -> dict[str, Any]:
     """Register a bridge connector with a context.
 
@@ -44,8 +45,9 @@ def register(
         context_id: Context to register the bridge in.
         operator_did: DID of the human operator accountable for the bridge.
         platform: External platform name (e.g., ``"discord"``, ``"slack"``).
-        mode: Bridge mode: ``"relay"``, ``"puppet"``, ``"api"``, or
-            ``"cooperative"``.
+        mode: Bridge mode.  Accepts a :class:`~scp_sdk.types.BridgeMode`
+            enum member or a raw string (``"relay"``, ``"puppet"``,
+            ``"api"``, or ``"cooperative"``).
 
     Returns:
         A dict with ``bridge_id``, ``operator_did``, ``platform``,
@@ -56,14 +58,15 @@ def register(
         ContextError: If registration fails.
     """
     bridge = _bridge()
-    return dict(bridge.bridge_register(context_id, operator_did, platform, mode))
+    mode_str = mode.value if isinstance(mode, BridgeMode) else mode
+    return dict(bridge.bridge_register(context_id, operator_did, platform, mode_str))
 
 
 def evaluate_trust(
     *,
     is_bridged: bool = False,
     is_native_transport: bool = True,
-    shadow_status: str = "shadow",
+    shadow_status: ShadowStatus | str = ShadowStatus.SHADOW,
 ) -> int:
     """Evaluate the trust level for an action based on bridge provenance.
 
@@ -77,7 +80,10 @@ def evaluate_trust(
     Args:
         is_bridged: Whether the action has bridge provenance.
         is_native_transport: Whether the transport is native SCP.
-        shadow_status: ``"shadow"`` or ``"claimed"`` (only if *is_bridged*).
+        shadow_status: Shadow provenance status.  Accepts a
+            :class:`~scp_sdk.types.ShadowStatus` enum member or a raw
+            string (``"shadow"`` or ``"claimed"``).  Only meaningful
+            when *is_bridged* is ``True``.
 
     Returns:
         Trust tier as an integer (0--3).
@@ -86,13 +92,14 @@ def evaluate_trust(
         ValidationError: If *shadow_status* is invalid.
     """
     bridge = _bridge()
-    return bridge.bridge_evaluate_trust(is_bridged, is_native_transport, shadow_status)
+    status_str = shadow_status.value if isinstance(shadow_status, ShadowStatus) else shadow_status
+    return bridge.bridge_evaluate_trust(is_bridged, is_native_transport, status_str)
 
 
 def create_shadow(
     bridge_id: str,
     platform_handle: str,
-    bridge_mode: str,
+    bridge_mode: BridgeMode | str,
     context_id: str = "ctx-shadow",
 ) -> dict[str, Any]:
     """Create a shadow identity for an external platform participant.
@@ -100,8 +107,10 @@ def create_shadow(
     Args:
         bridge_id: The bridge connector ID that owns this shadow.
         platform_handle: External platform handle (e.g., ``"@user#1234"``).
-        bridge_mode: Bridge mode: ``"relay"``, ``"puppet"``, ``"api"``, or
-            ``"cooperative"``.
+        bridge_mode: Bridge mode.  Accepts a
+            :class:`~scp_sdk.types.BridgeMode` enum member or a raw
+            string (``"relay"``, ``"puppet"``, ``"api"``, or
+            ``"cooperative"``).
         context_id: Context the shadow is being created in.
 
     Returns:
@@ -113,7 +122,8 @@ def create_shadow(
         ContextError: If shadow creation fails.
     """
     bridge = _bridge()
-    return dict(bridge.bridge_create_shadow(bridge_id, platform_handle, bridge_mode, context_id))
+    mode_str = bridge_mode.value if isinstance(bridge_mode, BridgeMode) else bridge_mode
+    return dict(bridge.bridge_create_shadow(bridge_id, platform_handle, mode_str, context_id))
 
 
 __all__ = [

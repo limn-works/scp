@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from scp_sdk.sync import run_sync
+from scp_sdk.types import CustodyType
 
 if TYPE_CHECKING:
     import _scp_core  # noqa: F401
@@ -111,24 +112,38 @@ class Identity:
         return self._handle.did
 
     @property
-    def custody_type(self) -> str:
-        """The custody type used for this identity (e.g. ``"platform"``)."""
-        return self._handle.custody
+    def custody_type(self) -> CustodyType | str:
+        """The custody type used for this identity.
+
+        Returns a :class:`~scp_sdk.types.CustodyType` enum member when
+        the value matches a known variant, otherwise the raw string.
+        """
+        raw = self._handle.custody
+        try:
+            return CustodyType(raw)
+        except ValueError:
+            return raw
 
     # -- Async factory methods -----------------------------------------------
 
     @classmethod
-    async def create(cls, custody: str = "platform") -> Identity:
+    async def create(cls, custody: CustodyType | str = CustodyType.PLATFORM) -> Identity:
         """Create a new SCP identity with the specified key custody method.
 
         Args:
-            custody: Key custody type.  Valid values:
+            custody: Key custody type.  Accepts a
+                :class:`~scp_sdk.types.CustodyType` enum member or a raw
+                string.  Valid values:
 
-                - ``"platform"`` (default) -- platform-native secure
-                  storage (Keychain on macOS/iOS, Keystore on Android,
-                  credential manager on Windows/Linux).
-                - ``"in_memory"`` -- ephemeral in-memory key store,
-                  suitable for testing or short-lived agents.
+                - :attr:`CustodyType.PLATFORM` / ``"platform"``
+                  (default) -- platform-native secure storage (Keychain
+                  on macOS/iOS, Keystore on Android, credential manager
+                  on Windows/Linux).
+                - :attr:`CustodyType.IN_MEMORY` / ``"in_memory"`` --
+                  ephemeral in-memory key store, suitable for testing or
+                  short-lived agents.
+                - :attr:`CustodyType.SOFTWARE` / ``"software"`` --
+                  software-backed file-based key store.
 
         Returns:
             A new :class:`Identity` instance.
@@ -140,7 +155,8 @@ class Identity:
         """
         import _scp_core
 
-        handle = _scp_core.py_identity_create(custody)
+        custody_str = custody.value if isinstance(custody, CustodyType) else custody
+        handle = _scp_core.py_identity_create(custody_str)
         return cls(handle)
 
     @classmethod
@@ -165,7 +181,7 @@ class Identity:
     # -- Sync convenience wrappers -------------------------------------------
 
     @classmethod
-    def create_sync(cls, custody: str = "platform") -> Identity:
+    def create_sync(cls, custody: CustodyType | str = CustodyType.PLATFORM) -> Identity:
         """Synchronous convenience wrapper for :meth:`create`.
 
         Uses :func:`scp_sdk.sync.run_sync` with a dedicated background
@@ -187,14 +203,19 @@ class Identity:
     # -- Async instance methods ----------------------------------------------
 
     @classmethod
-    async def create_with_agent_key(cls, custody: str = "platform") -> Identity:
+    async def create_with_agent_key(
+        cls, custody: CustodyType | str = CustodyType.PLATFORM
+    ) -> Identity:
         """Create a new SCP identity with an agent signing key (ADR-039).
 
         Creates a DID identity with both the standard signing key and an
         ``#agent`` verification method in the DID document.
 
         Args:
-            custody: Key custody type (``"platform"`` or ``"in_memory"``).
+            custody: Key custody type.  Accepts a
+                :class:`~scp_sdk.types.CustodyType` enum member or a
+                raw string (``"platform"``, ``"in_memory"``,
+                ``"software"``).
 
         Returns:
             A new :class:`Identity` instance with an agent key.
@@ -204,7 +225,8 @@ class Identity:
         """
         import _scp_core
 
-        handle = _scp_core.py_identity_create_with_agent_key(custody)
+        custody_str = custody.value if isinstance(custody, CustodyType) else custody
+        handle = _scp_core.py_identity_create_with_agent_key(custody_str)
         return cls(handle)
 
     async def add_agent_key(self) -> Identity:
