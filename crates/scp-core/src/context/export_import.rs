@@ -187,15 +187,19 @@ pub fn verify_merkle_chain(event_log_data: &[u8]) -> Result<[u8; 32], ContextErr
 
 /// Computes the SHA-256 hash for an event log entry.
 ///
-/// Hash input: `event_bytes || timestamp_le_bytes || prev_hash`
+/// Hash input: `"SCP-EXPORT-ENTRY-V1:" || event_bytes || timestamp_be_bytes || prev_hash`
+///
+/// Uses big-endian for the timestamp to match codebase convention, and a
+/// domain separator to prevent cross-protocol hash confusion.
 ///
 /// This must be identical to
 /// [`providers::event_log::compute_entry_hash`](super::providers::event_log)
 /// to ensure verification produces the same hashes.
 fn compute_entry_hash(event: &str, timestamp: u64, prev_hash: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
+    hasher.update(b"SCP-EXPORT-ENTRY-V1:");
     hasher.update(event.as_bytes());
-    hasher.update(timestamp.to_le_bytes());
+    hasher.update(timestamp.to_be_bytes());
     hasher.update(prev_hash);
     let result = hasher.finalize();
     let mut hash = [0u8; 32];

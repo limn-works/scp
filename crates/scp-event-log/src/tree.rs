@@ -448,7 +448,7 @@ fn extract_public_key_from_did(did: &str) -> Result<[u8; 32], String> {
 /// storage this full recomputation is acceptable and simpler to reason about.
 ///
 /// RFC 6962 structure: if a layer has an odd number of nodes, the last node
-/// is promoted (hashed with itself) to produce the parent.
+/// is promoted directly to the next level (not hashed with itself).
 fn recompute_tree(log: &mut EventLog) {
     log.tree.clear();
 
@@ -470,8 +470,8 @@ fn recompute_tree(log: &mut EventLog) {
                 // Hash pair: SHA-256(0x01 || left || right)
                 parents.push(hash_pair(&current_layer[i], &current_layer[i + 1]));
             } else {
-                // Odd node: promote by hashing with itself per RFC 6962.
-                parents.push(hash_pair(&current_layer[i], &current_layer[i]));
+                // Odd node: promote directly to the next level per RFC 6962.
+                parents.push(current_layer[i]);
             }
             i += 2;
         }
@@ -932,7 +932,8 @@ mod tests {
                 if i + 1 < current.len() {
                     next.push(hash_pair(&current[i], &current[i + 1]));
                 } else {
-                    next.push(hash_pair(&current[i], &current[i]));
+                    // Odd node: promote directly per RFC 6962.
+                    next.push(current[i]);
                 }
                 i += 2;
             }

@@ -145,28 +145,31 @@ impl Capability {
     }
 
     /// Returns the canonical string name of this capability.
+    ///
+    /// For [`ToolInvoke`](Self::ToolInvoke) variants, includes the tool ID
+    /// (e.g. `"tool:invoke:my_tool"`), matching the [`Display`] impl.
     #[must_use]
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> std::borrow::Cow<'_, str> {
         match self {
-            Self::MessagesRead => "messages:read",
-            Self::MessagesWrite => "messages:write",
-            Self::ToolInvoke(_) => "tool:invoke",
-            Self::ToolInvokeAll => "tool:invoke:*",
-            Self::ToolRegister => "tool:register",
-            Self::MemberInvite => "member:invite",
-            Self::MemberRemove => "member:remove",
-            Self::RoleAssign => "role:assign",
-            Self::GovernancePropose => "governance:propose",
-            Self::GovernanceVote => "governance:vote",
-            Self::ContextClose => "context:close",
-            Self::ChildContextCreate => "context:child:create",
-            Self::ToolInterface => "tool:interface",
-            Self::Bridging => "bridging",
-            Self::MediaVoice => "media:voice",
-            Self::MediaVideo => "media:video",
-            Self::MediaScreenShare => "media:screen_share",
-            Self::MemberBan => "member:ban",
-            Self::Custom(name) => name,
+            Self::MessagesRead => std::borrow::Cow::Borrowed("messages:read"),
+            Self::MessagesWrite => std::borrow::Cow::Borrowed("messages:write"),
+            Self::ToolInvoke(id) => std::borrow::Cow::Owned(format!("tool:invoke:{id}")),
+            Self::ToolInvokeAll => std::borrow::Cow::Borrowed("tool:invoke:*"),
+            Self::ToolRegister => std::borrow::Cow::Borrowed("tool:register"),
+            Self::MemberInvite => std::borrow::Cow::Borrowed("member:invite"),
+            Self::MemberRemove => std::borrow::Cow::Borrowed("member:remove"),
+            Self::RoleAssign => std::borrow::Cow::Borrowed("role:assign"),
+            Self::GovernancePropose => std::borrow::Cow::Borrowed("governance:propose"),
+            Self::GovernanceVote => std::borrow::Cow::Borrowed("governance:vote"),
+            Self::ContextClose => std::borrow::Cow::Borrowed("context:close"),
+            Self::ChildContextCreate => std::borrow::Cow::Borrowed("context:child:create"),
+            Self::ToolInterface => std::borrow::Cow::Borrowed("tool:interface"),
+            Self::Bridging => std::borrow::Cow::Borrowed("bridging"),
+            Self::MediaVoice => std::borrow::Cow::Borrowed("media:voice"),
+            Self::MediaVideo => std::borrow::Cow::Borrowed("media:video"),
+            Self::MediaScreenShare => std::borrow::Cow::Borrowed("media:screen_share"),
+            Self::MemberBan => std::borrow::Cow::Borrowed("member:ban"),
+            Self::Custom(name) => std::borrow::Cow::Borrowed(name.as_str()),
         }
     }
 }

@@ -21,6 +21,7 @@
 //! - [`padding`] — Bucket padding: [`pad_to_bucket`], [`strip_padding`].
 //! - [`pseudonym`] — Per-context pseudonym derivation via [`derive_pseudonym`].
 
+pub mod chunk;
 pub mod inner;
 pub mod outer;
 pub mod padding;

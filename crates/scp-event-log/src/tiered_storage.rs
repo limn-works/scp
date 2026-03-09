@@ -586,15 +586,16 @@ fn compute_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
 
         let mut i = 0;
         while i < current.len() {
-            let mut hasher = Sha256::new();
-            hasher.update([0x01]);
-            hasher.update(current[i]);
             if i + 1 < current.len() {
-                hasher.update(current[i + 1]);
-            } else {
+                let mut hasher = Sha256::new();
+                hasher.update([0x01]);
                 hasher.update(current[i]);
+                hasher.update(current[i + 1]);
+                parents.push(hasher.finalize().into());
+            } else {
+                // Odd node: promote directly to next level per RFC 6962.
+                parents.push(current[i]);
             }
-            parents.push(hasher.finalize().into());
             i += 2;
         }
 
@@ -904,13 +905,10 @@ mod tests {
                     sibling_hash: current_layer[sibling_idx],
                     direction,
                 });
-            } else {
-                // Odd node: sibling is itself (promoted).
-                path.push(ProofStep {
-                    sibling_hash: current_layer[idx],
-                    direction: Direction::Right,
-                });
             }
+            // Odd node: no sibling step needed -- node is promoted directly
+            // per RFC 6962. The verifier will see the parent is the node
+            // itself (no hash_pair involved).
 
             // Compute the next layer.
             let parent_count = current_layer.len().div_ceil(2);
@@ -924,11 +922,8 @@ mod tests {
                     hasher.update(current_layer[i + 1]);
                     parents.push(hasher.finalize().into());
                 } else {
-                    let mut hasher = Sha256::new();
-                    hasher.update([0x01]);
-                    hasher.update(current_layer[i]);
-                    hasher.update(current_layer[i]);
-                    parents.push(hasher.finalize().into());
+                    // Odd node: promote directly per RFC 6962.
+                    parents.push(current_layer[i]);
                 }
                 i += 2;
             }

@@ -1001,13 +1001,9 @@ fn build_proof_path(
             sibling_hash: leaves[sibling_idx],
             direction,
         });
-    } else {
-        // Odd node at the end: sibling is itself (promoted).
-        path.push(ProofStep {
-            sibling_hash: leaves[idx],
-            direction: Direction::Right,
-        });
     }
+    // Odd node at the end: no proof step needed -- node is promoted
+    // directly to the next level per RFC 6962.
 
     idx /= 2;
 
@@ -1024,12 +1020,8 @@ fn build_proof_path(
                 sibling_hash: layer[sibling_idx],
                 direction,
             });
-        } else {
-            path.push(ProofStep {
-                sibling_hash: layer[idx],
-                direction: Direction::Right,
-            });
         }
+        // Odd node: no proof step needed -- promoted directly per RFC 6962.
         idx /= 2;
     }
 
@@ -1058,7 +1050,8 @@ fn recompute_tree_from_leaves(leaves: &[[u8; 32]]) -> Vec<Vec<[u8; 32]>> {
             if i + 1 < current.len() {
                 parents.push(hash_pair(&current[i], &current[i + 1]));
             } else {
-                parents.push(hash_pair(&current[i], &current[i]));
+                // Odd node: promote directly per RFC 6962.
+                parents.push(current[i]);
             }
             i += 2;
         }

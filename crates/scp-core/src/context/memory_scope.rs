@@ -249,15 +249,34 @@ impl PublishableKeyDestructionAttestation {
 
     /// Returns the signing payload for this attestation.
     ///
-    /// The payload is: `context_id || member_did || destroyed_at (8 bytes
-    /// big-endian) || method ("HardwareBacked" or "SoftwareOnly")`.
+    /// The payload is length-prefixed to prevent field-boundary ambiguity:
+    /// ```text
+    /// "SCP-KEY-DESTRUCTION-V1:"
+    ///   || len(context_id) (4 bytes BE) || context_id
+    ///   || len(member_did) (4 bytes BE) || member_did
+    ///   || destroyed_at (8 bytes BE)
+    ///   || len(method) (4 bytes BE) || method
+    /// ```
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn signing_payload(&self) -> Vec<u8> {
         let mut payload = Vec::new();
-        payload.extend_from_slice(self.context_id.as_bytes());
-        payload.extend_from_slice(self.member_did.as_bytes());
+        payload.extend_from_slice(b"SCP-KEY-DESTRUCTION-V1:");
+
+        let ctx_bytes = self.context_id.as_bytes();
+        payload.extend_from_slice(&(ctx_bytes.len() as u32).to_be_bytes());
+        payload.extend_from_slice(ctx_bytes);
+
+        let did_bytes = self.member_did.as_bytes();
+        payload.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
+        payload.extend_from_slice(did_bytes);
+
         payload.extend_from_slice(&self.destroyed_at.to_be_bytes());
-        payload.extend_from_slice(self.method.to_string().as_bytes());
+
+        let method_str = self.method.to_string();
+        let method_bytes = method_str.as_bytes();
+        payload.extend_from_slice(&(method_bytes.len() as u32).to_be_bytes());
+        payload.extend_from_slice(method_bytes);
         payload
     }
 }
@@ -697,6 +716,8 @@ mod tests {
             _context_id: &[u8; 32],
             _sender_did: &str,
             _payload: &[u8],
+            _epoch: u64,
+            _sequence: u64,
         ) -> Result<Vec<u8>, ContextError> {
             Ok(vec![])
         }

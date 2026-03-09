@@ -209,13 +209,9 @@ pub fn prove_inclusion(log: &EventLog, leaf_index: u64) -> Result<InclusionProof
             sibling_hash: leaves[sibling_idx],
             direction,
         });
-    } else {
-        // Odd node at the end: sibling is itself (promoted).
-        path.push(ProofStep {
-            sibling_hash: leaves[idx],
-            direction: Direction::Right,
-        });
     }
+    // Odd node at the end: no proof step needed -- node is promoted
+    // directly to the next level per RFC 6962.
 
     // Move to the parent index for the next level.
     idx /= 2;
@@ -233,13 +229,9 @@ pub fn prove_inclusion(log: &EventLog, leaf_index: u64) -> Result<InclusionProof
                 sibling_hash: layer[sibling_idx],
                 direction,
             });
-        } else {
-            // Odd node: sibling is itself (promoted).
-            path.push(ProofStep {
-                sibling_hash: layer[idx],
-                direction: Direction::Right,
-            });
         }
+        // Odd node: no proof step needed -- node is promoted directly
+        // per RFC 6962.
         idx /= 2;
     }
 
@@ -507,7 +499,7 @@ use super::tree::hash_pair;
 /// Computes the Merkle root from a slice of leaf hashes.
 ///
 /// Uses the same RFC 6962 structure as the main tree: odd nodes are
-/// promoted by hashing with themselves.
+/// promoted directly to the next level (not hashed with themselves).
 fn compute_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
     if leaves.is_empty() {
         return [0u8; 32];
@@ -524,7 +516,8 @@ fn compute_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
             if i + 1 < current.len() {
                 next.push(hash_pair(&current[i], &current[i + 1]));
             } else {
-                next.push(hash_pair(&current[i], &current[i]));
+                // Odd node: promote directly per RFC 6962.
+                next.push(current[i]);
             }
             i += 2;
         }
