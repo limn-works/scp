@@ -24,13 +24,17 @@ use std::sync::Mutex;
 use openmls::prelude::*;
 use scp_identity::SigningKeyId;
 use tls_codec::Deserialize as TlsDeserializeTrait;
+use zeroize::Zeroizing;
 
 use super::credential::ScpCredential;
 use super::encrypt::{encrypt, serialize_ciphertext};
 use super::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
 use crate::context::ContextError;
 use crate::context::builder::{ContextCreationError, ContextCryptoProvider};
-use crate::crypto::sender_keys::{SenderKey, SenderKeyStore, generate_sender_key};
+use crate::crypto::sender_keys::{
+    NonceDedup, SenderKey, SenderKeyDistributionMessage, SenderKeyResponse, SenderKeyStore,
+    generate_sender_key, generate_wrapping_keypair,
+};
 
 /// Per-context cryptographic state managed by [`MlsCryptoProvider`].
 struct ContextCryptoState {
@@ -40,6 +44,16 @@ struct ContextCryptoState {
     sender_key: SenderKey,
     /// Sender key store tracking per-member keys (for blocking/distribution).
     sender_key_store: SenderKeyStore,
+    /// Sender key epoch counter (incremented on each key rotation).
+    sender_key_epoch: u64,
+    /// Pending sender key distribution messages: `(target_did, serialized_message)`.
+    /// Drained by [`MlsCryptoProvider::drain_pending_sender_key_messages`].
+    pending_distributions: Vec<(String, Vec<u8>)>,
+    /// Nonce deduplication cache for sender key requests (replay protection).
+    nonce_dedup: NonceDedup,
+    /// Remote members' X25519 wrapping public keys, keyed by DID.
+    /// Populated from key packages during [`MlsCryptoProvider::add_member`].
+    member_wrapping_keys: HashMap<String, [u8; 32]>,
 }
 
 /// Production [`ContextCryptoProvider`] backed by `OpenMLS`.
@@ -65,6 +79,13 @@ pub struct MlsCryptoProvider {
     contexts: Mutex<HashMap<[u8; 32], ContextCryptoState>>,
     /// Broadcast keys for broadcast-mode contexts.
     broadcast_keys: Mutex<HashMap<[u8; 32], SenderKey>>,
+    /// X25519 wrapping public key for sender key HPKE (§9.16.1).
+    /// Published in the MLS `LeafNode` `scp_wrapping_key` extension.
+    wrapping_public_key: [u8; 32],
+    /// X25519 wrapping secret key for sender key HPKE (§9.16.1).
+    /// Used to open HPKE-sealed sender key responses. Wrapped in
+    /// [`Zeroizing`] so key material is zeroed on drop.
+    wrapping_secret_key: Mutex<Zeroizing<[u8; 32]>>,
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -76,10 +97,13 @@ impl MlsCryptoProvider {
     /// * `local_did` - The local member's DID (must be a valid `did:dht:z...`).
     #[must_use]
     pub fn new(local_did: String) -> Self {
+        let (wrapping_public_key, wrapping_secret_key) = generate_wrapping_keypair();
         Self {
             local_did,
             contexts: Mutex::new(HashMap::new()),
             broadcast_keys: Mutex::new(HashMap::new()),
+            wrapping_public_key,
+            wrapping_secret_key: Mutex::new(Zeroizing::new(wrapping_secret_key)),
         }
     }
 
@@ -124,8 +148,9 @@ impl ContextCryptoProvider for MlsCryptoProvider {
 
     fn create_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         let credential = self.make_credential()?;
-        let mls_group = group::create_group(&credential)
-            .map_err(|e| ContextCreationError::CryptoFailed(e.to_string()))?;
+        let mls_group =
+            group::create_group_with_wrapping_key(&credential, Some(&self.wrapping_public_key))
+                .map_err(|e| ContextCreationError::CryptoFailed(e.to_string()))?;
 
         let sender_key = generate_sender_key();
         let sender_key_store = SenderKeyStore::new();
@@ -134,6 +159,10 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             mls_group,
             sender_key,
             sender_key_store,
+            sender_key_epoch: 0,
+            pending_distributions: Vec::new(),
+            nonce_dedup: NonceDedup::new(),
+            member_wrapping_keys: HashMap::new(),
         };
 
         let mut contexts = self
@@ -281,7 +310,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
     fn add_member(
         &self,
         context_id: &[u8; 32],
-        _member_did: &str,
+        member_did: &str,
         key_package_bytes: Option<&[u8]>,
     ) -> Result<(), ContextError> {
         let bytes = key_package_bytes.ok_or_else(|| {
@@ -291,13 +320,39 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             )
         })?;
 
-        // Deserialize to KeyPackageIn.
+        // Pre-validate the key package to extract the wrapping key before
+        // the add operation consumes it. Key package bytes arrive as TLS-
+        // serialized KeyPackageIn (not MlsMessageIn).
+        let wrapping_key = {
+            KeyPackageIn::tls_deserialize(&mut &*bytes)
+                .ok()
+                .and_then(|kp_in| {
+                    let provider_tmp = super::storage::InMemoryMlsProvider::default();
+                    kp_in
+                        .validate(provider_tmp.crypto(), ProtocolVersion::Mls10)
+                        .ok()
+                        .and_then(|verified| {
+                            super::wrapping_extension::extract_wrapping_key(
+                                verified.leaf_node().extensions(),
+                            )
+                            .ok()
+                            .flatten()
+                        })
+                })
+        };
+
+        // Deserialize to KeyPackageIn for the actual add operation.
         let kp_in = KeyPackageIn::tls_deserialize(&mut &*bytes)
             .map_err(|e| ContextError::CryptoFailed(format!("key package deserialization: {e}")))?;
 
+        let member_did_owned = member_did.to_owned();
         self.with_context(context_id, |state| {
             let _result = group::add_member(&mut state.mls_group, kp_in)
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+            // Store the member's wrapping key if present.
+            if let Some(wk) = wrapping_key {
+                state.member_wrapping_keys.insert(member_did_owned, wk);
+            }
             Ok(())
         })
     }
@@ -361,17 +416,56 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         let state = contexts.get_mut(context_id).ok_or_else(|| {
             ContextError::CryptoFailed("no MLS group for this context".to_string())
         })?;
-        // Distribute the local member's actual sender key to the target
-        // member. Store it under *our* DID — the recipient needs to know
-        // which sender key belongs to us so they can decrypt our messages.
+        // Store our sender key locally under our DID so local
+        // encrypt/decrypt can find it.
         state
             .sender_key_store
             .set(&ctx_id_hex, &self.local_did, state.sender_key.clone());
-        // Acknowledge that the distribution targets `member_did` — in a
-        // full transport implementation, the key bytes would be encrypted
-        // to `member_did`'s public key and sent over the wire. For now,
-        // the store records our key so local encrypt/decrypt can find it.
-        let _ = member_did;
+
+        // HPKE-seal our sender key to the target member's wrapping pubkey
+        // and queue a SenderKeyResponse for transport delivery.
+        if let Some(recipient_wrapping_pub) = state.member_wrapping_keys.get(member_did) {
+            let (sealed_vec, ephemeral_pub) =
+                crate::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
+                    state.sender_key.as_bytes(),
+                    recipient_wrapping_pub,
+                    &ctx_id_hex,
+                    &self.local_did,
+                    state.sender_key_epoch,
+                )
+                .map_err(|e| ContextError::CryptoFailed(format!("HPKE seal failed: {e}")))?;
+
+            let sealed: [u8; 60] = sealed_vec.try_into().map_err(|v: Vec<u8>| {
+                ContextError::CryptoFailed(format!(
+                    "HPKE seal produced {} bytes, expected 60",
+                    v.len()
+                ))
+            })?;
+
+            let response = SenderKeyResponse {
+                sender_did: self.local_did.clone(),
+                epoch: state.sender_key_epoch,
+                hpke_sealed_key: sealed,
+                ephemeral_pubkey: ephemeral_pub,
+                // No request nonce for proactive distribution — use zeroed nonce.
+                request_nonce: [0u8; 16],
+            };
+
+            let msg = SenderKeyDistributionMessage::KeyResponse(response);
+            let serialized = msg
+                .to_bytes()
+                .map_err(|e| ContextError::CryptoFailed(format!("serialization failed: {e}")))?;
+
+            state
+                .pending_distributions
+                .push((member_did.to_owned(), serialized));
+        } else {
+            tracing::debug!(
+                member_did = %member_did,
+                context_id = %ctx_id_hex,
+                "no wrapping key for member — sender key stored locally only"
+            );
+        }
         Ok(())
     }
 
@@ -389,7 +483,162 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             ContextError::CryptoFailed("no MLS group for this context".to_string())
         })?;
         state.sender_key_store.remove(&ctx_id_hex, member_did);
+        // Also remove the member's wrapping key — they are no longer a member.
+        state.member_wrapping_keys.remove(member_did);
         Ok(())
+    }
+
+    fn drain_pending_sender_key_messages(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<Vec<(String, Vec<u8>)>, ContextError> {
+        let mut contexts = self
+            .contexts
+            .lock()
+            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+        let state = contexts.get_mut(context_id).ok_or_else(|| {
+            ContextError::CryptoFailed("no MLS group for this context".to_string())
+        })?;
+        Ok(std::mem::take(&mut state.pending_distributions))
+    }
+
+    fn process_incoming_sender_key(
+        &self,
+        context_id: &[u8; 32],
+        sender_did: &str,
+        message_bytes: &[u8],
+    ) -> Result<(), ContextError> {
+        let ctx_id_hex = hex::encode(context_id);
+
+        // Deserialize the distribution message.
+        let msg = SenderKeyDistributionMessage::from_bytes(message_bytes)
+            .map_err(|e| ContextError::CryptoFailed(format!("deserialization failed: {e}")))?;
+
+        match msg {
+            SenderKeyDistributionMessage::KeyResponse(response) => {
+                // HPKE-open the sealed sender key using our wrapping secret key.
+                let wrapping_secret = self
+                    .wrapping_secret_key
+                    .lock()
+                    .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+
+                let sender_key = crate::crypto::sender_keys::key_protocol::hpke_open_sender_key(
+                    &response.hpke_sealed_key,
+                    &response.ephemeral_pubkey,
+                    &wrapping_secret,
+                    &ctx_id_hex,
+                    &response.sender_did,
+                    response.epoch,
+                )
+                .map_err(|e| ContextError::CryptoFailed(format!("HPKE open failed: {e}")))?;
+
+                // Verify the sender DID matches the claimed sender.
+                if response.sender_did != sender_did {
+                    return Err(ContextError::CryptoFailed(format!(
+                        "sender DID mismatch: message claims {}, transport says {}",
+                        response.sender_did, sender_did
+                    )));
+                }
+
+                // Store the recovered sender key.
+                let mut contexts = self
+                    .contexts
+                    .lock()
+                    .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+                let state = contexts.get_mut(context_id).ok_or_else(|| {
+                    ContextError::CryptoFailed("no MLS group for this context".to_string())
+                })?;
+                state
+                    .sender_key_store
+                    .set(&ctx_id_hex, sender_did, sender_key);
+                Ok(())
+            }
+            _ => Err(ContextError::CryptoFailed(
+                "expected SenderKeyDistributionMessage::KeyResponse".to_string(),
+            )),
+        }
+    }
+
+    fn handle_sender_key_request(
+        &self,
+        context_id: &[u8; 32],
+        request_bytes: &[u8],
+        requester_public_key: &[u8],
+    ) -> Result<Option<Vec<u8>>, ContextError> {
+        let ctx_id_hex = hex::encode(context_id);
+
+        // Deserialize the request.
+        let request: crate::crypto::sender_keys::SenderKeyRequest =
+            rmp_serde::from_slice(request_bytes)
+                .map_err(|e| ContextError::CryptoFailed(format!("request deserialization: {e}")))?;
+
+        let now_secs = crate::time::now_secs()
+            .map_err(|e| ContextError::CryptoFailed(format!("clock error: {e}")))?;
+
+        let mut contexts = self
+            .contexts
+            .lock()
+            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+        let state = contexts.get_mut(context_id).ok_or_else(|| {
+            ContextError::CryptoFailed("no MLS group for this context".to_string())
+        })?;
+
+        // Verify the request signature.
+        let valid = crate::crypto::sender_keys::verify_sender_key_request(
+            &request,
+            requester_public_key,
+        )
+        .map_err(|e| ContextError::CryptoFailed(format!("signature verification: {e}")))?;
+        if !valid {
+            return Err(ContextError::CryptoFailed(
+                "sender key request signature verification failed".to_string(),
+            ));
+        }
+
+        // Timestamp freshness.
+        crate::crypto::sender_keys::validate_sender_key_request_freshness(&request, now_secs)
+            .map_err(|e| ContextError::CryptoFailed(format!("freshness check: {e}")))?;
+
+        // Nonce replay protection.
+        if state.nonce_dedup.is_replayed(&request.nonce, now_secs) {
+            return Err(ContextError::CryptoFailed(
+                "replayed sender key request".to_string(),
+            ));
+        }
+
+        // HPKE-seal our sender key to the requester's wrapping pubkey.
+        let (sealed_vec, ephemeral_pub) =
+            crate::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
+                state.sender_key.as_bytes(),
+                &request.wrapping_pubkey,
+                &ctx_id_hex,
+                &self.local_did,
+                state.sender_key_epoch,
+            )
+            .map_err(|e| ContextError::CryptoFailed(format!("HPKE seal failed: {e}")))?;
+
+        let sealed: [u8; 60] = sealed_vec.try_into().map_err(|v: Vec<u8>| {
+            ContextError::CryptoFailed(format!(
+                "HPKE seal produced {} bytes, expected 60",
+                v.len()
+            ))
+        })?;
+
+        let response = SenderKeyResponse {
+            sender_did: self.local_did.clone(),
+            epoch: state.sender_key_epoch,
+            hpke_sealed_key: sealed,
+            ephemeral_pubkey: ephemeral_pub,
+            request_nonce: request.nonce,
+        };
+
+        let message = rmp_serde::to_vec_named(&response)
+            .map_err(|e| ContextError::CryptoFailed(format!("serialization: {e}")))?;
+
+        // Record nonce after successful processing.
+        state.nonce_dedup.record(request.nonce, now_secs);
+
+        Ok(Some(message))
     }
 
     fn encrypt_message(
@@ -671,9 +920,6 @@ mod tests {
 
     #[test]
     fn max_past_epochs_allows_grace_window() {
-        // Verify that the default MLS group configuration allows at least
-        // 1 past epoch (per #324). OpenMLS's default max_past_epochs is
-        // already > 0, but we verify it explicitly.
         let provider = make_provider();
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
@@ -682,8 +928,6 @@ mod tests {
         let state = contexts.get(&ctx_id).unwrap();
         let inner = state.mls_group.inner().unwrap();
 
-        // OpenMLS MlsGroupCreateConfig defaults max_past_epochs to a non-zero
-        // value. We verify the group was created successfully and is at epoch 0.
         assert_eq!(
             inner.epoch().as_u64(),
             0,
@@ -730,11 +974,6 @@ mod tests {
         let _carol_group =
             group::join_group(&add_carol_result.welcome, carol_provider_mls, carol_signer).unwrap();
 
-        // Alice encrypts — both Bob and Carol should be able to decrypt.
-        // Note: Bob needs to process Alice's commit for Carol's add first.
-        // In a real system, this would happen via message distribution.
-        // For this test, we verify that Alice's encrypt works and the
-        // group has 3 members.
         let contexts = provider.contexts.lock().unwrap();
         let state = contexts.get(&ctx_id).unwrap();
         let members = state.mls_group.members().unwrap();
@@ -757,7 +996,6 @@ mod tests {
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
 
-        // Add Bob.
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
         let (bob_kp_bundle, _bob_signer, _bob_provider) = generate_key_package(&bob_cred).unwrap();
@@ -769,17 +1007,14 @@ mod tests {
             .add_member(&ctx_id, bob_did, Some(&bob_kp_bytes))
             .unwrap();
 
-        // Verify epoch 1.
         {
             let contexts = provider.contexts.lock().unwrap();
             let state = contexts.get(&ctx_id).unwrap();
             assert_eq!(state.mls_group.epoch().unwrap(), 1);
         }
 
-        // Remove Bob.
         provider.remove_member(&ctx_id, bob_did).unwrap();
 
-        // Verify epoch 2.
         {
             let contexts = provider.contexts.lock().unwrap();
             let state = contexts.get(&ctx_id).unwrap();
@@ -820,14 +1055,11 @@ mod tests {
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
 
-        // distribute_sender_key stores the local member's sender key under
-        // the local DID (not the target member_did).
         assert!(
             provider
                 .distribute_sender_key(&ctx_id, "did:dht:z6MkBob")
                 .is_ok()
         );
-        // Verify the key is stored under the local DID.
         {
             let contexts = provider.contexts.lock().unwrap();
             let state = contexts.get(&ctx_id).unwrap();
@@ -835,7 +1067,6 @@ mod tests {
             assert!(state.sender_key_store.get(&ctx_hex, TEST_DID).is_some());
         }
 
-        // remove_member_sender_key removes by the given DID.
         assert!(provider.remove_member_sender_key(&ctx_id, TEST_DID).is_ok());
     }
 
@@ -843,7 +1074,6 @@ mod tests {
     fn distribute_sender_key_errors_without_context() {
         let provider = make_provider();
         let ctx_id = make_context_id();
-        // No group created — should error.
         assert!(
             provider
                 .distribute_sender_key(&ctx_id, "did:dht:z6MkBob")
@@ -855,7 +1085,6 @@ mod tests {
     fn remove_member_sender_key_errors_without_context() {
         let provider = make_provider();
         let ctx_id = make_context_id();
-        // No group created — should error.
         assert!(
             provider
                 .remove_member_sender_key(&ctx_id, "did:dht:z6MkBob")
@@ -867,7 +1096,6 @@ mod tests {
     fn generate_sender_key_errors_without_context() {
         let provider = make_provider();
         let ctx_id = make_context_id();
-        // No group created — should error.
         assert!(provider.generate_sender_key(&ctx_id).is_err());
     }
 
@@ -876,8 +1104,247 @@ mod tests {
         let provider = make_provider();
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();
-        // Attempting to remove self should fail.
         let result = provider.remove_member(&ctx_id, TEST_DID);
         assert!(result.is_err());
+    }
+
+    // -- New tests for sender key distribution wiring --------------------------
+
+    #[test]
+    fn create_mls_group_includes_wrapping_key() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+
+        let contexts = provider.contexts.lock().unwrap();
+        let state = contexts.get(&ctx_id).unwrap();
+        let extracted =
+            super::super::wrapping_extension::extract_own_wrapping_key(&state.mls_group).unwrap();
+        assert_eq!(
+            extracted,
+            Some(provider.wrapping_public_key),
+            "own leaf node must contain provider's wrapping public key"
+        );
+    }
+
+    #[test]
+    fn distribute_sender_key_hpke_seals_when_wrapping_key_available() {
+        use super::super::group::generate_key_package_with_wrapping_key;
+
+        let alice_provider = make_provider();
+        let ctx_id = make_context_id();
+        alice_provider.create_mls_group(&ctx_id).unwrap();
+
+        let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
+        let bob_wrapping = [0xBB_u8; 32];
+        let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) =
+            generate_key_package_with_wrapping_key(&bob_cred, Some(&bob_wrapping)).unwrap();
+        let kp_bytes = bob_kp_bundle
+            .key_package()
+            .tls_serialize_detached()
+            .unwrap();
+
+        alice_provider
+            .add_member(&ctx_id, bob_did, Some(&kp_bytes))
+            .unwrap();
+
+        {
+            let contexts = alice_provider.contexts.lock().unwrap();
+            let state = contexts.get(&ctx_id).unwrap();
+            assert_eq!(
+                state.member_wrapping_keys.get(bob_did),
+                Some(&bob_wrapping),
+                "Bob's wrapping key must be stored after add_member"
+            );
+        }
+
+        alice_provider
+            .distribute_sender_key(&ctx_id, bob_did)
+            .unwrap();
+
+        let pending = alice_provider
+            .drain_pending_sender_key_messages(&ctx_id)
+            .unwrap();
+        assert_eq!(pending.len(), 1, "should have 1 pending distribution");
+        assert_eq!(pending[0].0, bob_did, "pending message should target Bob");
+        assert!(
+            !pending[0].1.is_empty(),
+            "serialized message should be non-empty"
+        );
+
+        let msg =
+            crate::crypto::sender_keys::SenderKeyDistributionMessage::from_bytes(&pending[0].1)
+                .unwrap();
+        match msg {
+            crate::crypto::sender_keys::SenderKeyDistributionMessage::KeyResponse(resp) => {
+                assert_eq!(resp.sender_did, TEST_DID);
+                assert_eq!(resp.epoch, 0);
+            }
+            _ => panic!("expected KeyResponse variant"),
+        }
+    }
+
+    #[test]
+    fn distribute_sender_key_no_wrapping_key_still_stores_locally() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+
+        let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
+        let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_provider) =
+            generate_key_package(&bob_cred).unwrap();
+        let kp_bytes = bob_kp_bundle
+            .key_package()
+            .tls_serialize_detached()
+            .unwrap();
+        provider
+            .add_member(&ctx_id, bob_did, Some(&kp_bytes))
+            .unwrap();
+
+        provider
+            .distribute_sender_key(&ctx_id, bob_did)
+            .unwrap();
+
+        {
+            let contexts = provider.contexts.lock().unwrap();
+            let state = contexts.get(&ctx_id).unwrap();
+            let ctx_hex = hex::encode(ctx_id);
+            assert!(state.sender_key_store.get(&ctx_hex, TEST_DID).is_some());
+        }
+
+        let pending = provider
+            .drain_pending_sender_key_messages(&ctx_id)
+            .unwrap();
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn process_incoming_sender_key_roundtrip() {
+        use super::super::group::generate_key_package_with_wrapping_key;
+
+        let alice_provider = make_provider();
+        let bob_provider = MlsCryptoProvider::new(
+            "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_string(),
+        );
+        let ctx_id = make_context_id();
+        alice_provider.create_mls_group(&ctx_id).unwrap();
+        bob_provider.create_mls_group(&ctx_id).unwrap();
+
+        let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
+
+        let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_mls) =
+            generate_key_package_with_wrapping_key(
+                &bob_cred,
+                Some(&bob_provider.wrapping_public_key),
+            )
+            .unwrap();
+        let kp_bytes = bob_kp_bundle
+            .key_package()
+            .tls_serialize_detached()
+            .unwrap();
+        alice_provider
+            .add_member(&ctx_id, bob_did, Some(&kp_bytes))
+            .unwrap();
+
+        alice_provider
+            .distribute_sender_key(&ctx_id, bob_did)
+            .unwrap();
+        let pending = alice_provider
+            .drain_pending_sender_key_messages(&ctx_id)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+
+        bob_provider
+            .process_incoming_sender_key(&ctx_id, TEST_DID, &pending[0].1)
+            .unwrap();
+
+        {
+            let bob_contexts = bob_provider.contexts.lock().unwrap();
+            let bob_state = bob_contexts.get(&ctx_id).unwrap();
+            let ctx_hex = hex::encode(ctx_id);
+            let alice_key = bob_state.sender_key_store.get(&ctx_hex, TEST_DID);
+            assert!(
+                alice_key.is_some(),
+                "Bob must have Alice's sender key after processing distribution"
+            );
+
+            let alice_contexts = alice_provider.contexts.lock().unwrap();
+            let alice_state = alice_contexts.get(&ctx_id).unwrap();
+            assert_eq!(
+                alice_key.unwrap().as_bytes(),
+                alice_state.sender_key.as_bytes(),
+                "recovered key must match Alice's sender key"
+            );
+        }
+    }
+
+    #[test]
+    fn drain_pending_sender_key_messages_clears_queue() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+
+        let pending = provider
+            .drain_pending_sender_key_messages(&ctx_id)
+            .unwrap();
+        assert!(pending.is_empty());
+
+        provider
+            .distribute_sender_key(&ctx_id, "did:dht:z6MkBob")
+            .unwrap();
+        let pending = provider
+            .drain_pending_sender_key_messages(&ctx_id)
+            .unwrap();
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn drain_pending_sender_key_messages_errors_without_context() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        assert!(provider
+            .drain_pending_sender_key_messages(&ctx_id)
+            .is_err());
+    }
+
+    #[test]
+    fn process_incoming_sender_key_rejects_wrong_sender() {
+        let bob_provider = MlsCryptoProvider::new(
+            "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_string(),
+        );
+        let ctx_id = make_context_id();
+        bob_provider.create_mls_group(&ctx_id).unwrap();
+
+        let ctx_hex = hex::encode(ctx_id);
+        let (sealed_vec, ephemeral_pub) =
+            crate::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
+                &[42u8; 32],
+                &bob_provider.wrapping_public_key,
+                &ctx_hex,
+                TEST_DID,
+                0,
+            )
+            .unwrap();
+        let sealed: [u8; 60] = sealed_vec.try_into().unwrap();
+
+        let response = SenderKeyResponse {
+            sender_did: TEST_DID.to_string(),
+            epoch: 0,
+            hpke_sealed_key: sealed,
+            ephemeral_pubkey: ephemeral_pub,
+            request_nonce: [0u8; 16],
+        };
+        let msg = SenderKeyDistributionMessage::KeyResponse(response);
+        let serialized = msg.to_bytes().unwrap();
+
+        let result =
+            bob_provider.process_incoming_sender_key(&ctx_id, "did:dht:z6MkCharlie", &serialized);
+        assert!(
+            result.is_err(),
+            "should reject when sender_did doesn't match transport sender"
+        );
     }
 }

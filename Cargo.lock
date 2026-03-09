@@ -4969,6 +4969,7 @@ dependencies = [
  "js-sys",
  "jsonschema",
  "rand_core 0.6.4",
+ "scp-ffi-common",
  "serde",
  "serde_json",
  "sha2 0.10.9",

@@ -195,6 +195,78 @@ pub trait ContextCryptoProvider: Send + Sync {
         member_did: &str,
     ) -> Result<(), ContextError>;
 
+    /// Drains pending sender key distribution messages for a context.
+    ///
+    /// Returns `(target_did, serialized_message)` pairs that should be
+    /// delivered to the target members via transport. Each message is a
+    /// serialized [`SenderKeyDistributionMessage::KeyResponse`] containing
+    /// an HPKE-sealed sender key.
+    ///
+    /// The default implementation returns an empty vector (no pending
+    /// distributions). Production providers that HPKE-seal sender keys
+    /// during [`distribute_sender_key`](Self::distribute_sender_key) should
+    /// override this to drain their pending queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if the internal lock is
+    /// poisoned.
+    fn drain_pending_sender_key_messages(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<Vec<(String, Vec<u8>)>, ContextError> {
+        Ok(Vec::new())
+    }
+
+    /// Processes an incoming sender key distribution message from a remote
+    /// member.
+    ///
+    /// Deserializes the message, extracts the sender key, and stores it in
+    /// the local sender key store so subsequent messages from `sender_did`
+    /// can be decrypted.
+    ///
+    /// The default implementation is a no-op. Production providers that
+    /// support HPKE sender key distribution should override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if deserialization, HPKE
+    /// decryption, or storage fails.
+    fn process_incoming_sender_key(
+        &self,
+        _context_id: &[u8; 32],
+        _sender_did: &str,
+        _message_bytes: &[u8],
+    ) -> Result<(), ContextError> {
+        Ok(())
+    }
+
+    /// Handles an incoming sender key request from a remote member.
+    ///
+    /// Verifies the request, checks replay protection, and HPKE-seals the
+    /// local sender key to the requester's wrapping pubkey.
+    ///
+    /// Returns `Some(serialized_response)` if the requester should receive
+    /// a key, or `None` if the request was silently dropped (e.g., blocked).
+    ///
+    /// The default implementation returns an error indicating the provider
+    /// does not support sender key request handling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if signature verification,
+    /// HPKE encryption, or serialization fails.
+    fn handle_sender_key_request(
+        &self,
+        _context_id: &[u8; 32],
+        _request_bytes: &[u8],
+        _requester_public_key: &[u8],
+    ) -> Result<Option<Vec<u8>>, ContextError> {
+        Err(ContextError::CryptoFailed(
+            "sender key request handling not supported by this provider".to_string(),
+        ))
+    }
+
     /// Encrypts a payload with sender key (ADR-007), wraps in inner envelope
     /// (ADR-002), encrypts with MLS (ADR-001), wraps in outer envelope.
     ///

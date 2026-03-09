@@ -691,7 +691,7 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
 
     // HPKE seal: encrypt the sender key to the requester's wrapping key.
     // Context binding (§9.16.2): info and AAD include context_id, sender_did, epoch.
-    let (sealed_vec, ephemeral_pub) = hpke_seal(
+    let (sealed_vec, ephemeral_pub) = hpke_seal_sender_key(
         params.sender_key.as_bytes(),
         &wrapping_bytes,
         params.context_id,
@@ -827,6 +827,57 @@ pub async fn open_sender_key_response(
 
     // Decrypt the sealed sender key with AAD verification.
     let plaintext = aes128gcm_decrypt(&aes_key, &response.hpke_sealed_key, &aad)?;
+
+    let key_bytes: [u8; 32] = plaintext.as_slice().try_into().map_err(|_| {
+        SenderKeyError::HpkeDecryptionFailed(format!(
+            "decrypted key must be 32 bytes, got {}",
+            plaintext.len()
+        ))
+    })?;
+
+    Ok(SenderKey::from_bytes(key_bytes))
+}
+
+/// Decrypts an HPKE-sealed sender key using the raw X25519 wrapping secret
+/// key bytes.
+///
+/// This is the non-custody variant of [`open_sender_key_response`] for use
+/// when the wrapping secret key is held in software (e.g., in
+/// [`MlsCryptoProvider`](crate::crypto::mls::MlsCryptoProvider)) rather
+/// than inside a [`KeyCustody`] boundary.
+///
+/// # Arguments
+///
+/// * `sealed` - The HPKE-sealed key bytes (`nonce || ciphertext || tag`).
+/// * `ephemeral_pubkey` - The sender's ephemeral X25519 public key.
+/// * `wrapping_secret` - The recipient's X25519 wrapping secret key (32 bytes).
+/// * `context_id` - The SCP context identifier (hex string).
+/// * `sender_did` - The DID of the sender.
+/// * `epoch` - The sender key epoch.
+///
+/// # Errors
+///
+/// Returns [`SenderKeyError::HpkeDecryptionFailed`] if ECDH, KDF, or AEAD
+/// decryption fails.
+pub fn hpke_open_sender_key(
+    sealed: &[u8],
+    ephemeral_pubkey: &[u8; 32],
+    wrapping_secret: &[u8; 32],
+    context_id: &str,
+    sender_did: &str,
+    epoch: u64,
+) -> Result<SenderKey, SenderKeyError> {
+    use x25519_dalek::StaticSecret;
+
+    let secret = StaticSecret::from(*wrapping_secret);
+    let ephemeral_pub = X25519Pub::from(*ephemeral_pubkey);
+    let shared_secret = secret.diffie_hellman(&ephemeral_pub);
+
+    let info = build_hpke_info(context_id, sender_did, epoch);
+    let aad = build_hpke_aad(context_id, sender_did, epoch);
+
+    let aes_key = hkdf_derive_key(shared_secret.as_bytes(), &info)?;
+    let plaintext = aes128gcm_decrypt(&aes_key, sealed, &aad)?;
 
     let key_bytes: [u8; 32] = plaintext.as_slice().try_into().map_err(|_| {
         SenderKeyError::HpkeDecryptionFailed(format!(
@@ -1116,7 +1167,20 @@ fn build_hpke_aad(context_id: &str, sender_did: &str, epoch: u64) -> Vec<u8> {
 // HPKE helpers
 // ---------------------------------------------------------------------------
 
-fn hpke_seal(
+/// HPKE-seals a 32-byte sender key to a recipient's X25519 wrapping pubkey.
+///
+/// Returns `(sealed_bytes, ephemeral_pubkey)` where `sealed_bytes` is
+/// `nonce || ciphertext || tag` (60 bytes for 32-byte plaintext) and
+/// `ephemeral_pubkey` is the 32-byte X25519 public key used for ECDH.
+///
+/// Context binding: both info and AAD include `context_id`, `sender_did`,
+/// and `epoch` to prevent cross-context/cross-epoch replay (§9.16.2).
+///
+/// # Errors
+///
+/// Returns [`SenderKeyError::HpkeEncryptionFailed`] if HKDF or AES-128-GCM
+/// encryption fails.
+pub fn hpke_seal_sender_key(
     plaintext: &[u8; 32],
     recipient_pub: &[u8; 32],
     context_id: &str,
@@ -1396,7 +1460,7 @@ pub fn handle_bridge_shadow_key_request(
     requester_wrapping_pubkey: &[u8; 32],
     params: &BridgeShadowKeyParams<'_>,
 ) -> Result<([u8; 60], [u8; 32]), SenderKeyError> {
-    let (sealed_vec, ephemeral_pub) = hpke_seal(
+    let (sealed_vec, ephemeral_pub) = hpke_seal_sender_key(
         params.shadow_sender_key.as_bytes(),
         requester_wrapping_pubkey,
         params.context_id,
@@ -2393,7 +2457,7 @@ mod tests {
         let recipient_public = X25519Pub::from(&recipient_secret);
 
         let (sealed, ephemeral_pub) =
-            hpke_seal(&plaintext, &recipient_public.to_bytes(), ctx, sender, epoch).unwrap();
+            hpke_seal_sender_key(&plaintext, &recipient_public.to_bytes(), ctx, sender, epoch).unwrap();
 
         let ephemeral_key = X25519Pub::from(ephemeral_pub);
         let shared = recipient_secret.diffie_hellman(&ephemeral_key);
@@ -2418,7 +2482,7 @@ mod tests {
         let wrong_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
 
         let (sealed, ephemeral_pub) =
-            hpke_seal(&plaintext, &recipient_public.to_bytes(), ctx, sender, epoch).unwrap();
+            hpke_seal_sender_key(&plaintext, &recipient_public.to_bytes(), ctx, sender, epoch).unwrap();
 
         let ephemeral_key = X25519Pub::from(ephemeral_pub);
         let shared = wrong_secret.diffie_hellman(&ephemeral_key);
@@ -2457,7 +2521,7 @@ mod tests {
         let recipient_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
         let recipient_public = X25519Pub::from(&recipient_secret);
 
-        let (sealed, ephemeral_pub) = hpke_seal(
+        let (sealed, ephemeral_pub) = hpke_seal_sender_key(
             &plaintext,
             &recipient_public.to_bytes(),
             "ctx-A",
@@ -2486,7 +2550,7 @@ mod tests {
         let recipient_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
         let recipient_public = X25519Pub::from(&recipient_secret);
 
-        let (sealed, ephemeral_pub) = hpke_seal(
+        let (sealed, ephemeral_pub) = hpke_seal_sender_key(
             &plaintext,
             &recipient_public.to_bytes(),
             ctx,
@@ -2516,7 +2580,7 @@ mod tests {
         let recipient_public = X25519Pub::from(&recipient_secret);
 
         let (sealed, ephemeral_pub) =
-            hpke_seal(&plaintext, &recipient_public.to_bytes(), ctx, sender, 1).unwrap();
+            hpke_seal_sender_key(&plaintext, &recipient_public.to_bytes(), ctx, sender, 1).unwrap();
 
         let ephemeral_key = X25519Pub::from(ephemeral_pub);
         let shared = recipient_secret.diffie_hellman(&ephemeral_key);
