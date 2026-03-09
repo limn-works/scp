@@ -423,11 +423,10 @@ pub fn event_log_checkpoint(
                 key: &scp_id.active_signing_key,
             };
 
-            // generate_checkpoint is async — we are already on the tokio runtime
-            // inside an napi async function, so we can spawn a blocking task
-            // to call block_on.
-            let handle = tokio::runtime::Handle::current();
-            handle.block_on(async {
+            // generate_checkpoint is async — this sync NAPI function runs on
+            // a libuv worker thread (not inside tokio), so we use the stored
+            // runtime to block_on the future.
+            crate::runtime().block_on(async {
                 scp_event_log::checkpoint::generate_checkpoint(
                     &rt.event_log,
                     &sender_did,
