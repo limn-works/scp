@@ -1435,7 +1435,10 @@ mod tests {
         map.insert("evil_extra_field".into(), "malicious".into());
 
         let result = serde_json::from_value::<BroadcastEnvelope>(serde_json::Value::Object(map));
-        assert!(result.is_err(), "deny_unknown_fields must reject unknown keys");
+        assert!(
+            result.is_err(),
+            "deny_unknown_fields must reject unknown keys"
+        );
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("unknown field"),

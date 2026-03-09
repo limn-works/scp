@@ -61,9 +61,9 @@ public nonisolated struct UcanValidationResult: Sendable {
 /// injected for testability; defaults call through to ScpBindings.
 ///
 /// See ADR-026 for the flat delegation pattern and ADR-016 for UCAN spec.
-internal enum UcanBridge {
+enum UcanBridge {
     /// Validate a UCAN token. Maps to ``ucanValidate`` in ScpBindings.
-    internal typealias ValidateFn = @Sendable (
+    typealias ValidateFn = @Sendable (
         _ handle: ContextHandle,
         _ token: String,
         _ capability: String,
@@ -72,30 +72,30 @@ internal enum UcanBridge {
     ) async throws -> Void
 
     /// Mint a UCAN token. Maps to ``ucanMint`` in ScpBindings.
-    internal typealias MintFn = @Sendable (
+    typealias MintFn = @Sendable (
         _ handle: ContextHandle,
         _ memberDid: String,
         _ capabilities: [String]
     ) async throws -> UcanToken
 
     /// Revoke a UCAN token. Maps to ``ucanRevoke`` in ScpBindings.
-    internal typealias RevokeFn = @Sendable (
+    typealias RevokeFn = @Sendable (
         _ handle: ContextHandle,
         _ token: String
     ) async throws -> Void
 
     /// Default validate function that delegates to the UniFFI-generated binding.
-    internal static let defaultValidate: ValidateFn = { handle, token, capability, presentingAgentDid, proofTokens in
+    static let defaultValidate: ValidateFn = { handle, token, capability, presentingAgentDid, proofTokens in
         try await ucanValidate(handle: handle, token: token, capability: capability, presentingAgentDid: presentingAgentDid, proofTokens: proofTokens)
     }
 
     /// Default mint function that delegates to the UniFFI-generated binding.
-    internal static let defaultMint: MintFn = { handle, memberDid, capabilities in
+    static let defaultMint: MintFn = { handle, memberDid, capabilities in
         try await ucanMint(handle: handle, memberDid: memberDid, capabilities: capabilities)
     }
 
     /// Default revoke function that delegates to the UniFFI-generated binding.
-    internal static let defaultRevoke: RevokeFn = { handle, token in
+    static let defaultRevoke: RevokeFn = { handle, token in
         try await ucanRevoke(handle: handle, token: token)
     }
 }
@@ -196,7 +196,7 @@ public func revokeUcanToken(
 /// - Story SCP-221
 public func validate(
     encoded: String,
-    contextId: String,
+    contextId _: String,
     presenterDid: String,
     validateFn: UcanBridge.ValidateFn = UcanBridge.defaultValidate
 ) async throws -> UcanValidationResult {
@@ -221,11 +221,11 @@ public func validate(
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
 /// - Story SCP-221
 public func mint(
-    issuerDid: String,
+    issuerDid _: String,
     audienceDid: String,
     capabilities: [UcanCapability],
-    expirySecs: UInt64 = 3_600,
-    proofs: [String] = [],
+    expirySecs _: UInt64 = 3600,
+    proofs _: [String] = [],
     mintFn: UcanBridge.MintFn = UcanBridge.defaultMint
 ) async throws -> UcanToken {
     let handle = ContextHandle(noPointer: .init())
@@ -246,7 +246,7 @@ public func mint(
 /// - Story SCP-221
 public func revoke(
     encoded: String,
-    revokerDid: String,
+    revokerDid _: String,
     revokeFn: UcanBridge.RevokeFn = UcanBridge.defaultRevoke
 ) async throws {
     let handle = ContextHandle(noPointer: .init())

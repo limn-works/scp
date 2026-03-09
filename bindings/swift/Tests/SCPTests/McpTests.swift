@@ -1,7 +1,6 @@
 import Foundation
-import Testing
-
 @testable import SCP
+import Testing
 
 // MARK: - MCP Tests
 
@@ -16,9 +15,7 @@ import Testing
 /// pattern works end-to-end.
 ///
 /// See ADR-015 (MCP), ADR-026 (Swift SDK), and story SCP-221.
-@Suite("MCP Tests")
 struct McpTests {
-
     // MARK: - McpServerConfig type shape
 
     @Test("McpServerConfig stores context IDs and transport")
@@ -37,7 +34,7 @@ struct McpTests {
             contextIds: ["ctx-1"],
             transport: .sse(port: 8080)
         )
-        if case .sse(let port) = config.transport {
+        if case let .sse(port) = config.transport {
             #expect(port == 8080)
         } else {
             Issue.record("Expected SSE transport")
@@ -45,7 +42,7 @@ struct McpTests {
     }
 
     @Test("McpServerConfig is Sendable")
-    func serverConfigIsSendable() async {
+    func serverConfigIsSendable() {
         let config: any Sendable = McpServerConfig(
             contextIds: ["ctx"],
             transport: .stdio
@@ -68,7 +65,7 @@ struct McpTests {
     @Test("McpTransportType sse variant with port")
     func transportTypeSse() {
         let transport = McpTransportType.sse(port: 3000)
-        if case .sse(let port) = transport {
+        if case let .sse(port) = transport {
             #expect(port == 3000)
         } else {
             Issue.record("Expected sse transport type")
@@ -83,7 +80,7 @@ struct McpTests {
             command: "uvx",
             args: ["some-mcp-server", "--port", "3000"]
         )
-        if case .stdio(let command, let args) = config {
+        if case let .stdio(command, args) = config {
             #expect(command == "uvx")
             #expect(args.count == 3)
             #expect(args[0] == "some-mcp-server")
@@ -95,7 +92,7 @@ struct McpTests {
     @Test("McpClientConfig sse variant stores URL")
     func clientConfigSse() {
         let config = McpClientConfig.sse(url: "http://localhost:8080/sse")
-        if case .sse(let url) = config {
+        if case let .sse(url) = config {
             #expect(url == "http://localhost:8080/sse")
         } else {
             Issue.record("Expected sse client config")
@@ -103,7 +100,7 @@ struct McpTests {
     }
 
     @Test("McpClientConfig is Sendable")
-    func clientConfigIsSendable() async {
+    func clientConfigIsSendable() {
         let config: any Sendable = McpClientConfig.stdio(command: "test", args: [])
         #expect(config is McpClientConfig)
     }
@@ -193,7 +190,7 @@ struct McpTests {
             try await serveMcp(config: config)
             Issue.record("Expected serveMcp to throw")
         } catch let error as ScpError {
-            if case .Tool(_, let code) = error {
+            if case let .Tool(_, code) = error {
                 #expect(code == "SCP-MCP-10001")
             } else {
                 Issue.record("Expected ScpError.Tool, got \(error)")
@@ -208,7 +205,7 @@ struct McpTests {
     @Test("McpClient.connect calls bridge and returns client")
     func mcpClientConnectRoundtrip() async throws {
         let mockCreate: McpBridge.ClientCreateFn = { config in
-            if case .stdio(let command, _) = config {
+            if case let .stdio(command, _) = config {
                 #expect(command == "uvx")
             }
             return McpClientHandle(initialized: true)
@@ -227,7 +224,7 @@ struct McpTests {
             _ = try await McpClient.connect(config: .stdio(command: "uvx", args: []))
             Issue.record("Expected McpClient.connect to throw")
         } catch let error as ScpError {
-            if case .Tool(_, let code) = error {
+            if case let .Tool(_, code) = error {
                 #expect(code == "SCP-MCP-10002")
             } else {
                 Issue.record("Expected ScpError.Tool, got \(error)")
@@ -247,7 +244,7 @@ struct McpTests {
         ]
 
         let mockListTools: McpBridge.ClientListToolsFn = { _ in
-            return mockTools
+            mockTools
         }
 
         let client = McpClient(
@@ -305,5 +302,4 @@ struct McpTests {
         #expect(!uninit.initialized)
         #expect(init_.initialized)
     }
-
 } // end McpTests

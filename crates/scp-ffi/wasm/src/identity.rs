@@ -934,8 +934,7 @@ pub fn identity_verify_device_attestation(did: String, token_base64: String) -> 
 
         // Verify the Ed25519 signature against the public key.
         let payload = format!("device-attestation:{did}:{timestamp}");
-        let Ok(verifying_key) =
-            ed25519_dalek::VerifyingKey::from_bytes(&entry.public_key_bytes)
+        let Ok(verifying_key) = ed25519_dalek::VerifyingKey::from_bytes(&entry.public_key_bytes)
         else {
             return Ok(JsValue::from_bool(false));
         };

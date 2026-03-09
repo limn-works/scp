@@ -1,7 +1,6 @@
 import Foundation
-import Testing
-
 @testable import SCP
+import Testing
 
 // MARK: - Participation Tests
 
@@ -12,9 +11,7 @@ import Testing
 /// missing-key-is-zero semantics — so we test it thoroughly.
 ///
 /// See ADR-017 Layer 2 (Behavioral Validation) and spec section 23.7.
-@Suite("Participation Tests")
 struct ParticipationTests {
-
     // MARK: - ParticipationFact enum
 
     @Test("ParticipationFact has correct raw values")
@@ -214,5 +211,4 @@ struct ParticipationTests {
 
         #expect(result)
     }
-
 } // end ParticipationTests

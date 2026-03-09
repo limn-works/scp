@@ -69,15 +69,15 @@ public enum MemberRole: String, Sendable {
 // MARK: - GovernanceBridge
 
 /// Namespace for UniFFI bridge function references used by governance operations.
-internal enum GovernanceBridge {
+enum GovernanceBridge {
     /// Execute a governance action. Maps to ``governanceExecute`` in ScpBindings.
-    internal typealias ExecuteFn = @Sendable (
+    typealias ExecuteFn = @Sendable (
         _ handle: ContextHandle,
         _ proposalJson: String
     ) async throws -> String
 
     /// Default execute function that delegates to the UniFFI-generated binding.
-    internal static let defaultExecute: ExecuteFn = { handle, proposalJson in
+    static let defaultExecute: ExecuteFn = { handle, proposalJson in
         try await governanceExecute(handle: handle, proposalJson: proposalJson)
     }
 }
@@ -85,42 +85,42 @@ internal enum GovernanceBridge {
 // MARK: - MembershipBridge
 
 /// Namespace for UniFFI bridge function references used by membership queries.
-internal enum MembershipBridge {
+enum MembershipBridge {
     /// Return the member count for a context.
-    internal typealias MemberCountFn = @Sendable (
+    typealias MemberCountFn = @Sendable (
         _ handle: ContextHandle
     ) async throws -> UInt64?
 
     /// Check whether a DID is a member.
-    internal typealias IsMemberFn = @Sendable (
+    typealias IsMemberFn = @Sendable (
         _ handle: ContextHandle,
         _ did: String
     ) async throws -> Bool
 
     /// Return all member DIDs.
-    internal typealias MemberDidsFn = @Sendable (
+    typealias MemberDidsFn = @Sendable (
         _ handle: ContextHandle
     ) async throws -> [String]
 
     /// Return a member's role.
-    internal typealias MemberRoleFn = @Sendable (
+    typealias MemberRoleFn = @Sendable (
         _ handle: ContextHandle,
         _ did: String
     ) async throws -> String?
 
-    internal static let defaultMemberCount: MemberCountFn = { handle in
+    static let defaultMemberCount: MemberCountFn = { handle in
         try await contextMemberCount(handle: handle)
     }
 
-    internal static let defaultIsMember: IsMemberFn = { handle, did in
+    static let defaultIsMember: IsMemberFn = { handle, did in
         try await contextIsMember(handle: handle, did: did)
     }
 
-    internal static let defaultMemberDids: MemberDidsFn = { handle in
+    static let defaultMemberDids: MemberDidsFn = { handle in
         try await contextMemberDids(handle: handle)
     }
 
-    internal static let defaultMemberRole: MemberRoleFn = { handle, did in
+    static let defaultMemberRole: MemberRoleFn = { handle, did in
         try await contextMemberRole(handle: handle, did: did)
     }
 }
@@ -128,95 +128,94 @@ internal enum MembershipBridge {
 // MARK: - BroadcastBridge
 
 /// Namespace for UniFFI bridge function references used by broadcast operations.
-internal enum BroadcastBridge {
-    internal typealias SubscribeFn = @Sendable (
+enum BroadcastBridge {
+    typealias SubscribeFn = @Sendable (
         _ handle: ContextHandle,
         _ subscriberDid: String
     ) async throws -> Void
 
-    internal typealias UnsubscribeFn = @Sendable (
+    typealias UnsubscribeFn = @Sendable (
         _ handle: ContextHandle,
         _ subscriberDid: String,
         _ rotateKeys: Bool
     ) async throws -> Void
 
-    internal typealias PublishFn = @Sendable (
+    typealias PublishFn = @Sendable (
         _ handle: ContextHandle,
         _ authorDid: String,
         _ payload: Data
     ) async throws -> Void
 
-    internal typealias BlockSubscriberFn = @Sendable (
+    typealias BlockSubscriberFn = @Sendable (
         _ handle: ContextHandle,
         _ subscriberDid: String,
         _ blockerDid: String
     ) async throws -> Void
 
-    internal typealias HandleKeyRequestFn = @Sendable (
+    typealias HandleKeyRequestFn = @Sendable (
         _ handle: ContextHandle,
         _ authorDid: String,
         _ requesterDid: String
     ) async throws -> String
 
-    internal typealias SubscriberCountFn = @Sendable (
+    typealias SubscriberCountFn = @Sendable (
         _ handle: ContextHandle
     ) async throws -> UInt64?
 
-    internal typealias IsSubscriberFn = @Sendable (
+    typealias IsSubscriberFn = @Sendable (
         _ handle: ContextHandle,
         _ did: String
     ) async throws -> Bool
 
-    internal typealias AdmissionFn = @Sendable (
+    typealias AdmissionFn = @Sendable (
         _ handle: ContextHandle
     ) async throws -> String?
 
-    internal static let defaultSubscribe: SubscribeFn = { handle, subscriberDid in
+    static let defaultSubscribe: SubscribeFn = { handle, subscriberDid in
         try await broadcastSubscribe(handle: handle, subscriberDid: subscriberDid)
     }
 
-    internal static let defaultUnsubscribe: UnsubscribeFn = {
+    static let defaultUnsubscribe: UnsubscribeFn = {
         handle, subscriberDid, rotateKeys in
         try await broadcastUnsubscribe(
             handle: handle, subscriberDid: subscriberDid, rotateKeys: rotateKeys
         )
     }
 
-    internal static let defaultPublish: PublishFn = { handle, authorDid, payload in
+    static let defaultPublish: PublishFn = { handle, authorDid, payload in
         try await broadcastPublish(handle: handle, authorDid: authorDid, payload: payload)
     }
 
-    internal static let defaultBlockSubscriber: BlockSubscriberFn = {
+    static let defaultBlockSubscriber: BlockSubscriberFn = {
         handle, subscriberDid, blockerDid in
         try await broadcastBlockSubscriber(
             handle: handle, subscriberDid: subscriberDid, blockerDid: blockerDid
         )
     }
 
-    internal static let defaultHandleKeyRequest: HandleKeyRequestFn = {
+    static let defaultHandleKeyRequest: HandleKeyRequestFn = {
         handle, authorDid, requesterDid in
         try await broadcastHandleKeyRequest(
             handle: handle, authorDid: authorDid, requesterDid: requesterDid
         )
     }
 
-    internal static let defaultSubscriberCount: SubscriberCountFn = { handle in
+    static let defaultSubscriberCount: SubscriberCountFn = { handle in
         try await broadcastSubscriberCount(handle: handle)
     }
 
-    internal static let defaultIsSubscriber: IsSubscriberFn = { handle, did in
+    static let defaultIsSubscriber: IsSubscriberFn = { handle, did in
         try await broadcastIsSubscriber(handle: handle, did: did)
     }
 
-    internal static let defaultAdmission: AdmissionFn = { handle in
+    static let defaultAdmission: AdmissionFn = { handle in
         try await broadcastAdmission(handle: handle)
     }
 }
 
 // MARK: - Context Governance Extensions
 
-extension Context {
-
+public extension Context {
     /// Executes a governance action on this context.
     ///
     /// Delegates to the UniFFI ``governanceExecute`` bridge function.
@@ -227,7 +226,7 @@ extension Context {
     /// - Returns: A ``GovernanceActionResult`` describing the outcome.
     /// - Throws: ``ScpError/Context(message:code:)`` if the context is not
     ///   active or governance execution fails.
-    public func executeGovernanceAction(
+    func executeGovernanceAction(
         proposalJson: String,
         executeFn: GovernanceBridge.ExecuteFn = GovernanceBridge.defaultExecute
     ) async throws -> GovernanceActionResult {
@@ -250,14 +249,13 @@ extension Context {
 
 // MARK: - Context Membership Extensions
 
-extension Context {
-
+public extension Context {
     /// Returns the number of members in this context.
     ///
     /// - Parameter memberCountFn: Bridge function override for testing.
     /// - Returns: The member count, or `nil` if the context is not registered.
     /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active.
-    public func memberCount(
+    func memberCount(
         memberCountFn: MembershipBridge.MemberCountFn = MembershipBridge.defaultMemberCount
     ) async throws -> UInt64? {
         guard state == .active else {
@@ -279,7 +277,7 @@ extension Context {
     ///   - isMemberFn: Bridge function override for testing.
     /// - Returns: `true` if the DID is a member.
     /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active.
-    public func isMember(
+    func isMember(
         did: String,
         isMemberFn: MembershipBridge.IsMemberFn = MembershipBridge.defaultIsMember
     ) async throws -> Bool {
@@ -300,7 +298,7 @@ extension Context {
     /// - Parameter memberDidsFn: Bridge function override for testing.
     /// - Returns: An array of DID strings.
     /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active.
-    public func memberDids(
+    func memberDids(
         memberDidsFn: MembershipBridge.MemberDidsFn = MembershipBridge.defaultMemberDids
     ) async throws -> [String] {
         guard state == .active else {
@@ -322,7 +320,7 @@ extension Context {
     ///   - memberRoleFn: Bridge function override for testing.
     /// - Returns: A ``MemberRole``, or `nil` if the member is not found.
     /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active.
-    public func memberRole(
+    func memberRole(
         did: String,
         memberRoleFn: MembershipBridge.MemberRoleFn = MembershipBridge.defaultMemberRole
     ) async throws -> MemberRole? {
@@ -344,8 +342,7 @@ extension Context {
 
 // MARK: - Context Broadcast Extensions
 
-extension Context {
-
+public extension Context {
     /// Subscribes a DID to this broadcast context.
     ///
     /// - Parameters:
@@ -353,7 +350,7 @@ extension Context {
     ///   - subscribeFn: Bridge function override for testing.
     /// - Throws: ``ScpError/Context(message:code:)`` if the context is not
     ///   active or not a broadcast context.
-    public func broadcastSubscribe(
+    func broadcastSubscribe(
         subscriberDid: String,
         subscribeFn: BroadcastBridge.SubscribeFn = BroadcastBridge.defaultSubscribe
     ) async throws {
@@ -377,7 +374,7 @@ extension Context {
     ///   - unsubscribeFn: Bridge function override for testing.
     /// - Throws: ``ScpError/Context(message:code:)`` if the context is not
     ///   active or not a broadcast context.
-    public func broadcastUnsubscribe(
+    func broadcastUnsubscribe(
         subscriberDid: String,
         rotateKeys: Bool = false,
         unsubscribeFn: BroadcastBridge.UnsubscribeFn = BroadcastBridge.defaultUnsubscribe
@@ -402,7 +399,7 @@ extension Context {
     ///   - publishFn: Bridge function override for testing.
     /// - Throws: ``ScpError/Context(message:code:)`` if the context is not
     ///   active or not a broadcast context.
-    public func broadcastPublish(
+    func broadcastPublish(
         authorDid: String,
         payload: Data,
         publishFn: BroadcastBridge.PublishFn = BroadcastBridge.defaultPublish
@@ -426,7 +423,7 @@ extension Context {
     ///   - blockerDid: The DID of the blocker.
     ///   - blockSubscriberFn: Bridge function override for testing.
     /// - Throws: ``ScpError/Context(message:code:)`` if the operation fails.
-    public func broadcastBlockSubscriber(
+    func broadcastBlockSubscriber(
         subscriberDid: String,
         blockerDid: String,
         blockSubscriberFn: BroadcastBridge.BlockSubscriberFn =
@@ -452,7 +449,7 @@ extension Context {
     ///   - handleKeyRequestFn: Bridge function override for testing.
     /// - Returns: A string describing the key request decision.
     /// - Throws: ``ScpError/Context(message:code:)`` if the operation fails.
-    public func broadcastHandleKeyRequest(
+    func broadcastHandleKeyRequest(
         authorDid: String,
         requesterDid: String,
         handleKeyRequestFn: BroadcastBridge.HandleKeyRequestFn =
@@ -475,7 +472,7 @@ extension Context {
     /// - Parameter subscriberCountFn: Bridge function override for testing.
     /// - Returns: The subscriber count, or `nil` if not a broadcast context.
     /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active.
-    public func broadcastSubscriberCount(
+    func broadcastSubscriberCount(
         subscriberCountFn: BroadcastBridge.SubscriberCountFn =
             BroadcastBridge.defaultSubscriberCount
     ) async throws -> UInt64? {
@@ -498,7 +495,7 @@ extension Context {
     ///   - isSubscriberFn: Bridge function override for testing.
     /// - Returns: `true` if the DID is a subscriber.
     /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active.
-    public func broadcastIsSubscriber(
+    func broadcastIsSubscriber(
         did: String,
         isSubscriberFn: BroadcastBridge.IsSubscriberFn = BroadcastBridge.defaultIsSubscriber
     ) async throws -> Bool {
@@ -519,7 +516,7 @@ extension Context {
     /// - Parameter admissionFn: Bridge function override for testing.
     /// - Returns: The policy (`"Open"` or `"Gated"`), or `nil` if not broadcast.
     /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active.
-    public func broadcastAdmission(
+    func broadcastAdmission(
         admissionFn: BroadcastBridge.AdmissionFn = BroadcastBridge.defaultAdmission
     ) async throws -> String? {
         guard state == .active else {

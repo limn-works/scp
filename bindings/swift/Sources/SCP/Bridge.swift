@@ -102,9 +102,9 @@ public nonisolated struct ShadowIdentityResult: Sendable {
 /// ScpBindings.
 ///
 /// See spec section 12 (Bridge System) and ADR-023.
-internal enum BridgeConnectorBridge {
+enum BridgeConnectorBridge {
     /// Evaluate trust level for a bridge action.
-    internal typealias EvaluateTrustFn = @Sendable (
+    typealias EvaluateTrustFn = @Sendable (
         _ isBridged: Bool,
         _ isNativeTransport: Bool,
         _ shadowStatus: String
@@ -112,7 +112,7 @@ internal enum BridgeConnectorBridge {
 
     /// Default evaluate trust function — delegates to UniFFI
     /// ``bridgeEvaluateTrust``.
-    internal static let defaultEvaluateTrust: EvaluateTrustFn = {
+    static let defaultEvaluateTrust: EvaluateTrustFn = {
         isBridged, isNativeTransport, shadowStatus in
         try bridgeEvaluateTrust(
             isBridged: isBridged,

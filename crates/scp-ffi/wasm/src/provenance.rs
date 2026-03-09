@@ -232,8 +232,9 @@ pub fn evaluate_provenance_quality(
         ));
     };
 
-    let st = SourceType::from_str(&st_str)
-        .ok_or_else(|| JsError::new(&format!("[SCP-VALID-7201] invalid source_type: '{st_str}'")))?;
+    let st = SourceType::from_str(&st_str).ok_or_else(|| {
+        JsError::new(&format!("[SCP-VALID-7201] invalid source_type: '{st_str}'"))
+    })?;
 
     Ok(compute_quality(true, &st, cs, has_counterparties))
 }
@@ -301,8 +302,11 @@ pub fn provenance_attach(
         ))
     })?;
 
-    let counterparties: Vec<String> = serde_json::from_str(&counterparties_json)
-        .map_err(|e| JsError::new(&format!("[SCP-VALID-7214] invalid counterparties JSON: {e}")))?;
+    let counterparties: Vec<String> = serde_json::from_str(&counterparties_json).map_err(|e| {
+        JsError::new(&format!(
+            "[SCP-VALID-7214] invalid counterparties JSON: {e}"
+        ))
+    })?;
 
     // Compute chain depth and path
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

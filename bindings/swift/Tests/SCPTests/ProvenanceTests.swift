@@ -1,7 +1,6 @@
 import Foundation
-import Testing
-
 @testable import SCP
+import Testing
 
 // MARK: - Provenance Tests
 
@@ -9,9 +8,7 @@ import Testing
 /// and provenance attachment via injectable bridge closures.
 ///
 /// See spec section 24 (Provenance System) and ADR-019.
-@Suite("Provenance Tests")
 struct ProvenanceTests {
-
     // MARK: - evaluateProvenanceQuality via injectable bridge (roundtrip)
 
     @Test("evaluateProvenanceQuality calls bridge and returns tier")
@@ -48,7 +45,7 @@ struct ProvenanceTests {
     @Test("evaluateProvenanceQuality returns 0 for unknown state")
     func evaluateQualityUnknown() throws {
         let mockEvaluate: ProvenanceBridge.EvaluateQualityFn = { _, _, _, _ in
-            return 0
+            0
         }
 
         let tier = try evaluateProvenanceQuality(
@@ -89,7 +86,7 @@ struct ProvenanceTests {
         var receivedTargetContextId: String?
 
         let mockAttach: ProvenanceBridge.AttachFn = {
-            sourceContextId, sourceType, memoryScope, members, targetContextId, existingChainDepth in
+            sourceContextId, _, _, _, targetContextId, _ in
             receivedSourceContextId = sourceContextId
             receivedTargetContextId = targetContextId
             return #"{"source_context":"\#(sourceContextId)","target_context":"\#(targetContextId)","chain_depth":0}"#
@@ -137,7 +134,7 @@ struct ProvenanceTests {
     @Test("checkProvenanceChainDepth returns false when exceeded")
     func checkChainDepthExceeded() {
         let mockCheck: ProvenanceBridge.CheckChainDepthFn = { chainDepth, maxDepth in
-            return chainDepth <= (maxDepth ?? 3)
+            chainDepth <= (maxDepth ?? 3)
         }
 
         let withinLimit = checkProvenanceChainDepth(
@@ -147,5 +144,4 @@ struct ProvenanceTests {
 
         #expect(!withinLimit)
     }
-
 } // end ProvenanceTests

@@ -1,6 +1,5 @@
-import Testing
-
 @testable import SCP
+import Testing
 
 // MARK: - Identity Tests
 
@@ -18,9 +17,7 @@ import Testing
 /// stub error propagation through CheckedContinuation.
 ///
 /// See ADR-026 (Swift SDK) and story SCP-102.
-@Suite("Identity Tests")
 struct IdentityTests {
-
     // MARK: - Mock Identity subclass
 
     /// Mock subclass of the UniFFI-generated `Identity` class for testing.
@@ -34,25 +31,30 @@ struct IdentityTests {
         let mockCustodyType: String
 
         init(did: String, custodyType: String) {
-            self.mockDid = did
-            self.mockCustodyType = custodyType
+            mockDid = did
+            mockCustodyType = custodyType
             super.init(noPointer: .init())
         }
 
         required init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
-            self.mockDid = ""
-            self.mockCustodyType = ""
+            mockDid = ""
+            mockCustodyType = ""
             super.init(unsafeFromRawPointer: pointer)
         }
 
-        override func did() -> String { mockDid }
-        override func custodyType() -> String { mockCustodyType }
+        override func did() -> String {
+            mockDid
+        }
+
+        override func custodyType() -> String {
+            mockCustodyType
+        }
     }
 
     // MARK: - Type Shape
 
     @Test("Identity conforms to Sendable")
-    func identityIsSendable() async throws {
+    func identityIsSendable() {
         // Verify that Identity conforms to Sendable by assigning to a
         // Sendable-constrained binding. This is a compile-time check --
         // if Identity is not Sendable, this file will not compile.
@@ -61,19 +63,19 @@ struct IdentityTests {
     }
 
     @Test("Identity DID returns correct string")
-    func identityDidReturnsString() async throws {
+    func identityDidReturnsString() {
         let identity = MockIdentity(did: "did:dht:z6MkTestDid", custodyType: "platform")
         #expect(identity.did() == "did:dht:z6MkTestDid")
     }
 
     @Test("Identity custody type returns correct string")
-    func identityCustodyTypeReturnsString() async throws {
+    func identityCustodyTypeReturnsString() {
         let identity = MockIdentity(did: "did:dht:z6MkTestDid", custodyType: "platform")
         #expect(identity.custodyType() == "platform")
     }
 
     @Test("Identity preserves in_memory custody type")
-    func identityPreservesInMemoryCustodyType() async throws {
+    func identityPreservesInMemoryCustodyType() {
         let identity = MockIdentity(did: "did:dht:z6MkTestDid2", custodyType: "in_memory")
         #expect(identity.custodyType() == "in_memory")
     }
@@ -81,7 +83,7 @@ struct IdentityTests {
     // MARK: - Sendable Crossing
 
     @Test("Identity can cross task boundary")
-    func identityCanCrossTaskBoundary() async throws {
+    func identityCanCrossTaskBoundary() async {
         // Verify that Identity can be sent across task boundaries.
         // This is a compile-time + runtime check for Sendable conformance.
         let identity = MockIdentity(did: "did:dht:z6MkCrossTask", custodyType: "in_memory")
@@ -96,20 +98,20 @@ struct IdentityTests {
     // MARK: - DID Format Validation
 
     @Test("DID format uses did:dht: prefix")
-    func didFormatHasDhtPrefix() async throws {
+    func didFormatHasDhtPrefix() {
         let identity = MockIdentity(did: "did:dht:z6MkValidDid", custodyType: "in_memory")
         #expect(identity.did().hasPrefix("did:dht:"))
     }
 
     @Test("DID format contains z6Mk multibase prefix")
-    func didFormatContainsMultibasePrefix() async throws {
+    func didFormatContainsMultibasePrefix() {
         // SCP uses Ed25519 keys encoded with z-base58 multibase prefix (z6Mk).
         let identity = MockIdentity(did: "did:dht:z6MkSomeKey123", custodyType: "in_memory")
         #expect(identity.did().contains("z6Mk"))
     }
 
     @Test("DID format rejects invalid prefix")
-    func didFormatRejectsInvalidPrefix() async throws {
+    func didFormatRejectsInvalidPrefix() {
         // Identity preserves whatever DID string the bridge returns.
         // This test verifies that a non-standard DID is stored as-is.
         let identity = MockIdentity(did: "invalid:prefix:test", custodyType: "in_memory")
@@ -120,11 +122,10 @@ struct IdentityTests {
     // MARK: - No Force Unwraps Verification
 
     @Test("Identity handles empty DID without crashing")
-    func identityHandlesEmptyDid() async throws {
+    func identityHandlesEmptyDid() {
         // Verify that Identity handles edge cases without force unwrapping.
         let identity = MockIdentity(did: "", custodyType: "")
         #expect(identity.did() == "")
         #expect(identity.custodyType() == "")
     }
-
 } // end IdentityTests

@@ -1,7 +1,6 @@
 import Foundation
-import Testing
-
 @testable import SCP
+import Testing
 
 // MARK: - Trust Tests
 
@@ -17,16 +16,14 @@ import Testing
 /// with mock inputs.
 ///
 /// See ADR-017 (Trust Model), ADR-026 (Swift SDK), and story SCP-221.
-@Suite("Trust Tests")
 struct TrustTests {
-
     // MARK: - TrustEvaluation type shape
 
     @Test("TrustEvaluation stores all four-layer fields")
     func trustEvaluationFields() {
         let record = BehavioralRecord(
             contextsParticipated: 5,
-            totalDurationSecs: 3_600,
+            totalDurationSecs: 3600,
             governanceActionsAgainst: 0,
             toolInvocations: 10,
             roleTransitions: 1
@@ -71,7 +68,7 @@ struct TrustTests {
     }
 
     @Test("TrustEvaluation is Sendable")
-    func trustEvaluationIsSendable() async {
+    func trustEvaluationIsSendable() {
         let eval: any Sendable = TrustEvaluation(
             tokensValid: true,
             signaturesValid: true,
@@ -91,21 +88,21 @@ struct TrustTests {
     func behavioralRecordFields() {
         let record = BehavioralRecord(
             contextsParticipated: 10,
-            totalDurationSecs: 86_400,
+            totalDurationSecs: 86400,
             governanceActionsAgainst: 2,
             toolInvocations: 50,
             roleTransitions: 3
         )
 
         #expect(record.contextsParticipated == 10)
-        #expect(record.totalDurationSecs == 86_400)
+        #expect(record.totalDurationSecs == 86400)
         #expect(record.governanceActionsAgainst == 2)
         #expect(record.toolInvocations == 50)
         #expect(record.roleTransitions == 3)
     }
 
     @Test("BehavioralRecord is Sendable")
-    func behavioralRecordIsSendable() async {
+    func behavioralRecordIsSendable() {
         let record: any Sendable = BehavioralRecord(
             contextsParticipated: 0,
             totalDurationSecs: 0,
@@ -157,7 +154,7 @@ struct TrustTests {
                 notRevoked: true,
                 behavioralRecord: BehavioralRecord(
                     contextsParticipated: 7,
-                    totalDurationSecs: 14_400,
+                    totalDurationSecs: 14400,
                     governanceActionsAgainst: 0,
                     toolInvocations: 25,
                     roleTransitions: 2
@@ -275,7 +272,7 @@ struct TrustTests {
     @Test("verifyAttestation returns invalid result for bad attestation")
     func verifyAttestationInvalid() throws {
         let mockVerify: TrustBridge.VerifyAttestationFn = { _ in
-            return AttestationVerificationResult(
+            AttestationVerificationResult(
                 valid: false,
                 chainDepth: 0,
                 errorMessage: "signature verification failed"
@@ -343,7 +340,7 @@ struct TrustTests {
     @Test("verifyChallengeResponse returns false for invalid response")
     func verifyChallengeResponseInvalid() throws {
         let mockVerify: TrustBridge.VerifyResponseFn = { _, _ in
-            return false
+            false
         }
 
         let result = try verifyChallengeResponse(
@@ -354,5 +351,4 @@ struct TrustTests {
 
         #expect(!result)
     }
-
 } // end TrustTests

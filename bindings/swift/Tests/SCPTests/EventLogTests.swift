@@ -1,7 +1,6 @@
 import Foundation
-import Testing
-
 @testable import SCP
+import Testing
 
 // MARK: - Event Log Tests
 
@@ -15,9 +14,7 @@ import Testing
 /// pattern works end-to-end without a real UniFFI binary.
 ///
 /// See ADR-011 (Event Log), ADR-026 (Swift SDK), and story SCP-221.
-@Suite("Event Log Tests")
 struct EventLogTests {
-
     // MARK: - Event type shape (UniFFI struct)
 
     @Test("Event stores all fields correctly")
@@ -51,7 +48,7 @@ struct EventLogTests {
     }
 
     @Test("Event is Sendable")
-    func eventIsSendable() async {
+    func eventIsSendable() {
         let event: any Sendable = Event(
             eventType: "test",
             actorDid: "did:dht:z6MkTest",
@@ -129,7 +126,7 @@ struct EventLogTests {
     }
 
     @Test("Checkpoint is Sendable")
-    func checkpointIsSendable() async {
+    func checkpointIsSendable() {
         let checkpoint: any Sendable = Checkpoint(
             contextId: "ctx",
             senderDid: "did:dht:z6Mk",
@@ -152,7 +149,7 @@ struct EventLogTests {
     }
 
     @Test("EventLog is Sendable")
-    func eventLogIsSendable() async {
+    func eventLogIsSendable() {
         let handle = EventLogHandle(contextId: "ctx-sendable")
         let log: any Sendable = EventLog(handle: handle)
         #expect(log is EventLog)
@@ -205,7 +202,7 @@ struct EventLogTests {
             _ = try await log.query(fromSequence: 0, limit: 10)
             Issue.record("Expected query to throw")
         } catch let error as ScpError {
-            if case .Context(_, let code) = error {
+            if case let .Context(_, code) = error {
                 #expect(code == "SCP-CTX-2030")
             } else {
                 Issue.record("Expected ScpError.Context, got \(error)")
@@ -250,7 +247,7 @@ struct EventLogTests {
             _ = try await log.proveInclusion(leafIndex: 0)
             Issue.record("Expected proveInclusion to throw")
         } catch let error as ScpError {
-            if case .Context(_, let code) = error {
+            if case let .Context(_, code) = error {
                 #expect(code == "SCP-CTX-2031")
             } else {
                 Issue.record("Expected ScpError.Context, got \(error)")
@@ -273,5 +270,4 @@ struct EventLogTests {
         #expect(validResult == true)
         #expect(invalidResult == false)
     }
-
 } // end EventLogTests

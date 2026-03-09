@@ -35,8 +35,8 @@ public nonisolated struct TransportConfig: Sendable {
     public init(
         relayUrls: [String] = [],
         bootstrapDomain: String? = nil,
-        dedupCacheSize: Int = 10_000,
-        dedupCacheTtlSecs: UInt64 = 3_600
+        dedupCacheSize: Int = 10000,
+        dedupCacheTtlSecs: UInt64 = 3600
     ) {
         self.relayUrls = relayUrls
         self.bootstrapDomain = bootstrapDomain
@@ -62,24 +62,24 @@ public nonisolated struct TransportConfig: Sendable {
 /// injected for testability; defaults call through to ScpBindings.
 ///
 /// See ADR-026 for the flat delegation pattern and ADR-005 for transport spec.
-internal enum TransportBridge {
+enum TransportBridge {
     /// Connect to a relay. Maps to ``transportConnect`` in ScpBindings.
-    internal typealias ConnectFn = @Sendable (
+    typealias ConnectFn = @Sendable (
         _ relayUrl: String
     ) async throws -> TransportManager
 
     /// Query transport status. Maps to ``transportStatus`` in ScpBindings.
-    internal typealias StatusFn = @Sendable (
+    typealias StatusFn = @Sendable (
         _ manager: TransportManager
     ) async throws -> TransportStatus
 
     /// Default connect function that delegates to the UniFFI-generated binding.
-    internal static let defaultConnect: ConnectFn = { relayUrl in
+    static let defaultConnect: ConnectFn = { relayUrl in
         try await transportConnect(relayUrl: relayUrl)
     }
 
     /// Default status function that delegates to the UniFFI-generated binding.
-    internal static let defaultStatus: StatusFn = { manager in
+    static let defaultStatus: StatusFn = { manager in
         try await transportStatus(manager: manager)
     }
 }

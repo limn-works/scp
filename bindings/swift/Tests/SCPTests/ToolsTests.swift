@@ -1,7 +1,6 @@
 import Foundation
-import Testing
-
 @testable import SCP
+import Testing
 
 // MARK: - Tools Tests
 
@@ -17,9 +16,7 @@ import Testing
 ///
 /// See ADR-026 (Swift SDK), `.docs/scaffold/shared.md` conformance testing,
 /// and story SCP-221.
-@Suite("Tools Tests")
 struct ToolsTests {
-
     // MARK: - Helpers
 
     /// Creates a mock ``Context`` with injectable bridge functions for testing.
@@ -83,7 +80,7 @@ struct ToolsTests {
     }
 
     @Test("ToolDefinition is Sendable")
-    func toolDefinitionIsSendable() async {
+    func toolDefinitionIsSendable() {
         let definition: any Sendable = ToolDefinition(
             name: "sendable-tool",
             description: "Test",
@@ -99,7 +96,7 @@ struct ToolsTests {
     // MARK: - TestVector type shape (hand-written, not UniFFI)
 
     @Test("TestVector stores input and expected output")
-    func testVectorFields() {
+    func vectorFields() {
         let vector = TestVector(
             input: #"{"operands": [2, 3]}"#,
             expectedOutput: #"{"sum": 5}"#
@@ -109,7 +106,7 @@ struct ToolsTests {
     }
 
     @Test("TestVector is Sendable")
-    func testVectorIsSendable() async {
+    func vectorIsSendable() {
         let vector: any Sendable = TestVector(input: "{}", expectedOutput: "{}")
         #expect(vector is TestVector)
     }
@@ -198,7 +195,7 @@ struct ToolsTests {
             _ = try await context.invokeTool("calculator", input: Data("{}".utf8))
             Issue.record("Expected invokeTool to throw on closed context")
         } catch let error as ScpError {
-            if case .Context(_, let code) = error {
+            if case let .Context(_, code) = error {
                 #expect(code == "SCP-CTX-2001")
             } else {
                 Issue.record("Expected ScpError.Context, got \(error)")
@@ -262,7 +259,7 @@ struct ToolsTests {
             _ = try await context.registerTool(definition)
             Issue.record("Expected registerTool to throw on closed context")
         } catch let error as ScpError {
-            if case .Context(_, let code) = error {
+            if case let .Context(_, code) = error {
                 #expect(code == "SCP-CTX-2001")
             } else {
                 Issue.record("Expected ScpError.Context, got \(error)")
@@ -309,7 +306,7 @@ struct ToolsTests {
             _ = try await context.verifyTool("calculator")
             Issue.record("Expected verifyTool to throw on closed context")
         } catch let error as ScpError {
-            if case .Context(_, let code) = error {
+            if case let .Context(_, code) = error {
                 #expect(code == "SCP-CTX-2001")
             } else {
                 Issue.record("Expected ScpError.Context, got \(error)")
@@ -322,7 +319,7 @@ struct ToolsTests {
     // MARK: - Test vector verification
 
     @Test("ToolDefinition with test vectors JSON preserves data")
-    func toolDefinitionPreservesTestVectors() {
+    func toolDefinitionPreservesTestVectors() throws {
         let vectorsJson = #"[{"input": {"a": 1, "b": 2}, "expected_output": {"sum": 3}}, {"input": {"a": 10, "b": 20}, "expected_output": {"sum": 30}}]"#
         let definition = ToolDefinition(
             name: "add",
@@ -335,7 +332,7 @@ struct ToolsTests {
         )
 
         #expect(definition.testVectorsJson != nil)
-        #expect(definition.testVectorsJson!.contains("sum"))
+        #expect(try #require(definition.testVectorsJson?.contains("sum")))
     }
 
     // MARK: - ToolSessionResult type shape
@@ -407,7 +404,7 @@ struct ToolsTests {
             )
             Issue.record("Expected error for closed source context")
         } catch let error as ScpError {
-            if case .Context(_, let code) = error {
+            if case let .Context(_, code) = error {
                 #expect(code == "SCP-CTX-2001")
             } else {
                 Issue.record("Expected ScpError.Context, got \(error)")
@@ -530,7 +527,7 @@ struct ToolsTests {
             )
             Issue.record("Expected error for closed context")
         } catch let error as ScpError {
-            if case .Context(_, let code) = error {
+            if case let .Context(_, code) = error {
                 #expect(code == "SCP-CTX-2001")
             } else {
                 Issue.record("Expected ScpError.Context, got \(error)")
@@ -539,7 +536,6 @@ struct ToolsTests {
             Issue.record("Expected ScpError, got \(type(of: error))")
         }
     }
-
 } // end ToolsTests
 
 // MARK: - Mock ContextHandle for Tool Tests
@@ -553,10 +549,18 @@ private final class MockToolContextHandle: ContextHandleProtocol, @unchecked Sen
     init(id: String = "tool-test-ctx", creator: String = "did:dht:z6MkCreator", state: String = "active") {
         self.id = id
         self.creator = creator
-        self.initialState = state
+        initialState = state
     }
 
-    func contextId() -> String { id }
-    func creatorDid() -> String { creator }
-    func state() throws -> String { initialState }
+    func contextId() -> String {
+        id
+    }
+
+    func creatorDid() -> String {
+        creator
+    }
+
+    func state() throws -> String {
+        initialState
+    }
 }

@@ -70,9 +70,9 @@ public nonisolated struct ToolSessionResult: Sendable {
 /// injected for testability; defaults call through to ScpBindings.
 ///
 /// See ADR-026 for the flat delegation pattern and ADR-011 for tool spec.
-internal enum ToolBridge {
+enum ToolBridge {
     /// Invoke a tool. Maps to ``toolInvoke`` in ScpBindings.
-    internal typealias InvokeFn = @Sendable (
+    typealias InvokeFn = @Sendable (
         _ handle: ContextHandle,
         _ toolId: String,
         _ inputJson: String,
@@ -80,19 +80,19 @@ internal enum ToolBridge {
     ) async throws -> String
 
     /// Register a tool. Maps to ``toolRegister`` in ScpBindings.
-    internal typealias RegisterFn = @Sendable (
+    typealias RegisterFn = @Sendable (
         _ handle: ContextHandle,
         _ definition: ToolDefinition
     ) async throws -> String
 
     /// Verify a tool. Maps to ``toolVerify`` in ScpBindings.
-    internal typealias VerifyFn = @Sendable (
+    typealias VerifyFn = @Sendable (
         _ handle: ContextHandle,
         _ toolId: String
     ) async throws -> ToolVerificationResult
 
     /// Invoke a tool across context boundaries (spec section 6.2).
-    internal typealias InvokeCrossContextFn = @Sendable (
+    typealias InvokeCrossContextFn = @Sendable (
         _ sourceHandle: ContextHandle,
         _ targetHandle: ContextHandle,
         _ toolId: String,
@@ -102,7 +102,7 @@ internal enum ToolBridge {
     ) async throws -> String
 
     /// Create a stateful tool session (spec section 6.2.1).
-    internal typealias SessionCreateFn = @Sendable (
+    typealias SessionCreateFn = @Sendable (
         _ handle: ContextHandle,
         _ toolId: String,
         _ sourceContextId: String,
@@ -110,7 +110,7 @@ internal enum ToolBridge {
     ) async throws -> String
 
     /// Invoke a tool within an active session.
-    internal typealias SessionInvokeFn = @Sendable (
+    typealias SessionInvokeFn = @Sendable (
         _ handle: ContextHandle,
         _ sessionId: String,
         _ inputJson: String,
@@ -118,28 +118,28 @@ internal enum ToolBridge {
     ) async throws -> String
 
     /// Close a stateful tool session.
-    internal typealias SessionCloseFn = @Sendable (
+    typealias SessionCloseFn = @Sendable (
         _ handle: ContextHandle,
         _ sessionId: String
     ) async throws -> Void
 
     /// Default invoke function that delegates to the UniFFI-generated binding.
-    internal static let defaultInvoke: InvokeFn = { handle, toolId, inputJson, identity in
+    static let defaultInvoke: InvokeFn = { handle, toolId, inputJson, identity in
         try await toolInvoke(handle: handle, toolId: toolId, inputJson: inputJson, identity: identity)
     }
 
     /// Default register function that delegates to the UniFFI-generated binding.
-    internal static let defaultRegister: RegisterFn = { handle, definition in
+    static let defaultRegister: RegisterFn = { handle, definition in
         try await toolRegister(handle: handle, definition: definition)
     }
 
     /// Default verify function that delegates to the UniFFI-generated binding.
-    internal static let defaultVerify: VerifyFn = { handle, toolId in
+    static let defaultVerify: VerifyFn = { handle, toolId in
         try await toolVerify(handle: handle, toolId: toolId)
     }
 
     /// Default cross-context invoke function — delegates to UniFFI.
-    internal static let defaultInvokeCrossContext: InvokeCrossContextFn = {
+    static let defaultInvokeCrossContext: InvokeCrossContextFn = {
         sourceHandle, targetHandle, toolId, inputJson, identity, chainDepth in
         try await toolInvokeCrossContext(
             sourceHandle: sourceHandle,
@@ -152,7 +152,7 @@ internal enum ToolBridge {
     }
 
     /// Default session create function — delegates to UniFFI.
-    internal static let defaultSessionCreate: SessionCreateFn = {
+    static let defaultSessionCreate: SessionCreateFn = {
         handle, toolId, sourceContextId, ttlSeconds in
         try await toolSessionCreate(
             handle: handle,
@@ -163,7 +163,7 @@ internal enum ToolBridge {
     }
 
     /// Default session invoke function — delegates to UniFFI.
-    internal static let defaultSessionInvoke: SessionInvokeFn = {
+    static let defaultSessionInvoke: SessionInvokeFn = {
         handle, sessionId, inputJson, identity in
         try await toolSessionInvoke(
             handle: handle,
@@ -174,7 +174,7 @@ internal enum ToolBridge {
     }
 
     /// Default session close function — delegates to UniFFI.
-    internal static let defaultSessionClose: SessionCloseFn = { handle, sessionId in
+    static let defaultSessionClose: SessionCloseFn = { handle, sessionId in
         try await toolSessionClose(handle: handle, sessionId: sessionId)
     }
 }
@@ -182,8 +182,7 @@ internal enum ToolBridge {
 // MARK: - Context Tool Extensions
 
 /// Tool invocation and management extensions for ``Context``.
-extension Context {
-
+public extension Context {
     /// Invokes a registered tool in this context.
     ///
     /// Delegates to the UniFFI ``toolInvoke`` bridge function. The input Data
@@ -205,7 +204,7 @@ extension Context {
     /// - ADR-011 (Event Log) in `.docs/adrs/phase-2.md`
     /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
     /// - Story SCP-221
-    public func invokeTool(
+    func invokeTool(
         _ tool: String,
         input: Data,
         invokeFn: ToolBridge.InvokeFn = ToolBridge.defaultInvoke
@@ -229,7 +228,7 @@ extension Context {
             output: Data(outputJson.utf8),
             invokerDid: contextHandle.creatorDid(),
             contextId: contextId,
-            timestamp: UInt64(Date().timeIntervalSince1970 * 1_000)
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000)
         )
     }
 
@@ -248,7 +247,7 @@ extension Context {
     ///
     /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
     /// - Story SCP-221
-    public func registerTool(
+    func registerTool(
         _ definition: ToolDefinition,
         registerFn: ToolBridge.RegisterFn = ToolBridge.defaultRegister
     ) async throws -> String {
@@ -283,7 +282,7 @@ extension Context {
     ///
     /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
     /// - Story SCP-221
-    public func verifyTool(
+    func verifyTool(
         _ tool: String,
         verifyFn: ToolBridge.VerifyFn = ToolBridge.defaultVerify
     ) async throws -> ToolVerificationResult {
@@ -325,7 +324,7 @@ extension Context {
     ///
     /// - Spec section 6.2 (Cross-Context Tool Interfaces)
     /// - Story #322
-    public func invokeToolCrossContext(
+    func invokeToolCrossContext(
         _ tool: String,
         input: Data,
         targetContext: Context,
@@ -359,7 +358,7 @@ extension Context {
             output: Data(outputJson.utf8),
             invokerDid: sourceHandle.creatorDid(),
             contextId: contextId,
-            timestamp: UInt64(Date().timeIntervalSince1970 * 1_000)
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000)
         )
     }
 
@@ -381,7 +380,7 @@ extension Context {
     ///
     /// - Spec section 6.2.1 (Stateful Tool Sessions)
     /// - Story #322
-    public func createToolSession(
+    func createToolSession(
         toolId: String,
         sourceContextId: String,
         ttlSeconds: UInt64,
@@ -424,7 +423,7 @@ extension Context {
     ///
     /// - Spec section 6.2.1 (Stateful Tool Sessions)
     /// - Story #322
-    public func invokeToolSession(
+    func invokeToolSession(
         sessionId: String,
         input: Data,
         sessionInvokeFn: ToolBridge.SessionInvokeFn = ToolBridge.defaultSessionInvoke
@@ -450,7 +449,7 @@ extension Context {
             output: Data(outputJson.utf8),
             invokerDid: contextHandle.creatorDid(),
             contextId: contextId,
-            timestamp: UInt64(Date().timeIntervalSince1970 * 1_000)
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000)
         )
     }
 
@@ -470,7 +469,7 @@ extension Context {
     ///
     /// - Spec section 6.2.1 (Stateful Tool Sessions)
     /// - Story #322
-    public func closeToolSession(
+    func closeToolSession(
         sessionId: String,
         sessionCloseFn: ToolBridge.SessionCloseFn = ToolBridge.defaultSessionClose
     ) async throws {

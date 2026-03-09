@@ -1,7 +1,6 @@
 import Foundation
-import Testing
-
 @testable import SCP
+import Testing
 
 // MARK: - Bridge Tests
 
@@ -9,9 +8,7 @@ import Testing
 /// bridge closures.
 ///
 /// See spec section 12 (Bridge System) and ADR-023 (Bridge Connector).
-@Suite("Bridge Tests")
 struct BridgeTests {
-
     // MARK: - BridgeRegistrationResult type shape
 
     @Test("BridgeRegistrationResult stores all fields")
@@ -34,7 +31,7 @@ struct BridgeTests {
     }
 
     @Test("BridgeRegistrationResult is Sendable")
-    func bridgeRegistrationResultIsSendable() async {
+    func bridgeRegistrationResultIsSendable() {
         let result: any Sendable = BridgeRegistrationResult(
             bridgeId: "bridge-001",
             operatorDid: "did:dht:z6MkOp",
@@ -97,7 +94,7 @@ struct BridgeTests {
     @Test("evaluateBridgeTrust returns 0 for native-native")
     func evaluateBridgeTrustNativeNative() throws {
         let mockEvaluate: BridgeConnectorBridge.EvaluateTrustFn = { _, _, _ in
-            return 0
+            0
         }
 
         let tier = try evaluateBridgeTrust(
@@ -113,7 +110,7 @@ struct BridgeTests {
     @Test("evaluateBridgeTrust returns 3 for shadow-bridged")
     func evaluateBridgeTrustShadowBridged() throws {
         let mockEvaluate: BridgeConnectorBridge.EvaluateTrustFn = { _, _, _ in
-            return 3
+            3
         }
 
         let tier = try evaluateBridgeTrust(
@@ -125,5 +122,4 @@ struct BridgeTests {
 
         #expect(tier == 3)
     }
-
 } // end BridgeTests

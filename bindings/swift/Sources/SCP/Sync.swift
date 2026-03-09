@@ -8,15 +8,15 @@ import Foundation
 /// ScpBindings.
 ///
 /// See ADR-029 in `.docs/adrs/phase-6.md`.
-internal enum SyncBridge {
+enum SyncBridge {
     /// Classify offline duration into a tier.
-    internal typealias ClassifyOfflineFn = @Sendable (
+    typealias ClassifyOfflineFn = @Sendable (
         _ lastRelayContact: UInt64,
         _ now: UInt64
     ) -> String
 
     /// Classify offline duration with custom thresholds.
-    internal typealias ClassifyOfflineCustomFn = @Sendable (
+    typealias ClassifyOfflineCustomFn = @Sendable (
         _ lastRelayContact: UInt64,
         _ now: UInt64,
         _ tier1ThresholdSecs: UInt64,
@@ -25,14 +25,14 @@ internal enum SyncBridge {
 
     /// Default classify offline function — delegates to UniFFI
     /// ``syncClassifyOffline``.
-    internal static let defaultClassifyOffline: ClassifyOfflineFn = {
+    static let defaultClassifyOffline: ClassifyOfflineFn = {
         lastRelayContact, now in
         syncClassifyOffline(lastRelayContact: lastRelayContact, now: now)
     }
 
     /// Default classify offline custom function — delegates to UniFFI
     /// ``syncClassifyOfflineCustom``.
-    internal static let defaultClassifyOfflineCustom: ClassifyOfflineCustomFn = {
+    static let defaultClassifyOfflineCustom: ClassifyOfflineCustomFn = {
         lastRelayContact, now, tier1ThresholdSecs, tier2ThresholdSecs in
         syncClassifyOfflineCustom(
             lastRelayContact: lastRelayContact,

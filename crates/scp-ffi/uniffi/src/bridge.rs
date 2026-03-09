@@ -5741,13 +5741,9 @@ mod tests {
             callback_custody: None,
             signing_key: None,
             ceiling_strings: Vec::new(),
-            tool_registry: tokio::sync::Mutex::new(
-                scp_core::context::tools::ToolRegistry::new(),
-            ),
+            tool_registry: tokio::sync::Mutex::new(scp_core::context::tools::ToolRegistry::new()),
             tool_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-            session_store: tokio::sync::Mutex::new(
-                scp_core::context::tools::SessionStore::new(),
-            ),
+            session_store: tokio::sync::Mutex::new(scp_core::context::tools::SessionStore::new()),
         })
     }
 

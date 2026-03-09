@@ -1,7 +1,6 @@
 import Foundation
-import Testing
-
 @testable import SCP
+import Testing
 
 // MARK: - Discovery Tests
 
@@ -9,9 +8,7 @@ import Testing
 /// address normalization via injectable bridge closures.
 ///
 /// See ADR-020 in `.docs/adrs/phase-4.md` and spec section 22 (Addressing).
-@Suite("Discovery Tests")
 struct DiscoveryTests {
-
     // MARK: - parseAddress via injectable bridge (roundtrip)
 
     @Test("parseAddress calls bridge and returns parsed JSON")
@@ -82,7 +79,7 @@ struct DiscoveryTests {
     @Test("createDiscoveryQuery works with nil parameters")
     func createDiscoveryQueryNilParams() throws {
         let mockCreate: DiscoveryBridge.CreateQueryFn = { _, _, _ in
-            return #"{"capabilities":null,"keywords":null}"#
+            #"{"capabilities":null,"keywords":null}"#
         }
 
         let result = try createDiscoveryQuery(createQueryFn: mockCreate)
@@ -108,5 +105,4 @@ struct DiscoveryTests {
         #expect(receivedAddress == "  ALICE@Cooking  ")
         #expect(result == "alice@cooking")
     }
-
 } // end DiscoveryTests

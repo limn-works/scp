@@ -1,7 +1,6 @@
 import Foundation
-import Testing
-
 @testable import SCP
+import Testing
 
 // MARK: - Conformance Tests
 
@@ -19,14 +18,12 @@ import Testing
 ///
 /// See `.docs/scaffold/shared.md` section "Conformance Testing" and story
 /// SCP-102.
-@Suite("Conformance Tests")
 struct ConformanceTests {
-
     // MARK: - ConformanceFixture model
 
     /// A single conformance test fixture, matching the JSON format defined
     /// in `.docs/scaffold/shared.md`.
-    private struct ConformanceFixture: Sendable {
+    private struct ConformanceFixture {
         let testId: String
         let category: String
         let description: String
@@ -59,7 +56,6 @@ struct ConformanceTests {
         input: [String: String]
     ) async -> [String: String] {
         switch operation {
-
         case "ucan_validate":
             let encoded = input["encoded"] ?? ""
             let contextId = input["context_id"] ?? ""
@@ -184,13 +180,13 @@ struct ConformanceTests {
     /// Extracts the machine-readable error code from an ``ScpError``.
     private func errorCode(_ error: ScpError) -> String {
         switch error {
-        case .Identity(_, let code): code
-        case .Context(_, let code): code
-        case .Permission(_, let code): code
-        case .Crypto(_, let code): code
-        case .Transport(_, let code): code
-        case .Tool(_, let code): code
-        case .Validation(_, let code): code
+        case let .Identity(_, code): code
+        case let .Context(_, code): code
+        case let .Permission(_, code): code
+        case let .Crypto(_, code): code
+        case let .Transport(_, code): code
+        case let .Tool(_, code): code
+        case let .Validation(_, code): code
         }
     }
 
@@ -399,5 +395,4 @@ struct ConformanceTests {
             )
         }
     }
-
 } // end ConformanceTests

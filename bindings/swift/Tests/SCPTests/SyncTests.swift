@@ -1,7 +1,6 @@
 import Foundation
-import Testing
-
 @testable import SCP
+import Testing
 
 // MARK: - Sync Tests
 
@@ -9,9 +8,7 @@ import Testing
 /// closures.
 ///
 /// See ADR-029 in `.docs/adrs/phase-6.md`.
-@Suite("Sync Tests")
 struct SyncTests {
-
     // MARK: - classifyOffline via injectable bridge (roundtrip)
 
     @Test("classifyOffline calls bridge and returns tier string")
@@ -23,7 +20,7 @@ struct SyncTests {
             receivedLastContact = lastRelayContact
             receivedNow = now
             let elapsed = now - lastRelayContact
-            if elapsed < 14_400 { return "short" }
+            if elapsed < 14400 { return "short" }
             if elapsed < 604_800 { return "extended" }
             return "long"
         }
@@ -43,7 +40,7 @@ struct SyncTests {
     func classifyOfflineExtended() {
         let mockClassify: SyncBridge.ClassifyOfflineFn = { lastRelayContact, now in
             let elapsed = now - lastRelayContact
-            if elapsed < 14_400 { return "short" }
+            if elapsed < 14400 { return "short" }
             if elapsed < 604_800 { return "extended" }
             return "long"
         }
@@ -62,7 +59,7 @@ struct SyncTests {
     func classifyOfflineLong() {
         let mockClassify: SyncBridge.ClassifyOfflineFn = { lastRelayContact, now in
             let elapsed = now - lastRelayContact
-            if elapsed < 14_400 { return "short" }
+            if elapsed < 14400 { return "short" }
             if elapsed < 604_800 { return "extended" }
             return "long"
         }
@@ -127,5 +124,4 @@ struct SyncTests {
 
         #expect(tier == "long")
     }
-
 } // end SyncTests

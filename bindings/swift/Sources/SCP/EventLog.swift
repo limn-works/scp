@@ -66,7 +66,7 @@ public nonisolated struct Checkpoint: Sendable {
 /// Holds either a real ``ContextHandle`` for UniFFI bridge calls or a
 /// standalone context ID for testing. When the XCFramework is available,
 /// all event log operations delegate through the ``ContextHandle``.
-internal final class EventLogHandle: Sendable {
+final class EventLogHandle: Sendable {
     /// The context ID this event log belongs to.
     let contextId: String
 
@@ -76,12 +76,12 @@ internal final class EventLogHandle: Sendable {
     /// Creates an ``EventLogHandle`` for the given context.
     init(contextId: String) {
         self.contextId = contextId
-        self.contextHandle = nil
+        contextHandle = nil
     }
 
     /// Creates an ``EventLogHandle`` backed by a UniFFI context handle.
     init(contextHandle: ContextHandle) {
-        self.contextId = contextHandle.contextId()
+        contextId = contextHandle.contextId()
         self.contextHandle = contextHandle
     }
 }
@@ -93,26 +93,26 @@ internal final class EventLogHandle: Sendable {
 /// injected for testability; defaults call through to ScpBindings.
 ///
 /// See ADR-026 for the flat delegation pattern and ADR-011 for event log spec.
-internal enum EventLogBridge {
+enum EventLogBridge {
     /// Query events from a context's event log. Maps to ``eventLogQuery``.
-    internal typealias QueryFn = @Sendable (
+    typealias QueryFn = @Sendable (
         _ handle: ContextHandle,
         _ filterJson: String?
     ) async throws -> [Event]
 
     /// Verify an event log claim. Maps to ``eventLogVerify``.
-    internal typealias VerifyFn = @Sendable (
+    typealias VerifyFn = @Sendable (
         _ handle: ContextHandle,
         _ claimJson: String
     ) async throws -> Proof
 
     /// Default query function that delegates to the UniFFI-generated binding.
-    internal static let defaultQuery: QueryFn = { handle, filterJson in
+    static let defaultQuery: QueryFn = { handle, filterJson in
         try await eventLogQuery(handle: handle, filterJson: filterJson)
     }
 
     /// Default verify function that delegates to the UniFFI-generated binding.
-    internal static let defaultVerify: VerifyFn = { handle, claimJson in
+    static let defaultVerify: VerifyFn = { handle, claimJson in
         try await eventLogVerify(handle: handle, claimJson: claimJson)
     }
 }
@@ -145,12 +145,12 @@ public nonisolated struct EventLog: Sendable {
     private let verifyFn: EventLogBridge.VerifyFn
 
     /// Creates an ``EventLog`` from an internal ``EventLogHandle``.
-    internal init(
+    init(
         handle: EventLogHandle,
         queryFn: @escaping EventLogBridge.QueryFn = EventLogBridge.defaultQuery,
         verifyFn: @escaping EventLogBridge.VerifyFn = EventLogBridge.defaultVerify
     ) {
-        self.contextId = handle.contextId
+        contextId = handle.contextId
         self.handle = handle
         self.queryFn = queryFn
         self.verifyFn = verifyFn

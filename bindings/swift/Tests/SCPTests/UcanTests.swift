@@ -1,7 +1,6 @@
 import Foundation
-import Testing
-
 @testable import SCP
+import Testing
 
 // MARK: - UCAN Tests
 
@@ -20,9 +19,7 @@ import Testing
 /// pattern works end-to-end without a real UniFFI binary.
 ///
 /// See ADR-016 (UCAN), ADR-026 (Swift SDK), and story SCP-221.
-@Suite("UCAN Tests")
 struct UcanTests {
-
     // MARK: - Mock UcanToken subclass
 
     /// Mock subclass of the UniFFI-generated `UcanToken` class for testing.
@@ -40,28 +37,42 @@ struct UcanTests {
             tokenId: String = "token-\(UUID().uuidString)",
             capabilities: [String] = []
         ) {
-            self.mockIssuer = issuer
-            self.mockAudience = audience
-            self.mockExpiry = expiry
-            self.mockTokenId = tokenId
-            self.mockCapabilities = capabilities
+            mockIssuer = issuer
+            mockAudience = audience
+            mockExpiry = expiry
+            mockTokenId = tokenId
+            mockCapabilities = capabilities
             super.init(noPointer: .init())
         }
 
         required init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
-            self.mockIssuer = ""
-            self.mockAudience = ""
-            self.mockExpiry = nil
-            self.mockTokenId = ""
-            self.mockCapabilities = []
+            mockIssuer = ""
+            mockAudience = ""
+            mockExpiry = nil
+            mockTokenId = ""
+            mockCapabilities = []
             super.init(unsafeFromRawPointer: pointer)
         }
 
-        override func issuer() -> String { mockIssuer }
-        override func audience() -> String { mockAudience }
-        override func expiresAt() -> UInt64? { mockExpiry }
-        override func tokenId() -> String { mockTokenId }
-        override func capabilities() -> [String] { mockCapabilities }
+        override func issuer() -> String {
+            mockIssuer
+        }
+
+        override func audience() -> String {
+            mockAudience
+        }
+
+        override func expiresAt() -> UInt64? {
+            mockExpiry
+        }
+
+        override func tokenId() -> String {
+            mockTokenId
+        }
+
+        override func capabilities() -> [String] {
+            mockCapabilities
+        }
     }
 
     // MARK: - UcanToken type shape
@@ -94,7 +105,7 @@ struct UcanTests {
     }
 
     @Test("UcanToken is Sendable")
-    func ucanTokenIsSendable() async {
+    func ucanTokenIsSendable() {
         let token: any Sendable = MockUcanToken(
             issuer: "did:dht:z6MkIssuer",
             audience: "did:dht:z6MkAudience",
@@ -125,7 +136,7 @@ struct UcanTests {
     }
 
     @Test("UcanCapability is Sendable")
-    func ucanCapabilityIsSendable() async {
+    func ucanCapabilityIsSendable() {
         let cap: any Sendable = UcanCapability(resource: "scp:ctx:x", action: "read")
         #expect(cap is UcanCapability)
     }
@@ -284,5 +295,4 @@ struct UcanTests {
 
         #expect(revoked)
     }
-
 } // end UcanTests

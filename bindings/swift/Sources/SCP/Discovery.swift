@@ -9,33 +9,33 @@ import Foundation
 ///
 /// See ADR-020 in `.docs/adrs/phase-4.md` and spec section 22
 /// (Addressing).
-internal enum DiscoveryBridge {
+enum DiscoveryBridge {
     /// Parse an SCP address string into its components.
-    internal typealias ParseAddressFn = @Sendable (
+    typealias ParseAddressFn = @Sendable (
         _ address: String
     ) throws -> String
 
     /// Create a discovery query as a JSON string.
-    internal typealias CreateQueryFn = @Sendable (
+    typealias CreateQueryFn = @Sendable (
         _ capabilities: [String]?,
         _ keywords: [String]?,
         _ minHistorySecs: UInt64?
     ) throws -> String
 
     /// Normalize an address string per SCP addressing rules.
-    internal typealias NormalizeAddressFn = @Sendable (
+    typealias NormalizeAddressFn = @Sendable (
         _ address: String
     ) -> String
 
     /// Default parse address function — delegates to UniFFI
     /// ``discoveryParseAddress``.
-    internal static let defaultParseAddress: ParseAddressFn = { address in
+    static let defaultParseAddress: ParseAddressFn = { address in
         try discoveryParseAddress(address: address)
     }
 
     /// Default create query function — delegates to UniFFI
     /// ``discoveryCreateQuery``.
-    internal static let defaultCreateQuery: CreateQueryFn = {
+    static let defaultCreateQuery: CreateQueryFn = {
         capabilities, keywords, minHistorySecs in
         try discoveryCreateQuery(
             capabilities: capabilities,
@@ -46,7 +46,7 @@ internal enum DiscoveryBridge {
 
     /// Default normalize address function — delegates to UniFFI
     /// ``discoveryNormalizeAddress``.
-    internal static let defaultNormalizeAddress: NormalizeAddressFn = { address in
+    static let defaultNormalizeAddress: NormalizeAddressFn = { address in
         discoveryNormalizeAddress(address: address)
     }
 }

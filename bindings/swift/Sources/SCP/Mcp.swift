@@ -145,24 +145,24 @@ public nonisolated enum McpClientConfig: Sendable {
 /// implementations that will be replaced when the MCP UniFFI exports land.
 ///
 /// See ADR-015 for MCP spec and ADR-026 for the delegation pattern.
-internal enum McpBridge {
+enum McpBridge {
     /// Start an MCP server.
-    internal typealias ServeFn = @Sendable (
+    typealias ServeFn = @Sendable (
         _ config: McpServerConfig
     ) async throws -> Void
 
     /// Create an MCP client connection.
-    internal typealias ClientCreateFn = @Sendable (
+    typealias ClientCreateFn = @Sendable (
         _ config: McpClientConfig
     ) async throws -> McpClientHandle
 
     /// List tools from an MCP client.
-    internal typealias ClientListToolsFn = @Sendable (
+    typealias ClientListToolsFn = @Sendable (
         _ handle: McpClientHandle
     ) async throws -> [McpToolDefinition]
 
     /// Invoke a tool via an MCP client.
-    internal typealias ClientInvokeFn = @Sendable (
+    typealias ClientInvokeFn = @Sendable (
         _ handle: McpClientHandle,
         _ toolName: String,
         _ input: Data,
@@ -171,7 +171,7 @@ internal enum McpBridge {
     ) async throws -> McpToolResult
 
     /// Default serve function. Will delegate to UniFFI when MCP exports land.
-    internal static let defaultServe: ServeFn = { _ in
+    static let defaultServe: ServeFn = { _ in
         throw ScpError.Tool(
             message: "MCP server bridge not yet wired to UniFFI — awaiting mcp_serve export",
             code: "SCP-MCP-10001"
@@ -179,7 +179,7 @@ internal enum McpBridge {
     }
 
     /// Default client create function. Will delegate to UniFFI when MCP exports land.
-    internal static let defaultClientCreate: ClientCreateFn = { _ in
+    static let defaultClientCreate: ClientCreateFn = { _ in
         throw ScpError.Tool(
             message: "MCP client bridge not yet wired to UniFFI — awaiting mcp_client_create export",
             code: "SCP-MCP-10002"
@@ -187,7 +187,7 @@ internal enum McpBridge {
     }
 
     /// Default client list tools function.
-    internal static let defaultClientListTools: ClientListToolsFn = { _ in
+    static let defaultClientListTools: ClientListToolsFn = { _ in
         throw ScpError.Tool(
             message: "MCP client bridge not yet wired to UniFFI — awaiting mcp_client_list_tools export",
             code: "SCP-MCP-10003"
@@ -195,7 +195,7 @@ internal enum McpBridge {
     }
 
     /// Default client invoke function.
-    internal static let defaultClientInvoke: ClientInvokeFn = { _, _, _, _, _ in
+    static let defaultClientInvoke: ClientInvokeFn = { _, _, _, _, _ in
         throw ScpError.Tool(
             message: "MCP client bridge not yet wired to UniFFI — awaiting mcp_client_invoke export",
             code: "SCP-MCP-10004"
@@ -210,7 +210,7 @@ internal enum McpBridge {
 /// This placeholder mirrors the handle type that UniFFI will generate from
 /// the Rust `McpClient` struct. When the XCFramework build pipeline ships
 /// (SCP-103), this definition is replaced by the auto-generated type.
-internal final class McpClientHandle: Sendable {
+final class McpClientHandle: Sendable {
     /// Whether the MCP handshake has completed.
     let initialized: Bool
 
@@ -305,7 +305,7 @@ public actor McpClient {
     ///   - handle: The opaque MCP client handle from the UniFFI bridge.
     ///   - listToolsFn: Bridge function for listing tools.
     ///   - invokeFn: Bridge function for invoking tools.
-    internal init(
+    init(
         handle: McpClientHandle,
         listToolsFn: @escaping McpBridge.ClientListToolsFn = McpBridge.defaultClientListTools,
         invokeFn: @escaping McpBridge.ClientInvokeFn = McpBridge.defaultClientInvoke

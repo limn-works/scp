@@ -29,59 +29,59 @@ import Foundation
 /// ScpBindings.
 ///
 /// See ADR-039 (Agent Key Binding) and spec section 9.
-internal enum IdentityBridge {
+enum IdentityBridge {
     /// Check whether an identity has an agent signing key.
-    internal typealias HasAgentKeyFn = @Sendable (
+    typealias HasAgentKeyFn = @Sendable (
         _ identity: Identity
     ) -> Bool
 
     /// Get the agent signing key's public key as a multibase-encoded string.
-    internal typealias GetAgentPublicKeyFn = @Sendable (
+    typealias GetAgentPublicKeyFn = @Sendable (
         _ identity: Identity
     ) -> String?
 
     /// Add an agent signing key to an identity.
-    internal typealias AddAgentKeyFn = @Sendable (
+    typealias AddAgentKeyFn = @Sendable (
         _ identity: Identity
     ) async throws -> Identity
 
     /// Remove the agent signing key from an identity.
-    internal typealias RemoveAgentKeyFn = @Sendable (
+    typealias RemoveAgentKeyFn = @Sendable (
         _ identity: Identity
     ) async throws -> Identity
 
     /// Rotate the agent signing key for an identity.
-    internal typealias RotateAgentKeyFn = @Sendable (
+    typealias RotateAgentKeyFn = @Sendable (
         _ identity: Identity
     ) async throws -> Identity
 
     /// Default has agent key function — delegates to UniFFI
     /// ``Identity.hasAgentKey()``.
-    internal static let defaultHasAgentKey: HasAgentKeyFn = { identity in
+    static let defaultHasAgentKey: HasAgentKeyFn = { identity in
         identity.hasAgentKey()
     }
 
     /// Default get agent public key function — delegates to UniFFI
     /// ``Identity.getAgentPublicKey()``.
-    internal static let defaultGetAgentPublicKey: GetAgentPublicKeyFn = { identity in
+    static let defaultGetAgentPublicKey: GetAgentPublicKeyFn = { identity in
         identity.getAgentPublicKey()
     }
 
     /// Default add agent key function — delegates to UniFFI
     /// ``Identity.addAgentKey()``.
-    internal static let defaultAddAgentKey: AddAgentKeyFn = { identity in
+    static let defaultAddAgentKey: AddAgentKeyFn = { identity in
         try await identity.addAgentKey()
     }
 
     /// Default remove agent key function — delegates to UniFFI
     /// ``Identity.removeAgentKey()``.
-    internal static let defaultRemoveAgentKey: RemoveAgentKeyFn = { identity in
+    static let defaultRemoveAgentKey: RemoveAgentKeyFn = { identity in
         try await identity.removeAgentKey()
     }
 
     /// Default rotate agent key function — delegates to UniFFI
     /// ``Identity.rotateAgentKey()``.
-    internal static let defaultRotateAgentKey: RotateAgentKeyFn = { identity in
+    static let defaultRotateAgentKey: RotateAgentKeyFn = { identity in
         try await identity.rotateAgentKey()
     }
 }

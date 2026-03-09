@@ -121,7 +121,9 @@ pub fn discovery_parse_address(address: String) -> Result<String, JsError> {
     let scope = &address[at_pos + 1..];
 
     if scope.is_empty() {
-        return Err(JsError::new("[SCP-VALID-7102] scope part must not be empty"));
+        return Err(JsError::new(
+            "[SCP-VALID-7102] scope part must not be empty",
+        ));
     }
 
     validate_local_part(local).map_err(|e| JsError::new(&format!("[SCP-VALID-7103] {e}")))?;

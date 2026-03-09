@@ -14,32 +14,32 @@ import Foundation
 ///
 /// See ADR-021 for the bridge function surface and ADR-026 for the delegation
 /// pattern (every Swift SDK method calls exactly one bridge function).
-internal enum ContextBridge {
+enum ContextBridge {
     /// The closure type for context creation. Injected for testability.
-    internal typealias CreateFn = @Sendable (
+    typealias CreateFn = @Sendable (
         _ contextId: String,
         _ ceiling: [String]
     ) async throws -> any ContextHandleProtocol
 
     /// The closure type for sending a message. Injected for testability.
-    internal typealias SendFn = @Sendable (
+    typealias SendFn = @Sendable (
         _ handle: any ContextHandleProtocol,
         _ payload: Data
     ) async throws -> Void
 
     /// The closure type for subscribing to messages. Injected for testability.
-    internal typealias SubscribeFn = @Sendable (
+    typealias SubscribeFn = @Sendable (
         _ handle: any ContextHandleProtocol,
         _ listener: any MessageListener
     ) -> Void
 
     /// The closure type for leaving a context. Injected for testability.
-    internal typealias LeaveFn = @Sendable (
+    typealias LeaveFn = @Sendable (
         _ handle: any ContextHandleProtocol
     ) async throws -> Void
 
     /// The closure type for closing a context. Injected for testability.
-    internal typealias CloseFn = @Sendable (
+    typealias CloseFn = @Sendable (
         _ handle: any ContextHandleProtocol
     ) async throws -> Void
 }
@@ -71,7 +71,7 @@ private final class MessageListenerAdapter: MessageListener, @unchecked Sendable
         continuation.yield(message)
     }
 
-    func onError(error: ScpError) {
+    func onError(error _: ScpError) {
         // Finish the stream on error. Consumers detect end-of-stream via
         // the `for await` loop terminating. The specific error is not
         // propagated through AsyncStream (which has no error channel);
@@ -132,7 +132,7 @@ public actor Context {
     ///
     /// Internal visibility so that extensions in other files (Tools.swift,
     /// etc.) can cast to ``ContextHandle`` for UniFFI bridge calls.
-    internal let handle: any ContextHandleProtocol
+    let handle: any ContextHandleProtocol
 
     /// The continuation for the active message stream, if any.
     /// Retained so that ``close()`` and ``leave()`` can finish the stream.
@@ -158,7 +158,7 @@ public actor Context {
     ///   - subscribeFn: Bridge function for subscribing to messages.
     ///   - leaveFn: Bridge function for leaving the context.
     ///   - closeFn: Bridge function for closing the context.
-    internal init(
+    init(
         handle: any ContextHandleProtocol,
         sendFn: @escaping ContextBridge.SendFn,
         subscribeFn: @escaping ContextBridge.SubscribeFn,
@@ -166,16 +166,16 @@ public actor Context {
         closeFn: @escaping ContextBridge.CloseFn
     ) {
         self.handle = handle
-        self.contextId = handle.contextId()
+        contextId = handle.contextId()
         // UniFFI ContextHandleProtocol.state() throws, so use try? with a fallback.
         let stateString = (try? handle.state()) ?? "active"
         switch stateString {
-        case "creating": self.state = .creating
-        case "active": self.state = .active
-        case "closing": self.state = .closing
-        case "closed": self.state = .closed
-        case "expired": self.state = .expired
-        default: self.state = .active
+        case "creating": state = .creating
+        case "active": state = .active
+        case "closing": state = .closing
+        case "closed": state = .closed
+        case "expired": state = .expired
+        default: state = .active
         }
         self.sendFn = sendFn
         self.subscribeFn = subscribeFn
@@ -218,7 +218,7 @@ public actor Context {
     ///   - closeFn: Bridge function for closing the context.
     /// - Returns: A new `Context` in the ``ContextState/active`` state.
     /// - Throws: ``ScpError/Context(message:code:)`` if context creation fails.
-    internal static func create(
+    static func create(
         contextId: String,
         ceiling: [String],
         createFn: ContextBridge.CreateFn,
@@ -292,7 +292,7 @@ public actor Context {
             }
 
             let (stream, continuation) = AsyncStream<Message>.makeStream()
-            self.streamContinuation = continuation
+            streamContinuation = continuation
             let listener = MessageListenerAdapter(continuation: continuation)
             subscribeFn(handle, listener)
             return stream
