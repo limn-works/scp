@@ -104,4 +104,54 @@ struct DiscoveryTests {
         #expect(receivedAddress == "  ALICE@Cooking  ")
         #expect(result == "alice@cooking")
     }
+
+    // MARK: - discover via injectable bridge (roundtrip)
+
+    @Test("discover calls bridge and returns JSON results")
+    func discoverRoundtrip() async throws {
+        var receivedQuery: String?
+
+        let mockDiscover: DiscoveryBridge.DiscoverFn = { query in
+            receivedQuery = query
+            return """
+            [{"context_id":"ctx-001","relay_urls":["wss://relay.example"],"publisher_did":"did:dht:z6Mk","discovery_source":"dht","mode":null,"metadata_summary":null}]
+            """
+        }
+
+        let result = try await discover(
+            query: "did:dht:z6MkBob",
+            discoverFn: mockDiscover
+        )
+
+        #expect(receivedQuery == "did:dht:z6MkBob")
+        #expect(result.contains("ctx-001"))
+        #expect(result.contains("relay.example"))
+    }
+
+    @Test("discover default throws descriptive error")
+    func discoverDefaultThrows() async {
+        do {
+            _ = try await discover(query: "did:dht:z6MkBob")
+            Issue.record("Expected discover to throw")
+        } catch {
+            #expect(error is ScpError)
+        }
+    }
+
+    @Test("discover propagates bridge errors")
+    func discoverError() async {
+        let mockDiscover: DiscoveryBridge.DiscoverFn = { _ in
+            throw ScpError.Context(
+                message: "DID resolution failed",
+                code: "SCP-CTX-2050"
+            )
+        }
+
+        do {
+            _ = try await discover(query: "invalid-query", discoverFn: mockDiscover)
+            Issue.record("Expected discover to throw")
+        } catch {
+            #expect(error is ScpError)
+        }
+    }
 } // end DiscoveryTests
