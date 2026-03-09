@@ -749,8 +749,18 @@ pub fn identity_remove_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
         .into_js());
     }
 
+    // Clear the agent signing key from the identity registry to prevent
+    // the key material from lingering in WASM linear memory.
+    let did = identity.did.clone();
+    IDENTITY_REGISTRY.with(|reg| {
+        let mut map = reg.borrow_mut();
+        if let Some(entry) = map.get_mut(&did) {
+            entry.agent_signing_key_bytes = None;
+        }
+    });
+
     Ok(WasmIdentity {
-        did: identity.did.clone(),
+        did,
         custody_type: identity.custody_type.clone(),
         has_agent_key: false,
         agent_public_key_multibase: None,
@@ -789,6 +799,9 @@ pub fn identity_migrate(identity: &WasmIdentity) -> Promise {
 
         IDENTITY_REGISTRY.with(|reg| {
             let mut map = reg.borrow_mut();
+            // Remove the old identity's key material from the registry to
+            // prevent stale signing keys from lingering in WASM linear memory.
+            map.remove(&old_did);
             map.insert(
                 new_did.clone(),
                 IdentityEntry {
