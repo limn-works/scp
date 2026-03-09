@@ -4,7 +4,7 @@ import Foundation
 
 /// Result of executing a governance action (ADR-031).
 ///
-/// Each case corresponds to one of the 24+ governance action outcomes from
+/// Each case corresponds to one of the 28 governance action outcomes from
 /// `scp_core::context::manager::GovernanceActionResult`.
 ///
 /// See `.docs/specs/05-contexts.md` section 5.9 and ADR-031.
