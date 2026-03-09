@@ -110,6 +110,22 @@ enum BridgeConnectorBridge {
         _ shadowStatus: String
     ) throws -> UInt8
 
+    /// Register a bridge connector with a context.
+    typealias RegisterFn = @Sendable (
+        _ contextId: String,
+        _ operatorDid: String,
+        _ platform: String,
+        _ mode: String
+    ) throws -> BridgeRegistrationResult
+
+    /// Create a shadow identity for an external platform participant.
+    typealias CreateShadowFn = @Sendable (
+        _ bridgeId: String,
+        _ platformHandle: String,
+        _ bridgeMode: String,
+        _ contextId: String
+    ) throws -> ShadowIdentityResult
+
     /// Default evaluate trust function — delegates to UniFFI
     /// ``bridgeEvaluateTrust``.
     static let defaultEvaluateTrust: EvaluateTrustFn = { isBridged, isNativeTransport, shadowStatus in
@@ -117,6 +133,34 @@ enum BridgeConnectorBridge {
             isBridged: isBridged,
             isNativeTransport: isNativeTransport,
             shadowStatus: shadowStatus
+        )
+    }
+
+    /// Default register function — delegates to UniFFI ``bridgeRegister``.
+    ///
+    /// UniFFI does not yet export ``bridgeRegister``; the default throws a
+    /// descriptive error. Inject a real closure in production once the
+    /// UniFFI bridge is extended, or in tests via the injectable parameter.
+    static let defaultRegister: RegisterFn = { _, _, _, _ in
+        throw ScpError.Context(
+            message: "bridgeRegister is not yet available in the UniFFI bridge. "
+                + "Inject a bridge function or wait for the UniFFI export.",
+            code: "SCP-CTX-2040"
+        )
+    }
+
+    /// Default create shadow function — delegates to UniFFI
+    /// ``bridgeCreateShadow``.
+    ///
+    /// UniFFI does not yet export ``bridgeCreateShadow``; the default
+    /// throws a descriptive error. Inject a real closure in production
+    /// once the UniFFI bridge is extended, or in tests via the injectable
+    /// parameter.
+    static let defaultCreateShadow: CreateShadowFn = { _, _, _, _ in
+        throw ScpError.Context(
+            message: "bridgeCreateShadow is not yet available in the UniFFI bridge. "
+                + "Inject a bridge function or wait for the UniFFI export.",
+            code: "SCP-CTX-2041"
         )
     }
 }
@@ -151,4 +195,64 @@ public func evaluateBridgeTrust(
     evaluateTrustFn: BridgeConnectorBridge.EvaluateTrustFn = BridgeConnectorBridge.defaultEvaluateTrust
 ) throws -> UInt8 {
     try evaluateTrustFn(isBridged, isNativeTransport, shadowStatus)
+}
+
+/// Registers a bridge connector with a context.
+///
+/// Creates a registration for a bridge that connects an external platform
+/// (e.g., Discord, Slack) to an SCP context. The bridge operator is
+/// accountable for all messages relayed through the bridge.
+///
+/// - Parameters:
+///   - contextId: The context to register the bridge in.
+///   - operatorDid: DID of the human operator accountable for the bridge.
+///   - platform: External platform name (e.g., `"discord"`, `"slack"`).
+///   - mode: Bridge mode: `"relay"`, `"puppet"`, `"api"`, or
+///     `"cooperative"`.
+///   - registerFn: Bridge function override for testing.
+/// - Returns: A ``BridgeRegistrationResult`` with the registration details.
+/// - Throws: ``ScpError`` if registration fails.
+///
+/// ## Provenance
+///
+/// - Spec section 12 (Bridge System)
+/// - ADR-023 (Bridge Connector)
+public func bridgeRegister(
+    contextId: String,
+    operatorDid: String,
+    platform: String,
+    mode: String,
+    registerFn: BridgeConnectorBridge.RegisterFn = BridgeConnectorBridge.defaultRegister
+) throws -> BridgeRegistrationResult {
+    try registerFn(contextId, operatorDid, platform, mode)
+}
+
+/// Creates a shadow identity for an external platform participant.
+///
+/// Shadow identities represent non-SCP participants in a bridged context.
+/// They carry provenance metadata indicating they are not native SCP
+/// identities.
+///
+/// - Parameters:
+///   - bridgeId: The bridge connector ID that owns this shadow.
+///   - platformHandle: External platform handle (e.g., `"@user#1234"`).
+///   - bridgeMode: Bridge mode: `"relay"`, `"puppet"`, `"api"`, or
+///     `"cooperative"`.
+///   - contextId: Context the shadow is being created in.
+///   - createShadowFn: Bridge function override for testing.
+/// - Returns: A ``ShadowIdentityResult`` with the shadow identity details.
+/// - Throws: ``ScpError`` if shadow creation fails.
+///
+/// ## Provenance
+///
+/// - Spec section 12 (Bridge System)
+/// - ADR-023 (Bridge Connector)
+public func bridgeCreateShadow(
+    bridgeId: String,
+    platformHandle: String,
+    bridgeMode: String,
+    contextId: String,
+    createShadowFn: BridgeConnectorBridge.CreateShadowFn = BridgeConnectorBridge.defaultCreateShadow
+) throws -> ShadowIdentityResult {
+    try createShadowFn(bridgeId, platformHandle, bridgeMode, contextId)
 }

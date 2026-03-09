@@ -121,4 +121,113 @@ struct BridgeTests {
 
         #expect(tier == 3)
     }
+
+    // MARK: - bridgeRegister via injectable bridge (roundtrip)
+
+    @Test("bridgeRegister calls bridge and returns registration result")
+    func bridgeRegisterRoundtrip() throws {
+        var receivedContextId: String?
+        var receivedOperatorDid: String?
+        var receivedPlatform: String?
+        var receivedMode: String?
+
+        let mockRegister: BridgeConnectorBridge.RegisterFn = { contextId, operatorDid, platform, mode in
+            receivedContextId = contextId
+            receivedOperatorDid = operatorDid
+            receivedPlatform = platform
+            receivedMode = mode
+            return BridgeRegistrationResult(
+                bridgeId: "bridge-new",
+                operatorDid: operatorDid,
+                platform: platform,
+                mode: mode,
+                status: "active",
+                contextId: contextId
+            )
+        }
+
+        let result = try bridgeRegister(
+            contextId: "ctx-001",
+            operatorDid: "did:dht:z6MkOp",
+            platform: "discord",
+            mode: "relay",
+            registerFn: mockRegister
+        )
+
+        #expect(receivedContextId == "ctx-001")
+        #expect(receivedOperatorDid == "did:dht:z6MkOp")
+        #expect(receivedPlatform == "discord")
+        #expect(receivedMode == "relay")
+        #expect(result.bridgeId == "bridge-new")
+        #expect(result.status == "active")
+    }
+
+    @Test("bridgeRegister default throws descriptive error")
+    func bridgeRegisterDefaultThrows() {
+        do {
+            _ = try bridgeRegister(
+                contextId: "ctx-001",
+                operatorDid: "did:dht:z6MkOp",
+                platform: "discord",
+                mode: "relay"
+            )
+            Issue.record("Expected bridgeRegister to throw")
+        } catch {
+            #expect(error is ScpError)
+        }
+    }
+
+    // MARK: - bridgeCreateShadow via injectable bridge (roundtrip)
+
+    @Test("bridgeCreateShadow calls bridge and returns shadow result")
+    func bridgeCreateShadowRoundtrip() throws {
+        var receivedBridgeId: String?
+        var receivedHandle: String?
+        var receivedMode: String?
+        var receivedContextId: String?
+
+        let mockCreateShadow: BridgeConnectorBridge.CreateShadowFn = { bridgeId, handle, mode, contextId in
+            receivedBridgeId = bridgeId
+            receivedHandle = handle
+            receivedMode = mode
+            receivedContextId = contextId
+            return ShadowIdentityResult(
+                shadowId: "shadow-new",
+                platformHandle: handle,
+                bridgeId: bridgeId,
+                attributedRole: "member",
+                provenanceStatus: "Shadow"
+            )
+        }
+
+        let result = try bridgeCreateShadow(
+            bridgeId: "bridge-001",
+            platformHandle: "@alice#1234",
+            bridgeMode: "relay",
+            contextId: "ctx-bridge-001",
+            createShadowFn: mockCreateShadow
+        )
+
+        #expect(receivedBridgeId == "bridge-001")
+        #expect(receivedHandle == "@alice#1234")
+        #expect(receivedMode == "relay")
+        #expect(receivedContextId == "ctx-bridge-001")
+        #expect(result.shadowId == "shadow-new")
+        #expect(result.provenanceStatus == "Shadow")
+    }
+
+    @Test("bridgeCreateShadow default throws descriptive error")
+    func bridgeCreateShadowDefaultThrows() {
+        do {
+            _ = try bridgeCreateShadow(
+                bridgeId: "bridge-001",
+                platformHandle: "@alice",
+                bridgeMode: "relay",
+                contextId: "ctx-001"
+            )
+            Issue.record("Expected bridgeCreateShadow to throw")
+        } catch {
+            #expect(error is ScpError)
+        }
+    }
 } // end BridgeTests
