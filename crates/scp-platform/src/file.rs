@@ -57,6 +57,7 @@ use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
@@ -179,7 +180,7 @@ pub struct FileKeyCustody {
     pseudonym_keys: Mutex<HashMap<u64, SigningKey>>,
     /// Serializes file read-modify-write operations to prevent data races
     /// when multiple tasks call `append_entry` concurrently.
-    file_write_lock: Mutex<()>,
+    file_write_lock: StdMutex<()>,
 }
 
 impl FileKeyCustody {
@@ -224,7 +225,7 @@ impl FileKeyCustody {
             handle_map: Mutex::new(HandleMap::new()),
             next_id: AtomicU64::new(1),
             pseudonym_keys: Mutex::new(HashMap::new()),
-            file_write_lock: Mutex::new(()),
+            file_write_lock: StdMutex::new(()),
         })
     }
 
@@ -285,7 +286,7 @@ impl FileKeyCustody {
             handle_map: Mutex::new(handle_map),
             next_id: AtomicU64::new(next_id),
             pseudonym_keys: Mutex::new(HashMap::new()),
-            file_write_lock: Mutex::new(()),
+            file_write_lock: StdMutex::new(()),
         })
     }
 
@@ -378,7 +379,7 @@ impl FileKeyCustody {
         key_type: StoredKeyType,
         private_key: &[u8; KEY_LEN],
     ) -> Result<usize, PlatformError> {
-        let _lock = self.file_write_lock.blocking_lock();
+        let _lock = self.file_write_lock.lock().expect("file write lock poisoned");
         let mut data = self.read_file()?;
 
         // Read current entry count.
