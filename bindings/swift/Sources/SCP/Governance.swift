@@ -142,6 +142,7 @@ internal enum BroadcastBridge {
 
     internal typealias PublishFn = @Sendable (
         _ handle: ContextHandle,
+        _ authorDid: String,
         _ payload: Data
     ) async throws -> Void
 
@@ -181,8 +182,8 @@ internal enum BroadcastBridge {
         )
     }
 
-    internal static let defaultPublish: PublishFn = { handle, payload in
-        try await broadcastPublish(handle: handle, payload: payload)
+    internal static let defaultPublish: PublishFn = { handle, authorDid, payload in
+        try await broadcastPublish(handle: handle, authorDid: authorDid, payload: payload)
     }
 
     internal static let defaultBlockSubscriber: BlockSubscriberFn = {
@@ -396,11 +397,13 @@ extension Context {
     /// Publishes a message to this broadcast context.
     ///
     /// - Parameters:
+    ///   - authorDid: The DID of the author publishing the message.
     ///   - payload: The raw message payload.
     ///   - publishFn: Bridge function override for testing.
     /// - Throws: ``ScpError/Context(message:code:)`` if the context is not
     ///   active or not a broadcast context.
     public func broadcastPublish(
+        authorDid: String,
         payload: Data,
         publishFn: BroadcastBridge.PublishFn = BroadcastBridge.defaultPublish
     ) async throws {
@@ -413,7 +416,7 @@ extension Context {
                 code: "SCP-CTX-2002"
             )
         }
-        try await publishFn(contextHandle, payload)
+        try await publishFn(contextHandle, authorDid, payload)
     }
 
     /// Blocks a subscriber's read access in this broadcast context.

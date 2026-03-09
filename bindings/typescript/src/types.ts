@@ -47,6 +47,18 @@ export interface ContextParams {
 export type MemberRole = "Admin" | "Member" | "Observer" | "Custom";
 
 // ---------------------------------------------------------------------------
+// Broadcast
+// ---------------------------------------------------------------------------
+
+/**
+ * Admission policy for a broadcast context.
+ *
+ * - `"Open"` — any DID can subscribe without authorization.
+ * - `"Gated"` — subscription requires a valid `messagesRead` UCAN.
+ */
+export type BroadcastAdmissionPolicy = "Open" | "Gated";
+
+// ---------------------------------------------------------------------------
 // Governance
 // ---------------------------------------------------------------------------
 

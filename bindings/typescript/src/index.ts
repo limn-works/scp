@@ -105,6 +105,7 @@ export {
 export type {
   AttestationSummary,
   BehavioralRecord,
+  BroadcastAdmissionPolicy,
   Capability,
   Checkpoint,
   ContextParams,

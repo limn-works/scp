@@ -13,6 +13,7 @@
 
 import { TransportError } from "../errors.js";
 import type {
+  BroadcastAdmissionPolicy,
   Checkpoint,
   DIDDocument,
   Event,
@@ -368,7 +369,11 @@ export function createWasmBridge(): Bridge {
       );
     },
 
-    async broadcastPublish(_handle: BridgeContextHandle, _payload: Uint8Array): Promise<void> {
+    async broadcastPublish(
+      _handle: BridgeContextHandle,
+      _authorDid: string,
+      _payload: Uint8Array,
+    ): Promise<void> {
       throw new TransportError(
         "Broadcast operations are not available in the WASM bridge",
         "SCP-CTX-2030",
@@ -411,7 +416,9 @@ export function createWasmBridge(): Bridge {
       );
     },
 
-    async broadcastAdmission(_handle: BridgeContextHandle): Promise<string | null> {
+    async broadcastAdmission(
+      _handle: BridgeContextHandle,
+    ): Promise<BroadcastAdmissionPolicy | null> {
       throw new TransportError(
         "Broadcast operations are not available in the WASM bridge",
         "SCP-CTX-2030",

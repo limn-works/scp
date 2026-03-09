@@ -15,6 +15,7 @@ import { createRequire } from "node:module";
 
 import { TransportError } from "../errors.js";
 import type {
+  BroadcastAdmissionPolicy,
   Checkpoint,
   DIDDocument,
   Event,
@@ -273,11 +274,18 @@ export function createNativeBridge(): Bridge {
       )(handle, subscriberDid, rotateKeys);
     },
 
-    async broadcastPublish(handle: BridgeContextHandle, payload: Uint8Array): Promise<void> {
-      await (addon.broadcastPublish as (h: BridgeContextHandle, p: Uint8Array) => Promise<void>)(
-        handle,
-        payload,
-      );
+    async broadcastPublish(
+      handle: BridgeContextHandle,
+      authorDid: string,
+      payload: Uint8Array,
+    ): Promise<void> {
+      await (
+        addon.broadcastPublish as (
+          h: BridgeContextHandle,
+          d: string,
+          p: Uint8Array,
+        ) => Promise<void>
+      )(handle, authorDid, payload);
     },
 
     async broadcastBlockSubscriber(
@@ -323,9 +331,13 @@ export function createNativeBridge(): Bridge {
       )(handle, did);
     },
 
-    async broadcastAdmission(handle: BridgeContextHandle): Promise<string | null> {
+    async broadcastAdmission(
+      handle: BridgeContextHandle,
+    ): Promise<BroadcastAdmissionPolicy | null> {
       return await (
-        addon.contextBroadcastAdmission as (h: BridgeContextHandle) => Promise<string | null>
+        addon.contextBroadcastAdmission as (
+          h: BridgeContextHandle,
+        ) => Promise<BroadcastAdmissionPolicy | null>
       )(handle);
     },
 

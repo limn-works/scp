@@ -19,6 +19,7 @@
  */
 
 import type {
+  BroadcastAdmissionPolicy,
   Checkpoint,
   DIDDocument,
   Event,
@@ -90,7 +91,11 @@ export interface Bridge {
     subscriberDid: string,
     rotateKeys?: boolean,
   ): Promise<void>;
-  broadcastPublish(handle: BridgeContextHandle, payload: Uint8Array): Promise<void>;
+  broadcastPublish(
+    handle: BridgeContextHandle,
+    authorDid: string,
+    payload: Uint8Array,
+  ): Promise<void>;
   broadcastBlockSubscriber(
     handle: BridgeContextHandle,
     subscriberDid: string,
@@ -103,7 +108,7 @@ export interface Bridge {
   ): Promise<string>;
   broadcastSubscriberCount(handle: BridgeContextHandle): Promise<number | null>;
   broadcastIsSubscriber(handle: BridgeContextHandle, did: string): Promise<boolean>;
-  broadcastAdmission(handle: BridgeContextHandle): Promise<string | null>;
+  broadcastAdmission(handle: BridgeContextHandle): Promise<BroadcastAdmissionPolicy | null>;
 
   // Governance
   contextExecuteGovernanceAction(

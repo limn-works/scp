@@ -174,6 +174,7 @@ interface BroadcastBindings {
 
     fun broadcastPublish(
         contextHandle: Long,
+        authorDid: String,
         payload: ByteArray,
     )
 
@@ -770,12 +771,14 @@ class BroadcastBridgeOps internal constructor(
      * Publish a message to a broadcast context.
      *
      * @param contextHandle Handle from context create or join.
+     * @param authorDid The DID of the author publishing the message.
      * @param payload Raw message bytes.
      */
     suspend fun publish(
         contextHandle: Long,
+        authorDid: String,
         payload: ByteArray,
-    ): Unit = bridge.ffiCall { bindings.broadcastPublish(contextHandle, payload) }
+    ): Unit = bridge.ffiCall { bindings.broadcastPublish(contextHandle, authorDid, payload) }
 
     /**
      * Block a subscriber's read access in a broadcast context.

@@ -16,6 +16,7 @@ import type { Identity } from "./identity.js";
 import type { BridgeContextHandle } from "./internal/bridge.js";
 import { getBridge } from "./internal/bridge.js";
 import type {
+  BroadcastAdmissionPolicy,
   ContextParams,
   GovernanceActionResult,
   MemberRole,
@@ -370,13 +371,15 @@ export class Context implements AsyncDisposable {
    * Publishes a message to this broadcast context.
    *
    * @param payload - The raw message payload.
+   * @param authorDid - The DID of the author publishing the message.
+   *   Defaults to the identity that created/joined the context.
    * @throws {ContextError} If the context is not active or not broadcast.
    */
-  async broadcastPublish(payload: Uint8Array): Promise<void> {
+  async broadcastPublish(payload: Uint8Array, authorDid?: string): Promise<void> {
     this.assertActive();
     try {
       const bridge = await getBridge();
-      await bridge.broadcastPublish(this._handle, payload);
+      await bridge.broadcastPublish(this._handle, authorDid ?? this._identityDid, payload);
     } catch (error) {
       throw mapBridgeError(error);
     }
@@ -456,7 +459,7 @@ export class Context implements AsyncDisposable {
    * @returns The policy (`"Open"` or `"Gated"`), or `null` if not broadcast.
    * @throws {ContextError} If the context has been disposed.
    */
-  async broadcastAdmission(): Promise<string | null> {
+  async broadcastAdmission(): Promise<BroadcastAdmissionPolicy | null> {
     this.assertActive();
     try {
       const bridge = await getBridge();
