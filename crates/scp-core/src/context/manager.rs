@@ -2628,10 +2628,10 @@ impl ContextManager {
             // Append to Merkle event log using the standard governance event
             // label path (same pattern as propose/approve/reject/withdraw).
             let context_id_bytes = context_id_to_bytes(context_id);
-            let _ = self.event_log.append_context_event(
+            self.event_log.append_context_event(
                 &context_id_bytes,
                 Self::governance_event_label(&executed_event),
-            );
+            )?;
 
             // Push to receive buffer so SDK consumers observe outcomes with
             // rich context.
