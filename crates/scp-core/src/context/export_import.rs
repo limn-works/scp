@@ -283,6 +283,7 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         approved_proposals: HashMap::new(),
         governance_freeze: None,
         pending_ceiling_modification: None,
+        mls_epoch: 0,
     }
 }
 
@@ -378,6 +379,7 @@ mod tests {
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
+            mls_epoch: 0,
         }
     }
 

@@ -186,6 +186,7 @@ mod tests {
             approved_proposals: std::collections::HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
+            mls_epoch: 0,
         }
     }
 

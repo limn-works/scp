@@ -28,7 +28,8 @@ use super::governance::{
     CheckpointAttestationStatus, ContextCheckpoint, CosignedCheckpoint, GovernanceAction,
     GovernanceContext, GovernanceEngine, GovernanceEvent, GovernanceModelConfig,
     GovernanceProposal, KeyResolver, ProposalId, ProposalStatus, PruningPolicy, RevocationScope,
-    SingleAdminEngine, majority::MajorityVoteEngine, multisig::ThresholdEngine,
+    SingleAdminEngine, majority::MajorityVoteEngine,
+    mls_integration::{MlsImpact, classify_action}, multisig::ThresholdEngine,
     unanimity::UnanimityEngine,
 };
 use super::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
@@ -336,6 +337,11 @@ pub struct ContextSnapshot {
     /// Format: `(new_ceiling_capabilities, notification_timestamp, proposal_id)`.
     #[serde(default)]
     pub pending_ceiling_modification: Option<PendingCeilingModification>,
+    /// Monotonic MLS epoch counter. Tracks epoch advances from membership-
+    /// mutating governance actions (AddMember, RemoveMember, RevokeReadAccess,
+    /// ResetMember).
+    #[serde(default)]
+    pub mls_epoch: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +493,12 @@ struct PerContextState {
     governance_timeout_task: GovernanceTimeoutTask,
     /// Pending ceiling modification awaiting notification period (M7, §5.3).
     pending_ceiling_modification: Option<PendingCeilingModification>,
+    /// Monotonic MLS epoch counter. Incremented each time a governance action
+    /// triggers an MLS membership change (AddMember, RemoveMember,
+    /// RevokeReadAccess, ResetMember). Used to populate
+    /// `GovernanceActionExecuted.resulting_epoch` and
+    /// `GovernanceContext.current_epoch`.
+    mls_epoch: u64,
 }
 
 /// Creates a governance engine from a [`GovernanceModel`] selector and
@@ -1012,6 +1024,7 @@ impl ContextManager {
             approved_proposals: ctx.approved_proposals.clone(),
             governance_freeze: ctx.governance_freeze,
             pending_ceiling_modification: ctx.pending_ceiling_modification.clone(),
+            mls_epoch: ctx.mls_epoch,
         }
     }
 
@@ -1112,6 +1125,7 @@ impl ContextManager {
             economic_policy: ctx_snapshot.economic_policy,
             governance_timeout_task: GovernanceTimeoutTask::new(),
             pending_ceiling_modification: ctx_snapshot.pending_ceiling_modification,
+            mls_epoch: ctx_snapshot.mls_epoch,
         };
 
         {
@@ -1353,6 +1367,7 @@ impl ContextManager {
             economic_policy: export.snapshot.economic_policy,
             governance_timeout_task: GovernanceTimeoutTask::new(),
             pending_ceiling_modification: export.snapshot.pending_ceiling_modification,
+            mls_epoch: export.snapshot.mls_epoch,
         };
 
         // 6. Register the context.
@@ -1505,6 +1520,7 @@ impl ContextManager {
             economic_policy: params.economic_policy.clone(),
             governance_timeout_task: GovernanceTimeoutTask::new(),
             pending_ceiling_modification: None,
+            mls_epoch: 0,
         };
 
         // Atomic duplicate check + insert under lock -- no .await inside this scope.
@@ -1765,6 +1781,7 @@ impl ContextManager {
             economic_policy: params.economic_policy.clone(),
             governance_timeout_task: GovernanceTimeoutTask::new(),
             pending_ceiling_modification: None,
+            mls_epoch: 0,
         })
     }
 
@@ -2614,6 +2631,21 @@ impl ContextManager {
             }
         };
 
+        // For MLS-mutating actions (AddMember, RemoveMember, RevokeReadAccess,
+        // ResetMember), increment the epoch counter and report it. Non-MLS
+        // actions leave the epoch unchanged and report None.
+        let resulting_epoch = if classify_action(&proposal.action) == MlsImpact::MembershipChange {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.mls_epoch = ctx.mls_epoch.saturating_add(1);
+                Some(ctx.mls_epoch)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Construct the structured GovernanceEvent::GovernanceActionExecuted
         // and emit it to both the Merkle event log and the receive buffer
         // (ADR-031 §8, PRD SCP-269/SCP-270).
@@ -2622,7 +2654,7 @@ impl ContextManager {
                 proposal_id: proposal.proposal_id,
                 action: Box::new(proposal.action.clone()),
                 executor_did: proposal.proposer_did.clone(),
-                resulting_epoch: None,
+                resulting_epoch,
             };
 
             // Append to Merkle event log using the standard governance event
@@ -2643,7 +2675,7 @@ impl ContextManager {
                         proposal_id: proposal.proposal_id,
                         action_summary,
                         executor_did: proposal.proposer_did.clone(),
-                        resulting_epoch: None,
+                        resulting_epoch,
                     });
             }
         }
@@ -2990,7 +3022,7 @@ impl ContextManager {
             context_id: ctx.handle.context_id().to_owned(),
             members,
             admin_dids,
-            current_epoch: None, // MLS epoch not tracked here; governance doesn't need it.
+            current_epoch: Some(ctx.mls_epoch),
             now: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -9645,6 +9677,7 @@ mod tests {
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
+            mls_epoch: 0,
         };
 
         let bc_snapshot = test_broadcast_snapshot("persist-ctx-2");
@@ -9742,6 +9775,7 @@ mod tests {
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
+            mls_epoch: 0,
         };
 
         persistence
@@ -9827,6 +9861,7 @@ mod tests {
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
+            mls_epoch: 0,
         };
 
         persistence.persist_context("ttl-ctx", &snapshot).unwrap();
@@ -9891,6 +9926,7 @@ mod tests {
                 approved_proposals: HashMap::new(),
                 governance_freeze: None,
                 pending_ceiling_modification: None,
+                mls_epoch: 0,
             };
             persistence.persist_context(ctx_name, &snapshot).unwrap();
         }
@@ -9954,6 +9990,7 @@ mod tests {
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
+            mls_epoch: 0,
         };
 
         let bc_snapshot = test_broadcast_snapshot("dup-ctx");
@@ -10953,6 +10990,7 @@ mod tests {
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
+            mls_epoch: 0,
         };
 
         let json = serde_json::to_string(&snapshot).expect("serialize");
