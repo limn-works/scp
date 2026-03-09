@@ -63,10 +63,10 @@ Apache 2.0                         AGPL v3 only
 scp-core                     ──→   scp-node
 scp-transport                ──→     (depends on SDK
 scp-platform                 ──→      crates; dependency
-scp-ffi (PyO3)                        flows one way)
-scp-ffi-napi
-scp-ffi-wasm
-scp-ffi-uniffi
+scp-identity                          flows one way)
+scp-event-log
+scp-primitives
+scp-ffi (PyO3, UniFFI, napi, wasm)
 scp-mcp
 scp-media
 scp-testing
@@ -96,4 +96,4 @@ Dependencies flow strictly from AGPL into Apache 2.0, never the reverse. Apache 
 
 - **CLA document:** Must be created before accepting external contributions. Use Apache ICLA as template.
 - **SPDX file headers:** Consider adding per-file SPDX identifiers to `scp-node` source files. Non-blocking but recommended by AGPL appendix.
-- **Future crates:** `scp-bridge` and `scp-cli` (planned in architecture.md) will need explicit license assignments when created. Expected: Apache 2.0 for both.
+- **Future crates:** Any new crates will need explicit license assignments when created. Expected: Apache 2.0 for SDK-layer crates, AGPL v3 for infrastructure-layer crates.
