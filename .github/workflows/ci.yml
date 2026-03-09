@@ -276,7 +276,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.swift == 'true'
     name: Swift / lint + format
-    runs-on: macos-latest
+    runs-on: macos-15
     defaults:
       run:
         working-directory: bindings/swift
@@ -291,9 +291,12 @@ jobs:
     needs: changes
     if: needs.changes.outputs.swift == 'true'
     name: Swift / build + test
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.2"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build XCFramework (dev mode — macOS arm64 only)
