@@ -338,8 +338,8 @@ pub struct ContextSnapshot {
     #[serde(default)]
     pub pending_ceiling_modification: Option<PendingCeilingModification>,
     /// Monotonic MLS epoch counter. Tracks epoch advances from membership-
-    /// mutating governance actions (AddMember, RemoveMember, RevokeReadAccess,
-    /// ResetMember).
+    /// mutating governance actions (`AddMember`, `RemoveMember`,
+    /// `RevokeReadAccess`, `ResetMember`).
     #[serde(default)]
     pub mls_epoch: u64,
 }
@@ -494,8 +494,8 @@ struct PerContextState {
     /// Pending ceiling modification awaiting notification period (M7, §5.3).
     pending_ceiling_modification: Option<PendingCeilingModification>,
     /// Monotonic MLS epoch counter. Incremented each time a governance action
-    /// triggers an MLS membership change (AddMember, RemoveMember,
-    /// RevokeReadAccess, ResetMember). Used to populate
+    /// triggers an MLS membership change (`AddMember`, `RemoveMember`,
+    /// `RevokeReadAccess`, `ResetMember`). Used to populate
     /// `GovernanceActionExecuted.resulting_epoch` and
     /// `GovernanceContext.current_epoch`.
     mls_epoch: u64,
