@@ -22,6 +22,16 @@
 
 package com.limn.scp.bridge
 
+import com.limn.scp.BridgeConnectorBindings
+import com.limn.scp.BridgeConnectorBridge
+import com.limn.scp.DiscoveryBindings
+import com.limn.scp.DiscoveryBridge
+import com.limn.scp.IdentityAdvancedBindings
+import com.limn.scp.IdentityAdvancedBridge
+import com.limn.scp.ProvenanceBindings
+import com.limn.scp.ProvenanceBridge
+import com.limn.scp.SyncBindings
+import com.limn.scp.SyncBridge
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
@@ -217,6 +227,27 @@ interface NativeBindings :
     InfraBindings
 
 /**
+ * Container for extended operation bindings added post-initial SDK (#421, #426, #428).
+ *
+ * Kept separate from [NativeBindings] to avoid exceeding the detekt
+ * `TooManyFunctions` threshold (30) on the composite interface. Each field
+ * is optional — callers provide only the binding implementations available.
+ *
+ * @property provenance Provenance evaluation, attachment, and chain depth bindings.
+ * @property sync Sync/offline classification bindings.
+ * @property discovery Address parsing, query creation, and normalization bindings.
+ * @property bridgeConnector Bridge connector trust, registration, and shadow bindings.
+ * @property identityAdvanced Agent key, migration, and device attestation bindings.
+ */
+data class ExtendedBindings(
+    val provenance: ProvenanceBindings? = null,
+    val sync: SyncBindings? = null,
+    val discovery: DiscoveryBindings? = null,
+    val bridgeConnector: BridgeConnectorBindings? = null,
+    val identityAdvanced: IdentityAdvancedBindings? = null,
+)
+
+/**
  * Kotlin coroutine bridge over UniFFI-generated native bindings.
  *
  * This is the single dispatcher gateway for all FFI calls in the Kotlin SDK.
@@ -248,11 +279,13 @@ interface NativeBindings :
  * @param nativeBindings The UniFFI-generated native bindings (or a test stub).
  * @param ioDispatcher Dispatcher for FFI calls. Defaults to [Dispatchers.IO].
  * @param cpuDispatcher Dispatcher for CPU-bound work. Defaults to [Dispatchers.Default].
+ * @param extendedBindings Optional extended bindings for additional operation categories.
  */
 class CoroutineBridge(
     private val nativeBindings: NativeBindings,
     internal val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     internal val cpuDispatcher: CoroutineDispatcher = Dispatchers.Default,
+    extendedBindings: ExtendedBindings? = null,
 ) {
     /** Identity operations — all FFI, dispatched on IO. */
     val identity = IdentityBridge(nativeBindings, this)
@@ -268,6 +301,30 @@ class CoroutineBridge(
 
     /** Event log and transport operations — FFI on IO. */
     val infra = InfraBridge(nativeBindings, this)
+
+    /** Provenance operations — FFI on IO. Null if bindings not provided. */
+    val provenance: ProvenanceBridge? =
+        extendedBindings?.provenance?.let { ProvenanceBridge(it, this) }
+
+    /** Sync/offline operations — FFI on IO. Null if bindings not provided. */
+    val sync: SyncBridge? =
+        extendedBindings?.sync?.let { SyncBridge(it, this) }
+
+    /** Discovery operations — FFI on IO. Null if bindings not provided. */
+    val discovery: DiscoveryBridge? =
+        extendedBindings?.discovery?.let { DiscoveryBridge(it, this) }
+
+    /** Bridge connector operations — FFI on IO. Null if bindings not provided. */
+    val bridgeConnector: BridgeConnectorBridge? =
+        extendedBindings?.bridgeConnector?.let {
+            BridgeConnectorBridge(it, this)
+        }
+
+    /** Advanced identity operations — FFI on IO. Null if bindings not provided. */
+    val identityAdvanced: IdentityAdvancedBridge? =
+        extendedBindings?.identityAdvanced?.let {
+            IdentityAdvancedBridge(it, this)
+        }
 
     /**
      * Execute a CPU-bound operation on [Dispatchers.Default].
