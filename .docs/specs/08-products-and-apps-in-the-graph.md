@@ -100,7 +100,7 @@ The capability declaration uses JSON Schema (MCP-compatible) with SCP-specific e
 | `capabilities[].resource` | string | Yes | SCP resource URI. Format: `scp:ctx:{context_id}/{capability_category}` or `scp:ctx:{context_id}/tools/{tool_id}` for specific tools. The `{context_id}` is a template variable resolved at binding time. |
 | `capabilities[].actions` | array | Yes | Actions requested on the resource: `"read"`, `"write"`, `"invoke"`, `"admin"`. Minimum 1 action. |
 | `capabilities[].constraints` | object | No | Optional constraints on the capability (rate limits, size limits, type restrictions). App-defined; the protocol validates that constraints are a subset of the context's ceiling. |
-| `min_role` | string | Yes | Minimum context role required for this app to function: `"observer"`, `"member"`, `"moderator"`, `"admin"`. |
+| `min_role` | string | Yes | Minimum context role required for this app to function: `"observer"`, `"member"`, `"admin"`. Custom roles (§5.5) may also be specified. |
 | `signature` | string | Yes | Ed25519 signature by `app_id` over the canonical JSON serialization (RFC 8785 JCS) of the declaration with the `signature` field removed. |
 
 **Validation:** The SDK validates the declaration at binding time (when an app attaches to a context):
