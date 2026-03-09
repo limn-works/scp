@@ -114,7 +114,7 @@ pub struct StoredValue<T> {
 ///
 /// Incremented when the serialized format of any domain type changes.
 /// Migration logic (spec section 17.10) uses this to detect stale data.
-pub const CURRENT_STORE_VERSION: u16 = 1;
+pub const CURRENT_STORE_VERSION: u16 = 2;
 
 /// Current key-space schema version.
 ///
@@ -458,6 +458,18 @@ impl<S: Storage> ProtocolStore<S> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// `CURRENT_STORE_VERSION` must be 2 — the v1-to-v2 migration introduced
+    /// named `MessagePack` encoding (see spec section 17.10). Regression
+    /// guard: if this is ever accidentally reverted to 1, existing v2
+    /// data would be treated as "current" when it is not.
+    #[test]
+    fn current_store_version_is_two() {
+        assert_eq!(
+            CURRENT_STORE_VERSION, 2,
+            "CURRENT_STORE_VERSION must be 2 (v1→v2 migration exists)"
+        );
+    }
 
     #[test]
     fn stored_value_roundtrip_via_named_msgpack() {
