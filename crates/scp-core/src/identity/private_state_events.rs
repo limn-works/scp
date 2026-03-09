@@ -2,8 +2,8 @@
 //!
 //! The identity private state event log is an append-only, encrypted log of
 //! all private state mutations for an identity. This module defines the
-//! unified [`IdentityPrivateStateEvent`] enum covering all 28 event types
-//! across 10 categories:
+//! unified [`IdentityPrivateStateEvent`] enum covering all 25 event types
+//! across 9 categories:
 //!
 //! 1. **Block/Mute** (8 events) — global and per-context block/mute/unblock/unmute.
 //! 2. **Graph visibility** (3 events) — default visibility, per-DID grants/revokes.
@@ -14,7 +14,6 @@
 //! 7. **Attestation draft** (3 events) — draft attestation lifecycle.
 //! 8. **Device registry** (2 events) — device enrollment/unenrollment.
 //! 9. **Recovery contact** (2 events) — recovery contact management.
-//! 10. **Mute** (4 events are part of Block/Mute above).
 //!
 //! Block/unblock events (4 variants) are also defined in
 //! [`super::block_list::BlockListEvent`] for the specialized block list state
@@ -118,7 +117,7 @@ pub enum PetnameTarget {
 
 /// A unified event in the identity private state event log (§3.7.1.1).
 ///
-/// All 28 event types across 10 categories. This enum is the type stored in
+/// All 25 event types across 9 categories. This enum is the type stored in
 /// the encrypted private state event log. The block/mute variants mirror
 /// [`super::block_list::BlockListEvent`] — the block list module provides
 /// derived state from replaying these events.
@@ -553,15 +552,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn all_28_event_types_have_names() {
+    fn all_25_event_types_have_names() {
         // Construct one of each variant and verify event_type_name returns
         // a non-empty string for each.
         let events = make_all_events();
-        assert_eq!(
-            events.len(),
-            25,
-            "expected 25 variants (28 spec events, 4 mute events counted with block/mute)"
-        );
+        assert_eq!(events.len(), 25, "expected 25 enum variants");
         for event in &events {
             assert!(
                 !event.event_type_name().is_empty(),
