@@ -211,4 +211,80 @@ struct ParticipationTests {
 
         #expect(result)
     }
+
+    // MARK: - requireAll parameter (AND/OR logic)
+
+    @Test("RequireParticipation defaults requireAll to true")
+    func requireAllDefaultTrue() {
+        let requirement = RequireParticipation(thresholds: [
+            ParticipationThreshold(fact: .messagesSent, minimum: 5)
+        ])
+        #expect(requirement.requireAll == true)
+    }
+
+    @Test("requireAll false passes when any threshold is met (OR logic)")
+    func requireAllFalseOrLogic() {
+        let requirement = RequireParticipation(
+            thresholds: [
+                ParticipationThreshold(fact: .messagesSent, minimum: 100),
+                ParticipationThreshold(fact: .toolsInvoked, minimum: 1)
+            ],
+            requireAll: false
+        )
+        let profile: ParticipationProfile = [
+            .messagesSent: 0,
+            .toolsInvoked: 5
+        ]
+
+        let result = verifyParticipationRequirements(
+            requirement: requirement,
+            profile: profile
+        )
+
+        #expect(result)
+    }
+
+    @Test("requireAll false fails when no threshold is met")
+    func requireAllFalseNoneMet() {
+        let requirement = RequireParticipation(
+            thresholds: [
+                ParticipationThreshold(fact: .messagesSent, minimum: 100),
+                ParticipationThreshold(fact: .toolsInvoked, minimum: 100)
+            ],
+            requireAll: false
+        )
+        let profile: ParticipationProfile = [
+            .messagesSent: 0,
+            .toolsInvoked: 0
+        ]
+
+        let result = verifyParticipationRequirements(
+            requirement: requirement,
+            profile: profile
+        )
+
+        #expect(!result)
+    }
+
+    @Test("requireAll true fails when only some thresholds met (AND logic)")
+    func requireAllTrueAndLogic() {
+        let requirement = RequireParticipation(
+            thresholds: [
+                ParticipationThreshold(fact: .messagesSent, minimum: 5),
+                ParticipationThreshold(fact: .toolsInvoked, minimum: 100)
+            ],
+            requireAll: true
+        )
+        let profile: ParticipationProfile = [
+            .messagesSent: 10,
+            .toolsInvoked: 1
+        ]
+
+        let result = verifyParticipationRequirements(
+            requirement: requirement,
+            profile: profile
+        )
+
+        #expect(!result)
+    }
 } // end ParticipationTests

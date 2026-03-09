@@ -436,31 +436,44 @@ public nonisolated struct ParticipationThreshold: Sendable {
 /// - Spec section 23.7 (Participation Requirements)
 public typealias ParticipationProfile = [ParticipationFact: UInt64]
 
-/// A set of participation thresholds that must all be met.
+/// A set of participation thresholds for admission gating.
 ///
-/// Used as admission criteria or trust-gating requirements. All thresholds
-/// must be satisfied (conjunction) for the requirement to pass.
+/// Used as admission criteria or trust-gating requirements. When
+/// ``requireAll`` is `true` (the default), all thresholds must be
+/// satisfied (AND/conjunction). When `false`, any single threshold
+/// passing is sufficient (OR/disjunction).
 ///
 /// ## Provenance
 ///
 /// - ADR-017 Layer 2 (Behavioral Validation)
 /// - Spec section 23.7 (Participation Requirements)
 public nonisolated struct RequireParticipation: Sendable {
-    /// The thresholds that must all be met.
+    /// The thresholds to check.
     public let thresholds: [ParticipationThreshold]
 
+    /// If `true`, **all** thresholds must be met (AND logic).
+    /// If `false`, **any** single threshold is sufficient (OR logic).
+    public let requireAll: Bool
+
     /// Memberwise initializer.
-    public init(thresholds: [ParticipationThreshold]) {
+    ///
+    /// - Parameters:
+    ///   - thresholds: The participation thresholds to check.
+    ///   - requireAll: Whether all thresholds must be met (`true`, default)
+    ///     or any single threshold is sufficient (`false`).
+    public init(thresholds: [ParticipationThreshold], requireAll: Bool = true) {
         self.thresholds = thresholds
+        self.requireAll = requireAll
     }
 }
 
 // MARK: - Participation Verification
 
-/// Verifies that a participation profile meets all required thresholds.
+/// Verifies that a participation profile meets the required thresholds.
 ///
-/// Returns `true` if every threshold in the requirement is met by the
-/// corresponding value in the profile. Missing profile entries are
+/// When ``RequireParticipation/requireAll`` is `true` (default), returns
+/// `true` only if **every** threshold is met (AND). When `false`, returns
+/// `true` if **any** threshold is met (OR). Missing profile entries are
 /// treated as zero.
 ///
 /// This is a pure Swift function with no bridge dependency.
@@ -468,7 +481,7 @@ public nonisolated struct RequireParticipation: Sendable {
 /// - Parameters:
 ///   - requirement: The participation thresholds to check.
 ///   - profile: The observed participation values.
-/// - Returns: `true` if all thresholds are met, `false` otherwise.
+/// - Returns: `true` if the requirement is satisfied, `false` otherwise.
 ///
 /// ## Provenance
 ///
@@ -478,11 +491,16 @@ public func verifyParticipationRequirements(
     requirement: RequireParticipation,
     profile: ParticipationProfile
 ) -> Bool {
-    for threshold in requirement.thresholds {
-        let observed = profile[threshold.fact] ?? 0
-        if observed < threshold.minimum {
-            return false
-        }
+    if requirement.thresholds.isEmpty {
+        return true
     }
-    return true
+
+    let results = requirement.thresholds.map { threshold -> Bool in
+        let observed = profile[threshold.fact] ?? 0
+        return observed >= threshold.minimum
+    }
+
+    return requirement.requireAll
+        ? results.allSatisfy { $0 }
+        : results.contains { $0 }
 }
