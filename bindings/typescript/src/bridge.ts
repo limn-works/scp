@@ -15,12 +15,18 @@ import { getBridge } from "./internal/bridge.js";
 // Types
 // ---------------------------------------------------------------------------
 
+/** Bridge operating mode (spec §12). */
+export type BridgeMode = "relay" | "puppet" | "api" | "cooperative";
+
+/** Shadow identity provenance status. */
+export type ShadowStatus = "shadow" | "claimed";
+
 /** Bridge registration result. */
 export interface BridgeRegistration {
   readonly bridgeId: string;
   readonly operatorDid: string;
   readonly platform: string;
-  readonly mode: string;
+  readonly mode: BridgeMode;
   readonly status: string;
   readonly contextId: string;
 }
@@ -31,7 +37,7 @@ export interface ShadowIdentity {
   readonly platformHandle: string;
   readonly bridgeId: string;
   readonly attributedRole: string;
-  readonly provenanceStatus: string;
+  readonly provenanceStatus: ShadowStatus;
 }
 
 // ---------------------------------------------------------------------------
@@ -52,7 +58,7 @@ export async function bridgeRegister(
   contextId: string,
   operatorDid: string,
   platform: string,
-  mode: string,
+  mode: BridgeMode,
 ): Promise<BridgeRegistration> {
   try {
     const bridge = await getBridge();
@@ -81,7 +87,7 @@ export async function bridgeRegister(
 export async function bridgeEvaluateTrust(
   isBridged = false,
   isNativeTransport = true,
-  shadowStatus = "shadow",
+  shadowStatus: ShadowStatus = "shadow",
 ): Promise<number> {
   try {
     const bridge = await getBridge();
@@ -103,7 +109,7 @@ export async function bridgeEvaluateTrust(
 export async function bridgeCreateShadow(
   bridgeId: string,
   platformHandle: string,
-  bridgeMode: string,
+  bridgeMode: BridgeMode,
   contextId?: string,
 ): Promise<ShadowIdentity> {
   try {

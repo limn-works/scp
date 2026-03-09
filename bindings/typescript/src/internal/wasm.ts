@@ -11,6 +11,7 @@
  * See ADR-022 in `.docs/adrs/phase-4.md`.
  */
 
+import type { BridgeMode, ShadowStatus } from "../bridge.js";
 import { ScpError, TransportError } from "../errors.js";
 import type {
   BroadcastAdmissionPolicy,
@@ -123,17 +124,17 @@ interface WasmModule {
     contextId: string,
     operatorDid: string,
     platform: string,
-    mode: string,
+    mode: BridgeMode,
   ) => ReturnType<Bridge["bridgeRegister"]>;
   bridge_evaluate_trust: (
     isBridged: boolean,
     isNativeTransport: boolean,
-    shadowStatus: string,
+    shadowStatus: ShadowStatus,
   ) => number;
   bridge_create_shadow: (
     bridgeId: string,
     platformHandle: string,
-    bridgeMode: string,
+    bridgeMode: BridgeMode,
     contextId: string,
   ) => ReturnType<Bridge["bridgeCreateShadow"]>;
   // Discovery
@@ -631,12 +632,16 @@ export function createWasmBridge(): Bridge {
     },
 
     // Bridge Connector
-    bridgeRegister(contextId: string, operatorDid: string, platform: string, mode: string) {
+    bridgeRegister(contextId: string, operatorDid: string, platform: string, mode: BridgeMode) {
       const wasm = getWasm();
       return wasm.bridge_register(contextId, operatorDid, platform, mode);
     },
 
-    bridgeEvaluateTrust(isBridged: boolean, isNativeTransport: boolean, shadowStatus: string) {
+    bridgeEvaluateTrust(
+      isBridged: boolean,
+      isNativeTransport: boolean,
+      shadowStatus: ShadowStatus,
+    ) {
       const wasm = getWasm();
       return wasm.bridge_evaluate_trust(isBridged, isNativeTransport, shadowStatus);
     },
@@ -644,7 +649,7 @@ export function createWasmBridge(): Bridge {
     bridgeCreateShadow(
       bridgeId: string,
       platformHandle: string,
-      bridgeMode: string,
+      bridgeMode: BridgeMode,
       contextId: string | undefined,
     ) {
       const wasm = getWasm();

@@ -18,6 +18,7 @@
  * See ADR-022 in `.docs/adrs/phase-4.md`.
  */
 
+import type { BridgeMode, ShadowStatus } from "../bridge.js";
 import type {
   BroadcastAdmissionPolicy,
   Checkpoint,
@@ -153,27 +154,31 @@ export interface Bridge {
     contextId: string,
     operatorDid: string,
     platform: string,
-    mode: string,
+    mode: BridgeMode,
   ): {
     bridge_id: string;
     operator_did: string;
     platform: string;
-    mode: string;
+    mode: BridgeMode;
     status: string;
     context_id: string;
   };
-  bridgeEvaluateTrust(isBridged: boolean, isNativeTransport: boolean, shadowStatus: string): number;
+  bridgeEvaluateTrust(
+    isBridged: boolean,
+    isNativeTransport: boolean,
+    shadowStatus: ShadowStatus,
+  ): number;
   bridgeCreateShadow(
     bridgeId: string,
     platformHandle: string,
-    bridgeMode: string,
+    bridgeMode: BridgeMode,
     contextId: string | undefined,
   ): {
     shadow_id: string;
     platform_handle: string;
     bridge_id: string;
     attributed_role: string;
-    provenance_status: string;
+    provenance_status: ShadowStatus;
   };
 
   // Discovery

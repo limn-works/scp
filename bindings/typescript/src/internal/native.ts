@@ -13,6 +13,7 @@
 
 import { createRequire } from "node:module";
 
+import type { BridgeMode, ShadowStatus } from "../bridge.js";
 import { TransportError } from "../errors.js";
 import type {
   BroadcastAdmissionPolicy,
@@ -471,19 +472,23 @@ export function createNativeBridge(): Bridge {
     },
 
     // Bridge Connector
-    bridgeRegister(contextId: string, operatorDid: string, platform: string, mode: string) {
+    bridgeRegister(contextId: string, operatorDid: string, platform: string, mode: BridgeMode) {
       return (
         addon.bridgeRegister as (
           c: string,
           o: string,
           p: string,
-          m: string,
+          m: BridgeMode,
         ) => ReturnType<Bridge["bridgeRegister"]>
       )(contextId, operatorDid, platform, mode);
     },
 
-    bridgeEvaluateTrust(isBridged: boolean, isNativeTransport: boolean, shadowStatus: string) {
-      return (addon.bridgeEvaluateTrust as (b: boolean, n: boolean, s: string) => number)(
+    bridgeEvaluateTrust(
+      isBridged: boolean,
+      isNativeTransport: boolean,
+      shadowStatus: ShadowStatus,
+    ) {
+      return (addon.bridgeEvaluateTrust as (b: boolean, n: boolean, s: ShadowStatus) => number)(
         isBridged,
         isNativeTransport,
         shadowStatus,
@@ -493,14 +498,14 @@ export function createNativeBridge(): Bridge {
     bridgeCreateShadow(
       bridgeId: string,
       platformHandle: string,
-      bridgeMode: string,
+      bridgeMode: BridgeMode,
       contextId: string | undefined,
     ) {
       return (
         addon.bridgeCreateShadow as (
           b: string,
           p: string,
-          m: string,
+          m: BridgeMode,
           c: string | undefined,
         ) => ReturnType<Bridge["bridgeCreateShadow"]>
       )(bridgeId, platformHandle, bridgeMode, contextId);

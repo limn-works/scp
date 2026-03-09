@@ -65,7 +65,7 @@ export type BroadcastAdmissionPolicy = "Open" | "Gated";
 /**
  * Result of executing a governance action (ADR-031).
  *
- * Each variant corresponds to one of the 24+ governance action outcomes.
+ * Each variant corresponds to one of the 28 governance action outcomes.
  */
 export type GovernanceActionResult =
   | "MemberAdded"

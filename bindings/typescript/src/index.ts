@@ -82,7 +82,7 @@ export { connectMcp, connectMcpStdio, serveMcp } from "./mcp.js";
 // Bridge Connector
 // ---------------------------------------------------------------------------
 
-export type { BridgeRegistration, ShadowIdentity } from "./bridge.js";
+export type { BridgeMode, BridgeRegistration, ShadowIdentity, ShadowStatus } from "./bridge.js";
 export { bridgeCreateShadow, bridgeEvaluateTrust, bridgeRegister } from "./bridge.js";
 
 // ---------------------------------------------------------------------------
