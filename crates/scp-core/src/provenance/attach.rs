@@ -215,20 +215,21 @@ fn apply_counterparty_policy(
 
 /// Derives a context-scoped pseudonym for a DID (§9.10.4).
 ///
-/// `pseudonym = "did:pseudo:" || hex(SHA-256(pseudonym_key || context_id || did_string))`
+/// `pseudonym = "did:pseudo:" || hex(SHA-256("SCP-PSEUDONYM-V1:" || pseudonym_key || context_id || did_string))`
 ///
 /// The pseudonym is deterministic for the same (key, context, DID) triple,
 /// so the same real DID always maps to the same pseudonym within a context.
 /// Without the pseudonym key, the mapping is computationally irreversible.
 ///
-/// Each variable-length field is length-prefixed (4-byte big-endian) to
-/// prevent domain separation collisions where concatenation of different
-/// inputs could produce the same byte sequence.
+/// A domain separator prefix (`SCP-PSEUDONYM-V1:`) prevents collisions with
+/// other SHA-256 constructions in the codebase. Each variable-length field
+/// is length-prefixed (4-byte big-endian) to prevent concatenation ambiguity.
 #[must_use]
 #[allow(clippy::cast_possible_truncation)] // String/key lengths never exceed u32
 fn pseudonymize_did(did: &DID, context_id: &str, pseudonym_key: &[u8]) -> DID {
     let did_bytes = (*did).as_bytes();
     let mut hasher = Sha256::new();
+    hasher.update(b"SCP-PSEUDONYM-V1:");
     hasher.update((pseudonym_key.len() as u32).to_be_bytes());
     hasher.update(pseudonym_key);
     hasher.update((context_id.len() as u32).to_be_bytes());
