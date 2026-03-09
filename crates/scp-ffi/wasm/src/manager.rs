@@ -1096,6 +1096,30 @@ impl WasmContextManager {
         Ok(output)
     }
 
+    /// Returns the tool ID for an active session.
+    ///
+    /// Used to look up the tool before UCAN validation so the correct
+    /// `tool_invoke:{tool_id}` capability can be checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context or session is not found.
+    pub fn session_tool_id(
+        &self,
+        context_id: &str,
+        session_id: &str,
+    ) -> Result<String, ScpWasmError> {
+        let ctx = self.require_active_context(context_id)?;
+        let session = ctx
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| ScpWasmError::Tool {
+                message: format!("session '{session_id}' not found"),
+                code: "SCP-TOOL-6018".to_owned(),
+            })?;
+        Ok(session.tool_id.clone())
+    }
+
     /// Closes a stateful tool session.
     ///
     /// # Errors

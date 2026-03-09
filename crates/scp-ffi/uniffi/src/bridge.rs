@@ -2703,7 +2703,8 @@ pub async fn tool_verify(
 
 /// Invokes a tool across context boundaries.
 ///
-/// Validates chain depth per spec section 6.2 (max 3 hops).
+/// Validates UCAN authorization against the target context and chain depth
+/// per spec section 6.2 (max 3 hops).
 ///
 /// # Arguments
 ///
@@ -2712,10 +2713,17 @@ pub async fn tool_verify(
 /// * `tool_id` — The tool to invoke.
 /// * `input_json` — Tool input as a JSON string.
 /// * `identity` — The invoker's identity.
+/// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
+///   Validated against the TARGET context's ceiling using the full 11-step
+///   ADR-016 pipeline.
 /// * `chain_depth` — Current chain depth (0 for first hop).
+/// * `proof_tokens` — Optional list of encoded parent UCAN tokens for
+///   delegation chain traversal.
 ///
 /// # Errors
 ///
+/// Returns `ScpError::Permission` if the UCAN token is invalid, expired,
+/// revoked, or lacks the required tool invocation capability.
 /// Returns `ScpError::Tool` if chain depth exceeded or contexts not active.
 #[uniffi::export]
 pub async fn tool_invoke_cross_context(
@@ -2724,7 +2732,9 @@ pub async fn tool_invoke_cross_context(
     tool_id: String,
     input_json: String,
     identity: Arc<Identity>,
+    ucan_token: String,
     chain_depth: u8,
+    proof_tokens: Option<Vec<String>>,
 ) -> Result<String, ScpError> {
     runtime()
         .spawn(async move {
@@ -2764,6 +2774,17 @@ pub async fn tool_invoke_cross_context(
                     code: "SCP-TOOL-6012".to_owned(),
                 });
             }
+
+            // Primary authorization: UCAN token validation via the full 11-step
+            // ADR-016 pipeline against the TARGET context's ceiling.
+            // See spec §6.2, §8, ADR-016, and issue #319.
+            validate_tool_ucan_uniffi(
+                &target_handle,
+                &tool_id,
+                &ucan_token,
+                &identity.did,
+                proof_tokens.as_ref(),
+            )?;
 
             let input_value: serde_json::Value =
                 serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
@@ -2905,8 +2926,20 @@ pub async fn tool_session_create(
 
 /// Invokes a tool within an active session.
 ///
-/// Each call is individually governed. Session state is carried forward
-/// and the call count is incremented on success.
+/// Each call is individually governed: the invoker must present a valid
+/// UCAN token. Session state is carried forward and the call count is
+/// incremented on success.
+///
+/// # Arguments
+///
+/// * `handle` — The context containing the tool session.
+/// * `session_id` — The session to invoke within.
+/// * `input_json` — Tool input parameters as a JSON string.
+/// * `identity` — The identity of the invoker.
+/// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
+///   Validated using the full 11-step ADR-016 pipeline.
+/// * `proof_tokens` — Optional list of encoded parent UCAN tokens for
+///   delegation chain traversal.
 ///
 /// # Returns
 ///
@@ -2917,6 +2950,8 @@ pub async fn tool_session_invoke(
     session_id: String,
     input_json: String,
     identity: Arc<Identity>,
+    ucan_token: String,
+    proof_tokens: Option<Vec<String>>,
 ) -> Result<String, ScpError> {
     runtime()
         .spawn(async move {
@@ -2931,6 +2966,26 @@ pub async fn tool_session_invoke(
                 });
             }
             drop(state);
+
+            // Look up tool_id from session for UCAN validation.
+            let tool_id_for_ucan = {
+                let store = handle.session_store.lock().await;
+                let session = store.get(&session_id).ok_or_else(|| ScpError::Tool {
+                    message: format!("session '{session_id}' not found"),
+                    code: "SCP-TOOL-6018".to_owned(),
+                })?;
+                session.tool_id.clone()
+            };
+
+            // Primary authorization: UCAN token validation via the full 11-step
+            // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
+            validate_tool_ucan_uniffi(
+                &handle,
+                &tool_id_for_ucan,
+                &ucan_token,
+                &identity.did,
+                proof_tokens.as_ref(),
+            )?;
 
             let mut store = handle.session_store.lock().await;
 

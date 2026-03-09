@@ -249,6 +249,8 @@ pub fn tool_verify(context: &WasmContextHandle, tool_id: String) -> Promise {
 
 /// Invokes a tool across context boundaries.
 ///
+/// Validates UCAN authorization against the target context before dispatch.
+///
 /// # Returns
 ///
 /// `Promise<string>` — resolves to a JSON string of the tool's output.
@@ -259,11 +261,34 @@ pub fn tool_invoke_cross_context(
     tool_id: String,
     input_json: String,
     invoker_did: String,
+    ucan_token: String,
     chain_depth: u8,
 ) -> Promise {
     let source_id = source_context.context_id();
     let target_id = target_context.context_id();
     future_to_promise(async move {
+        // UCAN authorization: validate the token against the TARGET context's
+        // ceiling via the WASM-local 11-step pipeline.
+        // See spec §6.2, §8, ADR-016, and issue #319.
+        if ucan_token.is_empty() {
+            return Err(ScpWasmError::Validation {
+                message: "ucan_token is required for cross-context tool invocation".to_owned(),
+                code: "SCP-VALID-7000".to_owned(),
+            }
+            .into_js()
+            .into());
+        }
+        crate::ucan::validate_tool_ucan_wasm(&target_id, &tool_id, &ucan_token, &invoker_did)
+            .map_err(|e| {
+                ScpWasmError::Permission {
+                    message: format!(
+                        "UCAN authorization failed for cross-context tool '{tool_id}': {e}"
+                    ),
+                    code: "SCP-PERM-3000".to_owned(),
+                }
+                .into_js()
+            })?;
+
         let input: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("input_json is not valid JSON: {e}"),
@@ -330,6 +355,9 @@ pub fn tool_session_create(
 
 /// Invokes a tool within an active session.
 ///
+/// Each call is individually governed: the invoker must present a valid
+/// UCAN token.
+///
 /// # Returns
 ///
 /// `Promise<string>` — resolves to the tool output as a JSON string.
@@ -339,9 +367,43 @@ pub fn tool_session_invoke(
     session_id: String,
     input_json: String,
     invoker_did: String,
+    ucan_token: String,
 ) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
+        // UCAN authorization: look up the tool_id from the session, then
+        // validate the token via the WASM-local 11-step pipeline.
+        // See spec §6.2, §8, ADR-016, and issue #319.
+        if ucan_token.is_empty() {
+            return Err(ScpWasmError::Validation {
+                message: "ucan_token is required for session tool invocation".to_owned(),
+                code: "SCP-VALID-7000".to_owned(),
+            }
+            .into_js()
+            .into());
+        }
+
+        let tool_id_for_ucan =
+            with_manager(|mgr| mgr.session_tool_id(&context_id, &session_id))
+                .map_err(ScpWasmError::into_js)?;
+
+        crate::ucan::validate_tool_ucan_wasm(
+            &context_id,
+            &tool_id_for_ucan,
+            &ucan_token,
+            &invoker_did,
+        )
+        .map_err(|e| {
+            ScpWasmError::Permission {
+                message: format!(
+                    "UCAN authorization failed for tool '{}': {e}",
+                    tool_id_for_ucan
+                ),
+                code: "SCP-PERM-3000".to_owned(),
+            }
+            .into_js()
+        })?;
+
         let input: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("input_json is not valid JSON: {e}"),

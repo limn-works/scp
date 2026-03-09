@@ -415,8 +415,9 @@ pub async fn tool_verify(
 
 /// Invokes a tool across context boundaries.
 ///
-/// Validates chain depth, source context capability, and target context
-/// tool existence per spec section 6.2.
+/// Validates UCAN authorization against the target context, chain depth,
+/// source context capability, and target context tool existence per spec
+/// section 6.2.
 ///
 /// # Returns
 ///
@@ -430,7 +431,9 @@ pub async fn tool_invoke_cross_context(
     tool_id: String,
     input_json: String,
     invoker_did: String,
+    ucan_token: String,
     chain_depth: u8,
+    proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<String> {
     // Validate both contexts are active.
     let source_state = source_handle.state()?;
@@ -472,6 +475,25 @@ pub async fn tool_invoke_cross_context(
 
     // Ensure target context UCAN state is registered.
     crate::runtime::ensure_registered(target_handle)?;
+
+    // Primary authorization: UCAN token validation via the full 11-step
+    // ADR-016 pipeline against the TARGET context's ceiling.
+    // See spec §6.2, §8, ADR-016, and issue #319.
+    let proof_resolver = crate::ucan::build_proof_resolver_from_tokens(proof_tokens.as_deref())
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Permission {
+                message: format!("failed to build proof resolver: {e}"),
+                code: "SCP-PERM-3001".to_owned(),
+            })
+        })?;
+    validate_ucan_for_tool(
+        &target_context_id,
+        &tool_id,
+        &invoker_did,
+        &ucan_token,
+        &proof_resolver,
+    )
+    .map_err(napi::Error::from)?;
 
     let input_value: serde_json::Value =
         serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
@@ -610,6 +632,9 @@ pub async fn tool_session_create(
 
 /// Invokes a tool within an active session.
 ///
+/// Each call is individually governed: the invoker must present a valid
+/// UCAN token. Session state is carried forward across invocations.
+///
 /// # Returns
 ///
 /// A `Promise<string>` resolving to the tool output as a JSON string.
@@ -621,6 +646,8 @@ pub async fn tool_session_invoke(
     session_id: String,
     input_json: String,
     invoker_did: String,
+    ucan_token: String,
+    proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<String> {
     let state_str = handle.state()?;
     if state_str != "active" {
@@ -635,6 +662,38 @@ pub async fn tool_session_invoke(
 
     let context_id = handle.context_id();
     crate::runtime::ensure_registered(handle)?;
+
+    // Look up the tool_id from the session before UCAN validation so we can
+    // validate against the correct tool capability.
+    let tool_id_for_ucan = crate::runtime::with_context(&context_id, |rt| {
+        let session = rt
+            .session_store
+            .get(&session_id)
+            .ok_or_else(|| ScpNapiError::Tool {
+                message: format!("session '{session_id}' not found"),
+                code: "SCP-TOOL-6018".to_owned(),
+            })?;
+        Ok(session.tool_id.clone())
+    })
+    .map_err(napi::Error::from)?;
+
+    // Primary authorization: UCAN token validation via the full 11-step
+    // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
+    let proof_resolver = crate::ucan::build_proof_resolver_from_tokens(proof_tokens.as_deref())
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Permission {
+                message: format!("failed to build proof resolver: {e}"),
+                code: "SCP-PERM-3001".to_owned(),
+            })
+        })?;
+    validate_ucan_for_tool(
+        &context_id,
+        &tool_id_for_ucan,
+        &invoker_did,
+        &ucan_token,
+        &proof_resolver,
+    )
+    .map_err(napi::Error::from)?;
 
     let output = crate::runtime::with_context(&context_id, |rt| {
         let session = rt

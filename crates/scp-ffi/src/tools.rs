@@ -674,6 +674,10 @@ fn extract_test_vectors(
 /// * `tool_id` — The ID of the tool to invoke.
 /// * `input` — A Python dict of input parameters.
 /// * `invoker_did` — The DID of the participant invoking the tool.
+/// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
+///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability.
+///   Validated against the TARGET context's ceiling using the full 11-step
+///   ADR-016 pipeline.
 /// * `chain_depth` — Current cross-context chain depth (0 for first hop).
 ///
 /// # Returns
@@ -682,10 +686,14 @@ fn extract_test_vectors(
 ///
 /// # Errors
 ///
+/// Raises `UcanError` if the UCAN token is invalid, expired, revoked,
+/// or lacks the required tool invocation capability.
 /// Raises `ContextError` if either context is not connected, the tool is
 /// not found, chain depth is exceeded, or the interface is not approved.
 #[pyfunction]
 #[pyo3(name = "tool_invoke_cross_context")]
+#[pyo3(signature = (source_context_id, target_context_id, tool_id, input, invoker_did, ucan_token, chain_depth, proof_tokens=None))]
+#[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
 pub fn py_tool_invoke_cross_context(
     py: Python<'_>,
     source_context_id: &str,
@@ -693,15 +701,34 @@ pub fn py_tool_invoke_cross_context(
     tool_id: &str,
     input: &Bound<'_, PyDict>,
     invoker_did: &str,
+    ucan_token: &str,
     chain_depth: u8,
+    proof_tokens: Option<Vec<String>>,
 ) -> PyResult<PyObject> {
     validate::validate_context_id(source_context_id)?;
     validate::validate_context_id(target_context_id)?;
     validate::validate_tool_id(tool_id)?;
     validate::validate_did(invoker_did)?;
+    validate::validate_ucan_token(ucan_token)?;
+    if let Some(ref tokens) = proof_tokens {
+        for t in tokens {
+            validate::validate_ucan_token(t)?;
+        }
+    }
     let input_json = py_dict_to_json(input)?;
 
-    // Validate the source context has the invoker's capability.
+    // Primary authorization: UCAN token validation via the full 11-step
+    // ADR-016 pipeline against the TARGET context's ceiling.
+    // See spec §6.2, §8, ADR-016, and issue #319.
+    validate_tool_ucan(
+        target_context_id,
+        tool_id,
+        ucan_token,
+        invoker_did,
+        proof_tokens.as_ref(),
+    )?;
+
+    // Defense-in-depth: check role-state capabilities in the source context.
     let source_has_capability = crate::runtime::with_context(source_context_id, |rt| {
         Ok(scp_core::context::tools::has_tool_invoke_capability(
             &rt.role_state,
@@ -859,8 +886,9 @@ pub fn py_tool_session_create(
 /// Invokes a tool within an active session.
 ///
 /// Each call is individually governed: the invoker must hold `ToolInvoke`
-/// capability. Session state is carried forward across invocations. The
-/// session's call count is incremented on each successful invocation.
+/// capability and present a valid UCAN token. Session state is carried
+/// forward across invocations. The session's call count is incremented on
+/// each successful invocation.
 ///
 /// # Arguments
 ///
@@ -868,6 +896,9 @@ pub fn py_tool_session_create(
 /// * `session_id` — The session to invoke within.
 /// * `input` — A Python dict of input parameters.
 /// * `invoker_did` — The DID of the invoker (capability checked per call).
+/// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
+///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability.
+///   Validated using the full 11-step ADR-016 pipeline.
 ///
 /// # Returns
 ///
@@ -875,20 +906,52 @@ pub fn py_tool_session_create(
 ///
 /// # Errors
 ///
+/// Raises `UcanError` if the UCAN token is invalid, expired, revoked,
+/// or lacks the required tool invocation capability.
 /// Raises `ContextError` if the session is not found, has expired, or
 /// the invoker lacks capability.
 #[pyfunction]
 #[pyo3(name = "tool_session_invoke")]
+#[pyo3(signature = (context_id, session_id, input, invoker_did, ucan_token, proof_tokens=None))]
+#[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
 pub fn py_tool_session_invoke(
     py: Python<'_>,
     context_id: &str,
     session_id: &str,
     input: &Bound<'_, PyDict>,
     invoker_did: &str,
+    ucan_token: &str,
+    proof_tokens: Option<Vec<String>>,
 ) -> PyResult<PyObject> {
     validate::validate_context_id(context_id)?;
     validate::validate_did(invoker_did)?;
+    validate::validate_ucan_token(ucan_token)?;
+    if let Some(ref tokens) = proof_tokens {
+        for t in tokens {
+            validate::validate_ucan_token(t)?;
+        }
+    }
     let input_json = py_dict_to_json(input)?;
+
+    // Look up the tool_id from the session before UCAN validation so we can
+    // validate against the correct tool capability.
+    let tool_id_for_ucan = crate::runtime::with_context(context_id, |rt| {
+        let session = rt
+            .session_store
+            .get(session_id)
+            .ok_or_else(|| ScpPyError::context(format!("session '{session_id}' not found")))?;
+        Ok(session.tool_id.clone())
+    })?;
+
+    // Primary authorization: UCAN token validation via the full 11-step
+    // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
+    validate_tool_ucan(
+        context_id,
+        &tool_id_for_ucan,
+        ucan_token,
+        invoker_did,
+        proof_tokens.as_ref(),
+    )?;
 
     let output_json = crate::runtime::with_context(context_id, |rt| {
         // Look up session.
@@ -910,7 +973,8 @@ pub fn py_tool_session_invoke(
         let tool_id = session.tool_id.clone();
         let current_state = session.state.clone();
 
-        // Per-call UCAN governance: check ToolInvoke capability.
+        // Defense-in-depth: check role-state capabilities in addition to the
+        // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
         if !scp_core::context::tools::has_tool_invoke_capability(
             &rt.role_state,
             invoker_did,
