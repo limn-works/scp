@@ -858,8 +858,8 @@ Implement the FFI bridge as the `crates/scp-ffi/uniffi/` crate using UniFFI proc
     };
     ```
 
-    - `KeyCustodyProvider`: Swift implementation wraps Secure Enclave/Keychain; Kotlin implementation wraps Android Keystore.
-    - `StorageProvider`: Swift implementation wraps Core Data / UserDefaults / file-based storage; Kotlin implementation wraps Room / SharedPreferences.
+    - `KeyCustodyProvider`: Swift implementation wraps Keychain (Secure Enclave supports P-256 only; SCP uses Ed25519 — see ADR-025); Kotlin implementation wraps Android Keystore.
+    - `StorageProvider`: Swift implementation wraps SQLCipher-encrypted SQLite with Keychain-protected key (ADR-025); Kotlin implementation wraps SQLCipher with Android Keystore-protected key (ADR-027).
     - `PushProvider`: Swift implementation wraps APNs; Kotlin implementation wraps FCM.
     - `DeviceAttestationProvider`: Swift implementation wraps `DCAppAttestService` (App Attest) on iOS/macOS; Kotlin implementation wraps Play Integrity API on Android. Used by ADR-025 (Apple Platform Adapter) and the Android adapter.
     - `MessageListener`: Callback for incoming message streams. The Swift SDK converts to `AsyncStream<Message>` via `AsyncStream.Continuation`; the Kotlin SDK converts to `Flow<Message>` via `callbackFlow`.
