@@ -931,10 +931,16 @@ pub async fn broadcast_unsubscribe(
 ///   or the sender is not an author.
 /// - Rejects with `SCP-PERM-3020` if the context has no custody provider.
 #[napi(js_name = "broadcastPublish")]
-pub async fn broadcast_publish(handle: &NapiContextHandle, payload: Vec<u8>) -> napi::Result<()> {
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub async fn broadcast_publish(
+    handle: &NapiContextHandle,
+    author_did: String,
+    payload: Vec<u8>,
+) -> napi::Result<()> {
+    validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager();
     let context_id = handle.context_id.clone();
-    let author_did = DID(handle.creator_did.clone());
+    let author_did = DID(author_did);
 
     #[cfg(feature = "allow_in_memory_custody")]
     {
