@@ -213,6 +213,26 @@ jobs:
       - run: bun test
 
   # ── Kotlin ──────────────────────────────────────────────────────────
+  kotlin-lint:
+    needs: changes
+    if: needs.changes.outputs.kotlin == 'true'
+    name: Kotlin / lint + format
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bindings/kotlin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "platforms;android-35"
+      - uses: gradle/actions/setup-gradle@v4
+      - run: ./gradlew :scp-sdk-kotlin:runKtlintCheckOverMainSourceSet
+      - run: ./gradlew :scp-sdk-kotlin:detekt
+
   kotlin-test:
     needs: changes
     if: needs.changes.outputs.kotlin == 'true'
@@ -231,3 +251,18 @@ jobs:
       - run: sdkmanager "platforms;android-35"
       - uses: gradle/actions/setup-gradle@v4
       - run: ./gradlew test
+
+  # ── WASM ───────────────────────────────────────────────────────────
+  wasm-clippy:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    name: WASM / clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p scp-ffi-wasm --target wasm32-unknown-unknown -- -D warnings
