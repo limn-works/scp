@@ -49,11 +49,11 @@ data class SyncPolicy(
     val maxRetries: Int = DEFAULT_MAX_RETRIES,
 ) {
     companion object {
-        /** Default tier 1 threshold: 5 minutes (300 seconds). */
-        const val DEFAULT_TIER_1_THRESHOLD_SECS: Long = 300L
+        /** Default tier 1 threshold: 4 hours (14,400 seconds). */
+        const val DEFAULT_TIER_1_THRESHOLD_SECS: Long = 14_400L
 
-        /** Default tier 2 threshold: 24 hours (86400 seconds). */
-        const val DEFAULT_TIER_2_THRESHOLD_SECS: Long = 86_400L
+        /** Default tier 2 threshold: 7 days (604,800 seconds). */
+        const val DEFAULT_TIER_2_THRESHOLD_SECS: Long = 604_800L
 
         /** Default maximum retries for sync operations. */
         const val DEFAULT_MAX_RETRIES: Int = 3
