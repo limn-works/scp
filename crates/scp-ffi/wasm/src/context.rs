@@ -532,6 +532,54 @@ pub fn broadcast_block(handle: &WasmContextHandle, subscriber_did: String) -> Pr
 }
 
 // ---------------------------------------------------------------------------
+// Context export/import bridge functions (#424)
+// ---------------------------------------------------------------------------
+
+/// Exports a context's full state as serialized JSON bytes.
+///
+/// Returns a `Promise<Uint8Array>` containing a versioned JSON envelope with
+/// the context snapshot. The bytes are suitable for backup, migration, or
+/// transfer to another WASM node.
+///
+/// Delegates to `WasmContextManager::export_context`.
+#[wasm_bindgen]
+pub fn context_export(handle: &WasmContextHandle) -> Promise {
+    let context_id = handle.context_id();
+    let exporter_did = handle.creator_did();
+
+    future_to_promise(async move {
+        let bytes = with_manager(|mgr| mgr.export_context(&context_id, &exporter_did))
+            .map_err(ScpWasmError::into_js)?;
+
+        let len = u32::try_from(bytes.len()).map_err(|_| {
+            ScpWasmError::Context {
+                message: "export data exceeds 4 GiB — too large for WASM Uint8Array".to_owned(),
+                code: "SCP-CTX-2030".to_owned(),
+            }
+            .into_js()
+        })?;
+        let array = js_sys::Uint8Array::new_with_length(len);
+        array.copy_from(&bytes);
+        Ok(array.into())
+    })
+}
+
+/// Imports a context from serialized JSON bytes produced by [`context_export`].
+///
+/// Returns a `Promise<string>` resolving to the context ID of the imported
+/// context. The context becomes active and available for operations.
+///
+/// Delegates to `WasmContextManager::import_context`.
+#[wasm_bindgen]
+pub fn context_import(data: Vec<u8>) -> Promise {
+    future_to_promise(async move {
+        let context_id =
+            with_manager(|mgr| mgr.import_context(&data)).map_err(ScpWasmError::into_js)?;
+        Ok(JsValue::from_str(&context_id))
+    })
+}
+
+// ---------------------------------------------------------------------------
 // TTL bridge functions
 // ---------------------------------------------------------------------------
 

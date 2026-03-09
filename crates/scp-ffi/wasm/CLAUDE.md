@@ -15,7 +15,7 @@ All re-implementations must be algorithm-identical to scp-core. When scp-core ch
 | Module | Responsibility |
 |--------|---------------|
 | `runtime.rs` | WASM-local runtime registry: `WasmContextRuntime`, `ToolRegistry`, `WasmEventLog`, Merkle proof functions, schema validation, `with_context` |
-| `context.rs` | Context lifecycle: create, join, leave, close, send, subscribe |
+| `context.rs` | Context lifecycle: create, join, leave, close, send, subscribe, export, import |
 | `tools.rs` | Tool registration, invocation, verification |
 | `ucan.rs` | UCAN token management: validate, mint, revoke |
 | `event_log.rs` | Event log query, Merkle inclusion/absence proofs |
