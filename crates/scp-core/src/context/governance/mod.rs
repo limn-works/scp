@@ -694,6 +694,43 @@ pub enum GovernanceAction {
     LockEconomicPolicy,
 }
 
+impl GovernanceAction {
+    /// Returns the variant name as a static string for logging and event summaries.
+    #[must_use]
+    pub const fn variant_name(&self) -> &'static str {
+        match self {
+            Self::AddMember { .. } => "AddMember",
+            Self::RemoveMember { .. } => "RemoveMember",
+            Self::ChangeRole { .. } => "ChangeRole",
+            Self::RegisterTool { .. } => "RegisterTool",
+            Self::RemoveTool { .. } => "RemoveTool",
+            Self::ModifyCeiling { .. } => "ModifyCeiling",
+            Self::CloseContext { .. } => "CloseContext",
+            Self::ExtendTtl { .. } => "ExtendTtl",
+            Self::TransferAdmin { .. } => "TransferAdmin",
+            Self::CreateChildContext { .. } => "CreateChildContext",
+            Self::BlockAuthor { .. } => "BlockAuthor",
+            Self::RevokeReadAccess { .. } => "RevokeReadAccess",
+            Self::RestoreReadAccess { .. } => "RestoreReadAccess",
+            Self::ModifyPruningPolicy { .. } => "ModifyPruningPolicy",
+            Self::AddSigner { .. } => "AddSigner",
+            Self::RemoveSigner { .. } => "RemoveSigner",
+            Self::ModifyThreshold { .. } => "ModifyThreshold",
+            Self::EstablishToolInterface { .. } => "EstablishToolInterface",
+            Self::ResetMember { .. } => "ResetMember",
+            Self::ResolveConflict { .. } => "ResolveConflict",
+            Self::PromoteContext => "PromoteContext",
+            Self::RevokeWriteAccess { .. } => "RevokeWriteAccess",
+            Self::RestoreWriteAccess { .. } => "RestoreWriteAccess",
+            Self::RotateContentKeys { .. } => "RotateContentKeys",
+            Self::ReconfigureGovernance { .. } => "ReconfigureGovernance",
+            Self::SetEconomicPolicy { .. } => "SetEconomicPolicy",
+            Self::ApproveSpend { .. } => "ApproveSpend",
+            Self::LockEconomicPolicy => "LockEconomicPolicy",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // VoteType / SignedVote
 // ---------------------------------------------------------------------------

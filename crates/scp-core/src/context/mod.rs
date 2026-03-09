@@ -82,10 +82,10 @@ pub fn context_id_bytes(context_id: &str) -> [u8; 32] {
 
 // Re-export all parameter types for convenience.
 pub use params::{
-    BridgeDirectionality, BridgeMetadata, Capability, CeilingPolicy, ContextMode, ContextParams,
-    FieldVisibility, GovernanceModel, MemoryScope, MetadataVisibilityPolicy, ProjectionOverride,
-    ProjectionPolicy, ProjectionRule, PromotionPolicy, PublicMetadata, RoleDefinition,
-    RuntimeMetadata, TemplateId, ToolRegistration,
+    BridgeCapability, BridgeDirectionality, BridgeMetadata, Capability, CeilingPolicy, ContextMode,
+    ContextParams, FieldVisibility, GovernanceModel, MemoryScope, MetadataVisibilityPolicy,
+    ProjectionOverride, ProjectionPolicy, ProjectionRule, PromotionPolicy, PublicMetadata,
+    RoleDefinition, RuntimeMetadata, TemplateId, ToolRegistration,
 };
 pub use state_machine::transition;
 

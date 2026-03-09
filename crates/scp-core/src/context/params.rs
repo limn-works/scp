@@ -373,6 +373,28 @@ pub enum BridgeDirectionality {
 }
 
 // ---------------------------------------------------------------------------
+// BridgeCapability (§5.7)
+// ---------------------------------------------------------------------------
+
+/// Capabilities a bridge connector can exercise in a context (spec §5.7).
+///
+/// These are the four protocol-defined bridge capabilities. A bridge's
+/// `capabilities` field declares which of these it exercises, providing
+/// legibility to prospective members before they join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BridgeCapability {
+    /// Relay messages between SCP and the external platform.
+    RelayMessages,
+    /// Create shadow participants for external users.
+    CreateShadows,
+    /// Attest external user identities.
+    AttestIdentities,
+    /// Forward presence/typing indicators.
+    ForwardPresence,
+}
+
+// ---------------------------------------------------------------------------
 // BridgeMetadata (§5.7)
 // ---------------------------------------------------------------------------
 
@@ -394,9 +416,7 @@ pub struct BridgeMetadata {
     /// behavior (spec §12.2).
     pub bridge_did: DID,
     /// Capabilities the bridge exercises in this context.
-    /// Subset of: `"relay_messages"`, `"create_shadows"`,
-    /// `"attest_identities"`, `"forward_presence"`.
-    pub capabilities: Vec<String>,
+    pub capabilities: Vec<BridgeCapability>,
     /// Directionality of the bridge.
     pub mode: BridgeDirectionality,
 }

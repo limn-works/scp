@@ -2614,15 +2614,38 @@ impl ContextManager {
             }
         };
 
-        // Emit GovernanceActionExecuted event to the Merkle event log
-        // (ADR-031 §8, PRD SCP-269/SCP-270). Appended after every successful
-        // governance action execution so SDK consumers can observe execution
-        // through the event system.
+        // Construct the structured GovernanceEvent::GovernanceActionExecuted
+        // and emit it to both the Merkle event log and the receive buffer
+        // (ADR-031 §8, PRD SCP-269/SCP-270).
         {
+            let executed_event = GovernanceEvent::GovernanceActionExecuted {
+                proposal_id: proposal.proposal_id,
+                action: Box::new(proposal.action.clone()),
+                executor_did: proposal.proposer_did.clone(),
+                resulting_epoch: None,
+            };
+
+            // Append to Merkle event log using the standard governance event
+            // label path (same pattern as propose/approve/reject/withdraw).
             let context_id_bytes = context_id_to_bytes(context_id);
-            let _ = self
-                .event_log
-                .append_context_event(&context_id_bytes, "GovernanceActionExecuted");
+            let _ = self.event_log.append_context_event(
+                &context_id_bytes,
+                Self::governance_event_label(&executed_event),
+            );
+
+            // Push to receive buffer so SDK consumers observe outcomes with
+            // rich context.
+            let action_summary = proposal.action.variant_name().to_owned();
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.receive_buffer
+                    .push(ContextEvent::GovernanceActionExecuted {
+                        proposal_id: proposal.proposal_id,
+                        action_summary,
+                        executor_did: proposal.proposer_did.clone(),
+                        resulting_epoch: None,
+                    });
+            }
         }
 
         // Remove the executed proposal from approved_proposals so it no
@@ -2972,6 +2995,24 @@ impl ContextManager {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+        }
+    }
+
+    /// Returns the event-log label string for a [`GovernanceEvent`] variant.
+    ///
+    /// Used when appending governance events to the Merkle event log. Each
+    /// variant maps to a deterministic string label so event consumers can
+    /// filter by type without deserializing the full event.
+    fn governance_event_label(event: &GovernanceEvent) -> &'static str {
+        match event {
+            GovernanceEvent::ProposalCreated { .. } => "GovernanceProposalCreated",
+            GovernanceEvent::VoteCast { .. } => "GovernanceVoteCast",
+            GovernanceEvent::VoteWithdrawn { .. } => "GovernanceVoteWithdrawn",
+            GovernanceEvent::ProposalResolved { .. } => "GovernanceProposalResolved",
+            GovernanceEvent::DeadlockRecovery { .. } => "GovernanceDeadlockRecovery",
+            GovernanceEvent::ConflictDetected { .. } => "GovernanceConflictDetected",
+            GovernanceEvent::ConflictResolved { .. } => "GovernanceConflictResolved",
+            GovernanceEvent::GovernanceActionExecuted { .. } => "GovernanceActionExecuted",
         }
     }
 
@@ -3513,19 +3554,10 @@ impl ContextManager {
 
         let context_id_bytes = context_id_to_bytes(context_id);
         for event in &events {
-            let event_str = match event {
-                GovernanceEvent::ProposalCreated { .. } => "GovernanceProposalCreated",
-                GovernanceEvent::VoteCast { .. } => "GovernanceVoteCast",
-                GovernanceEvent::VoteWithdrawn { .. } => "GovernanceVoteWithdrawn",
-                GovernanceEvent::ProposalResolved { .. } => "GovernanceProposalResolved",
-                GovernanceEvent::DeadlockRecovery { .. } => "GovernanceDeadlockRecovery",
-                GovernanceEvent::ConflictDetected { .. } => "GovernanceConflictDetected",
-                GovernanceEvent::ConflictResolved { .. } => "GovernanceConflictResolved",
-                GovernanceEvent::GovernanceActionExecuted { .. } => "GovernanceActionExecuted",
-            };
-            let _ = self
-                .event_log
-                .append_context_event(&context_id_bytes, event_str);
+            let _ = self.event_log.append_context_event(
+                &context_id_bytes,
+                Self::governance_event_label(event),
+            );
         }
 
         // Persist context state after withdrawal.
