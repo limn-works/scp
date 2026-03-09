@@ -65,7 +65,7 @@ export async function evaluateProvenanceQuality(options: {
  * @param members - Member DID strings from the source context.
  * @param targetContextId - ID of the target context.
  * @param existingChainDepth - Chain depth of existing provenance (if any).
- * @returns JSON string with the provenance record.
+ * @returns Parsed provenance record.
  * @throws {ValidationError} If sourceType or memoryScope is invalid.
  */
 export async function provenanceAttach(
@@ -75,10 +75,10 @@ export async function provenanceAttach(
   members: string[],
   targetContextId: string,
   existingChainDepth?: number,
-): Promise<string> {
+): Promise<ProvenanceRecord> {
   try {
     const bridge = await getBridge();
-    return bridge.provenanceAttach(
+    const raw = bridge.provenanceAttach(
       sourceContextId,
       sourceType,
       memoryScope,
@@ -86,6 +86,8 @@ export async function provenanceAttach(
       targetContextId,
       existingChainDepth,
     );
+    const record: ProvenanceRecord = JSON.parse(raw);
+    return record;
   } catch (error) {
     throw mapBridgeError(error);
   }
