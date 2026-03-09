@@ -11,7 +11,7 @@ Software generation is becoming trivial. Frontier language models produce functi
 
 This paper presents the Shared Context Protocol (SCP), an open protocol providing cryptographic identity (DID), governed interaction spaces (contexts), end-to-end encryption as access control (MLS), capability-based authorization (UCAN), and verifiable provenance. All interaction occurs within contexts — bounded, encrypted, governed spaces where membership is enforced by cryptography, not infrastructure. The protocol is designed for a world where autonomous agents are the primary actors: every agent traces to a human identity through cryptographic binding, agents are isolated per context at the protocol level, and behavioral records replace reputation scores as the primary trust input.
 
-Key properties: no operator dependency (the protocol functions if its creators disappear), transport independence (17 adapter specifications across 4 tiers), human accountability for all autonomous agents, and context isolation as the security boundary. The reference implementation is in Rust with bindings for Python, Swift, Kotlin, TypeScript, and WebAssembly. The specification is published under CC-BY 4.0; the SDK under Apache 2.0.
+Key properties: no operator dependency (the protocol functions if its creators disappear), transport independence (17 adapter specifications across 3 tiers), human accountability for all autonomous agents, and context isolation as the security boundary. The reference implementation is in Rust with bindings for Python, Swift, Kotlin, TypeScript, and WebAssembly. The specification is published under CC-BY 4.0; the SDK under Apache 2.0.
 
 ---
 
@@ -39,23 +39,23 @@ SCP fills this gap. It is a social-level protocol: identity, trust, governed int
 
 SCP is governed by nine design principles. Each has a load-bearing consequence for the protocol's architecture.
 
-1. **Provenance everywhere.** All non-private data carries verifiable origin metadata. The absence of provenance is itself a signal — data with no verified origin triggers additional scrutiny by design, not by convention. *Consequence:* the protocol automatically attaches provenance at every context boundary crossing; manual tagging is not required.
+1. **Provenance everywhere.** All non-private data carries verifiable origin metadata. The absence of provenance is itself a signal. *Consequence:* the protocol attaches provenance automatically at context boundary crossings (Section 8).
 
-2. **Human accountability.** Every agent traces to a human DID through cryptographic binding — the agent's signing key is a verification method in the human's DID document. *Consequence:* there are no anonymous autonomous actors in the protocol; misbehavior is always attributable to a human identity.
+2. **Human accountability.** Every agent traces to a human DID through cryptographic binding. *Consequence:* there are no anonymous autonomous actors; misbehavior is always attributable (Section 4.4).
 
-3. **Context isolation.** All interaction occurs within bounded contexts. Cross-context data flow is explicit and governed through two opt-in mechanisms: tool interfaces (asymmetric) and multi-parent child contexts (symmetric). *Consequence:* agents in different contexts are separate instances at the protocol level, even when operated by the same human.
+3. **Context isolation.** All interaction occurs within bounded contexts. Cross-context data flow is explicit and governed. *Consequence:* agents in different contexts are separate instances at the protocol level, even when operated by the same human (Section 5).
 
-4. **Encryption-as-access-control.** MLS group keys enforce membership. If you do not have the key, you cannot read the data. No relay or intermediary enforces access — the cryptography does. *Consequence:* relays are untrusted dumb pipes; a compromised relay cannot breach confidentiality.
+4. **Encryption-as-access-control.** MLS group keys enforce membership. No relay or intermediary enforces access — the cryptography does. *Consequence:* relays are untrusted; a compromised relay cannot breach confidentiality (Section 6).
 
-5. **Legibility before opt-in.** Every context's parameters — capability ceiling, governance model, roles, tools, TTL, memory scope — are visible before joining. *Consequence:* informed consent is mechanical, not social.
+5. **Legibility before opt-in.** Every context's parameters are visible before joining. *Consequence:* informed consent is mechanical, not social.
 
-6. **No operator dependency.** The protocol must function if its creators disappear. No centralized infrastructure, no privileged nodes, no governance that requires a specific entity to exist. *Consequence:* identity is self-sovereign (DID-based, not server-bound), relays are substitutable, and all cryptographic operations are local.
+6. **No operator dependency.** The protocol must function if its creators disappear. *Consequence:* identity is self-sovereign, relays are substitutable, and all cryptographic operations are local.
 
-7. **Transport independence.** No structural coupling to any single transport mechanism. *Consequence:* the protocol defines a transport adapter trait; 17 adapters are specified across 4 tiers, from fully specified wire formats to feasibility-confirmed mappings.
+7. **Transport independence.** No structural coupling to any single transport. *Consequence:* the protocol defines a transport adapter trait with 17 adapter specifications (Section 9).
 
-8. **Agents are participants, not enforcers.** Agents consume the protocol; they do not enforce it. Enforcement is cryptographic and structural. *Consequence:* the protocol is safe even when clients are generated, untrusted, or adversarial — no security property depends on client cooperation.
+8. **Agents are participants, not enforcers.** Enforcement is cryptographic, not behavioral. *Consequence:* no security property depends on client cooperation.
 
-9. **Trust is contextual.** Trust is a function of identity, capability, context, and behavioral evidence — not a binary flag. *Consequence:* the protocol provides composable trust signals rather than a single trust score; contexts set their own thresholds.
+9. **Trust is contextual.** Trust is a function of identity, capability, context, and behavioral evidence — not a binary flag. *Consequence:* contexts set their own thresholds from composable trust signals (Section 11.3).
 
 ### 1.4 Contribution and Scope
 
@@ -92,19 +92,7 @@ Existing agent protocols operate at the tool level — they define how agents us
 
 ### 2.3 Why Not Existing Protocols?
 
-Each existing protocol solves pieces of the problem. None addresses the agent-native case comprehensively.
-
-**Matrix** provides federated rooms with end-to-end encryption (Megolm), but identity is server-bound (`@user:server`), there is no agent accountability model, no capability-based authorization, and no context isolation — rooms do not provide cryptographic boundaries.
-
-**AT Protocol** provides self-sovereign identity (`did:plc`) and portable data, but has no end-to-end encryption (relays see all content), no governed interaction spaces, and no agent-specific primitives.
-
-**Nostr** provides a simple relay model with censorship resistance, but has no group encryption, no governance, no capability model, and places the full key management burden on users.
-
-**Signal Protocol** provides best-in-class encryption (Double Ratchet), but identity is centralized (phone numbers), the ecosystem is closed, and there is no programmable governance or agent model.
-
-**Holepunch/Hypercore** provides zero-server peer-to-peer infrastructure with append-only logs, production-proven in Keet, but is transport-coupled (Hyperswarm), has no governance or capability model, uses single-writer logs with application-layer multi-writer composition, and its group encryption is undocumented.
-
-**MCP** provides the agent-to-tool protocol with wide adoption, but operates at the tool level only — no social layer, no identity, no trust, no encryption, no contexts.
+Existing protocols address pieces of this problem — federated messaging (Matrix), self-sovereign identity (AT Protocol), censorship-resistant relaying (Nostr), end-to-end encryption (Signal), zero-server P2P (Holepunch/Hypercore), and agent-tool integration (MCP). None addresses the agent-native case comprehensively: no existing protocol provides cryptographic context isolation, human accountability chains for autonomous agents, capability-based authorization with delegation, and verifiable provenance as a unified architecture. Section 12 provides a detailed structured comparison.
 
 ### 2.4 Requirements
 
@@ -155,7 +143,7 @@ The protocol is organized in five layers:
 
 **App Interface Layer.** Self-documenting, machine-readable capability declarations. Applications declare what protocol capabilities they need; the protocol validates and provides them. This layer makes generated applications safe — the attack surface of a poorly generated client is bounded by its capability declaration, not by its code quality.
 
-**Social Context Layer.** The novel contribution. Contexts, agents, tools, roles, governance, trust semantics. Agent-native social infrastructure. No existing protocol provides this layer.
+**Social Context Layer.** Contexts, agents, tools, roles, governance, trust semantics. Agent-native social infrastructure.
 
 **Identity and Capabilities.** DID-based identity with multi-key verification methods. UCAN-based capability tokens with verifiable delegation chains. Invisible key custody.
 
@@ -163,9 +151,7 @@ The protocol is organized in five layers:
 
 ### 3.3 Context as the Fundamental Unit
 
-All interaction occurs within contexts. A context is a bounded, governed space — a cryptographic entity with its own key material, event log, governance model, membership roster, and capability ceiling.
-
-Contexts are spaces, not actors. They do not initiate, act, or have agency. They hold the rules, the keys, and the audit trail. Agents do the acting within them.
+All interaction occurs within contexts — cryptographic entities with their own key material, event log, governance model, membership roster, and capability ceiling. Contexts are passive infrastructure: they hold the rules, the keys, and the audit trail. Agents do the acting within them.
 
 Contexts operate in one of two modes, set at creation and immutable:
 
@@ -178,7 +164,7 @@ Context creation is a runtime operation — approximately 5–15ms of local comp
 
 Messages in SCP pass through a layered security pipeline:
 
-1. **Construction.** The sender constructs an inner envelope containing: context ID, sender DID, signing key identifier (`#active` or `#agent`), MLS epoch, generation, sequence number, timestamp, padded payload, payload hash, and provenance metadata.
+1. **Construction.** The sender constructs an inner envelope containing: context ID, sender DID, signing key identifier (`#active` or `#agent`), MLS epoch, generation, sequence number, timestamp, payload hash (SHA-256 of the original plaintext, before padding), padded payload, and provenance metadata. The signature commits to the payload hash, not the padded payload, preventing padding manipulation.
 
 2. **Signing.** The inner envelope is signed with the sender's verification method key. The signature preimage includes the signing key identifier, binding the message to a specific key.
 
@@ -216,7 +202,7 @@ Every identity in SCP is rooted in a cryptographic keypair expressed as a Decent
 
 SCP uses `did:dht` as the primary DID method. did:dht stores DID documents as BEP44 signed mutable items on BitTorrent's Mainline DHT — a network of millions of nodes with over 20 years of operational history. The DID string (`did:dht:<z-base-32-encoded-Ed25519-public-key>`) encodes the public key directly, making it self-certifying: DID documents are verifiable against the DID without trusting any intermediary. MITM on resolution is cryptographically impossible given the correct DID.
 
-Key custody is invisible to users. Keys are stored in platform-specific secure hardware — iOS Secure Enclave, Android Keystore, passkey infrastructure — without the user managing keys directly. Recovery uses social and device mechanisms rather than seed phrases: trusted device recovery, social recovery via trusted contacts, and platform-backed recovery as the practical safety net for new users.
+Key custody is invisible to users. Keys are stored in platform-specific secure storage — iOS Keychain (Secure Enclave supports only P-256, not the Ed25519 required by SCP), Android Keystore, passkey infrastructure — without the user managing keys directly. Recovery uses social and device mechanisms rather than seed phrases: trusted device recovery, social recovery via trusted contacts, and platform-backed recovery as the practical safety net for new users.
 
 ### 4.2 Multi-Key Verification Method Architecture
 
@@ -295,7 +281,7 @@ Broadcast contexts support two-tier membership: bounded MLS-group members (write
 
 ### 5.4 Cross-Context Communication
 
-Tool interfaces carry provenance (source context, counterparties, chain depth), are rate-limited, and enforce a chain depth limit — the protocol default of 3 hops bounds amplification and prevents accountability laundering through cascading context traversals. Tool schemas must satisfy a structural specificity floor: no unbounded string-only interfaces, minimum two distinct fields. This raises the cost of using tool interfaces as covert messaging channels.
+Tool interfaces carry provenance (source context, counterparties, chain depth), are rate-limited, and enforce a chain depth limit — the protocol maximum of 5 hops (context-configurable default: 3) bounds amplification and prevents accountability laundering through cascading context traversals. Tool schemas must satisfy a structural specificity floor: no unbounded string-only interfaces, minimum two distinct fields. This raises the cost of using tool interfaces as covert messaging channels.
 
 Stateful tool sessions support multi-step workflows (negotiation, iterative refinement) within the governed framework, with per-caller session caps to prevent resource exhaustion.
 
@@ -313,9 +299,11 @@ MLS was chosen over alternatives for three reasons: it is an IETF standard with 
 
 Separate from MLS, each member maintains a per-sender AES-256-GCM key. Messages are double-encrypted: first with the sender's personal key, then with the MLS group key. This layer serves a specific purpose: enabling per-sender blocking without MLS group disruption.
 
-When Alice blocks Dave, Alice generates a new sender key and distributes it to all members except Dave via individual HPKE-wrapped messages. Dave can still decrypt the MLS layer (he remains a group member) but encounters ciphertext from Alice that he cannot decrypt. The block is unilateral, per-relationship, and does not require group coordination.
+When Alice blocks Dave, Alice rotates her sender key and makes it available to all members except Dave via HPKE-wrapped key distribution. Dave can still decrypt the MLS layer (he remains a group member) but encounters ciphertext from Alice that he cannot decrypt. The block is unilateral, per-relationship, and does not require group coordination.
 
 Key distribution uses a pull model. `SenderKeyEpochAdvance` messages notify the group of a key rotation (O(1) broadcast). `SenderKeyRequest` and `SenderKeyResponse` messages handle individual key requests (O(1) each). A 30-second grace period accommodates key transition.
+
+The sender-side key layer provides selective confidentiality but intentionally does not provide forward secrecy or post-compromise security — those properties are provided by the MLS layer underneath. Compromising a sender key reveals only the messages encrypted with that key for that sender; the MLS epoch keys remain protected by MLS's tree-based ratcheting.
 
 ### 6.3 Content Access Control
 
@@ -333,9 +321,7 @@ Broadcast contexts use per-author AES-256-GCM keys without MLS. Subscribers regi
 
 ### 6.5 Metadata Privacy
 
-SCP provides layered metadata protections: minimal outer envelopes with per-context pseudonymous routing IDs (derived via HKDF from identity key material), fixed bucket padding, persistent connections, cover traffic, and relay set partitioning. The relay threat model is explicit about what relays can learn (traffic patterns, timing, routing IDs) and what they cannot (message content, membership, context semantics).
-
-Traffic analysis remains the strongest residual attack surface. The protocol is honest about this rather than claiming defenses that do not hold under a sophisticated adversary.
+SCP provides layered metadata protections: per-context pseudonymous routing IDs, fixed bucket padding, persistent connections, cover traffic, and relay set partitioning. Section 11.4 provides the full analysis, including the residual traffic analysis attack surface.
 
 ---
 
@@ -381,7 +367,7 @@ This ordering enables mechanical quality comparison. Agents set their own thresh
 
 ### 8.3 Chain Depth Enforcement
 
-Cross-context tool calls carry a chain depth counter, incremented on each hop. The protocol enforces a maximum depth (default: 3 hops). Data at the maximum depth cannot trigger further cross-context calls. This bounds amplification and prevents accountability laundering — data traversing enough contexts that its origin becomes meaningless.
+Cross-context tool calls carry a chain depth counter, incremented on each hop. The protocol enforces a hard maximum of 5 hops (contexts may configure a lower limit; the recommended default is 3). Data at the effective maximum depth cannot trigger further cross-context calls. This bounds amplification and prevents accountability laundering — data traversing enough contexts that its origin becomes meaningless.
 
 Provenance degradation with chain depth is a feature, not a limitation. Data from many degrees of separation should be less trusted, the same way a message from a stranger warrants more scrutiny than one from a known contact.
 
@@ -405,11 +391,11 @@ SCP relays are:
 
 ### 9.2 Native Relay Protocol
 
-The SCP native relay protocol defines four operations over WebSocket with MessagePack binary frames: PUBLISH (store a blob at a routing ID with TTL), SUBSCRIBE (receive new blobs at a routing ID), QUERY (retrieve stored blobs, optionally filtered by timestamp), and DELETE (remove a blob).
+The SCP native relay protocol defines six operations over WebSocket with MessagePack binary frames: PUBLISH (store a blob at a routing ID with TTL), SUBSCRIBE (receive new blobs at a routing ID), UNSUBSCRIBE (stop receiving blobs at a routing ID), QUERY (retrieve stored blobs, optionally filtered by timestamp), DELETE (remove a blob), and ACK (confirm blob receipt for delivery tracking).
 
 ### 9.3 Transport Abstraction
 
-The protocol defines a transport adapter trait — a contract between protocol logic and delivery infrastructure. Transport adapters are organized in four tiers:
+The protocol defines a transport adapter trait — a contract between protocol logic and delivery infrastructure. Transport adapters are organized in three tiers:
 
 **Tier 1 (Fully specified):** SCP native relay, QUIC, WebTransport, UDP/DTLS. Wire format mapping, conformance suite, and fallback behavior documented.
 
@@ -425,7 +411,7 @@ SCP is designed so that a user's device can be a full protocol participant — n
 
 The deployment spectrum ranges from phones (full participants when online, relays for offline delivery), through laptops (persistent daemons, potential personal relays), agent workstations (dedicated always-on hardware — natural SCP nodes), personal servers (power users), to managed infrastructure (convenience and high availability). All points on the spectrum are simultaneously valid; a user can operate at multiple points at once.
 
-The agent workstation tier is architecturally significant. As autonomous agents become mainstream, users are acquiring dedicated always-on hardware to run them. SCP infrastructure — relays, context hosting, bridge connectors — is marginal additional load on hardware that is already running continuously. This changes relay economics: the question shifts from "who pays for relay infrastructure" to "the relay is just another process on hardware you already own."
+The agent workstation tier is architecturally significant. As autonomous agents become mainstream, users are acquiring dedicated always-on hardware to run them. SCP infrastructure — relays, context hosting, bridge connectors — is marginal additional load on hardware already running continuously, providing a natural deployment point for personal relay processes.
 
 ### 9.5 Offline Strategy
 
@@ -473,7 +459,7 @@ The protocol distinguishes between what it defends against (confidentiality brea
 
 ### 11.2 Security Properties
 
-**Confidentiality.** MLS provides group encryption with forward secrecy and post-compromise security. Sender-side keys provide per-sender encryption. Relays are untrusted dumb pipes that see only encrypted blobs.
+**Confidentiality.** MLS provides group encryption with forward secrecy and post-compromise security. Sender-side keys provide per-sender encryption. Relays see only encrypted blobs (Section 9.1).
 
 **Integrity.** Merkle event logs provide tamper-evident history. BEP44 signatures verify DID documents. UCAN chain validation ensures authorization. Inner envelope signatures provide non-repudiation.
 
@@ -501,14 +487,13 @@ Traffic analysis by a sophisticated adversary with visibility into relay traffic
 
 ### 11.5 Key Security Invariants
 
-1. Every action traces to a human via the shared-DID model.
-2. Agents are context-bound — no protocol-level cross-context awareness.
+1. Agents are context-bound — no protocol-level cross-context awareness.
+2. One agent per person per context (DID document cardinality enforcement).
 3. Tools are stateless and non-agentic.
-4. One agent per person per context.
-5. Category A actions (`#0` only) are structurally impossible for agents.
-6. `signing_key_id` provides unforgeable human-vs-agent attribution.
-7. Context metadata is transparent before opt-in.
-8. Role assignment is non-negotiable — agents cannot request elevated permissions.
+4. Category A actions (`#0` only) are structurally impossible for agents (hardware custody separation).
+5. `signing_key_id` provides unforgeable human-vs-agent attribution on every signed message.
+6. Context metadata is transparent before opt-in.
+7. Role assignment is non-negotiable — agents cannot request elevated permissions.
 
 ---
 
@@ -527,7 +512,7 @@ Traffic analysis by a sophisticated adversary with visibility into relay traffic
 | **Capabilities** | UCAN (fine-grained delegation) | Power levels | None | None | None | None | Tool permissions |
 | **Provenance** | Protocol-level, automatic | None | Repo signatures | Event signatures | None | Signature-level | None |
 | **Transport** | Abstracted (17 adapters) | Federation | BGS relay | Simple relay | Centralized | Coupled (Hyperswarm) | stdio/SSE |
-| **Governance** | Pluggable per-context (24 action types) | Power levels | Moderation lists | NIP-based | Centralized | None | N/A |
+| **Governance** | Pluggable per-context (28 action types) | Power levels | Moderation lists | NIP-based | Centralized | None | N/A |
 | **Self-hosting** | Device-as-node | Homeserver required | PDS | Relay | Not possible | Full P2P | Local |
 | **Offline** | Three-tier model | Server handles | Relay handles | Best-effort | Server handles | Peer-dependent | N/A |
 
@@ -545,19 +530,16 @@ The relay model is informed by Nostr's simplicity. Federation lessons are inform
 
 ### 12.3 What Is Novel
 
-- **Context isolation as the security boundary** for agent interaction. No existing protocol provides cryptographic isolation between interaction spaces with governed boundary crossing.
-- **Human accountability chains** for all autonomous agents via shared-DID binding with structural action provenance.
-- **Provenance as a core protocol principle** with automatic attachment at context boundaries and ordered quality tiers.
-- **Encryption-as-access-control** where MLS group keys constitute membership, not merely protect it.
-- **Sender-side key layer** enabling per-sender blocking without MLS group disruption.
+- **Context isolation as the security boundary** for agent interaction — cryptographic isolation between interaction spaces with governed boundary crossing.
+- **Human accountability chains** for all autonomous agents via shared-DID binding with structural action provenance (`signing_key_id` on every message).
+- **Provenance as a core protocol principle** — automatic attachment at context boundaries with ordered quality tiers, not a per-application feature.
+- **Multi-key identity architecture** with pre-rotation commitments, agent signing keys, and graduated permission categories — a stronger model than any existing DID method.
 - **Dual-layer DID resolution** with protocol-level self-healing across SCP relays and Mainline DHT.
-- **Multi-key identity architecture** with pre-rotation commitments, agent signing keys, and graduated permission categories.
-- **Verifiable behavioral records** derived from Merkle event logs, replacing reputation scores with evidence.
-- **Append-only logs embedded in governance and encryption context** — Hypercore validates the data structure; SCP embeds it in MLS groups, UCAN authorization, and context governance.
+- **Sender-side key layer** enabling per-sender blocking without MLS group disruption — the mechanism that decouples content access from group membership.
 
 ### 12.4 Hypercore Comparison
 
-Hypercore and SCP's event logs serve a structurally similar function: tamper-evident append-only history. The comparison is instructive because SCP took a well-understood primitive and embedded it in a richer security model.
+Hypercore is the closest structural parallel to SCP's event logs — both are append-only authenticated logs with Merkle trees. The comparison illuminates what SCP adds beyond the data structure:
 
 | Dimension | Hypercore | SCP Event Logs |
 |-----------|-----------|----------------|
@@ -566,11 +548,9 @@ Hypercore and SCP's event logs serve a structurally similar function: tamper-evi
 | Signing | Ed25519, single writer per log | Ed25519, multi-writer per context (MLS-authenticated) |
 | Multi-writer | Autobase (app-layer DAG linearization) | Native via MLS group membership |
 | Encryption | None at log level; transport-level only | MLS + sender-side AES-256-GCM at log level |
-| Governance | None | Full: 24 action types, pluggable engines |
+| Governance | None | Full: 28 action types, pluggable engines |
 
-The key distinction: Hypercore is a data structure. SCP event logs are a data structure embedded in a governance and encryption context. Hypercore answers "who appended this?" SCP event logs answer "who appended this, were they authorized to, under what governance, in what role, with what capabilities, and is it encrypted to the right group?"
-
-Autobase composes multi-writer from single-writer; SCP starts multi-writer (MLS groups) and single-writer is the degenerate one-member group. Keet's group encryption is undocumented — it cannot be independently implemented, formally analyzed, or interoperated with. SCP's encryption is fully specified. Publishing the protocol is the differentiator.
+Hypercore is a data structure; SCP event logs are a data structure embedded in a governance and encryption context. Autobase composes multi-writer from single-writer feeds; SCP starts multi-writer (MLS groups) and single-writer is the degenerate one-member group.
 
 ---
 
@@ -591,13 +571,11 @@ Language bindings: Python (PyO3), Swift (UniFFI), Kotlin (UniFFI), TypeScript (w
 
 Conformance is enforced through Rust macros that generate test suites for trait implementations:
 
-- `storage_conformance!()` — ProtocolStore implementations (state persistence)
-- `transport_conformance!()` — TransportAdapter implementations (send/subscribe roundtrips, backfill, deduplication)
-- `blob_store_conformance!()` — BlobStore implementations (relay storage backends)
-- `key_custody_conformance!()` — KeyCustody implementations (key generation, signing, rotation)
-- `attestation_conformance!()` — AttestationStore implementations
-- `push_conformance!()` — PushProvider implementations
-- `payment_conformance!()` — PaymentAdapter implementations
+- `storage_conformance!()` — ProtocolStore implementations (state persistence, 13 tests)
+- `blob_store_conformance!()` — BlobStore implementations (relay storage backends, 11 tests)
+- `payment_adapter_conformance!()` — PaymentAdapter implementations (economic governance, 8 tests)
+
+Additional conformance suites are specified for transport adapters, key custody, attestation stores, and push providers.
 
 Integration test suites cover cryptographic primitives, context lifecycle, and advanced features. Distributed invariant tests verify Merkle consistency, delivery guarantees, suppression detection, pseudonym unlinkability, and block enforcement.
 
@@ -619,19 +597,17 @@ The licensing structure reflects a deliberate strategy:
 
 **Protocol versioning and capability negotiation.** The concrete mechanism for protocol evolution — how nodes negotiate versions, how features are introduced without breaking existing participants — needs formal specification.
 
-**Formal security analysis of the composed construction.** MLS, sender-side keys, UCAN, and Merkle logs are individually well-understood. Their composition in SCP creates emergent properties that warrant formal analysis — particularly the interaction between MLS epoch advancement and sender-side key rotation during blocking.
+**Formal security analysis of the composed construction.** MLS, sender-side keys, UCAN, and Merkle logs are individually well-understood. Their composition in SCP creates properties that warrant formal analysis — particularly the interaction between MLS epoch advancement and sender-side key rotation during blocking, the three-layer encryption ordering (sender key → MLS → outer envelope), and the window between UCAN revocation and MLS membership removal.
 
 **Multi-device sync edge cases.** Concurrent key rotation across devices, epoch advancement during device-to-device sync, and the interaction between MLS group state and identity private state sync require additional specification.
 
 ### 14.2 Limitations
 
-**Metadata privacy against traffic analysis.** SCP provides layered protections but cannot defeat a sophisticated adversary with global traffic visibility. The protocol makes honest tradeoffs — practical metadata protections for common cases while acknowledging the residual attack surface.
+The security analysis (Section 11) addresses specific residual attack surfaces — traffic analysis, sybil resistance cost models, and MLS group scaling. Beyond those:
 
-**Sybil resistance without invasive verification.** Fundamentally unsolved in decentralized systems. SCP makes sybil attacks expensive but cannot prevent them entirely. Contexts must set thresholds appropriate to their risk tolerance.
+**Governance model complexity.** Pluggable governance is powerful but each model has its own tradeoffs. Single-admin is simple but centralized; voting is democratic but slow; consensus is thorough but can deadlock. The protocol provides the interface; choosing the right model for a given context is a social problem, not a protocol problem.
 
-**MLS scaling limits for large encrypted contexts.** MLS group operations are O(log n) but the constant factor grows with group size. Broadcast mode addresses the one-to-many case; large interactive groups remain a practical challenge.
-
-**Governance model complexity.** Pluggable governance is powerful but each model has its own tradeoffs. Single-admin is simple but centralized; voting is democratic but slow; consensus is thorough but can deadlock. The protocol provides the interface; choosing the right model for a given context is a social problem.
+**Bridge fidelity.** Platform bridge connectors (Section 12 of the specification) depend on external platforms' willingness or API availability. Relay-mode and puppet-mode bridges are inherently lower fidelity than native SCP communication, and shadow identities carry weaker trust properties than native identities.
 
 ### 14.3 Standardization Path
 
@@ -645,7 +621,7 @@ SCP provides the durable connective tissue for a world of ephemeral, generated s
 
 The protocol's contribution is a coherent architecture that composes established cryptographic primitives — MLS for group encryption, DIDs for identity, UCANs for authorization, Merkle trees for integrity — into a system designed from the ground up for autonomous agents. Context isolation provides the security boundary. Encryption constitutes access control. Provenance is automatic and structural. Every agent traces to a human through cryptographic binding. The trust surface shrinks as behavioral evidence accumulates.
 
-The protocol exists. The specification is complete and published under CC-BY 4.0. The reference implementation spans five languages. Independent implementation is possible from the specification alone.
+The specification is complete and published under CC-BY 4.0. The reference implementation spans five languages. Independent implementation is possible from the specification alone.
 
 ---
 
@@ -653,22 +629,28 @@ The protocol exists. The specification is complete and published under CC-BY 4.0
 
 | Primitive | Standard | Usage in SCP |
 |-----------|----------|-------------|
-| MLS | RFC 9420 | Group key management, forward secrecy, post-compromise security |
+| MLS | RFC 9420 | Group key management, forward secrecy, post-compromise security. Ciphersuite uses AES-128-GCM for the MLS AEAD. |
 | AES-256-GCM | NIST SP 800-38D | Sender-side encryption, broadcast encryption, content access keys |
+| AES-128-GCM | NIST SP 800-38D | MLS ciphersuite AEAD (within the MLS layer only) |
 | AES-256-KW | RFC 3394 | Content access key wrapping |
-| HPKE | RFC 9180 | Sender key distribution |
+| HPKE | RFC 9180 | Key distribution (sender keys, access keys, broadcast keys, MLS Welcome messages) |
 | HKDF | RFC 5869 | Key derivation (routing IDs, domain separation) |
+| HMAC-SHA256 | RFC 2104 | Key derivation within HKDF, pseudonym derivation |
 | Ed25519 | RFC 8032 | Signatures (DID documents, inner envelopes, BEP44) |
+| X25519 | RFC 7748 | Diffie-Hellman key agreement (HPKE KEM, MLS tree) |
 | SHA-256 | FIPS 180-4 | Hashes (Merkle trees, content addressing, routing ID derivation) |
-| MessagePack | msgpack.org | Deterministic binary serialization |
+
+**Serialization:** MessagePack (msgpack.org) is used for deterministic binary serialization of protocol messages. It is not a cryptographic primitive but is security-relevant: deterministic encoding is required for reproducible signature verification.
+
+**Security level note:** The MLS ciphersuite's AES-128-GCM AEAD provides 128-bit security for the group encryption layer. The sender-side and content access layers use AES-256-GCM (256-bit). The effective security level of the composed system is bounded by the weakest layer — 128 bits — which is considered sufficient for current and near-term threat models.
 
 ## Appendix B: Protocol Constants
 
 | Constant | Value | Purpose |
 |----------|-------|---------|
 | Maximum nesting depth | 3 | Bounds context hierarchy |
-| Default chain depth limit | 3 | Bounds cross-context data flow |
-| Bucket padding sizes | 256, 1024, 4096, 16384, 65536 bytes | Fixed-size outer envelopes |
+| Chain depth limit | 5 (protocol max), 3 (default) | Bounds cross-context data flow |
+| Bucket padding sizes | 256, 1024, 4096, 16384, 65536, 262144 bytes | Fixed-size outer envelopes |
 | Relay blob TTL | 604800 seconds (7 days) | Maximum relay retention |
 | DHT republish interval | 7200 seconds (2 hours) | BEP44 expiry |
 | Relay republish interval | 518400 seconds (6 days) | 7-day TTL with 1-day margin |
