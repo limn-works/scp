@@ -763,7 +763,7 @@ pub enum TransportEvent {
 
 ---
 
-## ADR-006: In-Memory Platform Adapter (Testing)
+## ADR-006: Platform Abstraction (In-Memory Testing Adapter)
 
 **Status:** Decided
 
@@ -1094,7 +1094,7 @@ This test proves: identity works, encryption works, the envelope format works, s
 ## ADR-039: Shared-DID Human-Agent Identity Model
 
 **Date:** March 4, 2026
-**Status:** Accepted
+**Status:** Decided
 **Extends:** ADR-003 (DID Creation)
 
 ### Context

@@ -4,7 +4,7 @@
 **Phase goal:** Android platform, Kotlin SDK, scale hardening, security audit, advanced governance, offline strategy.
 **Timeline:** Weeks 21+
 
-**Note:** Phase 6 follows Phases 1-5 implementation. All ADRs in this phase — ADR-027 (Android), ADR-028 (Kotlin), ADR-029 (Offline/Sync), ADR-030 (Event Log Pruning), and ADR-031 (Multi-Admin Governance) — are Decided.
+**Note:** Phase 6 follows Phases 1-5 implementation. All ADRs in this phase — ADR-027 (Android), ADR-028 (Kotlin), ADR-029 (Offline/Sync), ADR-030 (Event Log Pruning), ADR-031 (Multi-Admin Governance), and ADR-038 (Content Access Key Layer) — are Decided.
 
 **Dependencies between ADRs:**
 
@@ -18,7 +18,8 @@ Phase 1-5 ADRs
        │
        ├── ADR-029 (Offline/Sync) <── Phase 1-2 implementation + empirical data
        ├── ADR-030 (Event Log Pruning) <── Phase 2 event log + empirical data
-       └── ADR-031 (Multi-Admin Governance) <── Phase 2 UCAN + single-admin governance
+       ├── ADR-031 (Multi-Admin Governance) <── Phase 2 UCAN + single-admin governance
+       └── ADR-038 (Content Access Key Layer) <── ADR-007 (Sender Keys) + ADR-031 (Governance)
 ```
 
 ---
