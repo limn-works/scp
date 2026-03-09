@@ -4325,20 +4325,23 @@ async fn event_log_checkpoint_impl(
                     custody: &custody.0,
                     key: &core_id.active_signing_key,
                 };
-                // generate_checkpoint is async — use the tokio handle since we
-                // are already inside a spawned task.
+                // generate_checkpoint is async — use block_in_place to allow
+                // blocking inside this spawned async task. block_in_place moves
+                // the worker thread to blocking mode (requires multi-thread runtime).
                 let handle = tokio::runtime::Handle::current();
-                handle.block_on(async {
-                    scp_event_log::checkpoint::generate_checkpoint(
-                        &ucan_state.event_log,
-                        &sender_did,
-                        epoch,
-                        &signer,
-                    )
-                    .await
-                    .map_err(|e| ScpError::Context {
-                        message: format!("checkpoint generation failed: {e}"),
-                        code: "SCP-CTX-2027".to_owned(),
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        scp_event_log::checkpoint::generate_checkpoint(
+                            &ucan_state.event_log,
+                            &sender_did,
+                            epoch,
+                            &signer,
+                        )
+                        .await
+                        .map_err(|e| ScpError::Context {
+                            message: format!("checkpoint generation failed: {e}"),
+                            code: "SCP-CTX-2027".to_owned(),
+                        })
                     })
                 })
             })
