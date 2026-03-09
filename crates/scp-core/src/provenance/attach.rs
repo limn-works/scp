@@ -220,12 +220,21 @@ fn apply_counterparty_policy(
 /// The pseudonym is deterministic for the same (key, context, DID) triple,
 /// so the same real DID always maps to the same pseudonym within a context.
 /// Without the pseudonym key, the mapping is computationally irreversible.
+///
+/// Each variable-length field is length-prefixed (4-byte big-endian) to
+/// prevent domain separation collisions where concatenation of different
+/// inputs could produce the same byte sequence.
 #[must_use]
+#[allow(clippy::cast_possible_truncation)] // String/key lengths never exceed u32
 fn pseudonymize_did(did: &DID, context_id: &str, pseudonym_key: &[u8]) -> DID {
+    let did_bytes = (*did).as_bytes();
     let mut hasher = Sha256::new();
+    hasher.update((pseudonym_key.len() as u32).to_be_bytes());
     hasher.update(pseudonym_key);
+    hasher.update((context_id.len() as u32).to_be_bytes());
     hasher.update(context_id.as_bytes());
-    hasher.update((*did).as_bytes());
+    hasher.update((did_bytes.len() as u32).to_be_bytes());
+    hasher.update(did_bytes);
     let hash = hasher.finalize();
     DID::from(format!("did:pseudo:{}", hex::encode(hash)))
 }
