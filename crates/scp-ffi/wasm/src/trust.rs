@@ -147,9 +147,7 @@ pub fn trust_verify_attestation(attestation_json: String) -> Promise {
 pub fn trust_create_challenge(challenger_did: String, target_did: String) -> Promise {
     future_to_promise(async move {
         if challenger_did.is_empty() {
-            return Err(ScpWasmError::validation(
-                "challenger DID must not be empty",
-            ));
+            return Err(ScpWasmError::validation("challenger DID must not be empty"));
         }
         if !challenger_did.starts_with("did:") {
             return Err(ScpWasmError::validation(

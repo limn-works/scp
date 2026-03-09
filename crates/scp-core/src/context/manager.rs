@@ -28,8 +28,10 @@ use super::governance::{
     CheckpointAttestationStatus, ContextCheckpoint, CosignedCheckpoint, GovernanceAction,
     GovernanceContext, GovernanceEngine, GovernanceEvent, GovernanceModelConfig,
     GovernanceProposal, KeyResolver, ProposalId, ProposalStatus, PruningPolicy, RevocationScope,
-    SingleAdminEngine, majority::MajorityVoteEngine,
-    mls_integration::{MlsImpact, classify_action}, multisig::ThresholdEngine,
+    SingleAdminEngine,
+    majority::MajorityVoteEngine,
+    mls_integration::{MlsImpact, classify_action},
+    multisig::ThresholdEngine,
     unanimity::UnanimityEngine,
 };
 use super::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
