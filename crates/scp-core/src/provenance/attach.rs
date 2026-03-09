@@ -20,8 +20,21 @@ use super::{ContextId, DID, DataProvenance, DiscoveryMethod, ProvenanceError, So
 /// Protocol default maximum chain depth (3 hops). Cross-context data flows
 /// beyond this limit are rejected to prevent accountability laundering.
 ///
-/// See ADR-019: "The protocol default of 3 hops bounds this."
+/// Contexts may override this via `ContextParams::max_chain_depth`, but the
+/// effective limit is always clamped to [`PROTOCOL_HARD_MAX_CHAIN_DEPTH`].
+///
+/// See spec §24.4 and ADR-019.
 pub const DEFAULT_MAX_CHAIN_DEPTH: u8 = 3;
+
+/// Protocol hard maximum chain depth (5 hops).
+///
+/// No context may configure a `max_chain_depth` higher than this value.
+/// The effective limit is always
+/// `min(context.max_chain_depth.unwrap_or(DEFAULT_MAX_CHAIN_DEPTH), PROTOCOL_HARD_MAX_CHAIN_DEPTH)`.
+///
+/// This bounds the worst-case amplification factor for cross-context tool
+/// call chains regardless of per-context configuration.
+pub const PROTOCOL_HARD_MAX_CHAIN_DEPTH: u8 = 5;
 
 // ---------------------------------------------------------------------------
 // SourceContextInfo
@@ -149,6 +162,30 @@ pub const fn check_chain_depth(
     Ok(())
 }
 
+/// Computes the effective maximum chain depth for a context.
+///
+/// The effective limit is `min(context_max.unwrap_or(DEFAULT_MAX_CHAIN_DEPTH), PROTOCOL_HARD_MAX_CHAIN_DEPTH)`.
+/// This ensures:
+/// - Contexts without an explicit setting use the protocol default (3).
+/// - No context can exceed the protocol hard maximum (5).
+///
+/// # Arguments
+///
+/// - `context_max_chain_depth` -- The context's configured `max_chain_depth`,
+///   or `None` to use the protocol default.
+#[must_use]
+pub const fn effective_max_chain_depth(context_max_chain_depth: Option<u8>) -> u8 {
+    let context_or_default = match context_max_chain_depth {
+        Some(v) => v,
+        None => DEFAULT_MAX_CHAIN_DEPTH,
+    };
+    if context_or_default < PROTOCOL_HARD_MAX_CHAIN_DEPTH {
+        context_or_default
+    } else {
+        PROTOCOL_HARD_MAX_CHAIN_DEPTH
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -182,7 +219,12 @@ fn compute_chain(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::assertions_on_constants
+)]
 mod tests {
     use super::*;
 
@@ -582,12 +624,62 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // DEFAULT_MAX_CHAIN_DEPTH
+    // DEFAULT_MAX_CHAIN_DEPTH / PROTOCOL_HARD_MAX_CHAIN_DEPTH
     // -----------------------------------------------------------------------
 
     #[test]
     fn default_max_chain_depth_is_three() {
         assert_eq!(DEFAULT_MAX_CHAIN_DEPTH, 3);
+    }
+
+    #[test]
+    fn protocol_hard_max_chain_depth_is_five() {
+        assert_eq!(PROTOCOL_HARD_MAX_CHAIN_DEPTH, 5);
+    }
+
+    #[test]
+    fn default_does_not_exceed_hard_max() {
+        assert!(DEFAULT_MAX_CHAIN_DEPTH <= PROTOCOL_HARD_MAX_CHAIN_DEPTH);
+    }
+
+    // -----------------------------------------------------------------------
+    // effective_max_chain_depth
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn effective_max_uses_default_when_none() {
+        assert_eq!(effective_max_chain_depth(None), DEFAULT_MAX_CHAIN_DEPTH);
+    }
+
+    #[test]
+    fn effective_max_uses_context_value_when_within_hard_max() {
+        assert_eq!(effective_max_chain_depth(Some(4)), 4);
+    }
+
+    #[test]
+    fn effective_max_clamps_to_hard_max_when_context_exceeds() {
+        assert_eq!(
+            effective_max_chain_depth(Some(10)),
+            PROTOCOL_HARD_MAX_CHAIN_DEPTH
+        );
+    }
+
+    #[test]
+    fn effective_max_allows_zero() {
+        assert_eq!(effective_max_chain_depth(Some(0)), 0);
+    }
+
+    #[test]
+    fn effective_max_allows_exact_hard_max() {
+        assert_eq!(
+            effective_max_chain_depth(Some(PROTOCOL_HARD_MAX_CHAIN_DEPTH)),
+            PROTOCOL_HARD_MAX_CHAIN_DEPTH
+        );
+    }
+
+    #[test]
+    fn effective_max_allows_one() {
+        assert_eq!(effective_max_chain_depth(Some(1)), 1);
     }
 
     // -----------------------------------------------------------------------

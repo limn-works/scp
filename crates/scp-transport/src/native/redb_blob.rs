@@ -13,7 +13,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use redb::{Database, MultimapTableDefinition, ReadableTable, TableDefinition};
+use redb::{
+    Database, MultimapTableDefinition, ReadableTable, ReadableTableMetadata, TableDefinition,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -415,5 +417,20 @@ impl BlobStorage for RedbBlobStore {
             .map_err(|e| StorageError::Internal(format!("redb commit: {e}")))?;
 
         Ok(count)
+    }
+
+    async fn count(&self) -> Result<usize, StorageError> {
+        let db = self.db.lock().await;
+        let read_txn = db
+            .begin_read()
+            .map_err(|e| StorageError::Internal(format!("redb begin_read: {e}")))?;
+        let blobs_table = read_txn
+            .open_table(BLOBS_TABLE)
+            .map_err(|e| StorageError::Internal(format!("redb open blobs: {e}")))?;
+        let len = blobs_table
+            .len()
+            .map_err(|e| StorageError::Internal(format!("redb len: {e}")))?;
+        #[allow(clippy::cast_possible_truncation)]
+        Ok(len as usize)
     }
 }

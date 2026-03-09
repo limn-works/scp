@@ -9,3 +9,4 @@ logs/
 .iter_state
 .plugin_root
 *.log
+.stop_guard_blocks

@@ -30,6 +30,7 @@ use std::collections::HashMap;
 
 use napi_derive::napi;
 use scp_core::crypto::ucan::mint::{MintParams, mint_ucan};
+use scp_ffi_common::validate::{validate_capability_uri, validate_did, validate_ucan_token};
 
 use scp_core::crypto::ucan::UcanError as CoreUcanError;
 
@@ -39,7 +40,7 @@ use scp_core::crypto::ucan::validate::{
 };
 
 use scp_ffi_common::{
-    BridgeDidResolver, BridgeNonceTracker, BridgeProofResolver, BridgeRevocationChecker,
+    BridgeNonceTracker, BridgeProofResolver, BridgeRevocationChecker, DispatchDidResolver,
 };
 
 use crate::context::NapiContextHandle;
@@ -193,6 +194,9 @@ pub async fn ucan_validate(
     presenting_agent_did: Option<String>,
     proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<()> {
+    validate_ucan_token(&token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_capability_uri(&capability).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
     // Ensure the context's persistent runtime state (RevocationList, NonceTracker)
     // is registered. Uses the same registry as event_log and ucan_revoke.
     crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
@@ -228,7 +232,10 @@ pub async fn ucan_validate(
     // - Replayed nonces are detected across calls (persistent NonceTracker).
     crate::runtime::with_context(&context_id, |rt| {
         // Build validation context using persistent runtime state.
-        let did_resolver = BridgeDidResolver;
+        // Use production DID resolver when available (#311), fallback to string-only.
+        let production_resolver = crate::runtime::did_resolver();
+        let did_resolver =
+            DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
         let revocation_checker = BridgeRevocationChecker {
             revocation_list: &rt.revocation_list,
         };
@@ -290,52 +297,77 @@ pub async fn ucan_mint(
     member_did: String,
     capabilities: Vec<String>,
 ) -> napi::Result<NapiUcanToken> {
-    // Extract key custody and signing key from the context handle (RED-102).
-    let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
-        napi::Error::from(ScpNapiError::Permission {
-            message: "UCAN minting requires key custody — create the context with an \
+    validate_did(&member_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
+    // In-memory custody is only available when `allow_in_memory_custody` is enabled.
+    #[cfg(not(feature = "allow_in_memory_custody"))]
+    {
+        let _ = (&handle, &member_did, &capabilities);
+        return Err(napi::Error::from(ScpNapiError::Permission {
+            message: "UCAN minting requires key custody -- the in_memory custody path                       is not available in this build. Enable allow_in_memory_custody                       for dev/desktop use.".to_owned(),
+            code: "SCP-PERM-3023".to_owned(),
+        }));
+    }
+
+    #[cfg(feature = "allow_in_memory_custody")]
+    {
+        // Extract key custody and signing key from the context handle (RED-102).
+        let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
+            napi::Error::from(ScpNapiError::Permission {
+                message: "UCAN minting requires key custody — create the context with an \
                       in_memory identity (identity_create(\"in_memory\"))"
-                .to_owned(),
-            code: "SCP-PERM-3023".to_owned(),
-        })
-    })?;
-    let signing_key = handle.signing_key.ok_or_else(|| {
-        napi::Error::from(ScpNapiError::Permission {
-            message: "UCAN minting requires a signing key — the context creator identity \
+                    .to_owned(),
+                code: "SCP-PERM-3023".to_owned(),
+            })
+        })?;
+        let signing_key = handle.signing_key.ok_or_else(|| {
+            napi::Error::from(ScpNapiError::Permission {
+                message: "UCAN minting requires a signing key — the context creator identity \
                       must have an active signing key"
-                .to_owned(),
-            code: "SCP-PERM-3023".to_owned(),
-        })
-    })?;
+                    .to_owned(),
+                code: "SCP-PERM-3023".to_owned(),
+            })
+        })?;
 
-    let creator_did = handle.creator_did();
-    let context_id = handle.context_id();
+        let creator_did = handle.creator_did();
+        let context_id = handle.context_id();
 
-    let params = MintParams {
-        issuer_did: &creator_did,
-        issuer_key: &signing_key,
-        audience_did: &member_did,
-        context_id: &context_id,
-        capabilities: &capabilities,
-        lifetime_secs: 3600, // 1 hour default
-        not_before: None,
-        proofs: vec![],
-        facts: None,
-        key_scope: None,
-        signing_key_id: None,
-    };
+        // Get ceiling from the context handle for mint-time enforcement (#339).
+        // Empty ceiling means unrestricted — pass None, not Some(empty_set).
+        let ceiling_strings: std::collections::HashSet<String> =
+            handle.ceiling().into_iter().collect();
+        let ceiling = if ceiling_strings.is_empty() {
+            None
+        } else {
+            Some(ceiling_strings)
+        };
 
-    // Sign the token using the real InMemoryKeyCustody via scp-core.
-    // napi-rs async functions already run on the tokio runtime, so we
-    // can await directly without spawning a separate task.
-    let token = mint_ucan(&params, &custody.0).await.map_err(|e| {
-        napi::Error::from(ScpNapiError::Permission {
-            message: format!("UCAN minting failed: {e}"),
-            code: "SCP-PERM-3023".to_owned(),
-        })
-    })?;
+        let params = MintParams {
+            issuer_did: &creator_did,
+            issuer_key: &signing_key,
+            audience_did: &member_did,
+            context_id: &context_id,
+            capabilities: &capabilities,
+            lifetime_secs: 3600, // 1 hour default
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling,
+        };
 
-    let data = NapiUcanTokenData {
+        // Sign the token using the real InMemoryKeyCustody via scp-core.
+        // napi-rs async functions already run on the tokio runtime, so we
+        // can await directly without spawning a separate task.
+        let token = mint_ucan(&params, &custody.0).await.map_err(|e| {
+            napi::Error::from(ScpNapiError::Permission {
+                message: format!("UCAN minting failed: {e}"),
+                code: "SCP-PERM-3023".to_owned(),
+            })
+        })?;
+
+        let data = NapiUcanTokenData {
         token_id: token.payload.nnc.clone(),
         issuer: token.payload.iss.clone(),
         audience: token.payload.aud.clone(),
@@ -349,11 +381,12 @@ pub async fn ucan_mint(
         expires_at: Some(token.payload.exp as f64),
     };
 
-    increment_handle_count();
-    Ok(NapiUcanToken {
-        data,
-        encoded: token.encoded,
-    })
+        increment_handle_count();
+        Ok(NapiUcanToken {
+            data,
+            encoded: token.encoded,
+        })
+    }
 }
 
 /// Revokes a UCAN token.
@@ -376,13 +409,13 @@ pub async fn ucan_mint(
 pub async fn ucan_revoke(handle: &NapiContextHandle, token: String) -> napi::Result<()> {
     crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
 
-    // Parse the token to extract its payload for CID computation.
-    let parsed = parse_ucan(&token).map_err(ScpNapiError::from)?;
+    // Validate the token is a well-formed UCAN before revoking.
+    let _parsed = parse_ucan(&token).map_err(ScpNapiError::from)?;
 
     let context_id = handle.context_id();
     crate::runtime::with_context(&context_id, |rt| {
-        // Compute the content-hash CID matching scp-core's format.
-        let token_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(&parsed.payload);
+        // Compute the content-hash CID matching scp-core's format (SHA-256 of raw JWT).
+        let token_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(&token);
         rt.revocation_list.revoke(token_cid);
         Ok(())
     })
@@ -401,7 +434,7 @@ pub async fn ucan_revoke(handle: &NapiContextHandle, token: String) -> napi::Res
 /// JWT via `compute_cid`) so that the delegation chain verifier can resolve
 /// proof references. Uses `compute_cid` (not `compute_revocation_cid`) because
 /// the CID must match what was stored in the UCAN `prf` field during minting.
-fn build_proof_resolver(
+pub(crate) fn build_proof_resolver(
     proof_tokens: Option<&[String]>,
 ) -> Result<BridgeProofResolver, ScpNapiError> {
     let mut proofs = HashMap::new();
@@ -417,6 +450,15 @@ fn build_proof_resolver(
     }
 
     Ok(BridgeProofResolver { proofs })
+}
+
+/// Convenience alias that mirrors the `PyO3` bridge naming convention.
+///
+/// Builds a [`BridgeProofResolver`] from optional encoded proof token strings.
+pub(crate) fn build_proof_resolver_from_tokens(
+    proof_tokens: Option<&[String]>,
+) -> Result<BridgeProofResolver, ScpNapiError> {
+    build_proof_resolver(proof_tokens)
 }
 
 /// Encodes a byte slice as lowercase hexadecimal.
@@ -449,6 +491,7 @@ mod tests {
     use scp_core::crypto::ucan::validate::{
         DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
     };
+    use scp_ffi_common::BridgeDidResolver;
 
     // -----------------------------------------------------------------------
     // BridgeDidResolver

@@ -1,3 +1,13 @@
+// UniFFI requires owned types for exported functions (no &str, no &[u8]).
+// These lints are framework constraints, not code quality issues.
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::missing_errors_doc,
+    clippy::items_after_statements,
+    clippy::significant_drop_tightening,
+    clippy::too_many_lines
+)]
+
 //! `UniFFI` FFI bridge for SCP — generates Swift and Kotlin bindings.
 //!
 //! This crate is the Rust half of the Swift and Kotlin SDKs. It uses `UniFFI`'s
@@ -81,23 +91,70 @@ pub use bridge::{
     TrustInput,
     UcanToken,
     UcanTokenData,
-    // Free functions
+    // Free functions — bridge connector (#370)
+    bridge_evaluate_trust,
+    broadcast_admission,
+    broadcast_block_subscriber,
+    broadcast_handle_key_request,
+    broadcast_is_subscriber,
+    broadcast_publish,
+    // Free functions — broadcast (#387)
+    broadcast_subscribe,
+    broadcast_subscriber_count,
+    broadcast_unsubscribe,
+    // Free functions — context lifecycle
     context_close,
     context_create,
+    context_drain_events,
+    // Free functions — TTL (#387)
+    context_handle_ttl_expiry,
+    context_is_member,
     context_join,
     context_leave,
+    // Free functions — membership queries (#387)
+    context_member_count,
+    context_member_dids,
+    context_member_role,
+    context_propose_ttl_extension,
+    context_reset_ttl_timer,
     context_send,
     context_subscribe,
+    // Free functions — discovery (#370)
+    discovery_create_query,
+    discovery_normalize_address,
+    discovery_parse_address,
+    evaluate_provenance_quality,
+    // Free functions — event log
     event_log_query,
     event_log_verify,
+    // Free functions — governance (#387)
+    governance_execute,
+    // Free functions — identity
     identity_create,
+    identity_create_with_custody,
     identity_load,
     identity_resolve,
+    is_local_did,
+    // Free functions — provenance (#370)
+    provenance_attach,
+    provenance_check_chain_depth,
+    // Free functions — local DID management (#387)
+    register_local_did,
+    // Free functions — sync (#370)
+    sync_classify_offline,
+    sync_classify_offline_custom,
+    // Free functions — tools
     tool_invoke,
+    tool_invoke_cross_context,
     tool_register,
+    tool_session_close,
+    tool_session_create,
+    tool_session_invoke,
     tool_verify,
+    // Free functions — transport
     transport_connect,
     transport_status,
+    // Free functions — UCAN
     ucan_mint,
     ucan_revoke,
     ucan_validate,

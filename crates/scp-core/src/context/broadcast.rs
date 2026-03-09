@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -17,7 +18,8 @@ use crate::context::ContextError;
 use crate::context::membership::ContextEvent;
 use crate::context::params::ContextMode;
 use crate::crypto::sender_keys::{
-    BroadcastEnvelope, BroadcastKey, SenderKey, generate_sender_key, seal_broadcast,
+    BroadcastEnvelope, BroadcastKey, SealBroadcastParams, SenderKey, generate_sender_key,
+    seal_broadcast,
 };
 use crate::crypto::ucan::UcanToken;
 use crate::crypto::ucan::capability::CapabilityUri;
@@ -41,6 +43,144 @@ pub enum BroadcastAdmission {
     Open,
     /// Subscription requires a valid `messagesRead` UCAN (gated-broadcast).
     Gated,
+}
+
+// ---------------------------------------------------------------------------
+// SubscriberRegistration (wire type — spec section 5.14.3)
+// ---------------------------------------------------------------------------
+
+/// Wire-type subscriber registration request for broadcast contexts.
+///
+/// This is the DID-signed registration message that a prospective subscriber
+/// publishes to the context's `routing_id` as a structured relay message
+/// (spec section 5.14.3). The author SDK processes the registration, verifies
+/// the signature, checks admission policy, and responds with broadcast key
+/// material via the pull-based key protocol.
+///
+/// The signature covers `context_id || subscriber_did || wrapping_pubkey || timestamp`
+/// using the subscriber's Active Signing Key (Ed25519).
+///
+/// See spec section 5.14.3 and issue #299.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriberRegistration {
+    /// The subscriber's DID (identity).
+    pub subscriber_did: DID,
+    /// X25519 public key for HPKE key wrapping. Authors use this to encrypt
+    /// broadcast key material for the subscriber.
+    #[serde(with = "serde_bytes")]
+    pub wrapping_pubkey: Vec<u8>,
+    /// Optional UCAN token. Required for gated broadcast contexts
+    /// (`gated-broadcast` template) — must grant `messagesRead`.
+    /// `None` for open broadcast contexts (`public-broadcast` template).
+    pub ucan: Option<UcanToken>,
+    /// Unix timestamp (seconds) of registration request.
+    pub timestamp: u64,
+    /// Ed25519 signature over `context_id || subscriber_did || wrapping_pubkey || timestamp`.
+    /// Verified against the subscriber's Active Signing Key resolved via
+    /// the `DidResolver`.
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+}
+
+impl SubscriberRegistration {
+    /// Builds the signing input for signature creation and verification.
+    ///
+    /// The signing input is the concatenation of:
+    /// `context_id || subscriber_did || wrapping_pubkey || timestamp`
+    ///
+    /// `timestamp` is encoded as 8 big-endian bytes for deterministic
+    /// serialization across platforms.
+    #[must_use]
+    pub fn signing_input(
+        context_id: &str,
+        subscriber_did: &DID,
+        wrapping_pubkey: &[u8],
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let ctx_bytes = context_id.as_bytes();
+        let did_bytes = subscriber_did.0.as_bytes();
+        let mut input = Vec::with_capacity(
+            4 + ctx_bytes.len() + 4 + did_bytes.len() + wrapping_pubkey.len() + 8,
+        );
+        // Length-prefix variable-length fields to prevent ambiguous concatenation
+        // (e.g. context_id="a" + did="bc" vs context_id="ab" + did="c").
+        // Context IDs and DIDs are short strings — lengths will never exceed u32::MAX.
+        #[allow(clippy::cast_possible_truncation)]
+        input.extend_from_slice(&(ctx_bytes.len() as u32).to_be_bytes());
+        input.extend_from_slice(ctx_bytes);
+        #[allow(clippy::cast_possible_truncation)]
+        input.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
+        input.extend_from_slice(did_bytes);
+        // wrapping_pubkey is fixed-size (32 bytes) and timestamp is fixed-size (8 bytes)
+        // so no length prefix needed.
+        input.extend_from_slice(wrapping_pubkey);
+        input.extend_from_slice(&timestamp.to_be_bytes());
+        input
+    }
+
+    /// Verifies the registration signature against the subscriber's Active
+    /// Signing Key, resolved via the provided `DidResolver`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::PermissionDenied`] if:
+    /// - The DID cannot be resolved to a public key.
+    /// - The public key bytes are invalid (not a valid Ed25519 point).
+    /// - The signature is invalid for the signing input.
+    pub fn verify_signature<D: DidResolver>(
+        &self,
+        context_id: &str,
+        did_resolver: &D,
+    ) -> Result<(), ContextError> {
+        // Validate X25519 wrapping public key length (must be exactly 32 bytes).
+        if self.wrapping_pubkey.len() != 32 {
+            return Err(ContextError::PermissionDenied(format!(
+                "invalid wrapping_pubkey length: expected 32, got {}",
+                self.wrapping_pubkey.len()
+            )));
+        }
+
+        // Resolve the subscriber's Ed25519 public key.
+        let pub_key_bytes = did_resolver
+            .resolve_public_key(&self.subscriber_did.0)
+            .map_err(|e| {
+                ContextError::PermissionDenied(format!(
+                    "cannot resolve public key for {}: {e}",
+                    self.subscriber_did.0
+                ))
+            })?;
+
+        let verifying_key = VerifyingKey::from_bytes(&pub_key_bytes).map_err(|e| {
+            ContextError::PermissionDenied(format!(
+                "invalid Ed25519 public key for {}: {e}",
+                self.subscriber_did.0
+            ))
+        })?;
+
+        let sig_bytes: [u8; 64] = self.signature.as_slice().try_into().map_err(|_| {
+            ContextError::PermissionDenied(format!(
+                "invalid signature length: expected 64, got {}",
+                self.signature.len()
+            ))
+        })?;
+
+        let signature = Signature::from_bytes(&sig_bytes);
+
+        let signing_input = Self::signing_input(
+            context_id,
+            &self.subscriber_did,
+            &self.wrapping_pubkey,
+            self.timestamp,
+        );
+
+        verifying_key
+            .verify(&signing_input, &signature)
+            .map_err(|e| {
+                ContextError::PermissionDenied(format!(
+                    "subscriber registration signature verification failed: {e}"
+                ))
+            })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -70,8 +210,8 @@ pub struct SubscriberRecord {
 /// Per-author broadcast key state within a broadcast context.
 ///
 /// Each author maintains an independent broadcast key with its own epoch
-/// counter and block list. See spec section 5.14.2 for the key lifecycle
-/// and section 5.14.8 for blocking semantics.
+/// counter, sequence counter, and block list. See spec section 5.14.2 for
+/// the key lifecycle and section 5.14.8 for blocking semantics.
 #[derive(Debug)]
 pub struct AuthorState {
     /// The author's DID.
@@ -80,6 +220,10 @@ pub struct AuthorState {
     pub broadcast_key: SenderKey,
     /// The current key epoch (monotonically increasing).
     pub epoch: u64,
+    /// Next sequence number for this author's messages. Starts at 1 and
+    /// increments with each `publish()` call. Used for replay detection
+    /// on the consumer side (§5.14.5, issue #352).
+    pub next_sequence: u64,
     /// DIDs blocked by this author. Blocked subscribers receive no key
     /// material for epochs after the block.
     pub block_list: HashSet<String>,
@@ -87,13 +231,14 @@ pub struct AuthorState {
 
 impl AuthorState {
     /// Creates a new author state with a freshly generated broadcast key at
-    /// epoch 0.
+    /// epoch 0 and sequence starting at 1.
     #[must_use]
     pub fn new(author_did: String) -> Self {
         Self {
             author_did,
             broadcast_key: generate_sender_key(),
             epoch: 0,
+            next_sequence: 1,
             block_list: HashSet::new(),
         }
     }
@@ -262,6 +407,31 @@ impl std::fmt::Debug for KeyRequestDecision {
 }
 
 // ---------------------------------------------------------------------------
+// BroadcastPublishMetadata
+// ---------------------------------------------------------------------------
+
+/// Metadata needed to construct the broadcast signing payload for a message.
+///
+/// Returned by [`BroadcastContext::publish_metadata`]. Callers use these
+/// fields with [`build_broadcast_signing_payload`] and [`compute_provenance_hash`]
+/// to produce the signing payload, sign it via their key custody provider,
+/// and then pass the signature to [`BroadcastContext::publish`].
+///
+/// [`build_broadcast_signing_payload`]: crate::crypto::sender_keys::build_broadcast_signing_payload
+/// [`compute_provenance_hash`]: crate::crypto::sender_keys::compute_provenance_hash
+#[derive(Debug)]
+pub struct BroadcastPublishMetadata<'a> {
+    /// The context ID for this broadcast message.
+    pub context_id: &'a str,
+    /// The DID of the author.
+    pub author_did: &'a str,
+    /// The next sequence number that will be used by [`BroadcastContext::publish`].
+    pub next_sequence: u64,
+    /// The current broadcast key epoch for this author.
+    pub key_epoch: u64,
+}
+
+// ---------------------------------------------------------------------------
 // BroadcastContext
 // ---------------------------------------------------------------------------
 
@@ -405,6 +575,73 @@ impl BroadcastContext {
     // Subscriber registration (spec section 5.14.3)
     // -----------------------------------------------------------------------
 
+    /// Processes a [`SubscriberRegistration`] wire message.
+    ///
+    /// This is the entry point for the subscriber registration protocol
+    /// (spec section 5.14.3, issue #299). It:
+    ///
+    /// 1. Verifies the Ed25519 signature on the registration against the
+    ///    subscriber's Active Signing Key (resolved via `DidResolver`).
+    /// 2. Validates the wrapping public key length (32 bytes for X25519).
+    /// 3. Delegates to [`subscribe()`](Self::subscribe) for admission policy
+    ///    enforcement (open vs gated) and UCAN validation.
+    /// 4. Returns a [`SubscriptionResult`] containing author epochs and
+    ///    the `MemberJoined` event.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::PermissionDenied`] if signature verification fails.
+    /// - [`ContextError::PermissionDenied`] if wrapping key has invalid length.
+    /// - All errors from [`subscribe()`](Self::subscribe) (gated UCAN
+    ///   validation, duplicate subscriber, etc.).
+    pub fn register_subscriber<D, N, R, P, S>(
+        &mut self,
+        registration: &SubscriberRegistration,
+        validation_ctx: Option<&mut ValidationContext<'_, D, N, R, P, S>>,
+    ) -> Result<SubscriptionResult, ContextError>
+    where
+        D: DidResolver,
+        N: NonceTracker,
+        R: RevocationChecker,
+        P: ProofResolver,
+        S: BuildHasher,
+    {
+        // Step 1: Resolve the DID resolver from the validation context or
+        // require one for signature verification. For open contexts without
+        // a validation context, we need at minimum the DID resolver.
+        // Since DidResolver is available via the validation context, we
+        // require it for all registration paths (signature verification
+        // always needs DID resolution).
+        let did_resolver: &D = match &validation_ctx {
+            Some(ctx) => ctx.did_resolver,
+            None => {
+                return Err(ContextError::PermissionDenied(
+                    "subscriber registration requires a DID resolver for signature verification"
+                        .to_owned(),
+                ));
+            }
+        };
+
+        // Step 2: Verify the Ed25519 signature.
+        registration.verify_signature(&self.context_id, did_resolver)?;
+
+        // Step 3: Validate wrapping key length (X25519 = 32 bytes).
+        if registration.wrapping_pubkey.len() != 32 {
+            return Err(ContextError::PermissionDenied(format!(
+                "invalid wrapping public key length: expected 32, got {}",
+                registration.wrapping_pubkey.len()
+            )));
+        }
+
+        // Step 4: Delegate to subscribe() for admission policy and UCAN validation.
+        self.subscribe(
+            &registration.subscriber_did.0,
+            registration.ucan.as_ref(),
+            registration.timestamp,
+            validation_ctx,
+        )
+    }
+
     /// Registers a subscriber in the broadcast context.
     ///
     /// For open broadcast contexts (`BroadcastAdmission::Open`), any DID can
@@ -521,10 +758,9 @@ impl BroadcastContext {
 
         author.block_list.insert(blocked_did.to_owned());
 
-        // Remove the blocked subscriber from the local subscriber roster so
-        // `can_read()` immediately reflects the block. Without this, the
-        // subscriber retains read permission until the next roster sync.
-        self.subscribers.remove(blocked_did);
+        // Per-author blocking does NOT remove from the context-wide subscriber
+        // roster. The subscriber retains read access to other authors' content.
+        // Only `governance_ban_subscriber()` removes from the roster (§5.14.8).
 
         let new_epoch = author
             .epoch
@@ -575,7 +811,7 @@ impl BroadcastContext {
 
         for &did in blocked_dids {
             author.block_list.insert(did.to_owned());
-            self.subscribers.remove(did);
+            // Per-author blocking does NOT remove from roster (§5.14.8).
         }
 
         let new_epoch = author
@@ -758,14 +994,86 @@ impl BroadcastContext {
         self.authors.contains_key(did)
     }
 
-    /// Checks whether a DID holds `messagesRead` (is a registered subscriber
-    /// or author).
+    /// Checks whether a subscriber DID can read a specific author's content.
     ///
-    /// Authors implicitly have read access. Subscribers have read access
-    /// through registration.
+    /// Returns `true` if the subscriber is registered AND not on the given
+    /// author's block list, OR if the subscriber is itself an author (authors
+    /// have implicit read access). Per-author blocking means a subscriber
+    /// blocked by author A can still read author B's content (§5.14.8).
     #[must_use]
-    pub fn can_read(&self, did: &str) -> bool {
-        self.subscribers.contains_key(did) || self.authors.contains_key(did)
+    pub fn can_read(&self, subscriber_did: &str, author_did: &str) -> bool {
+        // Authors have implicit read access.
+        if self.authors.contains_key(subscriber_did) {
+            return true;
+        }
+        // Must be a registered subscriber.
+        if !self.subscribers.contains_key(subscriber_did) {
+            return false;
+        }
+        // Must not be on this author's block list.
+        !self.is_blocked(author_did, subscriber_did)
+    }
+
+    /// Checks whether a DID can read from at least one author in the context.
+    ///
+    /// Convenience method for call sites without a specific author context.
+    /// Returns `true` if the DID is an author (implicit read) or is a
+    /// registered subscriber not blocked by ALL authors.
+    #[must_use]
+    pub fn can_read_any(&self, did: &str) -> bool {
+        // Authors always have read access.
+        if self.authors.contains_key(did) {
+            return true;
+        }
+        // Must be a registered subscriber.
+        if !self.subscribers.contains_key(did) {
+            return false;
+        }
+        // Can read if not blocked by at least one author (or no authors exist).
+        if self.authors.is_empty() {
+            return true;
+        }
+        self.authors
+            .keys()
+            .any(|author_did| !self.is_blocked(author_did, did))
+    }
+
+    // -----------------------------------------------------------------------
+    // Publish metadata (for external signing)
+    // -----------------------------------------------------------------------
+
+    /// Returns the metadata needed to construct the broadcast signing payload
+    /// for the next message by the given author.
+    ///
+    /// This does NOT consume the sequence number — it peeks at the next value.
+    /// The caller should use this to build the signing payload, sign it via
+    /// key custody, and then call [`publish`](Self::publish) with the resulting
+    /// signature.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::PermissionDenied`] if `author_did` is not an author.
+    /// - [`ContextError::MemberNotFound`] if the author entry is missing.
+    pub fn publish_metadata(
+        &self,
+        author_did: &str,
+    ) -> Result<BroadcastPublishMetadata<'_>, ContextError> {
+        if !self.can_write(author_did) {
+            return Err(ContextError::PermissionDenied(format!(
+                "{author_did} is not an author (messagesWrite required)"
+            )));
+        }
+
+        let author = self.authors.get(author_did).ok_or_else(|| {
+            ContextError::MemberNotFound(format!("author not found: {author_did}"))
+        })?;
+
+        Ok(BroadcastPublishMetadata {
+            context_id: &self.context_id,
+            author_did: &author.author_did,
+            next_sequence: author.next_sequence,
+            key_epoch: author.epoch,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -779,10 +1087,22 @@ impl BroadcastContext {
     /// `can_write` check with [`seal_broadcast`] in a single operation so
     /// callers cannot accidentally bypass the authorization check.
     ///
+    /// Increments the author's `next_sequence` counter on each call. The
+    /// resulting `BroadcastEnvelope` includes all spec-defined fields
+    /// (§5.14.5, issue #352): `context_id`, `author_did`, `sequence`,
+    /// `timestamp`, `key_epoch`, `provenance`, `signature`, and
+    /// `encrypted_content`.
+    ///
     /// # Arguments
     ///
     /// * `author_did` -- The DID of the author publishing the message.
     /// * `payload` -- The plaintext content to encrypt.
+    /// * `timestamp` -- Unix timestamp in milliseconds.
+    /// * `signature` -- Pre-computed Ed25519 signature over the canonical
+    ///   signing payload (see [`build_broadcast_signing_payload`]).
+    /// * `nonce` -- Random 12-byte AES-256-GCM nonce (from
+    ///   [`generate_broadcast_nonce`]).
+    /// * `provenance` -- Optional provenance metadata (§7.7.1).
     ///
     /// # Errors
     ///
@@ -793,9 +1113,13 @@ impl BroadcastContext {
     ///
     /// [`seal_broadcast`]: crate::crypto::sender_keys::seal_broadcast
     pub fn publish(
-        &self,
+        &mut self,
         author_did: &str,
         payload: &[u8],
+        timestamp: u64,
+        signature: ed25519_dalek::Signature,
+        nonce: &[u8; 12],
+        provenance: Option<crate::provenance::DataProvenance>,
     ) -> Result<BroadcastEnvelope, ContextError> {
         if !self.can_write(author_did) {
             return Err(ContextError::PermissionDenied(format!(
@@ -803,9 +1127,14 @@ impl BroadcastContext {
             )));
         }
 
-        let author = self.authors.get(author_did).ok_or_else(|| {
+        let author = self.authors.get_mut(author_did).ok_or_else(|| {
             ContextError::MemberNotFound(format!("author not found: {author_did}"))
         })?;
+
+        let sequence = author.next_sequence;
+        author.next_sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| ContextError::CryptoFailed("broadcast sequence overflow".to_owned()))?;
 
         let broadcast_key = BroadcastKey::from_parts(
             author.broadcast_key.clone(),
@@ -813,7 +1142,15 @@ impl BroadcastContext {
             author.author_did.clone(),
         );
 
-        seal_broadcast(&broadcast_key, payload)
+        let params = SealBroadcastParams {
+            context_id: &self.context_id,
+            sequence,
+            timestamp,
+            provenance,
+            signature,
+        };
+
+        seal_broadcast(&broadcast_key, payload, nonce, &params)
             .map_err(|e| ContextError::CryptoFailed(format!("seal_broadcast failed: {e}")))
     }
 
@@ -983,6 +1320,7 @@ impl BroadcastContext {
                         author_did: state.author_did.clone(),
                         broadcast_key: state.broadcast_key.clone(),
                         epoch: state.epoch,
+                        next_sequence: state.next_sequence,
                         block_list: state.block_list.clone(),
                     },
                 )
@@ -1014,6 +1352,7 @@ impl BroadcastContext {
                         author_did: snap.author_did,
                         broadcast_key: snap.broadcast_key,
                         epoch: snap.epoch,
+                        next_sequence: snap.next_sequence,
                         block_list: snap.block_list,
                     },
                 )
@@ -1071,6 +1410,8 @@ pub struct AuthorStateSnapshot {
     pub broadcast_key: SenderKey,
     /// The current key epoch (monotonically increasing).
     pub epoch: u64,
+    /// Next sequence number for this author's messages (§5.14.5).
+    pub next_sequence: u64,
     /// DIDs blocked by this author.
     pub block_list: HashSet<String>,
 }
@@ -1113,12 +1454,17 @@ where
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::items_after_statements
+)]
 mod tests {
     use super::*;
     use crate::context::governance::RevocationScope;
     use crate::crypto::sender_keys::{
-        SenderKey, decrypt_sender_layer, encrypt_sender_layer, open_broadcast,
+        SenderKey, decrypt_sender_layer, encrypt_sender_layer, open_broadcast_trusted,
     };
     use crate::crypto::ucan::validate::{
         DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryNonceTracker,
@@ -1126,6 +1472,14 @@ mod tests {
     };
     use crate::crypto::ucan::{Attenuation, UcanHeader, UcanPayload};
     use std::collections::HashMap as StdHashMap;
+
+    // AAD constants for sender-layer encrypt/decrypt in broadcast tests.
+    // These bind the test ciphertexts to a fixed context so AAD is consistent
+    // between encrypt and decrypt calls.
+    const T_CTX: &str = "ctx-broadcast-test";
+    const T_DID: &str = "did:example:test-author";
+    const T_EPOCH: u64 = 0;
+    const T_SEQ: u64 = 0;
     use std::hash::RandomState;
 
     /// Helper to call subscribe on open contexts without a validation context.
@@ -1150,6 +1504,49 @@ mod tests {
         // Deterministic key for reproducible tests.
         let seed = [42u8; 32];
         ed25519_dalek::SigningKey::from_bytes(&seed)
+    }
+
+    /// Signing key for broadcast publish tests (separate from UCAN keypair).
+    fn test_broadcast_signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[0xAA; 32])
+    }
+
+    /// Helper that calls `BroadcastContext::publish` with test defaults.
+    ///
+    /// Computes the signing payload and signature externally, matching the
+    /// production pattern where key custody signs asynchronously.
+    fn test_publish(
+        ctx: &mut BroadcastContext,
+        author_did: &str,
+        payload: &[u8],
+    ) -> Result<BroadcastEnvelope, ContextError> {
+        use crate::crypto::sender_keys::{
+            SigningPayloadFields, build_broadcast_signing_payload, compute_provenance_hash,
+            generate_broadcast_nonce,
+        };
+        use ed25519_dalek::Signer;
+
+        let sk = test_broadcast_signing_key();
+        let timestamp = 1_700_000_000_000;
+        let nonce = generate_broadcast_nonce();
+
+        // Peek at the metadata to construct the signing payload.
+        let meta = ctx.publish_metadata(author_did)?;
+        let provenance_hash =
+            compute_provenance_hash(None).map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        let signing_payload = build_broadcast_signing_payload(&SigningPayloadFields {
+            version: crate::envelope::SCP_PROTOCOL_VERSION,
+            context_id: meta.context_id,
+            author_did: meta.author_did,
+            sequence: meta.next_sequence,
+            key_epoch: meta.key_epoch,
+            timestamp,
+            nonce: &nonce,
+            provenance_hash: &provenance_hash,
+        });
+        let signature = sk.sign(&signing_payload);
+
+        ctx.publish(author_did, payload, timestamp, signature, &nonce, None)
     }
 
     /// Creates a properly signed UCAN token for testing gated subscription.
@@ -1637,10 +2034,10 @@ mod tests {
 
         // Subscriber is still registered and can read.
         assert_eq!(ctx.subscriber_count(), 1);
-        assert!(ctx.can_read("did:example:sub1"));
+        assert!(ctx.can_read_any("did:example:sub1"));
 
         // Publishing fails (no author).
-        let publish_result = ctx.publish("did:example:sole-author", b"after block");
+        let publish_result = test_publish(&mut ctx, "did:example:sole-author", b"after block");
         assert!(publish_result.is_err());
 
         // Key request for the blocked author returns Deny.
@@ -1657,12 +2054,12 @@ mod tests {
         subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
 
         // Alice can publish before block.
-        assert!(ctx.publish("did:example:alice", b"hello").is_ok());
+        assert!(test_publish(&mut ctx, "did:example:alice", b"hello").is_ok());
 
         ctx.block_author("did:example:alice").unwrap();
 
         // Alice cannot publish after block.
-        let result = ctx.publish("did:example:alice", b"hello again");
+        let result = test_publish(&mut ctx, "did:example:alice", b"hello again");
         assert!(result.is_err());
     }
 
@@ -1706,30 +2103,52 @@ mod tests {
         let bob_key = bob_author.broadcast_key.clone();
 
         let alice_msg = b"Alice's message";
-        let alice_ct = encrypt_sender_layer(&alice_key, alice_msg).unwrap();
+        let alice_ct = encrypt_sender_layer(
+            &alice_key,
+            alice_msg,
+            T_CTX,
+            "did:example:alice",
+            T_EPOCH,
+            T_SEQ,
+        )
+        .unwrap();
         let bob_msg = b"Bob's message";
-        let bob_ct = encrypt_sender_layer(&bob_key, bob_msg).unwrap();
+        let bob_ct =
+            encrypt_sender_layer(&bob_key, bob_msg, T_CTX, "did:example:bob", T_EPOCH, T_SEQ)
+                .unwrap();
 
         // Both subscribers can decrypt both authors.
         assert_eq!(
-            decrypt_sender_layer(&alice_key, &alice_ct).unwrap(),
+            decrypt_sender_layer(
+                &alice_key,
+                &alice_ct,
+                T_CTX,
+                "did:example:alice",
+                T_EPOCH,
+                T_SEQ
+            )
+            .unwrap(),
             alice_msg
         );
-        assert_eq!(decrypt_sender_layer(&bob_key, &bob_ct).unwrap(), bob_msg);
+        assert_eq!(
+            decrypt_sender_layer(&bob_key, &bob_ct, T_CTX, "did:example:bob", T_EPOCH, T_SEQ)
+                .unwrap(),
+            bob_msg
+        );
 
         // Block Bob (admin action).
         ctx.block_author("did:example:bob").unwrap();
 
         // Alice can still publish (unaffected).
         let alice_msg2 = b"Alice's second message";
-        let _alice_envelope = ctx.publish("did:example:alice", alice_msg2).unwrap();
+        let _alice_envelope = test_publish(&mut ctx, "did:example:alice", alice_msg2).unwrap();
 
         // Subscribers can still decrypt Alice's messages via key request.
         let alice_decision = ctx.handle_key_request("did:example:alice", "did:example:sub1");
         assert!(matches!(alice_decision, KeyRequestDecision::Grant { .. }));
 
         // Bob cannot publish (PermissionDenied).
-        let bob_result = ctx.publish("did:example:bob", b"Bob tries to publish");
+        let bob_result = test_publish(&mut ctx, "did:example:bob", b"Bob tries to publish");
         assert!(bob_result.is_err());
 
         // Key request for Bob returns Deny (author not found).
@@ -1739,7 +2158,11 @@ mod tests {
         // Subscribers cannot get Bob's key at any epoch — his key is destroyed.
         // Old messages encrypted with Bob's key are still decryptable with the
         // cached key, but no new messages can be produced.
-        assert_eq!(decrypt_sender_layer(&bob_key, &bob_ct).unwrap(), bob_msg);
+        assert_eq!(
+            decrypt_sender_layer(&bob_key, &bob_ct, T_CTX, "did:example:bob", T_EPOCH, T_SEQ)
+                .unwrap(),
+            bob_msg
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1758,14 +2181,22 @@ mod tests {
     }
 
     #[test]
-    fn can_read_for_subscribers_and_authors() {
+    fn can_read_per_author_for_subscribers_and_authors() {
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
         subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
 
-        assert!(ctx.can_read("did:example:alice"));
-        assert!(ctx.can_read("did:example:bob"));
-        assert!(!ctx.can_read("did:example:unknown"));
+        // Per-author can_read: bob can read alice's content.
+        assert!(ctx.can_read("did:example:bob", "did:example:alice"));
+        // Authors have implicit read access.
+        assert!(ctx.can_read("did:example:alice", "did:example:alice"));
+        // Unknown DID cannot read.
+        assert!(!ctx.can_read("did:example:unknown", "did:example:alice"));
+
+        // can_read_any convenience.
+        assert!(ctx.can_read_any("did:example:alice"));
+        assert!(ctx.can_read_any("did:example:bob"));
+        assert!(!ctx.can_read_any("did:example:unknown"));
     }
 
     // -----------------------------------------------------------------------
@@ -1784,11 +2215,27 @@ mod tests {
         let author = ctx.get_author("did:example:alice").unwrap();
         let plaintext = b"Hello from Alice's broadcast!";
 
-        let ciphertext = encrypt_sender_layer(&author.broadcast_key, plaintext).unwrap();
+        let ciphertext = encrypt_sender_layer(
+            &author.broadcast_key,
+            plaintext,
+            T_CTX,
+            T_DID,
+            T_EPOCH,
+            T_SEQ,
+        )
+        .unwrap();
 
         for sub_did in &["did:example:sub1", "did:example:sub2", "did:example:sub3"] {
-            assert!(ctx.can_read(sub_did));
-            let decrypted = decrypt_sender_layer(&author.broadcast_key, &ciphertext).unwrap();
+            assert!(ctx.can_read(sub_did, "did:example:alice"));
+            let decrypted = decrypt_sender_layer(
+                &author.broadcast_key,
+                &ciphertext,
+                T_CTX,
+                T_DID,
+                T_EPOCH,
+                T_SEQ,
+            )
+            .unwrap();
             assert_eq!(decrypted, plaintext);
         }
     }
@@ -1812,10 +2259,11 @@ mod tests {
             .clone();
 
         let pre_block_msg = b"message before block";
-        let pre_block_ct = encrypt_sender_layer(&old_key, pre_block_msg).unwrap();
+        let pre_block_ct =
+            encrypt_sender_layer(&old_key, pre_block_msg, T_CTX, T_DID, T_EPOCH, T_SEQ).unwrap();
 
         assert_eq!(
-            decrypt_sender_layer(&old_key, &pre_block_ct).unwrap(),
+            decrypt_sender_layer(&old_key, &pre_block_ct, T_CTX, T_DID, T_EPOCH, T_SEQ).unwrap(),
             pre_block_msg
         );
 
@@ -1824,13 +2272,28 @@ mod tests {
             .unwrap();
 
         let post_block_msg = b"message after block";
-        let post_block_ct = encrypt_sender_layer(&block_result.new_key, post_block_msg).unwrap();
+        let post_block_ct = encrypt_sender_layer(
+            &block_result.new_key,
+            post_block_msg,
+            T_CTX,
+            T_DID,
+            1,
+            T_SEQ,
+        )
+        .unwrap();
 
-        let non_blocked_decrypted =
-            decrypt_sender_layer(&block_result.new_key, &post_block_ct).unwrap();
+        let non_blocked_decrypted = decrypt_sender_layer(
+            &block_result.new_key,
+            &post_block_ct,
+            T_CTX,
+            T_DID,
+            1,
+            T_SEQ,
+        )
+        .unwrap();
         assert_eq!(non_blocked_decrypted, post_block_msg);
 
-        let blocked_result = decrypt_sender_layer(&old_key, &post_block_ct);
+        let blocked_result = decrypt_sender_layer(&old_key, &post_block_ct, T_CTX, T_DID, 1, T_SEQ);
         assert!(
             blocked_result.is_err(),
             "blocked subscriber should not be able to decrypt post-block messages"
@@ -1854,9 +2317,25 @@ mod tests {
 
         let carol_author = ctx.get_author("did:example:carol").unwrap();
         let carol_msg = b"Carol's message";
-        let carol_ct = encrypt_sender_layer(&carol_author.broadcast_key, carol_msg).unwrap();
+        let carol_ct = encrypt_sender_layer(
+            &carol_author.broadcast_key,
+            carol_msg,
+            T_CTX,
+            "did:example:carol",
+            T_EPOCH,
+            T_SEQ,
+        )
+        .unwrap();
 
-        let decrypted = decrypt_sender_layer(&carol_author.broadcast_key, &carol_ct).unwrap();
+        let decrypted = decrypt_sender_layer(
+            &carol_author.broadcast_key,
+            &carol_ct,
+            T_CTX,
+            "did:example:carol",
+            T_EPOCH,
+            T_SEQ,
+        )
+        .unwrap();
         assert_eq!(decrypted, carol_msg);
     }
 
@@ -1889,10 +2368,11 @@ mod tests {
         let old_key = author.broadcast_key.clone();
 
         let msg_before = b"gated message before block";
-        let ct_before = encrypt_sender_layer(&old_key, msg_before).unwrap();
+        let ct_before =
+            encrypt_sender_layer(&old_key, msg_before, T_CTX, T_DID, T_EPOCH, T_SEQ).unwrap();
 
         assert_eq!(
-            decrypt_sender_layer(&old_key, &ct_before).unwrap(),
+            decrypt_sender_layer(&old_key, &ct_before, T_CTX, T_DID, T_EPOCH, T_SEQ).unwrap(),
             msg_before
         );
 
@@ -1901,9 +2381,10 @@ mod tests {
             .unwrap();
 
         let msg_after = b"gated message after block";
-        let ct_after = encrypt_sender_layer(&block_result.new_key, msg_after).unwrap();
+        let ct_after =
+            encrypt_sender_layer(&block_result.new_key, msg_after, T_CTX, T_DID, 1, T_SEQ).unwrap();
 
-        let blocked_result = decrypt_sender_layer(&old_key, &ct_after);
+        let blocked_result = decrypt_sender_layer(&old_key, &ct_after, T_CTX, T_DID, 1, T_SEQ);
         assert!(
             blocked_result.is_err(),
             "blocked subscriber cannot decrypt post-block gated messages"
@@ -2098,27 +2579,62 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Block removes subscriber from roster (RED-108)
+    // Per-author blocking does NOT remove from roster (#353, §5.14.8)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn block_subscriber_removes_from_subscribers() {
+    fn block_subscriber_does_not_remove_from_roster() {
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
+        ctx.add_author("did:example:bob").unwrap();
         subscribe_open(&mut ctx, "did:example:dave", None, 1000).unwrap();
 
         assert!(ctx.is_subscriber("did:example:dave"));
-        assert!(ctx.can_read("did:example:dave"));
+        assert!(ctx.can_read("did:example:dave", "did:example:alice"));
+        assert!(ctx.can_read("did:example:dave", "did:example:bob"));
 
         ctx.block_subscriber("did:example:alice", "did:example:dave")
             .unwrap();
 
-        // After blocking, subscriber should be removed from the roster and
-        // can_read should return false (unless they are also an author).
-        assert!(!ctx.is_subscriber("did:example:dave"));
+        // Per-author blocking: subscriber stays in roster but loses access
+        // to the blocking author's content only (§5.14.8).
         assert!(
-            !ctx.can_read("did:example:dave"),
-            "blocked subscriber must lose read access (RED-108)"
+            ctx.is_subscriber("did:example:dave"),
+            "per-author block must NOT remove from roster (#353)"
+        );
+        assert!(
+            !ctx.can_read("did:example:dave", "did:example:alice"),
+            "blocked subscriber must lose read access to blocking author"
+        );
+        assert!(
+            ctx.can_read("did:example:dave", "did:example:bob"),
+            "blocked subscriber must retain read access to other authors (#353)"
+        );
+        assert!(
+            ctx.can_read_any("did:example:dave"),
+            "subscriber blocked by one author can still read from another"
+        );
+    }
+
+    #[test]
+    fn block_subscriber_all_authors_blocks_all_read() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        ctx.add_author("did:example:bob").unwrap();
+        subscribe_open(&mut ctx, "did:example:dave", None, 1000).unwrap();
+
+        ctx.block_subscriber("did:example:alice", "did:example:dave")
+            .unwrap();
+        ctx.block_subscriber("did:example:bob", "did:example:dave")
+            .unwrap();
+
+        // Blocked by ALL authors — can_read_any returns false.
+        assert!(ctx.is_subscriber("did:example:dave"));
+        assert!(!ctx.can_read("did:example:dave", "did:example:alice"));
+        assert!(!ctx.can_read("did:example:dave", "did:example:bob"));
+        assert!(
+            !ctx.can_read_any("did:example:dave"),
+            "subscriber blocked by all authors has no read access"
         );
     }
 
@@ -2145,15 +2661,20 @@ mod tests {
             )
             .unwrap();
 
-        // All three should be blocked.
+        // All three should be blocked by this author.
         assert!(ctx.is_blocked("did:example:alice", "did:example:dave"));
         assert!(ctx.is_blocked("did:example:alice", "did:example:dave-alt"));
         assert!(ctx.is_blocked("did:example:alice", "did:example:dave-bot"));
 
-        // All three should be removed from subscribers.
-        assert!(!ctx.is_subscriber("did:example:dave"));
-        assert!(!ctx.is_subscriber("did:example:dave-alt"));
-        assert!(!ctx.is_subscriber("did:example:dave-bot"));
+        // Per-author blocking does NOT remove from roster (#353).
+        assert!(ctx.is_subscriber("did:example:dave"));
+        assert!(ctx.is_subscriber("did:example:dave-alt"));
+        assert!(ctx.is_subscriber("did:example:dave-bot"));
+
+        // But they cannot read from the blocking author.
+        assert!(!ctx.can_read("did:example:dave", "did:example:alice"));
+        assert!(!ctx.can_read("did:example:dave-alt", "did:example:alice"));
+        assert!(!ctx.can_read("did:example:dave-bot", "did:example:alice"));
 
         // Single key rotation (epoch incremented once, not three times).
         assert_eq!(result.new_epoch, 1);
@@ -2315,10 +2836,10 @@ mod tests {
         ctx.add_author("did:example:alice").unwrap();
         subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
 
-        assert!(ctx.can_read("did:example:bob"));
+        assert!(ctx.can_read("did:example:bob", "did:example:alice"));
         ctx.unsubscribe("did:example:bob", false).unwrap();
         assert!(
-            !ctx.can_read("did:example:bob"),
+            !ctx.can_read("did:example:bob", "did:example:alice"),
             "unsubscribed member must lose read access"
         );
     }
@@ -2579,9 +3100,11 @@ mod tests {
         // Step 3: Decrypt a broadcast message with the granted key.
         let author_key = &ctx.get_author("did:example:alice").unwrap().broadcast_key;
         let plaintext = b"Hello broadcast subscribers!";
-        let ciphertext = encrypt_sender_layer(author_key, plaintext).unwrap();
+        let ciphertext =
+            encrypt_sender_layer(author_key, plaintext, T_CTX, T_DID, T_EPOCH, T_SEQ).unwrap();
         let received_key = SenderKey::from_bytes(*key_bytes);
-        let decrypted = decrypt_sender_layer(&received_key, &ciphertext).unwrap();
+        let decrypted =
+            decrypt_sender_layer(&received_key, &ciphertext, T_CTX, T_DID, T_EPOCH, T_SEQ).unwrap();
         assert_eq!(decrypted, plaintext);
 
         // Step 4: Unsubscribe with key rotation.
@@ -2592,7 +3115,7 @@ mod tests {
 
         // Step 5: Verify no further access.
         assert!(!ctx.is_subscriber("did:example:bob"));
-        assert!(!ctx.can_read("did:example:bob"));
+        assert!(!ctx.can_read_any("did:example:bob"));
 
         // Step 6: Key request now denied.
         let denied = ctx.handle_key_request("did:example:alice", "did:example:bob");
@@ -2601,8 +3124,10 @@ mod tests {
         // Step 7: Old key cannot decrypt new content.
         let new_author_key = &ctx.get_author("did:example:alice").unwrap().broadcast_key;
         let new_plaintext = b"Post-unsubscribe message";
-        let new_ciphertext = encrypt_sender_layer(new_author_key, new_plaintext).unwrap();
-        let old_decrypt_result = decrypt_sender_layer(&received_key, &new_ciphertext);
+        let new_ciphertext =
+            encrypt_sender_layer(new_author_key, new_plaintext, T_CTX, T_DID, 1, T_SEQ).unwrap();
+        let old_decrypt_result =
+            decrypt_sender_layer(&received_key, &new_ciphertext, T_CTX, T_DID, 1, T_SEQ);
         assert!(
             old_decrypt_result.is_err(),
             "old key must not decrypt post-unsubscribe messages"
@@ -2733,14 +3258,14 @@ mod tests {
         subscribe_open(&mut ctx, "did:example:bob", None, 1000).unwrap();
 
         // Subscriber tries to publish -- must be rejected.
-        let result = ctx.publish("did:example:bob", b"unauthorized message");
+        let result = test_publish(&mut ctx, "did:example:bob", b"unauthorized message");
         assert!(
             matches!(&result, Err(ContextError::PermissionDenied(_))),
             "non-author must be rejected by publish: {result:?}"
         );
 
         // Completely unknown DID also rejected.
-        let result = ctx.publish("did:example:unknown", b"ghost message");
+        let result = test_publish(&mut ctx, "did:example:unknown", b"ghost message");
         assert!(
             matches!(&result, Err(ContextError::PermissionDenied(_))),
             "unknown DID must be rejected by publish: {result:?}"
@@ -2762,7 +3287,7 @@ mod tests {
         let plaintext = b"Hello from Alice via publish()!";
 
         // Author publishes through the capability-enforced path.
-        let envelope = ctx.publish("did:example:alice", plaintext).unwrap();
+        let envelope = test_publish(&mut ctx, "did:example:alice", plaintext).unwrap();
 
         // Verify envelope metadata.
         assert_eq!(envelope.author_did, "did:example:alice");
@@ -2780,8 +3305,11 @@ mod tests {
         );
 
         for sub_did in &["did:example:sub1", "did:example:sub2", "did:example:sub3"] {
-            assert!(ctx.can_read(sub_did), "{sub_did} must have read access");
-            let decrypted = open_broadcast(&subscriber_key, &envelope).unwrap();
+            assert!(
+                ctx.can_read(sub_did, "did:example:alice"),
+                "{sub_did} must have read access"
+            );
+            let decrypted = open_broadcast_trusted(&subscriber_key, &envelope).unwrap();
             assert_eq!(
                 decrypted, plaintext,
                 "{sub_did} must decrypt the correct plaintext"
@@ -2810,11 +3338,12 @@ mod tests {
 
         // Author publishes a message before the block.
         let pre_block_msg = b"message visible to everyone";
-        let pre_block_envelope = ctx.publish("did:example:alice", pre_block_msg).unwrap();
+        let pre_block_envelope =
+            test_publish(&mut ctx, "did:example:alice", pre_block_msg).unwrap();
 
         // Both subscribers can decrypt the pre-block message.
         assert_eq!(
-            open_broadcast(&pre_block_key, &pre_block_envelope).unwrap(),
+            open_broadcast_trusted(&pre_block_key, &pre_block_envelope).unwrap(),
             pre_block_msg,
         );
 
@@ -2826,7 +3355,8 @@ mod tests {
 
         // Author publishes a post-block message (with the new key).
         let post_block_msg = b"message only for sub1";
-        let post_block_envelope = ctx.publish("did:example:alice", post_block_msg).unwrap();
+        let post_block_envelope =
+            test_publish(&mut ctx, "did:example:alice", post_block_msg).unwrap();
         assert_eq!(post_block_envelope.key_epoch, 1);
 
         // sub1 (non-blocked) obtains the new key and can decrypt.
@@ -2836,12 +3366,12 @@ mod tests {
             post_block_author.epoch,
             post_block_author.author_did.clone(),
         );
-        let sub1_decrypted = open_broadcast(&post_block_key, &post_block_envelope).unwrap();
+        let sub1_decrypted = open_broadcast_trusted(&post_block_key, &post_block_envelope).unwrap();
         assert_eq!(sub1_decrypted, post_block_msg);
 
         // sub2 (blocked) only has the old key -- epoch mismatch means they
         // cannot even attempt decryption of the new envelope.
-        let sub2_result = open_broadcast(&pre_block_key, &post_block_envelope);
+        let sub2_result = open_broadcast_trusted(&pre_block_key, &post_block_envelope);
         assert!(
             sub2_result.is_err(),
             "blocked subscriber must not decrypt post-block messages"
@@ -2849,7 +3379,8 @@ mod tests {
 
         // Verify pre-block messages remain decryptable with the old key
         // (backwards compatibility: old content is not lost).
-        let pre_block_still_ok = open_broadcast(&pre_block_key, &pre_block_envelope).unwrap();
+        let pre_block_still_ok =
+            open_broadcast_trusted(&pre_block_key, &pre_block_envelope).unwrap();
         assert_eq!(pre_block_still_ok, pre_block_msg);
     }
 
@@ -3009,10 +3540,14 @@ mod tests {
             original_key_bytes
         );
 
-        // Blocked subscriber should not be in subscriber list.
-        assert!(!restored.is_subscriber("did:dht:z6MkSub1"));
-        // Unblocked subscriber should still be there.
+        // Per-author blocking does NOT remove from roster (#353, §5.14.8).
+        // Both subscribers remain registered.
+        assert!(restored.is_subscriber("did:dht:z6MkSub1"));
         assert!(restored.is_subscriber("did:dht:z6MkSub2"));
+
+        // But blocked subscriber cannot read this author's content.
+        assert!(!restored.can_read("did:dht:z6MkSub1", "did:dht:z6MkAuthor1"));
+        assert!(restored.can_read("did:dht:z6MkSub2", "did:dht:z6MkAuthor1"));
     }
 
     #[test]
@@ -3265,5 +3800,566 @@ mod tests {
                 .block_list
                 .is_empty()
         );
+    }
+
+    // =======================================================================
+    // SubscriberRegistration wire type and signature verification (#299)
+    // =======================================================================
+
+    /// Helper to create a signed `SubscriberRegistration` for testing.
+    fn make_signed_registration(
+        context_id: &str,
+        subscriber_did: &str,
+        signing_key: &ed25519_dalek::SigningKey,
+        wrapping_pubkey: [u8; 32],
+        timestamp: u64,
+        ucan: Option<UcanToken>,
+    ) -> SubscriberRegistration {
+        use ed25519_dalek::Signer;
+
+        let did = DID(subscriber_did.to_owned());
+        let signing_input =
+            SubscriberRegistration::signing_input(context_id, &did, &wrapping_pubkey, timestamp);
+        let signature = signing_key.sign(&signing_input);
+
+        SubscriberRegistration {
+            subscriber_did: did,
+            wrapping_pubkey: wrapping_pubkey.to_vec(),
+            ucan,
+            timestamp,
+            signature: signature.to_bytes().to_vec(),
+        }
+    }
+
+    /// Helper to create a subscriber keypair and register its DID in the
+    /// resolver. Returns (`signing_key`, DID string, `wrapping_pubkey`).
+    fn make_subscriber_identity(
+        seed: [u8; 32],
+        did_str: &str,
+        did_resolver: &mut InMemoryDidResolver,
+    ) -> (ed25519_dalek::SigningKey, [u8; 32]) {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let verifying_key = signing_key.verifying_key();
+        did_resolver
+            .keys
+            .insert(did_str.to_owned(), verifying_key.to_bytes());
+
+        // Generate a deterministic X25519 wrapping key for testing.
+        let wrapping_pubkey = [seed[0]; 32];
+
+        (signing_key, wrapping_pubkey)
+    }
+
+    // -----------------------------------------------------------------------
+    // AC: SubscriberRegistration struct (§5.14.3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn subscriber_registration_struct_has_required_fields() {
+        let reg = SubscriberRegistration {
+            subscriber_did: DID("did:example:test".to_owned()),
+            wrapping_pubkey: vec![0u8; 32],
+            ucan: None,
+            timestamp: 1_700_000_000,
+            signature: vec![0u8; 64],
+        };
+        assert_eq!(reg.subscriber_did.0, "did:example:test");
+        assert_eq!(reg.wrapping_pubkey.len(), 32);
+        assert!(reg.ucan.is_none());
+        assert_eq!(reg.timestamp, 1_700_000_000);
+        assert_eq!(reg.signature.len(), 64);
+    }
+
+    #[test]
+    fn subscriber_registration_signing_input_is_deterministic() {
+        let did = DID("did:example:sub".to_owned());
+        let pubkey = [42u8; 32];
+        let ts = 1_700_000_000u64;
+
+        let input1 = SubscriberRegistration::signing_input("ctx-1", &did, &pubkey, ts);
+        let input2 = SubscriberRegistration::signing_input("ctx-1", &did, &pubkey, ts);
+        assert_eq!(input1, input2, "signing input must be deterministic");
+
+        // Different context_id produces different input.
+        let input3 = SubscriberRegistration::signing_input("ctx-2", &did, &pubkey, ts);
+        assert_ne!(input1, input3);
+    }
+
+    // -----------------------------------------------------------------------
+    // AC: Signature verification on SubscriberRegistration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn subscriber_registration_valid_signature_passes() {
+        let mut setup = GatedTestSetup::new();
+        let sub_seed = [99u8; 32];
+        let sub_did = "did:example:subscriber";
+        let (sub_key, wrapping_pubkey) =
+            make_subscriber_identity(sub_seed, sub_did, &mut setup.did_resolver);
+
+        let reg = make_signed_registration(
+            "ctx-open-1",
+            sub_did,
+            &sub_key,
+            wrapping_pubkey,
+            1_700_000_000,
+            None,
+        );
+
+        let result = reg.verify_signature("ctx-open-1", &setup.did_resolver);
+        assert!(result.is_ok(), "valid signature must pass: {result:?}");
+    }
+
+    #[test]
+    fn subscriber_registration_tampered_timestamp_fails_signature() {
+        // AC: submit SubscriberRegistration with invalid signature
+        // (tampered timestamp) → rejected with signature verification error.
+        let mut setup = GatedTestSetup::new();
+        let sub_seed = [99u8; 32];
+        let sub_did = "did:example:subscriber";
+        let (sub_key, wrapping_pubkey) =
+            make_subscriber_identity(sub_seed, sub_did, &mut setup.did_resolver);
+
+        let mut reg = make_signed_registration(
+            "ctx-open-1",
+            sub_did,
+            &sub_key,
+            wrapping_pubkey,
+            1_700_000_000,
+            None,
+        );
+
+        // Tamper with the timestamp after signing.
+        reg.timestamp += 1;
+
+        let result = reg.verify_signature("ctx-open-1", &setup.did_resolver);
+        assert!(result.is_err(), "tampered timestamp must fail verification");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("signature verification failed"),
+            "error must indicate signature failure, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn subscriber_registration_wrong_context_fails_signature() {
+        let mut setup = GatedTestSetup::new();
+        let sub_seed = [99u8; 32];
+        let sub_did = "did:example:subscriber";
+        let (sub_key, wrapping_pubkey) =
+            make_subscriber_identity(sub_seed, sub_did, &mut setup.did_resolver);
+
+        // Sign for "ctx-1" but verify against "ctx-2".
+        let reg = make_signed_registration(
+            "ctx-1",
+            sub_did,
+            &sub_key,
+            wrapping_pubkey,
+            1_700_000_000,
+            None,
+        );
+
+        let result = reg.verify_signature("ctx-2", &setup.did_resolver);
+        assert!(
+            result.is_err(),
+            "wrong context must fail signature verification"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AC: Open broadcast register_subscriber path (#299)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn register_subscriber_open_broadcast_succeeds() {
+        // AC: open broadcast registration with ucan: None auto-registers.
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        let mut setup = GatedTestSetup::new();
+        let sub_did = "did:example:subscriber";
+        let (sub_key, wrapping_pubkey) =
+            make_subscriber_identity([99u8; 32], sub_did, &mut setup.did_resolver);
+
+        let reg = make_signed_registration(
+            "ctx-broadcast-1",
+            sub_did,
+            &sub_key,
+            wrapping_pubkey,
+            1_700_000_000,
+            None,
+        );
+
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: sub_did,
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        let result = ctx.register_subscriber(&reg, Some(&mut val_ctx)).unwrap();
+
+        assert!(ctx.is_subscriber(sub_did));
+        assert_eq!(result.author_epochs["did:example:alice"], 0);
+        assert_eq!(
+            result.event,
+            ContextEvent::MemberJoined {
+                member_did: DID(sub_did.to_owned()),
+                role_name: "subscriber".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn register_subscriber_rejects_invalid_signature() {
+        // AC: submit SubscriberRegistration with invalid signature
+        // (tampered timestamp) → rejected with signature verification error.
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        let mut setup = GatedTestSetup::new();
+        let sub_did = "did:example:subscriber";
+        let (sub_key, wrapping_pubkey) =
+            make_subscriber_identity([99u8; 32], sub_did, &mut setup.did_resolver);
+
+        let mut reg = make_signed_registration(
+            "ctx-broadcast-1",
+            sub_did,
+            &sub_key,
+            wrapping_pubkey,
+            1_700_000_000,
+            None,
+        );
+        // Tamper with timestamp after signing.
+        reg.timestamp += 1;
+
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: sub_did,
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("signature verification failed"),
+            "must indicate signature failure: {err_msg}"
+        );
+        assert!(!ctx.is_subscriber(sub_did));
+    }
+
+    #[test]
+    fn register_subscriber_rejects_invalid_wrapping_key_length() {
+        use ed25519_dalek::Signer;
+
+        let mut ctx = make_open_ctx();
+
+        let mut setup = GatedTestSetup::new();
+        let sub_did = "did:example:subscriber";
+        let (sub_key, _) = make_subscriber_identity([99u8; 32], sub_did, &mut setup.did_resolver);
+
+        // Use a 16-byte wrapping key instead of 32.
+        let bad_pubkey = [0u8; 16];
+        let did = DID(sub_did.to_owned());
+        let signing_input = SubscriberRegistration::signing_input(
+            "ctx-broadcast-1",
+            &did,
+            &bad_pubkey,
+            1_700_000_000,
+        );
+        let signature = sub_key.sign(&signing_input);
+
+        let reg = SubscriberRegistration {
+            subscriber_did: did,
+            wrapping_pubkey: bad_pubkey.to_vec(),
+            ucan: None,
+            timestamp: 1_700_000_000,
+            signature: signature.to_bytes().to_vec(),
+        };
+
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: sub_did,
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("invalid wrapping_pubkey length"),
+            "must indicate wrapping key issue: {err_msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AC: Gated broadcast register_subscriber path (#299)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn register_subscriber_gated_without_ucan_rejected() {
+        // AC: submit SubscriberRegistration to gated broadcast with ucan: None
+        // → rejected with error specifying "messagesRead UCAN required for
+        // gated broadcast".
+        let mut ctx = make_gated_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        let mut setup = GatedTestSetup::new();
+        let sub_did = "did:example:subscriber";
+        let (sub_key, wrapping_pubkey) =
+            make_subscriber_identity([99u8; 32], sub_did, &mut setup.did_resolver);
+
+        let reg = make_signed_registration(
+            "ctx-gated-1",
+            sub_did,
+            &sub_key,
+            wrapping_pubkey,
+            1_700_000_000,
+            None, // No UCAN for gated context.
+        );
+
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: sub_did,
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("gated broadcast requires messagesRead UCAN")
+                || err_msg.contains("messagesRead UCAN required"),
+            "must specify messagesRead UCAN required, got: {err_msg}"
+        );
+        assert!(!ctx.is_subscriber(sub_did));
+    }
+
+    #[test]
+    fn register_subscriber_gated_with_valid_ucan_succeeds() {
+        // AC: gated broadcast with valid messagesRead UCAN passes full
+        // 11-step validation.
+        let mut ctx = make_gated_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        let mut setup = GatedTestSetup::new();
+        let sub_did = "did:example:subscriber";
+        let (sub_key, wrapping_pubkey) =
+            make_subscriber_identity([99u8; 32], sub_did, &mut setup.did_resolver);
+
+        let ucan = setup.make_ucan("ctx-gated-1", sub_did);
+
+        let reg = make_signed_registration(
+            "ctx-gated-1",
+            sub_did,
+            &sub_key,
+            wrapping_pubkey,
+            1_700_000_000,
+            Some(ucan),
+        );
+
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: sub_did,
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        let result = ctx.register_subscriber(&reg, Some(&mut val_ctx)).unwrap();
+
+        assert!(ctx.is_subscriber(sub_did));
+        assert_eq!(
+            result.event,
+            ContextEvent::MemberJoined {
+                member_did: DID(sub_did.to_owned()),
+                role_name: "subscriber".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn register_subscriber_gated_with_expired_ucan_rejected() {
+        // AC: submit SubscriberRegistration to gated broadcast with expired
+        // UCAN → rejected at validation step 4 (time bounds).
+        let mut ctx = make_gated_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        let mut setup = GatedTestSetup::new();
+        let sub_did = "did:example:subscriber";
+        let (sub_key, wrapping_pubkey) =
+            make_subscriber_identity([99u8; 32], sub_did, &mut setup.did_resolver);
+
+        // Create an expired UCAN — exp in the past.
+        let expired_ucan = {
+            use base64::Engine;
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            use ed25519_dalek::Signer as _;
+
+            let now_secs = crate::time::now_secs().expect("clock unavailable");
+            let now_millis = crate::time::now_millis().expect("clock unavailable");
+
+            let header = UcanHeader::new();
+            let payload = UcanPayload {
+                iss: setup.issuer_did.clone(),
+                aud: sub_did.to_owned(),
+                exp: now_secs.saturating_sub(3600), // Expired 1 hour ago.
+                nbf: Some(now_secs.saturating_sub(7200)),
+                nnc: format!("{now_millis}-expired11223344expired11223344"),
+                att: vec![Attenuation {
+                    with: "scp:ctx:ctx-gated-1/messages:read".to_string(),
+                    can: "read".to_owned(),
+                }],
+                prf: vec![],
+                fct: None,
+            };
+
+            let header_json = serde_json::to_vec(&header).unwrap();
+            let payload_json = serde_json::to_vec(&payload).unwrap();
+            let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
+            let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+            let signing_input_str = format!("{header_b64}.{payload_b64}");
+            let sig = setup.signing_key.sign(signing_input_str.as_bytes());
+            let sig_bytes = sig.to_bytes().to_vec();
+            let sig_b64 = URL_SAFE_NO_PAD.encode(&sig_bytes);
+            let encoded = format!("{header_b64}.{payload_b64}.{sig_b64}");
+
+            UcanToken {
+                header,
+                payload,
+                signature: sig_bytes,
+                encoded,
+            }
+        };
+
+        let reg = make_signed_registration(
+            "ctx-gated-1",
+            sub_did,
+            &sub_key,
+            wrapping_pubkey,
+            1_700_000_000,
+            Some(expired_ucan),
+        );
+
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: sub_did,
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
+        assert!(result.is_err(), "expired UCAN must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("UCAN validation failed"),
+            "error must indicate UCAN validation failure: {err_msg}"
+        );
+        assert!(!ctx.is_subscriber(sub_did));
+    }
+
+    // -----------------------------------------------------------------------
+    // AC: Round-trip test — mint messagesRead UCAN → validate (#299)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn roundtrip_open_broadcast_mint_validate_ucan() {
+        // AC: mint a messagesRead UCAN for a subscriber in open broadcast →
+        // validate it via validate_ucan() → passes all 11 steps.
+        let setup = GatedTestSetup::new();
+        let sub_did = "did:example:subscriber";
+        let context_id = "ctx-broadcast-roundtrip";
+
+        // Mint a valid messagesRead UCAN.
+        let ucan = make_signed_ucan(context_id, &setup.issuer_did, sub_did, &setup.signing_key);
+
+        // Validate it through the full 11-step pipeline.
+        let required_cap = CapabilityUri::new(context_id, "messages", "read");
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: sub_did,
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        let result = validate_ucan(&ucan, &required_cap, &mut val_ctx);
+        assert!(
+            result.is_ok(),
+            "round-trip minted UCAN must pass full validation: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AC: SubscriberRegistration serialization roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn subscriber_registration_serde_roundtrip() {
+        let reg = SubscriberRegistration {
+            subscriber_did: DID("did:example:test".to_owned()),
+            wrapping_pubkey: vec![42u8; 32],
+            ucan: None,
+            timestamp: 1_700_000_000,
+            signature: vec![0xAA; 64],
+        };
+
+        let json = serde_json::to_string(&reg).unwrap();
+        let decoded: SubscriberRegistration = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.subscriber_did, reg.subscriber_did);
+        assert_eq!(decoded.wrapping_pubkey, reg.wrapping_pubkey);
+        assert_eq!(decoded.timestamp, reg.timestamp);
+        assert_eq!(decoded.signature, reg.signature);
+        assert!(decoded.ucan.is_none());
+    }
+
+    #[test]
+    fn subscriber_registration_msgpack_roundtrip() {
+        let reg = SubscriberRegistration {
+            subscriber_did: DID("did:example:msgpack-test".to_owned()),
+            wrapping_pubkey: vec![77u8; 32],
+            ucan: None,
+            timestamp: 1_700_000_000,
+            signature: vec![0xBB; 64],
+        };
+
+        let bytes = rmp_serde::to_vec(&reg).unwrap();
+        let decoded: SubscriberRegistration = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.subscriber_did, reg.subscriber_did);
+        assert_eq!(decoded.wrapping_pubkey, reg.wrapping_pubkey);
+        assert_eq!(decoded.timestamp, reg.timestamp);
+        assert_eq!(decoded.signature, reg.signature);
     }
 }

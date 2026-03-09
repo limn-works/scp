@@ -38,6 +38,124 @@ use super::{DidMethod, IdentityError, ScpIdentity};
 /// The `did:dht` DID method prefix.
 const DID_DHT_PREFIX: &str = "did:dht:";
 
+// ---------------------------------------------------------------------------
+// BEP44 Sequence Persistence (issue #327)
+// ---------------------------------------------------------------------------
+
+/// Persistence trait for BEP44 sequence numbers.
+///
+/// DID document publications to the Mainline DHT use BEP44 signed mutable
+/// items with a monotonically increasing sequence number. If the node restarts
+/// and begins from 0, previously-published documents with higher sequence
+/// numbers will be considered "newer" by DHT peers, enabling replay attacks.
+///
+/// Implementations persist the last-published sequence number so it can be
+/// recovered on restart. The identity crate defines this trait (rather than
+/// importing from `scp-core`) to preserve `scp-identity`'s self-contained
+/// design.
+///
+/// See issue #327 and BEP44 §Mutable Items.
+pub trait SequenceStore: Send + Sync {
+    /// Loads the last-persisted sequence number for the given DID.
+    ///
+    /// Returns `Ok(None)` if no sequence has been stored (first run).
+    fn load(
+        &self,
+        did: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, IdentityError>> + Send + '_>>;
+
+    /// Persists the sequence number for the given DID.
+    ///
+    /// Called after every successful DID document publication.
+    fn store(
+        &self,
+        did: &str,
+        seq: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), IdentityError>> + Send + '_>>;
+}
+
+/// In-memory [`SequenceStore`] for testing.
+///
+/// Stores sequence numbers in a `HashMap` behind a `tokio::sync::Mutex`.
+/// Not suitable for production (no persistence across restarts).
+#[derive(Debug, Default)]
+pub struct InMemorySequenceStore {
+    sequences: tokio::sync::Mutex<std::collections::HashMap<String, u64>>,
+}
+
+impl InMemorySequenceStore {
+    /// Creates a new empty in-memory sequence store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            sequences: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+impl SequenceStore for InMemorySequenceStore {
+    fn load(
+        &self,
+        did: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, IdentityError>> + Send + '_>> {
+        let did = did.to_owned();
+        Box::pin(async move {
+            let map = self.sequences.lock().await;
+            Ok(map.get(&did).copied())
+        })
+    }
+
+    fn store(
+        &self,
+        did: &str,
+        seq: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), IdentityError>> + Send + '_>> {
+        let did = did.to_owned();
+        Box::pin(async move {
+            self.sequences.lock().await.insert(did, seq);
+            Ok(())
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Post-resolve hook (TOFU / certificate pinning integration point)
+// ---------------------------------------------------------------------------
+
+/// Hook called after every successful DID resolution.
+///
+/// This is the integration point for TOFU key tracking (spec §9.11) and
+/// certificate pinning (spec §9.13). The `scp-core` crate provides an
+/// implementation that calls `check_tofu` and persists records via
+/// `ProtocolStore`. The identity crate defines this trait (rather than
+/// importing from `scp-core`) to preserve `scp-identity`'s self-contained
+/// dependency graph.
+///
+/// # Rotation authorization on key change
+///
+/// When TOFU detects a key change (`TofuResult::Changed`), the implementation
+/// should verify that the DID document update was properly authorized. For
+/// `did:dht`, BEP44 signature verification during resolution already provides
+/// this guarantee: the DHT record is signed by the Identity Key (`#0`), so
+/// any document update — including key rotations — is cryptographically
+/// authorized by the DID controller. The post-resolve hook does NOT need to
+/// perform additional rotation authorization checks; it can focus on alerting
+/// the user and refusing encrypted operations until the change is accepted.
+pub trait PostResolveHook: Send + Sync {
+    /// Called after a DID document is successfully resolved and verified.
+    ///
+    /// The hook receives the DID string and the resolved document. It may
+    /// inspect verification method keys, compare against stored records,
+    /// and report changes. Errors from this hook are logged but do not
+    /// prevent the resolution result from being returned — TOFU is advisory,
+    /// not a gate on resolution itself.
+    fn on_resolve(
+        &self,
+        did: &str,
+        document: &DidDocument,
+    ) -> Pin<Box<dyn Future<Output = Result<(), IdentityError>> + Send + '_>>;
+}
+
 /// Domain separator for migration proof hashes, preventing cross-protocol
 /// signature confusion. See issue #78.
 const DOMAIN_MIGRATION_V1: &[u8] = b"SCP-MIGRATION-V1:";
@@ -79,9 +197,20 @@ pub struct DidDht<D: DhtClient = InMemoryDhtClient, C: Clock = SystemClock> {
     sequence: AtomicU64,
     /// Optional signing function for BEP44 publish.
     sign_fn: Option<Arc<SignFn>>,
+    /// Optional persistence for BEP44 sequence numbers (issue #327).
+    ///
+    /// When present, the sequence number is persisted after every successful
+    /// DID document publication and loaded on startup via
+    /// [`initialize_sequence`](Self::initialize_sequence).
+    sequence_store: Option<Arc<dyn SequenceStore>>,
+    /// Optional post-resolve hook for TOFU key tracking (spec §9.11).
+    ///
+    /// When present, called after every successful DID resolution. Errors
+    /// from the hook are logged but do not prevent resolution from succeeding.
+    post_resolve_hook: Option<Arc<dyn PostResolveHook>>,
 }
 
-// Manual Debug impl because SignFn can't derive Debug.
+// Manual Debug impl because SignFn and dyn SequenceStore can't derive Debug.
 impl<D: DhtClient + std::fmt::Debug, C: Clock + std::fmt::Debug> std::fmt::Debug for DidDht<D, C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DidDht")
@@ -89,6 +218,14 @@ impl<D: DhtClient + std::fmt::Debug, C: Clock + std::fmt::Debug> std::fmt::Debug
             .field("cache", &self.cache)
             .field("sequence", &self.sequence)
             .field("sign_fn", &self.sign_fn.as_ref().map(|_| "<fn>"))
+            .field(
+                "sequence_store",
+                &self.sequence_store.as_ref().map(|_| "<store>"),
+            )
+            .field(
+                "post_resolve_hook",
+                &self.post_resolve_hook.as_ref().map(|_| "<hook>"),
+            )
             .finish()
     }
 }
@@ -113,6 +250,8 @@ impl DidDht<InMemoryDhtClient, SystemClock> {
             cache: Arc::new(DidCache::new()),
             sequence: AtomicU64::new(0),
             sign_fn: None,
+            sequence_store: None,
+            post_resolve_hook: None,
         }
     }
 }
@@ -127,6 +266,8 @@ impl<D: DhtClient> DidDht<D, SystemClock> {
             cache: Arc::new(DidCache::new()),
             sequence: AtomicU64::new(0),
             sign_fn: None,
+            sequence_store: None,
+            post_resolve_hook: None,
         }
     }
 }
@@ -149,6 +290,31 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             cache,
             sequence: AtomicU64::new(0),
             sign_fn: Some(sign_fn),
+            sequence_store: None,
+            post_resolve_hook: None,
+        }
+    }
+
+    /// Creates a new `DidDht` instance with DHT client, cache, signing
+    /// function, and sequence persistence store (issue #327).
+    ///
+    /// After construction, call [`initialize_sequence`](Self::initialize_sequence)
+    /// to bootstrap the sequence number from the store and/or DHT before
+    /// publishing any documents.
+    #[must_use]
+    pub fn with_client_signer_and_store(
+        dht_client: Arc<D>,
+        cache: Arc<DidCache<C>>,
+        sign_fn: Arc<SignFn>,
+        sequence_store: Arc<dyn SequenceStore>,
+    ) -> Self {
+        Self {
+            dht_client,
+            cache,
+            sequence: AtomicU64::new(0),
+            sign_fn: Some(sign_fn),
+            sequence_store: Some(sequence_store),
+            post_resolve_hook: None,
         }
     }
 
@@ -191,6 +357,89 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     /// Sets the sequence number (e.g., when loading from persistent storage).
     pub fn set_sequence(&self, seq: u64) {
         self.sequence.store(seq, Ordering::Release);
+    }
+
+    /// Returns a reference to the sequence store, if configured.
+    #[must_use]
+    pub fn sequence_store(&self) -> Option<&Arc<dyn SequenceStore>> {
+        self.sequence_store.as_ref()
+    }
+
+    /// Sets a post-resolve hook for TOFU key tracking (spec §9.11).
+    ///
+    /// The hook is called after every successful DID resolution. Use this
+    /// to integrate TOFU key tracking from `scp-core::crypto::tofu`.
+    pub fn set_post_resolve_hook(&mut self, hook: Arc<dyn PostResolveHook>) {
+        self.post_resolve_hook = Some(hook);
+    }
+
+    /// Returns a reference to the post-resolve hook, if configured.
+    #[must_use]
+    pub fn post_resolve_hook(&self) -> Option<&Arc<dyn PostResolveHook>> {
+        self.post_resolve_hook.as_ref()
+    }
+
+    /// Bootstraps the BEP44 sequence number from persistent storage and/or
+    /// the DHT (issue #327).
+    ///
+    /// This method MUST be called after construction and before publishing
+    /// any DID documents. It ensures the node never publishes with a sequence
+    /// number less than or equal to a previously-published value, even after
+    /// restart.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Load the last-persisted sequence from the [`SequenceStore`] (if
+    ///    configured).
+    /// 2. Best-effort DHT query for the current sequence of the DID's BEP44
+    ///    record. If the DHT is unreachable, initialization proceeds with the
+    ///    locally-stored value and logs a warning.
+    /// 3. Set the local sequence to `max(stored, remote)`. The next publish
+    ///    will increment this to `max(stored, remote) + 1`.
+    ///
+    /// If no store is configured and no DHT record exists, the sequence
+    /// remains at its current value (typically 0 for a new identity).
+    ///
+    /// # Errors
+    ///
+    /// Store load errors are propagated as-is. DHT query failures are
+    /// logged but not propagated (best-effort).
+    pub async fn initialize_sequence(&self, did: &str) -> Result<(), IdentityError> {
+        // Step 1: Load from persistent store.
+        let mut best_seq: u64 = if let Some(store) = &self.sequence_store
+            && let Some(stored_seq) = store.load(did).await?
+        {
+            stored_seq
+        } else {
+            0
+        };
+
+        // Step 2: Best-effort DHT query for the current remote sequence.
+        // If the DHT is unreachable we proceed with the locally-stored value
+        // rather than failing the entire initialization.
+        let public_key = extract_public_key(did)?;
+        match self.dht_client.resolve(&public_key).await {
+            Ok(Some(record)) => {
+                best_seq = best_seq.max(record.seq);
+            }
+            Ok(None) => {} // No record on DHT — first publish or expired.
+            Err(e) => {
+                tracing::warn!(
+                    did = %did,
+                    error = %e,
+                    "DHT query failed during sequence initialization, using local value"
+                );
+            }
+        }
+
+        // Step 3: Set to the maximum known sequence.
+        // The next publish_document call will fetch_add(1), producing
+        // max(stored, remote) + 1.
+        if best_seq > 0 {
+            self.sequence.store(best_seq, Ordering::Release);
+        }
+
+        Ok(())
     }
 
     /// Constructs the BEP44 signable payload for a value and sequence number.
@@ -269,6 +518,11 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         self.dht_client
             .publish(&public_key, &signature, value, seq)
             .await?;
+
+        // Persist the sequence number after successful publish (issue #327).
+        if let Some(store) = &self.sequence_store {
+            store.store(&identity.did, seq).await?;
+        }
 
         Ok(())
     }
@@ -376,7 +630,19 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         // derived from the DID string.
         verify_self_certification(did_string, &document)?;
 
-        // Step 6: Update cache.
+        // Step 6: Post-resolve hook (TOFU key tracking, spec §9.11).
+        // Errors are logged but do not prevent resolution from succeeding.
+        if let Some(hook) = &self.post_resolve_hook
+            && let Err(e) = hook.on_resolve(did_string, &document).await
+        {
+            tracing::warn!(
+                did = %did_string,
+                error = %e,
+                "post-resolve hook failed (TOFU key tracking may be unavailable)"
+            );
+        }
+
+        // Step 7: Update cache.
         self.cache
             .insert(did_string, document.clone(), record.seq)
             .await;
@@ -726,6 +992,48 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         };
 
         Ok((updated_identity, updated_doc))
+    }
+
+    /// Attaches a device attestation token to a DID document.
+    ///
+    /// Calls [`DeviceAttestation::attest()`] to generate a platform-specific
+    /// attestation token, then stores it as an `ScpDeviceAttestation` service
+    /// entry in the DID document (§9.3). The token is base64-encoded in the
+    /// `serviceEndpoint` field. The service entry uses the ID format
+    /// `{did}#device-attestation`.
+    ///
+    /// Device attestation is a Sybil resistance signal -- the protocol carries
+    /// the proof but does not prescribe interpretation. Contexts MAY require
+    /// device attestation for admission via `ContextParams`.
+    ///
+    /// When `DeviceAttestation` is not available (e.g., desktop platforms
+    /// without hardware attestation), callers should skip this method. The
+    /// absence of an `ScpDeviceAttestation` service entry is a valid state.
+    ///
+    /// # Arguments
+    ///
+    /// * `document` - The DID document to attach the attestation to.
+    /// * `attestation` - A platform `DeviceAttestation` implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::Platform`] if the attestation service is
+    /// unavailable or attestation generation fails.
+    ///
+    /// See §9.3, issue #362, BLACK-006.
+    pub async fn attach_device_attestation(
+        &self,
+        document: &DidDocument,
+        attestation: &impl scp_platform::traits::DeviceAttestation,
+    ) -> Result<DidDocument, IdentityError> {
+        let token = attestation
+            .attest()
+            .await
+            .map_err(IdentityError::Platform)?;
+
+        let mut updated_doc = document.clone();
+        updated_doc.set_device_attestation_token(token.as_bytes());
+        Ok(updated_doc)
     }
 
     /// Migrates an identity to a new DID (Layer 2).
@@ -3175,5 +3483,352 @@ mod tests {
             seq.load(Ordering::Acquire),
             (num_threads * increments_per_thread) as u64
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // BEP44 sequence persistence tests (issue #327)
+    // -----------------------------------------------------------------------
+
+    /// Helper to create a `DidDht` with a shared DHT client, custody, and
+    /// sequence store — simulating restart by creating a new `DidDht` that
+    /// shares the same store and DHT.
+    fn make_dht_with_store(
+        custody: &Arc<InMemoryKeyCustody>,
+        dht_client: Arc<InMemoryDhtClient>,
+        store: Arc<InMemorySequenceStore>,
+    ) -> DidDht<InMemoryDhtClient, Arc<TestClock>> {
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(clock));
+        let sign_fn =
+            DidDht::<InMemoryDhtClient, Arc<TestClock>>::make_sign_fn(Arc::clone(custody));
+        DidDht::with_client_signer_and_store(dht_client, cache, sign_fn, store)
+    }
+
+    #[tokio::test]
+    async fn publish_persists_sequence_to_store() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let store = Arc::new(InMemorySequenceStore::new());
+        let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+
+        // Publish increments and persists.
+        dht.publish_document(&identity, &document).await.unwrap();
+        assert_eq!(dht.current_sequence(), 1);
+
+        let stored = store.load(&identity.did).await.unwrap();
+        assert_eq!(stored, Some(1));
+
+        // Second publish persists 2.
+        dht.publish_document(&identity, &document).await.unwrap();
+        assert_eq!(dht.current_sequence(), 2);
+
+        let stored = store.load(&identity.did).await.unwrap();
+        assert_eq!(stored, Some(2));
+    }
+
+    #[tokio::test]
+    async fn initialize_sequence_from_store() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let store = Arc::new(InMemorySequenceStore::new());
+        let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+
+        // Publish 3 times to get sequence to 3.
+        for _ in 0..3 {
+            dht.publish_document(&identity, &document).await.unwrap();
+        }
+        assert_eq!(dht.current_sequence(), 3);
+        assert_eq!(store.load(&identity.did).await.unwrap(), Some(3));
+
+        // Simulate restart: create a new DidDht with same store and DHT.
+        let dht2 = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
+        assert_eq!(dht2.current_sequence(), 0); // Not yet initialized.
+
+        dht2.initialize_sequence(&identity.did).await.unwrap();
+        assert_eq!(dht2.current_sequence(), 3); // Loaded from store.
+
+        // Next publish must be > 3.
+        dht2.publish_document(&identity, &document).await.unwrap();
+        assert_eq!(dht2.current_sequence(), 4);
+        assert_eq!(store.load(&identity.did).await.unwrap(), Some(4));
+    }
+
+    #[tokio::test]
+    async fn initialize_sequence_from_dht_when_no_store() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let store = Arc::new(InMemorySequenceStore::new());
+
+        // First instance: publish with a store.
+        let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+        for _ in 0..5 {
+            dht.publish_document(&identity, &document).await.unwrap();
+        }
+        assert_eq!(dht.current_sequence(), 5);
+
+        // Second instance: fresh store (simulating lost storage), but same DHT.
+        let fresh_store = Arc::new(InMemorySequenceStore::new());
+        let dht2 = make_dht_with_store(&custody, Arc::clone(&dht_client), fresh_store);
+
+        dht2.initialize_sequence(&identity.did).await.unwrap();
+        // Should have recovered seq 5 from the DHT record.
+        assert_eq!(dht2.current_sequence(), 5);
+
+        // Next publish must be > 5.
+        dht2.publish_document(&identity, &document).await.unwrap();
+        assert_eq!(dht2.current_sequence(), 6);
+    }
+
+    #[tokio::test]
+    async fn initialize_sequence_uses_max_of_store_and_dht() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let store = Arc::new(InMemorySequenceStore::new());
+
+        // First instance: publish to get DHT seq to 3.
+        let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+        for _ in 0..3 {
+            dht.publish_document(&identity, &document).await.unwrap();
+        }
+
+        // Manually set the store to a higher value (simulating store ahead of DHT).
+        store.store(&identity.did, 10).await.unwrap();
+
+        let dht2 = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
+        dht2.initialize_sequence(&identity.did).await.unwrap();
+        // max(10, 3) = 10
+        assert_eq!(dht2.current_sequence(), 10);
+
+        // Next publish: 11.
+        dht2.publish_document(&identity, &document).await.unwrap();
+        assert_eq!(dht2.current_sequence(), 11);
+    }
+
+    #[tokio::test]
+    async fn publish_restart_publish_produces_higher_sequence() {
+        // This is the exact acceptance criterion test:
+        // "publish -> restart -> publish again -> second publication has higher sequence"
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let store = Arc::new(InMemorySequenceStore::new());
+
+        // First session: create and publish.
+        let dht1 = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
+        let (identity, document) = dht1.create(&*custody).await.unwrap();
+        dht1.publish_document(&identity, &document).await.unwrap();
+        let seq_before_restart = dht1.current_sequence();
+        assert_eq!(seq_before_restart, 1);
+
+        // Simulate restart: new DidDht, same store + DHT.
+        let dht2 = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
+        dht2.initialize_sequence(&identity.did).await.unwrap();
+
+        // Second session: publish again.
+        dht2.publish_document(&identity, &document).await.unwrap();
+        let seq_after_restart = dht2.current_sequence();
+
+        // The second publication MUST have a strictly higher sequence.
+        assert!(
+            seq_after_restart > seq_before_restart,
+            "sequence after restart ({seq_after_restart}) must be > sequence before restart ({seq_before_restart})"
+        );
+        assert_eq!(seq_after_restart, 2);
+    }
+
+    #[tokio::test]
+    async fn no_store_works_without_persistence() {
+        // Backward compatibility: DidDht without a store still works.
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+        dht.publish_document(&identity, &document).await.unwrap();
+        assert_eq!(dht.current_sequence(), 1);
+        dht.publish_document(&identity, &document).await.unwrap();
+        assert_eq!(dht.current_sequence(), 2);
+    }
+
+    #[tokio::test]
+    async fn initialize_sequence_no_store_no_dht_record() {
+        // New identity, no store, no DHT record: sequence stays at 0.
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let store = Arc::new(InMemorySequenceStore::new());
+        let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
+
+        let (identity, _document) = dht.create(&*custody).await.unwrap();
+        dht.initialize_sequence(&identity.did).await.unwrap();
+        assert_eq!(dht.current_sequence(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Device attestation integration tests (issue #362)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn attach_device_attestation_adds_service_entry() {
+        use scp_platform::testing::InMemoryDeviceAttestation;
+
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+        let attestation = InMemoryDeviceAttestation::new();
+
+        let (_identity, document) = dht.create(&*custody).await.unwrap();
+
+        // Before attaching: no device attestation service entry.
+        assert!(!document.has_device_attestation());
+        assert!(document.device_attestation_token().unwrap().is_none());
+
+        // Attach device attestation.
+        let updated_doc = dht
+            .attach_device_attestation(&document, &attestation)
+            .await
+            .unwrap();
+
+        // After attaching: device attestation service entry present.
+        assert!(updated_doc.has_device_attestation());
+        let token = updated_doc.device_attestation_token().unwrap().unwrap();
+        assert!(
+            token.starts_with(b"scp-test-attestation-v1:"),
+            "token should have synthetic prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn device_attestation_roundtrip_verify() {
+        use scp_platform::testing::InMemoryDeviceAttestation;
+        use scp_platform::traits::DeviceAttestation;
+
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+        let attestation = InMemoryDeviceAttestation::new();
+
+        let (_identity, document) = dht.create(&*custody).await.unwrap();
+
+        // Attach device attestation.
+        let updated_doc = dht
+            .attach_device_attestation(&document, &attestation)
+            .await
+            .unwrap();
+
+        // Extract token from service entry and verify it.
+        let token_bytes = updated_doc.device_attestation_token().unwrap().unwrap();
+        let token = scp_platform::traits::DeviceAttestationToken::new(token_bytes);
+        let verified = attestation.verify(&token).await.unwrap();
+        assert!(verified, "roundtrip token should verify successfully");
+    }
+
+    #[tokio::test]
+    async fn device_attestation_tampered_token_does_not_verify() {
+        use scp_platform::testing::InMemoryDeviceAttestation;
+        use scp_platform::traits::DeviceAttestation;
+
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+        let attestation = InMemoryDeviceAttestation::new();
+
+        let (_identity, document) = dht.create(&*custody).await.unwrap();
+
+        // Attach device attestation.
+        let updated_doc = dht
+            .attach_device_attestation(&document, &attestation)
+            .await
+            .unwrap();
+
+        // Extract and tamper with the token.
+        let mut token_bytes = updated_doc.device_attestation_token().unwrap().unwrap();
+        assert!(!token_bytes.is_empty());
+        // Bitflip the first byte (in the prefix) so the synthetic prefix check
+        // fails. The InMemoryDeviceAttestation verifier checks the prefix, so
+        // corrupting a prefix byte produces a verifiable false result.
+        token_bytes[0] ^= 0xFF;
+
+        let tampered_token = scp_platform::traits::DeviceAttestationToken::new(token_bytes);
+        let result = attestation.verify(&tampered_token).await;
+        // Should return Ok(false) or an error -- never panic.
+        if let Ok(verified) = result {
+            assert!(!verified, "tampered token should not verify");
+        } // Err is acceptable — tampered token may fail to parse
+    }
+
+    #[tokio::test]
+    async fn create_without_device_attestation_has_no_service_entry() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (_identity, document) = dht.create(&*custody).await.unwrap();
+
+        // No device attestation service entry when not explicitly attached.
+        assert!(!document.has_device_attestation());
+        assert!(document.device_attestation_token().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn device_attestation_service_entry_format() {
+        use base64::Engine;
+        use scp_platform::testing::InMemoryDeviceAttestation;
+
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+        let attestation = InMemoryDeviceAttestation::new();
+
+        let (identity, document) = dht.create(&*custody).await.unwrap();
+
+        let updated_doc = dht
+            .attach_device_attestation(&document, &attestation)
+            .await
+            .unwrap();
+
+        // Find the service entry and verify format.
+        let service = updated_doc
+            .service
+            .iter()
+            .find(|s| s.service_type == "ScpDeviceAttestation")
+            .expect("ScpDeviceAttestation service entry should exist");
+
+        assert_eq!(
+            service.id,
+            format!("{}#device-attestation", identity.did),
+            "service ID should use {{did}}#device-attestation format"
+        );
+        assert_eq!(service.service_type, "ScpDeviceAttestation");
+        // Endpoint should be valid base64.
+        assert!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&service.service_endpoint)
+                .is_ok(),
+            "service endpoint should be valid base64"
+        );
+    }
+
+    #[tokio::test]
+    async fn device_attestation_json_roundtrip() {
+        use scp_platform::testing::InMemoryDeviceAttestation;
+
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+        let attestation = InMemoryDeviceAttestation::new();
+
+        let (_identity, document) = dht.create(&*custody).await.unwrap();
+
+        let updated_doc = dht
+            .attach_device_attestation(&document, &attestation)
+            .await
+            .unwrap();
+
+        // Serialize to JSON and back.
+        let json = updated_doc.to_json().unwrap();
+        let parsed = DidDocument::from_json(&json).unwrap();
+
+        assert!(parsed.has_device_attestation());
+        let original_token = updated_doc.device_attestation_token().unwrap().unwrap();
+        let parsed_token = parsed.device_attestation_token().unwrap().unwrap();
+        assert_eq!(original_token, parsed_token);
     }
 }

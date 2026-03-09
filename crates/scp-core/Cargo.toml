@@ -27,6 +27,7 @@ scp-platform = { path = "../scp-platform" }
 scp-identity = { path = "../scp-identity" }
 scp-event-log = { path = "../scp-event-log" }
 async-trait = { workspace = true }
+aes = { workspace = true }
 aes-gcm = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
@@ -76,6 +77,14 @@ required-features = ["testing"]
 
 [[test]]
 name = "participation_event_log"
+required-features = ["testing"]
+
+[[test]]
+name = "governance_integration"
+required-features = ["testing"]
+
+[[test]]
+name = "content_access_integration"
 required-features = ["testing"]
 
 [lints]

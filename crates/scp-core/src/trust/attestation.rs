@@ -100,6 +100,57 @@ pub struct AttestationEvidence {
 }
 
 // ---------------------------------------------------------------------------
+// IdentityLinkClaim
+// ---------------------------------------------------------------------------
+
+/// Typed claim for `AttestationType::IdentityLink` attestations (spec §3.5, §7.4.2).
+///
+/// "Identity link. Issuer attests they control an external platform identity.
+/// Evidence: platform-specific proof (OAuth, signed post, DNS record)."
+///
+/// This struct provides a typed wire format for the identity link claim that
+/// would otherwise be an untyped `serde_json::Value` in [`Attestation::claim`].
+/// An `IdentityLinkClaim` can be serialized to/from JSON for use in the
+/// `claim` field of an [`Attestation`] with
+/// `attestation_type: AttestationType::IdentityLink`.
+///
+/// See spec §3.5 (Identity Attestations) and §7.4.2 (Attestation Types).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityLinkClaim {
+    /// The external platform name (e.g., `"x"`, `"github"`, `"google"`).
+    pub platform: String,
+    /// The user's handle or identifier on the external platform.
+    pub platform_handle: String,
+    /// The verification method used to prove ownership of the external
+    /// identity (e.g., `"oauth"`, `"signed-post"`, `"dns-record"`).
+    pub verification_method: String,
+    /// URL or reference to the verification proof, if publicly accessible
+    /// (e.g., a signed post URL, DNS TXT record location).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_url: Option<String>,
+}
+
+impl IdentityLinkClaim {
+    /// Serialize this claim to a `serde_json::Value` for use in [`Attestation::claim`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails (should not happen for this type).
+    pub fn to_claim_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(self)
+    }
+
+    /// Deserialize an `IdentityLinkClaim` from the `claim` field of an [`Attestation`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the JSON value does not match the expected structure.
+    pub fn from_claim_value(value: &serde_json::Value) -> Result<Self, serde_json::Error> {
+        serde_json::from_value(value.clone())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RevocationStatus
 // ---------------------------------------------------------------------------
 
@@ -269,6 +320,63 @@ pub trait DidPublicKeyResolver {
     ///
     /// Returns [`TrustError`] if the DID cannot be resolved.
     fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError>;
+}
+
+// ---------------------------------------------------------------------------
+// IdentityDidPublicKeyResolver — production implementation
+// ---------------------------------------------------------------------------
+
+/// Production [`DidPublicKeyResolver`] that resolves public keys from DID
+/// strings using `scp-identity`.
+///
+/// For `did:dht:z...` DIDs, extracts the Ed25519 public key embedded in the
+/// DID string itself (the identity key, verification method `#0`).
+///
+/// For `did:key:` DIDs (only accepted when `scp-core/testing` feature is
+/// enabled), decodes the hex-encoded key.
+///
+/// This resolver does NOT perform full DID document resolution (DHT lookup,
+/// relay query, cache check). It extracts the identity key directly from the
+/// DID string, which is sufficient for attestation signature verification
+/// because the identity key (`#0`) is the canonical signing key for
+/// attestations per ADR-017.
+///
+/// For use cases that require resolving the active signing key (`#active`) or
+/// agent key (`#agent`), callers should use the full DID resolution pipeline
+/// in `scp-identity` directly.
+pub struct IdentityDidPublicKeyResolver;
+
+impl DidPublicKeyResolver for IdentityDidPublicKeyResolver {
+    fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
+        // did:dht:z... — extract the 32-byte Ed25519 public key from the
+        // z-base-32-encoded suffix.
+        if did.starts_with("did:dht:z") {
+            let key = scp_identity::extract_public_key(did).map_err(|e| {
+                TrustError::AttestationSignatureInvalid {
+                    attestation_id: String::new(),
+                    reason: format!("failed to extract public key from DID {did}: {e}"),
+                }
+            })?;
+            return Ok(key.to_vec());
+        }
+
+        // did:key:{hex} — testing format only (see issue #128).
+        #[cfg(any(test, feature = "testing"))]
+        if did.starts_with("did:key:") {
+            let hex_str = did.strip_prefix("did:key:").unwrap_or_default();
+            let key_bytes =
+                hex::decode(hex_str).map_err(|e| TrustError::AttestationSignatureInvalid {
+                    attestation_id: String::new(),
+                    reason: format!("failed to decode did:key hex for {did}: {e}"),
+                })?;
+            return Ok(key_bytes);
+        }
+
+        Err(TrustError::AttestationSignatureInvalid {
+            attestation_id: String::new(),
+            reason: format!("unsupported DID method for public key resolution: {did}"),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1434,5 +1542,58 @@ mod tests {
             bytes_a, bytes_b,
             "shifting bytes between id and issuer must produce different canonical bytes"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // IdentityDidPublicKeyResolver tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolver_did_key_hex_valid() {
+        let resolver = IdentityDidPublicKeyResolver;
+        let key_hex = "a".repeat(64); // 32 bytes
+        let did = format!("did:key:{key_hex}");
+        let result = resolver.resolve_public_key(&did);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 32);
+    }
+
+    #[test]
+    fn resolver_did_key_invalid_hex() {
+        let resolver = IdentityDidPublicKeyResolver;
+        let result = resolver.resolve_public_key("did:key:not-valid-hex!");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err}").contains("did:key"),
+            "error should mention did:key: {err}"
+        );
+    }
+
+    #[test]
+    fn resolver_unsupported_method() {
+        let resolver = IdentityDidPublicKeyResolver;
+        let result = resolver.resolve_public_key("did:web:example.com");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err}").contains("unsupported"),
+            "error should mention unsupported: {err}"
+        );
+    }
+
+    #[test]
+    fn resolver_empty_string() {
+        let resolver = IdentityDidPublicKeyResolver;
+        let result = resolver.resolve_public_key("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolver_did_dht_malformed() {
+        let resolver = IdentityDidPublicKeyResolver;
+        // Valid prefix but garbage z-base-32
+        let result = resolver.resolve_public_key("did:dht:z!@#$%^&*");
+        assert!(result.is_err());
     }
 }

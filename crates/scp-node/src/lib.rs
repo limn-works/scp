@@ -9,6 +9,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bridge_auth;
+pub mod bridge_handlers;
 pub mod dev_api;
 pub(crate) mod error;
 pub mod http;
@@ -468,7 +470,7 @@ impl<S: Storage> ApplicationNode<S> {
     /// governance ban.
     ///
     /// After [`ContextManager::execute_governance_action`] returns
-    /// [`GovernanceActionResult::SubscriberBanned`], call this method with
+    /// [`GovernanceActionResult::ReadAccessRevoked`], call this method with
     /// the `context_id` and the [`GovernanceBanResult`] to ensure the
     /// projection endpoint can decrypt content encrypted under the new
     /// post-rotation keys.
@@ -874,6 +876,33 @@ pub trait TlsProvider: Send + Sync {
                 + '_,
         >,
     >;
+
+    /// Returns the shared ACME challenge map (token → key authorization).
+    ///
+    /// The default implementation returns a **new empty map on every call**,
+    /// which is correct for mock providers and `SelfSignedTlsProvider` that
+    /// never serve HTTP-01 challenges.
+    ///
+    /// # Important
+    ///
+    /// Implementors that override [`needs_challenge_listener()`](Self::needs_challenge_listener)
+    /// to return `true` **MUST** also override this method to return a
+    /// persistent, shared map. Failing to do so means the challenge listener
+    /// and the provisioning flow will operate on different maps, and ACME
+    /// validation will never succeed.
+    fn challenges(&self) -> Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>> {
+        Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()))
+    }
+
+    /// Whether this provider requires an HTTP-01 challenge listener.
+    ///
+    /// Returns `true` for real ACME providers that need the CA to probe
+    /// `GET /.well-known/acme-challenge/{token}` on port 80 during
+    /// provisioning. Returns `false` for mock providers and self-signed
+    /// certificate generators. Default: `false`.
+    fn needs_challenge_listener(&self) -> bool {
+        false
+    }
 }
 
 /// Blanket [`TlsProvider`] for [`AcmeProvider`](tls::AcmeProvider).
@@ -888,6 +917,14 @@ impl<S: Storage + 'static> TlsProvider for tls::AcmeProvider<S> {
         >,
     > {
         Box::pin(self.load_or_provision())
+    }
+
+    fn challenges(&self) -> Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>> {
+        self.challenges()
+    }
+
+    fn needs_challenge_listener(&self) -> bool {
+        true
     }
 }
 
@@ -1629,7 +1666,7 @@ impl<S: Storage + 'static, Dom>
     }
 }
 
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'static>
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
     ApplicationNodeBuilder<K, D, S, HasDomain, HasIdentity>
 {
     /// Builds the [`ApplicationNode`].
@@ -1652,15 +1689,19 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
     ///
     /// # Errors
     ///
+    /// Returns [`NodeError::MissingField`] if `.storage()` was not called.
     /// Returns [`NodeError::Identity`] if identity creation or DID
     /// publication fails. Returns [`NodeError::Relay`] if the relay server
     /// fails to start.
+    #[allow(clippy::too_many_lines)] // builder with many config steps
     pub async fn build(self) -> Result<ApplicationNode<S>, NodeError> {
         let domain = self.domain.ok_or(NodeError::MissingField("domain"))?;
         let identity_source = self
             .identity_source
             .ok_or(NodeError::MissingField("identity"))?;
-        let protocol_store = Arc::new(ProtocolStore::new(self.storage.unwrap_or_default()));
+        let protocol_store = Arc::new(ProtocolStore::new(
+            self.storage.ok_or(NodeError::MissingField("storage"))?,
+        ));
 
         let (identity, document, did_method) = resolve_identity(identity_source).await?;
         let bridge_secret = generate_bridge_secret();
@@ -1678,6 +1719,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
                 .ok_or(NodeError::MissingField("blob_storage"))?,
         );
         let relay_server = RelayServer::new(relay_config.clone(), Arc::clone(&blob_storage));
+        let connection_tracker = relay_server.connection_tracker();
+        let subscription_registry = relay_server.subscriptions();
         let (shutdown_handle, bound_addr) = relay_server.start().await?;
         let dev_token = self.local_api_addr.map(generate_dev_token);
         let http_bind_addr = self.http_bind_addr.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
@@ -1688,7 +1731,14 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
             &protocol_store,
             self.acme_email.as_ref(),
         );
-        match tls_provider.provision().await {
+
+        let (provision_result, acme_challenges) =
+            provision_with_challenge_listener(&*tls_provider).await?;
+        let rate_limit = self
+            .projection_rate_limit
+            .unwrap_or(DEFAULT_PROJECTION_RATE_LIMIT);
+
+        match provision_result {
             Ok(cert_data) => {
                 build_domain_inner(
                     domain,
@@ -1705,9 +1755,11 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
                     relay_config,
                     http_bind_addr,
                     self.cors_origins.clone(),
-                    self.projection_rate_limit
-                        .unwrap_or(DEFAULT_PROJECTION_RATE_LIMIT),
+                    rate_limit,
                     cert_data,
+                    connection_tracker.clone(),
+                    subscription_registry.clone(),
+                    acme_challenges,
                     #[cfg(feature = "http3")]
                     self.http3_config,
                 )
@@ -1740,9 +1792,10 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
                     relay_config,
                     Some(http_bind_addr),
                     self.cors_origins,
-                    self.projection_rate_limit
-                        .unwrap_or(DEFAULT_PROJECTION_RATE_LIMIT),
+                    rate_limit,
                     self.network_detector,
+                    connection_tracker,
+                    subscription_registry,
                 )
                 .await
             }
@@ -1825,6 +1878,114 @@ fn resolve_tls<S: Storage + 'static>(
 }
 
 // ---------------------------------------------------------------------------
+// ACME challenge listener (§18.6.3, issue #305)
+// ---------------------------------------------------------------------------
+
+/// Temporary ACME challenge listener handle.
+///
+/// Wraps the tokio task and cancellation token for the temporary HTTP-only
+/// listener that serves `GET /.well-known/acme-challenge/{token}` during
+/// ACME provisioning. Call [`stop`](Self::stop) to shut down the listener
+/// after provisioning completes.
+struct AcmeChallengeListener {
+    /// Cancellation token to signal shutdown.
+    shutdown: CancellationToken,
+    /// Handle to the spawned listener task.
+    task: tokio::task::JoinHandle<Result<(), NodeError>>,
+}
+
+impl AcmeChallengeListener {
+    /// Stop the temporary listener and wait for it to drain.
+    async fn stop(self) {
+        self.shutdown.cancel();
+        let _ = self.task.await;
+        tracing::info!("temporary ACME HTTP-01 challenge listener stopped");
+    }
+}
+
+/// Starts a temporary HTTP-only listener on port 80 to serve ACME HTTP-01
+/// challenges during certificate provisioning (issue #305, spec §18.6.3).
+///
+/// The listener serves only `GET /.well-known/acme-challenge/{token}` from
+/// the provided challenge map. It must be started BEFORE calling
+/// `provision()` so the ACME CA has an endpoint to probe.
+///
+/// # Errors
+///
+/// Returns [`NodeError::Serve`] if the listener cannot bind to port 80.
+async fn start_acme_challenge_listener(
+    challenges: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
+) -> Result<AcmeChallengeListener, NodeError> {
+    let router = tls::acme_challenge_router(challenges);
+    let shutdown = CancellationToken::new();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:80")
+        .await
+        .map_err(|e| {
+            NodeError::Serve(format!(
+                "failed to bind temporary ACME challenge listener on port 80: {e}"
+            ))
+        })?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|e| NodeError::Serve(e.to_string()))?;
+    tracing::info!(
+        addr = %local_addr,
+        "temporary ACME HTTP-01 challenge listener started"
+    );
+    let shutdown_clone = shutdown.clone();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown_clone.cancelled_owned())
+            .await
+            .map_err(|e| NodeError::Serve(format!("ACME challenge listener error: {e}")))
+    });
+    Ok(AcmeChallengeListener { shutdown, task })
+}
+
+/// Runs TLS provisioning with an optional temporary ACME challenge listener.
+///
+/// For real ACME providers (`needs_challenge_listener() == true`), starts
+/// a temporary HTTP-only listener on port 80, calls `provision()`, then
+/// shuts the listener down. For mock providers, calls `provision()` directly.
+///
+/// Returns the provisioning result and an optional shared challenge map
+/// (for mounting in `serve()` to support ACME renewal).
+///
+/// # Errors
+///
+/// Returns [`NodeError::Serve`] if the ACME listener cannot bind.
+async fn provision_with_challenge_listener(
+    provider: &dyn TlsProvider,
+) -> Result<
+    (
+        Result<tls::CertificateData, tls::TlsError>,
+        Option<Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>>,
+    ),
+    NodeError,
+> {
+    let challenges = provider.challenges();
+    let acme_listener = if provider.needs_challenge_listener() {
+        Some(start_acme_challenge_listener(Arc::clone(&challenges)).await?)
+    } else {
+        None
+    };
+
+    let result = provider.provision().await;
+
+    if let Some(listener) = acme_listener {
+        listener.stop().await;
+    }
+
+    let acme_challenges = if provider.needs_challenge_listener() {
+        Some(challenges)
+    } else {
+        None
+    };
+
+    Ok((result, acme_challenges))
+}
+
+// ---------------------------------------------------------------------------
 // NAT strategy resolution (§10.12.8 step 5)
 // ---------------------------------------------------------------------------
 
@@ -1871,6 +2032,9 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     cors_origins: Option<Vec<String>>,
     projection_rate_limit: u32,
     cert_data: tls::CertificateData,
+    connection_tracker: scp_transport::relay::rate_limit::ConnectionTracker,
+    subscription_registry: scp_transport::relay::subscription::SubscriptionRegistry,
+    acme_challenges: Option<Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>>,
     #[cfg(feature = "http3")] http3_config: Option<scp_transport::http3::Http3Config>,
 ) -> Result<ApplicationNode<S>, NodeError> {
     let relay_url = format!("wss://{domain}/scp/v1");
@@ -1909,6 +2073,11 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         ),
         tls_config: Some(Arc::new(tls_server_config)),
         cert_resolver: Some(cert_resolver),
+        did_document: document.clone(),
+        connection_tracker,
+        subscription_registry,
+        acme_challenges,
+        bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
     });
 
     Ok(ApplicationNode {
@@ -1950,6 +2119,8 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     cors_origins: Option<Vec<String>>,
     projection_rate_limit: u32,
     network_detector: Option<Arc<dyn NetworkChangeDetector>>,
+    connection_tracker: scp_transport::relay::rate_limit::ConnectionTracker,
+    subscription_registry: scp_transport::relay::subscription::SubscriptionRegistry,
 ) -> Result<ApplicationNode<S>, NodeError> {
     let tier = nat_strategy.select_tier(bound_addr.port()).await?;
 
@@ -2031,6 +2202,11 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         ),
         tls_config: None,
         cert_resolver: None,
+        did_document: document.clone(),
+        connection_tracker,
+        subscription_registry,
+        acme_challenges: None,
+        bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
     });
 
     // Do NOT serve .well-known/scp — no domain to serve from (§10.12.8).
@@ -2055,7 +2231,7 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
 // Build for HasNoDomain — zero-config NAT-traversed mode (§10.12.8)
 // ---------------------------------------------------------------------------
 
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'static>
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
     ApplicationNodeBuilder<K, D, S, HasNoDomain, HasIdentity>
 {
     /// Builds the [`ApplicationNode`] in zero-config no-domain mode (§10.12.8).
@@ -2076,6 +2252,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
     ///
     /// # Errors
     ///
+    /// Returns [`NodeError::MissingField`] if `.storage()` was not called.
     /// Returns [`NodeError::Nat`] if all reachability tiers fail.
     /// Returns [`NodeError::Identity`] if identity creation or DID
     /// publication fails. Returns [`NodeError::Relay`] if the relay server
@@ -2085,7 +2262,9 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
             .identity_source
             .ok_or(NodeError::MissingField("identity"))?;
 
-        let protocol_store = Arc::new(ProtocolStore::new(self.storage.unwrap_or_default()));
+        let protocol_store = Arc::new(ProtocolStore::new(
+            self.storage.ok_or(NodeError::MissingField("storage"))?,
+        ));
         let (identity, document, did_method) = resolve_identity(identity_source).await?;
 
         // 3. Start relay server.
@@ -2104,6 +2283,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
                 .ok_or(NodeError::MissingField("blob_storage"))?,
         );
         let relay_server = RelayServer::new(relay_config.clone(), Arc::clone(&blob_storage));
+        let connection_tracker = relay_server.connection_tracker();
+        let subscription_registry = relay_server.subscriptions();
         let (shutdown_handle, bound_addr) = relay_server.start().await?;
 
         // 4. Generate dev API token if local_api was configured.
@@ -2136,6 +2317,8 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + Default + 'st
             self.projection_rate_limit
                 .unwrap_or(DEFAULT_PROJECTION_RATE_LIMIT),
             self.network_detector,
+            connection_tracker,
+            subscription_registry,
         )
         .await
     }
@@ -2526,6 +2709,7 @@ mod tests {
         let did_method = Arc::new(make_test_dht(&custody));
 
         let node = ApplicationNodeBuilder::new()
+            .storage(InMemoryStorage::new())
             .domain("explicit.example.com")
             .tls_provider(Arc::new(SucceedingTlsProvider {
                 domain: "explicit.example.com".to_owned(),
@@ -2607,6 +2791,7 @@ mod tests {
         });
 
         let _node = ApplicationNodeBuilder::new()
+            .storage(InMemoryStorage::new())
             .domain("counting.example.com")
             .tls_provider(Arc::new(SucceedingTlsProvider {
                 domain: "counting.example.com".to_owned(),
@@ -2754,6 +2939,7 @@ mod tests {
         });
 
         let _node = ApplicationNodeBuilder::new()
+            .storage(InMemoryStorage::new())
             .domain("relay-order.example.com")
             .tls_provider(Arc::new(SucceedingTlsProvider {
                 domain: "relay-order.example.com".to_owned(),

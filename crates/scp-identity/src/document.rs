@@ -170,11 +170,30 @@ const ED25519_VERIFICATION_KEY_TYPE: &str = "Ed25519VerificationKey2020";
 /// The service type string for `SCPRelay` entries (§18.2.1).
 const SCP_RELAY_SERVICE_TYPE: &str = "SCPRelay";
 
+/// The service type string for `SCPBroadcastContext` entries (§18.2.2).
+///
+/// Broadcast contexts with `discoverable: true` publish a service entry of
+/// this type in the creator's DID document. The service endpoint encodes
+/// the context ID and relay URLs:
+///
+///   `scp:context:<context_id_hex>?relay=<url1>&relay=<url2>`
+const SCP_BROADCAST_CONTEXT_SERVICE_TYPE: &str = "SCPBroadcastContext";
+
 /// The required URL scheme for `SCPRelay` entries.
 const SCP_RELAY_SCHEME: &str = "wss://";
 
 /// The required path suffix for `SCPRelay` entries.
 const SCP_RELAY_PATH: &str = "/scp/v1";
+
+/// The service type string for `ScpDeviceAttestation` entries (§9.3).
+///
+/// Device attestation tokens (Apple App Attest, Android Play Integrity) are
+/// stored as DID document service entries. The protocol carries the proofs;
+/// contexts interpret them. See issue #362.
+const DEVICE_ATTESTATION_SERVICE_TYPE: &str = "ScpDeviceAttestation";
+
+/// The fragment identifier for device attestation service entries.
+const DEVICE_ATTESTATION_FRAGMENT: &str = "device-attestation";
 
 /// Maximum number of retired agent keys to retain in a DID document.
 ///
@@ -415,6 +434,119 @@ impl DidDocument {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // SCPBroadcastContext service entries (§18.2.2, §5.14.11)
+    // -----------------------------------------------------------------------
+
+    /// Adds an `SCPBroadcastContext` service entry for a discoverable broadcast
+    /// context.
+    ///
+    /// The service endpoint encodes the context ID and relay URLs:
+    ///
+    ///   `scp:context:<context_id_hex>?relay=<url1>&relay=<url2>`
+    ///
+    /// If a service entry for this `context_id` already exists, this method is
+    /// a no-op (duplicate prevention).
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` -- Hex-encoded context identifier.
+    /// * `relay_urls` -- Relay URLs where the context is reachable.
+    pub fn add_broadcast_context_service(&mut self, context_id: &str, relay_urls: &[String]) {
+        use std::fmt::Write as _;
+
+        // Duplicate check: skip if context_id already has a service entry.
+        let already_exists = self.service.iter().any(|s| {
+            s.service_type == SCP_BROADCAST_CONTEXT_SERVICE_TYPE
+                && s.service_endpoint
+                    .contains(&format!("scp:context:{context_id}"))
+        });
+        if already_exists {
+            return;
+        }
+
+        // Build endpoint: scp:context:<id>?relay=<url1>&relay=<url2>
+        let mut endpoint = format!("scp:context:{context_id}");
+        for (i, url) in relay_urls.iter().enumerate() {
+            let separator = if i == 0 { '?' } else { '&' };
+            let encoded = url.replace(':', "%3A").replace('/', "%2F");
+            let _ = write!(endpoint, "{separator}relay={encoded}");
+        }
+
+        let bc_count = self
+            .service
+            .iter()
+            .filter(|s| s.service_type == SCP_BROADCAST_CONTEXT_SERVICE_TYPE)
+            .count();
+
+        let service = Service {
+            id: format!("{}#scp-broadcast-ctx-{}", self.id, bc_count + 1),
+            service_type: SCP_BROADCAST_CONTEXT_SERVICE_TYPE.to_owned(),
+            service_endpoint: endpoint,
+        };
+
+        self.service.push(service);
+    }
+
+    /// Removes the `SCPBroadcastContext` service entry for the given context ID.
+    ///
+    /// Returns `true` if an entry was removed, `false` if no matching entry
+    /// existed.
+    pub fn remove_broadcast_context_service(&mut self, context_id: &str) -> bool {
+        let needle = format!("scp:context:{context_id}");
+        let before = self.service.len();
+        self.service.retain(|s| {
+            !(s.service_type == SCP_BROADCAST_CONTEXT_SERVICE_TYPE
+                && s.service_endpoint.contains(&needle))
+        });
+        self.service.len() < before
+    }
+
+    /// Returns all `SCPBroadcastContext` entries as `(context_id, relay_urls)` pairs.
+    ///
+    /// Parses each `SCPBroadcastContext` service endpoint to extract the context
+    /// ID and relay URLs. Entries with malformed endpoints are silently skipped.
+    #[must_use]
+    pub fn broadcast_context_entries(&self) -> Vec<(String, Vec<String>)> {
+        self.service
+            .iter()
+            .filter(|s| s.service_type == SCP_BROADCAST_CONTEXT_SERVICE_TYPE)
+            .filter_map(|s| parse_broadcast_context_endpoint(&s.service_endpoint))
+            .collect()
+    }
+
+    // Device attestation service (§9.3, #362)
+    // -----------------------------------------------------------------------
+
+    /// Adds a `ScpDeviceAttestation` service entry containing the attestation
+    /// token bytes encoded as hex.
+    ///
+    /// If a `ScpDeviceAttestation` service entry already exists, it is replaced.
+    /// The service entry ID uses the format `{did}#device-attestation`.
+    ///
+    /// See §9.3 and issue #362.
+    pub fn add_device_attestation(&mut self, token_bytes: &[u8]) {
+        // Remove any existing device attestation entry.
+        self.service
+            .retain(|s| s.service_type != DEVICE_ATTESTATION_SERVICE_TYPE);
+
+        let service = Service {
+            id: format!("{}#{DEVICE_ATTESTATION_FRAGMENT}", self.id),
+            service_type: DEVICE_ATTESTATION_SERVICE_TYPE.to_owned(),
+            service_endpoint: {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.encode(token_bytes)
+            },
+        };
+        self.service.push(service);
+    }
+
+    /// Removes the `ScpDeviceAttestation` service entry, if present.
+    pub fn remove_device_attestation(&mut self) {
+        self.service
+            .retain(|s| s.service_type != DEVICE_ATTESTATION_SERVICE_TYPE);
+    }
+
     /// Returns the key custody attestation from this DID document, if present.
     ///
     /// Searches the service entries for one with type `ScpKeyCustodyAttestation`
@@ -461,6 +593,81 @@ impl DidDocument {
         let service = attestation.to_service_entry(&self.id)?;
         self.service.push(service);
         Ok(())
+    }
+
+    /// Returns the device attestation token from this DID document, if present.
+    ///
+    /// Searches the service entries for one with type `ScpDeviceAttestation`
+    /// and returns the raw attestation token bytes decoded from the base64
+    /// service endpoint. Returns `None` if no device attestation service entry
+    /// exists.
+    ///
+    /// Device attestation is a self-asserted Sybil resistance signal (§9.3).
+    /// Contexts MAY require device attestation for admission via `ContextParams`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::DocumentDeserializationError`] if a device
+    /// attestation service entry exists but the endpoint cannot be base64-decoded.
+    pub fn device_attestation_token(&self) -> Result<Option<Vec<u8>>, IdentityError> {
+        use base64::Engine;
+
+        let entry = self
+            .service
+            .iter()
+            .find(|s| s.service_type == DEVICE_ATTESTATION_SERVICE_TYPE);
+
+        match entry {
+            None => Ok(None),
+            Some(service) => {
+                let token_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&service.service_endpoint)
+                    .map_err(|e| {
+                        IdentityError::DocumentDeserializationError(format!(
+                            "failed to decode device attestation token from base64: {e}"
+                        ))
+                    })?;
+                Ok(Some(token_bytes))
+            }
+        }
+    }
+
+    /// Sets or replaces the device attestation token in this DID document.
+    ///
+    /// Adds a service entry with type `ScpDeviceAttestation` containing the
+    /// attestation token bytes encoded as base64 in the `serviceEndpoint`.
+    /// If an existing device attestation entry exists, it is replaced. Other
+    /// service entries are preserved.
+    ///
+    /// The token is produced by [`DeviceAttestation::attest()`] from the
+    /// `scp-platform` crate. The protocol does not prescribe interpretation --
+    /// contexts MAY require device attestation for admission (§9.3).
+    ///
+    /// # Arguments
+    ///
+    /// * `token` - Raw attestation token bytes from a `DeviceAttestation` implementation.
+    pub fn set_device_attestation_token(&mut self, token: &[u8]) {
+        use base64::Engine;
+
+        // Remove any existing device attestation entry.
+        self.service
+            .retain(|s| s.service_type != DEVICE_ATTESTATION_SERVICE_TYPE);
+
+        let endpoint = base64::engine::general_purpose::STANDARD.encode(token);
+        let service = Service {
+            id: format!("{}#device-attestation", self.id),
+            service_type: DEVICE_ATTESTATION_SERVICE_TYPE.to_owned(),
+            service_endpoint: endpoint,
+        };
+        self.service.push(service);
+    }
+
+    /// Returns `true` if this DID document contains a device attestation service entry.
+    #[must_use]
+    pub fn has_device_attestation(&self) -> bool {
+        self.service
+            .iter()
+            .any(|s| s.service_type == DEVICE_ATTESTATION_SERVICE_TYPE)
     }
 
     /// Retires the current active signing key and installs a new one.
@@ -802,6 +1009,38 @@ fn multibase_encode(bytes: &[u8]) -> String {
 /// Base58btc encoding (Bitcoin alphabet) via the `bs58` crate.
 fn base58btc_encode(input: &[u8]) -> String {
     bs58::encode(input).into_string()
+}
+
+/// Parses an `SCPBroadcastContext` service endpoint string into
+/// `(context_id, relay_urls)`.
+///
+/// Expected format: `scp:context:<context_id>?relay=<url1>&relay=<url2>`
+///
+/// Returns `None` if the format is invalid.
+fn parse_broadcast_context_endpoint(endpoint: &str) -> Option<(String, Vec<String>)> {
+    let rest = endpoint.strip_prefix("scp:context:")?;
+
+    // Split on '?' to separate context_id from query parameters.
+    let (context_id, query) = match rest.split_once('?') {
+        Some((id, q)) => (id, q),
+        None => (rest, ""),
+    };
+
+    if context_id.is_empty() {
+        return None;
+    }
+
+    let mut relay_urls = Vec::new();
+    if !query.is_empty() {
+        for param in query.split('&') {
+            if let Some(value) = param.strip_prefix("relay=") {
+                let decoded = value.replace("%3A", ":").replace("%2F", "/");
+                relay_urls.push(decoded);
+            }
+        }
+    }
+
+    Some((context_id.to_owned(), relay_urls))
 }
 
 #[cfg(test)]
@@ -1725,5 +1964,107 @@ mod tests {
 
         let retrieved = parsed.custody_attestation().unwrap().unwrap();
         assert_eq!(retrieved, attestation);
+    }
+
+    // -----------------------------------------------------------------------
+    // Device attestation service entry tests (#362)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn add_device_attestation_creates_service_entry() {
+        let did = "did:dht:zDevAttest1";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        assert!(doc.device_attestation_token().unwrap().is_none());
+
+        doc.add_device_attestation(&[0xCA, 0xFE, 0xBA, 0xBE]);
+
+        let svc = doc
+            .service
+            .iter()
+            .find(|s| s.service_type == "ScpDeviceAttestation")
+            .expect("service entry should exist");
+        assert_eq!(svc.id, format!("{did}#device-attestation"));
+        assert_eq!(svc.service_type, "ScpDeviceAttestation");
+    }
+
+    #[test]
+    fn device_attestation_token_roundtrip() {
+        let did = "did:dht:zDevAttest2";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        let token = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03];
+
+        doc.add_device_attestation(&token);
+        let retrieved = doc.device_attestation_token().unwrap().unwrap();
+        assert_eq!(retrieved, token);
+    }
+
+    #[test]
+    fn device_attestation_absent_returns_none() {
+        let did = "did:dht:zDevAttest3";
+        let doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        assert!(doc.device_attestation_token().unwrap().is_none());
+    }
+
+    #[test]
+    fn device_attestation_survives_json_roundtrip() {
+        let did = "did:dht:zDevAttest4";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        let token = vec![0x01, 0x02, 0x03, 0x04, 0x05];
+
+        doc.add_device_attestation(&token);
+        let json = doc.to_json().unwrap();
+        let parsed = DidDocument::from_json(&json).unwrap();
+
+        let retrieved = parsed.device_attestation_token().unwrap().unwrap();
+        assert_eq!(retrieved, token);
+    }
+
+    #[test]
+    fn add_device_attestation_replaces_existing() {
+        let did = "did:dht:zDevAttest5";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        doc.add_device_attestation(&[0x01]);
+        doc.add_device_attestation(&[0x02]);
+
+        let count = doc
+            .service
+            .iter()
+            .filter(|s| s.service_type == "ScpDeviceAttestation")
+            .count();
+        assert_eq!(count, 1, "should have exactly one device attestation entry");
+
+        let retrieved = doc.device_attestation_token().unwrap().unwrap();
+        assert_eq!(retrieved, vec![0x02]);
+    }
+
+    #[test]
+    fn remove_device_attestation_clears_entry() {
+        let did = "did:dht:zDevAttest6";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        doc.add_device_attestation(&[0x01, 0x02]);
+        assert!(doc.device_attestation_token().unwrap().is_some());
+
+        doc.remove_device_attestation();
+        assert!(doc.device_attestation_token().unwrap().is_none());
+    }
+
+    #[test]
+    fn device_attestation_tampered_token_decode_fails() {
+        let did = "did:dht:zDevAttest7";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        doc.add_device_attestation(&[0x01]);
+
+        // Tamper with the service endpoint to have invalid base64.
+        let svc = doc
+            .service
+            .iter_mut()
+            .find(|s| s.service_type == "ScpDeviceAttestation")
+            .unwrap();
+        svc.service_endpoint = "!!!not-valid-base64!!!".to_owned();
+
+        let result = doc.device_attestation_token();
+        assert!(result.is_err());
     }
 }

@@ -129,7 +129,7 @@ pub enum ClientMessage {
     Publish {
         /// Client-assigned request ID, echoed in the relay response.
         /// Maximum 64 bytes.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
         ref_id: Option<String>,
 
         /// Per-context pseudonym for routing (32 bytes).
@@ -149,7 +149,8 @@ pub enum ClientMessage {
         blob_ttl: u32,
 
         /// The opaque blob content. 1--262144 bytes (256 KB).
-        #[serde(with = "serde_bytes")]
+        /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
+        #[serde(with = "scp_core::serde_util::serde_bounded_bytes")]
         blob: Vec<u8>,
     },
 
@@ -161,7 +162,7 @@ pub enum ClientMessage {
     #[serde(rename = "SUBSCRIBE")]
     Subscribe {
         /// Client-assigned request ID.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
         ref_id: Option<String>,
 
         /// Per-context pseudonym to subscribe to (32 bytes).
@@ -177,7 +178,7 @@ pub enum ClientMessage {
     #[serde(rename = "UNSUBSCRIBE")]
     Unsubscribe {
         /// Client-assigned request ID.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
         ref_id: Option<String>,
 
         /// Per-context pseudonym to unsubscribe from (32 bytes).
@@ -192,7 +193,7 @@ pub enum ClientMessage {
     #[serde(rename = "QUERY")]
     Query {
         /// Client-assigned request ID.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
         ref_id: Option<String>,
 
         /// Per-context pseudonym to query (32 bytes).
@@ -214,7 +215,7 @@ pub enum ClientMessage {
     #[serde(rename = "DELETE")]
     Delete {
         /// Client-assigned request ID.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
         ref_id: Option<String>,
 
         /// SHA-256 hash identifying the blob (32 bytes).
@@ -262,7 +263,7 @@ pub enum ClientMessage {
     #[serde(rename = "BRIDGE_REGISTER")]
     BridgeRegister {
         /// Client-assigned request ID.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
         ref_id: Option<String>,
 
         /// The routing ID to register for bridge proxying (32 bytes).
@@ -299,7 +300,7 @@ pub enum ClientMessage {
     #[serde(rename = "BRIDGE_DATA")]
     BridgeData {
         /// Client-assigned request ID.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
         ref_id: Option<String>,
 
         /// The routing ID of the target self-hosted relay (32 bytes).
@@ -307,7 +308,8 @@ pub enum ClientMessage {
         target_routing_id: [u8; 32],
 
         /// Opaque payload to forward. The bridge does NOT inspect this.
-        #[serde(with = "serde_bytes")]
+        /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
+        #[serde(with = "scp_core::serde_util::serde_bounded_bytes")]
         payload: Vec<u8>,
     },
 }
@@ -431,7 +433,7 @@ pub enum RelayMessage {
     #[serde(rename = "OK")]
     Ok {
         /// Echoed client request ID.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
         ref_id: Option<String>,
 
         /// Blob identifier (present only for PUBLISH responses).
@@ -452,7 +454,7 @@ pub enum RelayMessage {
     #[serde(rename = "ERR")]
     Err {
         /// Echoed client request ID.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
         ref_id: Option<String>,
 
         /// Numeric error code (4xxx = client, 5xxx = server).
@@ -490,7 +492,8 @@ pub enum RelayMessage {
         stored_at: u64,
 
         /// The opaque blob content.
-        #[serde(with = "serde_bytes")]
+        /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
+        #[serde(with = "scp_core::serde_util::serde_bounded_bytes")]
         blob: Vec<u8>,
     },
 
@@ -504,11 +507,12 @@ pub enum RelayMessage {
     #[serde(rename = "EVENT")]
     Event {
         /// Echoed client request ID.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
         ref_id: Option<String>,
 
         /// Event type identifier (e.g., `"backfill_complete"`,
         /// `"query_complete"`).
+        #[serde(rename = "type")]
         event_type: String,
     },
 
@@ -1458,5 +1462,192 @@ mod tests {
 
         let result = RelayMessage::from_bytes(&[]);
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Wire format field name compliance (ADR-004)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn client_publish_wire_field_ref_not_ref_id() {
+        // ADR-004 specifies the wire field name is "ref", not "ref_id".
+        let msg = ClientMessage::Publish {
+            ref_id: Some("test-ref".to_string()),
+            routing_id: [0xAA; 32],
+            recipient_hint: None,
+            blob_ttl: 60,
+            blob: vec![0x01],
+        };
+        let bytes = msg.to_bytes().unwrap();
+        let map: std::collections::BTreeMap<String, rmpv::Value> =
+            rmp_serde::from_slice(&bytes).unwrap();
+
+        assert!(
+            map.contains_key("ref"),
+            "wire format must use 'ref', not 'ref_id'"
+        );
+        assert!(
+            !map.contains_key("ref_id"),
+            "wire format must not contain 'ref_id'"
+        );
+        assert_eq!(map["ref"].as_str(), Some("test-ref"));
+    }
+
+    #[test]
+    fn relay_event_wire_field_type_not_event_type() {
+        // ADR-004 specifies the wire field name is "type", not "event_type".
+        let msg = RelayMessage::Event {
+            ref_id: Some("evt-1".to_string()),
+            event_type: "backfill_complete".to_string(),
+        };
+        let bytes = msg.to_bytes().unwrap();
+        let map: std::collections::BTreeMap<String, rmpv::Value> =
+            rmp_serde::from_slice(&bytes).unwrap();
+
+        assert!(
+            map.contains_key("type"),
+            "wire format must use 'type', not 'event_type'"
+        );
+        assert!(
+            !map.contains_key("event_type"),
+            "wire format must not contain 'event_type'"
+        );
+        assert_eq!(map["type"].as_str(), Some("backfill_complete"));
+
+        // Also verify ref field name.
+        assert!(
+            map.contains_key("ref"),
+            "wire format must use 'ref', not 'ref_id'"
+        );
+        assert!(
+            !map.contains_key("ref_id"),
+            "wire format must not contain 'ref_id'"
+        );
+    }
+
+    #[test]
+    fn relay_ok_wire_field_ref_not_ref_id() {
+        let msg = RelayMessage::Ok {
+            ref_id: Some("ok-ref".to_string()),
+            blob_id: None,
+        };
+        let bytes = msg.to_bytes().unwrap();
+        let map: std::collections::BTreeMap<String, rmpv::Value> =
+            rmp_serde::from_slice(&bytes).unwrap();
+
+        assert!(
+            map.contains_key("ref"),
+            "wire format must use 'ref', not 'ref_id'"
+        );
+        assert!(
+            !map.contains_key("ref_id"),
+            "wire format must not contain 'ref_id'"
+        );
+    }
+
+    #[test]
+    fn relay_err_wire_field_ref_not_ref_id() {
+        let msg = RelayMessage::Err {
+            ref_id: Some("err-ref".to_string()),
+            code: 4000,
+            msg: "test".to_string(),
+        };
+        let bytes = msg.to_bytes().unwrap();
+        let map: std::collections::BTreeMap<String, rmpv::Value> =
+            rmp_serde::from_slice(&bytes).unwrap();
+
+        assert!(
+            map.contains_key("ref"),
+            "wire format must use 'ref', not 'ref_id'"
+        );
+        assert!(
+            !map.contains_key("ref_id"),
+            "wire format must not contain 'ref_id'"
+        );
+    }
+
+    #[test]
+    fn all_client_variants_use_ref_wire_name() {
+        // Verify every ClientMessage variant with a ref_id field
+        // serializes it as "ref" on the wire.
+        let variants: Vec<ClientMessage> = vec![
+            ClientMessage::Publish {
+                ref_id: Some("r".into()),
+                routing_id: [0; 32],
+                recipient_hint: None,
+                blob_ttl: 1,
+                blob: vec![0x01],
+            },
+            ClientMessage::Subscribe {
+                ref_id: Some("r".into()),
+                routing_id: [0; 32],
+                since: None,
+            },
+            ClientMessage::Unsubscribe {
+                ref_id: Some("r".into()),
+                routing_id: [0; 32],
+            },
+            ClientMessage::Query {
+                ref_id: Some("r".into()),
+                routing_id: [0; 32],
+                since: None,
+                limit: None,
+            },
+            ClientMessage::Delete {
+                ref_id: Some("r".into()),
+                blob_id: [0; 32],
+            },
+            ClientMessage::BridgeRegister {
+                ref_id: Some("r".into()),
+                routing_id: [0; 32],
+                public_key: [0; 32],
+                signature: [0; 64],
+                timestamp: 0,
+                target_relay_hint: None,
+            },
+            ClientMessage::BridgeData {
+                ref_id: Some("r".into()),
+                target_routing_id: [0; 32],
+                payload: vec![0x01],
+            },
+        ];
+
+        for msg in variants {
+            let bytes = msg.to_bytes().unwrap();
+            let map: std::collections::BTreeMap<String, rmpv::Value> =
+                rmp_serde::from_slice(&bytes).unwrap();
+            assert!(
+                map.contains_key("ref"),
+                "{msg:?}: wire format must use 'ref'"
+            );
+            assert!(
+                !map.contains_key("ref_id"),
+                "{msg:?}: wire format must not contain 'ref_id'"
+            );
+        }
+    }
+
+    #[test]
+    fn wire_format_deserializes_from_spec_field_names() {
+        // Verify that messages using spec-compliant field names ("ref", "type")
+        // deserialize correctly — simulates receiving from a conformant peer.
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("op".to_string(), rmpv::Value::String("EVENT".into()));
+        map.insert("ref".to_string(), rmpv::Value::String("evt-deser".into()));
+        map.insert(
+            "type".to_string(),
+            rmpv::Value::String("query_complete".into()),
+        );
+
+        let bytes = rmp_serde::to_vec_named(&map).unwrap();
+        let msg = RelayMessage::from_bytes(&bytes).unwrap();
+
+        assert_eq!(
+            msg,
+            RelayMessage::Event {
+                ref_id: Some("evt-deser".to_string()),
+                event_type: "query_complete".to_string(),
+            }
+        );
     }
 }

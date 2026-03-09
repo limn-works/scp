@@ -1373,7 +1373,16 @@ When a member has been offline for more than 7 days, or when the epoch catch-up 
 
 **Reset protocol:**
 
-1. The reconnecting member publishes a `ResetRequest { context_id, member_did, last_known_epoch, reason, signature }` via the relay (not MLS-encrypted — the member may not be able to encrypt at the current epoch). The request is signed by the member's Active Signing Key or Agent Signing Key (ADR-039) for authentication — either key is accepted since both are valid verification methods on the member's DID.
+1. The reconnecting member publishes a `ResetRequest { context_id, member_did, last_known_epoch, reason, nonce, timestamp, signature }` via the relay (not MLS-encrypted — the member may not be able to encrypt at the current epoch). The request is signed by the member's Active Signing Key or Agent Signing Key (ADR-039) for authentication — either key is accepted since both are valid verification methods on the member's DID. The `nonce` is 16 random bytes (CSPRNG) and the `timestamp` is the current Unix time in seconds. The signature covers all fields except the signature itself via the canonical hash construction (§9.5.1) with domain separator `"SCP-RESET-REQUEST-V1:"`.
+
+   **Anti-replay validation.** Because ResetRequest is not MLS-encrypted, it is visible to relays and any network observer. Without replay protection, an attacker who captures a valid ResetRequest can replay it to force-remove and re-add the member repeatedly, disrupting their session. The relay (or any recipient processing the request) MUST validate:
+
+   - **(a) Signature validity.** Verify the Ed25519 signature against the member's DID document (resolve `member_did`, check `#active` or `#agent` verification method).
+   - **(b) Timestamp freshness.** Reject requests where `|relay_clock - timestamp| > 30 seconds`. This matches the freshness window used for `AccessKeyRequest` (§9.17) and `SenderKeyRequest` (§9.16.2) validation. The 30-second window accommodates reasonable clock skew while limiting the replay window.
+   - **(c) Nonce uniqueness.** Maintain a deduplication cache of `(member_did, nonce)` pairs with a 60-second TTL. Reject any request whose nonce has been seen within the TTL window. The 60-second TTL is 2x the freshness window, ensuring that even a request accepted at the edge of the 30-second window cannot be replayed after nonce eviction. Cache capacity: bounded at 10,000 entries with oldest-first eviction (matching the `NonceDedup` pattern used for `SenderKeyRequest` in `scp-core/crypto/sender_keys/key_protocol.rs`).
+
+   All three checks MUST pass before the request is forwarded to or processed by an admin. This is the same defense-in-depth pattern used for sender key requests (§9.16.2) and access key requests (§9.17).
+
 2. An online member with `MemberRemove` + `MemberInvite` capabilities (typically admin) processes the reset: (a) removes the offline member's stale leaf node via MLS `remove_member()`, (b) immediately re-adds the member using a fresh KeyPackage via MLS `add_member()`, (c) distributes the new Welcome message via relay.
 3. The reconnecting member processes the Welcome, joining the group at the current epoch. They request sender keys for all current members via the pull-based protocol (ADR-007 criterion 4c).
 4. The reconnecting member's outbound queue is drained using the new epoch's key schedule.
@@ -1398,6 +1407,10 @@ pub struct ResetRequest {
     pub member_did: DID,
     pub last_known_epoch: u64,
     pub reason: ResetReason,
+    /// 16 random bytes (CSPRNG). Prevents replay of captured requests.
+    pub nonce: [u8; 16],
+    /// Unix timestamp (seconds) when the request was created.
+    /// Recipients reject requests older than 30 seconds.
     pub timestamp: u64,
     pub signature: Ed25519Signature,
 }
@@ -3099,7 +3112,7 @@ pub struct WrappedCek {
 
 #### 2. Access Key Lifecycle
 
-**Generation.** When `AddMember` executes (via governance), the executor generates a fresh random 32-byte AES-256 access key for the new member. The access key is distributed via HPKE using the same pull-based protocol as sender keys (ADR-007 §9.16.2): the new member sends an `AccessKeyRequest`, the key holder responds with `AccessKeyResponse` containing the HPKE-encrypted access key. HPKE info strings for access key distribution MUST use a distinct domain separator: `info = "scp-access-key-v1" || context_id || member_did || epoch` (sender keys use `"scp-sender-key-v1"`). This prevents cross-protocol key confusion where a compromised access key response could be replayed as a sender key response.
+**Generation.** When `AddMember` executes (via governance), the executor generates a fresh random 32-byte AES-256 access key for the new member. The access key is distributed via HPKE Base mode (RFC 9180) using the same pull-based protocol and suite as sender keys (ADR-007, §9.16.2): DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. The new member sends an `AccessKeyRequest`, the key holder responds with `AccessKeyResponse` containing the HPKE-sealed access key. The HPKE `info` parameter MUST use a distinct domain separator: `info = "scp-access-key-v1" || context_id || member_did || epoch_bytes`. The `aad` parameter is: `aad = context_id || member_did || epoch_bytes`. Where `epoch_bytes` is the 8-byte big-endian encoding of the access key epoch. Sender keys use `"scp-sender-key-v1"` and broadcast keys use `"scp-broadcast-key-v1"`. This prevents cross-protocol key confusion where a compromised access key response could be replayed as a sender key response — different `info` values produce different HPKE key schedules.
 
 **Distribution.** Access keys are distributed via two new wire types:
 
@@ -3269,7 +3282,7 @@ The access key is destroyed on Full revocation and not archived. Re-wrapping his
    - `AccessKey` struct with 32-byte AES-256 key, context_id, member_did, epoch.
    - `generate_access_key(context_id, member_did) -> AccessKey` generates a cryptographically random key.
    - `AccessKeyRequest`/`AccessKeyResponse` wire types follow the pull-based protocol pattern from ADR-007.
-   - Distribution uses HPKE with ephemeral X25519 keypairs (same as sender key distribution).
+   - Distribution uses HPKE Base mode (RFC 9180) with DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. Info: `"scp-access-key-v1" || context_id || member_did || epoch_bytes`. AAD: `context_id || member_did || epoch_bytes`. Same suite as sender key distribution (§9.16.2).
 
 2. **CEK generation and wrapping:**
 

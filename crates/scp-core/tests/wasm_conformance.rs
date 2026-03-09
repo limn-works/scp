@@ -98,7 +98,8 @@ mod wasm_mirror {
                     if i + 1 < current_layer.len() {
                         parents.push(hash_pair(&current_layer[i], &current_layer[i + 1]));
                     } else {
-                        parents.push(hash_pair(&current_layer[i], &current_layer[i]));
+                        // RFC 6962: odd node is promoted, not duplicated.
+                        parents.push(current_layer[i]);
                     }
                     i += 2;
                 }
@@ -203,12 +204,8 @@ mod wasm_mirror {
                 sibling_hash: leaves[sibling_idx],
                 direction,
             });
-        } else {
-            path.push(ProofStep {
-                sibling_hash: leaves[idx],
-                direction: Direction::Right,
-            });
         }
+        // Odd node: no proof step needed — node is promoted per RFC 6962.
 
         idx /= 2;
 
@@ -224,12 +221,8 @@ mod wasm_mirror {
                     sibling_hash: layer[sibling_idx],
                     direction,
                 });
-            } else {
-                path.push(ProofStep {
-                    sibling_hash: layer[idx],
-                    direction: Direction::Right,
-                });
             }
+            // Odd node: no proof step needed — node is promoted per RFC 6962.
             idx /= 2;
         }
 
@@ -442,6 +435,15 @@ const fn event_type_tag(event_type: &EventType) -> u16 {
         EventType::EconomicPolicyChanged => 22,
         EventType::SpendingUcanGranted => 23,
         EventType::SpendingUcanRevoked => 24,
+        // Governance event types (ADR-031 §8)
+        EventType::GovernanceProposalCreated => 25,
+        EventType::GovernanceVoteCast => 26,
+        EventType::GovernanceVoteWithdrawn => 27,
+        EventType::GovernanceProposalResolved => 28,
+        EventType::GovernanceConflictDetected => 29,
+        EventType::GovernanceConflictResolved => 30,
+        EventType::GovernanceDeadlockRecovery => 31,
+        EventType::GovernanceActionExecuted => 32,
     }
 }
 
@@ -1826,16 +1828,15 @@ mod wasm_ucan_mirror {
         Ok(())
     }
 
-    pub fn compute_revocation_cid(payload: &UcanPayload) -> Result<String, String> {
-        let payload_bytes = serde_json::to_vec(payload)
-            .map_err(|e| format!("revocation CID serialization failed: {e}"))?;
-        let hash = Sha256::digest(&payload_bytes);
-        let hex = hash.iter().fold(String::with_capacity(64), |mut acc, b| {
+    /// Computes a revocation CID as the hex-encoded SHA-256 hash of the raw
+    /// encoded JWT string. Must match `scp-core::crypto::ucan::revoke::compute_revocation_cid`.
+    pub fn compute_revocation_cid(encoded_token: &str) -> String {
+        let hash = Sha256::digest(encoded_token.as_bytes());
+        hash.iter().fold(String::with_capacity(64), |mut acc, b| {
             use std::fmt::Write;
             let _ = write!(acc, "{b:02x}");
             acc
-        });
-        Ok(hex)
+        })
     }
 
     /// Verbatim mirror of WASM `verify_delegation_chain`.
@@ -1908,7 +1909,7 @@ mod wasm_ucan_mirror {
             verify_time_bounds(parent)?;
 
             // Verify parent token has not been revoked (spec 7.2).
-            let parent_revocation_cid = compute_revocation_cid(&parent.payload)?;
+            let parent_revocation_cid = compute_revocation_cid(&parent.encoded);
             if revoked_cids.contains(&parent_revocation_cid) {
                 return Err(format!("token revoked: {parent_revocation_cid}"));
             }
@@ -2521,8 +2522,8 @@ fn wasm_delegation_chain_rejects_revoked_parent() {
     let parent_jwt = make_signed_ucan(&parent_payload, &root_key);
     let parent_cid = wasm_ucan_mirror::compute_token_cid(&parent_jwt);
 
-    // Compute the parent's revocation CID (hash of the payload).
-    let parent_revocation_cid = wasm_ucan_mirror::compute_revocation_cid(&parent_payload).unwrap();
+    // Compute the parent's revocation CID (hash of the raw JWT string).
+    let parent_revocation_cid = wasm_ucan_mirror::compute_revocation_cid(&parent_jwt);
 
     // Add parent's revocation CID to the revocation set.
     let mut revoked_cids = HashSet::new();
@@ -2851,134 +2852,74 @@ fn wasm_multi_proof_divergent_root_issuers_rejected() {
 // ===========================================================================
 
 /// Cross-bridge golden test: both core and WASM mirror produce the same
-/// revocation CID for a payload with no optional fields.
+/// revocation CID for the same encoded JWT string.
 #[test]
 fn wasm_and_core_revocation_cid_match_golden_value() {
-    // Golden CID (must match revoke.rs::tests::revocation_cid_golden_value).
-    const GOLDEN_CID: &str = "570e8e588aef5a19ea59cf74f9fd0fec33c1aa32819aa6b48f76e4a21b3132ae";
+    // Golden encoded token: a stable fake JWT string.
+    const GOLDEN_TOKEN: &str =
+        "eyJhbGciOiJFZERTQSJ9.eyJpc3MiOiJkaWQ6ZGh0Ono2TWtHb2xkZW5UZXN0In0.dGVzdC1zaWc";
 
     // --- Core computation ---
-    let core_payload = scp_core::crypto::ucan::UcanPayload {
-        iss: "did:dht:z6MkGoldenTest".to_owned(),
-        aud: "did:dht:z6MkGoldenAudience".to_owned(),
-        exp: 1_700_000_000,
-        nbf: None,
-        nnc: "1699999000000-deadbeef0123456789abcdef01234567".to_owned(),
-        att: vec![scp_core::crypto::ucan::Attenuation {
-            with: "scp:ctx:golden-ctx/messages:write".to_owned(),
-            can: "write".to_owned(),
-        }],
-        prf: vec![],
-        fct: None,
-    };
-    let core_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(&core_payload);
-
-    assert_eq!(
-        core_cid, GOLDEN_CID,
-        "core compute_revocation_cid does not match golden value"
-    );
+    let core_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(GOLDEN_TOKEN);
 
     // --- WASM mirror computation ---
-    let wasm_payload = wasm_ucan_mirror::UcanPayload {
-        iss: "did:dht:z6MkGoldenTest".to_owned(),
-        aud: "did:dht:z6MkGoldenAudience".to_owned(),
-        exp: 1_700_000_000,
-        nbf: None,
-        nnc: "1699999000000-deadbeef0123456789abcdef01234567".to_owned(),
-        att: vec![wasm_ucan_mirror::Attenuation {
-            with: "scp:ctx:golden-ctx/messages:write".to_owned(),
-            can: "write".to_owned(),
-        }],
-        prf: vec![],
-        fct: None,
-    };
-    let wasm_cid = wasm_ucan_mirror::compute_revocation_cid(&wasm_payload)
-        .expect("WASM compute_revocation_cid failed");
+    let wasm_cid = wasm_ucan_mirror::compute_revocation_cid(GOLDEN_TOKEN);
 
+    // Verify format: 64 hex chars.
     assert_eq!(
-        wasm_cid, GOLDEN_CID,
-        "WASM compute_revocation_cid does not match golden value"
+        core_cid.len(),
+        64,
+        "core revocation CID must be 64 hex chars"
+    );
+    assert_eq!(
+        wasm_cid.len(),
+        64,
+        "WASM revocation CID must be 64 hex chars"
     );
 
     // --- Cross-check: core == WASM ---
     assert_eq!(
         core_cid, wasm_cid,
         "core and WASM compute_revocation_cid produce different CIDs for \
-         the same payload — cross-bridge revocation will fail silently"
+         the same encoded token — cross-bridge revocation will fail silently"
     );
 }
 
-/// Cross-bridge golden test with optional fields (nbf + fct + prf).
-///
-/// Exercises the `skip_serializing_if` serde behavior: when nbf and fct
-/// are `Some`, they must appear in the JSON in both implementations.
-/// If one bridge serializes `"nbf":null` while another omits it, the
-/// CIDs will diverge.
+/// Cross-bridge golden test: different tokens produce different CIDs,
+/// and core/WASM agree on each.
 #[test]
-fn wasm_and_core_revocation_cid_match_golden_value_with_optionals() {
-    const GOLDEN_CID_WITH_OPTIONALS: &str =
-        "b5e50448d6d2e9331158cbeb1269a33f5dc1dfa561105584ab2332f0a53fe330";
+fn wasm_and_core_revocation_cid_different_tokens() {
+    let token_a = "eyJhbGciOiJFZERTQSJ9.eyJpc3MiOiJhbGljZSJ9.c2lnLWE";
+    let token_b = "eyJhbGciOiJFZERTQSJ9.eyJpc3MiOiJib2IifQ.c2lnLWI";
 
-    // --- Core computation ---
-    let core_payload = scp_core::crypto::ucan::UcanPayload {
-        iss: "did:dht:z6MkGoldenTest".to_owned(),
-        aud: "did:dht:z6MkGoldenAudience".to_owned(),
-        exp: 1_700_000_000,
-        nbf: Some(1_699_999_000),
-        nnc: "1699999000000-deadbeef0123456789abcdef01234567".to_owned(),
-        att: vec![scp_core::crypto::ucan::Attenuation {
-            with: "scp:ctx:golden-ctx/messages:write".to_owned(),
-            can: "write".to_owned(),
-        }],
-        prf: vec!["bafyrei-parent-proof-cid".to_owned()],
-        fct: Some(serde_json::json!({"delegation_purpose": "test"})),
-    };
-    let core_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(&core_payload);
+    let core_a = scp_core::crypto::ucan::revoke::compute_revocation_cid(token_a);
+    let core_b = scp_core::crypto::ucan::revoke::compute_revocation_cid(token_b);
+    let wasm_a = wasm_ucan_mirror::compute_revocation_cid(token_a);
+    let wasm_b = wasm_ucan_mirror::compute_revocation_cid(token_b);
 
     assert_eq!(
-        core_cid, GOLDEN_CID_WITH_OPTIONALS,
-        "core compute_revocation_cid (with optionals) does not match golden value"
+        core_a, wasm_a,
+        "core and WASM must agree on CID for token A"
     );
-
-    // --- WASM mirror computation ---
-    let wasm_payload = wasm_ucan_mirror::UcanPayload {
-        iss: "did:dht:z6MkGoldenTest".to_owned(),
-        aud: "did:dht:z6MkGoldenAudience".to_owned(),
-        exp: 1_700_000_000,
-        nbf: Some(1_699_999_000),
-        nnc: "1699999000000-deadbeef0123456789abcdef01234567".to_owned(),
-        att: vec![wasm_ucan_mirror::Attenuation {
-            with: "scp:ctx:golden-ctx/messages:write".to_owned(),
-            can: "write".to_owned(),
-        }],
-        prf: vec!["bafyrei-parent-proof-cid".to_owned()],
-        fct: Some(serde_json::json!({"delegation_purpose": "test"})),
-    };
-    let wasm_cid = wasm_ucan_mirror::compute_revocation_cid(&wasm_payload)
-        .expect("WASM compute_revocation_cid (with optionals) failed");
-
     assert_eq!(
-        wasm_cid, GOLDEN_CID_WITH_OPTIONALS,
-        "WASM compute_revocation_cid (with optionals) does not match golden value"
+        core_b, wasm_b,
+        "core and WASM must agree on CID for token B"
     );
-
-    assert_eq!(
-        core_cid, wasm_cid,
-        "core and WASM compute_revocation_cid produce different CIDs for \
-         the same payload (with optional fields)"
+    assert_ne!(
+        core_a, core_b,
+        "different tokens must produce different CIDs"
     );
 }
 
 /// Cross-bridge consistency: revocation CID from a round-tripped JWT.
 ///
-/// End-to-end test that creates a signed JWT, parses it in both core and
-/// the WASM mirror, then computes the revocation CID from the parsed
-/// payload in both implementations. This validates the full path:
-/// JWT -> parse -> extract payload -> serialize -> SHA-256 -> hex.
+/// End-to-end test that creates a signed JWT, then computes the revocation
+/// CID from the raw JWT string in both core and the WASM mirror. Since both
+/// now hash the raw JWT string (not the deserialized payload), this validates
+/// the full path: JWT string -> SHA-256 -> hex.
 ///
-/// This catches subtle bugs where parsing produces structurally different
-/// payloads (e.g., extra fields, different defaults) that serialize to
-/// different JSON.
+/// This is the canonical consistency check: revocation CIDs computed on
+/// any platform for the same JWT must be identical.
 #[test]
 fn wasm_and_core_revocation_cid_match_after_jwt_roundtrip() {
     use ed25519_dalek::SigningKey;
@@ -3004,19 +2945,13 @@ fn wasm_and_core_revocation_cid_match_after_jwt_roundtrip() {
     // Mint a signed JWT using the WASM mirror's helper.
     let jwt = make_signed_ucan(&payload, &key);
 
-    // Parse with WASM mirror.
-    let wasm_parsed = wasm_ucan_mirror::parse_ucan(&jwt).expect("WASM parse_ucan failed");
-    let wasm_cid = wasm_ucan_mirror::compute_revocation_cid(&wasm_parsed.payload)
-        .expect("WASM compute_revocation_cid failed");
-
-    // Parse with core.
-    let core_parsed =
-        scp_core::crypto::ucan::validate::parse_ucan(&jwt).expect("core parse_ucan failed");
-    let core_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(&core_parsed.payload);
+    // Both implementations hash the raw JWT string directly.
+    let wasm_cid = wasm_ucan_mirror::compute_revocation_cid(&jwt);
+    let core_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(&jwt);
 
     assert_eq!(
         core_cid, wasm_cid,
-        "core and WASM produce different revocation CIDs after JWT round-trip \
-         — parsed payloads diverge between implementations"
+        "core and WASM produce different revocation CIDs for the same JWT string \
+         — cross-bridge revocation will fail silently"
     );
 }

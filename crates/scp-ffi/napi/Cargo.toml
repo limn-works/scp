@@ -9,6 +9,10 @@ license.workspace = true
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+default = []
+allow_in_memory_custody = ["scp-platform/testing"]
+
 [dependencies]
 napi = { version = "3", default-features = false, features = ["napi9", "tokio_rt", "async", "error_anyhow"] }
 napi-derive = "3"
@@ -22,17 +26,22 @@ dashmap = { workspace = true }
 rand = { workspace = true }
 z-base-32 = { workspace = true }
 hex = { workspace = true }
+ed25519-dalek = { workspace = true }
 scp-core = { path = "../../scp-core" }
 scp-identity = { path = "../../scp-identity" }
 scp-event-log = { path = "../../scp-event-log" }
 scp-ffi-common = { path = "../common" }
 scp-platform = { path = "../../scp-platform", features = ["testing"] }
+scp-mcp = { path = "../../scp-mcp" }
+scp-transport = { path = "../../scp-transport" }
 
 [dev-dependencies]
 scp-ffi-common = { path = "../common", features = ["testing"] }
+scp-platform = { path = "../../scp-platform", features = ["testing"] }
 
 [build-dependencies]
 napi-build = "2"
+cc = "1"
 
 [lints]
 workspace = true

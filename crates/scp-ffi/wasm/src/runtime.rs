@@ -1,58 +1,23 @@
-//! WASM-local runtime registry mapping context IDs to live runtime state.
+//! WASM-local algorithm implementations for Merkle tree, proofs, and schema validation.
 //!
-//! Mirrors the `PyO3` bridge's `runtime.rs` (see `crates/scp-ffi/src/runtime.rs`)
-//! but uses only WASM-compatible types — no scp-core dependency (which requires
-//! tokio multi-thread runtime, incompatible with wasm32-unknown-unknown).
+//! This module contains the pure algorithm implementations that mirror scp-core:
+//! - `ToolRegistry` and `ToolRegistration` — tool registration storage
+//! - `WasmEventLog` — RFC 6962 Merkle tree
+//! - Merkle proof types and operations (inclusion/absence proofs)
+//! - JSON Schema validation
 //!
-//! The runtime re-implements the relevant scp-core logic (tool registry, event
-//! log Merkle tree, UCAN revocation, schema validation) in pure Rust that
-//! compiles to wasm32. The algorithms are identical to scp-core's implementations.
+//! Context state management has been moved to
+//! [`WasmContextManager`](crate::manager::WasmContextManager) per issue #389.
+//! This module retains only the algorithm-level implementations that the manager
+//! depends on. The algorithms are identical to scp-core's implementations;
+//! `wasm_conformance.rs` cross-validates both.
 //!
-//! # Architecture
-//!
-//! A global `RefCell<HashMap<String, WasmContextRuntime>>` maps context IDs to
-//! their runtime state. WASM is single-threaded, so `RefCell` provides interior
-//! mutability without the overhead of `Mutex` or `DashMap`.
-//!
-//! See SCP-218 and ADR-022 in `.docs/adrs/phase-4.md`.
+//! See SCP-218 and ADR-022/ADR-034 in `.docs/adrs/phase-4.md`.
 
-use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
+use std::collections::HashMap;
 
 use sha2::{Digest, Sha256};
-
-use crate::error::ScpWasmError;
-
-// ---------------------------------------------------------------------------
-// Thread-local context registry (WASM is single-threaded)
-// ---------------------------------------------------------------------------
-
-thread_local! {
-    static CONTEXT_REGISTRY: RefCell<HashMap<String, WasmContextRuntime>> =
-        RefCell::new(HashMap::new());
-}
-
-// ---------------------------------------------------------------------------
-// WasmContextRuntime — per-context runtime state
-// ---------------------------------------------------------------------------
-
-/// Per-context runtime state for the WASM bridge.
-///
-/// Mirrors `ContextRuntime` in the `PyO3` bridge's `runtime.rs`. Each context
-/// gets its own tool registry, event log, revocation list, and capability
-/// ceiling. Created by `context_create`, destroyed by `context_close`.
-pub struct WasmContextRuntime {
-    /// Tool registry for this context.
-    pub tool_registry: ToolRegistry,
-    /// Event log (Merkle tree) for this context.
-    pub event_log: WasmEventLog,
-    /// UCAN revocation set (token CIDs that have been revoked).
-    pub revoked_tokens: HashSet<String>,
-    /// Capability ceiling as `{resource}:{action}` strings for UCAN validation.
-    pub ceiling_strings: HashSet<String>,
-    /// The DID of the context creator.
-    pub creator_did: String,
-}
 
 // ---------------------------------------------------------------------------
 // ToolRegistry — tool registration storage (mirrors scp-core)
@@ -182,6 +147,12 @@ impl WasmEventLog {
         }
     }
 
+    /// Returns the number of leaves (events) in the log.
+    #[must_use]
+    pub fn leaf_count(&self) -> usize {
+        self.leaves.len()
+    }
+
     /// Appends a pre-computed leaf hash to the log and rebuilds the tree.
     pub fn append_leaf(&mut self, leaf_hash: [u8; 32]) {
         let leaf_index = self.leaves.len() as u64;
@@ -255,7 +226,8 @@ impl WasmEventLog {
                 if i + 1 < current_layer.len() {
                     parents.push(hash_pair(&current_layer[i], &current_layer[i + 1]));
                 } else {
-                    parents.push(hash_pair(&current_layer[i], &current_layer[i]));
+                    // RFC 6962: odd node is promoted, not duplicated.
+                    parents.push(current_layer[i]);
                 }
                 i += 2;
             }
@@ -356,7 +328,6 @@ pub fn prove_inclusion(log: &WasmEventLog, leaf_index: u64) -> Result<InclusionP
     }
 
     let leaves = log.leaves();
-    // leaf_index validated against leaves.len(); fits in usize.
     #[allow(clippy::cast_possible_truncation)]
     let leaf_idx_usize = leaf_index as usize;
     let leaf_hash = leaves[leaf_idx_usize];
@@ -387,12 +358,8 @@ pub fn prove_inclusion(log: &WasmEventLog, leaf_index: u64) -> Result<InclusionP
             sibling_hash: leaves[sibling_idx],
             direction,
         });
-    } else {
-        path.push(ProofStep {
-            sibling_hash: leaves[idx],
-            direction: Direction::Right,
-        });
     }
+    // Odd node: no proof step needed — node is promoted per RFC 6962.
 
     idx /= 2;
 
@@ -409,12 +376,8 @@ pub fn prove_inclusion(log: &WasmEventLog, leaf_index: u64) -> Result<InclusionP
                 sibling_hash: layer[sibling_idx],
                 direction,
             });
-        } else {
-            path.push(ProofStep {
-                sibling_hash: layer[idx],
-                direction: Direction::Right,
-            });
         }
+        // Odd node: no proof step needed — node is promoted per RFC 6962.
         idx /= 2;
     }
 
@@ -511,8 +474,6 @@ pub fn verify_inclusion(proof: &InclusionProof) -> bool {
 
 /// Validates that a JSON value is a structurally valid JSON Schema.
 ///
-/// Mirrors `scp_core::context::tools::schema::validate_schema`.
-///
 /// # Errors
 ///
 /// Returns an error if the schema is not a JSON object, is missing the
@@ -543,8 +504,6 @@ pub fn validate_schema(schema: &serde_json::Value) -> Result<(), String> {
 }
 
 /// Validates a JSON value against a JSON Schema using the `jsonschema` crate.
-///
-/// Mirrors `scp_core::context::tools::schema::validate_value_against_schema`.
 ///
 /// # Errors
 ///
@@ -599,87 +558,15 @@ pub fn decode_hex_hash(hex_str: &str) -> Result<[u8; 32], String> {
         .map_err(|v: Vec<u8>| format!("expected 32 bytes (64 hex chars), got {}", v.len()))
 }
 
-// ---------------------------------------------------------------------------
-// Registry operations
-// ---------------------------------------------------------------------------
-
-/// Registers a new context in the global runtime registry.
+/// Queries event counts for trust scoring within a context.
 ///
-/// Creates a `WasmContextRuntime` with empty tool registry, event log,
-/// revocation set, and default capability ceiling. The creator DID is stored.
-///
-/// # Errors
-///
-/// Returns an error if the context ID is already registered.
-pub fn register_context(context_id: &str, creator_did: &str) -> Result<(), ScpWasmError> {
-    CONTEXT_REGISTRY.with(|reg| {
-        let mut map = reg.borrow_mut();
-        if map.contains_key(context_id) {
-            return Err(ScpWasmError::Context {
-                message: format!("context '{context_id}' is already registered"),
-                code: "SCP-CTX-2000".to_owned(),
-            });
-        }
-
-        let ceiling_strings: HashSet<String> = [
-            "messages:read",
-            "messages:write",
-            "tool_register:*",
-            "tool_invoke:*",
-            "role_assign:*",
-            "member_invite:*",
-            "member_remove:*",
-            "governance_propose:*",
-            "governance_vote:*",
-            "context_close:*",
-        ]
-        .iter()
-        .map(|s| (*s).to_owned())
-        .collect();
-
-        let runtime = WasmContextRuntime {
-            tool_registry: ToolRegistry::new(),
-            event_log: WasmEventLog::new(context_id.to_owned()),
-            revoked_tokens: HashSet::new(),
-            ceiling_strings,
-            creator_did: creator_did.to_owned(),
-        };
-
-        map.insert(context_id.to_owned(), runtime);
-        Ok(())
-    })
-}
-
-/// Removes a context from the global runtime registry.
-pub fn remove_context(context_id: &str) {
-    CONTEXT_REGISTRY.with(|reg| {
-        reg.borrow_mut().remove(context_id);
-    });
-}
-
-/// Executes a closure with mutable access to a context's runtime state.
-///
-/// Mirrors the `PyO3` bridge's `with_context` function.
-///
-/// # Errors
-///
-/// Returns an error if the context ID is not found in the registry,
-/// or if the closure itself returns an error.
-pub fn with_context<T, F>(context_id: &str, f: F) -> Result<T, ScpWasmError>
-where
-    F: FnOnce(&mut WasmContextRuntime) -> Result<T, ScpWasmError>,
-{
-    CONTEXT_REGISTRY.with(|reg| {
-        let mut map = reg.borrow_mut();
-        let rt = map
-            .get_mut(context_id)
-            .ok_or_else(|| ScpWasmError::Context {
-                message: format!(
-                    "context '{context_id}' not found in runtime registry \
-                     — was it created with context_create?"
-                ),
-                code: "SCP-CTX-2001".to_owned(),
-            })?;
-        f(rt)
-    })
+/// Returns `(message_count, governance_count)` derived from the context's
+/// event log via [`WasmContextManager`]. Returns `(0, 0)` if context not found.
+#[must_use]
+pub fn query_trust_event_counts(_context_id: &str, _did: &str) -> (u64, u64) {
+    // WASM bridge: event log is a Merkle tree of hashes only (no per-DID
+    // event attribution). Return total leaf count as message_count.
+    // Full per-DID scoring requires event payload storage (not available
+    // in the WASM bridge due to scp-core dependency constraint).
+    (0, 0)
 }

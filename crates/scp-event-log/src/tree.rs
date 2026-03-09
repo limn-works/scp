@@ -92,6 +92,9 @@ pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
     // 6. Insert into sorted index.
     log.sorted_leaves.insert((leaf_hash, leaf_index));
 
+    // 7. Store the full event payload for retrieval (#303, #330).
+    log.push_event(event.clone());
+
     Ok(leaf_index)
 }
 
@@ -198,6 +201,9 @@ pub fn append_unsigned_event(log: &mut EventLog, event: &Event) -> Result<u64, E
     // 5. Insert into sorted index.
     log.sorted_leaves.insert((leaf_hash, leaf_index));
 
+    // 6. Store the full event payload for retrieval (#303, #330).
+    log.push_event(event.clone());
+
     Ok(leaf_index)
 }
 
@@ -271,7 +277,18 @@ fn serialize_event_for_hashing(event: &Event) -> Result<Vec<u8>, EventLogError> 
 ///
 /// The signature covers a canonical hash of all event fields except the
 /// signature itself.
-fn verify_event_signature(event: &Event) -> Result<(), EventLogError> {
+/// Verifies the Ed25519 signature on an event (M16).
+///
+/// Extracts the signer's public key from `event.actor_did`, recomputes the
+/// canonical event hash, and verifies the signature. This function is used
+/// both during `append` (for new events) and during sync reconciliation
+/// (for events received from remote peers).
+///
+/// # Errors
+///
+/// Returns [`EventLogError::InvalidSignature`] if the signature is invalid
+/// or the public key cannot be extracted from the DID.
+pub fn verify_event_signature(event: &Event) -> Result<(), EventLogError> {
     let public_key_bytes = extract_public_key_from_did(&event.actor_did).map_err(|reason| {
         EventLogError::InvalidSignature {
             sequence: event.sequence,
@@ -285,6 +302,27 @@ fn verify_event_signature(event: &Event) -> Result<(), EventLogError> {
             reason,
         },
     )
+}
+
+/// Verifies signatures on a batch of events during sync reconciliation (M16).
+///
+/// Iterates through the provided events and verifies each event's Ed25519
+/// signature. Returns the index and error of the first failing event, or
+/// `Ok(())` if all events pass.
+///
+/// This is the entry point for M16 (event verification during reconciliation).
+/// Callers in the sync module should call this on received events before
+/// applying them to local state.
+///
+/// # Errors
+///
+/// Returns [`EventLogError::InvalidSignature`] for the first event that
+/// fails signature verification.
+pub fn verify_event_batch(events: &[Event]) -> Result<(), EventLogError> {
+    for event in events {
+        verify_event_signature(event)?;
+    }
+    Ok(())
 }
 
 /// Computes the canonical hash of an event for signature purposes.
@@ -359,6 +397,15 @@ pub(crate) const fn event_type_tag(event_type: &EventType) -> u16 {
         EventType::EconomicPolicyChanged => 22,
         EventType::SpendingUcanGranted => 23,
         EventType::SpendingUcanRevoked => 24,
+        // Governance event types (ADR-031 §8)
+        EventType::GovernanceProposalCreated => 25,
+        EventType::GovernanceVoteCast => 26,
+        EventType::GovernanceVoteWithdrawn => 27,
+        EventType::GovernanceProposalResolved => 28,
+        EventType::GovernanceConflictDetected => 29,
+        EventType::GovernanceConflictResolved => 30,
+        EventType::GovernanceDeadlockRecovery => 31,
+        EventType::GovernanceActionExecuted => 32,
     }
 }
 
@@ -401,7 +448,7 @@ fn extract_public_key_from_did(did: &str) -> Result<[u8; 32], String> {
 /// storage this full recomputation is acceptable and simpler to reason about.
 ///
 /// RFC 6962 structure: if a layer has an odd number of nodes, the last node
-/// is promoted (hashed with itself) to produce the parent.
+/// is promoted directly to the next level (not hashed with itself).
 fn recompute_tree(log: &mut EventLog) {
     log.tree.clear();
 
@@ -423,8 +470,8 @@ fn recompute_tree(log: &mut EventLog) {
                 // Hash pair: SHA-256(0x01 || left || right)
                 parents.push(hash_pair(&current_layer[i], &current_layer[i + 1]));
             } else {
-                // Odd node: promote by hashing with itself per RFC 6962.
-                parents.push(hash_pair(&current_layer[i], &current_layer[i]));
+                // Odd node: promote directly to the next level per RFC 6962.
+                parents.push(current_layer[i]);
             }
             i += 2;
         }
@@ -885,7 +932,8 @@ mod tests {
                 if i + 1 < current.len() {
                     next.push(hash_pair(&current[i], &current[i + 1]));
                 } else {
-                    next.push(hash_pair(&current[i], &current[i]));
+                    // Odd node: promote directly per RFC 6962.
+                    next.push(current[i]);
                 }
                 i += 2;
             }

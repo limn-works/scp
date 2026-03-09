@@ -236,10 +236,16 @@ pub fn build_reloadable_tls_config(
 /// Implements [`ResolvesServerCert`] so it can be used with `rustls::ServerConfig`.
 /// The inner `RwLock` allows updating the certificate without restarting the
 /// TLS acceptor.
+///
+/// Uses [`std::sync::RwLock`] (not `tokio::sync::RwLock`) because
+/// [`ResolvesServerCert::resolve`] is synchronous. A tokio `RwLock` required
+/// `try_read()` which returns `None` during certificate updates, causing TLS
+/// handshake failures. A std `RwLock` blocks briefly during the (very fast)
+/// pointer swap, so `resolve` never returns `None`.
 #[derive(Debug)]
 pub struct CertResolver {
     /// The current certified key, behind a read-write lock for hot-reload.
-    pub(crate) inner: RwLock<Arc<CertifiedKey>>,
+    pub(crate) inner: std::sync::RwLock<Arc<CertifiedKey>>,
 }
 
 impl CertResolver {
@@ -247,25 +253,34 @@ impl CertResolver {
     #[must_use]
     pub fn new(key: CertifiedKey) -> Self {
         Self {
-            inner: RwLock::new(Arc::new(key)),
+            inner: std::sync::RwLock::new(Arc::new(key)),
         }
     }
 
     /// Update the certificate. Subsequent TLS handshakes will use the new
     /// certificate.
-    pub async fn update(&self, key: CertifiedKey) {
-        let mut guard = self.inner.write().await;
+    ///
+    /// This acquires a std `RwLock` write guard, which blocks briefly but is
+    /// safe because the critical section is a single pointer swap.
+    ///
+    /// If the lock is poisoned (prior panic during a write), we recover by
+    /// clearing the poison — the old `Arc<CertifiedKey>` is still valid and
+    /// we are replacing it with a fresh one anyway.
+    pub fn update(&self, key: CertifiedKey) {
+        let mut guard = match self.inner.write() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                tracing::warn!("CertResolver RwLock was poisoned, clearing poison");
+                poisoned.into_inner()
+            }
+        };
         *guard = Arc::new(key);
     }
 }
 
 impl ResolvesServerCert for CertResolver {
     fn resolve(&self, _client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        // `try_read()` is non-blocking and appropriate for the synchronous
-        // `resolve` callback. If a write is in progress (certificate update),
-        // this returns `None` and rustls will reject the handshake — the next
-        // attempt will succeed after the update completes.
-        self.inner.try_read().ok().map(|guard| Arc::clone(&*guard))
+        self.inner.read().ok().map(|guard| Arc::clone(&*guard))
     }
 }
 
@@ -299,6 +314,13 @@ pub struct AcmeProvider<S: Storage> {
     directory_url: String,
     /// Optional cert resolver for hot-reloading certificates.
     cert_resolver: Option<Arc<CertResolver>>,
+    /// Shared map from ACME challenge token to key authorization string.
+    ///
+    /// Populated during [`provision()`](Self::provision) and read by the
+    /// ACME challenge router (`GET /.well-known/acme-challenge/{token}`).
+    /// The map is wrapped in `Arc<RwLock<_>>` so the router can serve
+    /// challenges concurrently while provisioning writes new entries.
+    challenges: Arc<RwLock<std::collections::HashMap<String, String>>>,
 }
 
 impl<S: Storage> std::fmt::Debug for AcmeProvider<S> {
@@ -324,6 +346,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
             email: None,
             directory_url: "https://acme-v02.api.letsencrypt.org/directory".to_owned(),
             cert_resolver: None,
+            challenges: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
     }
 
@@ -346,6 +369,16 @@ impl<S: Storage + 'static> AcmeProvider<S> {
     pub fn with_cert_resolver(mut self, resolver: Arc<CertResolver>) -> Self {
         self.cert_resolver = Some(resolver);
         self
+    }
+
+    /// Returns a handle to the shared ACME challenge map.
+    ///
+    /// Pass this to [`acme_challenge_router`] so the HTTP server can serve
+    /// `GET /.well-known/acme-challenge/{token}` responses during ACME
+    /// provisioning.
+    #[must_use]
+    pub fn challenges(&self) -> Arc<RwLock<std::collections::HashMap<String, String>>> {
+        Arc::clone(&self.challenges)
     }
 
     /// Load a TLS certificate from the protocol store, converting to
@@ -431,7 +464,21 @@ impl<S: Storage + 'static> AcmeProvider<S> {
                 .challenge(instant_acme::ChallengeType::Http01)
                 .ok_or_else(|| TlsError::Acme("no HTTP-01 challenge found".to_owned()))?;
 
-            let _key_auth = challenge_handle.key_authorization().as_str().to_owned();
+            let key_auth = challenge_handle.key_authorization().as_str().to_owned();
+            let token = challenge_handle.token.clone();
+
+            // Store the token → key-authorization mapping so the ACME
+            // challenge router can serve it at
+            // `GET /.well-known/acme-challenge/{token}`.
+            {
+                let mut map = self.challenges.write().await;
+                map.insert(token.clone(), key_auth);
+            }
+
+            tracing::debug!(
+                domain = %self.domain, %token,
+                "ACME HTTP-01 challenge token stored in challenge map"
+            );
 
             // 4. Signal that we're ready for validation.
             challenge_handle
@@ -471,6 +518,14 @@ impl<S: Storage + 'static> AcmeProvider<S> {
             .store_tls_certificate(&cert_data.certificate_chain_pem, &cert_data.private_key_pem)
             .await
             .map_err(|e| TlsError::Storage(format!("failed to store certificate: {e}")))?;
+
+        // Clear challenge map — tokens are single-use and no longer needed
+        // after the certificate is issued. Prevents stale tokens from being
+        // served if the router remains mounted.
+        {
+            let mut map = self.challenges.write().await;
+            map.clear();
+        }
 
         tracing::info!(domain = %self.domain, "TLS certificate provisioned via ACME");
 
@@ -526,7 +581,7 @@ impl<S: Storage + 'static> AcmeProvider<S> {
                                             rustls::crypto::ring::sign::any_supported_type(&key)
                                     {
                                         let certified = CertifiedKey::new(certs, signing_key);
-                                        resolver.update(certified).await;
+                                        resolver.update(certified);
                                         tracing::info!(
                                             domain = %self.domain,
                                             "TLS certificate renewed and hot-reloaded"
@@ -602,8 +657,20 @@ pub fn acme_challenge_router(
     ) -> impl IntoResponse {
         let map = challenges.read().await;
         map.get(&token).map_or_else(
-            || (StatusCode::NOT_FOUND, String::new()),
-            |key_auth| (StatusCode::OK, key_auth.clone()),
+            || {
+                (
+                    StatusCode::NOT_FOUND,
+                    [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                    String::new(),
+                )
+            },
+            |key_auth| {
+                (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                    key_auth.clone(),
+                )
+            },
         )
     }
 
@@ -921,14 +988,14 @@ mod tests {
 
         // Before update: should have cert1.
         {
-            let guard = resolver.inner.read().await;
+            let guard = resolver.inner.read().unwrap();
             assert_eq!(guard.cert.len(), certs1.len());
         }
 
         // After update: should have cert2.
-        resolver.update(ck2).await;
+        resolver.update(ck2);
         {
-            let guard = resolver.inner.read().await;
+            let guard = resolver.inner.read().unwrap();
             assert_eq!(guard.cert.len(), certs2.len());
         }
     }
@@ -983,6 +1050,15 @@ mod tests {
 
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        // Verify Content-Type: text/plain (AC7, issue #305).
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .expect("should have Content-Type header")
+            .to_str()
+            .unwrap();
+        assert_eq!(content_type, "text/plain");
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"test-key-auth");
@@ -1048,5 +1124,164 @@ mod tests {
             AcmeProvider::new("example.com", storage).with_cert_resolver(Arc::clone(&resolver));
 
         assert!(provider.cert_resolver.is_some());
+    }
+
+    // -- ACME challenge map integration (issue #305) --
+
+    #[test]
+    fn acme_provider_challenges_returns_shared_map() {
+        let storage = Arc::new(ProtocolStore::new(InMemoryStorage::new()));
+        let provider = AcmeProvider::new("example.com", storage);
+
+        let challenges_a = provider.challenges();
+        let challenges_b = provider.challenges();
+
+        // Both handles point to the same underlying map.
+        assert!(Arc::ptr_eq(&challenges_a, &challenges_b));
+    }
+
+    #[tokio::test]
+    async fn acme_challenge_router_serves_from_shared_map() {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        // Simulate the provision() flow: write to the shared challenge map,
+        // then verify the router serves the key authorization (AC6/AC7).
+        let storage = Arc::new(ProtocolStore::new(InMemoryStorage::new()));
+        let provider = AcmeProvider::new("example.com", storage);
+        let challenges = provider.challenges();
+
+        // Populate the challenge map as provision() would.
+        {
+            let mut map = challenges.write().await;
+            map.insert("acme-token-abc".to_owned(), "key-auth-xyz".to_owned());
+        }
+
+        // Build the router from the same shared map.
+        let router = acme_challenge_router(Arc::clone(&challenges));
+
+        let request = axum::http::Request::builder()
+            .uri("/.well-known/acme-challenge/acme-token-abc")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .expect("should have Content-Type header")
+            .to_str()
+            .unwrap();
+        assert_eq!(content_type, "text/plain");
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"key-auth-xyz");
+    }
+
+    /// AC8: `provision()` against a non-existent ACME server returns an error
+    /// (does not hang or panic).
+    #[tokio::test]
+    async fn provision_without_acme_server_returns_error() {
+        // Install the ring crypto provider for instant_acme's internal
+        // rustls usage. Ignore errors if already installed by another test.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let storage = Arc::new(ProtocolStore::new(InMemoryStorage::new()));
+        let provider = AcmeProvider::new("test.example.com", storage)
+            // Point to a non-existent ACME directory so it fails fast.
+            .with_directory_url("http://127.0.0.1:1/nonexistent");
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(10), provider.provision()).await;
+
+        // Must complete within timeout (no hang).
+        let provision_result = result.expect("provision() should not hang");
+
+        // Must return an error (no panic).
+        assert!(
+            provision_result.is_err(),
+            "provision() without ACME server should return TlsError"
+        );
+    }
+
+    /// AC6: Integration test verifying the full pipeline: `AcmeProvider`
+    /// populates the shared challenge map, and the router serves the
+    /// key authorization string correctly. Tests the fix for the three
+    /// compounding defects in issue #305.
+    #[tokio::test]
+    async fn acme_challenge_pipeline_end_to_end() {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        // Create an AcmeProvider and get its shared challenge map.
+        let storage = Arc::new(ProtocolStore::new(InMemoryStorage::new()));
+        let provider = AcmeProvider::new("test.example.com", storage);
+        let challenges = provider.challenges();
+
+        // Simulate what provision() does: populate the challenge map with a
+        // token → key-authorization mapping.
+        {
+            let mut map = challenges.write().await;
+            map.insert(
+                "simulated-token".to_owned(),
+                "simulated-key-auth".to_owned(),
+            );
+        }
+
+        // Build a router from the same challenge map (as build_merged_router
+        // does in serve()).
+        let router = acme_challenge_router(provider.challenges());
+
+        // Verify the router serves the challenge correctly.
+        let request = axum::http::Request::builder()
+            .uri("/.well-known/acme-challenge/simulated-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .expect("should have Content-Type header")
+            .to_str()
+            .unwrap();
+        assert_eq!(content_type, "text/plain");
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"simulated-key-auth");
+
+        // Verify unknown tokens return 404.
+        let request_404 = axum::http::Request::builder()
+            .uri("/.well-known/acme-challenge/unknown-token")
+            .body(Body::empty())
+            .unwrap();
+        let response_404 = router.oneshot(request_404).await.unwrap();
+        assert_eq!(response_404.status(), axum::http::StatusCode::NOT_FOUND);
+
+        // Verify challenge map cleanup: clear the map (as provision()
+        // does after successful issuance) and confirm router returns 404
+        // for the previously valid token.
+        {
+            let mut map = challenges.write().await;
+            map.clear();
+        }
+
+        let router_after_clear = acme_challenge_router(provider.challenges());
+        let request_cleared = axum::http::Request::builder()
+            .uri("/.well-known/acme-challenge/simulated-token")
+            .body(Body::empty())
+            .unwrap();
+        let response_cleared = router_after_clear.oneshot(request_cleared).await.unwrap();
+        assert_eq!(
+            response_cleared.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "cleared challenge map should no longer serve token"
+        );
     }
 }

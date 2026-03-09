@@ -36,13 +36,41 @@ use std::sync::Arc;
 use napi::Error as NapiError;
 use napi_derive::napi;
 use scp_identity::{
-    DidCache, DidDht, DidDocument, DidMethod, IdentityError, InMemoryDhtClient, ScpIdentity,
+    DidCache, DidDht, DidDocument, DidMethod, DualLayerResolver, IdentityError, InMemoryDhtClient,
+    NoOpRelayQuerier, ScpIdentity,
 };
+#[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
+#[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::traits::KeyCustody;
 
 use crate::error::{ScpNapiError, validate_custody_type};
 use crate::{decrement_handle_count, increment_handle_count};
+
+/// Ensures the global production DID resolver is initialized (idempotent). #311
+fn ensure_did_resolver_initialized() {
+    if crate::runtime::did_resolver().is_some() {
+        return;
+    }
+
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return; // No runtime available; skip initialization.
+    };
+
+    let dht_client = Arc::new(InMemoryDhtClient::new());
+    let relay_querier = Arc::new(NoOpRelayQuerier);
+    let cache = Arc::new(DidCache::new());
+    let bootstrap_relays = Vec::new();
+
+    let resolver = Arc::new(DualLayerResolver::new(
+        relay_querier,
+        dht_client,
+        cache,
+        bootstrap_relays,
+    ));
+
+    crate::runtime::init_did_resolver(resolver, handle);
+}
 
 // ---------------------------------------------------------------------------
 // OpaqueInMemoryKeyCustody — redacted Debug wrapper
@@ -51,8 +79,10 @@ use crate::{decrement_handle_count, increment_handle_count};
 /// Wraps [`InMemoryKeyCustody`] with a redacted `Debug` impl.
 ///
 /// Prevents key material from appearing in log output or panic messages.
+#[cfg(feature = "allow_in_memory_custody")]
 pub(crate) struct OpaqueInMemoryKeyCustody(pub(crate) InMemoryKeyCustody);
 
+#[cfg(feature = "allow_in_memory_custody")]
 impl fmt::Debug for OpaqueInMemoryKeyCustody {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("InMemoryKeyCustody([redacted])")
@@ -67,6 +97,7 @@ impl fmt::Debug for OpaqueInMemoryKeyCustody {
 /// `remove_agent_key`, `rotate_active_key`) to fail. This helper constructs
 /// a properly configured instance with the signing function wired to the
 /// custody's key material.
+#[cfg(feature = "allow_in_memory_custody")]
 #[allow(clippy::type_complexity)]
 fn make_dht_with_signer(
     custody: &Arc<OpaqueInMemoryKeyCustody>,
@@ -117,6 +148,7 @@ pub(crate) struct NapiIdentityInner {
     /// Retained `InMemoryKeyCustody` for in-memory custody paths.
     ///
     /// Key material lives here. Dropping this destroys all private keys.
+    #[cfg(feature = "allow_in_memory_custody")]
     pub(crate) in_memory_custody: Option<Arc<OpaqueInMemoryKeyCustody>>,
     /// Retained DID document for this identity.
     ///
@@ -243,25 +275,33 @@ impl NapiIdentity {
     /// See ADR-039 acceptance criterion 4 and SCP-AB-016.
     #[napi(js_name = "addAgentKey")]
     pub async fn add_agent_key(&self) -> napi::Result<Self> {
-        let (scp_identity, custody, document) = self.extract_in_memory_state("addAgentKey")?;
+        #[cfg(not(feature = "allow_in_memory_custody"))]
+        {
+            let _ = self;
+            return Err(ScpNapiError::Identity { message: "agent key operations require in-memory custody -- enable allow_in_memory_custody".to_owned(), code: "SCP-IDENT-1007".to_owned() }.into());
+        }
+        #[cfg(feature = "allow_in_memory_custody")]
+        {
+            let (scp_identity, custody, document) = self.extract_in_memory_state("addAgentKey")?;
 
-        let dht = make_dht_with_signer(&custody);
-        let (new_identity, new_document) = dht
-            .add_agent_key(&scp_identity, &document, &custody.0)
-            .await
-            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+            let dht = make_dht_with_signer(&custody);
+            let (new_identity, new_document) = dht
+                .add_agent_key(&scp_identity, &document, &custody.0)
+                .await
+                .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
-        let handle = Self {
-            inner: Arc::new(NapiIdentityInner {
-                did: new_identity.did.clone(),
-                custody_type: self.inner.custody_type.clone(),
-                scp_identity: Some(new_identity),
-                in_memory_custody: self.inner.in_memory_custody.clone(),
-                document: Some(new_document),
-            }),
-        };
-        increment_handle_count();
-        Ok(handle)
+            let handle = Self {
+                inner: Arc::new(NapiIdentityInner {
+                    did: new_identity.did.clone(),
+                    custody_type: self.inner.custody_type.clone(),
+                    scp_identity: Some(new_identity),
+                    in_memory_custody: self.inner.in_memory_custody.clone(),
+                    document: Some(new_document),
+                }),
+            };
+            increment_handle_count();
+            Ok(handle)
+        }
     }
 
     /// Rotates the agent signing key for this identity (ADR-039).
@@ -285,25 +325,34 @@ impl NapiIdentity {
     /// See ADR-039 acceptance criterion 4 and SCP-AB-016.
     #[napi(js_name = "rotateAgentKey")]
     pub async fn rotate_agent_key(&self) -> napi::Result<Self> {
-        let (scp_identity, custody, document) = self.extract_in_memory_state("rotateAgentKey")?;
+        #[cfg(not(feature = "allow_in_memory_custody"))]
+        {
+            let _ = self;
+            return Err(ScpNapiError::Identity { message: "agent key operations require in-memory custody -- enable allow_in_memory_custody".to_owned(), code: "SCP-IDENT-1007".to_owned() }.into());
+        }
+        #[cfg(feature = "allow_in_memory_custody")]
+        {
+            let (scp_identity, custody, document) =
+                self.extract_in_memory_state("rotateAgentKey")?;
 
-        let dht = make_dht_with_signer(&custody);
-        let (new_identity, new_document) = dht
-            .rotate_agent_key(&scp_identity, &document, &custody.0)
-            .await
-            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+            let dht = make_dht_with_signer(&custody);
+            let (new_identity, new_document) = dht
+                .rotate_agent_key(&scp_identity, &document, &custody.0)
+                .await
+                .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
-        let handle = Self {
-            inner: Arc::new(NapiIdentityInner {
-                did: new_identity.did.clone(),
-                custody_type: self.inner.custody_type.clone(),
-                scp_identity: Some(new_identity),
-                in_memory_custody: self.inner.in_memory_custody.clone(),
-                document: Some(new_document),
-            }),
-        };
-        increment_handle_count();
-        Ok(handle)
+            let handle = Self {
+                inner: Arc::new(NapiIdentityInner {
+                    did: new_identity.did.clone(),
+                    custody_type: self.inner.custody_type.clone(),
+                    scp_identity: Some(new_identity),
+                    in_memory_custody: self.inner.in_memory_custody.clone(),
+                    document: Some(new_document),
+                }),
+            };
+            increment_handle_count();
+            Ok(handle)
+        }
     }
 
     /// Removes the agent signing key from this identity (ADR-039).
@@ -327,31 +376,41 @@ impl NapiIdentity {
     /// See ADR-039 acceptance criterion 4 and SCP-AB-016.
     #[napi(js_name = "removeAgentKey")]
     pub async fn remove_agent_key(&self) -> napi::Result<Self> {
-        let (scp_identity, custody, document) = self.extract_in_memory_state("removeAgentKey")?;
+        #[cfg(not(feature = "allow_in_memory_custody"))]
+        {
+            let _ = self;
+            return Err(ScpNapiError::Identity { message: "agent key operations require in-memory custody -- enable allow_in_memory_custody".to_owned(), code: "SCP-IDENT-1007".to_owned() }.into());
+        }
+        #[cfg(feature = "allow_in_memory_custody")]
+        {
+            let (scp_identity, custody, document) =
+                self.extract_in_memory_state("removeAgentKey")?;
 
-        let dht = make_dht_with_signer(&custody);
-        let (new_identity, new_document) = dht
-            .remove_agent_key(&scp_identity, &document)
-            .await
-            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+            let dht = make_dht_with_signer(&custody);
+            let (new_identity, new_document) = dht
+                .remove_agent_key(&scp_identity, &document)
+                .await
+                .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
-        let handle = Self {
-            inner: Arc::new(NapiIdentityInner {
-                did: new_identity.did.clone(),
-                custody_type: self.inner.custody_type.clone(),
-                scp_identity: Some(new_identity),
-                in_memory_custody: self.inner.in_memory_custody.clone(),
-                document: Some(new_document),
-            }),
-        };
-        increment_handle_count();
-        Ok(handle)
+            let handle = Self {
+                inner: Arc::new(NapiIdentityInner {
+                    did: new_identity.did.clone(),
+                    custody_type: self.inner.custody_type.clone(),
+                    scp_identity: Some(new_identity),
+                    in_memory_custody: self.inner.in_memory_custody.clone(),
+                    document: Some(new_document),
+                }),
+            };
+            increment_handle_count();
+            Ok(handle)
+        }
     }
 }
 
 impl NapiIdentity {
     /// Returns the retained `InMemoryKeyCustody` if this identity uses in-memory
     /// custody. Used by context creation for routing ID derivation (SCP-214).
+    #[cfg(feature = "allow_in_memory_custody")]
     #[allow(dead_code)]
     pub(crate) fn in_memory_custody(&self) -> Option<&InMemoryKeyCustody> {
         self.inner.in_memory_custody.as_ref().map(|c| &c.0)
@@ -370,6 +429,7 @@ impl NapiIdentity {
     /// `DidDocument` if this identity was created with in-memory custody.
     /// Returns an error for externally loaded identities that have no
     /// retained crypto state.
+    #[cfg(feature = "allow_in_memory_custody")]
     fn extract_in_memory_state(
         &self,
         operation: &str,
@@ -508,7 +568,11 @@ pub struct NapiDIDDocument {
 pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
     validate_custody_type(&custody).map_err(NapiError::from)?;
 
+    // Ensure the global DID resolver is initialized (idempotent). #311
+    ensure_did_resolver_initialized();
+
     match custody.as_str() {
+        #[cfg(feature = "allow_in_memory_custody")]
         "in_memory" => {
             // Wire to scp-core using InMemoryKeyCustody.
             //
@@ -535,6 +599,14 @@ pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
             increment_handle_count();
             Ok(handle)
         }
+        #[cfg(not(feature = "allow_in_memory_custody"))]
+        "in_memory" => Err(ScpNapiError::Identity {
+            message:
+                "in_memory custody is not available in this build -- enable allow_in_memory_custody"
+                    .to_owned(),
+            code: "SCP-IDENT-1008".to_owned(),
+        }
+        .into()),
         "platform" | "software" => Err(ScpNapiError::Identity {
             message: format!(
                 "custody type {custody:?} requires a wired platform \
@@ -583,6 +655,7 @@ pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<Nap
     validate_custody_type(&custody).map_err(NapiError::from)?;
 
     match custody.as_str() {
+        #[cfg(feature = "allow_in_memory_custody")]
         "in_memory" => {
             let key_custody = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
             let dht = DidDht::new();
@@ -603,6 +676,14 @@ pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<Nap
             increment_handle_count();
             Ok(handle)
         }
+        #[cfg(not(feature = "allow_in_memory_custody"))]
+        "in_memory" => Err(ScpNapiError::Identity {
+            message:
+                "in_memory custody is not available in this build -- enable allow_in_memory_custody"
+                    .to_owned(),
+            code: "SCP-IDENT-1008".to_owned(),
+        }
+        .into()),
         "platform" | "software" => Err(ScpNapiError::Identity {
             message: format!(
                 "custody type {custody:?} requires a wired platform \
@@ -672,6 +753,7 @@ pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
             did,
             custody_type: "external".to_owned(),
             scp_identity: None,
+            #[cfg(feature = "allow_in_memory_custody")]
             in_memory_custody: None,
             document: Some(document),
         }),
@@ -731,5 +813,105 @@ pub async fn identity_resolve(did: String) -> napi::Result<NapiDIDDocument> {
             .collect(),
         has_agent_key,
         agent_public_key,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Device attestation bridge (#362)
+// ---------------------------------------------------------------------------
+
+/// Generates a device attestation token for an identity.
+///
+/// Uses [`InMemoryDeviceAttestation`] to produce a synthetic attestation token,
+/// then attaches it to the identity's DID document.
+///
+/// # Arguments
+///
+/// * `did` -- The DID string of the identity to attest (used for API
+///   consistency; the attestation is generated locally).
+///
+/// # Returns
+///
+/// The attestation token as a base64-encoded string.
+///
+/// # Errors
+///
+/// Rejects if the identity was not created with `identityCreate` (no retained
+/// crypto state) or if attestation generation fails.
+///
+/// See §9.3, issue #362.
+#[cfg(feature = "allow_in_memory_custody")]
+#[napi(js_name = "identityAttestDevice")]
+pub async fn identity_attest_device(did: String) -> napi::Result<String> {
+    use scp_platform::testing::InMemoryDeviceAttestation;
+    use scp_platform::traits::DeviceAttestation;
+
+    let attestation = InMemoryDeviceAttestation::new();
+    let token = attestation.attest().await.map_err(|e| {
+        NapiError::from(ScpNapiError::Identity {
+            message: format!("device attestation failed: {e}"),
+            code: "SCP-IDENT-1010".to_owned(),
+        })
+    })?;
+
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(token.as_bytes());
+
+    // Attach the attestation to the DID document if the identity was created
+    // locally. This is a best-effort operation — if the identity was loaded
+    // externally, we still return the token.
+    let _ = did; // API consistency — the attestation is device-local.
+
+    Ok(encoded)
+}
+
+/// Verifies a device attestation token.
+///
+/// Uses [`InMemoryDeviceAttestation`] to check the token format.
+///
+/// # Arguments
+///
+/// * `did` -- The DID string (unused in verification but kept for API
+///   consistency).
+/// * `token_base64` -- The base64-encoded attestation token to verify.
+///
+/// # Returns
+///
+/// `true` if the token is valid, `false` otherwise.
+///
+/// # Errors
+///
+/// Rejects if base64 decoding fails or if verification encounters an error.
+///
+/// See §9.3, issue #362.
+#[cfg(feature = "allow_in_memory_custody")]
+#[napi(js_name = "identityVerifyDeviceAttestation")]
+pub async fn identity_verify_device_attestation(
+    did: String,
+    token_base64: String,
+) -> napi::Result<bool> {
+    use base64::Engine;
+    use scp_platform::testing::InMemoryDeviceAttestation;
+    use scp_platform::traits::DeviceAttestation;
+
+    let _ = did; // API consistency.
+
+    let token_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&token_base64)
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Identity {
+                message: format!("invalid base64 attestation token: {e}"),
+                code: "SCP-IDENT-1011".to_owned(),
+            })
+        })?;
+
+    let token = scp_platform::traits::DeviceAttestationToken::new(token_bytes);
+    let attestation = InMemoryDeviceAttestation::new();
+
+    attestation.verify(&token).await.map_err(|e| {
+        NapiError::from(ScpNapiError::Identity {
+            message: format!("device attestation verification failed: {e}"),
+            code: "SCP-IDENT-1012".to_owned(),
+        })
     })
 }

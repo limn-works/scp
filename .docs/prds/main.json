@@ -7751,10 +7751,7 @@
         "bindings/python/README.md",
         "bindings/typescript/README.md",
         "bindings/swift/README.md",
-        "bindings/kotlin/README.md",
-        "bindings/go/README.md",
-        "bindings/csharp/README.md",
-        "bindings/java/README.md"
+        "bindings/kotlin/README.md"
       ],
       "description": "Every SDK ships with: (1) README.md — Quick start (install, create identity, create context, send message) in under 30 lines, (2) API reference — Generated from source (rustdoc, pydoc, typedoc, DocC, KDoc, godoc, xmldoc, javadoc), (3) Type stubs / declarations — For IDE autocompletion and static analysis (.pyi, .d.ts, etc.), (4) Examples directory — Runnable examples covering: basic messaging, tool invocation, MCP integration, multi-agent coordination.",
       "acceptanceCriteria": [
@@ -9978,7 +9975,17 @@
           "section": "## ADR-022: TypeScript SDK (Dual-Target Architecture)"
         }
       ],
-      "actionItems": [],
+      "actionItems": [
+        "Wire tool_register in wasm/src/tools.rs to ToolRegistry::register with schema validation",
+        "Wire tool_invoke in wasm/src/tools.rs to scp-core tool invocation pipeline",
+        "Wire tool_verify in wasm/src/tools.rs to scp-core schema verification",
+        "Wire ucan_validate in wasm/src/ucan.rs to scp-core verify_ucan_chain",
+        "Wire ucan_mint in wasm/src/ucan.rs to scp-core mint_ucan (KeyCustody signing deferred to SCP-214)",
+        "Wire ucan_revoke in wasm/src/ucan.rs to scp-core UCAN revocation",
+        "Wire event_log_query in wasm/src/event_log.rs to scp-core EventLog query",
+        "Wire event_log_verify in wasm/src/event_log.rs to scp-core Merkle verification",
+        "Verify wasm-pack build compiles without errors after wiring"
+      ],
       "details": {},
       "blockedByIssues": [
         306
@@ -10046,7 +10053,14 @@
           "section": "## ADR-021: UniFFI Bridge Definitions"
         }
       ],
-      "actionItems": [],
+      "actionItems": [
+        "Wire ucan_validate in uniffi/src/bridge.rs to scp-core verify_ucan_chain",
+        "Wire ucan_mint in uniffi/src/bridge.rs to scp-core mint_ucan (KeyCustody signing deferred to SCP-214)",
+        "Wire ucan_revoke in uniffi/src/bridge.rs to scp-core UCAN revocation",
+        "Wire event_log_query in uniffi/src/bridge.rs to scp-core EventLog query",
+        "Wire event_log_verify in uniffi/src/bridge.rs to scp-core Merkle verification",
+        "Verify cargo build -p scp-ffi-uniffi compiles without errors after wiring"
+      ],
       "details": {},
       "blockedByIssues": [
         307
@@ -10088,7 +10102,16 @@
           "section": "## ADR-026: Swift SDK"
         }
       ],
-      "actionItems": [],
+      "actionItems": [
+        "Wire Mcp.swift functions to ScpBindings UniFFI bridge for MCP tool operations",
+        "Wire Tools.swift functions to ScpBindings for tool registration, invocation, and verification",
+        "Wire Ucan.swift functions to ScpBindings for UCAN validation, minting, and revocation",
+        "Wire Transport.swift functions to ScpBindings for transport send/receive",
+        "Wire EventLog.swift functions to ScpBindings for event log query and verification",
+        "Wire Trust.swift functions to ScpBindings for attestation verification and trust evaluation",
+        "Remove all 'not yet available' placeholder error returns from Swift wrapper files",
+        "Add async roundtrip test per module (Tools, Ucan, EventLog, Transport, Trust) verifying async/await bridging"
+      ],
       "details": {}
     },
     {
@@ -10313,7 +10336,16 @@
           "section": "### 5.14.8 Blocking"
         }
       ],
-      "actionItems": [],
+      "actionItems": [
+        "Implement subscribe_broadcast(context_id, subscriber_did) that registers subscriber and returns current author key epoch",
+        "Implement open vs. gated admission logic per §5.14.4 (UCAN MessagesRead check for gated mode)",
+        "Implement unsubscribe_broadcast(context_id, subscriber_did) that removes subscriber",
+        "Implement block_broadcast_author(author_did) that revokes sender key per §5.14.8",
+        "Enforce MessagesWrite restricted to authors, MessagesRead open to subscribers per §5.14.9",
+        "Wire ContextManager integration for subscribe/unsubscribe/block operations",
+        "Add integration test: author publishes, 3 subscribers receive and decrypt",
+        "Add integration test: blocked author's subsequent messages are undecryptable"
+      ],
       "details": {}
     },
     {

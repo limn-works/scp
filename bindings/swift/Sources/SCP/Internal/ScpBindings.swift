@@ -406,6 +406,22 @@ private let UNIFFI_CALLBACK_UNEXPECTED_ERROR: Int32 = 2
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt8: FfiConverterPrimitive {
+    typealias FfiType = UInt8
+    typealias SwiftType = UInt8
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt8 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: UInt8, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
     typealias FfiType = UInt32
     typealias SwiftType = UInt32
@@ -742,6 +758,24 @@ public func FfiConverterTypeContextHandle_lower(_ value: ContextHandle) -> Unsaf
 public protocol IdentityProtocol: AnyObject, Sendable {
     
     /**
+     * Adds an agent signing key to this identity (ADR-039).
+     *
+     * Generates a new Ed25519 keypair for the `#agent` verification method,
+     * adds it to the DID document, publishes the updated document to the DHT,
+     * and returns a new `Identity` handle with the agent key.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Identity` if:
+     * - The identity already has an agent key
+     * - No in-memory custody is available (feature-gated)
+     * - Key generation or DHT publishing fails
+     *
+     * See ADR-039 acceptance criterion 4.
+     */
+    func addAgentKey() async throws  -> Identity
+    
+    /**
      * Returns the custody method string for this identity.
      *
      * One of: `"in_memory"`, `"platform"`, `"software"`, `"external"`.
@@ -752,6 +786,79 @@ public protocol IdentityProtocol: AnyObject, Sendable {
      * Returns the DID string for this identity.
      */
     func did()  -> String
+    
+    /**
+     * Returns the agent signing key's public key as a multibase-encoded string.
+     *
+     * Retrieves the `#agent` verification method's `publicKeyMultibase` from
+     * the retained DID document (`core_document`). Returns `None` if no
+     * agent key exists or if the identity has no retained document.
+     *
+     * **Note:** This method checks `core_document` (DID document contents),
+     * while [`has_agent_key`](Self::has_agent_key) checks `core_id` (key
+     * handle existence). Both should agree for identities created via
+     * `identity_create_with_agent_key` or after calling `add_agent_key`.
+     * For loaded identities without retained crypto state, both return
+     * `false`/`None`.
+     *
+     * See ADR-039 acceptance criterion 4.
+     */
+    func getAgentPublicKey()  -> String?
+    
+    /**
+     * Returns whether this identity has an agent signing key (`#agent` VM).
+     *
+     * Checks the retained `ScpIdentity`'s `agent_signing_key` field
+     * (`core_id`). Returns `false` for external/loaded identities that
+     * have no retained `ScpIdentity` (even if the DID document on the DHT
+     * contains an `#agent` verification method).
+     *
+     * **Note:** This method checks `core_id` (key handle existence), while
+     * [`get_agent_public_key`](Self::get_agent_public_key) checks
+     * `core_document` (DID document contents). Both should agree for
+     * identities created via `identity_create_with_agent_key` or after
+     * calling `add_agent_key`. For loaded identities without retained
+     * crypto state, both return `false`/`None`.
+     *
+     * See ADR-039 acceptance criterion 4.
+     */
+    func hasAgentKey()  -> Bool
+    
+    /**
+     * Removes the agent signing key from this identity (ADR-039).
+     *
+     * Removes the `#agent` verification method from the DID document,
+     * publishes the updated document to the DHT, and returns a new `Identity`
+     * handle without the agent key.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Identity` if:
+     * - The identity has no agent key
+     * - No in-memory custody is available (feature-gated)
+     * - DHT publishing fails
+     *
+     * See ADR-039 acceptance criterion 4.
+     */
+    func removeAgentKey() async throws  -> Identity
+    
+    /**
+     * Rotates the agent signing key for this identity (ADR-039).
+     *
+     * Generates a new Ed25519 keypair, moves the old `#agent` key to
+     * `#retired-agent-{sequence}`, installs the new key as `#agent`, publishes
+     * the updated DID document, and returns a new `Identity` handle.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Identity` if:
+     * - The identity has no agent key to rotate
+     * - No in-memory custody is available (feature-gated)
+     * - Key generation or DHT publishing fails
+     *
+     * See ADR-039 acceptance criterion 4.
+     */
+    func rotateAgentKey() async throws  -> Identity
     
     /**
      * Rotates the active signing key for this identity (async).
@@ -832,6 +939,39 @@ open class Identity: IdentityProtocol, @unchecked Sendable {
 
     
     /**
+     * Adds an agent signing key to this identity (ADR-039).
+     *
+     * Generates a new Ed25519 keypair for the `#agent` verification method,
+     * adds it to the DID document, publishes the updated document to the DHT,
+     * and returns a new `Identity` handle with the agent key.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Identity` if:
+     * - The identity already has an agent key
+     * - No in-memory custody is available (feature-gated)
+     * - Key generation or DHT publishing fails
+     *
+     * See ADR-039 acceptance criterion 4.
+     */
+open func addAgentKey()async throws  -> Identity  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_identity_add_agent_key(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeIdentity_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
      * Returns the custody method string for this identity.
      *
      * One of: `"in_memory"`, `"platform"`, `"software"`, `"external"`.
@@ -851,6 +991,119 @@ open func did() -> String  {
     uniffi_scp_ffi_uniffi_fn_method_identity_did(self.uniffiClonePointer(),$0
     )
 })
+}
+    
+    /**
+     * Returns the agent signing key's public key as a multibase-encoded string.
+     *
+     * Retrieves the `#agent` verification method's `publicKeyMultibase` from
+     * the retained DID document (`core_document`). Returns `None` if no
+     * agent key exists or if the identity has no retained document.
+     *
+     * **Note:** This method checks `core_document` (DID document contents),
+     * while [`has_agent_key`](Self::has_agent_key) checks `core_id` (key
+     * handle existence). Both should agree for identities created via
+     * `identity_create_with_agent_key` or after calling `add_agent_key`.
+     * For loaded identities without retained crypto state, both return
+     * `false`/`None`.
+     *
+     * See ADR-039 acceptance criterion 4.
+     */
+open func getAgentPublicKey() -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_identity_get_agent_public_key(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Returns whether this identity has an agent signing key (`#agent` VM).
+     *
+     * Checks the retained `ScpIdentity`'s `agent_signing_key` field
+     * (`core_id`). Returns `false` for external/loaded identities that
+     * have no retained `ScpIdentity` (even if the DID document on the DHT
+     * contains an `#agent` verification method).
+     *
+     * **Note:** This method checks `core_id` (key handle existence), while
+     * [`get_agent_public_key`](Self::get_agent_public_key) checks
+     * `core_document` (DID document contents). Both should agree for
+     * identities created via `identity_create_with_agent_key` or after
+     * calling `add_agent_key`. For loaded identities without retained
+     * crypto state, both return `false`/`None`.
+     *
+     * See ADR-039 acceptance criterion 4.
+     */
+open func hasAgentKey() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_identity_has_agent_key(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Removes the agent signing key from this identity (ADR-039).
+     *
+     * Removes the `#agent` verification method from the DID document,
+     * publishes the updated document to the DHT, and returns a new `Identity`
+     * handle without the agent key.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Identity` if:
+     * - The identity has no agent key
+     * - No in-memory custody is available (feature-gated)
+     * - DHT publishing fails
+     *
+     * See ADR-039 acceptance criterion 4.
+     */
+open func removeAgentKey()async throws  -> Identity  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_identity_remove_agent_key(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeIdentity_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Rotates the agent signing key for this identity (ADR-039).
+     *
+     * Generates a new Ed25519 keypair, moves the old `#agent` key to
+     * `#retired-agent-{sequence}`, installs the new key as `#agent`, publishes
+     * the updated DID document, and returns a new `Identity` handle.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Identity` if:
+     * - The identity has no agent key to rotate
+     * - No in-memory custody is available (feature-gated)
+     * - Key generation or DHT publishing fails
+     *
+     * See ADR-039 acceptance criterion 4.
+     */
+open func rotateAgentKey()async throws  -> Identity  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_identity_rotate_agent_key(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeIdentity_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
 }
     
     /**
@@ -1321,6 +1574,190 @@ public func FfiConverterTypeUcanToken_lower(_ value: UcanToken) -> UnsafeMutable
 }
 
 
+
+
+/**
+ * Result of attestation verification.
+ */
+public struct AttestationVerificationResult {
+    /**
+     * Whether the attestation is valid.
+     */
+    public var valid: Bool
+    /**
+     * Chain depth (1 for a single attestation).
+     */
+    public var chainDepth: UInt32
+    /**
+     * Error message if verification failed, empty string if valid.
+     */
+    public var errorMessage: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Whether the attestation is valid.
+         */valid: Bool, 
+        /**
+         * Chain depth (1 for a single attestation).
+         */chainDepth: UInt32, 
+        /**
+         * Error message if verification failed, empty string if valid.
+         */errorMessage: String) {
+        self.valid = valid
+        self.chainDepth = chainDepth
+        self.errorMessage = errorMessage
+    }
+}
+
+#if compiler(>=6)
+extension AttestationVerificationResult: Sendable {}
+#endif
+
+
+extension AttestationVerificationResult: Equatable, Hashable {
+    public static func ==(lhs: AttestationVerificationResult, rhs: AttestationVerificationResult) -> Bool {
+        if lhs.valid != rhs.valid {
+            return false
+        }
+        if lhs.chainDepth != rhs.chainDepth {
+            return false
+        }
+        if lhs.errorMessage != rhs.errorMessage {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(valid)
+        hasher.combine(chainDepth)
+        hasher.combine(errorMessage)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAttestationVerificationResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AttestationVerificationResult {
+        return
+            try AttestationVerificationResult(
+                valid: FfiConverterBool.read(from: &buf), 
+                chainDepth: FfiConverterUInt32.read(from: &buf), 
+                errorMessage: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AttestationVerificationResult, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.valid, into: &buf)
+        FfiConverterUInt32.write(value.chainDepth, into: &buf)
+        FfiConverterString.write(value.errorMessage, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAttestationVerificationResult_lift(_ buf: RustBuffer) throws -> AttestationVerificationResult {
+    return try FfiConverterTypeAttestationVerificationResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAttestationVerificationResult_lower(_ value: AttestationVerificationResult) -> RustBuffer {
+    return FfiConverterTypeAttestationVerificationResult.lower(value)
+}
+
+
+/**
+ * Result of creating a challenge request.
+ */
+public struct ChallengeResult {
+    /**
+     * The unique challenge ID (UUID v4).
+     */
+    public var challengeId: String
+    /**
+     * The serialized challenge request (JSON).
+     */
+    public var challengeJson: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The unique challenge ID (UUID v4).
+         */challengeId: String, 
+        /**
+         * The serialized challenge request (JSON).
+         */challengeJson: String) {
+        self.challengeId = challengeId
+        self.challengeJson = challengeJson
+    }
+}
+
+#if compiler(>=6)
+extension ChallengeResult: Sendable {}
+#endif
+
+
+extension ChallengeResult: Equatable, Hashable {
+    public static func ==(lhs: ChallengeResult, rhs: ChallengeResult) -> Bool {
+        if lhs.challengeId != rhs.challengeId {
+            return false
+        }
+        if lhs.challengeJson != rhs.challengeJson {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(challengeId)
+        hasher.combine(challengeJson)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeChallengeResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ChallengeResult {
+        return
+            try ChallengeResult(
+                challengeId: FfiConverterString.read(from: &buf), 
+                challengeJson: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ChallengeResult, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.challengeId, into: &buf)
+        FfiConverterString.write(value.challengeJson, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeChallengeResult_lift(_ buf: RustBuffer) throws -> ChallengeResult {
+    return try FfiConverterTypeChallengeResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeChallengeResult_lower(_ value: ChallengeResult) -> RustBuffer {
+    return FfiConverterTypeChallengeResult.lower(value)
+}
 
 
 /**
@@ -2452,7 +2889,7 @@ public struct TrustInput {
      */
     public var verifiedAttestationCount: UInt32
     /**
-     * Participation count from the behavioral record.
+     * Participation count from the participation record.
      */
     public var participationCount: UInt64
     /**
@@ -2477,7 +2914,7 @@ public struct TrustInput {
          * Number of verified attestations from independent attestors.
          */verifiedAttestationCount: UInt32, 
         /**
-         * Participation count from the behavioral record.
+         * Participation count from the participation record.
          */participationCount: UInt64, 
         /**
          * Number of triggered consequence rules in the evaluation window.
@@ -2573,6 +3010,109 @@ public func FfiConverterTypeTrustInput_lift(_ buf: RustBuffer) throws -> TrustIn
 #endif
 public func FfiConverterTypeTrustInput_lower(_ value: TrustInput) -> RustBuffer {
     return FfiConverterTypeTrustInput.lower(value)
+}
+
+
+/**
+ * Result of a trust score query.
+ *
+ * Contains participation-derived event counts and a normalized composite
+ * score for convenience. The trust engine does not produce authoritative
+ * scores — agents apply their own criteria to these inputs.
+ */
+public struct TrustScoreResult {
+    /**
+     * Number of message events attributed to the DID.
+     */
+    public var messageCount: UInt64
+    /**
+     * Number of governance action events attributed to the DID.
+     */
+    public var governanceCount: UInt64
+    /**
+     * Normalized composite score (0.0–1.0) based on total participation.
+     */
+    public var compositeScore: Double
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Number of message events attributed to the DID.
+         */messageCount: UInt64, 
+        /**
+         * Number of governance action events attributed to the DID.
+         */governanceCount: UInt64, 
+        /**
+         * Normalized composite score (0.0–1.0) based on total participation.
+         */compositeScore: Double) {
+        self.messageCount = messageCount
+        self.governanceCount = governanceCount
+        self.compositeScore = compositeScore
+    }
+}
+
+#if compiler(>=6)
+extension TrustScoreResult: Sendable {}
+#endif
+
+
+extension TrustScoreResult: Equatable, Hashable {
+    public static func ==(lhs: TrustScoreResult, rhs: TrustScoreResult) -> Bool {
+        if lhs.messageCount != rhs.messageCount {
+            return false
+        }
+        if lhs.governanceCount != rhs.governanceCount {
+            return false
+        }
+        if lhs.compositeScore != rhs.compositeScore {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(messageCount)
+        hasher.combine(governanceCount)
+        hasher.combine(compositeScore)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTrustScoreResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TrustScoreResult {
+        return
+            try TrustScoreResult(
+                messageCount: FfiConverterUInt64.read(from: &buf), 
+                governanceCount: FfiConverterUInt64.read(from: &buf), 
+                compositeScore: FfiConverterDouble.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TrustScoreResult, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.messageCount, into: &buf)
+        FfiConverterUInt64.write(value.governanceCount, into: &buf)
+        FfiConverterDouble.write(value.compositeScore, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTrustScoreResult_lift(_ buf: RustBuffer) throws -> TrustScoreResult {
+    return try FfiConverterTypeTrustScoreResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTrustScoreResult_lower(_ value: TrustScoreResult) -> RustBuffer {
+    return FfiConverterTypeTrustScoreResult.lower(value)
 }
 
 
@@ -5077,6 +5617,186 @@ public func uniffiForeignFutureHandleCountScp() -> Int {
     UNIFFI_FOREIGN_FUTURE_HANDLE_MAP.count
 }
 /**
+ * Returns the broadcast admission policy for a context.
+ *
+ * Returns the policy as a string: `"Open"` or `"Gated"`.
+ * Returns `None` if the context is not a broadcast context.
+ */
+public func broadcastAdmission(handle: ContextHandle)async  -> String?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_broadcast_admission(FfiConverterTypeContextHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionString.lift,
+            errorHandler: nil
+            
+        )
+}
+/**
+ * Blocks a subscriber's read access in a broadcast context.
+ *
+ * The subscriber is removed from the registry and added to all authors'
+ * block lists; all author keys are rotated.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Context` if the operation fails.
+ */
+public func broadcastBlockSubscriber(handle: ContextHandle, subscriberDid: String, blockerDid: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_broadcast_block_subscriber(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(subscriberDid),FfiConverterString.lower(blockerDid)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Handles a broadcast key request from a subscriber.
+ *
+ * Validates the author DID is locally controlled and processes the key
+ * distribution request.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Context` if the operation fails.
+ */
+public func broadcastHandleKeyRequest(handle: ContextHandle, authorDid: String, requesterDid: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_broadcast_handle_key_request(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(authorDid),FfiConverterString.lower(requesterDid)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Returns `true` if the given DID is a broadcast subscriber.
+ */
+public func broadcastIsSubscriber(handle: ContextHandle, did: String)async  -> Bool  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_broadcast_is_subscriber(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(did)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: nil
+            
+        )
+}
+/**
+ * Publishes a message to a broadcast context.
+ *
+ * The payload is encrypted with the author's broadcast key.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Context` if the context is not active, not broadcast,
+ * or the sender is not an author.
+ */
+public func broadcastPublish(handle: ContextHandle, authorDid: String, payload: Data)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_broadcast_publish(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(authorDid),FfiConverterData.lower(payload)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Subscribes a DID to a broadcast context.
+ *
+ * For open broadcast contexts, any DID can subscribe. For gated contexts,
+ * a valid `messagesRead` UCAN is required (passed as `ucan_token` JSON).
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Context` if the context is not active, not a
+ * broadcast context, or if subscription fails.
+ */
+public func broadcastSubscribe(handle: ContextHandle, subscriberDid: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_broadcast_subscribe(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(subscriberDid)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Returns the number of broadcast subscribers for a context.
+ *
+ * Returns `None` if the context is not registered or not a broadcast context.
+ */
+public func broadcastSubscriberCount(handle: ContextHandle)async  -> UInt64?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_broadcast_subscriber_count(FfiConverterTypeContextHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+/**
+ * Unsubscribes a DID from a broadcast context.
+ *
+ * When `rotate_keys` is `true`, all authors rotate their broadcast keys
+ * for forward secrecy.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Context` if the context is not active or not broadcast.
+ */
+public func broadcastUnsubscribe(handle: ContextHandle, subscriberDid: String, rotateKeys: Bool)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_broadcast_unsubscribe(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(subscriberDid),FfiConverterBool.lower(rotateKeys)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
  * Closes an SCP context.
  *
  * Initiates the cooperative closing window: notifies members, generates
@@ -5139,6 +5859,68 @@ public func contextCreate(identity: Identity, params: ContextParams)async throws
         )
 }
 /**
+ * Drains all pending events from the context's receive buffer.
+ *
+ * Returns a list of event descriptions as JSON strings. Returns empty
+ * if the context is not registered.
+ */
+public func contextDrainEvents(handle: ContextHandle)async  -> [String]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_context_drain_events(FfiConverterTypeContextHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceString.lift,
+            errorHandler: nil
+            
+        )
+}
+/**
+ * Handles TTL expiry for a context.
+ *
+ * Transitions from `Active` to `Expired`, destroys keys per memory scope.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Context` if the context is not active.
+ */
+public func contextHandleTtlExpiry(handle: ContextHandle)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_context_handle_ttl_expiry(FfiConverterTypeContextHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Returns `true` if the given DID is a member of the context.
+ */
+public func contextIsMember(handle: ContextHandle, did: String)async  -> Bool  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_context_is_member(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(did)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: nil
+            
+        )
+}
+/**
  * Joins an existing SCP context.
  *
  * # Arguments
@@ -5190,6 +5972,108 @@ public func contextLeave(handle: ContextHandle, identity: Identity)async throws 
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Returns the current member count for a context.
+ *
+ * Returns `None` if the context is not registered.
+ */
+public func contextMemberCount(handle: ContextHandle)async  -> UInt64?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_context_member_count(FfiConverterTypeContextHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+/**
+ * Returns all member DIDs for a context.
+ */
+public func contextMemberDids(handle: ContextHandle)async  -> [String]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_context_member_dids(FfiConverterTypeContextHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceString.lift,
+            errorHandler: nil
+            
+        )
+}
+/**
+ * Returns the role assignment for a specific member as a JSON string.
+ *
+ * Returns `None` if the member is not found or the context is not registered.
+ */
+public func contextMemberRole(handle: ContextHandle, did: String)async  -> String?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_context_member_role(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(did)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionString.lift,
+            errorHandler: nil
+            
+        )
+}
+/**
+ * Proposes a TTL extension. Records consent from the given member.
+ *
+ * Returns `true` if all members have consented (unanimous approval).
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Context` if the context is not registered or the
+ * member is not found.
+ */
+public func contextProposeTtlExtension(handle: ContextHandle, memberDid: String, proposedSeconds: UInt64)async throws  -> Bool  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_context_propose_ttl_extension(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(memberDid),FfiConverterUInt64.lower(proposedSeconds)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Resets the TTL timer after a successful unanimous extension.
+ *
+ * Cancels the old timer and spawns a new one with the given duration.
+ */
+public func contextResetTtlTimer(handle: ContextHandle, newSeconds: UInt64)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_context_reset_ttl_timer(FfiConverterTypeContextHandle_lower(handle),FfiConverterUInt64.lower(newSeconds)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
         )
 }
 /**
@@ -5253,6 +6137,32 @@ public func contextSubscribe(handle: ContextHandle, listener: MessageListener)as
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeScpError_lift
         )
+}
+/**
+ * Evaluates the provenance quality tier for data with the given parameters.
+ *
+ * Returns an integer (0-3) representing the quality tier:
+ * - `0` = `NoProvenance`
+ * - `1` = `EphemeralKnownParties`
+ * - `2` = `SummaryVerified`
+ * - `3` = `PersistentVerifiable`
+ *
+ * See spec §24.5 and ADR-019.
+ *
+ * # Errors
+ *
+ * Returns [`ScpError::Validation`] if `source_type` or `context_state`
+ * contain unrecognized values.
+ */
+public func evaluateProvenanceQuality(sourceContext: String?, sourceType: String, contextState: String, counterparties: [String])throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_evaluate_provenance_quality(
+        FfiConverterOptionString.lower(sourceContext),
+        FfiConverterString.lower(sourceType),
+        FfiConverterString.lower(contextState),
+        FfiConverterSequenceString.lower(counterparties),$0
+    )
+})
 }
 /**
  * Queries the context event log with optional filter criteria.
@@ -5324,6 +6234,38 @@ public func eventLogVerify(handle: ContextHandle, claimJson: String)async throws
         )
 }
 /**
+ * Executes an approved governance action on a context.
+ *
+ * The `proposal_json` must be a JSON-serialized `GovernanceProposal` with
+ * status `Approved`. All 24 governance action variants (ADR-031) are
+ * supported.
+ *
+ * # Arguments
+ *
+ * * `handle` — The context handle.
+ * * `proposal_json` — JSON-serialized `GovernanceProposal`.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Permission` if the proposal is not approved, targets
+ * the wrong context, or has already been executed (replay protection).
+ * Returns `ScpError::Context` for any other governance execution failure.
+ */
+public func governanceExecute(handle: ContextHandle, proposalJson: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_governance_execute(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(proposalJson)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
  * Creates a new DID identity with the specified custody method.
  *
  * # Arguments
@@ -5353,7 +6295,7 @@ public func eventLogVerify(handle: ContextHandle, claimJson: String)async throws
  *
  * When `custody` is `"in_memory"` and the `allow_in_memory_custody` feature
  * is enabled, this function creates a real `did:dht` identity using
- * [`scp_core::identity::DidDht`] backed by `InMemoryKeyCustody`. The
+ * [`scp_identity::DidDht`] backed by `InMemoryKeyCustody`. The
  * returned DID is self-certifying and has the `did:dht:z` prefix.
  *
  * `"in_memory"` custody stores key material in unprotected heap memory.
@@ -5436,6 +6378,44 @@ public func identityResolve(did: String)async throws  -> DidDocument  {
         )
 }
 /**
+ * Returns `true` if the given DID is registered as locally controlled.
+ */
+public func isLocalDid(did: String)async  -> Bool  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_is_local_did(FfiConverterString.lower(did)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: nil
+            
+        )
+}
+/**
+ * Registers a DID as locally controlled by this node/SDK.
+ *
+ * Used for defense-in-depth validation in broadcast key request handling.
+ */
+public func registerLocalDid(did: String)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_register_local_did(FfiConverterString.lower(did)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+/**
  * Waits for all outstanding FFI handles to be released, then shuts down.
  *
  * Call this from Swift/Kotlin before your process exits or before tearing
@@ -5503,6 +6483,38 @@ public func toolInvoke(handle: ContextHandle, toolId: String, inputJson: String,
         )
 }
 /**
+ * Invokes a tool across context boundaries.
+ *
+ * Validates chain depth per spec section 6.2 (max 3 hops).
+ *
+ * # Arguments
+ *
+ * * `source_handle` — The calling context.
+ * * `target_handle` — The context containing the tool.
+ * * `tool_id` — The tool to invoke.
+ * * `input_json` — Tool input as a JSON string.
+ * * `identity` — The invoker's identity.
+ * * `chain_depth` — Current chain depth (0 for first hop).
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Tool` if chain depth exceeded or contexts not active.
+ */
+public func toolInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: ContextHandle, toolId: String, inputJson: String, identity: Identity, chainDepth: UInt8)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_tool_invoke_cross_context(FfiConverterTypeContextHandle_lower(sourceHandle),FfiConverterTypeContextHandle_lower(targetHandle),FfiConverterString.lower(toolId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterUInt8.lower(chainDepth)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
  * Registers a tool in an SCP context.
  *
  * # Arguments
@@ -5524,6 +6536,73 @@ public func toolRegister(handle: ContextHandle, definition: ToolDefinition)async
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_func_tool_register(FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeToolDefinition_lower(definition)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Closes a stateful tool session.
+ *
+ * Removes the session from the store, releasing the caller's session slot.
+ */
+public func toolSessionClose(handle: ContextHandle, sessionId: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_tool_session_close(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(sessionId)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Creates a stateful tool session.
+ *
+ * Sessions enable multi-turn workflows with TTL and per-caller caps
+ * (default: 5 concurrent sessions per caller, per spec section 6.2.1).
+ *
+ * # Returns
+ *
+ * The session ID (UUID string).
+ */
+public func toolSessionCreate(handle: ContextHandle, toolId: String, sourceContextId: String, ttlSeconds: UInt64)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_tool_session_create(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(toolId),FfiConverterString.lower(sourceContextId),FfiConverterUInt64.lower(ttlSeconds)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Invokes a tool within an active session.
+ *
+ * Each call is individually governed. Session state is carried forward
+ * and the call count is incremented on success.
+ *
+ * # Returns
+ *
+ * The tool output as a JSON string.
+ */
+public func toolSessionInvoke(handle: ContextHandle, sessionId: String, inputJson: String, identity: Identity)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_tool_session_invoke(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(sessionId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
@@ -5613,6 +6692,57 @@ public func transportStatus(manager: TransportManager)async throws  -> Transport
             liftFunc: FfiConverterTypeTransportStatus_lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
+}
+/**
+ * Creates a challenge request for capability verification.
+ *
+ * See ADR-017 Layer 3 (Challenge-Response).
+ */
+public func trustCreateChallenge(targetDid: String)throws  -> ChallengeResult  {
+    return try  FfiConverterTypeChallengeResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_trust_create_challenge(
+        FfiConverterString.lower(targetDid),$0
+    )
+})
+}
+/**
+ * Queries participation-based trust data for a DID within a context.
+ *
+ * See ADR-017 Layer 2 (Participation).
+ */
+public func trustQueryScore(did: String, contextId: String)throws  -> TrustScoreResult  {
+    return try  FfiConverterTypeTrustScoreResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_trust_query_score(
+        FfiConverterString.lower(did),
+        FfiConverterString.lower(contextId),$0
+    )
+})
+}
+/**
+ * Verifies an attestation's Ed25519 signature, evidence, expiry, and
+ * revocation status.
+ *
+ * See ADR-017 Layer 3 (Attestation).
+ */
+public func trustVerifyAttestation(attestationJson: String)throws  -> AttestationVerificationResult  {
+    return try  FfiConverterTypeAttestationVerificationResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_trust_verify_attestation(
+        FfiConverterString.lower(attestationJson),$0
+    )
+})
+}
+/**
+ * Verifies a challenge response against its original challenge request.
+ *
+ * See ADR-017 Layer 3 (Challenge-Response).
+ */
+public func trustVerifyResponse(challengeJson: String, responseJson: String)throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_trust_verify_response(
+        FfiConverterString.lower(challengeJson),
+        FfiConverterString.lower(responseJson),$0
+    )
+})
 }
 /**
  * Mints a new UCAN token for a context member with real Ed25519 signing.
@@ -5748,10 +6878,43 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_admission() != 35635) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_block_subscriber() != 14388) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_handle_key_request() != 49269) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_is_subscriber() != 6475) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_publish() != 38105) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_subscribe() != 51819) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_subscriber_count() != 44888) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_unsubscribe() != 49698) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_func_context_close() != 27411) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_context_create() != 28748) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_drain_events() != 18382) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_handle_ttl_expiry() != 13868) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_is_member() != 64785) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_context_join() != 63640) {
@@ -5760,10 +6923,28 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_context_leave() != 33485) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_member_count() != 37326) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_member_dids() != 8361) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_member_role() != 16107) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_propose_ttl_extension() != 19380) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_reset_ttl_timer() != 64326) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_func_context_send() != 19747) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_context_subscribe() != 40434) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_evaluate_provenance_quality() != 60373) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_event_log_query() != 3128) {
@@ -5772,7 +6953,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_event_log_verify() != 52809) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_create() != 20789) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_governance_execute() != 62327) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_identity_create() != 17470) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_identity_load() != 36247) {
@@ -5781,13 +6965,31 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_identity_resolve() != 4675) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_func_is_local_did() != 887) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_register_local_did() != 587) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_func_scp_shutdown() != 6072) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_tool_invoke() != 54094) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_func_tool_invoke_cross_context() != 8649) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_func_tool_register() != 20572) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_tool_session_close() != 13245) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_tool_session_create() != 34176) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_tool_session_invoke() != 35068) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_tool_verify() != 15916) {
@@ -5797,6 +6999,18 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_transport_status() != 40821) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_trust_create_challenge() != 37813) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_trust_query_score() != 29292) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_trust_verify_attestation() != 50772) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_trust_verify_response() != 47639) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_ucan_mint() != 26230) {
@@ -5817,10 +7031,25 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_state() != 51972) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_identity_add_agent_key() != 41639) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_custody_type() != 7777) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_did() != 6016) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_identity_get_agent_public_key() != 3768) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_identity_has_agent_key() != 16136) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_identity_remove_agent_key() != 20170) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_identity_rotate_agent_key() != 65044) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_rotate_key() != 49701) {

@@ -33,6 +33,74 @@ use super::memory_scope::{
     BlobId, ContextId, KeyDestructionLevel, KeyDestructionOrchestrator, KeyDestructionResult,
 };
 use super::{ContextError, MemoryScope};
+use scp_identity::DID;
+
+// ---------------------------------------------------------------------------
+// IncompleteVerificationPolicy
+// ---------------------------------------------------------------------------
+
+/// Policy controlling what happens when the summary verification window TTL
+/// expires before all members have verified.
+///
+/// Set at context creation in [`ContextParams`] and consumed by the close
+/// orchestrator. Defaults to [`Proceed`](IncompleteVerificationPolicy::Proceed)
+/// if not specified.
+///
+/// See spec §5.11 and issue #365.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum IncompleteVerificationPolicy {
+    /// Proceed with close even if not all members verified.
+    #[default]
+    Proceed,
+    /// Extend the verification window by the specified number of seconds.
+    ExtendWindow {
+        /// Number of seconds to extend the deadline by.
+        duration_secs: u64,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// DisputeAction
+// ---------------------------------------------------------------------------
+
+/// Action taken by an admin or governance vote to resolve a disputed summary.
+///
+/// See issue #365.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisputeAction {
+    /// Accept the current summary and proceed with close.
+    Proceed,
+    /// Replace the summary with a revised version and re-open verification.
+    Revise {
+        /// The replacement summary (JSON value).
+        new_summary: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// VerificationState
+// ---------------------------------------------------------------------------
+
+/// Internal state of the summary verification window.
+///
+/// Tracks whether verification is proceeding normally or has been disputed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerificationState {
+    /// Normal verification in progress.
+    Verifying,
+    /// A member has disputed the summary. Awaiting resolution.
+    Disputed {
+        /// DID of the member who rejected the summary.
+        rejector_did: DID,
+        /// Reason for the rejection.
+        reason: String,
+    },
+    /// Dispute resolved (either proceeded or revised).
+    Resolved {
+        /// The action taken to resolve the dispute.
+        action: DisputeAction,
+    },
+}
 
 // ---------------------------------------------------------------------------
 // ContextCloseReason
@@ -98,6 +166,10 @@ pub struct SummaryVerificationWindow {
     verified_by: HashSet<String>,
     /// Total member count at the time the window was opened.
     member_count: usize,
+    /// Current state of the verification window.
+    state: VerificationState,
+    /// Policy for handling incomplete verification at TTL expiry.
+    incomplete_policy: IncompleteVerificationPolicy,
 }
 
 impl SummaryVerificationWindow {
@@ -116,12 +188,33 @@ impl SummaryVerificationWindow {
         duration_secs: u64,
         member_count: usize,
     ) -> Self {
+        Self::with_policy(
+            context_id,
+            opened_at,
+            duration_secs,
+            member_count,
+            IncompleteVerificationPolicy::default(),
+        )
+    }
+
+    /// Creates a new verification window with a specific incomplete
+    /// verification policy.
+    #[must_use]
+    pub fn with_policy(
+        context_id: ContextId,
+        opened_at: u64,
+        duration_secs: u64,
+        member_count: usize,
+        incomplete_policy: IncompleteVerificationPolicy,
+    ) -> Self {
         Self {
             context_id,
             opened_at,
             deadline: opened_at.saturating_add(duration_secs),
             verified_by: HashSet::new(),
             member_count,
+            state: VerificationState::Verifying,
+            incomplete_policy,
         }
     }
 
@@ -142,6 +235,12 @@ impl SummaryVerificationWindow {
     ) -> Result<bool, ContextError> {
         if now >= self.deadline {
             return Err(ContextError::ContextClosed);
+        }
+        if self.state != VerificationState::Verifying {
+            return Err(ContextError::InvalidState(format!(
+                "cannot verify summary: window is in {:?} state, expected Verifying",
+                self.state
+            )));
         }
         Ok(self.verified_by.insert(participant_did.to_owned()))
     }
@@ -187,6 +286,103 @@ impl SummaryVerificationWindow {
     pub const fn verified_participants(&self) -> &HashSet<String> {
         &self.verified_by
     }
+
+    /// Returns the current verification state.
+    #[must_use]
+    pub const fn state(&self) -> &VerificationState {
+        &self.state
+    }
+
+    /// Returns the incomplete verification policy.
+    #[must_use]
+    pub const fn incomplete_policy(&self) -> IncompleteVerificationPolicy {
+        self.incomplete_policy
+    }
+
+    /// Rejects the summary, transitioning the window to the `Disputed` state.
+    ///
+    /// A member calls this when they believe the summary does not accurately
+    /// reflect the context's event log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextClosed`] if the verification window
+    /// has already closed.
+    /// Returns [`ContextError::InvalidState`] if the window is not in the
+    /// `Verifying` state (already disputed or resolved).
+    pub fn reject(
+        &mut self,
+        member_did: &DID,
+        reason: String,
+        now: u64,
+    ) -> Result<(), ContextError> {
+        if now >= self.deadline {
+            return Err(ContextError::ContextClosed);
+        }
+        if self.state != VerificationState::Verifying {
+            return Err(ContextError::InvalidState(format!(
+                "cannot reject summary: window is in {:?} state, expected Verifying",
+                self.state
+            )));
+        }
+        self.state = VerificationState::Disputed {
+            rejector_did: member_did.clone(),
+            reason,
+        };
+        Ok(())
+    }
+
+    /// Resolves a dispute, either proceeding with the current summary or
+    /// replacing it with a revised version.
+    ///
+    /// For `DisputeAction::Revise`, the window resets: `verified_by` is cleared,
+    /// the deadline is extended by the original window duration, and the state
+    /// returns to `Verifying` so members can verify the new summary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::InvalidState`] if the window is not in the
+    /// `Disputed` state.
+    pub fn resolve_dispute(&mut self, action: DisputeAction, now: u64) -> Result<(), ContextError> {
+        if !matches!(self.state, VerificationState::Disputed { .. }) {
+            return Err(ContextError::InvalidState(format!(
+                "cannot resolve dispute: window is in {:?} state, expected Disputed",
+                self.state
+            )));
+        }
+        match action {
+            action @ DisputeAction::Proceed => {
+                self.state = VerificationState::Resolved { action };
+            }
+            DisputeAction::Revise { .. } => {
+                // Re-open verification: clear votes, extend deadline, return to Verifying.
+                self.verified_by.clear();
+                let original_duration = self.deadline.saturating_sub(self.opened_at);
+                self.deadline = now.saturating_add(original_duration);
+                self.opened_at = now;
+                self.state = VerificationState::Verifying;
+            }
+        }
+        Ok(())
+    }
+
+    /// Handles TTL expiry according to the incomplete verification policy.
+    ///
+    /// Returns `true` if the window should proceed to close (policy is
+    /// `Proceed`). Returns `false` if the window was extended (policy is
+    /// `ExtendWindow`).
+    pub const fn handle_ttl_expiry(&mut self, now: u64) -> bool {
+        if !self.is_window_closed(now) {
+            return false;
+        }
+        match self.incomplete_policy {
+            IncompleteVerificationPolicy::Proceed => true,
+            IncompleteVerificationPolicy::ExtendWindow { duration_secs } => {
+                self.deadline = now.saturating_add(duration_secs);
+                false
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +420,22 @@ pub enum CloseEvent {
         participant_did: String,
         /// Unix timestamp when the verification was recorded.
         verified_at: u64,
+    },
+    /// A participant rejected the summary during the verification window.
+    SummaryRejected {
+        /// The DID of the rejecting participant.
+        rejector_did: String,
+        /// The rejection reason.
+        reason: String,
+        /// Unix timestamp when the rejection was recorded.
+        rejected_at: u64,
+    },
+    /// A summary dispute was resolved.
+    SummaryDisputeResolved {
+        /// The action taken to resolve the dispute.
+        action: DisputeAction,
+        /// Unix timestamp when the dispute was resolved.
+        resolved_at: u64,
     },
     /// Keys have been destroyed (Ephemeral or Summary post-window).
     KeysDestroyed {
@@ -534,7 +746,11 @@ mod tests {
             Ok(())
         }
 
-        fn validate_key_package(&self, _owner_did: &str) -> Result<(), ContextError> {
+        fn validate_key_package(
+            &self,
+            _owner_did: &str,
+            _key_package_bytes: Option<&[u8]>,
+        ) -> Result<(), ContextError> {
             Ok(())
         }
 
@@ -542,6 +758,7 @@ mod tests {
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
+            _key_package_bytes: Option<&[u8]>,
         ) -> Result<(), ContextError> {
             Ok(())
         }
@@ -575,6 +792,8 @@ mod tests {
             _context_id: &[u8; 32],
             _sender_did: &str,
             _payload: &[u8],
+            _epoch: u64,
+            _sequence: u64,
         ) -> Result<Vec<u8>, ContextError> {
             Ok(vec![])
         }
@@ -1288,5 +1507,169 @@ mod tests {
         assert_eq!(result.deletion_requests.len(), 1);
         assert!(crypto.mls_destroyed.load(Ordering::SeqCst));
         assert!(crypto.sender_key_destroyed.load(Ordering::SeqCst));
+    }
+
+    // -----------------------------------------------------------------------
+    // Dispute resolution tests (#365)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn verify_then_close_succeeds_happy_path() {
+        let mut window = SummaryVerificationWindow::new("ctx-dispute-1".to_owned(), 1000, 300, 2);
+        window.verify_summary("did:dht:alice", 1100).unwrap();
+        window.verify_summary("did:dht:bob", 1150).unwrap();
+        assert_eq!(window.verification_count(), 2);
+        assert_eq!(*window.state(), VerificationState::Verifying);
+    }
+
+    #[test]
+    fn reject_transitions_to_disputed_state() {
+        let mut window = SummaryVerificationWindow::new("ctx-dispute-2".to_owned(), 1000, 300, 2);
+        let did = DID::from("did:dht:alice");
+        window
+            .reject(&did, "missing events".to_owned(), 1100)
+            .unwrap();
+        match window.state() {
+            VerificationState::Disputed {
+                rejector_did,
+                reason,
+            } => {
+                assert_eq!(rejector_did, &did);
+                assert_eq!(reason, "missing events");
+            }
+            _ => panic!("expected Disputed state"),
+        }
+    }
+
+    #[test]
+    fn reject_after_window_closed_fails() {
+        let mut window = SummaryVerificationWindow::new("ctx-dispute-3".to_owned(), 1000, 300, 2);
+        let did = DID::from("did:dht:alice");
+        let result = window.reject(&did, "too late".to_owned(), 1400);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn reject_while_already_disputed_fails() {
+        let mut window = SummaryVerificationWindow::new("ctx-dispute-4".to_owned(), 1000, 300, 2);
+        let did1 = DID::from("did:dht:alice");
+        let did2 = DID::from("did:dht:bob");
+        window
+            .reject(&did1, "bad summary".to_owned(), 1100)
+            .unwrap();
+        let result = window.reject(&did2, "also bad".to_owned(), 1100);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_dispute_proceed_transitions_to_resolved() {
+        let mut window = SummaryVerificationWindow::new("ctx-dispute-5".to_owned(), 1000, 300, 2);
+        let did = DID::from("did:dht:alice");
+        window.reject(&did, "bad".to_owned(), 1100).unwrap();
+        window
+            .resolve_dispute(DisputeAction::Proceed, 1150)
+            .unwrap();
+        match window.state() {
+            VerificationState::Resolved { action } => {
+                assert_eq!(*action, DisputeAction::Proceed);
+            }
+            _ => panic!("expected Resolved state"),
+        }
+    }
+
+    #[test]
+    fn resolve_dispute_revise_resets_window() {
+        let mut window = SummaryVerificationWindow::new("ctx-dispute-6".to_owned(), 1000, 300, 2);
+        let did = DID::from("did:dht:alice");
+        window.verify_summary("did:dht:bob", 1050).unwrap();
+        assert_eq!(window.verification_count(), 1);
+
+        window.reject(&did, "wrong".to_owned(), 1100).unwrap();
+        window
+            .resolve_dispute(
+                DisputeAction::Revise {
+                    new_summary: "revised summary".to_owned(),
+                },
+                1200,
+            )
+            .unwrap();
+
+        // Should be back to Verifying with cleared votes and extended deadline.
+        assert_eq!(*window.state(), VerificationState::Verifying);
+        assert_eq!(window.verification_count(), 0);
+        // Deadline should be 1200 + 300 = 1500 (original duration re-applied).
+        assert_eq!(window.deadline(), 1500);
+    }
+
+    #[test]
+    fn resolve_dispute_when_not_disputed_fails() {
+        let mut window = SummaryVerificationWindow::new("ctx-dispute-7".to_owned(), 1000, 300, 2);
+        let result = window.resolve_dispute(DisputeAction::Proceed, 1100);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn ttl_expiry_with_proceed_policy_returns_true() {
+        let mut window = SummaryVerificationWindow::new("ctx-ttl-1".to_owned(), 1000, 300, 2);
+        assert!(window.handle_ttl_expiry(1300));
+    }
+
+    #[test]
+    fn ttl_expiry_with_extend_policy_extends_deadline() {
+        let mut window = SummaryVerificationWindow::with_policy(
+            "ctx-ttl-2".to_owned(),
+            1000,
+            300,
+            2,
+            IncompleteVerificationPolicy::ExtendWindow { duration_secs: 60 },
+        );
+        assert!(!window.handle_ttl_expiry(1300));
+        assert_eq!(window.deadline(), 1360);
+    }
+
+    #[test]
+    fn ttl_expiry_before_deadline_is_noop() {
+        let mut window = SummaryVerificationWindow::new("ctx-ttl-3".to_owned(), 1000, 300, 2);
+        assert!(!window.handle_ttl_expiry(1100));
+    }
+
+    #[test]
+    fn reject_then_proceed_then_verify_succeeds() {
+        // Full flow: reject -> admin proceeds -> verify succeeds.
+        let mut window = SummaryVerificationWindow::new("ctx-flow-1".to_owned(), 1000, 300, 2);
+        let did = DID::from("did:dht:alice");
+        window.reject(&did, "incomplete".to_owned(), 1100).unwrap();
+        window
+            .resolve_dispute(DisputeAction::Proceed, 1150)
+            .unwrap();
+        // After Proceed resolution, window is in Resolved state.
+        // Verification shouldn't be possible once resolved.
+        assert!(matches!(
+            *window.state(),
+            VerificationState::Resolved { .. }
+        ));
+    }
+
+    #[test]
+    fn reject_then_revise_then_verify_then_close() {
+        let mut window = SummaryVerificationWindow::new("ctx-flow-2".to_owned(), 1000, 300, 2);
+        let did = DID::from("did:dht:alice");
+        window
+            .reject(&did, "missing data".to_owned(), 1100)
+            .unwrap();
+        window
+            .resolve_dispute(
+                DisputeAction::Revise {
+                    new_summary: "corrected".to_owned(),
+                },
+                1200,
+            )
+            .unwrap();
+
+        // Now we're back in Verifying state, can verify the new summary.
+        window.verify_summary("did:dht:alice", 1300).unwrap();
+        window.verify_summary("did:dht:bob", 1350).unwrap();
+        assert_eq!(window.verification_count(), 2);
+        assert_eq!(*window.state(), VerificationState::Verifying);
     }
 }

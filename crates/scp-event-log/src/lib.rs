@@ -18,7 +18,7 @@
 //!
 //! - [`EventLog`] -- The append-only Merkle tree per context.
 //! - [`Event`] -- A protocol event with actor, type, payload, and signature.
-//! - [`EventType`] -- The 25 event type variants.
+//! - [`EventType`] -- The 33 event type variants.
 //! - [`EventPayload`] -- Type-specific event data.
 //! - [`EventLogError`] -- Error type for event log operations.
 //! - [`EventLogSigner`] -- Trait abstracting signing for checkpoint generation.
@@ -87,10 +87,15 @@ pub trait EventLogSigner: Send + Sync {
 // EventType
 // ---------------------------------------------------------------------------
 
-/// The 25 event type variants for SCP context event logs.
+/// The 33 event type variants for SCP context event logs.
 ///
 /// Every protocol action that mutates context state is represented as one of
-/// these variants. See ADR-011 for the full enumeration.
+/// these variants. See ADR-011 for the base enumeration and ADR-031 for
+/// the 8 governance-specific event types.
+///
+/// Governance event payloads are serialized into [`EventPayload`]. The
+/// payload fields for each governance event type are documented below;
+/// producers serialize them as `MessagePack` into `EventPayload::data`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventType {
     /// Context was created.
@@ -121,7 +126,8 @@ pub enum EventType {
     ToolVerified,
     /// A tool interface was established.
     ToolInterfaceEstablished,
-    /// A governance action was executed.
+    /// A governance action was executed (legacy variant, see also
+    /// `GovernanceActionExecuted`).
     GovernanceAction,
     /// A consistency checkpoint was generated.
     ConsistencyCheckpoint,
@@ -144,6 +150,48 @@ pub enum EventType {
     SpendingUcanGranted,
     /// A spending UCAN was revoked (spec section 19.6.1).
     SpendingUcanRevoked,
+
+    // -------------------------------------------------------------------
+    // Governance event types (ADR-031 §8)
+    // -------------------------------------------------------------------
+    /// A governance proposal was created (ADR-031 §8).
+    ///
+    /// Payload fields: `proposal_id`, `proposer_did`, `action`,
+    /// `voting_deadline`.
+    GovernanceProposalCreated,
+    /// A vote was cast on a governance proposal (ADR-031 §8).
+    ///
+    /// Payload fields: `proposal_id`, `voter_did`, `vote`.
+    GovernanceVoteCast,
+    /// A vote was withdrawn from a governance proposal (ADR-031 §8).
+    ///
+    /// Payload fields: `proposal_id`, `voter_did`.
+    GovernanceVoteWithdrawn,
+    /// A governance proposal was resolved (approved, rejected, expired)
+    /// (ADR-031 §8).
+    ///
+    /// Payload fields: `proposal_id`, `status`, `executor_did`,
+    /// `resulting_epoch`.
+    GovernanceProposalResolved,
+    /// A governance conflict was detected (two proposals landed at the
+    /// same event log sequence) (ADR-031 §7).
+    ///
+    /// Payload fields: `proposal_a`, `proposal_b`.
+    GovernanceConflictDetected,
+    /// A governance conflict was resolved (ADR-031 §7).
+    ///
+    /// Payload fields: `winner_id`, `resolution`.
+    GovernanceConflictResolved,
+    /// A deadlock recovery was performed (ADR-031 §10).
+    ///
+    /// Payload fields: `justification`, `changes`.
+    GovernanceDeadlockRecovery,
+    /// A governance action was executed from an approved proposal
+    /// (ADR-031 §8).
+    ///
+    /// Payload fields: `proposal_id`, `action`, `executor_did`,
+    /// `resulting_epoch`.
+    GovernanceActionExecuted,
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +320,9 @@ pub enum EventLogError {
 /// A sorted index (`sorted_leaves`) is maintained alongside the append-order
 /// tree for future absence proof support.
 ///
+/// Event payloads are stored alongside hashes for retrieval and provenance
+/// verification. See issue #303.
+///
 /// See ADR-011 acceptance criterion 1.
 pub struct EventLog {
     /// SHA-256 hashes of serialized events, in append order.
@@ -283,6 +334,9 @@ pub struct EventLog {
     context_id: ContextId,
     /// Sorted index of `(leaf_hash, leaf_index)` for absence proof support.
     sorted_leaves: BTreeSet<([u8; 32], u64)>,
+    /// Full event payloads stored alongside leaf hashes, indexed by sequence.
+    /// Enables `get_event` and `query_events` retrieval (#303, #330).
+    events: Vec<Event>,
 }
 
 impl EventLog {
@@ -294,6 +348,7 @@ impl EventLog {
             tree: Vec::new(),
             context_id,
             sorted_leaves: BTreeSet::new(),
+            events: Vec::new(),
         }
     }
 
@@ -321,6 +376,43 @@ impl EventLog {
         &self.sorted_leaves
     }
 
+    /// Returns the stored events.
+    #[must_use]
+    pub fn events(&self) -> &[Event] {
+        &self.events
+    }
+
+    /// Returns the full event at the given sequence number.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventLogError::LeafIndexOutOfBounds`] if `sequence` is
+    /// greater than or equal to the number of events.
+    /// Returns [`EventLogError::EmptyLog`] if the log has no events.
+    pub fn get_event(&self, sequence: u64) -> Result<&Event, EventLogError> {
+        if self.events.is_empty() {
+            return Err(EventLogError::EmptyLog);
+        }
+        let idx = usize::try_from(sequence).map_err(|_| EventLogError::LeafIndexOutOfBounds {
+            index: sequence,
+            count: self.events.len() as u64,
+        })?;
+        self.events
+            .get(idx)
+            .ok_or(EventLogError::LeafIndexOutOfBounds {
+                index: sequence,
+                count: self.events.len() as u64,
+            })
+    }
+
+    /// Stores a full event payload alongside the leaf hash.
+    ///
+    /// Called by [`tree::append`] and [`tree::append_unsigned_event`]
+    /// after the event passes verification.
+    pub(crate) fn push_event(&mut self, event: Event) {
+        self.events.push(event);
+    }
+
     /// Pushes a pre-computed leaf hash into the log and rebuilds the tree.
     ///
     /// This is used by [`checkpoint::TruncatedEventLog`] to reconstruct a
@@ -342,5 +434,110 @@ impl EventLog {
     fn rebuild_tree(&mut self) {
         // Use tree::recompute_raw which handles the full recompute.
         tree::recompute_raw(self);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_type_serialization_roundtrip_all_variants() {
+        let event_types = vec![
+            EventType::ContextCreated,
+            EventType::ContextClosing,
+            EventType::ContextClosed,
+            EventType::ContextExpired,
+            EventType::MemberJoined,
+            EventType::MemberLeft,
+            EventType::RoleAssigned,
+            EventType::TokenRevoked,
+            EventType::MessageSent,
+            EventType::ToolRegistered,
+            EventType::ToolUpdated,
+            EventType::ToolInvoked,
+            EventType::ToolVerified,
+            EventType::ToolInterfaceEstablished,
+            EventType::GovernanceAction,
+            EventType::ConsistencyCheckpoint,
+            EventType::AbsenceProofRequested,
+            EventType::MemberBlocked,
+            EventType::KeyEpochAdvance,
+            EventType::MediaSessionStarted,
+            EventType::MediaSessionEnded,
+            EventType::PaymentReceived,
+            EventType::EconomicPolicyChanged,
+            EventType::SpendingUcanGranted,
+            EventType::SpendingUcanRevoked,
+            // Governance event types (ADR-031 §8)
+            EventType::GovernanceProposalCreated,
+            EventType::GovernanceVoteCast,
+            EventType::GovernanceVoteWithdrawn,
+            EventType::GovernanceProposalResolved,
+            EventType::GovernanceConflictDetected,
+            EventType::GovernanceConflictResolved,
+            EventType::GovernanceDeadlockRecovery,
+            EventType::GovernanceActionExecuted,
+        ];
+
+        // Verify all 33 variants are covered.
+        assert_eq!(
+            event_types.len(),
+            33,
+            "all EventType variants must be tested"
+        );
+
+        for event_type in &event_types {
+            let json = serde_json::to_string(event_type).expect("serialize");
+            let deserialized: EventType = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(
+                event_type, &deserialized,
+                "round-trip mismatch for {event_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn governance_event_types_are_distinct() {
+        // Verify the 8 new governance event types serialize to unique strings.
+        let governance_types = [
+            EventType::GovernanceProposalCreated,
+            EventType::GovernanceVoteCast,
+            EventType::GovernanceVoteWithdrawn,
+            EventType::GovernanceProposalResolved,
+            EventType::GovernanceConflictDetected,
+            EventType::GovernanceConflictResolved,
+            EventType::GovernanceDeadlockRecovery,
+            EventType::GovernanceActionExecuted,
+        ];
+
+        let serialized: Vec<String> = governance_types
+            .iter()
+            .map(|et| serde_json::to_string(et).unwrap())
+            .collect();
+
+        // All must be unique.
+        let mut unique = serialized.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            serialized.len(),
+            unique.len(),
+            "governance event types must serialize to unique values"
+        );
+
+        // None should equal the legacy GovernanceAction variant.
+        let legacy = serde_json::to_string(&EventType::GovernanceAction).unwrap();
+        for s in &serialized {
+            assert_ne!(
+                s, &legacy,
+                "governance event type must not collide with legacy GovernanceAction"
+            );
+        }
     }
 }

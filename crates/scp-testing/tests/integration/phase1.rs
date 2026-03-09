@@ -42,7 +42,7 @@ use scp_core::crypto::sender_keys::{
     SenderKeyStore, generate_sender_key, handle_sender_key_request, open_sender_key_response,
     publish_sender_key_epoch_advance, request_sender_key, verify_epoch_advance,
 };
-use scp_core::envelope::inner::{InnerEnvelopeParams, create_inner_envelope};
+use scp_core::envelope::inner::{InnerEnvelopeParams, MessageType, create_inner_envelope};
 use scp_core::envelope::outer::{open_envelope, seal_envelope};
 use scp_core::envelope::padding::strip_padding;
 use scp_core::envelope::pseudonym::derive_pseudonym;
@@ -241,7 +241,7 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
 
     // Verify the epoch advance is valid.
     let advance: scp_core::crypto::sender_keys::SenderKeyEpochAdvance =
-        serde_json::from_slice(&advance_bytes).unwrap();
+        rmp_serde::from_slice(&advance_bytes).unwrap();
     let advance_ok = verify_epoch_advance(&advance, ctx_id, &alice_pubkey).unwrap();
     assert!(advance_ok, "epoch advance signature must verify");
 
@@ -282,17 +282,23 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
 
     // Alice handles the request (verifies signature, HPKE-encrypts the key).
     let sk_request: scp_core::crypto::sender_keys::SenderKeyRequest =
-        serde_json::from_slice(&req_result.request_message).unwrap();
+        rmp_serde::from_slice(&req_result.request_message).unwrap();
 
     let block_list: HashSet<String> = HashSet::new();
+    let mut nonce_dedup = scp_core::crypto::sender_keys::NonceDedup::new();
     let resp_bytes = handle_sender_key_request(
         &sk_request,
         &bob_pubkey,
-        &alice_sender_key,
-        &alice_id.did,
-        1,
-        &block_list,
-        None,
+        &scp_core::crypto::sender_keys::HandleRequestParams {
+            sender_key: &alice_sender_key,
+            context_id: "ctx-1",
+            sender_did: &alice_id.did,
+            epoch: 1,
+            block_list: &block_list,
+            context_members: None,
+            now_secs: sk_request.timestamp,
+        },
+        &mut nonce_dedup,
     )
     .await
     .unwrap()
@@ -300,11 +306,15 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
 
     // Bob decrypts the response to obtain Alice's sender key.
     let sk_response: scp_core::crypto::sender_keys::SenderKeyResponse =
-        serde_json::from_slice(&resp_bytes).unwrap();
-    let received_sk =
-        open_sender_key_response(&bob_custody, &req_result.wrapping_key_handle, &sk_response)
-            .await
-            .unwrap();
+        rmp_serde::from_slice(&resp_bytes).unwrap();
+    let received_sk = open_sender_key_response(
+        &bob_custody,
+        &req_result.wrapping_key_handle,
+        "ctx-1",
+        &sk_response,
+    )
+    .await
+    .unwrap();
 
     // Verify the key material matches.
     assert_eq!(
@@ -340,9 +350,11 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
             generation: 0,
             sequence: 1,
             timestamp: 1_700_000_000,
+            message_type: MessageType::Content,
             payload: original_msg,
             provenance: None,
             signing_key_id: scp_core::identity::SigningKeyId::Active,
+            version: scp_core::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
         },
         &alice_mls_custody,
         &dummy_handle,
@@ -415,7 +427,16 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
     let bob_alice_sk = bob_sk_store
         .get(ctx_id, &alice_id.did)
         .expect("Bob must have Alice's sender key");
-    let verified_inner = open_envelope(&received_outer, &mut bob_group, bob_alice_sk).unwrap();
+    let verified_inner = open_envelope(
+        &received_outer,
+        &mut bob_group,
+        bob_alice_sk,
+        &inner_env.context_id,
+        &inner_env.sender_did,
+        inner_env.epoch,
+        inner_env.sequence,
+    )
+    .unwrap();
 
     // 11b. Strip padding to recover original plaintext.
     let decrypted_msg = strip_padding(&verified_inner.payload).unwrap();

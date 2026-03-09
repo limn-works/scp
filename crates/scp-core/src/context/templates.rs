@@ -17,8 +17,8 @@
 
 use super::params::{
     Capability, CeilingPolicy, ContextMode, ContextParams, FieldVisibility, GovernanceModel,
-    MemoryScope, MetadataVisibilityPolicy, ProjectionPolicy, ProjectionRule, PromotionPolicy,
-    TemplateId,
+    IncompleteVerificationPolicy, MemoryScope, MetadataVisibilityPolicy, ProjectionPolicy,
+    ProjectionRule, PromotionPolicy, TemplateId,
 };
 
 // ---------------------------------------------------------------------------
@@ -278,6 +278,10 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             economic_policy: None,
             metadata_visibility: private_encrypted_visibility(),
             projection_policy: None,
+            discoverable: false,
+            max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         TemplateId::BilateralPersistent => ContextParams {
             mode: ContextMode::Encrypted,
@@ -293,6 +297,10 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             economic_policy: None,
             metadata_visibility: private_encrypted_visibility(),
             projection_policy: None,
+            discoverable: false,
+            max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         TemplateId::Coordination => ContextParams {
             mode: ContextMode::Encrypted,
@@ -308,6 +316,10 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             economic_policy: None,
             metadata_visibility: private_encrypted_visibility(),
             projection_policy: None,
+            discoverable: false,
+            max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         TemplateId::GroupDiscussion => ContextParams {
             mode: ContextMode::Encrypted,
@@ -323,6 +335,10 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             economic_policy: None,
             metadata_visibility: group_discussion_visibility(),
             projection_policy: None,
+            discoverable: false,
+            max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         TemplateId::PublicBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
@@ -341,6 +357,10 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
                 default_rule: ProjectionRule::Public,
                 overrides: vec![],
             }),
+            discoverable: false,
+            max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         TemplateId::GatedBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
@@ -359,6 +379,10 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
                 default_rule: ProjectionRule::Gated,
                 overrides: vec![],
             }),
+            discoverable: false,
+            max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         TemplateId::ToolInterfaceTemplate => ContextParams {
             mode: ContextMode::Encrypted,
@@ -374,6 +398,10 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             economic_policy: None,
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
+            discoverable: false,
+            max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         // Extends scp:template/tool-interface -- same ceiling and governance,
         // but economic_policy is caller-provided and validated separately.
@@ -391,6 +419,10 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             economic_policy: None,
             metadata_visibility: member_count_hidden_visibility(),
             projection_policy: None,
+            discoverable: false,
+            max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
         // Extends scp:template/gated-broadcast -- broadcast mode with gated
         // subscriber admission. economic_policy is caller-provided.
@@ -411,6 +443,32 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
                 default_rule: ProjectionRule::Gated,
                 overrides: vec![],
             }),
+            discoverable: false,
+            max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
+        },
+        // Discovery context: encrypted mode with messaging + tool invocation
+        // ceiling. Discoverable by default so it can be found via DHT. Used
+        // to bootstrap agent discovery via standardized tool schemas (ADR-020).
+        TemplateId::DiscoveryContext => ContextParams {
+            mode: ContextMode::Encrypted,
+            ceiling: messaging_tool_invoke_ban_ceiling(),
+            ceiling_policy: CeilingPolicy::Immutable,
+            promotion_policy: PromotionPolicy::NoPromotion,
+            roles: Vec::new(),
+            tools: Vec::new(),
+            ttl: None,
+            memory_scope: MemoryScope::Full,
+            governance: GovernanceModel::SingleAdmin,
+            template_id: Some(TemplateId::DiscoveryContext),
+            economic_policy: None,
+            metadata_visibility: MetadataVisibilityPolicy::default(),
+            projection_policy: None,
+            discoverable: true,
+            max_chain_depth: None,
+            participation_requirements: Vec::new(),
+            incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
     }
 }
@@ -457,7 +515,8 @@ const fn ttl_policy(template_id: TemplateId) -> TtlPolicy {
         | TemplateId::GatedBroadcast
         | TemplateId::ToolInterfaceTemplate
         | TemplateId::PaidService
-        | TemplateId::PaidBroadcast => TtlPolicy::Optional,
+        | TemplateId::PaidBroadcast
+        | TemplateId::DiscoveryContext => TtlPolicy::Optional,
     }
 }
 
@@ -588,6 +647,16 @@ pub fn validate_against_template(params: &ContextParams) -> Result<(), TemplateE
     // Governance-gaps fields: metadata visibility and projection policy.
     validate_governance_gaps_fields(*template_id, params, &expected)?;
 
+    // Discoverable flag
+    if params.discoverable != expected.discoverable {
+        return Err(TemplateError::Mismatch {
+            template: *template_id,
+            field: "discoverable",
+            expected: format!("{}", expected.discoverable),
+            actual: format!("{}", params.discoverable),
+        });
+    }
+
     // TTL policy enforcement
     match ttl_policy(*template_id) {
         TtlPolicy::Required => {
@@ -712,8 +781,8 @@ fn capabilities_match(a: &[Capability], b: &[Capability]) -> bool {
     }
 
     // Sort names for comparison.
-    let mut a_names: Vec<&str> = a.iter().map(Capability::name).collect();
-    let mut b_names: Vec<&str> = b.iter().map(Capability::name).collect();
+    let mut a_names: Vec<String> = a.iter().map(|c| c.name().into_owned()).collect();
+    let mut b_names: Vec<String> = b.iter().map(|c| c.name().into_owned()).collect();
     a_names.sort_unstable();
     b_names.sort_unstable();
     a_names == b_names
@@ -721,7 +790,7 @@ fn capabilities_match(a: &[Capability], b: &[Capability]) -> bool {
 
 /// Formats a capability list for error messages.
 fn format_capabilities(caps: &[Capability]) -> String {
-    let mut names: Vec<&str> = caps.iter().map(Capability::name).collect();
+    let mut names: Vec<String> = caps.iter().map(|c| c.name().into_owned()).collect();
     names.sort_unstable();
     format!("[{}]", names.join(", "))
 }
@@ -1187,6 +1256,7 @@ mod tests {
             TemplateId::ToolInterfaceTemplate,
             TemplateId::PaidService,
             TemplateId::PaidBroadcast,
+            TemplateId::DiscoveryContext,
         ];
         for variant in &variants {
             let params = template_params(variant);
@@ -1277,6 +1347,10 @@ mod tests {
             template_params(&TemplateId::PaidService).mode,
             ContextMode::Encrypted
         );
+        assert_eq!(
+            template_params(&TemplateId::DiscoveryContext).mode,
+            ContextMode::Encrypted
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1319,6 +1393,7 @@ mod tests {
             TemplateId::ToolInterfaceTemplate,
             TemplateId::PaidService,
             TemplateId::PaidBroadcast,
+            TemplateId::DiscoveryContext,
         ];
         for variant in &variants {
             let from_method = ContextParams::from_template(*variant);
@@ -1391,8 +1466,11 @@ mod tests {
     fn validate_rejects_unexpected_roles() {
         let mut params = template_params(&TemplateId::BilateralEphemeral);
         params.ttl = Some(Duration::from_secs(300));
-        params.roles = vec![super::super::params::RoleDefinition {
+        params.roles = vec![super::super::roles::RoleDefinition {
             name: "smuggled".to_owned(),
+            capabilities: std::collections::HashSet::from([
+                super::super::params::Capability::MessagesRead,
+            ]),
         }];
         let err = validate_against_template(&params).unwrap_err();
         assert!(matches!(
@@ -1405,8 +1483,20 @@ mod tests {
     fn validate_rejects_unexpected_tools() {
         let mut params = template_params(&TemplateId::BilateralEphemeral);
         params.ttl = Some(Duration::from_secs(300));
-        params.tools = vec![super::super::params::ToolRegistration {
+        params.tools = vec![super::super::tools::ToolRegistration {
+            tool_id: "rogue-tool".to_owned(),
             name: "rogue-tool".to_owned(),
+            description: "Rogue tool for testing".to_owned(),
+            schema: super::super::tools::ToolSchema {
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: serde_json::json!({"type": "object"}),
+            },
+            implementation_hash: [0u8; 32],
+            test_vectors: vec![],
+            operator_did: "did:dht:z6MkTestOperator".into(),
+            economic_metadata: None,
+            registered_at: 0,
+            signature: Vec::new(),
         }];
         let err = validate_against_template(&params).unwrap_err();
         assert!(matches!(
@@ -1805,6 +1895,7 @@ mod tests {
             TemplateId::GroupDiscussion,
             TemplateId::ToolInterfaceTemplate,
             TemplateId::PaidService,
+            TemplateId::DiscoveryContext,
         ];
         for tid in &encrypted_templates {
             let params = template_params(tid);
@@ -1930,6 +2021,7 @@ mod tests {
             TemplateId::GroupDiscussion,
             TemplateId::ToolInterfaceTemplate,
             TemplateId::PaidService,
+            TemplateId::DiscoveryContext,
         ];
         for tid in &encrypted_templates {
             let params = template_params(tid);

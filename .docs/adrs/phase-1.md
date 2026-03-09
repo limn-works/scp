@@ -1015,7 +1015,7 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
    - Receives a `SenderKeyRequest` from another member.
    - Verifies the request signature against `requester_did`.
    - Checks block list: if `requester_did` is blocked, returns `None` (no response, the requester cannot obtain the key).
-   - If not blocked: HPKE-encrypts the current sender key to the requester's `wrapping_pubkey`. HPKE assembly: (1) generate ephemeral X25519 keypair (software-generated), (2) ECDH between ephemeral secret and requester wrapping pubkey, (3) HKDF to derive encryption key, (4) AES-128-GCM encrypt the sender key. The ephemeral public key is included in the response.
+   - If not blocked: seals the current sender key to the requester's `wrapping_pubkey` using HPKE Base mode (RFC 9180). Suite: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. The `info` parameter provides domain separation: `"scp-sender-key-v1" || context_id || sender_did || epoch_bytes`. The `aad` parameter binds context: `context_id || sender_did || epoch_bytes`. The HPKE `enc` (encapsulated key) is transmitted as `ephemeral_pubkey` and `ct` (AEAD ciphertext) as `hpke_sealed_key` in the response. See §9.16.2 for the full HPKE specification.
    - Returns `Some(MlsMessage)` containing the `SenderKeyResponse`, sent with `recipient_hint` to the requester. **O(1) cost per request.**
 
    **4c. `request_sender_key(key_custody, mls_group, sender_did, epoch) -> MlsMessage`**
@@ -1023,7 +1023,7 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
    - Signs the request with the requester's Active Signing Key or Agent Signing Key (ADR-039).
    - Sends as an MLS application message with `recipient_hint` to the sender. **O(1) cost.**
 
-   **HPKE open (recipient-side decryption):** Uses `key_custody.dh_agree(wrapping_key_handle, ephemeral_pk)` to compute the shared secret inside the custody boundary, then KDF + AEAD in software to recover the sender key. The wrapping private key never leaves KeyCustody.
+   **HPKE open (recipient-side decryption):** Calls `SetupBaseR(enc, wrapping_secret_key, info)` where `enc` is `ephemeral_pubkey` from the response, then `recipient_context.Open(aad, ct)` where `ct` is `hpke_sealed_key`. The `wrapping_secret_key` is computed inside the `KeyCustody` boundary via `dh_agree(wrapping_key_handle, enc)` — the wrapping private key never leaves KeyCustody. See §9.16.2 for `info` and `aad` parameter formats.
 
    **New member join (pull-based):** When a new member joins the group, they observe each existing member's current `sender_key_epoch` from the group state. The new member publishes a `SenderKeyRequest` for each author whose key they need. Each author's SDK responds automatically (checking block list). Same O(N) total work as push-based, but demand-driven and naturally load-balanced — the new member drives the process, not N existing members racing to push.
 

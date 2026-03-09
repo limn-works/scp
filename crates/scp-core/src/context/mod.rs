@@ -29,15 +29,18 @@
 pub mod broadcast;
 pub mod builder;
 pub mod close;
+pub mod export_import;
 pub mod governance;
 pub mod invitation;
 pub mod manager;
 pub mod membership;
 pub mod memory_scope;
+pub mod metadata;
 pub mod nesting;
 pub mod params;
 pub mod policy;
 pub mod promotion;
+pub mod providers;
 pub mod roles;
 pub mod standing;
 pub mod state_machine;
@@ -92,7 +95,8 @@ pub use templates::{TemplateError, template_params, validate_against_template};
 pub use roles::{
     CapabilityCeiling, ContextRoleState, RoleAssignment, RoleError, UcanAttestation, UcanToken,
     assign_role, builtin_admin, builtin_author, builtin_broadcast_roles, builtin_member,
-    builtin_observer, builtin_roles, builtin_subscriber, check_ceiling, validate_role_definition,
+    builtin_moderator, builtin_observer, builtin_roles, builtin_subscriber, check_ceiling,
+    validate_role_definition,
 };
 
 // Re-export builder and manager types for convenience.
@@ -100,7 +104,12 @@ pub use builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
     CreationReceipt, EventLogHandle, MlsGroupHandle, SenderKeyHandle, create_context,
 };
-pub use manager::{ContextManager, ContextPersistence, ContextSnapshot, GovernanceActionResult};
+pub use manager::{
+    ContentKeysRotatedResult, ContextManager, ContextPersistence, ContextSnapshot,
+    GovernanceActionResult, GovernanceReconfiguredResult, ProposalOutcome,
+    ReadAccessRestoredResult, ReadAccessRevokedResult, WriteAccessRestoredResult,
+    WriteAccessRevokedResult,
+};
 
 // Re-export membership types.
 pub use membership::{
@@ -110,8 +119,9 @@ pub use membership::{
 
 // Re-export memory scope and key destruction types (SCP-067).
 pub use memory_scope::{
-    DeletionResponseStatus, KeyDestructionAttestation, KeyDestructionLevel,
-    KeyDestructionOrchestrator, RelayDeletionRequest, RelayDeletionTracker,
+    DeletionResponseStatus, DestructionMethod, EphemeralContextMetadata, KeyDestructionAttestation,
+    KeyDestructionLevel, KeyDestructionOrchestrator, PlatformAttestation,
+    PublishableKeyDestructionAttestation, RelayDeletionRequest, RelayDeletionTracker,
     validate_memory_scope_for_broadcast,
 };
 
@@ -140,17 +150,24 @@ pub use standing::{StandingChannelError, StandingChannelManager};
 
 // Re-export governance types (SCP-129, ADR-031).
 pub use governance::{
-    GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
-    GovernanceModelConfig, GovernanceProposal, ProposalId, ProposalStatus, RejectionReason,
-    RevocationScope, SignedVote, SingleAdminEngine, VoteType, majority::MajorityVoteEngine,
-    sign_vote, verify_vote,
+    ConflictResolution, DeadlockJustification, GovernanceAction, GovernanceContext,
+    GovernanceEngine, GovernanceError, GovernanceEvent, GovernanceModelConfig, GovernanceProposal,
+    GovernanceReconfigAction, ProposalId, ProposalStatus, RejectionReason, RevocationScope,
+    SignedVote, SingleAdminEngine, VoteType, majority::MajorityVoteEngine,
+    multisig::ThresholdEngine, sign_vote, unanimity::UnanimityEngine, verify_vote,
 };
 
 // Re-export broadcast context types (SCP-227, spec section 5.14, #101).
 pub use broadcast::{
     AuthorBlockResult, AuthorState, AuthorStateSnapshot, BlockResult, BroadcastAdmission,
     BroadcastContext, BroadcastContextSnapshot, KeyRequestDecision, SubscriberRecord,
-    SubscriptionResult, UnsubscribeResult,
+    SubscriberRegistration, SubscriptionResult, UnsubscribeResult,
+};
+
+// Re-export context export/import types (issue #363).
+pub use export_import::{
+    CURRENT_EXPORT_VERSION, ContextExport, ExportScope, create_export, deserialize_export,
+    serialize_export, validate_export_for_import, verify_merkle_chain,
 };
 
 // Re-export TTL management types (SCP-021, SCP-066).
@@ -279,9 +296,19 @@ pub enum ContextError {
     #[error("member not found: {0}")]
     MemberNotFound(String),
 
+    /// An operation was attempted while the context or subcomponent is in an
+    /// unexpected state (e.g., summary window already disputed).
+    #[error("invalid state: {0}")]
+    InvalidState(String),
+
     /// A key package validation failed.
     #[error("invalid key package: {0}")]
     InvalidKeyPackage(String),
+
+    /// A governance action would exceed a protocol-level collection size limit
+    /// (§5.9). The message includes the limit value for debuggability.
+    #[error("limit exceeded: {0}")]
+    LimitExceeded(String),
 
     /// An invalid memory scope was requested for a broadcast context.
     ///
@@ -290,6 +317,13 @@ pub enum ContextError {
     /// required by `Ephemeral` and `Summary` scopes.
     #[error("broadcast contexts only support MemoryScope::Full")]
     InvalidMemoryScopeForBroadcast,
+
+    /// Attempted to restore access that was never revoked (§5.9).
+    ///
+    /// Restoring read or write access for a member whose access was never
+    /// revoked is an error — there is nothing to restore.
+    #[error("nothing to restore: {0}")]
+    NothingToRestore(String),
 
     /// An action-payment integration error occurred during a paid action.
     ///
@@ -307,6 +341,17 @@ pub enum ContextError {
     /// during context or broadcast state persistence or restoration.
     #[error("persistence failed: {0}")]
     PersistenceFailed(String),
+
+    /// A governance operation failed (proposal, vote, engine error).
+    ///
+    /// Returned when the [`GovernanceEngine`] reports an error during
+    /// proposal creation, voting, or resolution.
+    #[error("governance failed: {0}")]
+    GovernanceFailed(String),
+
+    /// Context creation failed due to invalid parameters or internal error.
+    #[error("creation failed: {0}")]
+    CreationFailed(String),
 }
 
 // ---------------------------------------------------------------------------

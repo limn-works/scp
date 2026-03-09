@@ -95,4 +95,12 @@ pub enum MlsError {
     /// The provided DID does not match the expected `did:dht:z...` format.
     #[error("invalid DID format: {0}")]
     InvalidDidFormat(String),
+
+    /// An MLS `LeafNode` extension is malformed or failed validation.
+    #[error("extension error: {0}")]
+    ExtensionError(String),
+
+    /// A member with the given leaf index was not found in the group.
+    #[error("member not found at leaf index {0}")]
+    MemberNotFound(u32),
 }

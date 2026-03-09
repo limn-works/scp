@@ -48,6 +48,7 @@ use scp_mcp::allowlist;
 use scp_mcp::client::{McpClient, McpTransport, SystemTimestamp};
 use scp_mcp::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
 use scp_mcp::server::{ContextProvider, ContextToolInfo, McpServer, MemberInfo};
+use scp_platform::traits::Storage;
 
 use crate::error::ScpPyError;
 use crate::types::{json_to_py_dict, py_dict_to_json};
@@ -589,6 +590,21 @@ struct FfiBridgeProvider {
     /// handler blocks longer than this, the invocation returns an error
     /// instead of blocking indefinitely. See issue #123.
     tool_timeout_ms: u64,
+    /// JWT-encoded UCAN token for tool invocation authorization.
+    ///
+    /// When present, `validate_capability` runs the full 11-step ADR-016
+    /// validation pipeline to verify the token grants `tool_invoke:{tool_name}`
+    /// or `tool_invoke:*` for the context. When absent, `validate_capability`
+    /// rejects immediately (UCAN is required for tool invocation).
+    ///
+    /// See spec §6.2, §8, ADR-016, and issue #319.
+    agent_ucan_token: Option<String>,
+    /// Optional proof tokens for UCAN delegation chain verification.
+    ///
+    /// When the `agent_ucan_token` is a delegated UCAN (non-empty `prf` field),
+    /// the parent tokens must be provided here so the proof resolver can
+    /// verify the delegation chain. Without these, delegated UCANs always fail.
+    agent_proof_tokens: Option<Vec<String>>,
 }
 
 impl ContextProvider for FfiBridgeProvider {
@@ -633,6 +649,67 @@ impl ContextProvider for FfiBridgeProvider {
     }
 
     fn validate_capability(&self, context_id: &str, tool_name: &str) -> Result<(), String> {
+        // Primary check: UCAN token validation via the full 11-step ADR-016
+        // pipeline. Verifies the token grants tool_invoke:{tool_name} or
+        // tool_invoke:* for this context.
+        // See spec §6.2, §8, ADR-016, and issue #319.
+        if let Some(ref token) = self.agent_ucan_token {
+            // Build proof resolver from optional proof tokens (supports delegated UCANs).
+            let proof_resolver =
+                crate::ucan::build_proof_resolver_from_tokens(self.agent_proof_tokens.as_deref())
+                    .map_err(|e| format!("failed to build proof resolver: {e}"))?;
+
+            crate::runtime::with_context(context_id, |rt| {
+                let production_resolver = crate::runtime::did_resolver();
+                let did_resolver = crate::bridge_adapters::DispatchDidResolver::new(
+                    production_resolver.map(std::convert::AsRef::as_ref),
+                );
+                let revocation_checker = crate::bridge_adapters::BridgeRevocationChecker {
+                    revocation_list: &rt.revocation_list,
+                };
+                let mut nonce_adapter = crate::bridge_adapters::BridgeNonceTracker {
+                    inner: &mut rt.nonce_tracker,
+                };
+
+                let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
+                    did_resolver: &did_resolver,
+                    nonce_tracker: &mut nonce_adapter,
+                    revocation_checker: &revocation_checker,
+                    proof_resolver: &proof_resolver,
+                    ceiling: &rt.ceiling_strings,
+                    context_creator_did: &rt.creator_did,
+                    presenting_agent_did: &self.agent_did,
+                    clock_skew_tolerance_secs:
+                        scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                };
+
+                scp_core::context::tools::validate_tool_invocation_ucan(
+                    token, context_id, tool_name, &mut ctx,
+                )
+                .map_err(|e| {
+                    tracing::warn!(
+                        agent = %self.agent_did,
+                        tool = %tool_name,
+                        context = %context_id,
+                        error = %e,
+                        "UCAN validation failed for tool invocation"
+                    );
+                    ScpPyError::ucan(format!(
+                        "UCAN authorization failed for tool '{tool_name}': {e}"
+                    ))
+                })
+            })
+            .map_err(|e| format!("{e}"))?;
+        } else {
+            tracing::warn!(
+                agent = %self.agent_did,
+                tool = %tool_name,
+                context = %context_id,
+                "no UCAN token provided for tool invocation — authorization bypass risk"
+            );
+            return Err("UCAN token required for tool invocation — no token provided".to_owned());
+        }
+
         // Defense-in-depth: check role-state capabilities in addition to the
         // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
         crate::runtime::with_context(context_id, |rt| {
@@ -644,16 +721,14 @@ impl ContextProvider for FfiBridgeProvider {
                 Ok(())
             } else {
                 // Generic message for the wire — detailed info stays server-side.
-                // The Err string propagates into a JSON-RPC error response via
-                // McpServer::handle_tool_call (server.rs:430-435).
                 tracing::warn!(
                     agent = %self.agent_did,
                     tool = %tool_name,
                     context = %context_id,
                     "capability check failed: agent lacks ToolInvoke capability"
                 );
-                Err(ScpPyError::ContextError(
-                    "insufficient permissions to invoke tool".to_owned(),
+                Err(ScpPyError::context(
+                    "insufficient permissions to invoke tool",
                 ))
             }
         })
@@ -724,7 +799,7 @@ impl ContextProvider for FfiBridgeProvider {
         // be consumed by the handler).
         let (dispatch, input_hash) = crate::runtime::with_context(context_id, |rt| {
             let registration = rt.tool_registry.get(tool_name).ok_or_else(|| {
-                ScpPyError::ContextError(format!(
+                ScpPyError::context(format!(
                     "tool '{tool_name}' not found in context '{context_id}'"
                 ))
             })?;
@@ -735,7 +810,7 @@ impl ContextProvider for FfiBridgeProvider {
                 &registration.schema.input_schema,
             )
             .map_err(|msg| {
-                ScpPyError::ValidationError(format!(
+                ScpPyError::validation(format!(
                     "input validation failed for tool '{tool_name}': {msg}"
                 ))
             })?;
@@ -830,6 +905,7 @@ impl ContextProvider for FfiBridgeProvider {
             execution_time_ms: elapsed_ms,
             input_hash,
             output_hash: Some(scp_core::context::tools::sha256_json(&output)),
+            cost: None,
         };
 
         let payload_data = serde_json::to_vec(&tool_event).unwrap_or_default();
@@ -841,7 +917,9 @@ impl ContextProvider for FfiBridgeProvider {
             .map_or(0, |d| d.as_secs());
 
         // Re-acquire the DashMap lock briefly to append the event.
-        if let Err(e) = crate::runtime::with_context(context_id, |rt| {
+        // Returns (sequence, serialized_event_bytes) on success for
+        // ProtocolStore persistence (GitHub issue #303).
+        let append_result = crate::runtime::with_context(context_id, |rt| {
             let sequence = scp_event_log::tree::event_count(&rt.event_log);
             let prev_hash = if rt.event_log.leaves().is_empty() {
                 scp_event_log::tree::GENESIS_PREV_HASH
@@ -861,16 +939,51 @@ impl ContextProvider for FfiBridgeProvider {
                 signature: Vec::new(),
             };
 
+            // Serialize the event for ProtocolStore persistence.
+            let event_bytes = rmp_serde::to_vec(&event)
+                .map_err(|e| ScpPyError::context(format!("event serialization failed: {e}")))?;
+
             scp_event_log::tree::append_unsigned_event(&mut rt.event_log, &event)
-                .map_err(|e| ScpPyError::ContextError(e.to_string()))?;
-            Ok(())
-        }) {
-            tracing::warn!(
-                tool = %tool_name,
-                context = %context_id,
-                error = %e,
-                "failed to append ToolInvokedEvent to event log"
-            );
+                .map_err(|e| ScpPyError::context(e.to_string()))?;
+
+            // Return the leaf hash (last appended leaf) for ProtocolStore.
+            let leaf_hash: [u8; 32] = rt.event_log.leaves()[rt.event_log.leaves().len() - 1];
+
+            Ok((sequence, event_bytes, leaf_hash))
+        });
+
+        match append_result {
+            Ok((sequence, event_bytes, _leaf_hash)) => {
+                // Persist the event payload to storage (best-effort).
+                // This enables py_event_log_query to return real events
+                // instead of just a LogSummary (GitHub issue #303).
+                //
+                // Uses the Storage trait directly because the global storage
+                // is Arc<InMemoryStorage> and ProtocolStore requires an owned
+                // Storage impl. The key convention matches ProtocolStore's
+                // event_data_key format.
+                if let Ok(storage) = crate::runtime::get_storage()
+                    && let Ok(rt) = crate::runtime()
+                {
+                    let key = format!("context/{context_id}/event_data/{sequence:020}");
+                    if let Err(e) = rt.block_on(storage.store(&key, &event_bytes)) {
+                        tracing::warn!(
+                            tool = %tool_name,
+                            context = %context_id,
+                            error = %e,
+                            "failed to persist event payload to storage"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    tool = %tool_name,
+                    context = %context_id,
+                    error = %e,
+                    "failed to append ToolInvokedEvent to event log"
+                );
+            }
         }
 
         Ok(output)
@@ -1010,12 +1123,14 @@ fn generate_handle_id(prefix: &str) -> String {
 /// See ADR-015: MCP server with context namespace mapping.
 #[pyfunction]
 #[pyo3(name = "py_mcp_serve")]
+#[pyo3(signature = (identity_did, context_ids, transport, ucan_token=None))]
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec for #[pyfunction] arguments.
 #[allow(clippy::too_many_lines)] // MCP server startup with stdio/SSE transport dispatch is inherently verbose.
 pub fn py_mcp_serve(
     identity_did: &str,
     context_ids: Vec<String>,
     transport: &str,
+    ucan_token: Option<String>,
 ) -> PyResult<String> {
     validate::validate_did(identity_did)?;
     validate::validate_transport_mode(transport)?;
@@ -1025,9 +1140,8 @@ pub fn py_mcp_serve(
 
     // Validate that all context IDs are registered in the runtime.
     for ctx_id in &context_ids {
-        crate::runtime::with_context(ctx_id, |_rt| Ok(())).map_err(|e| {
-            ScpPyError::TransportError(format!("cannot serve context '{ctx_id}': {e}"))
-        })?;
+        crate::runtime::with_context(ctx_id, |_rt| Ok(()))
+            .map_err(|e| ScpPyError::transport(format!("cannot serve context '{ctx_id}': {e}")))?;
     }
 
     // Create the FfiBridgeProvider and McpServer.
@@ -1035,6 +1149,9 @@ pub fn py_mcp_serve(
         agent_did: identity_did.to_owned(),
         context_ids: context_ids.clone(),
         tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+        agent_ucan_token: ucan_token.clone(),
+
+        agent_proof_tokens: None,
     };
     let server = McpServer::new(provider);
     let server = Arc::new(Mutex::new(server));
@@ -1048,6 +1165,7 @@ pub fn py_mcp_serve(
     let transport_mode = transport.to_owned();
     let sse_agent_did = identity_did.to_owned();
     let sse_context_ids = context_ids.clone();
+    let sse_ucan_token = ucan_token;
 
     let task_handle = rt.spawn(async move {
         match transport_mode.as_str() {
@@ -1133,6 +1251,9 @@ pub fn py_mcp_serve(
                     agent_did: sse_agent_did,
                     context_ids: sse_context_ids,
                     tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+                    agent_ucan_token: sse_ucan_token,
+
+                    agent_proof_tokens: None,
                 };
                 let sse_server = McpServer::new(provider);
                 let config =
@@ -1192,15 +1313,14 @@ pub fn py_mcp_serve(
 #[pyo3(name = "py_mcp_server_stop")]
 pub fn py_mcp_server_stop(handle: &str) -> PyResult<()> {
     validate::validate_mcp_handle(handle)?;
-    let mut entry = server_registry().get_mut(handle).ok_or_else(|| {
-        ScpPyError::TransportError(format!("MCP server handle '{handle}' not found"))
-    })?;
+    let mut entry = server_registry()
+        .get_mut(handle)
+        .ok_or_else(|| ScpPyError::transport(format!("MCP server handle '{handle}' not found")))?;
 
     if entry.stopped {
-        return Err(ScpPyError::TransportError(format!(
-            "MCP server '{handle}' is already stopped"
-        ))
-        .into());
+        return Err(
+            ScpPyError::transport(format!("MCP server '{handle}' is already stopped")).into(),
+        );
     }
 
     entry.stopped = true;
@@ -1234,7 +1354,7 @@ pub fn py_mcp_server_wait(py: Python<'_>, handle: &str) -> PyResult<()> {
     // Extract the task handle if available.
     let task_handle = {
         let mut entry = server_registry().get_mut(handle).ok_or_else(|| {
-            ScpPyError::TransportError(format!("MCP server handle '{handle}' not found"))
+            ScpPyError::transport(format!("MCP server handle '{handle}' not found"))
         })?;
 
         if entry.stopped && entry.task_handle.is_none() {
@@ -1274,9 +1394,9 @@ pub fn py_mcp_server_wait(py: Python<'_>, handle: &str) -> PyResult<()> {
 #[pyo3(name = "py_mcp_server_info")]
 pub fn py_mcp_server_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
     validate::validate_mcp_handle(handle)?;
-    let entry = server_registry().get(handle).ok_or_else(|| {
-        ScpPyError::TransportError(format!("MCP server handle '{handle}' not found"))
-    })?;
+    let entry = server_registry()
+        .get(handle)
+        .ok_or_else(|| ScpPyError::transport(format!("MCP server handle '{handle}' not found")))?;
 
     let dict = PyDict::new(py);
     dict.set_item("identity_did", &entry.identity_did)?;
@@ -1304,9 +1424,9 @@ pub fn py_mcp_server_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
 #[pyo3(name = "py_mcp_client_info")]
 pub fn py_mcp_client_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
     validate::validate_mcp_handle(handle)?;
-    let entry = client_registry().get(handle).ok_or_else(|| {
-        ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
-    })?;
+    let entry = client_registry()
+        .get(handle)
+        .ok_or_else(|| ScpPyError::transport(format!("MCP client handle '{handle}' not found")))?;
 
     let dict = PyDict::new(py);
     dict.set_item("transport", &entry.transport)?;
@@ -1344,20 +1464,18 @@ pub fn py_mcp_client_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec for #[pyfunction] arguments.
 pub fn py_mcp_client_connect_stdio(command: Vec<String>) -> PyResult<String> {
     if command.is_empty() {
-        return Err(
-            ScpPyError::ValidationError("command must be a non-empty list".to_owned()).into(),
-        );
+        return Err(ScpPyError::validation("command must be a non-empty list".to_owned()).into());
     }
 
     // Spawn the subprocess and create the transport.
     let transport = StdioClientTransport::spawn(&command)
-        .map_err(|e| ScpPyError::TransportError(format!("failed to connect stdio client: {e}")))?;
+        .map_err(|e| ScpPyError::transport(format!("failed to connect stdio client: {e}")))?;
 
     // Create the MCP client and perform the initialize handshake.
     let mut client = McpClient::new(ClientTransport::Stdio(transport));
     client
         .initialize()
-        .map_err(|e| ScpPyError::TransportError(format!("MCP initialize handshake failed: {e}")))?;
+        .map_err(|e| ScpPyError::transport(format!("MCP initialize handshake failed: {e}")))?;
 
     let handle = generate_handle_id("mcp-client");
     let state = McpClientState {
@@ -1397,13 +1515,13 @@ pub fn py_mcp_client_connect_sse(url: &str) -> PyResult<String> {
 
     // Connect to the SSE endpoint.
     let transport = SseClientTransport::connect(url)
-        .map_err(|e| ScpPyError::TransportError(format!("failed to connect SSE client: {e}")))?;
+        .map_err(|e| ScpPyError::transport(format!("failed to connect SSE client: {e}")))?;
 
     // Create the MCP client and perform the initialize handshake.
     let mut client = McpClient::new(ClientTransport::Sse(transport));
     client
         .initialize()
-        .map_err(|e| ScpPyError::TransportError(format!("MCP initialize handshake failed: {e}")))?;
+        .map_err(|e| ScpPyError::transport(format!("MCP initialize handshake failed: {e}")))?;
 
     let handle = generate_handle_id("mcp-client");
     let state = McpClientState {
@@ -1437,9 +1555,9 @@ pub fn py_mcp_client_connect_sse(url: &str) -> PyResult<String> {
 #[pyo3(name = "py_mcp_client_disconnect")]
 pub fn py_mcp_client_disconnect(handle: &str) -> PyResult<()> {
     validate::validate_mcp_handle(handle)?;
-    let (_, state) = client_registry().remove(handle).ok_or_else(|| {
-        ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
-    })?;
+    let (_, state) = client_registry()
+        .remove(handle)
+        .ok_or_else(|| ScpPyError::transport(format!("MCP client handle '{handle}' not found")))?;
 
     // Dropping `state` drops the Arc<Mutex<McpClient>>, which drops the
     // McpClient, which drops the ClientTransport. For stdio transports,
@@ -1472,9 +1590,9 @@ pub fn py_mcp_client_disconnect(handle: &str) -> PyResult<()> {
 #[pyo3(name = "py_mcp_client_list_tools")]
 pub fn py_mcp_client_list_tools(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
     validate::validate_mcp_handle(handle)?;
-    let entry = client_registry().get(handle).ok_or_else(|| {
-        ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
-    })?;
+    let entry = client_registry()
+        .get(handle)
+        .ok_or_else(|| ScpPyError::transport(format!("MCP client handle '{handle}' not found")))?;
 
     // Send the real tools/list request via the MCP client.
     let client = Arc::clone(&entry.client);
@@ -1483,10 +1601,10 @@ pub fn py_mcp_client_list_tools(py: Python<'_>, handle: &str) -> PyResult<PyObje
     let tools = {
         let client_guard = client
             .lock()
-            .map_err(|e| ScpPyError::TransportError(format!("client lock poisoned: {e}")))?;
+            .map_err(|e| ScpPyError::transport(format!("client lock poisoned: {e}")))?;
         client_guard
             .list_tools()
-            .map_err(|e| ScpPyError::TransportError(format!("tools/list failed: {e}")))?
+            .map_err(|e| ScpPyError::transport(format!("tools/list failed: {e}")))?
     };
 
     // Convert tool definitions to JSON array for Python.
@@ -1540,9 +1658,9 @@ pub fn py_mcp_client_invoke(
     validate::validate_tool_name(tool_name)?;
     validate::validate_context_id(context_id)?;
     validate::validate_did(identity_did)?;
-    let entry = client_registry().get(handle).ok_or_else(|| {
-        ScpPyError::TransportError(format!("MCP client handle '{handle}' not found"))
-    })?;
+    let entry = client_registry()
+        .get(handle)
+        .ok_or_else(|| ScpPyError::transport(format!("MCP client handle '{handle}' not found")))?;
 
     let client = Arc::clone(&entry.client);
     drop(entry); // Release the DashMap guard before Python object access.
@@ -1554,10 +1672,10 @@ pub fn py_mcp_client_invoke(
     let result = {
         let client_guard = client
             .lock()
-            .map_err(|e| ScpPyError::TransportError(format!("client lock poisoned: {e}")))?;
+            .map_err(|e| ScpPyError::transport(format!("client lock poisoned: {e}")))?;
         client_guard
             .invoke(tool_name, input_json, context_id, identity_did)
-            .map_err(|e| ScpPyError::TransportError(format!("tools/call failed: {e}")))?
+            .map_err(|e| ScpPyError::transport(format!("tools/call failed: {e}")))?
     };
 
     // Convert the McpToolResult to a Python dict.
@@ -1760,9 +1878,9 @@ fn allowlist_err(e: allowlist::AllowlistError) -> ScpPyError {
         | AllowlistError::NulInEntry(_)
         | AllowlistError::ControlCharInEntry(_)
         | AllowlistError::PathInCommand(_)
-        | AllowlistError::InvalidCommand(_) => ScpPyError::ValidationError(msg),
+        | AllowlistError::InvalidCommand(_) => ScpPyError::validation(msg),
         AllowlistError::NotAllowed { .. } | AllowlistError::LockPoisoned => {
-            ScpPyError::TransportError(msg)
+            ScpPyError::transport(msg)
         }
     }
 }
@@ -1882,7 +2000,7 @@ pub fn py_register_tool_handler(
     validate::validate_tool_name(tool_name)?;
     // Verify the handler is callable before storing it.
     if !handler.bind(py).is_callable() {
-        return Err(ScpPyError::ValidationError("handler must be callable".to_owned()).into());
+        return Err(ScpPyError::validation("handler must be callable".to_owned()).into());
     }
 
     // Wrap the Python callable in a Rust closure that acquires the GIL,
@@ -2151,6 +2269,9 @@ mod tests {
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec!["ctx-1".to_owned(), "ctx-2".to_owned()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
         assert_eq!(
             provider.active_context_ids(),
@@ -2164,6 +2285,9 @@ mod tests {
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec![],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
         assert_eq!(provider.agent_did(), "did:dht:z6MkTest");
     }
@@ -2174,6 +2298,9 @@ mod tests {
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec!["nonexistent".to_owned()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
         // Unknown context returns empty tool list (no panic).
         let tools = provider.context_tools("nonexistent");
@@ -2217,6 +2344,8 @@ mod tests {
                     test_vectors: vec![],
                     operator_did: "did:dht:z6MkOperator".into(),
                     economic_metadata: None,
+                    registered_at: 0,
+                    signature: Vec::new(),
                 };
                 scp_core::context::tools::register_tool(
                     &mut rt.tool_registry,
@@ -2224,7 +2353,7 @@ mod tests {
                     registration,
                     creator_did,
                 )
-                .map_err(|e| crate::error::ScpPyError::ContextError(format!("{e}")))?;
+                .map_err(|e| crate::error::ScpPyError::context(format!("{e}")))?;
                 Ok(())
             })
             .unwrap();
@@ -2234,11 +2363,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FfiBridgeProvider::validate_capability — authorized (creator has all caps)
+    // FfiBridgeProvider::validate_capability — rejects missing UCAN (#319)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn ffi_bridge_provider_validate_capability_allows_authorized() {
+    fn ffi_bridge_provider_validate_capability_rejects_missing_ucan() {
         let creator = "did:dht:z6MkCreatorValCap";
         let ctx_id = setup_test_context(creator, true);
 
@@ -2246,18 +2375,28 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
-        // Creator has ToolInvokeAll, so any tool name should pass.
+        // Even the creator is rejected without a UCAN token.
+        let result = provider.validate_capability(&ctx_id, "calculator");
         assert!(
-            provider.validate_capability(&ctx_id, "calculator").is_ok(),
-            "creator should be authorized to invoke tools"
+            result.is_err(),
+            "should reject when no UCAN token is provided"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("UCAN token required"),
+            "error should mention UCAN requirement: {err}"
         );
 
         crate::runtime::remove_context(&ctx_id);
     }
 
     // -----------------------------------------------------------------------
-    // FfiBridgeProvider::validate_capability — rejects unauthorized
+    // FfiBridgeProvider::validate_capability — rejects unauthorized member
+    // without UCAN token (#319)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2282,16 +2421,19 @@ mod tests {
             agent_did: member.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
         let result = provider.validate_capability(&ctx_id, "calculator");
         assert!(
             result.is_err(),
-            "member without ToolInvoke should be rejected"
+            "member without UCAN token should be rejected"
         );
         let err = result.unwrap_err();
         assert!(
-            err.contains("insufficient permissions"),
-            "error should be generic (no agent DID/tool/context leaked): {err}"
+            err.contains("UCAN token required"),
+            "error should mention UCAN requirement: {err}"
         );
 
         crate::runtime::remove_context(&ctx_id);
@@ -2310,6 +2452,9 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
 
         let input = serde_json::json!({"a": 3, "b": 4});
@@ -2350,6 +2495,9 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
 
         // Invoke in echo mode (no handler registered).
@@ -2402,6 +2550,9 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
 
         let result =
@@ -2438,6 +2589,9 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
 
         // Invoke with invalid input (schema validation fails).
@@ -2471,6 +2625,9 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
 
         // Input schema requires an object with "a" and "b" as required fields.
@@ -2512,6 +2669,9 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
 
         let result = provider.invoke_tool(&ctx_id, "nonexistent", serde_json::json!({}));
@@ -2627,6 +2787,9 @@ mod tests {
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec![],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
         assert!(provider.subscribe_resource("scp://ctx/events").is_ok());
     }
@@ -2660,6 +2823,9 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
 
         let input = serde_json::json!({"a": 3, "b": 4});
@@ -2720,6 +2886,9 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
 
         let result =
@@ -2752,6 +2921,9 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
 
         let result =
@@ -2787,6 +2959,9 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: 50, // 50ms — will expire before the 5s sleep.
+            agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
 
         let result =
@@ -2830,6 +3005,9 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: 5_000, // 5 seconds — plenty for an instant handler.
+            agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
 
         let result =
@@ -2912,6 +3090,9 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
         let server = McpServer::new(provider);
         let server = Arc::new(Mutex::new(server));
@@ -2957,6 +3138,9 @@ mod tests {
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
+
+            agent_proof_tokens: None,
         };
         let server = McpServer::new(provider);
         let server = Arc::new(Mutex::new(server));

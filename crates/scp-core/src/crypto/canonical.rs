@@ -13,6 +13,7 @@
 //! - `u64`: 8 bytes big-endian.
 //! - `u32`: 4 bytes big-endian.
 //! - `u16`: 2 bytes big-endian.
+//! - `u8`: 1 byte (discriminator bytes, message type tags).
 //! - Optional absent: `SHA-256(0x00)` sentinel (32 bytes).
 
 use sha2::{Digest, Sha256};
@@ -45,6 +46,9 @@ pub enum CanonicalField<'a> {
     U32(u32),
     /// Unsigned 16-bit integer: 2 bytes big-endian.
     U16(u16),
+    /// Unsigned 8-bit integer: 1 byte. Used for discriminator bytes (e.g.,
+    /// `MessageType`).
+    U8(u8),
     /// Optional field that is absent: uses `SHA-256(0x00)` sentinel.
     Absent,
 }
@@ -78,11 +82,49 @@ pub fn canonical_hash(domain: &str, fields: &[CanonicalField<'_>]) -> [u8; 32] {
             CanonicalField::U64(n) => hasher.update(n.to_be_bytes()),
             CanonicalField::U32(n) => hasher.update(n.to_be_bytes()),
             CanonicalField::U16(n) => hasher.update(n.to_be_bytes()),
+            CanonicalField::U8(n) => hasher.update([*n]),
             CanonicalField::Absent => hasher.update(ABSENT_SENTINEL),
         }
     }
 
     hasher.finalize().into()
+}
+
+/// Encode fields into canonical byte representation without hashing.
+///
+/// Same encoding rules as [`canonical_hash`] but returns the raw bytes
+/// instead of their SHA-256 digest. Used when the caller needs signable
+/// bytes rather than a fixed-size hash (e.g., Ed25519 signs arbitrary
+/// messages).
+///
+/// # Panics
+///
+/// Panics if any [`CanonicalField::VarBytes`] field exceeds `u32::MAX` bytes.
+#[must_use]
+pub fn canonical_hash_bytes(domain: &[u8], fields: &[CanonicalField<'_>]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(256);
+    bytes.extend_from_slice(domain);
+
+    for field in fields {
+        match field {
+            CanonicalField::VarBytes(b) => {
+                #[allow(clippy::expect_used)]
+                let len = u32::try_from(b.len()).expect("field exceeds u32::MAX bytes");
+                bytes.extend_from_slice(&len.to_be_bytes());
+                bytes.extend_from_slice(b);
+            }
+            CanonicalField::RawBytes(b) => bytes.extend_from_slice(b),
+            CanonicalField::Fixed32(b) => bytes.extend_from_slice(b.as_slice()),
+            CanonicalField::Fixed64(b) => bytes.extend_from_slice(b.as_slice()),
+            CanonicalField::U64(n) => bytes.extend_from_slice(&n.to_be_bytes()),
+            CanonicalField::U32(n) => bytes.extend_from_slice(&n.to_be_bytes()),
+            CanonicalField::U16(n) => bytes.extend_from_slice(&n.to_be_bytes()),
+            CanonicalField::U8(n) => bytes.push(*n),
+            CanonicalField::Absent => bytes.extend_from_slice(&ABSENT_SENTINEL),
+        }
+    }
+
+    bytes
 }
 
 #[cfg(test)]

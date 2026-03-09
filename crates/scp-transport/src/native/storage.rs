@@ -166,6 +166,14 @@ pub trait BlobStorage: Send + Sync {
     /// blobs purged.
     async fn purge_expired(&self) -> Result<usize, StorageError>;
 
+    /// Returns the total number of blobs currently stored.
+    ///
+    /// Used by the dev API health/status endpoints to report storage
+    /// metrics. Implementations should return the count of non-expired
+    /// blobs where feasible, but may include expired-but-not-yet-purged
+    /// blobs if a precise count is expensive.
+    async fn count(&self) -> Result<usize, StorageError>;
+
     /// Stores a blob from a stream of chunks.
     ///
     /// Default implementation collects the stream to `Vec<u8>` and delegates
@@ -453,6 +461,10 @@ impl BlobStorage for InMemoryBlobStorage {
 
         Ok(expired_ids.len())
     }
+
+    async fn count(&self) -> Result<usize, StorageError> {
+        Ok(self.blobs.read().await.len())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -663,6 +675,10 @@ impl BlobStorage for BlobStorageBackend {
 
     async fn purge_expired(&self) -> Result<usize, StorageError> {
         dispatch!(self, purge_expired())
+    }
+
+    async fn count(&self) -> Result<usize, StorageError> {
+        dispatch!(self, count())
     }
 
     async fn store_streaming(

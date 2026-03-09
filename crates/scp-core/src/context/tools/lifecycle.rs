@@ -19,6 +19,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::economy::types::Amount;
 use crate::provenance::DataProvenance;
 use scp_identity::DID;
 
@@ -283,6 +284,11 @@ pub struct ToolInvokedEvent {
     pub input_hash: String,
     /// SHA-256 hash of the output (hex-encoded), if output was produced.
     pub output_hash: Option<String>,
+    /// Cost attributed to this invocation (§19.3). `None` for free contexts
+    /// or tools without per-invocation cost. Value is in the context's
+    /// economic policy currency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<Amount>,
 }
 
 // ---------------------------------------------------------------------------
@@ -508,6 +514,7 @@ mod tests {
             execution_time_ms: 42,
             input_hash: "abcd".to_owned(),
             output_hash: Some("efgh".to_owned()),
+            cost: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: ToolInvokedEvent = serde_json::from_str(&json).unwrap();

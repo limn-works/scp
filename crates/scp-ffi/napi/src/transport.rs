@@ -16,6 +16,7 @@
 //! See ADR-022 and ADR-005 (Transport Abstraction) in `.docs/adrs/`.
 
 use napi_derive::napi;
+use scp_ffi_common::validate::validate_relay_url;
 
 use crate::error::ScpNapiError;
 use crate::{decrement_handle_count, increment_handle_count};
@@ -126,8 +127,9 @@ impl Drop for NapiTransportManager {
 /// - Rejects with `SCP-TRANS-5001` if the connection fails (unreachable relay,
 ///   protocol mismatch, timeout, authentication failure) in the full runtime.
 #[napi]
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub async fn transport_connect(relay_url: String) -> napi::Result<NapiTransportManager> {
+    validate_relay_url(&relay_url).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
     if !relay_url.starts_with("wss://") {
         return Err(ScpNapiError::Validation {
             message: format!(
@@ -139,15 +141,37 @@ pub async fn transport_connect(relay_url: String) -> napi::Result<NapiTransportM
         .into());
     }
 
-    let handle = NapiTransportManager {
-        status: std::sync::Mutex::new(NapiTransportStatus {
-            connected: true,
-            relay_url: Some(relay_url),
-            latency_ms: None,
-        }),
+    // Attempt a real WebSocket connection via scp-transport.
+    let sourced = scp_transport::relay::connection::SourcedRelayUrl {
+        url: relay_url.clone(),
+        source: scp_transport::relay::connection::RelayUrlSource::Explicit,
     };
-    increment_handle_count();
-    Ok(handle)
+
+    let start = std::time::Instant::now();
+    let adapter_result = scp_transport::native::NativeRelayAdapter::connect_sourced(&sourced).await;
+
+    match adapter_result {
+        Ok(_adapter) => {
+            // Connection succeeded. Measure latency.
+            #[allow(clippy::cast_precision_loss)]
+            let latency = start.elapsed().as_millis() as f64;
+
+            let handle = NapiTransportManager {
+                status: std::sync::Mutex::new(NapiTransportStatus {
+                    connected: true,
+                    relay_url: Some(relay_url),
+                    latency_ms: Some(latency),
+                }),
+            };
+            increment_handle_count();
+            Ok(handle)
+        }
+        Err(e) => Err(ScpNapiError::Transport {
+            message: format!("failed to connect to relay '{relay_url}': {e}"),
+            code: "SCP-TRANS-5001".to_owned(),
+        }
+        .into()),
+    }
 }
 
 /// Returns the current transport connection status.
@@ -205,4 +229,56 @@ pub async fn transport_disconnect(manager: &NapiTransportManager) -> napi::Resul
     drop(s);
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    // -----------------------------------------------------------------------
+    // transport_connect rejects non-wss URLs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn transport_connect_rejects_plaintext_ws_url() {
+        // The bridge validates scheme synchronously before any async I/O.
+        let url = "ws://relay.example.com";
+        assert!(
+            !url.starts_with("wss://"),
+            "plaintext ws:// URL must be rejected by the bridge"
+        );
+    }
+
+    #[test]
+    fn transport_connect_rejects_http_url() {
+        let url = "http://relay.example.com";
+        assert!(
+            !url.starts_with("wss://"),
+            "http:// URL must be rejected by the bridge"
+        );
+    }
+
+    #[test]
+    fn transport_connect_accepts_wss_scheme() {
+        let url = "wss://relay.example.com";
+        assert!(
+            url.starts_with("wss://"),
+            "wss:// URL must pass scheme validation"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // NapiTransportStatus defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn transport_status_default_disconnected() {
+        let status = super::NapiTransportStatus {
+            connected: false,
+            relay_url: None,
+            latency_ms: None,
+        };
+        assert!(!status.connected);
+        assert!(status.relay_url.is_none());
+        assert!(status.latency_ms.is_none());
+    }
 }

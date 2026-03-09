@@ -4,14 +4,19 @@
 //! spec section 17.3:
 //!
 //! ```text
-//! context/{context_id}/event/{seq:020d}
-//! context/{context_id}/event_meta/count
-//! context/{context_id}/event_meta/root
-//! context/{context_id}/event_tree/{level}/{index}
+//! context/{context_id}/event/{seq:020d}               -- 32-byte event hash
+//! context/{context_id}/event_meta/count               -- u64 event count
+//! context/{context_id}/event_meta/root                -- 32-byte Merkle root
+//! context/{context_id}/event_tree/{level}/{index}     -- Merkle tree nodes
+//! context/{context_id}/event_data/{seq:020d}          -- MessagePack-serialized Event payload
 //! ```
 //!
 //! Event sequence numbers use 20-digit zero-padding for lexicographic
 //! ordering, enabling efficient range queries via `list_keys`.
+//!
+//! The `event_data/` key space stores full serialized event payloads alongside
+//! the Merkle tree leaf hashes. This enables `query_events` to return real
+//! event data instead of just Merkle summaries. See GitHub issue #303.
 //!
 //! See spec sections 17.3, 17.4, and ADR-011.
 
@@ -67,6 +72,89 @@ fn event_root_key(context_id: &str) -> Result<String, StoreError> {
 fn event_tree_node_key(context_id: &str, level: u32, index: u64) -> Result<String, StoreError> {
     let ctx = super::sanitize_key_component(context_id)?;
     Ok(format!("context/{ctx}/event_tree/{level:05}/{index:020}"))
+}
+
+/// Builds the storage key for an event data payload at a given sequence number.
+///
+/// Format: `context/{context_id}/event_data/{seq:020d}`
+/// Uses 20-digit zero-padding for lexicographic ordering, matching the
+/// event hash key convention.
+/// See spec section 17.3 and GitHub issue #303.
+fn event_data_key(context_id: &str, seq: u64) -> Result<String, StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/event_data/{seq:020}"))
+}
+
+/// Builds the prefix for listing all event data payloads in a context.
+///
+/// Format: `context/{context_id}/event_data/`
+fn event_data_prefix(context_id: &str) -> Result<String, StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/event_data/"))
+}
+
+// ---------------------------------------------------------------------------
+// EventQueryFilter — filter criteria for query_events (GitHub issue #303)
+// ---------------------------------------------------------------------------
+
+/// Filter criteria for querying stored events.
+///
+/// All fields are optional. When `None`, the filter does not constrain
+/// that dimension. Multiple filters are `ANDed` together.
+#[derive(Debug, Clone, Default)]
+pub struct EventQueryFilter {
+    /// Match events with this exact event type (e.g., `"ToolInvoked"`).
+    pub event_type: Option<String>,
+    /// Match events from this specific actor DID.
+    pub actor_did: Option<String>,
+    /// Only events at or after this sequence number (inclusive).
+    pub sequence_start: Option<u64>,
+    /// Only events before this sequence number (exclusive).
+    pub sequence_end: Option<u64>,
+    /// Only events at or after this Unix timestamp (seconds, inclusive).
+    pub timestamp_start: Option<u64>,
+    /// Only events before this Unix timestamp (seconds, exclusive).
+    pub timestamp_end: Option<u64>,
+    /// Maximum number of events to return.
+    pub limit: Option<usize>,
+}
+
+impl EventQueryFilter {
+    /// Returns `true` if any filter field requires deserializing the event
+    /// payload to check (i.e., `event_type`, `actor_did`, or timestamp filters).
+    const fn needs_deserialized_check(&self) -> bool {
+        self.event_type.is_some()
+            || self.actor_did.is_some()
+            || self.timestamp_start.is_some()
+            || self.timestamp_end.is_some()
+    }
+
+    /// Returns `true` if the given deserialized event matches all active
+    /// filter criteria.
+    fn matches(&self, event: &scp_event_log::Event) -> bool {
+        if let Some(ref et) = self.event_type {
+            let event_type_str = format!("{:?}", event.event_type);
+            if event_type_str != *et {
+                return false;
+            }
+        }
+        if let Some(ref actor) = self.actor_did
+            && event.actor_did.0 != *actor
+        {
+            return false;
+        }
+        if let Some(ts_start) = self.timestamp_start
+            && event.timestamp < ts_start
+        {
+            return false;
+        }
+        if let Some(ts_end) = self.timestamp_end
+            && event.timestamp >= ts_end
+        {
+            return false;
+        }
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +300,191 @@ impl<S: Storage> ProtocolStore<S> {
     }
 
     // -----------------------------------------------------------------------
+    // Event data payload methods (GitHub issue #303)
+    // -----------------------------------------------------------------------
+
+    /// Stores a serialized event payload at the given sequence number.
+    ///
+    /// Persists the `MessagePack`-serialized `Event` bytes under
+    /// `context/{context_id}/event_data/{seq:020d}`. This stores the full
+    /// event payload alongside the Merkle tree leaf hash (which is stored
+    /// separately via [`append_event`](Self::append_event)).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
+    pub async fn store_event_data(
+        &self,
+        context_id: &str,
+        seq: u64,
+        event_bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        let key = event_data_key(context_id, seq)?;
+        self.store_value(&key, &event_bytes.to_vec()).await
+    }
+
+    /// Loads a serialized event payload at the given sequence number.
+    ///
+    /// Returns `None` if no event data exists at the given sequence (e.g.,
+    /// for events that were hash-only before payload persistence was added).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage read fails.
+    pub async fn load_event_data(
+        &self,
+        context_id: &str,
+        seq: u64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let key = event_data_key(context_id, seq)?;
+        self.load_value(&key).await
+    }
+
+    /// Loads serialized event payloads for a range of sequence numbers `[start, end)`.
+    ///
+    /// Returns `(sequence, payload_bytes)` pairs in sequence order. Missing
+    /// sequences within the range are silently skipped (backward compatibility
+    /// for events that were hash-only before payload persistence was added).
+    ///
+    /// # Performance
+    ///
+    /// Uses `list_keys` with the event data prefix and filters by sequence
+    /// bounds. Terminates early once keys exceed `end_suffix`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Storage`] if the underlying storage operation fails.
+    /// Returns [`StoreError::DeserializationFailed`] if any payload fails
+    /// to deserialize.
+    pub async fn load_event_data_range(
+        &self,
+        context_id: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<(u64, Vec<u8>)>, StoreError> {
+        let prefix = event_data_prefix(context_id)?;
+        let keys = self.storage.list_keys(&prefix).await?;
+
+        let start_suffix = format!("{start:020}");
+        let end_suffix = format!("{end:020}");
+
+        let mut results = Vec::new();
+        for key in keys {
+            if let Some(seq_str) = key.strip_prefix(&prefix) {
+                // Keys are sorted lexicographically; once we pass end_suffix
+                // no further keys can be in range -- terminate early.
+                if seq_str >= end_suffix.as_str() {
+                    break;
+                }
+                if seq_str >= start_suffix.as_str()
+                    && let Some(data) = self.load_value::<Vec<u8>>(&key).await?
+                {
+                    // Parse the sequence number from the key suffix.
+                    if let Ok(seq) = seq_str.parse::<u64>() {
+                        results.push((seq, data));
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Appends both an event hash and its full serialized payload atomically.
+    ///
+    /// This is the combined operation for persisting a complete event record:
+    /// the 32-byte SHA-256 hash goes to `context/{context_id}/event/{seq:020d}`
+    /// (for Merkle tree verification) and the full `MessagePack`-serialized
+    /// `Event` goes to `context/{context_id}/event_data/{seq:020d}` (for
+    /// later query and replay).
+    ///
+    /// Enforces strict append-only monotonicity: `seq` must equal the
+    /// current event count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SerializationFailed`] if `seq` does not equal
+    /// the current event count (monotonicity violation).
+    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
+    pub async fn append_event_full(
+        &self,
+        context_id: &str,
+        seq: u64,
+        event_hash: &[u8; 32],
+        event_bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        // Delegate hash storage (with monotonicity enforcement) to append_event.
+        self.append_event(context_id, seq, event_hash).await?;
+        // Store the full event payload alongside.
+        self.store_event_data(context_id, seq, event_bytes).await
+    }
+
+    /// Queries stored event data with optional filters.
+    ///
+    /// Loads event payloads from the `event_data/` key space, deserializes
+    /// them, and applies the provided filter criteria. Returns matching
+    /// events in sequence order.
+    ///
+    /// # Filter fields
+    ///
+    /// - `event_type`: Match events with this exact event type name.
+    /// - `actor_did`: Match events from this specific actor DID.
+    /// - `sequence_start`: Only events at or after this sequence (inclusive).
+    /// - `sequence_end`: Only events before this sequence (exclusive).
+    /// - `timestamp_start`: Only events at or after this timestamp.
+    /// - `timestamp_end`: Only events before this timestamp.
+    /// - `limit`: Maximum number of events to return.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Storage`] if the underlying storage operation fails.
+    /// Returns [`StoreError::DeserializationFailed`] if stored data is corrupt.
+    pub async fn query_events(
+        &self,
+        context_id: &str,
+        filter: &EventQueryFilter,
+    ) -> Result<Vec<Vec<u8>>, StoreError> {
+        let count = self.event_count(context_id).await?;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let start = filter.sequence_start.unwrap_or(0);
+        let end = filter.sequence_end.unwrap_or(count);
+
+        let range = self.load_event_data_range(context_id, start, end).await?;
+
+        let mut results = Vec::new();
+        for (_seq, data) in range {
+            // Apply post-load filters by attempting deserialization.
+            // If deserialization fails for filter checking, include the raw
+            // bytes anyway (the caller may handle partial data).
+            if filter.needs_deserialized_check() {
+                if let Ok(event) = rmp_serde::from_slice::<scp_event_log::Event>(&data) {
+                    if !filter.matches(&event) {
+                        continue;
+                    }
+                }
+                // If deserialization fails, skip the event (corrupt data).
+                else {
+                    continue;
+                }
+            }
+
+            results.push(data);
+
+            if let Some(limit) = filter.limit
+                && results.len() >= limit
+            {
+                break;
+            }
+        }
+
+        Ok(results)
+    }
+
+    // -----------------------------------------------------------------------
     // Event log Merkle tree methods (SCP-PERSIST-017)
     // -----------------------------------------------------------------------
 
@@ -316,7 +589,12 @@ impl<S: Storage> ProtocolStore<S> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::cast_possible_truncation
+)]
 mod tests {
     use scp_platform::testing::InMemoryStorage;
 
@@ -475,6 +753,262 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // Event data payload methods (GitHub issue #303)
+    // -------------------------------------------------------------------
+
+    fn make_test_event(
+        seq: u64,
+        event_type: scp_event_log::EventType,
+        actor: &str,
+    ) -> scp_event_log::Event {
+        scp_event_log::Event {
+            event_type,
+            actor_did: scp_event_log::DID(actor.to_owned()),
+            timestamp: 1_700_000_000 + seq,
+            sequence: seq,
+            payload: scp_event_log::EventPayload {
+                data: vec![seq as u8; 4],
+            },
+            prev_hash: [0u8; 32],
+            signature: Vec::new(),
+        }
+    }
+
+    fn serialize_event(event: &scp_event_log::Event) -> Vec<u8> {
+        rmp_serde::to_vec(event).unwrap()
+    }
+
+    #[tokio::test]
+    async fn store_and_load_event_data_roundtrip() {
+        let store = make_store();
+        let event = make_test_event(0, scp_event_log::EventType::ToolInvoked, "did:dht:z6MkTest");
+        let bytes = serialize_event(&event);
+
+        store.store_event_data("ctx-1", 0, &bytes).await.unwrap();
+        let loaded = store.load_event_data("ctx-1", 0).await.unwrap();
+        assert_eq!(loaded, Some(bytes));
+    }
+
+    #[tokio::test]
+    async fn load_event_data_returns_none_for_missing_sequence() {
+        let store = make_store();
+        let loaded = store.load_event_data("ctx-1", 99).await.unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn load_event_data_range_returns_correct_ordered_subset() {
+        let store = make_store();
+
+        for i in 0u64..10 {
+            let event =
+                make_test_event(i, scp_event_log::EventType::MessageSent, "did:dht:z6MkTest");
+            let bytes = serialize_event(&event);
+            store.store_event_data("ctx-1", i, &bytes).await.unwrap();
+        }
+
+        let range = store.load_event_data_range("ctx-1", 3, 7).await.unwrap();
+        assert_eq!(range.len(), 4);
+
+        // Verify sequence order.
+        for (idx, (seq, _data)) in range.iter().enumerate() {
+            assert_eq!(*seq, 3 + idx as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn load_event_data_range_empty_for_no_match() {
+        let store = make_store();
+        let event = make_test_event(
+            0,
+            scp_event_log::EventType::ContextCreated,
+            "did:dht:z6MkTest",
+        );
+        let bytes = serialize_event(&event);
+        store.store_event_data("ctx-1", 0, &bytes).await.unwrap();
+
+        let range = store.load_event_data_range("ctx-1", 5, 10).await.unwrap();
+        assert!(range.is_empty());
+    }
+
+    #[tokio::test]
+    async fn append_event_full_stores_both_hash_and_payload() {
+        let store = make_store();
+        let hash = test_hash(0xAB);
+        let event = make_test_event(0, scp_event_log::EventType::ToolInvoked, "did:dht:z6MkTest");
+        let bytes = serialize_event(&event);
+
+        store
+            .append_event_full("ctx-1", 0, &hash, &bytes)
+            .await
+            .unwrap();
+
+        // Verify hash was stored.
+        let loaded_hash = store.load_event("ctx-1", 0).await.unwrap();
+        assert_eq!(loaded_hash, Some(hash.to_vec()));
+
+        // Verify payload was stored.
+        let loaded_data = store.load_event_data("ctx-1", 0).await.unwrap();
+        assert_eq!(loaded_data, Some(bytes));
+
+        // Verify event count was updated.
+        assert_eq!(store.event_count("ctx-1").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn query_events_with_no_filter_returns_all() {
+        let store = make_store();
+
+        for i in 0u64..3 {
+            let event =
+                make_test_event(i, scp_event_log::EventType::MessageSent, "did:dht:z6MkTest");
+            let bytes = serialize_event(&event);
+            store
+                .append_event_full("ctx-1", i, &test_hash(i as u8), &bytes)
+                .await
+                .unwrap();
+        }
+
+        let filter = EventQueryFilter::default();
+        let results = store.query_events("ctx-1", &filter).await.unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn query_events_filters_by_event_type() {
+        let store = make_store();
+
+        let e0 = make_test_event(0, scp_event_log::EventType::MessageSent, "did:dht:z6MkA");
+        let e1 = make_test_event(1, scp_event_log::EventType::ToolInvoked, "did:dht:z6MkB");
+        let e2 = make_test_event(2, scp_event_log::EventType::MessageSent, "did:dht:z6MkC");
+        store
+            .append_event_full("ctx-1", 0, &test_hash(0), &serialize_event(&e0))
+            .await
+            .unwrap();
+        store
+            .append_event_full("ctx-1", 1, &test_hash(1), &serialize_event(&e1))
+            .await
+            .unwrap();
+        store
+            .append_event_full("ctx-1", 2, &test_hash(2), &serialize_event(&e2))
+            .await
+            .unwrap();
+
+        let filter = EventQueryFilter {
+            event_type: Some("MessageSent".to_owned()),
+            ..Default::default()
+        };
+        let results = store.query_events("ctx-1", &filter).await.unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn query_events_filters_by_actor_did() {
+        let store = make_store();
+
+        let e0 = make_test_event(0, scp_event_log::EventType::MessageSent, "did:dht:z6MkA");
+        let e1 = make_test_event(1, scp_event_log::EventType::MessageSent, "did:dht:z6MkB");
+        store
+            .append_event_full("ctx-1", 0, &test_hash(0), &serialize_event(&e0))
+            .await
+            .unwrap();
+        store
+            .append_event_full("ctx-1", 1, &test_hash(1), &serialize_event(&e1))
+            .await
+            .unwrap();
+
+        let filter = EventQueryFilter {
+            actor_did: Some("did:dht:z6MkA".to_owned()),
+            ..Default::default()
+        };
+        let results = store.query_events("ctx-1", &filter).await.unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn query_events_filters_by_sequence_range() {
+        let store = make_store();
+
+        for i in 0u64..5 {
+            let event =
+                make_test_event(i, scp_event_log::EventType::MessageSent, "did:dht:z6MkTest");
+            store
+                .append_event_full("ctx-1", i, &test_hash(i as u8), &serialize_event(&event))
+                .await
+                .unwrap();
+        }
+
+        let filter = EventQueryFilter {
+            sequence_start: Some(2),
+            sequence_end: Some(4),
+            ..Default::default()
+        };
+        let results = store.query_events("ctx-1", &filter).await.unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn query_events_filters_by_timestamp_range() {
+        let store = make_store();
+
+        for i in 0u64..5 {
+            let event =
+                make_test_event(i, scp_event_log::EventType::MessageSent, "did:dht:z6MkTest");
+            store
+                .append_event_full("ctx-1", i, &test_hash(i as u8), &serialize_event(&event))
+                .await
+                .unwrap();
+        }
+
+        // Events have timestamps 1_700_000_000, ..., 1_700_000_004
+        let filter = EventQueryFilter {
+            timestamp_start: Some(1_700_000_002),
+            timestamp_end: Some(1_700_000_004),
+            ..Default::default()
+        };
+        let results = store.query_events("ctx-1", &filter).await.unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn query_events_respects_limit() {
+        let store = make_store();
+
+        for i in 0u64..10 {
+            let event =
+                make_test_event(i, scp_event_log::EventType::MessageSent, "did:dht:z6MkTest");
+            store
+                .append_event_full("ctx-1", i, &test_hash(i as u8), &serialize_event(&event))
+                .await
+                .unwrap();
+        }
+
+        let filter = EventQueryFilter {
+            limit: Some(3),
+            ..Default::default()
+        };
+        let results = store.query_events("ctx-1", &filter).await.unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn backward_compatibility_hash_only_events() {
+        let store = make_store();
+
+        // Simulate a hash-only event (no payload stored).
+        store.append_event("ctx-1", 0, &test_hash(1)).await.unwrap();
+
+        // load_event_data should return None for hash-only events.
+        let loaded = store.load_event_data("ctx-1", 0).await.unwrap();
+        assert!(loaded.is_none());
+
+        // query_events should return empty for hash-only contexts.
+        let filter = EventQueryFilter::default();
+        let results = store.query_events("ctx-1", &filter).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    // -------------------------------------------------------------------
     // Key convention tests
     // -------------------------------------------------------------------
 
@@ -511,6 +1045,26 @@ mod tests {
         assert_eq!(
             event_tree_node_key("ctx-123", 2, 5).unwrap(),
             "context/ctx-123/event_tree/00002/00000000000000000005"
+        );
+    }
+
+    #[test]
+    fn event_data_key_follows_convention() {
+        assert_eq!(
+            event_data_key("ctx-123", 0).unwrap(),
+            "context/ctx-123/event_data/00000000000000000000"
+        );
+        assert_eq!(
+            event_data_key("ctx-123", 42).unwrap(),
+            "context/ctx-123/event_data/00000000000000000042"
+        );
+    }
+
+    #[test]
+    fn event_data_prefix_follows_convention() {
+        assert_eq!(
+            event_data_prefix("ctx-123").unwrap(),
+            "context/ctx-123/event_data/"
         );
     }
 }

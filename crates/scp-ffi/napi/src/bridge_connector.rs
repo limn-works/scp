@@ -1,0 +1,307 @@
+//! napi-rs bridge for bridge connector operations.
+//!
+//! Exposes SCP bridge connector operations to Node.js/Bun:
+//!
+//! - [`bridge_evaluate_trust`] -- Evaluate trust level for a bridge action.
+//! - [`bridge_register`] -- Register a bridge connector with a context.
+//! - [`bridge_create_shadow`] -- Create a shadow identity.
+//!
+//! See spec section 12 (Bridge System) and ADR-023.
+
+use napi_derive::napi;
+
+use scp_core::bridge::provenance::{
+    evaluate_trust_level, mark_bridge_provenance, BridgeTrustLevel,
+};
+use scp_core::bridge::registration::{
+    approve_registration, register_bridge, BridgeRegistrationRequest, BridgeRegistry,
+};
+use scp_core::bridge::shadow::{create_shadow, ShadowRegistry};
+use scp_core::bridge::{
+    BridgeConnector, BridgeMode, BridgeStatus, ShadowIdentity, ShadowProvenanceStatus,
+};
+use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
+
+use crate::error::ScpNapiError;
+
+// ---------------------------------------------------------------------------
+// Result types
+// ---------------------------------------------------------------------------
+
+/// Shadow identity creation result.
+#[napi(object)]
+pub struct NapiShadowIdentity {
+    /// Unique identifier for this shadow identity.
+    pub shadow_id: String,
+    /// External platform handle.
+    pub platform_handle: String,
+    /// Bridge connector that created this shadow.
+    pub bridge_id: String,
+    /// Role attributed to this shadow.
+    pub attributed_role: String,
+    /// Provenance status: `"Shadow"` or `"Claimed"`.
+    pub provenance_status: String,
+}
+
+/// Bridge registration result.
+#[napi(object)]
+pub struct NapiBridgeRegistration {
+    /// Unique identifier for the registered bridge.
+    pub bridge_id: String,
+    /// DID of the bridge operator.
+    pub operator_did: String,
+    /// External platform name.
+    pub platform: String,
+    /// Bridge operating mode.
+    pub mode: String,
+    /// Bridge status after registration.
+    pub status: String,
+    /// Context the bridge is registered in.
+    pub context_id: String,
+}
+
+// ---------------------------------------------------------------------------
+// Bridge functions
+// ---------------------------------------------------------------------------
+
+/// Evaluates the trust level for an action based on bridge provenance.
+///
+/// Returns an integer (0-3) representing the trust tier.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn bridge_evaluate_trust(
+    is_bridged: bool,
+    is_native_transport: bool,
+    shadow_status: String,
+) -> napi::Result<u32> {
+    if !is_bridged {
+        let level = evaluate_trust_level(None, is_native_transport);
+        return Ok(level as u32);
+    }
+
+    let status = parse_shadow_status(&shadow_status)?;
+
+    let base = DataProvenance {
+        source_context: String::new(),
+        source_type: SourceType::Persistent,
+        counterparties: vec![],
+        purpose: None,
+        discovery_method: DiscoveryMethod::None,
+        age: std::time::Duration::from_secs(0),
+        memory_scope: scp_core::context::MemoryScope::Full,
+        chain_depth: 0,
+        chain_path: None,
+        payment_amount: None,
+        payment_adapter: None,
+        payment_receipt_id: None,
+    };
+
+    let connector = BridgeConnector {
+        bridge_id: String::new(),
+        operator_did: "did:key:unused".into(),
+        platform: String::new(),
+        mode: BridgeMode::Relay,
+        status: BridgeStatus::Active,
+        registration_context: String::new(),
+        registered_at: 0,
+    };
+
+    let shadow = ShadowIdentity {
+        shadow_id: String::new(),
+        platform_handle: String::new(),
+        bridge_id: String::new(),
+        attributed_role: "observer".to_string(),
+        provenance_status: status,
+        created_at: 0,
+    };
+
+    let bp = mark_bridge_provenance(base, &connector, &shadow);
+    let level = evaluate_trust_level(Some(&bp), is_native_transport);
+    Ok(level as u32)
+}
+
+/// Registers a new bridge connector with a context.
+///
+/// Creates a temporary `BridgeRegistry`, submits a registration request,
+/// and immediately approves it.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn bridge_register(
+    context_id: String,
+    operator_did: String,
+    platform: String,
+    mode: String,
+) -> napi::Result<NapiBridgeRegistration> {
+    let bridge_mode = parse_bridge_mode(&mode)?;
+
+    let mut registry = BridgeRegistry::new(context_id.clone());
+
+    let bridge_id = format!(
+        "bridge-{platform}-{}",
+        context_id.chars().take(8).collect::<String>()
+    );
+    let request = BridgeRegistrationRequest {
+        bridge_id: bridge_id.clone(),
+        operator_did: operator_did.clone().into(),
+        platform: platform.clone(),
+        mode: bridge_mode,
+        context_id: context_id.clone(),
+        requested_at: 0,
+        self_hosted: false,
+    };
+
+    let _event = register_bridge(&mut registry, request).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("bridge registration failed: {e}"),
+            code: "SCP-VALID-7012".to_owned(),
+        })
+    })?;
+
+    let governance_did: scp_identity::DID = operator_did.clone().into();
+    let (connector, _approval_event) =
+        approve_registration(&mut registry, &bridge_id, &governance_did, 0).map_err(|e| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!("bridge approval failed: {e}"),
+                code: "SCP-VALID-7013".to_owned(),
+            })
+        })?;
+
+    Ok(NapiBridgeRegistration {
+        bridge_id: connector.bridge_id,
+        operator_did,
+        platform,
+        mode,
+        status: "active".to_string(),
+        context_id,
+    })
+}
+
+/// Creates a shadow identity for an external platform participant.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn bridge_create_shadow(
+    bridge_id: String,
+    platform_handle: String,
+    bridge_mode: String,
+    context_id: Option<String>,
+) -> napi::Result<NapiShadowIdentity> {
+    let mode = parse_bridge_mode(&bridge_mode)?;
+    let ctx_id = context_id.unwrap_or_else(|| "ctx-shadow".to_string());
+
+    let shadow_id = format!("shadow-{bridge_id}-{}", platform_handle.replace('@', ""));
+    let mut shadow_registry = ShadowRegistry::new(ctx_id);
+
+    let (shadow, _event) = create_shadow(
+        &mut shadow_registry,
+        &shadow_id,
+        &bridge_id,
+        mode,
+        &platform_handle,
+        &[], // no existing context member DIDs for collision check
+        0,   // timestamp
+    )
+    .map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("shadow creation failed: {e}"),
+            code: "SCP-VALID-7014".to_owned(),
+        })
+    })?;
+
+    Ok(NapiShadowIdentity {
+        shadow_id: shadow.shadow_id,
+        platform_handle: shadow.platform_handle,
+        bridge_id: shadow.bridge_id,
+        attributed_role: shadow.attributed_role,
+        provenance_status: format!("{:?}", shadow.provenance_status),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+fn parse_bridge_mode(s: &str) -> napi::Result<BridgeMode> {
+    match s {
+        "relay" => Ok(BridgeMode::Relay),
+        "puppet" => Ok(BridgeMode::Puppet),
+        "api" => Ok(BridgeMode::Api),
+        "cooperative" => Ok(BridgeMode::Cooperative),
+        other => Err(ScpNapiError::Validation {
+            message: format!(
+                "invalid bridge mode '{other}': expected 'relay', 'puppet', 'api', or 'cooperative'"
+            ),
+            code: "SCP-VALID-7010".to_owned(),
+        }
+        .into()),
+    }
+}
+
+fn parse_shadow_status(s: &str) -> napi::Result<ShadowProvenanceStatus> {
+    match s {
+        "shadow" => Ok(ShadowProvenanceStatus::Shadow),
+        "claimed" => Ok(ShadowProvenanceStatus::Claimed),
+        other => Err(ScpNapiError::Validation {
+            message: format!(
+                "invalid shadow_status '{other}': expected 'shadow' or 'claimed'"
+            ),
+            code: "SCP-VALID-7011".to_owned(),
+        }
+        .into()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evaluate_trust_native_native() {
+        let result =
+            bridge_evaluate_trust(false, true, "shadow".to_owned()).unwrap();
+        assert_eq!(result, BridgeTrustLevel::NativeNative as u32);
+    }
+
+    #[test]
+    fn evaluate_trust_shadow_bridged() {
+        let result =
+            bridge_evaluate_trust(true, false, "shadow".to_owned()).unwrap();
+        assert_eq!(result, BridgeTrustLevel::ShadowBridged as u32);
+    }
+
+    #[test]
+    fn evaluate_trust_claimed_bridged() {
+        let result =
+            bridge_evaluate_trust(true, false, "claimed".to_owned()).unwrap();
+        assert_eq!(result, BridgeTrustLevel::ClaimedBridged as u32);
+    }
+
+    #[test]
+    fn register_bridge_returns_active() {
+        let result = bridge_register(
+            "ctx-test".to_owned(),
+            "did:key:operator".to_owned(),
+            "discord".to_owned(),
+            "relay".to_owned(),
+        )
+        .unwrap();
+        assert_eq!(result.status, "active");
+        assert_eq!(result.platform, "discord");
+    }
+
+    #[test]
+    fn create_shadow_returns_observer_role() {
+        let result = bridge_create_shadow(
+            "bridge-1".to_owned(),
+            "@user".to_owned(),
+            "relay".to_owned(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.attributed_role, "observer");
+    }
+}

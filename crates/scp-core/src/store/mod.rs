@@ -18,15 +18,18 @@
 //!
 //! See spec section 17.4 and ADR-006.
 
+pub mod access_keys;
 pub mod context;
 pub mod economy;
 pub mod event_log;
 pub mod identity;
 pub mod nonce;
 pub mod tls;
+pub mod tofu;
 pub mod tools;
 pub mod transport;
 pub mod ucan;
+pub mod wrapping_key;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use zeroize::Zeroize;
@@ -192,16 +195,19 @@ impl<S: Storage> ProtocolStore<S> {
         &self.storage
     }
 
-    /// Serializes a value into a `StoredValue` envelope using `MessagePack`.
+    /// Serializes a value into a `StoredValue` envelope using named `MessagePack`.
     ///
     /// Wraps the data in a version envelope (spec section 17.5) and
-    /// serializes the entire envelope with `rmp-serde`.
+    /// serializes the entire envelope with `rmp-serde` in named (map) format.
+    /// Named format encodes struct field names, making the format resilient
+    /// to field additions and reordering.
     fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, StoreError> {
         let envelope = StoredValue {
             version: CURRENT_STORE_VERSION,
             data: value,
         };
-        rmp_serde::to_vec(&envelope).map_err(|e| StoreError::SerializationFailed(e.to_string()))
+        rmp_serde::to_vec_named(&envelope)
+            .map_err(|e| StoreError::SerializationFailed(e.to_string()))
     }
 
     /// Deserializes a `StoredValue` envelope from `MessagePack` bytes.
@@ -209,6 +215,10 @@ impl<S: Storage> ProtocolStore<S> {
     /// Checks the version field: if the stored version exceeds the current
     /// version, returns `StoreError::IncompatibleVersion`. Otherwise
     /// deserializes and returns the inner data.
+    ///
+    /// Handles both named (map) and positional (array) `MessagePack` formats
+    /// for backward compatibility with data serialized before the switch
+    /// to `rmp_serde::to_vec_named`.
     fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, StoreError> {
         let envelope: StoredValue<T> = rmp_serde::from_slice(bytes)
             .map_err(|e| StoreError::DeserializationFailed(e.to_string()))?;
@@ -289,7 +299,7 @@ impl<S: Storage> ProtocolStore<S> {
             version: T::CURRENT_VERSION,
             data: value,
         };
-        let bytes = rmp_serde::to_vec(&envelope)
+        let bytes = rmp_serde::to_vec_named(&envelope)
             .map_err(|e| StoreError::SerializationFailed(e.to_string()))?;
         self.storage.store(key, &bytes).await?;
         Ok(())
@@ -354,7 +364,7 @@ impl<S: Storage> ProtocolStore<S> {
                             version: current_version,
                             data: &migrated,
                         };
-                        current_raw = rmp_serde::to_vec(&envelope)
+                        current_raw = rmp_serde::to_vec_named(&envelope)
                             .map_err(|e| StoreError::SerializationFailed(e.to_string()))?;
                     } else {
                         // Reached CURRENT_VERSION — write back and return.
@@ -450,12 +460,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stored_value_roundtrip_via_msgpack() {
+    fn stored_value_roundtrip_via_named_msgpack() {
         let original = StoredValue {
             version: 1,
             data: "hello".to_owned(),
         };
-        let bytes = rmp_serde::to_vec(&original).unwrap();
+        let bytes = rmp_serde::to_vec_named(&original).unwrap();
         let decoded: StoredValue<String> = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(decoded, original);
     }
@@ -476,7 +486,7 @@ mod tests {
             version: CURRENT_STORE_VERSION + 1,
             data: "future",
         };
-        let bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let bytes = rmp_serde::to_vec_named(&envelope).unwrap();
         let result =
             ProtocolStore::<scp_platform::testing::InMemoryStorage>::deserialize::<String>(&bytes);
         assert!(matches!(
@@ -527,6 +537,12 @@ mod tests {
                 }
                 2 => {
                     // v2 stored data as (String, u32) tuple in the envelope.
+                    // Chain migrations re-serialize as TestMigratable (named struct),
+                    // so we try the struct format first, then fall back to the tuple
+                    // format for data originally written at v2.
+                    if let Ok(envelope) = rmp_serde::from_slice::<StoredValue<Self>>(data) {
+                        return Some(envelope.data);
+                    }
                     let envelope: StoredValue<(String, u32)> = rmp_serde::from_slice(data).ok()?;
                     Some(Self {
                         value: envelope.data.0,
@@ -594,7 +610,7 @@ mod tests {
             version: 99u16,
             data: "future",
         };
-        let bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let bytes = rmp_serde::to_vec_named(&envelope).unwrap();
         store.storage.store("test/future", &bytes).await.unwrap();
 
         let result: Result<Option<TestMigratable>, _> = store.load_migratable("test/future").await;

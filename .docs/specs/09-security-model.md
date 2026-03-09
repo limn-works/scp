@@ -9,6 +9,7 @@
 5. **Contexts are isolated by default.** No transitive exposure. Cross-context data flow only through two explicit, opt-in mechanisms: tool interfaces (asymmetric, §6.2) and multi-parent child contexts (symmetric, §5.13).
 6. **Role assignment is non-negotiable.** Agents cannot request elevated permissions.
 7. **Context metadata is transparent.** Full legibility before opt-in.
+8. **Apps are capability-scoped.** The SDK enforces declaration contracts — apps receive scoped handles that expose only declared capabilities. API calls exceeding declared capabilities are rejected at the call site (§8.4.2).
 
 ## 9.2 Identified Threat Vectors and Mitigations
 
@@ -66,7 +67,7 @@ These constraints don't prevent a sufficiently creative attacker from encoding a
 
 *Mitigation — chain depth limit and provenance-based cost attribution.*
 
-- **Protocol-enforced chain depth limit.** Tool calls carry a `chain_depth` counter, incremented on each cross-context hop. The protocol enforces a maximum chain depth (suggested default: 3 hops). A tool call at the depth limit cannot trigger further cross-context tool calls. This is a hard protocol limit, not a governance option — it bounds the worst-case amplification factor.
+- **Protocol-enforced chain depth limit.** Tool calls carry a `chain_depth` counter, incremented on each cross-context hop. The protocol enforces a hard maximum chain depth of 5 hops that cannot be exceeded. Contexts MAY configure a lower limit via `max_chain_depth` in `ContextParams` (RECOMMENDED default: 3 hops). The effective limit is `min(context.max_chain_depth.unwrap_or(3), 5)`. A tool call at the effective depth limit cannot trigger further cross-context tool calls. The protocol hard maximum bounds the worst-case amplification factor; the context-configurable limit allows stricter enforcement where desired (§24.4).
 - **Provenance carries chain depth.** The provenance record (§7.7.1) includes the chain depth at each hop. Receiving contexts see how many boundaries the data has crossed. This enables depth-aware trust evaluation: data at chain depth 1 (direct tool call) carries stronger provenance than data at chain depth 3 (three intermediaries).
 - **Per-window rate limiting across chains.** Each context enforces rate limits on both inbound and outbound tool calls within a sliding time window. A context that receives a burst of inbound tool calls (even from different source contexts) throttles proportionally. This prevents amplification where many chains converge on a single target. Economic rate limits (§19.7) complement participation rate limits — cost escalation via `SenderVelocity` makes high-velocity patterns increasingly expensive, providing an economic deterrent that operates independently of and in parallel with participation throttling.
 - **Provenance degradation as trust signal.** Transitive provenance degradation is not a flaw — it is the protocol working as designed. Data from many degrees of separation away should be less trusted, the same way a message from a stranger deserves more scrutiny than one from a known contact. The chain depth in provenance gives the receiving agent the information to calibrate trust: "this data originated three hops away in a context I have no relationship with" is a meaningful signal. The protocol ensures this signal is always available; the agent decides how to weight it.
@@ -111,7 +112,7 @@ The distinction that matters is between **meaningful proliferation** (standing c
 
 - **All interface operations are logged.** Tool interface creation, connection, disconnection, and modification are protocol events recorded in the verifiable event log (§7.3.1). Members can see every interface decision the admin has made, when, and to which contexts. No silent interface changes.
 - **Interface metadata is visible.** Active tool interfaces are part of context metadata (§5.7). Members see what interfaces exist before joining and while participating.
-- **Governance evolution.** Single-admin governance is the Phase 2 minimum. The pluggable governance interface (§5.9) supports multi-sig, consensus, and voting models where interface decisions require member approval. Contexts that need member control over interfaces use governance models that provide it. This is not deferred — the governance interface is specified; specific multi-party models beyond single-admin are Phase 2+.
+- **Governance evolution.** Single-admin governance is the Phase 2 minimum. The pluggable governance interface (§5.9) supports multi-sig, consensus, and voting models where interface decisions require member approval. Contexts that need member control over interfaces use governance models that provide it. This is not deferred — the governance interface is specified and multi-party models are implemented. ADR-031 (Phase 6, `.docs/adrs/phase-6.md`) specifies four governance engines: `SingleAdminEngine`, `ThresholdEngine` (M-of-N), `MajorityVoteEngine`, and `UnanimityEngine`. All are implemented (SCP-129 through SCP-133).
 - **Exit as veto.** Any member can leave a context at any time. If the admin connects the context to an interface the member disagrees with, the member leaves. In an environment where context creation is cheap (§5.12), members can create a new context without the objectionable interface and migrate — the social graph is portable (§8.3).
 
 **8. Caller/tool asymmetry in peer interactions.**
@@ -185,6 +186,38 @@ Three layers compose:
 
 These layers interact: earned capacity makes new identities limited, social and economic cost makes depth expensive to fake, and context-level thresholds let high-value spaces demand the depth that sybil accounts lack. Consequences for coordinated attacks render sybil accounts single-use — once detected and penalized, the investment in aging and building history is lost. This makes sustained sybil campaigns economically irrational even when individual identity creation is feasible.
 
+**Earned capacity protocol-level defaults (RECOMMENDED per RFC 2119):**
+
+The protocol defines baseline earned capacity parameters. Implementations MAY override these values, but MUST document deviations. These defaults are calibrated to make sybil accounts expensive to mature while not penalizing legitimate new users:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `initial_context_creation_limit` | 3 | Maximum contexts a new identity (age < 7 days) can create. |
+| `initial_context_membership_limit` | 10 | Maximum contexts a new identity can join simultaneously. |
+| `initial_message_rate` | 60/hour | Maximum messages per hour across all contexts for a new identity. |
+| `initial_tool_invocation_rate` | 10/hour | Maximum tool invocations per hour for a new identity. |
+| `capacity_growth_interval` | 7 days | Duration between capacity tier increases. |
+| `capacity_growth_factor` | 2x | Multiplier applied to all rate limits at each growth interval. |
+| `maximum_capacity_tier` | 5 | Number of growth intervals before capacity is uncapped (5 tiers = 35 days to full capacity). |
+| `capacity_decay_trigger` | 30 days inactive | Duration of inactivity (no signed messages or context operations) before capacity decays by one tier. |
+| `capacity_decay_interval` | 14 days | Duration between successive tier decreases during continued inactivity. |
+| `measurement_window` | 1 hour (sliding) | Window over which rate limits are evaluated. |
+
+**Capacity tier progression (at default values):**
+
+| Tier | Age | Context creation | Membership | Message rate | Tool rate |
+|------|-----|-----------------|------------|-------------|-----------|
+| 0 (new) | 0-6d | 3 | 10 | 60/h | 10/h |
+| 1 | 7-13d | 6 | 20 | 120/h | 20/h |
+| 2 | 14-20d | 12 | 40 | 240/h | 40/h |
+| 3 | 21-27d | 24 | 80 | 480/h | 80/h |
+| 4 | 28-34d | 48 | 160 | 960/h | 160/h |
+| 5 (uncapped) | 35d+ | no limit | no limit | no limit | no limit |
+
+Age alone is necessary but not sufficient — the identity MUST also have at least `tier * 2` participation records from distinct contexts (not self-created) to advance. This prevents aging-only sybil attacks where an attacker creates identities and waits without interacting.
+
+**Enforcement:** Earned capacity is enforced at the SDK level. The SDK tracks the identity's creation timestamp (from the DID document's initial BEP44 sequence), participation record count (from context state), and inactivity duration. Rate limit violations produce `ErrorCode::RATE_LIMITED` (error code 4001) with a `Retry-After` hint. Context governance MAY impose stricter thresholds than the protocol defaults (§9.3 layer 3), but MUST NOT relax them below the protocol floor for identities at tier 0-2.
+
 Sybil resistance is a **deterrent**, not an enforcement guarantee. The defense is structural: expensive to mount, expensive to sustain, costly when detected.
 
 ## 9.4 Systemic Defense Philosophy
@@ -211,7 +244,18 @@ The protocol mandates a single ciphersuite for v1. No negotiation, no fallback. 
 
 **DID-to-DID encryption:** HPKE (RFC 9180) with suite DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. Used for MLS Welcome messages. The HPKE suite matches the MLS ciphersuite to minimize the cryptographic surface area.
 
-**Merkle tree hash:** SHA-256. Append-only log tree following Certificate Transparency structure (RFC 6962). Each event entry is `SHA256(previous_hash || event_data)`. The Merkle root provides tamper-evident integrity over the entire event history.
+**Key distribution HPKE:** RFC 9180 Base mode for sender key (§9.16.2), access key (§9.17), and broadcast key (§5.14.2) distribution. The suite is identical to DID-to-DID encryption: DHKEM(X25519, HKDF-SHA256) (KEM ID: 0x0020), HKDF-SHA256 (KDF ID: 0x0001), AES-128-GCM (AEAD ID: 0x0001). AES-128-GCM is used (not AES-256-GCM) because the HPKE AEAD protects a single 32-byte key per operation — the 128-bit security level matches the X25519 KEM and is consistent with the MLS ciphersuite. Each key distribution protocol uses a distinct `info` string for domain separation (see §9.16.2, §9.17.1, §5.14.2). Nonces for the AEAD within HPKE are managed internally by RFC 9180 — implementations MUST NOT generate or supply external nonces for the HPKE AEAD. The HPKE `enc` (encapsulated key) and `ct` (ciphertext) are transmitted in the wire format as specified per protocol.
+
+**Merkle tree hash:** SHA-256. Append-only log tree following Certificate Transparency structure (RFC 6962 §2). SCP uses the RFC 6962 hash construction with domain-separated leaf and interior node hashing to support efficient inclusion proofs and consistency proofs:
+
+- **Leaf hash:** `SHA-256(0x00 || event_data)` — the `0x00` prefix byte identifies leaf nodes.
+- **Interior node hash:** `SHA-256(0x01 || left_child_hash || right_child_hash)` — the `0x01` prefix byte identifies interior nodes.
+- **Empty tree:** The Merkle root of an empty tree is defined as `SHA-256("")` (the hash of the empty string, `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`).
+- **Tree construction:** Events are appended as leaves in order. The tree is built incrementally — each new leaf extends the tree per RFC 6962 §2. The root is recomputed after each append.
+
+The `0x00`/`0x01` domain separation prevents second-preimage attacks where an attacker constructs an interior node that is interpreted as a leaf (or vice versa). This is a critical security property: without it, an attacker could forge inclusion proofs by substituting tree layers.
+
+The Merkle root provides tamper-evident integrity over the entire event history. Inclusion proofs (proving a specific event is in the log) require `O(log N)` hashes. Consistency proofs (proving one log state is an extension of another) also require `O(log N)` hashes. These are used for equivocation detection (§9.9) and context state verification (§7.3.1).
 
 ### 9.5.1 Canonical Hash Construction
 
@@ -235,6 +279,8 @@ All signed structures in the protocol use a single canonical hash construction. 
 **Domain separator versioning:** each struct's domain separator includes a version suffix (e.g., `"SCP-INNER-ENVELOPE-V1:"`). Changing any field's encoding, adding a field, or removing a field requires incrementing the version. Old signatures become invalid — this is intentional.
 
 **Reference implementation:** the migration proof (§9.12) uses this exact construction: `SHA-256("SCP-MIGRATION-V1:" || len(old_did) || old_did || len(new_did) || new_did || rotated_at)`.
+
+**Additional signed structures** using this canonical hash construction are defined in their respective spec sections: `ResetRequest` (domain: `"SCP-RESET-REQUEST-V1:"`) is defined in §23.5.2.
 
 ### 9.5.2 Signed Structure Definitions
 
@@ -270,6 +316,8 @@ The outer envelope is unsigned — it contains only the routing pseudonym, recip
 | 8 | `provenance_hash` | 32 bytes (SHA-256 of serialized provenance, or `SHA-256(0x00)` if absent) |
 
 Note: the current implementation uses AEAD authentication only; the full signed structure above is the target format. The `BroadcastEnvelope` struct will be expanded to include all fields per #352.
+
+The AEAD nonce is intentionally excluded from the canonical hash. The AEAD authentication tag already authenticates the nonce as part of the encryption — including it in the signed hash would be redundant and would create a second binding that must be kept consistent without providing additional security.
 
 The signature is verified by subscribers against the author's Active Signing Key or Agent Signing Key (resolved from the author's DID document, ADR-039).
 
@@ -344,8 +392,18 @@ Note: the `claim` field uses compact JSON with no whitespace (equivalent to Pyth
 | 2 | `requester_did` | 4-byte BE length + UTF-8 bytes |
 | 3 | `timestamp` | 8-byte BE u64 |
 | 4 | `wrapping_pubkey` | 32 bytes (X25519 public key) |
+| 5 | `nonce` | 16 bytes (random, unique per request) |
 
 **UCAN signing:** EdDSA (Ed25519) per UCAN specification. The nonce field (`nnc`) is mandatory and must be unique per token issuance. This prevents UCAN token replay. UCAN token expiry (`exp`) MUST NOT exceed 24 hours (matching the nonce deduplication cache window in §9.8.2). Tokens with longer expiry could be replayed after nonce cache eviction. **UCAN revocation** is per-context via `RevocationList` — an append-only map of token CIDs to revocation states (Active, RevocationPending, Revoked). Revocations are distributed as MLS application messages to all context members. Revocation check is step 10 of the 11-step validation pipeline (ADR-016) and is performed on every capability exercise. The system is **fail-closed**: tokens in `RevocationPending` state (revocation initiated but not yet confirmed via MLS) are denied. See ADR-016 criterion 7 and `scp-core/crypto/ucan/revoke.rs` for the full specification.
+
+**UCAN CID computation.** UCAN tokens are identified by Content Identifiers (CIDs) in the `RevocationList` and in delegation chain `prf` references. CID computation MUST use the following parameters:
+
+- **CID version:** CIDv1 (multicodec prefix `0x01`).
+- **Hash algorithm:** SHA-256 (multihash code `0x12`, digest length 32 bytes).
+- **Content codec:** DAG-CBOR (`0x71`). The UCAN payload (header + claims, excluding the signature) is serialized to canonical CBOR (RFC 8949 deterministic encoding, §4.2) before hashing. This ensures that CIDs are computed over a deterministic byte representation regardless of the original token encoding (JWT string vs. binary).
+- **Serialization order for CID computation:** The UCAN payload fields are serialized in lexicographic key order per DAG-CBOR conventions: `att`, `aud`, `exp`, `fct` (if present), `iss`, `nbf` (if present), `nnc`, `prf`. This is the canonical field set from UCAN 0.10+.
+- **Multibase encoding:** `base32lower` (multibase prefix `b`) for display and logging. Raw CID bytes (no multibase prefix) for wire format in `RevocationList` entries, `prf` references, and MLS application messages.
+- **Implementation note:** The CID is computed over the UCAN payload only (not the full JWT including the signature), because the payload uniquely identifies the token's claims and the signature is verifiable separately. Two tokens with identical payloads but different signatures (e.g., reissued after key rotation) produce the same CID — this is intentional and ensures that revocations target the claim content, not the cryptographic binding.
 
 **Why single ciphersuite:** Ciphersuite negotiation adds complexity and introduces downgrade attack vectors. For v1, every implementation uses exactly these algorithms. Future protocol versions may introduce additional ciphersuites with a secure negotiation mechanism, but v1 prioritizes simplicity and auditability.
 
@@ -414,12 +472,14 @@ MLS (RFC 9420) provides the group encryption layer for SCP. This section specifi
 | Epoch | Context epoch | Increments on every membership change or key update. Included in all SCP envelopes. |
 | LeafNode credential | DID + UCAN + signing_key_id | The MLS credential field contains the member's DID, their context-scoped UCAN token, and the `signing_key_id` (`#active` or `#agent`) identifying which verification method signed this leaf node (ADR-039). |
 | Welcome message | Context join token | HPKE-encrypted to new member's KeyPackage. Contains the group state needed to decrypt future messages. |
-| KeyPackage | Pre-key bundle | Published to relays so others can add the identity to groups even when offline. Signed by identity key. Single-use. |
+| KeyPackage | Pre-key bundle | Published to relays so others can add the identity to groups even when offline. Signed by the Active Signing Key (`#active`) or Agent Signing Key (`#agent`) — NOT the Identity Key (`#0`). Single-use. See note below. |
 | Proposal (Add/Remove/Update) | Governance action | MLS membership proposals map to SCP membership changes. |
 | Commit | Governance commit | Finalizes pending proposals and advances the epoch. |
 | Application message | SCP envelope payload | The encrypted content within an SCP envelope. |
 | Delivery Service (DS) | SCP relay(s) | The untrusted store-and-forward layer. Any transport adapter (native relay, Nostr, Matrix, etc.) serves this role. |
 | Authentication Service (AS) | DID resolution + UCAN validation | SCP's identity layer serves as MLS's AS. No separate trusted server. |
+
+**KeyPackage signing key.** Per RFC 9420 §10.1, the signature key in a KeyPackage's `leaf_node` field is the key used to sign the KeyPackage. In SCP, this is the Active Signing Key (`#active`) for human-initiated joins, or the Agent Signing Key (`#agent`) for agent-initiated joins (ADR-039). The Identity Key (`#0`) is NOT used for KeyPackage signing — `#0` is reserved exclusively for DID document operations and pre-rotation commitments (ADR-003). Using `#active` or `#agent` for KeyPackages is consistent with the MLS credential model: the `leaf_node` credential contains the `signing_key_id` field (`#active` or `#agent`), and the KeyPackage signature MUST be verifiable against the corresponding verification method in the signer's DID document. On key rotation (§9.12), all outstanding KeyPackages signed by the old key MUST be deleted from relays and replaced with KeyPackages signed by the new key.
 
 **Group context extensions for nesting.** Child contexts include parent context IDs and governance configuration hashes in the MLS `group_context` extensions field (§5.13.3). This cryptographically binds the parent lineage to the child's group identity — the derived `group_id` is a function of the parent references. Root contexts (no parents) have empty nesting extensions.
 
@@ -461,7 +521,7 @@ MLS provides PCS through the Update proposal mechanism. After a member sends an 
 
 - Identity Key (Ed25519): Generated in hardware security module where available (Secure Enclave, Android Keystore). Private key never exported from the secure element. Used ONLY for DID document updates and signing pre-rotation commitments. The DID string is derived from this key and never changes.
 - Active Signing Key (Ed25519): Generated via KeyCustody. Used for MLS credentials, inner envelope signatures, UCAN issuance. Rotatable via DID document update signed by the Identity Key (ADR-003 §4a). The DID string does NOT change on active key rotation.
-- Pre-Rotation Key (Ed25519): Generated at identity creation, stored in cold/offline custody. `SHA-256(public_key)` is published as a PreRotationCommitment in the DID document. Revealed only during Identity Key migration (ADR-003 §4b) to prove legitimate rotation.
+- Pre-Rotation Key (Ed25519): Generated at identity creation, stored in cold/offline custody (see §9.7.4.1 for custody requirements). `SHA-256(public_key)` is published as a PreRotationCommitment in the DID document. Revealed only during Identity Key migration (ADR-003 §4b) to prove legitimate rotation.
 - Agent Signing Key (Ed25519, optional): Generated by agent runtime software. Published as `#agent` verification method in the DID document by the Identity Key (`#0`). Software-held — no HSM requirement (agent runtimes typically lack hardware security). Used for agent-autonomous message signing and scoped UCAN delegation. Rotatable via DID document update signed by `#0` (ADR-039). The DID string does NOT change on agent key rotation.
 - MLS leaf key (X25519): Generated by the MLS library per the selected ciphersuite. Stored in platform secure storage.
 - KeyPackages: Pre-generated and published to relays. Each KeyPackage is single-use. The SDK MUST maintain a buffer of at least 10 unused KeyPackages per identity on relays. Replenished when the buffer drops below 5.
@@ -486,6 +546,47 @@ MLS provides PCS through the Update proposal mechanism. After a member sends an 
 - Ephemeral context close: Destroy MLS group state — tree secrets, all epoch key schedules, application key material. See §9.15 for destruction verification.
 - KeyPackage consumption: After a KeyPackage is used in a Welcome message, the SDK deletes the KeyPackage's private key. One-time use is mandatory.
 - Old epoch material: Destroyed after Commit processing (forward secrecy, §9.7.2).
+
+### 9.7.4.1 Pre-Rotation Key Custody
+
+The pre-rotation key is the security backstop for the entire identity system — the last resort for recovery after Identity Key compromise (§9.12). Its custody MUST be specified with the same rigor as the Identity Key.
+
+**Custody requirements:**
+
+1. **Generation.** The pre-rotation keypair MUST be generated on the device during identity creation, using the platform's CSPRNG. The private key MUST NOT be generated on a remote server.
+
+2. **Commitment publication.** `SHA-256(pre_rotation_public_key)` is published as a `PreRotationCommitment` service endpoint in the DID document (§18.2.2). Only the hash is published — the public key itself is never published until the pre-rotation key is used.
+
+3. **Storage isolation.** The pre-rotation private key MUST be stored separately from the Identity Key and Active Signing Key. It MUST NOT be accessible through the same custody provider or authentication flow used for daily operations. This ensures that compromise of the operational custody path does not compromise the recovery path.
+
+4. **Approved custody methods** (ordered by security, any one is sufficient):
+
+   | Method | Security level | Description |
+   |--------|---------------|-------------|
+   | Hardware security key (FIDO2/U2F) | Highest | Pre-rotation key stored on a dedicated hardware security key (e.g., YubiKey). The key never leaves the hardware. Requires physical possession for recovery. |
+   | Secondary device secure enclave | High | Pre-rotation key stored in the secure enclave of a device NOT used for daily SCP operations (e.g., a tablet kept at home while the phone is the daily driver). |
+   | Platform-backed cloud key store | Medium | Pre-rotation key stored in platform key backup (iCloud Keychain with Advanced Data Protection, Google Cloud Key Vault). Recoverable through platform account recovery. |
+   | Encrypted offline backup | Medium | Pre-rotation private key encrypted with AES-256-GCM using a key derived from a user-chosen passphrase via Argon2id (memory: 64 MiB, iterations: 3, parallelism: 4). The encrypted backup is stored offline (USB drive, printed QR code, or secure note). The SDK MUST generate the passphrase with at least 128 bits of entropy if auto-generated. |
+   | Shamir secret sharing (3-of-5) | Medium | Pre-rotation private key split into 5 shares using Shamir's Secret Sharing (GF(2^8)), with any 3 shares sufficient to reconstruct. Shares distributed to trusted contacts or stored in geographically separate locations. Each share is 33 bytes (1 byte share index + 32 bytes share data). |
+   | Paper backup (BIP39 mnemonic) | Lowest acceptable | Pre-rotation private key encoded as a 24-word BIP39 mnemonic phrase. Stored physically (written, printed, engraved). The SDK MUST warn users that loss of the paper backup eliminates the pre-rotation recovery path. |
+
+5. **SDK presentation.** At identity creation, the SDK MUST:
+   a. Generate the pre-rotation keypair.
+   b. Present the user with custody options (ordered by security as above).
+   c. Guide the user through the selected custody method.
+   d. Verify the backup (for offline methods: require the user to re-enter or re-scan the backup before proceeding).
+   e. Publish the `PreRotationCommitment` to the DID document only after backup verification succeeds.
+   f. Destroy the pre-rotation private key from the creating device's memory after backup is confirmed.
+
+6. **Post-rotation key cycling.** After a pre-rotation key is used for Identity Key migration (§9.12), the protocol MUST immediately generate a new pre-rotation keypair, guide the user through custody selection again, and publish a new `PreRotationCommitment`. The old pre-rotation key is destroyed after migration completes.
+
+7. **Custody status tracking.** The SDK SHOULD periodically prompt the user to verify their pre-rotation key backup is still accessible (e.g., every 6 months). This is a client-level reminder, not a protocol-level enforcement — the protocol cannot verify that an offline backup still exists.
+
+**Failure modes:**
+
+- **Pre-rotation backup lost, Identity Key intact:** No immediate impact. The identity continues to function. The user has lost their recovery backstop. The SDK SHOULD warn that identity recovery from compromise is no longer possible and guide the user to generate a new pre-rotation keypair.
+- **Pre-rotation backup lost, Identity Key compromised:** Social recovery (§3.3) is the only remaining path. Trusted contacts with admin roles must remove the compromised identity and re-add under a new DID.
+- **Pre-rotation key compromised (but Identity Key intact):** The user MUST immediately generate a new pre-rotation keypair and publish a new `PreRotationCommitment` to their DID document. The old pre-rotation commitment is superseded by the new one.
 
 ## 9.8 Message Security
 
@@ -612,6 +713,38 @@ Checkpoints are sent as regular MLS application messages (encrypted, authenticat
 
 **Sybil-amplified equivocation defense:** The Relay Consistency Protocol is NOT a majority vote. ANY divergence between ANY two honest members detects equivocation. An attacker who controls Sybil members and a relay can make the Sybil members confirm the attacker's version, but this is irrelevant — two honest members comparing checkpoints will detect the equivocation regardless of how many Sybils agree with the attacker. The defense requires only two honest members in the context.
 
+**Equivocation response protocol.** When equivocation is detected (divergent Merkle roots at the same event count between two honest members), the detecting member initiates the following response:
+
+1. **EquivocationAlert event.** The detector publishes an `EquivocationAlert` as an MLS application message, signed by the detector's Active Signing Key or Agent Signing Key (ADR-039):
+
+```
+EquivocationAlert {
+  detector_did:         DID
+  context_id:           String
+  relay_url:            String              // the relay suspected of equivocation
+  local_checkpoint:     ConsistencyCheckpoint
+  divergent_checkpoint: ConsistencyCheckpoint  // the checkpoint that diverges
+  conflicting_hashes:   Vec<[u8; 32]>       // event hashes where logs diverge
+  proof:                Vec<MerkleProof>     // inclusion proofs for the conflicting events
+  timestamp:            DateTime
+  signature:            Ed25519Signature     // signed by detector's #active or #agent key
+}
+```
+
+The signature covers `context_id || detector_did || relay_url || local_checkpoint.merkleRoot || divergent_checkpoint.merkleRoot || timestamp` using the canonical signed structure format (§9.5.2). The `proof` field includes Merkle inclusion proofs for the conflicting events from both the detector's and the divergent member's logs, enabling independent verification by any group member.
+
+2. **Alert distribution.** The `EquivocationAlert` is distributed to all context members as a standard MLS application message (encrypted, authenticated). Every member's SDK processes the alert independently.
+
+3. **Governance response.** The context's governance engine processes the `EquivocationAlert`. The response is configurable per context via `equivocation_policy` in context parameters:
+
+   - `warn` — Log the alert and notify the application layer. No automated enforcement. Suitable for low-stakes contexts where equivocation may be benign (e.g., relay software bugs).
+   - `suspend_relay` (default) — Mark the suspected relay as untrusted in the context's relay set. Members MUST stop publishing to and subscribing from the suspected relay for this context. Members migrate to alternative relays in the context's relay set. If no alternative relays are available, the context enters a degraded state and members are notified.
+   - `remove_relay` — Permanently remove the suspected relay from the context's relay set via a governance action (`UpdateRelaySet`). Requires governance authority (admin or vote depending on governance model).
+
+4. **Trust score impact.** The equivocating relay's trust score (§9.3) is reduced. Members who operate relay infrastructure and whose relay is implicated in equivocation receive a `RelayEquivocationViolation` record in the `ViolationStore` (ADR-039). This violation is durable and affects the operator's trust score across all contexts where other members observe the violation record.
+
+5. **Member-initiated equivocation.** If equivocation is attributed to a member (e.g., a member publishes conflicting events to different relays intentionally), the governance engine processes it as a member violation. The configurable response is: `warn` (log only), `suspend_write` (suspend the equivocating member's write access pending admin review — this is the default), or `remove` (remove the member from the context via MLS Remove proposal). Write suspension is implemented by the governance engine adding the member's DID to a `write_suspended` set; the SDK checks this set before accepting application messages from that member and rejects messages from suspended members with an `EquivocationSuspension` error. The suspension is recorded as an `EventType::MemberWriteSuspended { did, reason: "equivocation" }` in the context event log.
+
 ### 9.9.4 Selective Suppression of MLS Commits
 
 A specific relay attack: suppress an MLS Remove Commit to keep an excluded member in the group.
@@ -669,7 +802,27 @@ Pad plaintext to the next bucket boundary before encryption to prevent message s
 
 **Bucket sizes:** 256B, 1KB, 4KB, 16KB, 64KB, 256KB.
 
-Messages larger than 256KB are chunked into 256KB blocks. Padding happens below the application layer and above the transport layer — the SDK handles it transparently. Application developers never see it. Relay operators see uniform bucket-sized blobs.
+Messages larger than 256KB are chunked. Padding happens below the application layer and above the transport layer — the SDK handles it transparently. Application developers never see it. Relay operators see uniform bucket-sized blobs.
+
+**Chunking protocol.** When a padded message exceeds the relay's `max_blob_size` (or 256KB if the relay does not advertise a limit), the SDK splits it into chunks before encryption:
+
+```
+ChunkEnvelope {
+  chunk_id:      [u8; 16]   // random, unique per logical message
+  sequence:      u32         // 0-indexed chunk position
+  total_chunks:  u32         // total number of chunks in this message
+  payload:       Vec<u8>     // chunk payload (plaintext fragment)
+}
+```
+
+1. **Splitting.** The SDK generates a random 16-byte `chunk_id` per logical message. The padded plaintext is split into fragments whose size does not exceed the relay's `max_blob_size`. Each fragment is wrapped in a `ChunkEnvelope` with its `sequence` index and the `total_chunks` count.
+2. **Individual encryption.** Each `ChunkEnvelope` is independently encrypted as a separate MLS application message (in encrypted contexts) or a separate sender-key-encrypted message (in broadcast contexts). This means each chunk is individually authenticated (inner signature + MLS membership_tag or sender key AEAD) and individually padded to the nearest bucket boundary (§9.10.3). Individual encryption ensures that a relay cannot correlate chunks by ciphertext similarity — each chunk is an opaque, independently-sized blob.
+3. **Transmission.** Chunks are published as separate relay blobs. The relay treats each chunk as an independent message. Chunks MAY be published to different relays in the context's relay set for redundancy.
+4. **Reassembly.** The recipient decrypts each chunk individually, then reassembles by `chunk_id` + `sequence` ordering. The recipient maintains a per-`chunk_id` reassembly buffer.
+5. **Reassembly timeout.** The recipient MUST discard incomplete chunk sets (not all `total_chunks` received) after 60 seconds from receipt of the first chunk in the set. This prevents resource exhaustion from partial chunk deliveries.
+6. **Maximum chunks per message.** A single logical message MUST NOT exceed 256 chunks. Messages requiring more than 256 chunks MUST use out-of-band blob storage with an in-band reference (§10.6). This bounds the reassembly buffer to 256 entries per in-flight message.
+7. **Maximum chunk payload size.** Each chunk's `payload` size MUST NOT exceed the relay's advertised `max_blob_size` (from `.well-known/scp` relay_config, §10.5.1). If the relay does not advertise a limit, the default maximum chunk payload size is 256KB.
+8. **Chunk authentication.** Because each chunk is a separate MLS/sender-key message, chunk forgery and chunk replay are prevented by the same mechanisms as regular messages (§9.8.1, §9.8.2). A chunk with a mismatched `total_chunks` (e.g., an attacker injects a chunk claiming `total_chunks: 1` with a valid `chunk_id`) is detected because the reassembled plaintext will fail application-layer integrity checks (the original message includes a content hash in the envelope metadata).
 
 ### 9.10.4 Per-Context Pseudonyms
 
@@ -687,8 +840,58 @@ context_pseudonym = context_keypair.public_key
 - **Verification:** Sender includes full DID inside MLS-encrypted payload. Group members verify pseudonym-to-DID mapping on first encounter and cache the association.
 - **No ZK proofs** — unnecessary complexity since only group members need to verify the mapping.
 - The SDK handles derivation, caching, and verification transparently.
-- **HSM compatibility.** Pseudonym derivation is performed via `KeyCustody::derive_pseudonym(identity_key_handle, context_id)` (ADR-006). The HMAC-SHA256 computation happens inside the custody boundary — the private key never leaves the HSM. For hardware-backed keys, the HSM computes the HMAC internally using an associated symmetric key derived during `generate_keypair`. For software keys, the HMAC uses the raw Ed25519 public key bytes (ADR-027 amendment: public key bytes ensure cross-platform determinism with hardware TEE keys that cannot export private bytes). All implementations produce identical output for the same identity key and context_id, regardless of custody type. See ADR-002 criterion 1 for the full derivation specification.
-- **Pre-join context inspection.** Prospective members who know a `context_id` but have not joined the context can retrieve its publicly visible parameters (capability ceiling, governance model, roles, TTL, memory scope — see §5.7) from relays without joining. The relay indexes context metadata under a publicly derivable identifier: `metadata_routing_id = SHA-256(context_id || "scp-metadata")`. This identifier is distinct from the per-member pseudonyms used for message routing and does not reveal member identities or message content. It enables the "legibility before opt-in" tenet: any agent evaluating whether to join a context can inspect its parameters by querying the `metadata_routing_id` on the context's relays.
+- **HSM compatibility.** Pseudonym derivation is performed via `KeyCustody::derive_pseudonym(identity_key_handle, context_id)` (ADR-006). The HMAC-SHA256 computation happens inside the custody boundary — the private key never leaves the HSM. For hardware-backed keys, the HSM computes the HMAC internally using an associated symmetric key derived during `generate_keypair`. For software keys, the HMAC uses a symmetric pseudonym secret derived during key generation (see below). All implementations produce identical output for the same identity key and context_id, regardless of custody type. See ADR-002 criterion 1 for the full derivation specification.
+
+#### 9.10.4.A Pseudonym Derivation Privacy Model
+
+**Threat: publicly derivable pseudonyms enable membership enumeration.** If `identity_key_material` in the HMAC were the raw Ed25519 public key bytes (which are public by definition), any party knowing a `context_id` and a DID's public key could compute `HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym")` and test whether the resulting pseudonym appears as an active subscription on a relay. This constitutes a membership enumeration oracle.
+
+**Mitigation: pseudonym secret.** The `identity_key_material` used in pseudonym derivation MUST be a 32-byte symmetric secret that is NOT publicly derivable. The pseudonym secret is generated alongside the identity keypair and stored within the custody boundary:
+
+```
+pseudonym_secret = HKDF-SHA256(
+  ikm  = ed25519_private_key_bytes,
+  salt = "scp-pseudonym-secret-v1",
+  info = "",
+  len  = 32
+)
+```
+
+For **software custody**, the pseudonym secret is derived from the Ed25519 private key bytes during key generation and cached in the `KeyCustody` store. The private key bytes are the only input — the public key is never used.
+
+For **hardware custody** (Secure Enclave, Android Keystore, HSM), where private key bytes cannot be exported, the pseudonym secret is generated as a separate 32-byte random value during `generate_keypair` and stored as an associated symmetric key within the hardware boundary. The hardware computes the HMAC internally using this associated key.
+
+**Cross-platform determinism:** Software implementations derive the pseudonym secret deterministically from the private key, ensuring identical pseudonyms across platforms for the same identity. Hardware implementations use a stored random value — since hardware keys cannot be exported and re-imported, cross-platform identity migration uses the social/device recovery protocol (§3.3), which provisions a new pseudonym secret at the destination.
+
+**Migration from public-key-based derivation:** SDKs that previously used public key bytes MUST re-derive pseudonyms using the pseudonym secret on upgrade. The SDK:
+1. Derives the pseudonym secret from the private key (software) or generates one (hardware).
+2. Subscribes to both old and new routing IDs for a grace period (2x blob TTL).
+3. Announces the new pseudonym to group members via an MLS application message (same mechanism as §9.10.4.1 pseudonym rotation).
+4. After the grace period, unsubscribes from the old routing ID.
+
+- **Pre-join context inspection.** Prospective members who know a `context_id` but have not joined the context can retrieve its publicly visible parameters (capability ceiling, governance model, roles, TTL, memory scope — see §5.7) from relays without joining. The relay indexes context metadata under a keyed identifier (see §9.10.4.B below) that does not reveal member identities or message content. It enables the "legibility before opt-in" tenet: any agent evaluating whether to join a context can inspect its parameters by querying the metadata routing ID on the context's relays.
+
+#### 9.10.4.B Metadata Routing ID Privacy
+
+**Threat: publicly derivable metadata routing IDs enable context enumeration.** If `metadata_routing_id = SHA-256(context_id || "scp-metadata")`, any party who knows or guesses a `context_id` can compute the metadata routing ID and probe relays to determine whether the context exists, which relays host it, and (combined with pseudonym enumeration) who is a member.
+
+**Mitigation: keyed metadata routing ID.** The metadata routing ID is derived using a context-specific secret known only to context members and authorized prospective members:
+
+```
+metadata_routing_id = HMAC-SHA256(
+  key  = context_metadata_key,
+  data = context_id || "scp-metadata-v2"
+)
+```
+
+The `context_metadata_key` is a 32-byte symmetric key distributed as follows:
+
+- **At context creation:** The creator generates `context_metadata_key` and includes it in the context's initial parameters.
+- **In invitations:** The `context_metadata_key` is included in the invitation payload (which is encrypted to the invitee's public key). This allows prospective members to inspect context metadata before joining.
+- **In discovery contexts:** Public or discoverable contexts publish their `context_metadata_key` in their discovery context entry. This preserves the "legibility before opt-in" property for contexts that want to be found, while keeping non-discoverable contexts invisible to probing.
+- **Rotation:** The `context_metadata_key` MAY be rotated via a governance action. On rotation, the context re-publishes metadata under the new routing ID and maintains the old routing ID for a grace period (2x blob TTL).
+
+**Backward compatibility:** Contexts created before this change use the legacy `SHA-256(context_id || "scp-metadata")` derivation. SDKs MUST support both derivation schemes during the migration period. New contexts MUST use the keyed derivation.
 
 #### 9.10.4.1 Pseudonym Rotation (BLACK-001 Mitigation)
 
@@ -735,7 +938,7 @@ Cover traffic uses **tiered configuration driven by transport profiles** (§10.1
 2. **Push-wake connections: no cover traffic.** Push-wake connections are transient and brief; cover traffic is meaningless over them.
 3. **Dummy message format.** Single-byte flag inside encrypted payload distinguishes real from dummy. `REAL_FLAG = 0x01`, `DUMMY_FLAG = 0x00`. Recipients decrypt, check the flag, discard dummies.
 4. **Rate is per relay connection, not per context.** Prevents relay from correlating traffic rate changes with context activity.
-5. **Bucket padding.** All payloads (real and dummy) are padded to the nearest power-of-2 bucket: 256, 512, 1024, 2048, 4096 bytes. This normalizes message sizes regardless of content length.
+5. **Bucket padding.** All payloads (real and dummy) are padded to the nearest bucket boundary per §9.10.3. This normalizes message sizes regardless of content length.
 
 **Bandwidth baseline by tier:**
 - `full`: ~15MB/day for 5 relay connections at 1024-byte padding. Real messages add <5% above baseline at moderate usage.
@@ -909,7 +1112,7 @@ Each participant in a context holds one AES-256 symmetric sender key. All messag
 - **Key size:** 32 bytes per sender key per context member. Storage is trivial.
 - **Encryption order:** Sender-first (AES-256-GCM), then MLS. Recipients decrypt MLS layer, then decrypt sender layer with the cached sender key.
 
-**Wrapping key terminology.** The sender-side key layer uses two distinct wrapping keys, both HPKE-based but serving different roles: (1) the **stable wrapping keypair** (below) protects the persistent per-sender AES-256 symmetric key during key distribution — it is long-lived and published in the MLS LeafNode; (2) the **ephemeral wrapping keypair** (§9.16.2) protects per-request key material during individual key exchanges — it is generated fresh for each `SenderKeyRequest` and discarded after use. Both use X25519 + HPKE for key encapsulation, but the stable key enables offline key distribution while the ephemeral key provides forward secrecy for individual key exchanges.
+**Wrapping key terminology.** The sender-side key layer uses two distinct wrapping keys, both HPKE-based (RFC 9180 Base mode, §9.5) but serving different roles: (1) the **stable wrapping keypair** (below) protects the persistent per-sender AES-256 symmetric key during key distribution — it is long-lived and published in the MLS LeafNode; (2) the **ephemeral wrapping keypair** (§9.16.2) protects per-request key material during individual key exchanges — it is generated fresh for each `SenderKeyRequest` and discarded after use. Both use X25519 DHKEM + HPKE for key encapsulation, but the stable key enables offline key distribution while the ephemeral key provides forward secrecy for individual key exchanges.
 
 **Stable wrapping keypair.** Each member maintains a single dedicated X25519 keypair per context (one per DID, shared by human and agent — ADR-039), used exclusively for HPKE wrapping of sender key distributions (§9.16.2). This keypair is published as an MLS LeafNode extension (`scp_wrapping_key`) and is distinct from the MLS leaf HPKE key used for MLS key agreement. The wrapping keypair does NOT rotate on MLS Updates (epoch advances) — it remains stable across epochs so that sender key distributions can always be unwrapped, even by members who are offline during epoch transitions or who join after an epoch advance. The wrapping keypair rotates only on: (1) identity key rotation (§9.12), or (2) suspected compromise. On rotation, the member publishes the new wrapping public key in their LeafNode extension via an MLS Update and re-distributes their current sender key to all non-blocked members using the new wrapping keys.
 
@@ -923,11 +1126,44 @@ Sender keys are distributed via a pull-based request/response protocol. When a s
 
 2. **Key request.** Members who need the key (because they see a new epoch, or because they just joined) send a `SenderKeyRequest { requester_did, sender_did, epoch, wrapping_pubkey, signature }` as an MLS application message with `recipient_hint` directed to the key holder. The `wrapping_pubkey` is a fresh ephemeral X25519 key generated per request.
 
-3. **Key response.** The key holder's SDK processes the request: verifies the signature, checks the block list. If the requester is not blocked, responds with `SenderKeyResponse { sender_did, epoch, hpke_sealed_key, ephemeral_pubkey }` via an MLS application message with `recipient_hint` to the requester. The sender key is HPKE-encrypted to the requester's ephemeral wrapping pubkey. If blocked, no response — the blocked party cannot obtain the key.
+3. **Key response.** The key holder's SDK processes the request: verifies the signature, checks the block list. If the requester is not blocked, responds with `SenderKeyResponse { sender_did, epoch, hpke_sealed_key, ephemeral_pubkey, request_nonce }` via an MLS application message with `recipient_hint` to the requester. The sender key is sealed using HPKE Base mode (RFC 9180) to the requester's ephemeral wrapping public key. If blocked, no response — the blocked party cannot obtain the key. The `ephemeral_pubkey` field carries the HPKE encapsulated key (`enc` in RFC 9180 terminology) and `hpke_sealed_key` carries the AEAD ciphertext (`ct`).
 
-**HPKE assembly:** (1) Generate ephemeral X25519 keypair (software-managed), (2) ECDH between ephemeral secret and requester wrapping pubkey, (3) HKDF to derive encryption key, (4) AES-128-GCM encrypt the sender key. The ephemeral public key is included in the response for decryption.
+**HPKE Base mode specification (RFC 9180).** Sender key distribution uses HPKE Base mode (`mode_base`, §5.1.1 of RFC 9180) with the following suite:
 
-**HPKE open (recipient-side):** Uses `key_custody.dh_agree(wrapping_key_handle, ephemeral_pk)` to compute the shared secret inside the custody boundary, then KDF + AEAD in software to recover the sender key. The wrapping private key never leaves KeyCustody.
+- **KEM:** DHKEM(X25519, HKDF-SHA256) — KEM ID `0x0020` (RFC 9180 §7.1)
+- **KDF:** HKDF-SHA256 — KDF ID `0x0001` (RFC 9180 §7.2)
+- **AEAD:** AES-128-GCM — AEAD ID `0x0001` (RFC 9180 §7.3)
+
+This suite matches the MLS ciphersuite (§9.5) and the DID-to-DID HPKE suite, minimizing the cryptographic surface area.
+
+**Seal (sender-side):**
+
+1. Call `SetupBaseS(requester_wrapping_pubkey, info)` (RFC 9180 §5.1.1) to obtain `(enc, sender_context)`.
+2. Call `sender_context.Seal(aad, sender_key_bytes)` to obtain `ct`.
+3. Transmit `enc` as `ephemeral_pubkey` (32 bytes) and `ct` as `hpke_sealed_key` (32 + 16 = 48 bytes, ciphertext + AEAD tag) in the `SenderKeyResponse`.
+
+**Open (recipient-side):**
+
+1. Call `SetupBaseR(enc, wrapping_secret_key, info)` (RFC 9180 §5.1.1) to obtain `recipient_context`, where `enc` is the `ephemeral_pubkey` from the response. The wrapping secret key is computed inside the `KeyCustody` boundary via `dh_agree(wrapping_key_handle, enc)`.
+2. Call `recipient_context.Open(aad, ct)` to recover `sender_key_bytes`, where `ct` is the `hpke_sealed_key` from the response.
+
+**`info` parameter (domain separation):**
+
+```
+info = "scp-sender-key-v1" || context_id || sender_did || epoch_bytes
+```
+
+Where `context_id` and `sender_did` are UTF-8 bytes (no length prefix — the `info` string is not parsed, only compared) and `epoch_bytes` is the 8-byte big-endian encoding of the sender key epoch. The `info` string binds the HPKE encryption to a specific context, sender, and epoch. Using a different `info` on open produces a different derived key, causing AEAD decryption to fail.
+
+**`aad` parameter (additional authenticated data):**
+
+```
+aad = context_id || sender_did || epoch_bytes
+```
+
+Where fields use the same encoding as `info` (without the domain separator prefix). The AAD binds the ciphertext to the context and sender, preventing cross-context and cross-sender key substitution attacks. Tampering with any field in the wire format causes AEAD verification to fail.
+
+**Nonce:** The AEAD nonce is managed internally by the HPKE context (RFC 9180 §5.2 `ComputeNonce`). Implementations MUST NOT generate or supply an external nonce — HPKE derives it from the key schedule. Since each `SenderKeyResponse` creates a fresh HPKE context (fresh ephemeral keypair), the internal sequence counter starts at 0 and only one `Seal`/`Open` call is made per context.
 
 **New member join (pull-based):** When a new member joins the group, they observe each existing member's current sender key epoch from the group state. The new member publishes a `SenderKeyRequest` for each member whose key they need. Each member's SDK responds automatically (checking block list). Same O(N) total work as a push model, but demand-driven and naturally load-balanced.
 
@@ -1043,16 +1279,16 @@ Content Encryption:
 
 **Key types:**
 - **Content Encryption Key (CEK):** AES-256, generated per message (or per message batch). Encrypts the actual content. Ephemeral — not stored after wrapping.
-- **Access Key:** AES-256, per member per context. Generated at join time. Used to wrap/unwrap CEKs. Stored in the member's local key store and distributed via HPKE (same mechanism as sender keys, §9.16.2). HPKE info strings for access key distribution MUST use a distinct domain separator from sender key distribution: `info = "scp-access-key-v1" || context_id || member_did || epoch` (vs `"scp-sender-key-v1"` for sender keys). This prevents cross-protocol key confusion.
+- **Access Key:** AES-256, per member per context. Generated at join time. Used to wrap/unwrap CEKs. Stored in the member's local key store and distributed via HPKE Base mode (RFC 9180), using the same suite as sender key distribution (§9.16.2): DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. The HPKE `info` string for access key distribution MUST use a distinct domain separator: `info = "scp-access-key-v1" || context_id || member_did || epoch_bytes` (vs `"scp-sender-key-v1"` for sender keys). The `aad` is: `aad = context_id || member_did || epoch_bytes`. Where `epoch_bytes` is the 8-byte big-endian encoding of the access key epoch. This prevents cross-protocol key confusion — an HPKE ciphertext produced for sender key distribution cannot be substituted for an access key distribution response (different `info` produces different derived keys).
 - **Key Wrapping:** AES-256-KW (RFC 3394). Deterministic, no IV needed. The wrapped CEK is stored alongside the ciphertext.
 
 **AES-256-GCM additional authenticated data (AAD).** Content encryption MUST bind `context_id` as AAD: `AAD = context_id || sender_did || sequence_number`. This prevents ciphertext from being moved between contexts or reordered within a context. The AEAD authentication tag provides integrity verification — no separate content hash is needed.
 
-**Access key request protocol.** `AccessKeyRequest` messages MUST include a signed payload: `{ context_id, requester_did, epoch, timestamp }` signed with the requester's Active Signing Key or Agent Signing Key (either `#active` or `#agent` is valid — ADR-039). The responder verifies the signature, checks the block list and revocation list, and responds with the HPKE-encrypted access key only if the requester is authorized. The timestamp prevents replay (requests older than 30 seconds are rejected).
+**Access key request protocol.** `AccessKeyRequest` messages MUST include a signed payload: `{ context_id, requester_did, epoch, timestamp, nonce }` signed with the requester's Active Signing Key or Agent Signing Key (either `#active` or `#agent` is valid — ADR-039). The `nonce` is a 16-byte random value, unique per request. The responder verifies the signature, checks the block list and revocation list, and responds with the HPKE-encrypted access key only if the requester is authorized. **Replay prevention:** The responder validates that the request timestamp is within 5 minutes of local time (consistent with the protocol-wide clock skew tolerance, §9.14) and that the `nonce` has not been previously seen. The responder maintains a nonce deduplication cache with a 5-minute TTL — nonces are single-use and cached for the duration of the validity window. Requests with expired timestamps or duplicate nonces are rejected. This replaces the previous 30-second window, which was inconsistent with the 5-minute clock skew tolerance (§9.14) — a 30-second window with 5-minute skew would reject legitimate requests from slightly-skewed clocks.
 
 ### 9.17.2 Access Key Lifecycle
 
-1. **Generation.** When a member joins a context, a fresh random 32-byte AES-256 access key is generated by the context creator (or the member who executed the `AddMember` governance action). The access key is distributed to the new member via HPKE, using the same pull-based protocol as sender keys (§9.16.2).
+1. **Generation.** When a member joins a context, a fresh random 32-byte AES-256 access key is generated by the context creator (or the member who executed the `AddMember` governance action). The access key is distributed to the new member via the same pull-based HPKE Base mode protocol as sender keys (§9.16.2), with the `info` and `aad` parameters specified in §9.17.1.
 
 2. **Normal operation.** Each message sender generates a fresh CEK, encrypts the content, wraps the CEK with each intended recipient's access key, and publishes the wrapped CEKs alongside the ciphertext. In encrypted contexts, this wrapping occurs BEFORE the MLS encryption layer. In broadcast contexts, it occurs before the sender key encryption.
 
@@ -1110,11 +1346,22 @@ Because `WrappedContent` (including the `wrapped_ceks` entries) is inside the br
 
 **Full revocation (retroactive):**
 
-1. Delete the target's access key from all members' local stores.
-2. Notify all members via an `AccessKeyRevoked { did, scope: Full }` event.
-3. Each member's SDK purges the target's access key from their key store.
-4. The relay retains the ciphertext and wrapped CEKs, but the target's wrapped CEK is now useless — the target's access key (needed to unwrap it) no longer exists on any compliant client.
-5. The target cannot request the access key via the pull-based protocol — the key holder checks the revocation list and denies the request (same pattern as sender key block list check).
+1. The revoker publishes an `AccessKeyRevoked { did, scope: Full, revocation_id, timestamp, signature }` event as an MLS application message. The `revocation_id` is a unique identifier (`SHA-256(context_id || target_did || "access-key-revoke" || timestamp)`). The signature covers `context_id || target_did || scope || revocation_id || timestamp` using the revoker's signing key.
+2. Each member's SDK, upon receiving and verifying the `AccessKeyRevoked` event:
+   a. Deletes the target's access key from the local key store.
+   b. Adds the target's DID to the local access key revocation list.
+   c. Records a `AccessKeyDeletionAck { revocation_id, member_did, timestamp, signature }` in the context event log. The acknowledgment is signed by the member's signing key.
+3. The relay retains the ciphertext and wrapped CEKs, but the target's wrapped CEK is now useless — the target's access key (needed to unwrap it) no longer exists on any compliant client.
+4. The target cannot request the access key via the pull-based protocol — the key holder checks the revocation list and denies the request (same pattern as sender key block list check).
+
+**Coordinated deletion protocol:**
+
+Coordinated key deletion across a distributed system is fundamentally best-effort — the revoker cannot force deletion on a non-compliant client. The protocol provides the strongest coordination guarantees achievable:
+
+- **Offline members:** Members offline at revocation time receive the `AccessKeyRevoked` event upon reconnecting (MLS guarantees ordered delivery within the group). The SDK processes the deletion immediately on receipt. There is no separate "catch-up" protocol — MLS epoch synchronization (§9.7.2) handles delivery.
+- **Deletion verification:** The revoker MAY track `AccessKeyDeletionAck` events in the context log to determine which members have confirmed deletion. If a member has not acknowledged within 24 hours of coming online (observable via presence signals or message activity), the revoker MAY escalate to governance (e.g., request removal of the non-acknowledging member).
+- **Non-compliant clients:** A malicious or modified client can retain the key despite the deletion instruction. This is an inherent limitation of distributed key management — the protocol cannot enforce key destruction on adversarial hardware. The mitigation is defense in depth: (a) future messages do not include wrapped CEKs for the revoked target, (b) the revocation is recorded in the event log for auditability, (c) governance can remove persistently non-compliant members from the MLS group entirely.
+- **Confirmation timeout:** SDKs MUST publish `AccessKeyDeletionAck` within 30 seconds of processing an `AccessKeyRevoked` event. Failure to publish an ack is not a protocol violation (the member may be offline), but persistently active members who do not acknowledge are flagged for governance review.
 
 **FutureOnly revocation:**
 

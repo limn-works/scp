@@ -441,8 +441,9 @@ mod tests {
     use ed25519_dalek::Signer;
 
     use super::*;
-    use crate::bridge::shadow::{ShadowRegistry, create_shadow};
+    use crate::bridge::shadow::{CreateShadowParams, ShadowRegistry, create_shadow};
     use crate::bridge::{BridgeMode, ShadowProvenanceStatus};
+    use crate::crypto::sender_keys::SenderKeyStore;
     use crate::trust::attestation::AttestationEvidence;
 
     // -------------------------------------------------------------------
@@ -470,16 +471,15 @@ mod tests {
     }
 
     fn create_test_shadow(registry: &mut ShadowRegistry) {
-        create_shadow(
-            registry,
-            SHADOW_ID,
-            BRIDGE_ID,
-            BridgeMode::Relay,
-            HANDLE,
-            &[],
-            1_700_000_100,
-        )
-        .unwrap();
+        let params = CreateShadowParams {
+            shadow_id: SHADOW_ID,
+            bridge_id: BRIDGE_ID,
+            bridge_mode: BridgeMode::Relay,
+            platform_handle: HANDLE,
+            context_member_dids: &[],
+            timestamp: 1_700_000_100,
+        };
+        create_shadow(registry, &mut SenderKeyStore::new(), &params).unwrap();
     }
 
     fn make_identity_attestation(
@@ -964,27 +964,25 @@ mod tests {
         let mut registry = make_registry();
 
         // Create two shadows.
-        create_shadow(
-            &mut registry,
-            "shadow-a",
-            BRIDGE_ID,
-            BridgeMode::Relay,
-            "@alice",
-            &[],
-            1_700_000_100,
-        )
-        .unwrap();
+        let params_a = CreateShadowParams {
+            shadow_id: "shadow-a",
+            bridge_id: BRIDGE_ID,
+            bridge_mode: BridgeMode::Relay,
+            platform_handle: "@alice",
+            context_member_dids: &[],
+            timestamp: 1_700_000_100,
+        };
+        create_shadow(&mut registry, &mut SenderKeyStore::new(), &params_a).unwrap();
 
-        create_shadow(
-            &mut registry,
-            "shadow-b",
-            BRIDGE_ID,
-            BridgeMode::Relay,
-            "@bob",
-            &[],
-            1_700_000_100,
-        )
-        .unwrap();
+        let params_b = CreateShadowParams {
+            shadow_id: "shadow-b",
+            bridge_id: BRIDGE_ID,
+            bridge_mode: BridgeMode::Relay,
+            platform_handle: "@bob",
+            context_member_dids: &[],
+            timestamp: 1_700_000_100,
+        };
+        create_shadow(&mut registry, &mut SenderKeyStore::new(), &params_b).unwrap();
 
         // Claim shadow-a.
         let (verifying_key, signing_key) = test_keypair();
@@ -1014,16 +1012,15 @@ mod tests {
     fn claim_event_carries_registry_context_id() {
         let custom_ctx = "ctx-custom-claim";
         let mut registry = ShadowRegistry::new(custom_ctx.to_owned());
-        create_shadow(
-            &mut registry,
-            SHADOW_ID,
-            BRIDGE_ID,
-            BridgeMode::Puppet,
-            HANDLE,
-            &[],
-            1_700_000_100,
-        )
-        .unwrap();
+        let params = CreateShadowParams {
+            shadow_id: SHADOW_ID,
+            bridge_id: BRIDGE_ID,
+            bridge_mode: BridgeMode::Puppet,
+            platform_handle: HANDLE,
+            context_member_dids: &[],
+            timestamp: 1_700_000_100,
+        };
+        create_shadow(&mut registry, &mut SenderKeyStore::new(), &params).unwrap();
 
         let request = make_default_claim_request();
         let event = claim_shadow(&mut registry, &request).unwrap();

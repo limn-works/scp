@@ -19,6 +19,8 @@
 //!
 //! Built-in roles are always available in every context:
 //! - `admin` -- all capabilities in the ceiling.
+//! - `moderator` -- `MessagesRead`, `MessagesWrite`, `ToolInvokeAll`,
+//!   `MemberRemove`, `GovernancePropose` (§5.9 elected moderators).
 //! - `member` -- `MessagesRead`, `MessagesWrite`, `ToolInvokeAll`.
 //! - `observer` -- `MessagesRead` only.
 //!
@@ -143,28 +145,31 @@ impl Capability {
     }
 
     /// Returns the canonical string name of this capability.
+    ///
+    /// For [`ToolInvoke`](Self::ToolInvoke) variants, includes the tool ID
+    /// (e.g. `"tool:invoke:my_tool"`), matching the [`Display`] impl.
     #[must_use]
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> std::borrow::Cow<'_, str> {
         match self {
-            Self::MessagesRead => "messages:read",
-            Self::MessagesWrite => "messages:write",
-            Self::ToolInvoke(_) => "tool:invoke",
-            Self::ToolInvokeAll => "tool:invoke:*",
-            Self::ToolRegister => "tool:register",
-            Self::MemberInvite => "member:invite",
-            Self::MemberRemove => "member:remove",
-            Self::RoleAssign => "role:assign",
-            Self::GovernancePropose => "governance:propose",
-            Self::GovernanceVote => "governance:vote",
-            Self::ContextClose => "context:close",
-            Self::ChildContextCreate => "context:child:create",
-            Self::ToolInterface => "tool:interface",
-            Self::Bridging => "bridging",
-            Self::MediaVoice => "media:voice",
-            Self::MediaVideo => "media:video",
-            Self::MediaScreenShare => "media:screen_share",
-            Self::MemberBan => "member:ban",
-            Self::Custom(name) => name,
+            Self::MessagesRead => std::borrow::Cow::Borrowed("messages:read"),
+            Self::MessagesWrite => std::borrow::Cow::Borrowed("messages:write"),
+            Self::ToolInvoke(id) => std::borrow::Cow::Owned(format!("tool:invoke:{id}")),
+            Self::ToolInvokeAll => std::borrow::Cow::Borrowed("tool:invoke:*"),
+            Self::ToolRegister => std::borrow::Cow::Borrowed("tool:register"),
+            Self::MemberInvite => std::borrow::Cow::Borrowed("member:invite"),
+            Self::MemberRemove => std::borrow::Cow::Borrowed("member:remove"),
+            Self::RoleAssign => std::borrow::Cow::Borrowed("role:assign"),
+            Self::GovernancePropose => std::borrow::Cow::Borrowed("governance:propose"),
+            Self::GovernanceVote => std::borrow::Cow::Borrowed("governance:vote"),
+            Self::ContextClose => std::borrow::Cow::Borrowed("context:close"),
+            Self::ChildContextCreate => std::borrow::Cow::Borrowed("context:child:create"),
+            Self::ToolInterface => std::borrow::Cow::Borrowed("tool:interface"),
+            Self::Bridging => std::borrow::Cow::Borrowed("bridging"),
+            Self::MediaVoice => std::borrow::Cow::Borrowed("media:voice"),
+            Self::MediaVideo => std::borrow::Cow::Borrowed("media:video"),
+            Self::MediaScreenShare => std::borrow::Cow::Borrowed("media:screen_share"),
+            Self::MemberBan => std::borrow::Cow::Borrowed("member:ban"),
+            Self::Custom(name) => std::borrow::Cow::Borrowed(name.as_str()),
         }
     }
 }
@@ -330,6 +335,7 @@ impl RoleDefinition {
         ceiling: &CapabilityCeiling,
     ) -> Result<Self, RoleError> {
         let name = name.into();
+        validate_role_name(&name)?;
         for cap in &capabilities {
             if !ceiling.contains(cap) {
                 return Err(RoleError::CapabilityOutsideCeiling {
@@ -389,6 +395,31 @@ pub fn builtin_member(ceiling: &CapabilityCeiling) -> RoleDefinition {
     RoleDefinition::new_unchecked("member", capabilities)
 }
 
+/// Returns the `moderator` built-in role definition.
+///
+/// Moderators can read/write messages, invoke tools, remove members, and
+/// propose governance actions. This fills the gap between `member` (no
+/// moderation power) and `admin` (full control). Referenced in §5.9 as
+/// "elected moderators" governance pattern. Capabilities are intersected
+/// with the ceiling.
+///
+/// See ADR-009 acceptance criterion 2.
+#[must_use]
+pub fn builtin_moderator(ceiling: &CapabilityCeiling) -> RoleDefinition {
+    let desired = HashSet::from([
+        Capability::MessagesRead,
+        Capability::MessagesWrite,
+        Capability::ToolInvokeAll,
+        Capability::MemberRemove,
+        Capability::GovernancePropose,
+    ]);
+    let capabilities = desired
+        .into_iter()
+        .filter(|cap| ceiling.contains(cap))
+        .collect();
+    RoleDefinition::new_unchecked("moderator", capabilities)
+}
+
 /// Returns the `observer` built-in role definition.
 ///
 /// Observers can only read messages. The capability is intersected with the
@@ -444,11 +475,12 @@ pub fn builtin_subscriber(ceiling: &CapabilityCeiling) -> RoleDefinition {
 
 /// Returns all standard built-in role definitions for a given ceiling.
 ///
-/// Includes `admin`, `member`, and `observer`.
+/// Includes `admin`, `moderator`, `member`, and `observer`.
 #[must_use]
 pub fn builtin_roles(ceiling: &CapabilityCeiling) -> Vec<RoleDefinition> {
     vec![
         builtin_admin(ceiling),
+        builtin_moderator(ceiling),
         builtin_member(ceiling),
         builtin_observer(ceiling),
     ]
@@ -536,6 +568,11 @@ pub enum RoleError {
     #[error("member \"{0}\" is not in the context")]
     MemberNotInContext(String),
 
+    /// A custom role name is invalid (empty, too long, uses reserved name,
+    /// or contains invalid characters).
+    #[error("invalid role name: {0}")]
+    InvalidRoleName(String),
+
     /// A context lifecycle error occurred during role assignment.
     #[error("context error: {0}")]
     Context(#[from] ContextError),
@@ -610,8 +647,9 @@ impl ContextRoleState {
         let context_id = context_id.into();
         let creator_did = creator_did.into();
 
-        // Validate custom roles against ceiling.
+        // Validate custom roles: name format + capabilities against ceiling.
         for role in &custom_roles {
+            validate_role_name(&role.name)?;
             for cap in &role.capabilities {
                 if !ceiling.contains(cap) {
                     return Err(RoleError::CapabilityOutsideCeiling {
@@ -673,6 +711,53 @@ impl ContextRoleState {
         self.member_capabilities
             .get(member_did)
             .is_some_and(|caps| caps.contains(capability))
+    }
+
+    /// Revokes `GovernanceVote` and `GovernancePropose` capabilities from a
+    /// member (§5.9: presence-only members lose governance capabilities).
+    ///
+    /// Called when a member has both read and write access revoked. The member
+    /// remains in the context but cannot influence governance decisions about
+    /// content they cannot see.
+    pub fn revoke_governance_capabilities(&mut self, member_did: &scp_identity::DID) {
+        let did_str = member_did.as_ref();
+        if let Some(caps) = self.member_capabilities.get_mut(did_str) {
+            caps.remove(&Capability::GovernanceVote);
+            caps.remove(&Capability::GovernancePropose);
+        }
+    }
+
+    /// Restores `GovernanceVote` and `GovernancePropose` capabilities for a
+    /// member, re-deriving them from the member's current role definition.
+    ///
+    /// Called when a presence-only member has read or write access restored,
+    /// taking them out of presence-only state. Only restores capabilities
+    /// that exist in the member's role definition AND the context ceiling.
+    pub fn restore_governance_capabilities(&mut self, member_did: &scp_identity::DID) {
+        let did_str = member_did.as_ref();
+        // Look up the member's current role to see which capabilities they
+        // should have. Only restore governance capabilities that are in the
+        // role definition AND the ceiling.
+        let role_caps: Option<HashSet<Capability>> = self
+            .assignments
+            .get(did_str)
+            .and_then(|assignment| self.role_definitions.get(&assignment.role_name))
+            .map(|def| def.capabilities.clone());
+
+        if let Some(role_caps) = role_caps
+            && let Some(caps) = self.member_capabilities.get_mut(did_str)
+        {
+            if role_caps.contains(&Capability::GovernanceVote)
+                && self.ceiling.contains(&Capability::GovernanceVote)
+            {
+                caps.insert(Capability::GovernanceVote);
+            }
+            if role_caps.contains(&Capability::GovernancePropose)
+                && self.ceiling.contains(&Capability::GovernancePropose)
+            {
+                caps.insert(Capability::GovernancePropose);
+            }
+        }
     }
 }
 
@@ -737,6 +822,90 @@ pub fn assign_role(
         .insert(member_did.to_owned(), role_def.capabilities);
 
     Ok(tokens)
+}
+
+// ---------------------------------------------------------------------------
+// Role name validation (M3)
+// ---------------------------------------------------------------------------
+
+/// Maximum length of a custom role name in bytes.
+///
+/// Role names are stored in `ContextSnapshot` and serialized into event log
+/// entries. 64 bytes is generous for any practical role name while preventing
+/// unbounded growth.
+pub const MAX_ROLE_NAME_LENGTH: usize = 64;
+
+/// Built-in role names that custom roles MUST NOT shadow.
+///
+/// These are the protocol-defined role names from §5.5 and §5.14. Custom
+/// roles using these names would collide with built-in role constructors,
+/// causing ambiguous role resolution.
+const RESERVED_ROLE_NAMES: &[&str] = &[
+    "admin",
+    "moderator",
+    "member",
+    "observer",
+    "author",
+    "subscriber",
+];
+
+/// Validates a custom role name.
+///
+/// Role names MUST:
+/// - Be non-empty.
+/// - Not exceed [`MAX_ROLE_NAME_LENGTH`] bytes.
+/// - Not collide with reserved built-in role names.
+/// - Contain only lowercase ASCII letters, digits, hyphens, and underscores
+///   (`[a-z0-9_-]`), and not start or end with a hyphen or underscore.
+///
+/// # Errors
+///
+/// Returns [`RoleError::InvalidRoleName`] on validation failure.
+pub fn validate_role_name(name: &str) -> Result<(), RoleError> {
+    if name.is_empty() {
+        return Err(RoleError::InvalidRoleName(
+            "role name must not be empty".into(),
+        ));
+    }
+
+    if name.len() > MAX_ROLE_NAME_LENGTH {
+        return Err(RoleError::InvalidRoleName(format!(
+            "role name exceeds maximum length of {MAX_ROLE_NAME_LENGTH} bytes (got {} bytes)",
+            name.len()
+        )));
+    }
+
+    if RESERVED_ROLE_NAMES.contains(&name) {
+        return Err(RoleError::InvalidRoleName(format!(
+            "'{name}' is a reserved built-in role name"
+        )));
+    }
+
+    // Format: lowercase ASCII letters, digits, hyphens, underscores.
+    // Must not start or end with hyphen/underscore.
+    let first = name.as_bytes()[0];
+    if first == b'-' || first == b'_' {
+        return Err(RoleError::InvalidRoleName(format!(
+            "'{name}' must not start with a hyphen or underscore"
+        )));
+    }
+
+    let last = name.as_bytes()[name.len() - 1];
+    if last == b'-' || last == b'_' {
+        return Err(RoleError::InvalidRoleName(format!(
+            "'{name}' must not end with a hyphen or underscore"
+        )));
+    }
+
+    for ch in name.chars() {
+        if !matches!(ch, 'a'..='z' | '0'..='9' | '-' | '_') {
+            return Err(RoleError::InvalidRoleName(format!(
+                "'{name}' contains invalid character '{ch}' (only lowercase ASCII letters, digits, hyphens, and underscores allowed)"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1113,6 +1282,41 @@ mod tests {
     }
 
     #[test]
+    fn builtin_moderator_has_expected_capabilities() {
+        let ceiling = test_ceiling();
+        let moderator = builtin_moderator(&ceiling);
+        assert_eq!(moderator.name, "moderator");
+        assert!(moderator.capabilities.contains(&Capability::MessagesRead));
+        assert!(moderator.capabilities.contains(&Capability::MessagesWrite));
+        assert!(moderator.capabilities.contains(&Capability::ToolInvokeAll));
+        assert!(moderator.capabilities.contains(&Capability::MemberRemove));
+        assert!(
+            moderator
+                .capabilities
+                .contains(&Capability::GovernancePropose)
+        );
+        assert_eq!(moderator.capabilities.len(), 5);
+    }
+
+    #[test]
+    fn builtin_moderator_respects_ceiling() {
+        // If GovernancePropose is not in the ceiling, moderator should not have it.
+        let ceiling = CapabilityCeiling::new([
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::ToolInvokeAll,
+            Capability::MemberRemove,
+        ]);
+        let moderator = builtin_moderator(&ceiling);
+        assert!(
+            !moderator
+                .capabilities
+                .contains(&Capability::GovernancePropose)
+        );
+        assert_eq!(moderator.capabilities.len(), 4);
+    }
+
+    #[test]
     fn builtin_author_has_expected_capabilities() {
         let ceiling = test_ceiling();
         let author = builtin_author(&ceiling);
@@ -1142,12 +1346,13 @@ mod tests {
     }
 
     #[test]
-    fn builtin_roles_returns_three_roles() {
+    fn builtin_roles_returns_four_roles() {
         let ceiling = test_ceiling();
         let roles = builtin_roles(&ceiling);
-        assert_eq!(roles.len(), 3);
+        assert_eq!(roles.len(), 4);
         let names: Vec<&str> = roles.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains(&"admin"));
+        assert!(names.contains(&"moderator"));
         assert!(names.contains(&"member"));
         assert!(names.contains(&"observer"));
     }
@@ -1210,7 +1415,7 @@ mod tests {
     fn context_role_state_new_with_custom_role() {
         let ceiling = test_ceiling();
         let custom = RoleDefinition::new(
-            "moderator",
+            "content-mod",
             HashSet::from([
                 Capability::MessagesRead,
                 Capability::MessagesWrite,
@@ -1222,8 +1427,8 @@ mod tests {
 
         let state =
             ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![custom]).unwrap();
-        assert!(state.role_definitions.contains_key("moderator"));
-        let mod_role = state.role_definitions.get("moderator").unwrap();
+        assert!(state.role_definitions.contains_key("content-mod"));
+        let mod_role = state.role_definitions.get("content-mod").unwrap();
         assert_eq!(mod_role.capabilities.len(), 3);
     }
 
@@ -1407,7 +1612,7 @@ mod tests {
     fn assign_role_custom_role() {
         let ceiling = test_ceiling();
         let custom = RoleDefinition::new(
-            "moderator",
+            "content-mod",
             HashSet::from([
                 Capability::MessagesRead,
                 Capability::MessagesWrite,
@@ -1422,8 +1627,13 @@ mod tests {
 
         state.members.insert("did:dht:alice".to_owned());
 
-        let tokens =
-            assign_role(&mut state, "did:dht:alice", "moderator", "did:dht:creator").unwrap();
+        let tokens = assign_role(
+            &mut state,
+            "did:dht:alice",
+            "content-mod",
+            "did:dht:creator",
+        )
+        .unwrap();
         assert_eq!(tokens.len(), 3);
         assert!(state.member_has_capability("did:dht:alice", &Capability::MemberRemove));
     }
@@ -1617,7 +1827,7 @@ mod tests {
     fn context_role_state_msgpack_roundtrip() {
         let ceiling = test_ceiling();
         let custom = RoleDefinition::new(
-            "moderator",
+            "content-mod",
             HashSet::from([
                 Capability::MessagesRead,
                 Capability::MessagesWrite,
@@ -1632,7 +1842,13 @@ mod tests {
 
         // Add a second member with a non-admin role.
         state.members.insert("did:dht:alice".to_owned());
-        assign_role(&mut state, "did:dht:alice", "moderator", "did:dht:creator").unwrap();
+        assign_role(
+            &mut state,
+            "did:dht:alice",
+            "content-mod",
+            "did:dht:creator",
+        )
+        .unwrap();
 
         // Serialize to MessagePack.
         let bytes = rmp_serde::to_vec(&state).expect("ContextRoleState serialization failed");
@@ -1643,5 +1859,100 @@ mod tests {
             rmp_serde::from_slice(&bytes).expect("ContextRoleState deserialization failed");
 
         assert_eq!(state, decoded);
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_role_name (M3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_role_name_accepts_valid_names() {
+        assert!(validate_role_name("custom-role").is_ok());
+        assert!(validate_role_name("my-role-1").is_ok());
+        assert!(validate_role_name("role123").is_ok());
+        assert!(validate_role_name("a").is_ok());
+        assert!(validate_role_name("role_with_underscores").is_ok());
+    }
+
+    #[test]
+    fn validate_role_name_rejects_empty() {
+        let err = validate_role_name("").unwrap_err();
+        assert!(matches!(err, RoleError::InvalidRoleName(_)));
+    }
+
+    #[test]
+    fn validate_role_name_rejects_too_long() {
+        let long_name = "a".repeat(MAX_ROLE_NAME_LENGTH + 1);
+        let err = validate_role_name(&long_name).unwrap_err();
+        assert!(
+            matches!(&err, RoleError::InvalidRoleName(msg) if msg.contains("maximum length")),
+            "expected max length error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_role_name_rejects_reserved_names() {
+        for name in &[
+            "admin",
+            "moderator",
+            "member",
+            "observer",
+            "author",
+            "subscriber",
+        ] {
+            let err = validate_role_name(name).unwrap_err();
+            assert!(
+                matches!(&err, RoleError::InvalidRoleName(msg) if msg.contains("reserved")),
+                "expected reserved name error for '{name}', got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_role_name_rejects_uppercase() {
+        let err = validate_role_name("Admin").unwrap_err();
+        assert!(matches!(err, RoleError::InvalidRoleName(_)));
+    }
+
+    #[test]
+    fn validate_role_name_rejects_leading_hyphen() {
+        let err = validate_role_name("-leading").unwrap_err();
+        assert!(matches!(err, RoleError::InvalidRoleName(_)));
+    }
+
+    #[test]
+    fn validate_role_name_rejects_trailing_underscore() {
+        let err = validate_role_name("trailing_").unwrap_err();
+        assert!(matches!(err, RoleError::InvalidRoleName(_)));
+    }
+
+    #[test]
+    fn validate_role_name_rejects_spaces() {
+        let err = validate_role_name("has space").unwrap_err();
+        assert!(matches!(err, RoleError::InvalidRoleName(_)));
+    }
+
+    #[test]
+    fn role_definition_new_validates_name() {
+        let ceiling = test_ceiling();
+        let caps = HashSet::from([Capability::MessagesRead]);
+        let err = RoleDefinition::new("admin", caps, &ceiling).unwrap_err();
+        assert!(
+            matches!(&err, RoleError::InvalidRoleName(msg) if msg.contains("reserved")),
+            "expected reserved name error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn context_role_state_rejects_reserved_custom_role() {
+        let ceiling = test_ceiling();
+        let custom =
+            RoleDefinition::new_unchecked("member", HashSet::from([Capability::MessagesRead]));
+        let err =
+            ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![custom]).unwrap_err();
+        assert!(
+            matches!(&err, RoleError::InvalidRoleName(msg) if msg.contains("reserved")),
+            "expected reserved name error, got: {err}"
+        );
     }
 }

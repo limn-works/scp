@@ -45,11 +45,14 @@ pub use attestation::{
 };
 pub use cache::{DidCache, DidResolutionResult, Staleness};
 pub use dht::{
-    DidDht, decode_multibase_key, did_from_ed25519_public_key, extract_public_key,
-    verify_bep44_signature, verify_migration, verify_self_certification,
+    DidDht, InMemorySequenceStore, PostResolveHook, SequenceStore, decode_multibase_key,
+    did_from_ed25519_public_key, extract_public_key, verify_bep44_signature, verify_migration,
+    verify_self_certification,
 };
 // SigningKeyId is defined in this module and exported directly.
 pub use dht_client::{DhtClient, InMemoryDhtClient};
+#[cfg(feature = "production-dht")]
+pub use dht_client::{PkarrDhtClient, PkarrDhtClientBuilder};
 pub use document::{DidDocument, DidRotationEvent, MigrationProof, PreRotationProof};
 pub use republish::RepublishManager;
 pub use resolution::{
@@ -58,7 +61,7 @@ pub use resolution::{
 };
 pub use resolver::{
     DidResolver, DualLayerHealingPublisher, DualLayerResolver, HealingPublisher, MultiRelayQuerier,
-    NoOpHealer, ResolutionSource, ResolvedDidDocument, StaleLayer,
+    NoOpHealer, NoOpRelayQuerier, ResolutionSource, ResolvedDidDocument, StaleLayer,
 };
 
 use serde::{Deserialize, Serialize};

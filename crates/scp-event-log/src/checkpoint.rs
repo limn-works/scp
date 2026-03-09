@@ -713,6 +713,44 @@ pub fn verify_checkpointed_proof(proof: &CheckpointedProof) -> bool {
     verify_pruned_inclusion(&proof.pruned_proof)
 }
 
+/// Verifies the Ed25519 signature on a consistency checkpoint (M17).
+///
+/// Recomputes the canonical hash from the checkpoint fields (same computation
+/// used during creation in [`generate_checkpoint_at`]) and verifies the
+/// signature against the provided public key. The public key should be the
+/// signing key of the checkpoint's `sender_did`.
+///
+/// # Errors
+///
+/// Returns `Err` with a human-readable reason if:
+/// - The signature is not 64 bytes.
+/// - The Ed25519 signature does not verify against the public key.
+pub fn verify_checkpoint_signature(
+    checkpoint: &ConsistencyCheckpoint,
+    signer_public_key: &ed25519_dalek::VerifyingKey,
+) -> Result<(), String> {
+    let sig_bytes: [u8; 64] = checkpoint.signature.as_slice().try_into().map_err(|_| {
+        format!(
+            "checkpoint signature must be 64 bytes, got {}",
+            checkpoint.signature.len()
+        )
+    })?;
+
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    let canonical = compute_checkpoint_canonical_hash(
+        &checkpoint.context_id,
+        &checkpoint.sender_did,
+        checkpoint.event_count,
+        &checkpoint.merkle_root,
+        checkpoint.epoch,
+        checkpoint.timestamp,
+    );
+
+    signer_public_key
+        .verify_strict(&canonical, &signature)
+        .map_err(|e| format!("Ed25519 verification failed: {e}"))
+}
+
 /// Verifies consistency between two checkpoints.
 ///
 /// Two checkpoints are consistent if they cover the same context and the
@@ -963,13 +1001,9 @@ fn build_proof_path(
             sibling_hash: leaves[sibling_idx],
             direction,
         });
-    } else {
-        // Odd node at the end: sibling is itself (promoted).
-        path.push(ProofStep {
-            sibling_hash: leaves[idx],
-            direction: Direction::Right,
-        });
     }
+    // Odd node at the end: no proof step needed -- node is promoted
+    // directly to the next level per RFC 6962.
 
     idx /= 2;
 
@@ -986,12 +1020,8 @@ fn build_proof_path(
                 sibling_hash: layer[sibling_idx],
                 direction,
             });
-        } else {
-            path.push(ProofStep {
-                sibling_hash: layer[idx],
-                direction: Direction::Right,
-            });
         }
+        // Odd node: no proof step needed -- promoted directly per RFC 6962.
         idx /= 2;
     }
 
@@ -1020,7 +1050,8 @@ fn recompute_tree_from_leaves(leaves: &[[u8; 32]]) -> Vec<Vec<[u8; 32]>> {
             if i + 1 < current.len() {
                 parents.push(hash_pair(&current[i], &current[i + 1]));
             } else {
-                parents.push(hash_pair(&current[i], &current[i]));
+                // Odd node: promote directly per RFC 6962.
+                parents.push(current[i]);
             }
             i += 2;
         }

@@ -45,6 +45,24 @@ public nonisolated struct ToolInvocationResult: Sendable {
     }
 }
 
+// MARK: - ToolSessionResult
+
+/// The result of creating a stateful tool session.
+///
+/// Contains the session ID and metadata needed to invoke the tool within
+/// the session.
+///
+/// See spec section 6.2.1 (Stateful Tool Sessions).
+public nonisolated struct ToolSessionResult: Sendable {
+    /// The unique session ID (UUID).
+    public let sessionId: String
+
+    /// Memberwise initializer.
+    public init(sessionId: String) {
+        self.sessionId = sessionId
+    }
+}
+
 // MARK: - ToolBridge
 
 /// Namespace for UniFFI bridge function references used by tool operations.
@@ -73,6 +91,38 @@ internal enum ToolBridge {
         _ toolId: String
     ) async throws -> ToolVerificationResult
 
+    /// Invoke a tool across context boundaries (spec section 6.2).
+    internal typealias InvokeCrossContextFn = @Sendable (
+        _ sourceHandle: ContextHandle,
+        _ targetHandle: ContextHandle,
+        _ toolId: String,
+        _ inputJson: String,
+        _ identity: Identity,
+        _ chainDepth: UInt8
+    ) async throws -> String
+
+    /// Create a stateful tool session (spec section 6.2.1).
+    internal typealias SessionCreateFn = @Sendable (
+        _ handle: ContextHandle,
+        _ toolId: String,
+        _ sourceContextId: String,
+        _ ttlSeconds: UInt64
+    ) async throws -> String
+
+    /// Invoke a tool within an active session.
+    internal typealias SessionInvokeFn = @Sendable (
+        _ handle: ContextHandle,
+        _ sessionId: String,
+        _ inputJson: String,
+        _ identity: Identity
+    ) async throws -> String
+
+    /// Close a stateful tool session.
+    internal typealias SessionCloseFn = @Sendable (
+        _ handle: ContextHandle,
+        _ sessionId: String
+    ) async throws -> Void
+
     /// Default invoke function that delegates to the UniFFI-generated binding.
     internal static let defaultInvoke: InvokeFn = { handle, toolId, inputJson, identity in
         try await toolInvoke(handle: handle, toolId: toolId, inputJson: inputJson, identity: identity)
@@ -86,6 +136,46 @@ internal enum ToolBridge {
     /// Default verify function that delegates to the UniFFI-generated binding.
     internal static let defaultVerify: VerifyFn = { handle, toolId in
         try await toolVerify(handle: handle, toolId: toolId)
+    }
+
+    /// Default cross-context invoke function — delegates to UniFFI.
+    internal static let defaultInvokeCrossContext: InvokeCrossContextFn = {
+        sourceHandle, targetHandle, toolId, inputJson, identity, chainDepth in
+        try await toolInvokeCrossContext(
+            sourceHandle: sourceHandle,
+            targetHandle: targetHandle,
+            toolId: toolId,
+            inputJson: inputJson,
+            identity: identity,
+            chainDepth: chainDepth
+        )
+    }
+
+    /// Default session create function — delegates to UniFFI.
+    internal static let defaultSessionCreate: SessionCreateFn = {
+        handle, toolId, sourceContextId, ttlSeconds in
+        try await toolSessionCreate(
+            handle: handle,
+            toolId: toolId,
+            sourceContextId: sourceContextId,
+            ttlSeconds: ttlSeconds
+        )
+    }
+
+    /// Default session invoke function — delegates to UniFFI.
+    internal static let defaultSessionInvoke: SessionInvokeFn = {
+        handle, sessionId, inputJson, identity in
+        try await toolSessionInvoke(
+            handle: handle,
+            sessionId: sessionId,
+            inputJson: inputJson,
+            identity: identity
+        )
+    }
+
+    /// Default session close function — delegates to UniFFI.
+    internal static let defaultSessionClose: SessionCloseFn = { handle, sessionId in
+        try await toolSessionClose(handle: handle, sessionId: sessionId)
     }
 }
 
@@ -137,7 +227,7 @@ extension Context {
         let outputJson = try await invokeFn(contextHandle, tool, inputJson, identity)
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
-            invokerDid: "",
+            invokerDid: contextHandle.creatorDid(),
             contextId: contextId,
             timestamp: UInt64(Date().timeIntervalSince1970 * 1_000)
         )
@@ -210,5 +300,192 @@ extension Context {
             )
         }
         return try await verifyFn(contextHandle, tool)
+    }
+
+    /// Invokes a tool registered in a different context (cross-context).
+    ///
+    /// Delegates to the UniFFI ``toolInvokeCrossContext`` bridge function.
+    /// Requires bidirectional consent: the source context must allow outbound
+    /// tool calls and the target context must allow inbound tool calls.
+    /// Chain depth is enforced (max 3 hops per spec section 6.2).
+    ///
+    /// - Parameters:
+    ///   - tool: The tool ID to invoke in the target context.
+    ///   - input: The tool input as serialized JSON data.
+    ///   - targetContext: The ``Context`` containing the target tool.
+    ///   - chainDepth: Current chain depth (0 for direct invocation).
+    ///   - invokeCrossContextFn: Bridge function override for testing.
+    /// - Returns: A ``ToolInvocationResult`` containing the tool's output
+    ///   and provenance metadata.
+    /// - Throws: ``ScpError/Tool(message:code:)`` if the tool is not found,
+    ///   chain depth exceeds the limit, or consent is denied.
+    ///   ``ScpError/Context(message:code:)`` if either context is not active.
+    ///
+    /// ## Provenance
+    ///
+    /// - Spec section 6.2 (Cross-Context Tool Interfaces)
+    /// - Story #322
+    public func invokeToolCrossContext(
+        _ tool: String,
+        input: Data,
+        targetContext: Context,
+        chainDepth: UInt8 = 0,
+        invokeCrossContextFn: ToolBridge.InvokeCrossContextFn = ToolBridge.defaultInvokeCrossContext
+    ) async throws -> ToolInvocationResult {
+        guard state == .active else {
+            throw ScpError.Context(
+                message: "Source context is not active",
+                code: "SCP-CTX-2001"
+            )
+        }
+        guard let sourceHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "Source context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        guard let targetHandle = targetContext.handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "Target context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        let inputJson = String(data: input, encoding: .utf8) ?? "{}"
+        let identity = Identity(noPointer: .init())
+        let outputJson = try await invokeCrossContextFn(
+            sourceHandle, targetHandle, tool, inputJson, identity, chainDepth
+        )
+        return ToolInvocationResult(
+            output: Data(outputJson.utf8),
+            invokerDid: sourceHandle.creatorDid(),
+            contextId: contextId,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1_000)
+        )
+    }
+
+    /// Creates a stateful tool session for repeated invocations.
+    ///
+    /// Delegates to the UniFFI ``toolSessionCreate`` bridge function.
+    /// Sessions have a TTL and a per-caller cap (5 concurrent).
+    ///
+    /// - Parameters:
+    ///   - toolId: The tool ID to create a session for.
+    ///   - sourceContextId: The context ID of the calling context.
+    ///   - ttlSeconds: Time-to-live for the session in seconds.
+    ///   - sessionCreateFn: Bridge function override for testing.
+    /// - Returns: A ``ToolSessionResult`` containing the session ID.
+    /// - Throws: ``ScpError/Tool(message:code:)`` if session creation fails.
+    ///   ``ScpError/Context(message:code:)`` if the context is not active.
+    ///
+    /// ## Provenance
+    ///
+    /// - Spec section 6.2.1 (Stateful Tool Sessions)
+    /// - Story #322
+    public func createToolSession(
+        toolId: String,
+        sourceContextId: String,
+        ttlSeconds: UInt64,
+        sessionCreateFn: ToolBridge.SessionCreateFn = ToolBridge.defaultSessionCreate
+    ) async throws -> ToolSessionResult {
+        guard state == .active else {
+            throw ScpError.Context(
+                message: "Context is not active",
+                code: "SCP-CTX-2001"
+            )
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        let sessionId = try await sessionCreateFn(
+            contextHandle, toolId, sourceContextId, ttlSeconds
+        )
+        return ToolSessionResult(sessionId: sessionId)
+    }
+
+    /// Invokes a tool within an active session.
+    ///
+    /// Delegates to the UniFFI ``toolSessionInvoke`` bridge function.
+    /// Each invocation increments the session call count and checks
+    /// TTL expiry.
+    ///
+    /// - Parameters:
+    ///   - sessionId: The session ID from ``createToolSession``.
+    ///   - input: The tool input as serialized JSON data.
+    ///   - sessionInvokeFn: Bridge function override for testing.
+    /// - Returns: A ``ToolInvocationResult`` containing the tool's output.
+    /// - Throws: ``ScpError/Tool(message:code:)`` if the session is expired
+    ///   or not found. ``ScpError/Context(message:code:)`` if the context
+    ///   is not active.
+    ///
+    /// ## Provenance
+    ///
+    /// - Spec section 6.2.1 (Stateful Tool Sessions)
+    /// - Story #322
+    public func invokeToolSession(
+        sessionId: String,
+        input: Data,
+        sessionInvokeFn: ToolBridge.SessionInvokeFn = ToolBridge.defaultSessionInvoke
+    ) async throws -> ToolInvocationResult {
+        guard state == .active else {
+            throw ScpError.Context(
+                message: "Context is not active",
+                code: "SCP-CTX-2001"
+            )
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        let inputJson = String(data: input, encoding: .utf8) ?? "{}"
+        let identity = Identity(noPointer: .init())
+        let outputJson = try await sessionInvokeFn(
+            contextHandle, sessionId, inputJson, identity
+        )
+        return ToolInvocationResult(
+            output: Data(outputJson.utf8),
+            invokerDid: contextHandle.creatorDid(),
+            contextId: contextId,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1_000)
+        )
+    }
+
+    /// Closes a stateful tool session.
+    ///
+    /// Delegates to the UniFFI ``toolSessionClose`` bridge function.
+    /// The session is removed and can no longer be invoked.
+    ///
+    /// - Parameters:
+    ///   - sessionId: The session ID to close.
+    ///   - sessionCloseFn: Bridge function override for testing.
+    /// - Throws: ``ScpError/Tool(message:code:)`` if the session is not
+    ///   found. ``ScpError/Context(message:code:)`` if the context is
+    ///   not active.
+    ///
+    /// ## Provenance
+    ///
+    /// - Spec section 6.2.1 (Stateful Tool Sessions)
+    /// - Story #322
+    public func closeToolSession(
+        sessionId: String,
+        sessionCloseFn: ToolBridge.SessionCloseFn = ToolBridge.defaultSessionClose
+    ) async throws {
+        guard state == .active else {
+            throw ScpError.Context(
+                message: "Context is not active",
+                code: "SCP-CTX-2001"
+            )
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        try await sessionCloseFn(contextHandle, sessionId)
     }
 }

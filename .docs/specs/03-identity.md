@@ -15,15 +15,77 @@ Users never see or manage keys directly. Custody is delegated to whatever the us
 - Hardware security keys
 - Self-managed keys (power users who want direct control)
 
-The identity layer abstracts custody. The user authenticates however they choose; under the hood it resolves to a protocol-level DID. Migration between custody methods is possible without changing identity.
+The identity layer abstracts custody. The user authenticates however they choose; under the hood it resolves to a protocol-level DID. Migration between custody methods is possible without changing identity, using the key custody migration protocol (§3.2.1).
+
+### 3.2.1 Key Custody Migration Protocol
+
+Custody migration moves the operational signing capability from one custody provider to another (e.g., Secure Enclave to hardware security key, or passkey to self-managed key) without changing the identity (DID string). The Identity Key (`#0`) remains the root of trust throughout.
+
+**Two cases:**
+
+1. **Active Signing Key migration (common).** The Active Signing Key (`#active`) is rotatable by design (ADR-003 §4a). Migration generates a new `#active` key in the target custody provider and publishes an updated DID document signed by `#0`. The old `#active` key is revoked. The DID string does not change because it is derived from `#0`, not `#active`. This is the standard `rotate_active_key` operation applied to a custody change rather than a compromise.
+
+2. **Identity Key migration (rare).** If `#0` itself must move (e.g., the Secure Enclave device is being decommissioned and the key cannot be exported), the pre-rotation key mechanism (ADR-003 §4b, §9.12) is used. This creates a new DID — identity continuity is maintained through the `alsoKnownAs` forwarding record and the `DidRotationEvent` sent to all active contexts. The pre-rotation proof cryptographically binds the old identity to the new one.
+
+**Migration protocol (case 1 — Active Signing Key):**
+
+```
+1. INITIATE on target device:
+   a. Generate new Ed25519 keypair in target custody provider.
+   b. Create CustodyMigrationRequest:
+      - new_active_pubkey: [u8; 32]
+      - target_custody_type: enum { SecureEnclave, AndroidKeystore, HardwareKey, Passkey, Software }
+      - requested_at: u64 (Unix timestamp)
+
+2. AUTHORIZE on device holding #0:
+   a. Verify the migration request was initiated by the identity owner
+      (device-local authentication — biometric, PIN, or platform credential).
+   b. Construct updated DID document:
+      - Replace #active verification method with new_active_pubkey.
+      - Retain #0 and #agent (if present) unchanged.
+      - Increment BEP44 sequence number.
+   c. Sign DID document with #0 (Identity Key).
+
+3. PUBLISH:
+   a. Publish updated DID document to both resolution layers (§3.10.5).
+   b. Issue MLS Update proposals in all active contexts with credentials
+      referencing the new #active key (§9.7.3).
+   c. Revoke all UCAN tokens signed by the old #active key.
+      Reissue under the new #active key.
+
+4. TRANSFER attestation chain:
+   a. Identity attestations (§3.5) that were signed by the old #active key
+      MUST be re-signed by the new #active key and republished.
+   b. The SDK enumerates all published attestations and re-signs them
+      as part of the migration transaction.
+
+5. DESTROY old key material:
+   a. After confirmation that the new DID document has propagated
+      (verified by resolving from at least one relay and DHT),
+      the old #active private key is destroyed in the source custody provider.
+   b. Destruction is best-effort for HSM-backed keys (the HSM may not support
+      explicit deletion, but the key becomes inaccessible once the device
+      is decommissioned).
+```
+
+**Failure semantics:**
+
+- **Step 2 fails (authorization denied):** No state change. The old custody provider remains active. The new keypair generated in step 1 is discarded.
+- **Step 3a fails (publication fails on some relays/DHT):** The SDK retries publication. The RepublishManager (§3.10.5) will propagate on its next cycle. Partial publication is safe — peers that resolve the old document continue to work; peers that resolve the new document use the new key. Both are valid until the old key is destroyed.
+- **Step 3b/3c fails (MLS Update or UCAN reissuance fails in some contexts):** The SDK queues failed operations for retry. Contexts that have not received the Update continue to verify messages against the old `#active` key (still in the previously-resolved DID document). The migration converges as retries succeed.
+- **Step 5 fails (old key destruction fails):** The migration is still complete — the DID document references the new key. The old key is orphaned but harmless: UCAN tokens signed by it are revoked, and peers verify against the new DID document.
+
+**Multi-device coordination:** If the identity owner has multiple devices (e.g., phone + laptop + tablet), each device holds its own key material for signing. Custody migration affects only the `#active` key published in the DID document — the single authoritative signing key. Other devices learn of the migration by resolving the updated DID document (§3.10.4). After migration, only the device with the new custody provider can sign as `#active`. Other devices that need signing capability must independently generate keys and request delegation via scoped UCANs from the new `#active` key holder.
+
+**Invariant:** At no point during migration are there zero valid signing keys for the identity. The old key remains valid until the new DID document propagates. The new key becomes valid upon publication. The overlap window ensures continuity.
 
 ## 3.3 Recovery
 
 No seed phrases. Recovery uses social and device mechanisms:
 
-- **Trusted device recovery:** Another device you control vouches for a new one.
-- **Social recovery:** Trusted contacts confirm your identity.
-- **Platform-backed recovery:** If custody is delegated to Apple/Google, their recovery mechanisms apply.
+- **Trusted device recovery:** Another device you control vouches for a new one. The trusted device enrolls the new device into the identity's device registry and distributes the Private State Key (PSK) via HPKE (§3.7.2). Recovery IS device enrollment — the same cryptographic protocol applies.
+- **Social recovery:** Trusted contacts confirm your identity. After social recovery re-establishes key custody, the recovering device is enrolled as a new device (§3.7.2) and receives the PSK from any existing enrolled device. If no enrolled devices remain (all devices lost), PSK recovery requires re-keying: a new PSK is generated, existing private state history encrypted under the old PSK is permanently inaccessible (same forward-only property as §9.17.5), and the identity starts a fresh private state log.
+- **Platform-backed recovery:** If custody is delegated to Apple/Google, their recovery mechanisms apply. The PSK is stored in the platform's secure key store (Keychain, Keystore — §17.8) and may be recoverable through platform backup/restore mechanisms (e.g., iCloud Keychain sync, Google Cloud Key Vault). This provides a recovery path for the PSK that does not depend on another SCP device being available.
 
 For new users with a single device and no SCP contacts, platform-backed recovery is the practical safety net. Social and device recovery grow in value over time as users add devices and build connections. Apps should prompt for trusted recovery contacts during onboarding — the same pattern Google and Apple use today.
 
@@ -48,8 +110,120 @@ Properties of identity attestations:
 Identity attestations enable three critical flows:
 
 1. **Social graph import.** A user exports their follower list from X. Their local agent resolves each handle against known attestations. Contacts who have also joined SCP are automatically discoverable.
-2. **Shadow identity claiming.** When a bridge connector creates a shadow identity for an external participant (see §12), a user can claim it by presenting a matching attestation. The shadow identity merges with their real DID.
+2. **Shadow identity claiming.** When a bridge connector creates a shadow identity for an external participant (see §12), a user can claim it by presenting a matching attestation. The shadow identity merges with their real DID (see §3.5.3 for the claiming protocol).
 3. **Cross-platform reputation continuity.** Trust judgments about a person can follow them across platforms — not because platforms share data, but because the human has cryptographically proven they're the same person.
+
+### 3.5.1 Identity Attestation Wire Format
+
+Identity attestations use the attestation envelope defined in §7.4.1, with identity-link-specific fields. The canonical serialization is MessagePack (§17), consistent with all other SCP wire formats. The signature scope covers the canonical MessagePack serialization of all fields except the `signature` field itself.
+
+```
+IdentityLinkAttestation {
+  id:           String,          // SHA-256(issuer_did || platform || platform_handle || created_at), hex-encoded
+  type:         "identity_link",
+  issuer:       DID,             // The DID claiming the external identity
+  subject:      DID,             // Same as issuer (self-attestation)
+  issued_at:    u64,             // Unix timestamp (ms)
+  expires_at:   Option<u64>,     // Optional expiry (ms). If absent, valid until revoked.
+  claim: {
+    platform:       String,      // Platform identifier: "x.com", "github.com", "discord.com", etc.
+    platform_handle: String,     // Handle on the platform: "@alice", "alice123", etc.
+    platform_id:    Option<String>, // Platform-specific immutable user ID (e.g., Twitter user ID)
+    link_type:      "self_attestation",
+  },
+  evidence: {
+    method:         String,      // Verification method: "oauth", "signed_post", "dns_record", "challenge_response"
+    proof:          String,      // Method-specific proof data (see §3.5.2)
+    verified_at:    u64,         // Timestamp of last verification
+    verifier_did:   Option<DID>, // DID of the verifier, if third-party verified
+  },
+  revocation: {
+    method:         "did_document", // Revocation check method
+    endpoint:       String,        // DID document service endpoint path for revocation status
+  },
+  signature:    Ed25519Signature,  // Signs MessagePack(all fields except signature), using issuer's #active or #agent key
+}
+```
+
+**Signature scope:** The signature covers `MessagePack_canonical(id, type, issuer, subject, issued_at, expires_at, claim, evidence, revocation)` where `MessagePack_canonical` uses sorted-key encoding (keys in lexicographic order within each map) per §17.1. The signature is computed using the issuer's Active Signing Key (`#active`) or Agent Signing Key (`#agent`).
+
+**Revocation check:** Verifiers check revocation by resolving the issuer's DID document and looking for an `AttestationRevocations` service endpoint (§18.2.2). The endpoint returns a list of revoked attestation IDs. If the attestation's `id` appears in the list, it is revoked.
+
+### 3.5.2 Identity Attestation Verification Protocol
+
+Each platform verification method has a defined verification protocol:
+
+**OAuth verification (`method: "oauth"`):**
+1. The attesting SDK initiates an OAuth 2.0 authorization code flow with the target platform.
+2. On success, the SDK receives an access token and uses it to query the platform's user info endpoint.
+3. The `proof` field contains the OAuth provider's signed ID token (JWT) OR a JSON object `{ "provider": "<platform>", "subject": "<platform_user_id>", "issued_at": <unix_ts> }` signed by the attesting SDK.
+4. **Verification:** The verifier validates the JWT signature against the platform's published JWKS, confirms the `subject` matches `platform_id`, and confirms `issued_at` is within the attestation's validity period.
+5. **Platforms:** Google (`accounts.google.com`), Apple (`appleid.apple.com`), GitHub (`github.com`), Discord (`discord.com`).
+
+**Signed post verification (`method: "signed_post"`):**
+1. The attesting user posts a message on the target platform containing their DID string and a nonce.
+2. The `proof` field contains `{ "post_url": "<url>", "nonce": "<random_hex>", "posted_at": <unix_ts> }`.
+3. **Verification:** The verifier fetches the post at `post_url`, confirms the post body contains the DID string and nonce, and confirms the post is authored by the claimed `platform_handle`. The verifier MUST use the platform's official API (not HTML scraping) where available.
+4. **Platforms:** X/Twitter, Mastodon, Bluesky, Reddit, any platform with public posts and API access.
+
+**DNS record verification (`method: "dns_record"`):**
+1. The attesting user adds a TXT record at `_scp-verify.<domain>` containing their DID string.
+2. The `proof` field contains `{ "domain": "<domain>", "record_name": "_scp-verify" }`.
+3. **Verification:** The verifier performs a DNS TXT lookup for `_scp-verify.<domain>` and confirms the record contains the DID string. DNSSEC validation is RECOMMENDED where the domain supports it.
+4. **Platforms:** Any domain the user controls.
+
+**Challenge-response verification (`method: "challenge_response"`):**
+1. A third-party verifier (another SCP agent) sends a challenge to the claimed external identity through the platform.
+2. The user signs the challenge with their SCP identity key and returns the signature through the platform.
+3. The `proof` field contains `{ "challenge": "<hex>", "response_signature": "<hex>", "verifier_did": "<did>" }`.
+4. **Verification:** The verifier confirms the response signature is valid for the challenge under the claimed DID's signing key.
+
+**Renewal:** Identity link attestations SHOULD be re-verified at the following intervals:
+
+| Method | Renewal interval | Rationale |
+|--------|-----------------|-----------|
+| OAuth | 30 days | Tokens expire; account may be revoked |
+| Signed post | 90 days | Posts may be deleted; account may be suspended |
+| DNS record | 180 days | DNS records are stable; domain ownership changes slowly |
+| Challenge-response | 60 days | No persistent proof; freshness matters |
+
+### 3.5.3 Shadow Identity Claiming Protocol
+
+When a bridge connector creates a shadow identity for an external platform participant (§12.3), the following protocol governs claiming:
+
+**Claiming sequence:**
+
+1. **Eligibility check.** The claimant presents an `IdentityLinkAttestation` (§3.5.1) for the same platform and handle as the shadow identity. The bridge verifies:
+   a. The attestation is valid (signature verifies, not expired, not revoked).
+   b. The `platform` and `platform_handle` (or `platform_id` if available) match the shadow identity's external identity.
+   c. The attestation's `evidence` has been verified within the last renewal interval (§3.5.2).
+
+2. **Claim request.** The claimant sends a `ShadowClaimRequest` to the bridge context:
+   ```
+   ShadowClaimRequest {
+     claimant_did:      DID,
+     shadow_did:        DID,            // The shadow identity's DID
+     attestation_id:    String,         // ID of the IdentityLinkAttestation
+     attestation:       IdentityLinkAttestation, // Full attestation for verification
+     timestamp:         u64,
+     signature:         Ed25519Signature, // Signs claimant_did || shadow_did || attestation_id || timestamp
+   }
+   ```
+
+3. **Bridge verification.** The bridge operator verifies:
+   a. The attestation links the claimant's DID to the shadow identity's external identity.
+   b. No other DID has already claimed this shadow identity.
+   c. The claimant's DID is not on any block list relevant to the context.
+
+4. **Merge execution.** On successful verification:
+   a. The shadow identity's membership records in all bridge contexts are updated to reference the claimant's DID.
+   b. Historical messages from the shadow identity are re-attributed to the claimant's DID in the context event log via a `ShadowClaimed { shadow_did, claimant_did, attestation_id, timestamp }` event.
+   c. The shadow DID is deactivated — it cannot send new messages or be claimed by another party.
+   d. The claimant inherits the shadow identity's role in the context (typically `member`; never higher than the context's default role for new members unless governance explicitly grants an upgrade).
+
+5. **Conflict resolution.** If two claimants present valid attestations for the same shadow identity simultaneously, the first `ShadowClaimRequest` processed by the bridge wins. The second claimant receives a `SHADOW_ALREADY_CLAIMED` error (code 4040). The losing claimant MAY dispute via the bridge context's governance mechanism.
+
+**Participation record handling.** The shadow identity's participation history (message counts, duration, event log entries) is NOT merged into the claimant's participation profile. Shadow participation is recorded under the shadow DID — the `ShadowClaimed` event establishes the link for auditing, but participation records remain separate to prevent Sybil amplification (creating shadow identities to inflate participation).
 
 ## 3.6 Social Graph
 
@@ -119,15 +293,70 @@ Identity (DID)
     └── (extensible — any identity-level private data)
 ```
 
-**Encryption model.** Private state is encrypted to the identity's own keys. This is the single-owner case — no group key management, no member add/remove. Only you hold the decryption key. Simpler than context encryption, same confidentiality guarantee.
+**Encryption model.** Private state is encrypted with a dedicated symmetric **Private State Key (PSK)** — an AES-256 key used exclusively for identity private state encryption. The PSK is not derived from any signing key. Ed25519 keys are signing-only — they cannot be used for encryption. The PSK is generated independently and distributed to the identity owner's devices via HPKE (§3.7.2).
+
+**Cryptographic specification:**
+
+- **Algorithm:** AES-256-GCM (RFC 5116).
+- **Key:** 32-byte random Private State Key (PSK), generated via CSPRNG (e.g., `OsRng`). The PSK is a raw symmetric key — it is not managed through `KeyCustody` (which handles asymmetric Ed25519/X25519 keys). One PSK per identity, shared across all enrolled devices.
+- **Nonce:** 96-bit (12-byte) random nonce, generated per event via CSPRNG. Each event in the private state log gets a unique nonce. The nonce is stored alongside the ciphertext — it is not secret.
+- **AAD (Additional Authenticated Data):** `did || "scp-private-state-v1" || sequence_number` where `did` is the identity's DID string encoded as 4-byte big-endian length prefix + UTF-8 bytes (per §9.5.1 encoding rules), `"scp-private-state-v1"` is the domain separator as raw UTF-8 bytes (no length prefix — fixed per version), and `sequence_number` is the event's sequence number as 8-byte big-endian u64. AAD binding prevents: (a) ciphertext from one identity being replayed against another, (b) events being reordered within the log, (c) cross-protocol confusion with other AES-256-GCM uses in SCP.
+- **Domain separator:** `"scp-private-state-v1"`. Distinct from `"scp-sender-key-v1"` (§9.16.2), `"scp-access-key-v1"` (§9.17.1), and all other SCP domain separators.
+
+```
+Encryption (per event):
+  nonce = random(12)
+  aad = len(did) || did || "scp-private-state-v1" || sequence_number
+  (ciphertext, tag) = AES-256-GCM-Seal(PSK, nonce, plaintext_event, aad)
+  stored: { nonce, ciphertext, tag, sequence_number }
+
+Decryption (per event):
+  aad = len(did) || did || "scp-private-state-v1" || sequence_number
+  plaintext = AES-256-GCM-Open(PSK, nonce, ciphertext, tag, aad)
+  if tag verification fails → reject (tampered or wrong key)
+```
 
 **Storage model.** Same as context state: encrypted blobs stored on your published relays. Relays see "DID X has encrypted private state." Relays store and serve it. Relays cannot read, modify, or interpret it. This is encryption-as-access-control (§10.5) applied to identity rather than context — the same infrastructure, the same relay behavior, the same trust assumptions.
 
-**Sync model.** Append-only event log, same pattern as context event logs. Each device appends events ("blocked DID Y at timestamp T", "granted Bob graph visibility at scope Z"). Any device reconstructs current state from the log. Multi-device consistency: two phones and a laptop all append to the same log, all converge to the same state.
+**Routing ID derivation.** Identity private state blobs are addressed on relays by a deterministic `routing_id` derived from the identity's DID string:
+
+```
+private_state_routing_id = HKDF-SHA-256(
+    ikm:  identity_key_material,      // raw bytes of #0 public key
+    salt: SHA-256("scp-private-state-salt-v1"),
+    info: "scp-private-state-v1" || did_string,
+    len:  32
+)
+```
+
+HKDF (RFC 5869) is used instead of plain SHA-256 to prevent the relay from computing the `routing_id` from a known DID string. With plain `SHA-256("scp:private:" || did_string)`, any relay that knows a DID could identify which routing ID holds that identity's private state, enabling targeted censorship or surveillance. The HKDF derivation requires `identity_key_material` (the `#0` public key bytes), which the relay does not possess unless it has previously resolved the DID — and even then, the derivation is not obvious without knowing the salt and info strings. This provides pseudonymity for private state storage relative to relays that have not correlated the identity.
+
+The domain separation (`"scp-private-state-v1"` info string and `"scp-private-state-salt-v1"` salt) prevents collision with other routing ID derivation schemes: DID document routing uses `SHA-256("scp:did:" || did_string)` (§3.10.2), encrypted context routing uses HKDF from identity key material with `"scp-pseudonym"` (§9.10.4), broadcast context routing uses `SHA-256(context_id)` (§5.14), and context metadata routing uses `SHA-256(context_id || "scp-metadata")` (§5.7).
+
+The `IdentityPrivateState` service endpoint in the DID document (see below) lists which relays store the private state. The `routing_id` tells the SDK how to address those blobs on those relays.
+
+**Sync model.** Append-only event log, same pattern as context event logs. Each device appends events ("blocked DID Y at timestamp T", "granted Bob graph visibility at scope Z"). Any device that holds the PSK reconstructs current state from the log. Multi-device consistency: two phones and a laptop all hold the same PSK, all append to the same log, all converge to the same state. See §3.7.2 for how the PSK is distributed to devices.
 
 Most identity private state operations are naturally commutative — "block X" and "block Y" produce the same result regardless of order. Simultaneous updates from multiple devices resolve without conflict in most cases. The event log records all operations; state is derived from the full log.
 
-**Integrity.** The event log is authenticated (Merkle root or equivalent). If a relay tampers with your private state, you detect it on next read. Single-owner verification is simpler than multi-party — you're the only writer — but the integrity guarantee is the same.
+**Integrity.** The event log is authenticated via an append-only hash chain. Each event entry is hashed as:
+
+```
+event_hash[0] = SHA-256("SCP-PRIVATE-LOG-V1:" || event_data[0])
+event_hash[i] = SHA-256("SCP-PRIVATE-LOG-V1:" || event_hash[i-1] || event_data[i])
+```
+
+The head hash (`event_hash[N-1]`) serves as the integrity root for the entire log. On each read from a relay, the device verifies the chain by recomputing hashes from the last verified checkpoint forward. If a relay has tampered with, reordered, or omitted events, the hash chain breaks and the device detects it.
+
+**Verification procedure:**
+
+1. The device stores the last verified `(event_count, head_hash)` tuple locally (in platform secure storage, alongside identity key material).
+2. On fetch, the device receives new events from the relay starting after `event_count`.
+3. The device computes `event_hash[event_count]` using the stored `head_hash` as the previous hash and the first new event's data.
+4. Each subsequent event extends the chain: `event_hash[i] = SHA-256("SCP-PRIVATE-LOG-V1:" || event_hash[i-1] || event_data[i])`.
+5. If the relay also returns a claimed head hash, the device verifies it matches the locally computed chain head. Mismatch indicates tampering.
+
+The domain separator `"SCP-PRIVATE-LOG-V1:"` prevents cross-domain hash collisions with context event logs (which use the construction in §9.5). `event_data` is the serialized event bytes (MessagePack per §17). This is a linear hash chain (not a Merkle tree) because the single-owner case does not require efficient inclusion proofs or consistency proofs — the owner holds the full log and verifies sequentially. Context event logs use the full Merkle tree construction (§9.5) because multi-party verification requires proof exchange. The AES-256-GCM authentication tag provides per-event integrity verification: any modification to ciphertext, nonce, or associated data causes tag verification failure.
 
 **Relationship to context state.** Identity private state is the single-owner degenerate case of context state. Same storage infrastructure. Same integrity model. Same relay interaction. No governance, no roles, no capability ceiling — because it's your data. The protocol doesn't need new infrastructure for this — it's the existing infrastructure with membership count of one and no access control layer (the encryption IS the access control, and only you have the key).
 
@@ -135,7 +364,7 @@ Most identity private state operations are naturally commutative — "block X" a
 
 - **Size constraints.** Less constrained than context state. The single-owner case allows growth (block lists, annotations, agent memory, draft attestations) without imposing storage on other participants. Relays MAY enforce per-DID storage quotas as an operational concern, but the protocol does not mandate minimalism for identity private state.
 - **Relay obligations.** Same storage class and retention as context events. No differentiated commitment — relays treat all encrypted blobs uniformly. A relay that stores context events for a DID stores identity private state under the same terms.
-- **Key rotation.** On identity key rotation (§9.12), private state is re-encrypted to the new key. Single-owner case requires no group redistribution — the owner re-encrypts and republishes. For large private state, re-encryption is incremental: most recent events first, backfill in background.
+- **Key rotation.** On identity key rotation (§9.12), the PSK is rotated: generate a new PSK, re-encrypt private state events, distribute the new PSK to all enrolled devices via HPKE (§3.7.2). The old PSK is destroyed on all devices after re-encryption completes. For large private state, re-encryption is incremental: most recent events first, backfill in background. Each re-encrypted event receives a fresh random nonce.
 - **Discovery pointer.** Explicit. The DID document includes a service endpoint of type `IdentityPrivateState` listing relays that store private state. This cleanly disambiguates context event fetches from private state fetches without relay-side guessing.
 - **Relay service endpoints.** The DID document includes service endpoints of type `SCPRelay` listing the identity's transport-layer relay URLs — the endpoints where `TransportManager` routes encrypted blobs for this identity. Multiple entries are recommended for suppression resistance (§9.9.2). Self-certified via BEP44 signature (§9.6.3). See §18.2 for the full specification of DID document service endpoint types.
 
@@ -171,6 +400,191 @@ Propagation is best-effort and idempotent — if the SDK is offline for some con
 - `is_blocked_in_context(blocker: &DID, target: &DID, context_id: &ContextId) -> Result<bool>`
 
 These methods derive current state from the identity private state event log. Implementations MAY maintain materialized views for query performance.
+
+**Write operations.** Block list mutations are performed through identity private state events. The SDK provides:
+
+- `add_global_block(blocker: &DID, target: &DID) -> Result<()>` — Appends `BlockDID` event, then propagates to all shared contexts (§9.16.3).
+- `remove_global_block(blocker: &DID, target: &DID) -> Result<()>` — Appends `UnblockDID` event, then propagates forward-only restoration to shared contexts.
+- `add_context_block(blocker: &DID, target: &DID, context_id: &ContextId) -> Result<()>` — Appends `BlockDIDInContext` event, then executes Tier 1 block protocol.
+- `remove_context_block(blocker: &DID, target: &DID, context_id: &ContextId) -> Result<()>` — Appends `UnblockDIDInContext` event, then executes forward-only restoration.
+
+Each write triggers sender key rotation (§9.16.3), access key operations (§9.17.5), and SDK-mandated state destruction (§9.16.7) as side effects.
+
+**Conflict resolution for same-target block/unblock.** If two devices simultaneously block and unblock the same target DID, the operations are NOT commutative. Resolution rule: **block wins.** When replaying the event log, if both `BlockDID { target: X }` and `UnblockDID { target: X }` exist with the same timestamp (within 1-second tolerance), the block takes precedence. For events with different timestamps, the later timestamp determines the current state.
+
+### 3.7.1.1 Exhaustive Private State Event Types
+
+All identity private state event types, organized by category:
+
+**Block/Mute events:**
+
+| Event type | Fields | Commutative | Notes |
+|-----------|--------|-------------|-------|
+| `BlockDID` | `target_did: DID, timestamp: u64` | Yes (different targets) | Global block (Tier 2) |
+| `UnblockDID` | `target_did: DID, timestamp: u64` | Yes (different targets) | Global unblock |
+| `BlockDIDInContext` | `target_did: DID, context_id: ContextId, timestamp: u64` | Yes | Per-context block (Tier 1) |
+| `UnblockDIDInContext` | `target_did: DID, context_id: ContextId, timestamp: u64` | Yes | Per-context unblock |
+| `MuteDID` | `target_did: DID, timestamp: u64` | Yes | Global mute |
+| `UnmuteDID` | `target_did: DID, timestamp: u64` | Yes | Global unmute |
+| `MuteDIDInContext` | `target_did: DID, context_id: ContextId, timestamp: u64` | Yes | Per-context mute |
+| `UnmuteDIDInContext` | `target_did: DID, context_id: ContextId, timestamp: u64` | Yes | Per-context unmute |
+
+**Graph visibility events:**
+
+| Event type | Fields | Commutative | Notes |
+|-----------|--------|-------------|-------|
+| `SetDefaultGraphVisibility` | `visibility: GraphVisibility, timestamp: u64` | No | Default visibility for all DIDs |
+| `GrantGraphVisibility` | `target_did: DID, scope: VisibilityScope, timestamp: u64` | Yes (different targets) | Per-DID override |
+| `RevokeGraphVisibility` | `target_did: DID, timestamp: u64` | Yes | Remove per-DID override |
+
+**Agent configuration events:**
+
+| Event type | Fields | Commutative | Notes |
+|-----------|--------|-------------|-------|
+| `SetAgentConfig` | `key: String, value: MessagePackValue, timestamp: u64` | No (same key) | Key-value agent preferences |
+| `DeleteAgentConfig` | `key: String, timestamp: u64` | No (same key) | Remove a preference |
+
+**Annotation events:**
+
+| Event type | Fields | Commutative | Notes |
+|-----------|--------|-------------|-------|
+| `SetAnnotation` | `target_did: DID, key: String, value: String, timestamp: u64` | No (same target+key) | Personal note on a DID |
+| `DeleteAnnotation` | `target_did: DID, key: String, timestamp: u64` | No (same target+key) | Remove annotation |
+
+**Petname events (§22.4):**
+
+| Event type | Fields | Commutative | Notes |
+|-----------|--------|-------------|-------|
+| `SetPetname` | `target: PetnameTarget, name: String, timestamp: u64` | No (same target) | `PetnameTarget` = DID or ContextId |
+| `DeletePetname` | `target: PetnameTarget, timestamp: u64` | No (same target) | Remove petname |
+
+**Notification events:**
+
+| Event type | Fields | Commutative | Notes |
+|-----------|--------|-------------|-------|
+| `SetNotificationPreference` | `scope: NotificationScope, level: NotificationLevel, timestamp: u64` | No (same scope) | `NotificationScope` = Global, PerContext(id), PerDID(did) |
+
+**Attestation draft events:**
+
+| Event type | Fields | Commutative | Notes |
+|-----------|--------|-------------|-------|
+| `SaveDraftAttestation` | `draft_id: String, attestation: IdentityLinkAttestation, timestamp: u64` | Yes (different drafts) | Draft not yet published |
+| `DeleteDraftAttestation` | `draft_id: String, timestamp: u64` | Yes | Remove draft |
+| `PublishDraftAttestation` | `draft_id: String, timestamp: u64` | Yes | Mark draft as published |
+
+**Device registry events:**
+
+| Event type | Fields | Commutative | Notes |
+|-----------|--------|-------------|-------|
+| `EnrollDevice` | `device_id: String, device_x25519_pubkey: [u8; 32], device_name: String, enrolled_at: u64` | Yes | New device enrollment |
+| `UnenrollDevice` | `device_id: String, timestamp: u64` | Yes | Device removal |
+
+**Recovery contact events:**
+
+| Event type | Fields | Commutative | Notes |
+|-----------|--------|-------------|-------|
+| `AddRecoveryContact` | `contact_did: DID, timestamp: u64` | Yes | Designate recovery contact |
+| `RemoveRecoveryContact` | `contact_did: DID, timestamp: u64` | Yes | Remove recovery contact |
+
+For non-commutative events (same key/target modified from multiple devices), conflict resolution is **last-timestamp-wins** with tie-breaking by lexicographic comparison of the event hash.
+
+### 3.7.2 Multi-Device Private State Key Distribution
+
+Identity private state is encrypted with a single PSK shared across all of the identity owner's devices. The challenge: each device has its own hardware-backed keys that cannot be exported (§9.7.2), so the PSK must be distributed TO each device rather than derived FROM a shared secret.
+
+**Device enrollment model.** Each device generates a device-specific X25519 keypair via `KeyCustody::generate_keypair(KeyType::X25519)` at device enrollment time. This keypair is used exclusively for receiving HPKE-wrapped key material (PSK distribution, PSK rotation). The X25519 public key is published in the identity's device registry — an encrypted list within identity private state itself (bootstrapped during identity creation, see below).
+
+**Why not derive from the Identity Key (#0)?** The Identity Key is Ed25519 (signing-only) and its private key "never [leaves] the secure element" (§9.7.2). While Ed25519-to-X25519 conversion is mathematically possible (RFC 7748, birational equivalence between Edwards and Montgomery curves), it requires access to the Ed25519 private key bytes — which hardware security modules (Secure Enclave, Android Keystore) do not export. A design that depends on Ed25519-to-X25519 conversion would fail on every hardware-backed key. The PSK is therefore an independent symmetric key, distributed via HPKE to device-specific X25519 keys that are software-managed through `KeyCustody`.
+
+**Identity creation (first device):**
+
+1. Generate the PSK: 32 random bytes via CSPRNG.
+2. Generate a device-local X25519 keypair via `KeyCustody`.
+3. Store the PSK locally in the device's secure key store.
+4. Initialize the device registry in identity private state with this device's X25519 public key. The device registry is the first event in the private state log — it is encrypted with the PSK (which only this device holds at this point).
+5. Publish the encrypted private state to relays.
+
+**Adding a new device (device enrollment):**
+
+```
+Existing device (Device A) enrolls new device (Device B):
+
+1. Device B generates an X25519 keypair via KeyCustody.
+2. Device B presents its X25519 public key to Device A.
+   Transport: out-of-band (QR code, local network, NFC) or via
+   a standing bilateral context (§5.12.4) between the human's devices.
+3. Device A verifies the enrollment request (user confirmation required).
+4. Device A wraps the PSK to Device B's X25519 public key via HPKE:
+   enc, sealed_psk = HPKE-Seal(
+     mode: Base,
+     kem: DHKEM(X25519, HKDF-SHA256),
+     kdf: HKDF-SHA256,
+     aead: AES-128-GCM,
+     recipient_pk: device_b_x25519_pubkey,
+     info: "scp-private-state-v1" || len(did) || did || "device-enroll",
+     plaintext: psk
+   )
+5. Device A sends (enc, sealed_psk) to Device B via the same channel.
+6. Device B opens the HPKE ciphertext using its X25519 private key,
+   recovering the PSK.
+7. Device A appends a DeviceEnrolled event to the private state log:
+   DeviceEnrolled { device_x25519_pubkey, enrolled_at, enrolled_by_device }
+   This event is encrypted with the PSK (readable by all enrolled devices).
+8. Device B can now decrypt and append to the private state event log.
+```
+
+**HPKE suite.** Device enrollment and PSK distribution use DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM — the same HPKE suite as MLS (§9.5) and sender key distribution (§9.16.2). The `info` parameter includes the domain separator `"scp-private-state-v1"` concatenated with the DID and purpose string to prevent cross-protocol confusion with sender key HPKE (`"scp-sender-key-v1"`) or access key HPKE (`"scp-access-key-v1"`).
+
+**Device removal:**
+
+1. An authorized device appends a `DeviceRemoved { device_x25519_pubkey, removed_at }` event to the private state log.
+2. The removing device rotates the PSK: generates a new PSK, re-wraps it via HPKE to all remaining enrolled devices' X25519 public keys, and appends a `PskRotated { wrapped_keys: Vec<(device_pubkey, hpke_ciphertext)> }` event.
+3. Re-encryption of existing private state events proceeds incrementally under the new PSK (same as key rotation, §3.7 protocol-level constants).
+4. The removed device's cached PSK becomes useless for future events. Historical events encrypted under the old PSK are accessible only if the removed device retained the old PSK locally — the protocol cannot force deletion on an untrusted device (same honest limitation as §9.15).
+
+**Device registry.**
+
+The device registry is stored within identity private state as a sequence of `DeviceEnrolled` and `DeviceRemoved` events. The current set of enrolled devices is derived by replaying the log (same pattern as block lists, §3.7.1). Each entry contains:
+
+```
+DeviceEnrolled {
+    device_x25519_pubkey: [u8; 32],  // X25519 public key for HPKE
+    enrolled_at: u64,                 // Unix timestamp (milliseconds)
+    enrolled_by_device: [u8; 32],     // X25519 pubkey of the enrolling device
+    device_label: String,             // Human-readable label ("iPhone", "Laptop")
+}
+
+DeviceRemoved {
+    device_x25519_pubkey: [u8; 32],
+    removed_at: u64,
+}
+
+PskRotated {
+    wrapped_keys: Vec<DeviceWrappedPsk>,  // One entry per enrolled device
+    rotated_at: u64,
+}
+
+DeviceWrappedPsk {
+    device_x25519_pubkey: [u8; 32],
+    enc: Vec<u8>,           // HPKE encapsulated key
+    sealed_psk: Vec<u8>,    // HPKE-sealed PSK
+}
+```
+
+**Bootstrap paradox resolution.** The device registry is itself encrypted with the PSK — so how does the first device read it? The first device generated the PSK (step 1 of identity creation) and holds it locally before any private state events exist. The first `DeviceEnrolled` event is encrypted with that PSK. Subsequent devices receive the PSK via HPKE before they need to read the log. There is no circular dependency: the PSK is always distributed out-of-band (HPKE to device key) before the device attempts to read PSK-encrypted events.
+
+**Interaction with trusted device recovery (§3.3).** When a user recovers their identity on a new device via trusted device recovery, the recovery flow includes PSK distribution: the trusted device wraps the current PSK to the new device's X25519 public key via the same HPKE enrollment protocol above. This is the same mechanism as adding a new device — recovery IS enrollment. The recovering device generates a fresh X25519 keypair, the trusted device wraps the PSK, and the new device gains access to the full private state history.
+
+**Interaction with key rotation (§9.12).** Step 6 of the compromise recovery protocol specifies "re-encrypt identity private state under the new key." With PSK-based encryption, this means: (a) generate a new PSK, (b) wrap the new PSK to all enrolled devices via HPKE, (c) append a `PskRotated` event, (d) re-encrypt existing events under the new PSK incrementally. If the compromise involved a device (device stolen), that device is removed first (device removal protocol above), and the PSK rotation excludes the compromised device's X25519 public key.
+
+**ProtocolStore methods.** The `Storage` trait (§17) requires these additional methods for PSK and device management:
+
+- `store_private_state_key(did: &DID, psk: &Zeroizing<[u8; 32]>) -> Result<(), StoreError>`
+- `load_private_state_key(did: &DID) -> Result<Option<Zeroizing<[u8; 32]>>, StoreError>`
+- `store_device_registry_event(did: &DID, seq: u64, event: &[u8]) -> Result<(), StoreError>`
+- `load_device_registry(did: &DID) -> Result<Vec<DeviceRegistryEvent>, StoreError>`
+
+The PSK MUST be stored in the platform's secure key store (Keychain on Apple, Keystore on Android, SQLCipher-encrypted storage on desktop/server — per §17.8 platform-specific key custody). The PSK is zeroized on destruction (`Zeroizing<[u8; 32]>`).
 
 ## 3.8 DID Resolution Security
 
@@ -278,6 +692,18 @@ The full resolution sequence:
 ```
 
 The relay query in step 3a targets relays in priority order: the identity's own relays (from a previously cached DID document), then bootstrap relays. If the resolver has no prior knowledge of the identity's relays, only bootstrap relays are queried for the relay layer — the DHT layer provides the backup.
+
+**Cancellation and contradiction semantics:**
+
+The parallel query model (step 3) requires clear rules for when queries are cancelled, how contradictions are resolved, and what happens on failure:
+
+- **First-response optimization.** When the first valid response arrives, the resolver SHOULD continue waiting for the second layer's response for up to 2 seconds (not cancel immediately). This allows the resolver to detect stale documents: if both layers return valid documents, the higher sequence number is authoritative (step 5). Cancelling the slower query immediately would miss a fresher document on the slower layer.
+- **Both layers succeed, same sequence number.** The documents MUST be byte-identical (same key signs both, same content). If they differ despite identical sequence numbers, this indicates a bug in the publishing implementation. The resolver MUST log a warning and accept either document (they should be identical; if not, neither is more authoritative).
+- **Both layers succeed, different sequence numbers.** The higher sequence number is authoritative. The resolver MAY re-publish the fresher document to the layer that returned the stale one (protocol-level healing, §3.10.7).
+- **One layer fails, one succeeds.** The successful response is accepted. The failed layer's error is logged but does not prevent resolution. The resolver does NOT retry the failed layer synchronously — the next resolution cycle (24h for active contacts, 7d for inactive) will attempt both layers again.
+- **Both layers fail.** If a cached document exists and is less than 7 days old, the cached document is returned with a `resolution_source: "cache"` indicator. If no cache exists or the cache is older than 7 days, resolution fails with error `DID_RESOLUTION_FAILED` (code 5010). The resolver MUST NOT fabricate a document.
+- **One layer returns invalid signature.** The response is discarded as if the layer had failed. An invalid signature is logged at WARN level (it may indicate relay tampering). The resolver does not fall back to the invalid document under any circumstances.
+- **Timeout.** Each layer query has a 5-second timeout. If a layer does not respond within 5 seconds, it is treated as a failure for that resolution attempt.
 
 ### 3.10.5 Publishing Protocol
 

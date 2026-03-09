@@ -553,9 +553,9 @@ where
         .check_and_record(&token.payload.nnc, token.payload.exp)?;
 
     // Step 10: Revocation — verify token CID not revoked.
-    // Uses the content-hash revocation CID (SHA-256 of the payload) to match
+    // Uses the revocation CID (SHA-256 of the raw encoded JWT) to match
     // the format used by revoke_ucan.
-    let revocation_cid = compute_revocation_cid(&token.payload);
+    let revocation_cid = compute_revocation_cid(&token.encoded);
     if ctx.revocation_checker.is_revoked(&revocation_cid) {
         return Err(UcanError::TokenRevoked(revocation_cid));
     }
@@ -909,7 +909,7 @@ fn verify_chain_recursive(
         verify_expiry(&parent, clock_skew_tolerance_secs)?;
 
         // Verify parent token has not been revoked (spec 7.2).
-        let parent_revocation_cid = compute_revocation_cid(&parent.payload);
+        let parent_revocation_cid = compute_revocation_cid(&parent.encoded);
         if revocation_checker.is_revoked(&parent_revocation_cid) {
             return Err(UcanError::TokenRevoked(parent_revocation_cid));
         }
@@ -1167,6 +1167,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -1213,6 +1214,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let mut token = mint_ucan(&params, &custody).await.unwrap();
@@ -1285,6 +1287,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_creator,
         )
@@ -1308,6 +1311,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_delegator,
         )
@@ -1374,6 +1378,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_creator,
         )
@@ -1397,6 +1402,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_b,
         )
@@ -1455,6 +1461,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody,
         )
@@ -1511,6 +1518,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -1572,6 +1580,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_non_creator,
         )
@@ -1595,6 +1604,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_delegator,
         )
@@ -1659,6 +1669,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -1713,6 +1724,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -1764,6 +1776,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -1828,6 +1841,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_creator,
         )
@@ -1851,6 +1865,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_delegator,
         )
@@ -1914,6 +1929,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -1971,6 +1987,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -2036,6 +2053,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -2046,11 +2064,12 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
 
-        // Add the token's revocation CID (content hash) to the revocation list.
+        // Add the token's revocation CID (SHA-256 of raw encoded JWT) to the
+        // revocation list.
         let mut revocation_checker = InMemoryRevocationChecker::new();
         revocation_checker
             .revoked
-            .insert(compute_revocation_cid(&token.payload));
+            .insert(compute_revocation_cid(&token.encoded));
 
         let proof_resolver = InMemoryProofResolver::new();
         let ceiling = default_ceiling();
@@ -2090,10 +2109,11 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
-        let revocation_cid = compute_revocation_cid(&token.payload);
+        let revocation_cid = compute_revocation_cid(&token.encoded);
 
         let resolver = InMemoryDidResolver {
             keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
@@ -2101,7 +2121,7 @@ mod tests {
         };
         let mut nonce_tracker = InMemoryNonceTracker::new();
 
-        // Revoke using content-hash CID (SHA-256 of payload).
+        // Revoke using content-hash CID (SHA-256 of raw encoded JWT).
         let mut revocation_checker = InMemoryRevocationChecker::new();
         revocation_checker.revoked.insert(revocation_cid.clone());
 
@@ -2147,6 +2167,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -2416,6 +2437,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let minted = mint_ucan(&params, &custody).await.unwrap();
@@ -2472,6 +2494,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -2530,6 +2553,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_creator,
         )
@@ -2559,6 +2583,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_delegator,
         )
@@ -2767,6 +2792,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             custody,
         )
@@ -2888,6 +2914,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_a,
         )
@@ -2909,6 +2936,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_b,
         )
@@ -3427,6 +3455,7 @@ mod tests {
             facts: None,
             key_scope: Some("#active".to_owned()),
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -3491,6 +3520,7 @@ mod tests {
             facts: None,
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -3559,6 +3589,7 @@ mod tests {
             facts: None,
             key_scope: Some("#agent".to_owned()), // Says #agent
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -3627,6 +3658,7 @@ mod tests {
             facts: None,
             key_scope: Some("#active".to_owned()),
             signing_key_id: None,
+            ceiling: None,
         };
 
         let base_token = mint_ucan(&base_params, &custody).await.unwrap();
@@ -3720,6 +3752,7 @@ mod tests {
             facts: None,
             key_scope: None, // No key scope: legacy token
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -3779,6 +3812,7 @@ mod tests {
             facts: None,
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -3952,6 +3986,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
         let child_token = mint_ucan(&child_params, &custody_creator).await.unwrap();
 
@@ -4104,6 +4139,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
         let child_token = mint_ucan(&child_params, &custody_delegator).await.unwrap();
 
@@ -4211,6 +4247,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
         let child_token = mint_ucan(&child_params, &custody_delegator).await.unwrap();
 

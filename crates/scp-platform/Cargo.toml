@@ -13,6 +13,7 @@ software_platform = [
     "dep:rand",
     "dep:hmac",
     "dep:sha2",
+    "dep:hkdf",
     "dep:uuid",
 ]
 # In-memory platform adapters for testing and development (ADR-006).
@@ -25,6 +26,9 @@ testing = ["software_platform"]
 apple = ["dep:rusqlite", "dep:hex"]
 # SQLite storage adapter with SQLCipher encryption (spec section 17.6).
 sqlite = ["dep:rusqlite", "dep:hex"]
+# Encrypted file-backed key custody (Argon2id + AES-256-GCM).
+# Universal fallback for non-HSM platforms. See GitHub issue #391.
+file = ["software_platform", "dep:aes-gcm", "dep:argon2"]
 # Filesystem storage adapter (spec section 17.6).
 filesystem = []
 # SyncableStorage wrapper for P2P state synchronization (SCP-PERSIST-064).
@@ -40,10 +44,15 @@ zeroize = { workspace = true }
 # sync dependencies, gated behind the `sync` feature flag.
 rmp-serde = { workspace = true, optional = true }
 
+# file dependencies, gated behind the `file` feature flag.
+aes-gcm = { workspace = true, optional = true }
+argon2 = { workspace = true, optional = true }
+
 # software_platform dependencies, gated behind the `software_platform` feature flag.
 ed25519-dalek = { workspace = true, optional = true }
 x25519-dalek = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
+hkdf = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }

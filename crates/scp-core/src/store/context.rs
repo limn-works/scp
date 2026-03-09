@@ -14,6 +14,7 @@
 
 use std::collections::HashSet;
 
+use hex;
 use scp_platform::traits::Storage;
 use zeroize::Zeroize;
 
@@ -133,12 +134,99 @@ fn full_snapshot_key(context_id: &str) -> Result<String, super::StoreError> {
     Ok(format!("context/{ctx}/full_snapshot"))
 }
 
+/// Builds the storage key for ephemeral context durable metadata.
+///
+/// Format: `context/{context_id}/ephemeral_metadata`
+/// See spec section 5.11 — durable metadata persists after ephemeral close.
+fn ephemeral_metadata_key(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/ephemeral_metadata"))
+}
+
 /// Builds the prefix for all keys belonging to a context.
 ///
 /// Format: `context/{context_id}/`
 fn context_prefix(context_id: &str) -> Result<String, super::StoreError> {
     let ctx = super::sanitize_key_component(context_id)?;
     Ok(format!("context/{ctx}/"))
+}
+
+// ---------------------------------------------------------------------------
+// Governance persistence key helpers (ADR-031 §8)
+// ---------------------------------------------------------------------------
+
+/// Builds the storage key for a context's governance configuration.
+///
+/// Format: `context/{context_id}/governance/config`
+/// See ADR-031 §4.
+///
+/// # Errors
+///
+/// Returns [`StoreError::InvalidKey`](super::StoreError::InvalidKey) if `context_id`
+/// contains invalid key characters.
+pub fn governance_config_key(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/governance/config"))
+}
+
+/// Builds the storage key for a specific governance proposal.
+///
+/// Format: `context/{context_id}/governance/proposal/{proposal_id_hex}`
+/// See ADR-031 §8.
+///
+/// # Errors
+///
+/// Returns [`StoreError::InvalidKey`](super::StoreError::InvalidKey) if `context_id`
+/// contains invalid key characters.
+pub fn governance_proposal_key(
+    context_id: &str,
+    proposal_id: &[u8; 32],
+) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    let pid_hex = hex::encode(proposal_id);
+    Ok(format!("context/{ctx}/governance/proposal/{pid_hex}"))
+}
+
+/// Builds the storage key for the pending proposal index.
+///
+/// Format: `context/{context_id}/governance/proposal_index/pending`
+/// See ADR-031 §8.
+///
+/// # Errors
+///
+/// Returns [`StoreError::InvalidKey`](super::StoreError::InvalidKey) if `context_id`
+/// contains invalid key characters.
+pub fn governance_pending_index_key(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/governance/proposal_index/pending"))
+}
+
+/// Builds the storage key for the resolved proposal index.
+///
+/// Format: `context/{context_id}/governance/proposal_index/resolved`
+/// See ADR-031 §8.
+///
+/// # Errors
+///
+/// Returns [`StoreError::InvalidKey`](super::StoreError::InvalidKey) if `context_id`
+/// contains invalid key characters.
+pub fn governance_resolved_index_key(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/governance/proposal_index/resolved"))
+}
+
+/// Builds the storage key for governance deadlock state.
+///
+/// Format: `context/{context_id}/governance/deadlock_state`
+/// See ADR-031 §10.
+///
+/// # Errors
+///
+/// Returns [`StoreError::InvalidKey`](super::StoreError::InvalidKey) if `context_id`
+/// contains invalid key characters.
+pub fn governance_deadlock_state_key(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/governance/deadlock_state"))
 }
 
 // ---------------------------------------------------------------------------
@@ -644,6 +732,42 @@ impl<S: Storage> ProtocolStore<S> {
         author_did: &str,
     ) -> Result<Option<HashSet<String>>, StoreError> {
         let key = broadcast_block_key(context_id, author_did)?;
+        self.load_value(&key).await
+    }
+
+    /// Stores durable metadata for an ephemeral context after close.
+    ///
+    /// Per spec §5.11, durable metadata (participants, creation time,
+    /// purpose, participation counts) persists after ephemeral close even
+    /// though content and keys are destroyed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
+    pub async fn store_ephemeral_metadata(
+        &self,
+        context_id: &str,
+        metadata: &crate::context::memory_scope::EphemeralContextMetadata,
+    ) -> Result<(), StoreError> {
+        let key = ephemeral_metadata_key(context_id)?;
+        self.store_value(&key, metadata).await
+    }
+
+    /// Loads durable metadata for an ephemeral context.
+    ///
+    /// Returns `None` if no ephemeral metadata has been stored for this
+    /// context (either the context is not ephemeral or has not been closed).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
+    /// Returns [`StoreError::Storage`] if the underlying storage read fails.
+    pub async fn load_ephemeral_metadata(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<crate::context::memory_scope::EphemeralContextMetadata>, StoreError> {
+        let key = ephemeral_metadata_key(context_id)?;
         self.load_value(&key).await
     }
 }
@@ -1229,6 +1353,7 @@ mod tests {
                 author_did: "did:dht:z6MkAuthor1".to_owned(),
                 broadcast_key: generate_sender_key(),
                 epoch: 3,
+                next_sequence: 1,
                 block_list,
             },
         );
@@ -1376,10 +1501,17 @@ mod tests {
             ttl_remaining_secs: Some(300),
             registered_tools: Vec::new(),
             write_revoked_members: std::collections::HashSet::new(),
+            read_revoked_members: std::collections::HashSet::new(),
+            read_exclusion_list: std::collections::HashSet::new(),
             tool_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
             pruning_policy: None,
+            governance_model_config: None,
+            economic_policy: None,
+            approved_proposals: std::collections::HashMap::new(),
+            governance_freeze: None,
+            pending_ceiling_modification: None,
         }
     }
 

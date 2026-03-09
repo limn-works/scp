@@ -11,10 +11,18 @@ name = "scp-relay"
 path = "src/main.rs"
 
 [dependencies]
-scp-transport = { path = "../scp-transport" }
+scp-transport = { path = "../scp-transport", features = [
+    "sqlite-blob",
+    "redb-blob",
+    "postgres-blob",
+    "s3-blob",
+] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

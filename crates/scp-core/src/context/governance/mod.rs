@@ -46,9 +46,11 @@
 pub mod majority;
 pub mod mls_integration;
 pub mod multisig;
+pub mod timeout;
 pub mod unanimity;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
@@ -57,8 +59,24 @@ use sha2::{Digest, Sha256};
 use super::params::{Capability, ContextParams, ToolRegistration};
 use super::roles::ToolId;
 use super::tools::interface::ToolInterface;
+use crate::economy::types::{Amount, EconomicPolicy};
 use scp_event_log::{ContextId, Ed25519Signature};
 use scp_identity::DID;
+
+// ---------------------------------------------------------------------------
+// KeyResolver
+// ---------------------------------------------------------------------------
+
+/// Resolves a voter's DID to their Ed25519 verifying key.
+///
+/// Governance engines use this to verify vote signatures against the voter's
+/// actual public key (derived from their DID), rather than trusting the
+/// signing key provided by the caller. This prevents forged votes where an
+/// attacker supplies a valid DID but signs with a different key.
+///
+/// Returns `None` if the DID cannot be resolved (e.g., non-did:dht method
+/// with no fallback, or unknown DID).
+pub type KeyResolver = Arc<dyn Fn(&DID) -> Option<ed25519_dalek::VerifyingKey> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // ProposalId
@@ -344,6 +362,56 @@ pub struct CheckpointSchedule {
     pub min_events_since_last: u64,
 }
 
+// ---------------------------------------------------------------------------
+// Checkpoint cosignature types (ADR-031 §9)
+// ---------------------------------------------------------------------------
+
+/// A cosigned checkpoint from a governance quorum member (ADR-031 §9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CosignedCheckpoint {
+    /// The DID of the signer.
+    pub signer_did: DID,
+    /// Ed25519 signature over the checkpoint hash (64 bytes).
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+}
+
+/// Attestation status for a checkpoint (ADR-031 §9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CheckpointAttestationStatus {
+    /// Checkpoint has full governance quorum cosignatures.
+    FullyAttested,
+    /// Checkpoint valid with creator's signature only (insufficient cosignatures).
+    PartiallyAttested,
+}
+
+/// Context checkpoint with governance cosignatures (ADR-031 §9, ADR-030 §1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCheckpoint {
+    /// Sequence number in the event log.
+    pub checkpoint_seq: u64,
+    /// Merkle root at this sequence number.
+    pub merkle_root: [u8; 32],
+    /// Number of events included in this checkpoint.
+    pub event_count: u64,
+    /// Hash of the last event before this checkpoint.
+    pub last_event_hash: [u8; 32],
+    /// Deterministic hash of the context state snapshot.
+    pub state_snapshot_hash: [u8; 32],
+    /// Timestamp when checkpoint was created.
+    pub created_at: u64,
+    /// Creator's DID and signature.
+    pub creator_did: DID,
+    /// Creator's Ed25519 signature over checkpoint data (64 bytes).
+    #[serde(with = "serde_bytes")]
+    pub creator_signature: Vec<u8>,
+    /// Governance quorum cosignatures (ADR-031 §9).
+    /// Empty for `SingleAdmin` contexts, populated for multi-admin contexts.
+    pub cosignatures: Vec<CosignedCheckpoint>,
+    /// Attestation status based on cosignature quorum.
+    pub attestation_status: CheckpointAttestationStatus,
+}
+
 /// Pruning policy for a context's event log (ADR-030 §6).
 ///
 /// Set at context creation or modified via governance. Included in
@@ -457,7 +525,7 @@ pub enum GovernanceAction {
     /// Change a member's role.
     ChangeRole { did: DID, new_role: String },
     /// Register a new tool in the context.
-    RegisterTool { registration: ToolRegistration },
+    RegisterTool { registration: Box<ToolRegistration> },
     /// Remove a tool from the context.
     RemoveTool { tool_id: ToolId },
     /// Modify the capability ceiling (only if `ceiling_policy` is `Governed`).
@@ -597,6 +665,33 @@ pub enum GovernanceAction {
         /// Justification for the deadlock recovery.
         justification: DeadlockJustification,
     },
+    /// Set or update the context's economic policy (§19.3, ADR-033).
+    ///
+    /// Requires the economic policy to not be locked. If the new policy has
+    /// `locked: true`, the policy becomes immutable after this action.
+    SetEconomicPolicy {
+        /// The new economic policy to apply.
+        policy: EconomicPolicy,
+    },
+    /// Approve a spending authorization for a member (§19.5, ADR-033).
+    ///
+    /// Grants the specified member permission to spend up to `amount` in the
+    /// context's currency. The `purpose` field documents the reason for the
+    /// spend authorization.
+    ApproveSpend {
+        /// The DID of the member authorized to spend.
+        spender: DID,
+        /// The maximum amount authorized.
+        amount: Amount,
+        /// Human-readable purpose for the spending authorization.
+        purpose: String,
+    },
+    /// Lock the context's economic policy, making it immutable (§19.3).
+    ///
+    /// Once locked, the economic policy cannot be changed through governance.
+    /// The lock is itself immutable: once set, it cannot be reverted.
+    /// Requires an economic policy to already be set on the context.
+    LockEconomicPolicy,
 }
 
 // ---------------------------------------------------------------------------
@@ -710,6 +805,13 @@ pub struct GovernanceProposal {
     /// The governance action being proposed.
     pub action: GovernanceAction,
     /// Current lifecycle status.
+    ///
+    /// **Invariant:** When `status` is [`ProposalStatus::Approved`], all vote
+    /// signatures in [`approvals`](Self::approvals) have been cryptographically
+    /// verified against the voter's DID-resolved public key via the engine's
+    /// [`KeyResolver`]. Code that receives an `Approved` proposal can trust
+    /// that every approval vote is authentic — no further signature checks
+    /// are needed.
     pub status: ProposalStatus,
     /// Unix timestamp (seconds) when the proposal was created.
     pub created_at: u64,
@@ -734,9 +836,9 @@ pub struct GovernanceProposal {
 /// Included in context metadata (spec section 5.7) -- visible before opt-in.
 /// Changing the governance model requires creating a new context.
 ///
-/// Note: `PartialEq` only (not `Eq`) because `Majority::min_participation`
-/// is `f64`, which does not implement `Eq`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Uses `u32` basis points for `min_participation_bps` (ADR-031) so this
+/// type derives `Eq`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum GovernanceModelConfig {
     /// Single admin holds all governance authority. Phase 2 baseline.
     /// The creator is the initial (and only) admin. Admin transfer is
@@ -759,8 +861,9 @@ pub enum GovernanceModelConfig {
     Majority {
         /// Voting window in seconds. Default: `86_400` (24 hours).
         voting_window_secs: u64,
-        /// Minimum participation threshold as a fraction (0.0 to 1.0).
-        min_participation: f64,
+        /// Minimum participation in basis points (1–10000, where 10000 = 100%).
+        /// Default: `5000` (50%). Per ADR-031.
+        min_participation_bps: u32,
     },
 
     /// Unanimity among all context members holding `GovernanceVote`
@@ -857,6 +960,29 @@ pub enum GovernanceError {
     /// Vote signature verification failed.
     #[error("vote verification failed: {0}")]
     VerificationFailed(String),
+
+    /// A vote signature failed cryptographic verification against the voter's
+    /// DID-resolved public key.
+    ///
+    /// This means the signature was not produced by the key associated with
+    /// the claimed voter DID — the vote is forged or corrupted.
+    #[error("invalid vote signature: voter {voter_did} on proposal {proposal_id}")]
+    InvalidSignature {
+        /// The DID of the voter whose signature failed verification.
+        voter_did: String,
+        /// Hex-encoded proposal ID the vote was for.
+        proposal_id: String,
+    },
+
+    /// The voter's DID could not be resolved to a public key.
+    ///
+    /// The key resolver returned `None` for this DID, meaning the voter's
+    /// identity cannot be verified. The vote is rejected.
+    #[error("unknown voter: cannot resolve public key for DID {did}")]
+    UnknownVoter {
+        /// The unresolvable DID.
+        did: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -873,7 +999,7 @@ pub enum GovernanceEvent {
     ProposalCreated {
         proposal_id: ProposalId,
         proposer_did: DID,
-        action: GovernanceAction,
+        action: Box<GovernanceAction>,
         voting_deadline: u64,
     },
     /// A vote was cast on a proposal.
@@ -891,6 +1017,31 @@ pub enum GovernanceEvent {
     ProposalResolved {
         proposal_id: ProposalId,
         status: ProposalStatus,
+    },
+    /// Deadlock recovery was triggered (ADR-031 §10).
+    ///
+    /// Logged when a `ReconfigureGovernance` proposal is approved via
+    /// fallback quorum (majority-of-active). Records the justification
+    /// and the governance parameter changes applied.
+    DeadlockRecovery {
+        justification: DeadlockJustification,
+        changes: Vec<GovernanceReconfigAction>,
+    },
+    /// A simultaneous governance conflict was detected (ADR-031 §7).
+    ///
+    /// Logged when two conflicting proposals land at the same event log
+    /// sequence, triggering a governance freeze state.
+    ConflictDetected {
+        proposal_a: ProposalId,
+        proposal_b: ProposalId,
+    },
+    /// A governance conflict was resolved (ADR-031 §7).
+    ///
+    /// Logged when a sequential conflict is resolved (lower sequence wins)
+    /// or when a `ResolveConflict` action is executed.
+    ConflictResolved {
+        winner_id: ProposalId,
+        loser_id: ProposalId,
     },
 }
 
@@ -1029,6 +1180,100 @@ pub trait GovernanceEngine: Send + Sync {
 
     /// Look up a proposal by ID. Returns `None` if not found.
     fn get_proposal(&self, proposal_id: &ProposalId) -> Option<&GovernanceProposal>;
+
+    /// List all proposals tracked by this engine (pending and resolved).
+    ///
+    /// Returns cloned proposals. Engines only track proposals in memory;
+    /// for durable access, proposals should be queried from the event log.
+    fn list_proposals(&self) -> Vec<GovernanceProposal>;
+
+    /// Return the IDs of all pending proposals.
+    ///
+    /// Used by the governance timeout task to find proposals that may need
+    /// timeout processing.
+    fn pending_proposal_ids(&self) -> Vec<ProposalId>;
+
+    /// Remove a voter's vote from a pending proposal due to departure.
+    ///
+    /// When an eligible voter leaves the context, their vote is removed from
+    /// the tally. This may change the resolution (ADR-031 §5). Returns the
+    /// updated status and any events produced by automatic resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GovernanceError`] if the proposal cannot be found or
+    /// the voter state is invalid.
+    ///
+    /// # Default implementation
+    ///
+    /// Returns `Ok(None)` for engines that do not support voter departure
+    /// handling (e.g., `SingleAdminEngine`).
+    fn remove_departed_voter(
+        &mut self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        context: &GovernanceContext,
+    ) -> Result<(Option<ProposalStatus>, Vec<GovernanceEvent>), GovernanceError> {
+        let _ = (proposal_id, voter, context);
+        Ok((None, Vec::new()))
+    }
+
+    /// Invalidate a pending proposal.
+    ///
+    /// Used for proposer departure and epoch reset scenarios (ADR-031 §5).
+    /// Transitions a `Pending` proposal to `Invalidated` with the given reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GovernanceError`] if the proposal cannot be found or is
+    /// not in `Pending` status.
+    fn invalidate_proposal(
+        &mut self,
+        proposal_id: &ProposalId,
+        reason: String,
+    ) -> Result<Vec<GovernanceEvent>, GovernanceError>;
+
+    /// Get checkpoint cosignature requirements for this governance model (ADR-031 §9).
+    ///
+    /// Returns the set of DIDs that must cosign checkpoints and the minimum
+    /// number of cosignatures required for full attestation.
+    ///
+    /// # Returns
+    ///
+    /// Returns `(required_signers, minimum_count)`:
+    /// - `required_signers`: Vec of DIDs eligible to cosign checkpoints
+    /// - `minimum_count`: Minimum cosignatures needed for `FullyAttested` status
+    ///
+    /// For `SingleAdmin`: returns `(vec![], 0)` (no cosignatures required)
+    /// For Threshold: returns `(signers, threshold)`
+    /// For Majority: returns `(eligible_voters, ceil(voters * 0.5) + 1)`
+    /// For Unanimity: returns `(eligible_voters, eligible_voters.len())`
+    fn checkpoint_cosignature_requirements(&self) -> (Vec<DID>, usize);
+
+    /// Validate a checkpoint cosignature collection (ADR-031 §9).
+    ///
+    /// Verifies that cosignatures meet this governance model's requirements.
+    /// Returns the appropriate attestation status.
+    ///
+    /// # Parameters
+    ///
+    /// - `cosignatures`: Collected cosignatures for the checkpoint
+    /// - `checkpoint_hash`: The checkpoint hash that was signed
+    ///
+    /// # Returns
+    ///
+    /// Returns `CheckpointAttestationStatus`:
+    /// - `FullyAttested`: Required cosignature quorum reached
+    /// - `PartiallyAttested`: Insufficient cosignatures but creator signature valid
+    ///
+    /// # Errors
+    ///
+    /// Returns `GovernanceError` if signature verification fails or invalid signers.
+    fn validate_checkpoint_cosignatures(
+        &self,
+        cosignatures: &[CosignedCheckpoint],
+        checkpoint_hash: &[u8; 32],
+    ) -> Result<CheckpointAttestationStatus, GovernanceError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,17 +1293,22 @@ pub struct SingleAdminEngine {
     admin_did: DID,
     /// Active and resolved proposals, keyed by proposal ID.
     proposals: HashMap<ProposalId, GovernanceProposal>,
+    /// Resolves voter DIDs to their Ed25519 verifying keys for signature
+    /// verification.
+    key_resolver: KeyResolver,
 }
 
 impl SingleAdminEngine {
     /// Creates a new single-admin governance engine.
     ///
-    /// The provided DID is the sole governance authority.
+    /// The provided DID is the sole governance authority. The `key_resolver`
+    /// maps DIDs to Ed25519 verifying keys for vote signature verification.
     #[must_use]
-    pub fn new(admin_did: DID) -> Self {
+    pub fn new(admin_did: DID, key_resolver: KeyResolver) -> Self {
         Self {
             admin_did,
             proposals: HashMap::new(),
+            key_resolver,
         }
     }
 
@@ -1112,8 +1362,17 @@ impl GovernanceEngine for SingleAdminEngine {
             signing_key,
         )?;
 
-        // Defense-in-depth: verify the admin's vote signature before accepting it.
-        verify_vote(&proposal_id, &admin_vote, &signing_key.verifying_key())?;
+        // Verify the admin's vote signature against their DID-resolved key.
+        let resolved_key =
+            (self.key_resolver)(proposer).ok_or_else(|| GovernanceError::UnknownVoter {
+                did: proposer.to_string(),
+            })?;
+        verify_vote(&proposal_id, &admin_vote, &resolved_key).map_err(|_| {
+            GovernanceError::InvalidSignature {
+                voter_did: proposer.to_string(),
+                proposal_id: hex::encode(proposal_id),
+            }
+        })?;
 
         // In single-admin mode, the proposal is immediately approved.
         let proposal = GovernanceProposal {
@@ -1133,7 +1392,7 @@ impl GovernanceEngine for SingleAdminEngine {
             GovernanceEvent::ProposalCreated {
                 proposal_id,
                 proposer_did: proposer.clone(),
-                action,
+                action: Box::new(action),
                 voting_deadline: context.now,
             },
             GovernanceEvent::VoteCast {
@@ -1215,6 +1474,170 @@ impl GovernanceEngine for SingleAdminEngine {
     fn get_proposal(&self, proposal_id: &ProposalId) -> Option<&GovernanceProposal> {
         self.proposals.get(proposal_id)
     }
+
+    fn list_proposals(&self) -> Vec<GovernanceProposal> {
+        self.proposals.values().cloned().collect()
+    }
+
+    fn pending_proposal_ids(&self) -> Vec<ProposalId> {
+        self.proposals
+            .iter()
+            .filter(|(_, p)| p.status.is_pending())
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    fn invalidate_proposal(
+        &mut self,
+        proposal_id: &ProposalId,
+        reason: String,
+    ) -> Result<Vec<GovernanceEvent>, GovernanceError> {
+        let proposal = self.proposals.get_mut(proposal_id).ok_or_else(|| {
+            GovernanceError::ProposalNotFound {
+                id: hex::encode(proposal_id),
+            }
+        })?;
+        if !proposal.status.is_pending() {
+            return Err(GovernanceError::ProposalNotPending {
+                status: format!("{:?}", proposal.status),
+            });
+        }
+        proposal.status = ProposalStatus::Invalidated {
+            reason: reason.clone(),
+        };
+        Ok(vec![GovernanceEvent::ProposalResolved {
+            proposal_id: *proposal_id,
+            status: ProposalStatus::Invalidated { reason },
+        }])
+    }
+
+    fn checkpoint_cosignature_requirements(&self) -> (Vec<DID>, usize) {
+        // SingleAdmin: admin signature only, no cosignatures required (ADR-031 §9)
+        (Vec::new(), 0)
+    }
+
+    fn validate_checkpoint_cosignatures(
+        &self,
+        cosignatures: &[CosignedCheckpoint],
+        _checkpoint_hash: &[u8; 32],
+    ) -> Result<CheckpointAttestationStatus, GovernanceError> {
+        // SingleAdmin: cosignatures should be empty, always FullyAttested with admin signature
+        if cosignatures.is_empty() {
+            Ok(CheckpointAttestationStatus::FullyAttested)
+        } else {
+            Err(GovernanceError::NotEligible(format!(
+                "SingleAdmin checkpoints must have empty cosignatures, found {}",
+                cosignatures.len()
+            )))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Conflict Detection
+// ---------------------------------------------------------------------------
+
+/// Detects if two governance actions conflict with each other (ADR-031 §7).
+///
+/// Two approved proposals are considered conflicting if they cannot both be
+/// executed without creating an inconsistent context state. This function
+/// implements the conflict detection rules from ADR-031 section 7.
+///
+/// # Conflict types detected:
+/// - Mutual `RemoveMember` proposals (each targeting the other's proposer)
+/// - Competing `ChangeRole` proposals for the same DID with different roles
+/// - Competing `ModifyCeiling` proposals with different ceiling sets
+/// - `RemoveMember` + `ChangeRole` for the same DID
+/// - `RevokeReadAccess` + `RestoreReadAccess` for the same DID
+/// - `RevokeWriteAccess` + `RestoreWriteAccess` for the same DID
+/// - Multiple `RevokeReadAccess` for same DID with different scopes
+/// - Multiple `RevokeWriteAccess` for same DID with different scopes
+///
+/// # Arguments
+/// * `action_a` - The first governance action
+/// * `proposer_a` - The DID of the proposer of `action_a`
+/// * `action_b` - The second governance action
+/// * `proposer_b` - The DID of the proposer of `action_b`
+///
+/// # Returns
+/// `true` if the actions conflict, `false` otherwise.
+#[must_use]
+pub fn actions_conflict(
+    action_a: &GovernanceAction,
+    proposer_a: &DID,
+    action_b: &GovernanceAction,
+    proposer_b: &DID,
+) -> bool {
+    use GovernanceAction::{
+        ChangeRole, ModifyCeiling, RemoveMember, RestoreReadAccess, RestoreWriteAccess,
+        RevokeReadAccess, RevokeWriteAccess,
+    };
+
+    match (action_a, action_b) {
+        // Mutual RemoveMember (each targeting the other's proposer)
+        (RemoveMember { did: target_a, .. }, RemoveMember { did: target_b, .. }) => {
+            target_a == proposer_b && target_b == proposer_a
+        }
+
+        // Competing ChangeRole proposals for the same DID with different roles
+        (
+            ChangeRole {
+                did: did_a,
+                new_role: role_a,
+            },
+            ChangeRole {
+                did: did_b,
+                new_role: role_b,
+            },
+        ) => did_a == did_b && role_a != role_b,
+
+        // Competing ModifyCeiling proposals with different ceiling sets
+        (
+            ModifyCeiling {
+                new_ceiling: ceiling_a,
+            },
+            ModifyCeiling {
+                new_ceiling: ceiling_b,
+            },
+        ) => ceiling_a != ceiling_b,
+
+        // RemoveMember + ChangeRole for the same DID
+        (RemoveMember { did: did_a, .. }, ChangeRole { did: did_b, .. })
+        | (ChangeRole { did: did_a, .. }, RemoveMember { did: did_b, .. })
+        // RevokeReadAccess + RestoreReadAccess for the same DID (mutually contradictory)
+        | (RevokeReadAccess { did: did_a, .. }, RestoreReadAccess { did: did_b })
+        | (RestoreReadAccess { did: did_a }, RevokeReadAccess { did: did_b, .. })
+        // RevokeWriteAccess + RestoreWriteAccess for the same DID (mutually contradictory)
+        | (RevokeWriteAccess { did: did_a, .. }, RestoreWriteAccess { did: did_b })
+        | (RestoreWriteAccess { did: did_a }, RevokeWriteAccess { did: did_b, .. }) => {
+            did_a == did_b
+        }
+
+        // Two RevokeReadAccess or RevokeWriteAccess for same DID with different scopes
+        (
+            RevokeReadAccess {
+                did: did_a,
+                scope: scope_a,
+            },
+            RevokeReadAccess {
+                did: did_b,
+                scope: scope_b,
+            },
+        )
+        | (
+            RevokeWriteAccess {
+                did: did_a,
+                scope: scope_a,
+            },
+            RevokeWriteAccess {
+                did: did_b,
+                scope: scope_b,
+            },
+        ) => did_a == did_b && scope_a != scope_b,
+
+        // All other combinations are not conflicting
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1222,8 +1645,16 @@ impl GovernanceEngine for SingleAdminEngine {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::doc_markdown
+)]
 mod tests {
+    use super::majority::MajorityVoteEngine;
+    use super::multisig::ThresholdEngine;
+    use super::unanimity::UnanimityEngine;
     use super::*;
 
     fn alice() -> DID {
@@ -1250,6 +1681,35 @@ mod tests {
     /// [`test_signing_key`]) for multi-party test scenarios.
     fn test_signing_key_2() -> ed25519_dalek::SigningKey {
         ed25519_dalek::SigningKey::from_bytes(&[2u8; 32])
+    }
+
+    /// Returns the signing key for the given seed byte (deterministic).
+    fn sk_for(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// Signs `data` with the signing key seeded by `seed` and returns the
+    /// signature bytes as a `Vec<u8>`.
+    fn sign_with(seed: u8, data: &[u8]) -> Vec<u8> {
+        use ed25519_dalek::Signer;
+        sk_for(seed).sign(data).to_bytes().to_vec()
+    }
+
+    /// Mock key resolver that maps test DIDs to their corresponding signing
+    /// key's verifying key. Alice -> [1u8;32], Bob -> [2u8;32], etc.
+    fn mock_resolver() -> KeyResolver {
+        Arc::new(|did: &DID| {
+            let did_str: &str = did.as_ref();
+            match did_str {
+                "did:dht:z6MkAlice" => Some(sk_for(1).verifying_key()),
+                "did:dht:z6MkBob" => Some(sk_for(2).verifying_key()),
+                "did:dht:z6MkCarol" => Some(sk_for(3).verifying_key()),
+                "did:dht:z6MkCharlie" => Some(sk_for(4).verifying_key()),
+                "did:dht:z6MkDavid" => Some(sk_for(5).verifying_key()),
+                "did:dht:z6MkEve" => Some(sk_for(6).verifying_key()),
+                _ => None,
+            }
+        })
     }
 
     fn test_context(admin: &DID) -> GovernanceContext {
@@ -1376,9 +1836,19 @@ mod tests {
     // GovernanceAction serialization
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn governance_action_serialization_roundtrip() {
-        let actions = vec![
+    /// Returns all 28 `GovernanceAction` variants (24 per ADR-031, `BlockAuthor`,
+    /// and 3 economic: `SetEconomicPolicy`, `ApproveSpend`, `LockEconomicPolicy`)
+    /// for serialization testing. Split into two helpers to stay within the
+    /// function line limit.
+    fn all_governance_actions() -> Vec<GovernanceAction> {
+        let mut actions = governance_actions_core();
+        actions.extend(governance_actions_extended());
+        actions
+    }
+
+    /// Core governance actions (membership, tools, settings, access control).
+    fn governance_actions_core() -> Vec<GovernanceAction> {
+        vec![
             GovernanceAction::AddMember {
                 did: bob(),
                 role: "member".to_owned(),
@@ -1392,9 +1862,21 @@ mod tests {
                 new_role: "observer".to_owned(),
             },
             GovernanceAction::RegisterTool {
-                registration: ToolRegistration {
+                registration: Box::new(ToolRegistration {
+                    tool_id: "search".to_owned(),
                     name: "search".to_owned(),
-                },
+                    description: "Search tool".to_owned(),
+                    schema: crate::context::tools::ToolSchema {
+                        input_schema: serde_json::json!({"type": "object"}),
+                        output_schema: serde_json::json!({"type": "object"}),
+                    },
+                    implementation_hash: [0u8; 32],
+                    test_vectors: vec![],
+                    operator_did: "did:dht:z6MkTestOperator".into(),
+                    economic_metadata: None,
+                    registered_at: 0,
+                    signature: Vec::new(),
+                }),
             },
             GovernanceAction::RemoveTool {
                 tool_id: "search".to_owned(),
@@ -1409,16 +1891,115 @@ mod tests {
                 additional_secs: 3600,
             },
             GovernanceAction::TransferAdmin { new_admin: bob() },
+            GovernanceAction::CreateChildContext {
+                params: Box::new(ContextParams::default()),
+            },
             GovernanceAction::BlockAuthor {
                 did: bob(),
                 reason: Some("spam".to_owned()),
             },
-        ];
+            GovernanceAction::RevokeReadAccess {
+                did: bob(),
+                scope: RevocationScope::Full,
+            },
+            GovernanceAction::RestoreReadAccess { did: bob() },
+            GovernanceAction::ModifyPruningPolicy {
+                new_policy: PruningPolicy::default(),
+            },
+        ]
+    }
+
+    /// Extended governance actions (signers, interfaces, structural,
+    /// content access, economic).
+    fn governance_actions_extended() -> Vec<GovernanceAction> {
+        use crate::context::tools::interface::ToolInterface;
+
+        vec![
+            GovernanceAction::AddSigner { did: carol() },
+            GovernanceAction::RemoveSigner { did: carol() },
+            GovernanceAction::ModifyThreshold { new_threshold: 2 },
+            GovernanceAction::EstablishToolInterface {
+                interface: ToolInterface {
+                    source_context: "ctx-src".to_owned(),
+                    target_context: "ctx-tgt".to_owned(),
+                    tool_id: "tool-1".to_owned(),
+                    rate_limit: None,
+                    approved_by_source: true,
+                    approved_by_target: false,
+                },
+            },
+            GovernanceAction::ResetMember {
+                did: bob(),
+                reason: "group state corruption".to_owned(),
+            },
+            GovernanceAction::ResolveConflict {
+                proposal_a: [1u8; 32],
+                proposal_b: [2u8; 32],
+                resolution: ConflictResolution::AcceptProposal {
+                    winner_id: [1u8; 32],
+                },
+            },
+            GovernanceAction::PromoteContext,
+            GovernanceAction::RevokeWriteAccess {
+                did: bob(),
+                scope: RevocationScope::FutureOnly,
+            },
+            GovernanceAction::RestoreWriteAccess { did: bob() },
+            GovernanceAction::RotateContentKeys {
+                reason: Some("periodic hygiene".to_owned()),
+            },
+            GovernanceAction::ReconfigureGovernance {
+                changes: vec![
+                    GovernanceReconfigAction::RemoveInactiveSigner { did: carol() },
+                    GovernanceReconfigAction::ReduceThreshold { new_threshold: 1 },
+                ],
+                justification: DeadlockJustification {
+                    unavailable_dids: vec![carol()],
+                    missed_windows: vec![(carol(), 5)],
+                    detected_at: 1_700_000_000,
+                },
+            },
+            GovernanceAction::SetEconomicPolicy {
+                policy: crate::economy::types::EconomicPolicy {
+                    locked: false,
+                    cost_schedule: crate::economy::types::CostSchedule {
+                        currency: crate::economy::types::CurrencyCode::from("USD"),
+                        per_message: Some(Amount::new(1)),
+                        per_tool_invoke: None,
+                        per_join: None,
+                        per_period: None,
+                        per_byte_stored: None,
+                    },
+                    payment_adapters: vec![],
+                    pricing_formula: None,
+                    payee: DID::from("did:dht:z6MkPayee"),
+                },
+            },
+            GovernanceAction::ApproveSpend {
+                spender: bob(),
+                amount: Amount::new(1000),
+                purpose: "tool costs".to_owned(),
+            },
+            GovernanceAction::LockEconomicPolicy,
+        ]
+    }
+
+    #[test]
+    fn governance_action_serialization_roundtrip() {
+        let actions = all_governance_actions();
+
+        // Verify all 28 variants are covered (24 per ADR-031 + BlockAuthor + 3 economic).
+        assert_eq!(
+            actions.len(),
+            28,
+            "all GovernanceAction variants must be tested"
+        );
 
         for action in &actions {
             let json = serde_json::to_string(action).expect("serialize");
-            // Verify it deserializes without error (round-trip validates serde).
-            let _deserialized: GovernanceAction = serde_json::from_str(&json).expect("deserialize");
+            let deserialized: GovernanceAction = serde_json::from_str(&json).expect("deserialize");
+            let json2 = serde_json::to_string(&deserialized).expect("re-serialize");
+            assert_eq!(json, json2, "round-trip mismatch for action");
         }
     }
 
@@ -1437,7 +2018,7 @@ mod tests {
             },
             GovernanceModelConfig::Majority {
                 voting_window_secs: 86_400,
-                min_participation: 0.5,
+                min_participation_bps: 5000,
             },
             GovernanceModelConfig::Unanimity {
                 voting_window_secs: 172_800,
@@ -1462,10 +2043,10 @@ mod tests {
             GovernanceEvent::ProposalCreated {
                 proposal_id: [1u8; 32],
                 proposer_did: alice(),
-                action: GovernanceAction::AddMember {
+                action: Box::new(GovernanceAction::AddMember {
                     did: bob(),
                     role: "member".to_owned(),
-                },
+                }),
                 voting_deadline: 1_700_000_000,
             },
             GovernanceEvent::VoteCast {
@@ -1492,7 +2073,7 @@ mod tests {
     #[test]
     fn single_admin_propose_auto_approves() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::AddMember {
@@ -1537,7 +2118,7 @@ mod tests {
     #[test]
     fn single_admin_non_admin_cannot_propose() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::AddMember {
@@ -1557,7 +2138,7 @@ mod tests {
     #[test]
     fn single_admin_approve_is_noop_for_admin() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
@@ -1580,7 +2161,7 @@ mod tests {
     #[test]
     fn single_admin_reject_is_noop_for_admin() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
@@ -1602,7 +2183,7 @@ mod tests {
     #[test]
     fn single_admin_non_admin_cannot_approve() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
@@ -1625,7 +2206,7 @@ mod tests {
     #[test]
     fn single_admin_non_admin_cannot_reject() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
@@ -1648,7 +2229,7 @@ mod tests {
     #[test]
     fn single_admin_approve_unknown_proposal() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
         let fake_id = [0u8; 32];
 
@@ -1663,7 +2244,7 @@ mod tests {
     #[test]
     fn single_admin_reject_unknown_proposal() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
         let fake_id = [0u8; 32];
 
@@ -1682,7 +2263,7 @@ mod tests {
     #[test]
     fn single_admin_model_config() {
         let admin = alice();
-        let engine = SingleAdminEngine::new(admin.clone());
+        let engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
 
         let config = engine.model_config();
         assert_eq!(
@@ -1698,7 +2279,7 @@ mod tests {
     #[test]
     fn single_admin_eligible_voters() {
         let admin = alice();
-        let engine = SingleAdminEngine::new(admin.clone());
+        let engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let voters = engine.eligible_voters(&ctx);
@@ -1712,7 +2293,7 @@ mod tests {
     #[test]
     fn single_admin_get_proposal() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::AddMember {
@@ -1731,7 +2312,7 @@ mod tests {
     #[test]
     fn single_admin_get_proposal_not_found() {
         let admin = alice();
-        let engine = SingleAdminEngine::new(admin);
+        let engine = SingleAdminEngine::new(admin, mock_resolver());
         let fake_id = [0u8; 32];
         assert!(engine.get_proposal(&fake_id).is_none());
     }
@@ -1743,7 +2324,7 @@ mod tests {
     #[test]
     fn single_admin_transfer_admin() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         // Propose transfer.
@@ -1781,7 +2362,7 @@ mod tests {
     #[test]
     fn single_admin_distinct_proposal_ids() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
 
         let ctx1 = GovernanceContext {
             context_id: "ctx-1".to_owned(),
@@ -1820,7 +2401,7 @@ mod tests {
     #[test]
     fn single_admin_propose_all_action_variants() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let actions: Vec<GovernanceAction> = vec![
@@ -1837,9 +2418,21 @@ mod tests {
                 new_role: "observer".to_owned(),
             },
             GovernanceAction::RegisterTool {
-                registration: ToolRegistration {
+                registration: Box::new(ToolRegistration {
+                    tool_id: "calc".to_owned(),
                     name: "calc".to_owned(),
-                },
+                    description: "Calculator tool".to_owned(),
+                    schema: crate::context::tools::ToolSchema {
+                        input_schema: serde_json::json!({"type": "object"}),
+                        output_schema: serde_json::json!({"type": "object"}),
+                    },
+                    implementation_hash: [0u8; 32],
+                    test_vectors: vec![],
+                    operator_did: "did:dht:z6MkTestOperator".into(),
+                    economic_metadata: None,
+                    registered_at: 0,
+                    signature: Vec::new(),
+                }),
             },
             GovernanceAction::RemoveTool {
                 tool_id: "calc".to_owned(),
@@ -1857,6 +2450,28 @@ mod tests {
             GovernanceAction::CreateChildContext {
                 params: Box::new(ContextParams::default()),
             },
+            GovernanceAction::SetEconomicPolicy {
+                policy: crate::economy::types::EconomicPolicy {
+                    locked: false,
+                    cost_schedule: crate::economy::types::CostSchedule {
+                        currency: crate::economy::types::CurrencyCode::from("USD"),
+                        per_message: Some(crate::economy::types::Amount::new(1)),
+                        per_tool_invoke: None,
+                        per_join: None,
+                        per_period: None,
+                        per_byte_stored: None,
+                    },
+                    payment_adapters: vec![],
+                    pricing_formula: None,
+                    payee: DID::from("did:dht:z6MkPayee"),
+                },
+            },
+            GovernanceAction::ApproveSpend {
+                spender: bob(),
+                amount: Amount::new(1000),
+                purpose: "tool costs".to_owned(),
+            },
+            GovernanceAction::LockEconomicPolicy,
         ];
 
         let sk = test_signing_key();
@@ -1882,7 +2497,7 @@ mod tests {
     fn governance_engine_is_object_safe() {
         fn assert_object_safe(_: &dyn GovernanceEngine) {}
         let admin = alice();
-        let engine = SingleAdminEngine::new(admin);
+        let engine = SingleAdminEngine::new(admin, mock_resolver());
         assert_object_safe(&engine);
     }
 
@@ -1903,7 +2518,7 @@ mod tests {
     #[test]
     fn proposal_lifecycle_state_machine_single_admin() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         // 1. Propose -> immediately Approved (state: Pending -> Approved).
@@ -2038,7 +2653,7 @@ mod tests {
     #[test]
     fn governance_events_are_serializable_for_merkle_log() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::ChangeRole {
@@ -2068,7 +2683,7 @@ mod tests {
     #[test]
     fn governance_proposal_serialization_roundtrip() {
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::AddMember {
@@ -2300,7 +2915,7 @@ mod tests {
         let sk = test_signing_key();
         let vk = sk.verifying_key();
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
@@ -2323,7 +2938,7 @@ mod tests {
         let sk = test_signing_key();
         let vk = sk.verifying_key();
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
@@ -2338,7 +2953,7 @@ mod tests {
     fn verify_proposal_votes_rejects_tampered_signature() {
         let sk = test_signing_key();
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
@@ -2362,7 +2977,7 @@ mod tests {
     fn verify_proposal_votes_rejects_unknown_voter_key() {
         let sk = test_signing_key();
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
@@ -2383,7 +2998,7 @@ mod tests {
         let sk = test_signing_key();
         let wrong_vk = test_signing_key_2().verifying_key();
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
@@ -2404,7 +3019,7 @@ mod tests {
         let sk = test_signing_key();
         let vk = sk.verifying_key();
         let admin = alice();
-        let mut engine = SingleAdminEngine::new(admin.clone());
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
         let ctx = test_context(&admin);
 
         let action = GovernanceAction::CloseContext { reason: None };
@@ -2431,5 +3046,307 @@ mod tests {
             result.unwrap_err(),
             GovernanceError::VerificationFailed(_)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Economic governance action tests — SingleAdmin (§19.3, ADR-033, #334)
+    // -----------------------------------------------------------------------
+
+    fn test_economic_policy() -> EconomicPolicy {
+        EconomicPolicy {
+            locked: false,
+            cost_schedule: crate::economy::types::CostSchedule {
+                currency: crate::economy::types::CurrencyCode::from("USD"),
+                per_message: Some(Amount::new(10)),
+                per_tool_invoke: Some(Amount::new(50)),
+                per_join: None,
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec!["x402".to_owned()],
+            pricing_formula: None,
+            payee: DID::from("did:dht:z6MkPayee"),
+        }
+    }
+
+    #[test]
+    fn single_admin_set_economic_policy() {
+        let admin = alice();
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
+        let ctx = test_context(&admin);
+        let sk = test_signing_key();
+
+        let action = GovernanceAction::SetEconomicPolicy {
+            policy: test_economic_policy(),
+        };
+
+        let (proposal, events) = engine.propose(&admin, action, &ctx, &sk).unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Approved);
+        assert_eq!(events.len(), 3); // Created, VoteCast, Resolved
+    }
+
+    #[test]
+    fn single_admin_approve_spend() {
+        let admin = alice();
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
+        let ctx = test_context(&admin);
+        let sk = test_signing_key();
+
+        let action = GovernanceAction::ApproveSpend {
+            spender: bob(),
+            amount: Amount::new(5000),
+            purpose: "tool invocation budget".to_owned(),
+        };
+
+        let (proposal, events) = engine.propose(&admin, action, &ctx, &sk).unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Approved);
+        assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn single_admin_lock_economic_policy() {
+        let admin = alice();
+        let mut engine = SingleAdminEngine::new(admin.clone(), mock_resolver());
+        let ctx = test_context(&admin);
+        let sk = test_signing_key();
+
+        let action = GovernanceAction::LockEconomicPolicy;
+
+        let (proposal, events) = engine.propose(&admin, action, &ctx, &sk).unwrap();
+        assert_eq!(proposal.status, ProposalStatus::Approved);
+        assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn single_admin_checkpoint_cosignature_requirements() {
+        let admin = alice();
+        let engine = SingleAdminEngine::new(admin, mock_resolver());
+
+        let (required_signers, minimum_count) = engine.checkpoint_cosignature_requirements();
+        assert_eq!(required_signers.len(), 0);
+        assert_eq!(minimum_count, 0);
+    }
+
+    #[test]
+    fn single_admin_checkpoint_empty_cosignatures() {
+        let admin = alice();
+        let engine = SingleAdminEngine::new(admin, mock_resolver());
+
+        let checkpoint_hash = [0u8; 32];
+        let cosignatures = vec![];
+
+        let status = engine
+            .validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash)
+            .unwrap();
+        assert_eq!(status, CheckpointAttestationStatus::FullyAttested);
+    }
+
+    #[test]
+    fn single_admin_checkpoint_rejects_cosignatures() {
+        let admin = alice();
+        let engine = SingleAdminEngine::new(admin, mock_resolver());
+
+        let checkpoint_hash = [0u8; 32];
+        let cosignatures = vec![CosignedCheckpoint {
+            signer_did: bob(),
+            signature: vec![0u8; 64],
+        }];
+
+        let result = engine.validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            GovernanceError::NotEligible(msg) => {
+                assert!(msg.contains("SingleAdmin checkpoints must have empty cosignatures"));
+            }
+            _ => panic!("Expected InvalidSigner error"),
+        }
+    }
+
+    #[test]
+    fn threshold_checkpoint_cosignature_requirements() {
+        let signers = vec![alice(), bob(), charlie()];
+        let threshold = 2;
+        let engine =
+            ThresholdEngine::new(signers.clone(), threshold, 86_400, mock_resolver()).unwrap();
+
+        let (required_signers, minimum_count) = engine.checkpoint_cosignature_requirements();
+        assert_eq!(required_signers, signers);
+        assert_eq!(minimum_count, 2);
+    }
+
+    #[test]
+    fn threshold_checkpoint_fully_attested() {
+        let signers = vec![alice(), bob(), charlie()];
+        let threshold = 2;
+        let engine = ThresholdEngine::new(signers, threshold, 86_400, mock_resolver()).unwrap();
+
+        let checkpoint_hash = [1u8; 32];
+        let cosignatures = vec![
+            CosignedCheckpoint {
+                signer_did: alice(),
+                signature: sign_with(1, &checkpoint_hash),
+            },
+            CosignedCheckpoint {
+                signer_did: bob(),
+                signature: sign_with(2, &checkpoint_hash),
+            },
+        ];
+
+        let status = engine
+            .validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash)
+            .unwrap();
+        assert_eq!(status, CheckpointAttestationStatus::FullyAttested);
+    }
+
+    #[test]
+    fn threshold_checkpoint_partially_attested() {
+        let signers = vec![alice(), bob(), charlie()];
+        let threshold = 2;
+        let engine = ThresholdEngine::new(signers, threshold, 86_400, mock_resolver()).unwrap();
+
+        let checkpoint_hash = [1u8; 32];
+        let cosignatures = vec![CosignedCheckpoint {
+            signer_did: alice(),
+            signature: sign_with(1, &checkpoint_hash),
+        }];
+
+        let status = engine
+            .validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash)
+            .unwrap();
+        assert_eq!(status, CheckpointAttestationStatus::PartiallyAttested);
+    }
+
+    #[test]
+    fn majority_checkpoint_cosignature_requirements() {
+        let voters = vec![alice(), bob(), charlie(), david(), eve()]; // 5 voters
+        let engine =
+            MajorityVoteEngine::new(voters.clone(), 86_400, 5000, mock_resolver()).unwrap();
+
+        let (required_signers, minimum_count) = engine.checkpoint_cosignature_requirements();
+        assert_eq!(required_signers, voters);
+        assert_eq!(minimum_count, 3); // (5 / 2) + 1 = 3
+    }
+
+    #[test]
+    fn majority_checkpoint_fully_attested() {
+        let voters = vec![alice(), bob(), charlie(), david(), eve()];
+        let engine = MajorityVoteEngine::new(voters, 86_400, 5000, mock_resolver()).unwrap();
+
+        let checkpoint_hash = [1u8; 32];
+        let cosignatures = vec![
+            CosignedCheckpoint {
+                signer_did: alice(),
+                signature: sign_with(1, &checkpoint_hash),
+            },
+            CosignedCheckpoint {
+                signer_did: bob(),
+                signature: sign_with(2, &checkpoint_hash),
+            },
+            CosignedCheckpoint {
+                signer_did: charlie(),
+                signature: sign_with(4, &checkpoint_hash), // charlie = seed 4
+            },
+        ];
+
+        let status = engine
+            .validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash)
+            .unwrap();
+        assert_eq!(status, CheckpointAttestationStatus::FullyAttested);
+    }
+
+    #[test]
+    fn majority_checkpoint_partially_attested() {
+        let voters = vec![alice(), bob(), charlie(), david(), eve()];
+        let engine = MajorityVoteEngine::new(voters, 86_400, 5000, mock_resolver()).unwrap();
+
+        let checkpoint_hash = [1u8; 32];
+        let cosignatures = vec![
+            CosignedCheckpoint {
+                signer_did: alice(),
+                signature: sign_with(1, &checkpoint_hash),
+            },
+            CosignedCheckpoint {
+                signer_did: bob(),
+                signature: sign_with(2, &checkpoint_hash),
+            },
+        ];
+
+        let status = engine
+            .validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash)
+            .unwrap();
+        assert_eq!(status, CheckpointAttestationStatus::PartiallyAttested);
+    }
+
+    #[test]
+    fn unanimity_checkpoint_cosignature_requirements() {
+        let voters = vec![alice(), bob(), charlie()];
+        let engine = UnanimityEngine::new(voters.clone(), 172_800, mock_resolver()).unwrap();
+
+        let (required_signers, minimum_count) = engine.checkpoint_cosignature_requirements();
+        assert_eq!(required_signers, voters);
+        assert_eq!(minimum_count, 3); // All voters
+    }
+
+    #[test]
+    fn unanimity_checkpoint_fully_attested() {
+        let voters = vec![alice(), bob(), charlie()];
+        let engine = UnanimityEngine::new(voters, 172_800, mock_resolver()).unwrap();
+
+        let checkpoint_hash = [1u8; 32];
+        let cosignatures = vec![
+            CosignedCheckpoint {
+                signer_did: alice(),
+                signature: sign_with(1, &checkpoint_hash),
+            },
+            CosignedCheckpoint {
+                signer_did: bob(),
+                signature: sign_with(2, &checkpoint_hash),
+            },
+            CosignedCheckpoint {
+                signer_did: charlie(),
+                signature: sign_with(4, &checkpoint_hash), // charlie = seed 4
+            },
+        ];
+
+        let status = engine
+            .validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash)
+            .unwrap();
+        assert_eq!(status, CheckpointAttestationStatus::FullyAttested);
+    }
+
+    #[test]
+    fn unanimity_checkpoint_partially_attested() {
+        let voters = vec![alice(), bob(), charlie()];
+        let engine = UnanimityEngine::new(voters, 172_800, mock_resolver()).unwrap();
+
+        let checkpoint_hash = [1u8; 32];
+        let cosignatures = vec![
+            CosignedCheckpoint {
+                signer_did: alice(),
+                signature: sign_with(1, &checkpoint_hash),
+            },
+            CosignedCheckpoint {
+                signer_did: bob(),
+                signature: sign_with(2, &checkpoint_hash),
+            },
+            // Missing charlie() - not unanimous
+        ];
+
+        let status = engine
+            .validate_checkpoint_cosignatures(&cosignatures, &checkpoint_hash)
+            .unwrap();
+        assert_eq!(status, CheckpointAttestationStatus::PartiallyAttested);
+    }
+
+    fn charlie() -> DID {
+        DID::from("did:dht:z6MkCharlie")
+    }
+
+    fn david() -> DID {
+        DID::from("did:dht:z6MkDavid")
+    }
+
+    fn eve() -> DID {
+        DID::from("did:dht:z6MkEve")
     }
 }

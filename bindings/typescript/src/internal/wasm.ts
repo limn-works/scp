@@ -41,7 +41,16 @@ interface WasmModule {
   default: () => Promise<void>;
   scp_init: () => void;
   scp_version: () => string;
+  identity_create: (custody: string) => Promise<{ did: string; custodyType: string }>;
   identity_load: (did: string) => Promise<{ did: string; custodyType: string }>;
+  identity_resolve: (did: string) => Promise<{
+    id: string;
+    verificationMethodsJson: string;
+    servicesJson: string;
+    alsoKnownAsJson: string;
+    authenticationJson: string;
+    assertionMethodsJson: string;
+  }>;
   context_create: (
     identityDid: string,
     paramsJson: string,
@@ -66,6 +75,47 @@ interface WasmModule {
       onComplete: () => void;
     },
   ) => void;
+  tool_register: (handle: BridgeContextHandle, definitionJson: string) => Promise<string>;
+  tool_invoke: (
+    handle: BridgeContextHandle,
+    toolId: string,
+    inputJson: string,
+    identityDid: string,
+  ) => Promise<string>;
+  tool_verify: (
+    handle: BridgeContextHandle,
+    toolId: string,
+  ) => Promise<{ toolId: string; passed: boolean; failuresJson: string }>;
+  transport_connect: (relayUrl: string) => Promise<{
+    connected: boolean;
+    relayUrl: string | null;
+    latencyMs: number | null;
+  }>;
+  event_log_query: (handle: BridgeContextHandle, filterJson: string | undefined) => Promise<string>;
+  event_log_verify: (
+    handle: BridgeContextHandle,
+    claimJson: string,
+  ) => Promise<{ verified: boolean; proofType: string; detailsJson: string }>;
+  ucan_validate: (
+    handle: BridgeContextHandle,
+    token: string,
+    capability: string,
+    expectedAudDid: string,
+    proofTokensJson: string | undefined,
+  ) => Promise<void>;
+  ucan_mint: (
+    handle: BridgeContextHandle,
+    memberDid: string,
+    capabilitiesJson: string,
+  ) => Promise<{
+    tokenId: string;
+    issuer: string;
+    audience: string;
+    capabilitiesJson: string;
+    expiresAt: number | null;
+    encoded: string;
+  }>;
+  ucan_revoke: (handle: BridgeContextHandle, token: string) => Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -173,15 +223,8 @@ export function createWasmBridge(): Bridge {
     // Identity
     async identityCreate(custody: string): Promise<BridgeIdentityHandle> {
       const wasm = getWasm();
-      if (custody === "in_memory" || custody === "js_custody") {
-        const handle = await wasm.identity_load("did:dht:placeholder");
-        return { did: handle.did, custodyType: custody };
-      }
-      throw new TransportError(
-        `Custody type "${custody}" is not supported in the browser WASM bridge. ` +
-          'Use "js_custody" or "in_memory" for browser environments.',
-        "SCP-TRANS-5003",
-      );
+      const handle = await wasm.identity_create(custody);
+      return { did: handle.did, custodyType: handle.custodyType };
     },
 
     async identityLoad(did: string): Promise<BridgeIdentityHandle> {
@@ -191,13 +234,15 @@ export function createWasmBridge(): Bridge {
     },
 
     async identityResolve(did: string): Promise<DIDDocument> {
+      const wasm = getWasm();
+      const doc = await wasm.identity_resolve(did);
       return {
-        id: did,
-        verificationMethods: [],
-        authentication: [],
-        assertionMethods: [],
-        alsoKnownAs: [],
-        serviceEndpoints: [],
+        id: doc.id,
+        verificationMethods: JSON.parse(doc.verificationMethodsJson),
+        authentication: JSON.parse(doc.authenticationJson),
+        assertionMethods: JSON.parse(doc.assertionMethodsJson),
+        alsoKnownAs: JSON.parse(doc.alsoKnownAsJson),
+        serviceEndpoints: JSON.parse(doc.servicesJson),
       };
     },
 
@@ -271,39 +316,50 @@ export function createWasmBridge(): Bridge {
       });
     },
 
-    // Tools -- WASM bridge stubs (require JS-side implementation)
-    async toolRegister(_handle: BridgeContextHandle, _definition: ToolDefinition): Promise<string> {
-      throw new TransportError(
-        "Tool registration in the WASM bridge requires runtime wiring",
-        "SCP-TOOL-6001",
-      );
+    // Tools -- delegates to WASM runtime registry
+    async toolRegister(handle: BridgeContextHandle, definition: ToolDefinition): Promise<string> {
+      const wasm = getWasm();
+      const definitionJson = JSON.stringify({
+        name: definition.name,
+        description: definition.description,
+        schema: {
+          input: definition.inputSchema,
+          output: definition.outputSchema,
+        },
+        operatorDid: definition.operator,
+        testVectors: definition.testVectors?.map((tv) => ({
+          input: tv.input,
+          expectedOutput: tv.expectedOutput,
+        })),
+      });
+      return await wasm.tool_register(handle, definitionJson);
     },
 
     async toolInvoke(
-      _handle: BridgeContextHandle,
-      _toolId: string,
-      _inputJson: string,
-      _identityDid: string,
+      handle: BridgeContextHandle,
+      toolId: string,
+      inputJson: string,
+      identityDid: string,
     ): Promise<string> {
-      throw new TransportError(
-        "Tool invocation in the WASM bridge requires runtime wiring",
-        "SCP-TOOL-6001",
-      );
+      const wasm = getWasm();
+      return await wasm.tool_invoke(handle, toolId, inputJson, identityDid);
     },
 
-    async toolVerify(
-      _handle: BridgeContextHandle,
-      _toolId: string,
-    ): Promise<ToolVerificationResult> {
-      throw new TransportError(
-        "Tool verification in the WASM bridge requires runtime wiring",
-        "SCP-TOOL-6001",
-      );
+    async toolVerify(handle: BridgeContextHandle, toolId: string): Promise<ToolVerificationResult> {
+      const wasm = getWasm();
+      const result = await wasm.tool_verify(handle, toolId);
+      return {
+        toolId: result.toolId,
+        passed: result.passed,
+        failures: JSON.parse(result.failuresJson),
+      };
     },
 
     // Transport
     async transportConnect(relayUrl: string): Promise<BridgeTransportHandle> {
-      return { isConnected: true, relayUrl };
+      const wasm = getWasm();
+      const status = await wasm.transport_connect(relayUrl);
+      return { isConnected: status.connected, relayUrl: status.relayUrl };
     },
 
     async transportStatus(handle: BridgeTransportHandle): Promise<TransportStatus> {
@@ -314,57 +370,86 @@ export function createWasmBridge(): Bridge {
       // WebSocket disconnect -- handled by the browser runtime.
     },
 
-    // UCAN -- WASM bridge stubs
+    // UCAN -- delegates to WASM 11-step validation pipeline
     async ucanValidate(
-      _handle: BridgeContextHandle,
-      _token: string,
-      _capability: string,
+      handle: BridgeContextHandle,
+      token: string,
+      capability: string,
     ): Promise<void> {
-      throw new TransportError(
-        "UCAN validation in the WASM bridge requires runtime wiring",
-        "SCP-PERM-3001",
-      );
+      const wasm = getWasm();
+      // The WASM bridge expects an audience DID for step 5 validation.
+      // Use the context creator DID as the expected audience.
+      await wasm.ucan_validate(handle, token, capability, handle.creatorDid, undefined);
     },
 
     async ucanMint(
-      _handle: BridgeContextHandle,
-      _memberDid: string,
-      _capabilities: readonly string[],
+      handle: BridgeContextHandle,
+      memberDid: string,
+      capabilities: readonly string[],
     ): Promise<UcanToken> {
-      throw new TransportError(
-        "UCAN minting in the WASM bridge requires runtime wiring",
-        "SCP-PERM-3002",
-      );
+      const wasm = getWasm();
+      const capabilitiesJson = JSON.stringify(capabilities);
+      const result = await wasm.ucan_mint(handle, memberDid, capabilitiesJson);
+      const token: UcanToken = {
+        id: result.tokenId,
+        encoded: result.encoded,
+        issuer: result.issuer,
+        audience: result.audience,
+        capabilities: JSON.parse(result.capabilitiesJson) as string[],
+      };
+      if (result.expiresAt != null) {
+        return { ...token, expiresAt: result.expiresAt };
+      }
+      return token;
     },
 
-    async ucanRevoke(_handle: BridgeContextHandle, _token: string): Promise<void> {
-      throw new TransportError(
-        "UCAN revocation in the WASM bridge requires runtime wiring",
-        "SCP-PERM-3003",
-      );
+    async ucanRevoke(handle: BridgeContextHandle, token: string): Promise<void> {
+      const wasm = getWasm();
+      await wasm.ucan_revoke(handle, token);
     },
 
-    // Event Log -- WASM bridge stubs
+    // Event Log -- delegates to WASM-local Merkle tree
     async eventLogQuery(
-      _handle: BridgeContextHandle,
-      _filter: EventFilter | undefined,
+      handle: BridgeContextHandle,
+      filter: EventFilter | undefined,
     ): Promise<readonly Event[]> {
-      throw new TransportError(
-        "Event log query in the WASM bridge requires runtime wiring",
-        "SCP-CTX-2023",
-      );
+      const wasm = getWasm();
+      const filterJson = filter ? JSON.stringify(filter) : undefined;
+      const resultJson = await wasm.event_log_query(handle, filterJson);
+      const events: Array<{
+        eventType: string;
+        actorDid: string;
+        timestamp: number;
+        payloadJson: string;
+        sequence: number;
+      }> = JSON.parse(resultJson);
+      return events.map((e) => ({
+        eventType: e.eventType,
+        actorDid: e.actorDid,
+        timestamp: e.timestamp,
+        payload: JSON.parse(e.payloadJson),
+        sequence: e.sequence,
+      }));
     },
 
-    async eventLogVerify(_handle: BridgeContextHandle, _claim: EventClaim): Promise<Proof> {
-      throw new TransportError(
-        "Event log verification in the WASM bridge requires runtime wiring",
-        "SCP-CTX-2025",
-      );
+    async eventLogVerify(handle: BridgeContextHandle, claim: EventClaim): Promise<Proof> {
+      const wasm = getWasm();
+      const claimJson = JSON.stringify(claim);
+      const result = await wasm.event_log_verify(handle, claimJson);
+      return {
+        verified: result.verified,
+        proofType: result.proofType as "inclusion" | "absence",
+        details: JSON.parse(result.detailsJson),
+      };
     },
 
     async eventLogCheckpoint(_handle: BridgeContextHandle): Promise<Checkpoint> {
+      // Checkpoint requires access to the Merkle root — this is not directly
+      // exposed via a dedicated WASM export yet. Return a minimal checkpoint
+      // from available data. The WASM bridge stores the Merkle tree internally;
+      // the root is accessible via event_log_verify with a known leaf.
       throw new TransportError(
-        "Event log checkpoint in the WASM bridge requires runtime wiring",
+        "Event log checkpoint in the WASM bridge requires a dedicated export",
         "SCP-CTX-2027",
       );
     },

@@ -25,6 +25,8 @@ use js_sys::Promise;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
+use scp_ffi_common::validate::validate_relay_url;
+
 use crate::error::ScpWasmError;
 
 // ---------------------------------------------------------------------------
@@ -113,6 +115,9 @@ impl WasmTransportStatus {
 #[wasm_bindgen]
 pub fn transport_connect(relay_url: String) -> Promise {
     future_to_promise(async move {
+        // Validate relay URL structure (length, control chars, scheme).
+        validate_relay_url(&relay_url).map_err(|e| ScpWasmError::from(e).into_js())?;
+
         // Validate scheme — browser targets MUST use wss:// (TLS-encrypted).
         // Plain ws:// is not permitted; it allows cleartext interception of
         // all SCP protocol traffic. See ADR-022 acceptance criterion 1.

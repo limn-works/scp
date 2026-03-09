@@ -10,7 +10,8 @@
     clippy::expect_used,
     clippy::panic,
     clippy::cast_possible_truncation,
-    clippy::similar_names
+    clippy::similar_names,
+    clippy::type_complexity
 )]
 mod tests {
     use std::collections::HashSet;
@@ -104,6 +105,7 @@ mod tests {
             })),
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None, // Deliberately not setting — tests key_scope mismatch
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -151,6 +153,7 @@ mod tests {
             facts: None, // No key_scope!
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         // mint_ucan rejects self-delegation without key_scope at mint time
@@ -202,6 +205,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody_agent).await.unwrap();
@@ -322,15 +326,39 @@ mod tests {
 
         let eligible_voters = vec![admin_did.clone(), voter_did.clone(), third_did.clone()];
 
-        let mut engine = MajorityVoteEngine::new(
-            eligible_voters,
-            300, // voting_window_secs: 5 minutes
-            0.5, // min_participation: 50%
-        )
-        .unwrap();
-
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xAA; 32]);
         let admin_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xBB; 32]);
+
+        // Resolver maps each DID to the signing key used by that participant.
+        let admin_vk = admin_signing_key.verifying_key();
+        let voter_vk = signing_key.verifying_key();
+        let third_vk = ed25519_dalek::SigningKey::from_bytes(&[0xCC; 32]).verifying_key();
+        #[allow(clippy::type_complexity)]
+        let resolver: std::sync::Arc<
+            dyn Fn(&scp_identity::DID) -> Option<ed25519_dalek::VerifyingKey> + Send + Sync,
+        > = {
+            let admin_d = admin_did.clone();
+            let voter_d = voter_did.clone();
+            let third_d = third_did.clone();
+            std::sync::Arc::new(move |did: &scp_identity::DID| {
+                if *did == admin_d {
+                    Some(admin_vk)
+                } else if *did == voter_d {
+                    Some(voter_vk)
+                } else if *did == third_d {
+                    Some(third_vk)
+                } else {
+                    None
+                }
+            })
+        };
+        let mut engine = MajorityVoteEngine::new(
+            eligible_voters,
+            300,  // voting_window_secs: 5 minutes
+            5000, // min_participation_bps: 50%
+            resolver,
+        )
+        .unwrap();
 
         let ctx = GovernanceContext {
             context_id: "ctx-gov-test".to_owned(),

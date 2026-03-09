@@ -25,13 +25,12 @@
 //!
 //! See ADR-013 in `.docs/adrs/phase-3.md` for the full specification.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use scp_core::context::roles::Capability;
 use scp_platform::traits::KeyCustody;
 use tokio::sync::mpsc;
 
@@ -526,9 +525,9 @@ impl PyMessage {
 }
 
 impl PyMessage {
-    /// Creates a new `PyMessage`. Used internally by the receive pipeline.
+    /// Creates a new `PyMessage`. Used by `drain_and_deliver` and
+    /// `deliver_message` to feed messages into the receive channel.
     #[must_use]
-    #[allow(dead_code)] // Will be used when transport wiring is connected.
     pub const fn new(
         sender_did: String,
         payload: Vec<u8>,
@@ -570,7 +569,7 @@ impl PyMessage {
 pub struct PyMessageReceiver {
     /// The receiving half of the message channel, wrapped in a `tokio::sync::Mutex`
     /// so it can be locked across `.await` points in `__anext__`. Shared with
-    /// `ContextRuntime::message_rx` via `Arc` so that `deliver_message` can
+    /// `FfiBridgeState::message_rx` via `Arc` so that `deliver_message` can
     /// implement oldest-drop overflow.
     rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>,
 }
@@ -630,7 +629,7 @@ impl PyMessageReceiver {
     /// Creates a new receiver from a pre-wrapped shared receiver Arc.
     ///
     /// The `Arc<tokio::sync::Mutex<Receiver>>` is shared with
-    /// `ContextRuntime::message_rx` so that `deliver_message` can access
+    /// `FfiBridgeState::message_rx` so that `deliver_message` can access
     /// the receiver for oldest-drop overflow handling.
     #[must_use]
     pub const fn from_shared_rx(rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>) -> Self {
@@ -728,13 +727,40 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
     // for embedding in scp://context/<id> URIs.
     let context_id = crate::types::generate_context_id();
 
-    let handle = PyContextHandle::new(context_id.clone(), identity_did.to_owned(), parsed);
+    let handle = PyContextHandle::new(context_id.clone(), identity_did.to_owned(), parsed.clone());
 
-    // Register runtime objects (ToolRegistry, EventLog, RoleState, RevocationList)
-    // in the global runtime registry so that tools/UCAN/event_log bridge functions
-    // can look them up by context ID.
+    // Register FFI-specific state (ToolRegistry, EventLog, RoleState, RevocationList)
+    // in the global FFI state registry so that tools/UCAN/event_log bridge functions
+    // can look them up by context ID. Also initializes the shared ContextManager.
     crate::runtime::register_context(&context_id, identity_did)
-        .map_err(|e| PyRuntimeError::new_err(format!("failed to register context runtime: {e}")))?;
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to register context state: {e}")))?;
+
+    // Delegate context creation to the shared ContextManager for lifecycle tracking.
+    // Build scp-core ContextParams from the parsed PyContextParams.
+    {
+        let core_params = build_core_context_params(&parsed);
+        let creator_did_owned = scp_identity::DID(identity_did.to_owned());
+        let rt = crate::runtime()?;
+        let mgr = crate::runtime::context_manager()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let mgr = mgr.clone();
+        let ctx_id = context_id.clone();
+        let creator_did_for_register = scp_identity::DID(identity_did.to_owned());
+        rt.block_on(async move {
+            mgr.create_context(ctx_id, core_params, creator_did_owned)
+                .await
+                .map_err(|e| scp_core::context::ContextError::CreationFailed(e.to_string()))?;
+            // Register the creator's DID as a local DID for defense-in-depth,
+            // matching NAPI's behavior.
+            mgr.register_local_did(creator_did_for_register).await;
+            Ok::<(), scp_core::context::ContextError>(())
+        })
+        .map_err(|e| {
+            // Clean up FFI state on ContextManager failure.
+            crate::runtime::remove_context(&context_id);
+            PyRuntimeError::new_err(format!("ContextManager create_context failed: {e}"))
+        })?;
+    }
 
     // Register in the known-contexts registry for discovery via
     // py_mcp_load_contexts. Derive a per-identity routing ID using
@@ -744,7 +770,7 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
     {
         let routing_id = crate::runtime::with_identity(identity_did, |entry| {
             let rt = crate::runtime().map_err(|e| {
-                crate::error::ScpPyError::IdentityError(format!("runtime not available: {e}"))
+                crate::error::ScpPyError::identity(format!("runtime not available: {e}"))
             })?;
             let pseudonym = rt.block_on(async {
                 entry
@@ -754,15 +780,11 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
             });
             let pk = pseudonym
                 .map_err(|e| {
-                    crate::error::ScpPyError::IdentityError(format!(
-                        "pseudonym derivation failed: {e}"
-                    ))
+                    crate::error::ScpPyError::identity(format!("pseudonym derivation failed: {e}"))
                 })?
                 .public_key;
             let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
-                crate::error::ScpPyError::IdentityError(
-                    "pseudonym public key must be 32 bytes".to_owned(),
-                )
+                crate::error::ScpPyError::identity("pseudonym public key must be 32 bytes")
             })?;
             Ok(bytes)
         })
@@ -828,11 +850,48 @@ fn py_context_join(handle: &PyContextHandle, identity_did: &str) -> PyResult<()>
     }
     drop(state);
 
-    // In the full runtime, this would:
-    // 1. Generate a key package for the joining member.
-    // 2. Add the member to the MLS group.
-    // 3. Log the join event.
-    let _ = identity_did; // Will be used when connected to scp-core runtime.
+    // Delegate join to the shared ContextManager for membership tracking.
+    {
+        let context_id = handle.context_id.clone();
+        let member_did = identity_did.to_owned();
+        let rt = crate::runtime()?;
+        let mgr = crate::runtime::context_manager()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let mgr = mgr.clone();
+
+        // Build a key package for the joining member.
+        let key_package = scp_core::context::membership::KeyPackage {
+            owner_did: scp_identity::DID(member_did.clone()),
+            mls_key_package_bytes: None,
+        };
+
+        // Look up the ContextHandle from a completed create_context call.
+        // The ContextManager stores PerContextState keyed by context_id.
+        // We need the handle to delegate. Since the handle is stored in
+        // ContextManager's internal state, we create a temporary handle
+        // matching the context's params for the join call.
+        let core_params = build_core_context_params(&handle.params);
+        let temp_handle = scp_core::context::ContextHandle::new(context_id.clone(), core_params);
+        // Transition the temp handle to Active to match the real state.
+        rt.block_on(async {
+            let _ = temp_handle
+                .transition_to(&scp_core::context::ContextState::Active)
+                .await;
+            mgr.join_context(&temp_handle, key_package).await
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("ContextManager join_context failed: {e}")))?;
+
+        // Also update FFI bridge state's role_state for UCAN/tool capability checks.
+        crate::runtime::with_ffi_state(&context_id, |st| {
+            st.role_state.members.insert(member_did.clone());
+            Ok(())
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        // Bridge: drain events (MemberJoined) from ContextManager's receive
+        // buffer and deliver to the FFI receive channel (#332).
+        drain_and_deliver(&context_id);
+    }
 
     Ok(())
 }
@@ -863,11 +922,39 @@ fn py_context_leave(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
     }
     drop(state);
 
-    // In the full runtime, this would:
-    // 1. Remove the member from the MLS group.
-    // 2. Update sender keys.
-    // 3. Log the leave event.
-    let _ = identity_did; // Will be used when connected to scp-core runtime.
+    // Delegate leave to the shared ContextManager for membership tracking.
+    {
+        let context_id = handle.context_id.clone();
+        let member_did = scp_identity::DID(identity_did.to_owned());
+        let rt = crate::runtime()?;
+        let mgr = crate::runtime::context_manager()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let mgr = mgr.clone();
+
+        let core_params = build_core_context_params(&handle.params);
+        let temp_handle = scp_core::context::ContextHandle::new(context_id.clone(), core_params);
+        rt.block_on(async {
+            let _ = temp_handle
+                .transition_to(&scp_core::context::ContextState::Active)
+                .await;
+            // Self-removal: caller_did == member_did.
+            mgr.leave_context(&temp_handle, &member_did, &member_did)
+                .await
+        })
+        .map_err(|e| {
+            PyRuntimeError::new_err(format!("ContextManager leave_context failed: {e}"))
+        })?;
+
+        // Also update FFI bridge state's role_state.
+        let _ = crate::runtime::with_ffi_state(&context_id, |st| {
+            st.role_state.members.remove(identity_did);
+            Ok(())
+        });
+
+        // Bridge: drain events (MemberLeft) from ContextManager's receive
+        // buffer and deliver BEFORE closing the channel (#332).
+        drain_and_deliver(&context_id);
+    }
 
     // Close the receive channel so any active PyMessageReceiver raises
     // StopAsyncIteration (SCP-216 AC6).
@@ -908,31 +995,53 @@ fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
         )));
     }
 
-    // Verify the caller has the ContextClose capability before allowing
-    // the close operation. Without this check, any caller could close any
-    // context -- a privilege escalation vulnerability (black-hat finding).
+    // Authorization is enforced by the ContextManager (which delegates to
+    // ttl::close_context checking the ContextClose capability). No bridge-layer
+    // auth check — the ContextManager is authoritative.
     let context_id = handle.context_id.clone();
-    crate::runtime::with_context(&context_id, |rt| {
-        if !rt
-            .role_state
-            .member_has_capability(identity_did, &Capability::ContextClose)
-        {
-            return Err(crate::error::ScpPyError::ContextError(format!(
-                "identity '{identity_did}' does not have the ContextClose capability \
-                 for context '{context_id}' -- only admins or members with the \
-                 context:close capability can close a context"
-            )));
+
+    // Delegate close to the shared ContextManager FIRST. If it fails with a
+    // real error (not "context not found" which is idempotent), propagate
+    // before cleaning up FFI state. This prevents the scenario where FFI
+    // state is destroyed but the ContextManager still holds the context.
+    {
+        let initiator_did = scp_identity::DID(identity_did.to_owned());
+        let rt = crate::runtime()?;
+        let mgr = crate::runtime::context_manager()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let mgr = mgr.clone();
+
+        let core_params = build_core_context_params(&handle.params);
+        let temp_handle = scp_core::context::ContextHandle::new(context_id, core_params);
+        let close_result = rt.block_on(async {
+            let _ = temp_handle
+                .transition_to(&scp_core::context::ContextState::Active)
+                .await;
+            mgr.close_context(&temp_handle, &initiator_did).await
+        });
+        // Propagate errors unless the context was already removed from
+        // ContextManager (idempotent — e.g. all members left). The
+        // "not registered" error is safe to ignore.
+        if let Err(ref e) = close_result {
+            let msg = e.to_string();
+            if !msg.contains("not registered") && !msg.contains("context not found") {
+                return Err(PyRuntimeError::new_err(format!(
+                    "ContextManager close_context failed: {e}"
+                )));
+            }
         }
-        Ok(())
-    })
-    .map_err(|e: crate::error::ScpPyError| -> PyErr { e.into() })?;
+    }
 
     // Transition directly to "closed" (skipping "closing" for the bridge
     // layer -- the full runtime will implement the cooperative closing window).
     "closed".clone_into(&mut state);
     drop(state);
 
-    // Remove context from the runtime registry to free resources.
+    // Bridge: drain events (SystemClose) from ContextManager before
+    // removing FFI state, so any active receiver gets the close event (#332).
+    drain_and_deliver(&handle.context_id);
+
+    // Remove context from the FFI state registry to free resources.
     crate::runtime::remove_context(&handle.context_id);
 
     Ok(())
@@ -980,27 +1089,30 @@ fn py_context_send(
         return Err(PyTypeError::new_err("payload must be bytes or str"));
     };
 
-    // Create a real inner envelope using the retained KeyCustody for signing.
-    // This validates that the identity's active signing key can produce a
-    // valid Ed25519 signature over the message. The inner envelope is not
-    // yet transmitted (MLS encryption and transport are future stories) but
-    // the signing path exercises real KeyCustody. See SCP-214 criterion 6.
+    // Delegate message sending to the shared ContextManager. The ContextManager
+    // validates Active state, checks write capabilities, assigns sequence numbers,
+    // encrypts via the crypto provider, and sends via the transport provider.
     let context_id = handle.context_id.clone();
     let identity_did_owned = identity_did.to_owned();
-
     let rt = crate::runtime()?;
+
+    // Create a real inner envelope using the retained KeyCustody for signing.
+    // This validates that the identity's active signing key can produce a
+    // valid Ed25519 signature over the message. See SCP-214 criterion 6.
     crate::runtime::with_identity(&identity_did_owned, |entry| {
         let now_ms = scp_core::time::now_millis()
-            .map_err(|e| crate::error::ScpPyError::ContextError(format!("{e}")))?;
+            .map_err(|e| crate::error::ScpPyError::context(format!("{e}")))?;
 
         let inner_result = rt.block_on(async {
             let params = scp_core::envelope::InnerEnvelopeParams {
+                version: scp_core::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
                 context_id: &context_id,
                 sender_did: &identity_did_owned,
                 epoch: 0,
                 generation: 0,
                 sequence: 0,
                 timestamp: now_ms,
+                message_type: scp_core::envelope::MessageType::Content,
                 payload: &payload_bytes,
                 provenance: None,
                 signing_key_id: scp_identity::SigningKeyId::Active,
@@ -1014,14 +1126,136 @@ fn py_context_send(
         });
 
         inner_result.map_err(|e| {
-            crate::error::ScpPyError::ContextError(format!("inner envelope creation failed: {e}"))
+            crate::error::ScpPyError::context(format!("inner envelope creation failed: {e}"))
         })?;
 
         Ok(())
     })
     .map_err(|e: crate::error::ScpPyError| -> PyErr { e.into() })?;
 
+    // Delegate to ContextManager for message delivery through the transport.
+    let context_id_for_drain = context_id.clone();
+    {
+        let sender_did = scp_identity::DID(identity_did_owned);
+        let mgr = crate::runtime::context_manager()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let mgr = mgr.clone();
+
+        let core_params = build_core_context_params(&handle.params);
+        let temp_handle = scp_core::context::ContextHandle::new(context_id, core_params);
+        rt.block_on(async {
+            let _ = temp_handle
+                .transition_to(&scp_core::context::ContextState::Active)
+                .await;
+            mgr.send_message(&temp_handle, &sender_did, &payload_bytes, None)
+                .await
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("ContextManager send_message failed: {e}")))?;
+    }
+
+    // Bridge: drain events from ContextManager's receive buffer and deliver
+    // them to the FFI bridge's mpsc channel so that py_context_receive yields
+    // them to Python consumers. This is the producer half of #332.
+    drain_and_deliver(&context_id_for_drain);
+
     Ok(())
+}
+
+/// Drains events from the [`ContextManager`]'s receive buffer and delivers
+/// them to the FFI bridge's receive channel via [`deliver_message`].
+///
+/// This is the bridge between the `ContextManager`'s internal event buffer
+/// (`ReceiveBuffer`) and the `PyO3` bridge's `tokio::sync::mpsc` channel that
+/// feeds `PyMessageReceiver`. Without this, events pushed by
+/// `ContextManager::send_message` (e.g., `MessageSent`, `MemberJoined`)
+/// would accumulate in the `ReceiveBuffer` but never reach the Python
+/// `async for msg in context.receive()` consumer.
+///
+/// Called after any `ContextManager` operation that may produce events:
+/// - `py_context_send` (produces `MessageSent`)
+/// - `py_context_join` (produces `MemberJoined`)
+/// - `py_context_leave` (produces `MemberLeft`)
+///
+/// Events are converted from [`ContextEvent`] to [`PyMessage`]:
+/// - `MessageSent` -> payload is the message bytes, `sender_did` is the sender.
+/// - `MemberJoined` -> payload is `"member_joined:{did}:{role}"`.
+/// - `MemberLeft` -> payload is `"member_left:{did}"`.
+/// - `SystemClose` -> payload is `"system_close:{did}"`.
+/// - Other events -> payload is a debug representation.
+///
+/// If no receive channel is open (i.e., `py_context_receive` has not been
+/// called), events are silently discarded. This is intentional: the channel
+/// is demand-driven, and events before subscription are lost (consistent
+/// with the subscription model in `TransportAdapter::subscribe`).
+fn drain_and_deliver(context_id: &str) {
+    let Ok(rt) = crate::runtime() else {
+        return;
+    };
+    let mgr = match crate::runtime::context_manager() {
+        Ok(mgr) => mgr.clone(),
+        Err(_) => return,
+    };
+
+    let events = rt.block_on(mgr.drain_events(context_id));
+
+    for event in events {
+        let (sender_did, payload, timestamp) = match event {
+            scp_core::context::membership::ContextEvent::MessageSent {
+                sender_did,
+                payload,
+                ..
+            } => {
+                #[allow(clippy::cast_precision_loss)]
+                let ts = scp_core::time::now_secs().map_or(0.0, |s| s as f64);
+                (sender_did.to_string(), payload, ts)
+            }
+            scp_core::context::membership::ContextEvent::MemberJoined {
+                member_did,
+                role_name,
+            } => {
+                #[allow(clippy::cast_precision_loss)]
+                let ts = scp_core::time::now_secs().map_or(0.0, |s| s as f64);
+                (
+                    "scp:system".to_owned(),
+                    format!("member_joined:{member_did}:{role_name}").into_bytes(),
+                    ts,
+                )
+            }
+            scp_core::context::membership::ContextEvent::MemberLeft { member_did } => {
+                #[allow(clippy::cast_precision_loss)]
+                let ts = scp_core::time::now_secs().map_or(0.0, |s| s as f64);
+                (
+                    "scp:system".to_owned(),
+                    format!("member_left:{member_did}").into_bytes(),
+                    ts,
+                )
+            }
+            scp_core::context::membership::ContextEvent::SystemClose { initiator_did } => {
+                #[allow(clippy::cast_precision_loss)]
+                let ts = scp_core::time::now_secs().map_or(0.0, |s| s as f64);
+                (
+                    "scp:system".to_owned(),
+                    format!("system_close:{initiator_did}").into_bytes(),
+                    ts,
+                )
+            }
+            other => {
+                #[allow(clippy::cast_precision_loss)]
+                let ts = scp_core::time::now_secs().map_or(0.0, |s| s as f64);
+                (
+                    "scp:system".to_owned(),
+                    format!("{other:?}").into_bytes(),
+                    ts,
+                )
+            }
+        };
+
+        let msg = PyMessage::new(sender_did, payload, timestamp, context_id.to_owned());
+        // Best-effort: if no channel is open or the channel is full, the
+        // event is dropped. This matches the subscription model where
+        // events before subscribe are lost.
+        let _ = crate::runtime::deliver_message(context_id, msg);
+    }
 }
 
 /// Returns an async iterator of incoming messages for a context.
@@ -1057,14 +1291,775 @@ fn py_context_receive(handle: &PyContextHandle) -> PyResult<PyMessageReceiver> {
     let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
 
     let context_id = handle.context_id.clone();
-    crate::runtime::with_context(&context_id, |rt| {
-        rt.message_tx = Some(tx);
-        rt.message_rx = Some(Arc::clone(&rx_arc));
+    crate::runtime::with_ffi_state(&context_id, |st| {
+        st.message_tx = Some(tx);
+        st.message_rx = Some(Arc::clone(&rx_arc));
         Ok(())
     })
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     Ok(PyMessageReceiver::from_shared_rx(rx_arc))
+}
+
+// ---------------------------------------------------------------------------
+// ContextManager delegation helpers
+// ---------------------------------------------------------------------------
+
+/// Builds scp-core [`ContextParams`] from a [`PyContextParams`].
+///
+/// Converts the flat FFI-facing parameter representation into the typed
+/// scp-core parameter struct used by [`ContextManager::create_context`].
+fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::ContextParams {
+    use scp_core::context::params::{
+        CeilingPolicy, ContextMode, GovernanceModel, MemoryScope, PromotionPolicy, TemplateId,
+    };
+
+    let mode = match py_params.mode.as_str() {
+        "broadcast" => ContextMode::Broadcast,
+        _ => ContextMode::Encrypted,
+    };
+
+    let ceiling_policy = match py_params.ceiling_policy.as_str() {
+        "governed" => CeilingPolicy::Governed,
+        _ => CeilingPolicy::Immutable,
+    };
+
+    let promotion_policy = match py_params.promotion_policy.as_str() {
+        "promotable" => PromotionPolicy::Promotable,
+        _ => PromotionPolicy::NoPromotion,
+    };
+
+    let memory_scope = match py_params.memory_scope.as_str() {
+        "summary" => MemoryScope::Summary,
+        "full" => MemoryScope::Full,
+        _ => MemoryScope::Ephemeral,
+    };
+
+    // Currently only SingleAdmin is supported; governance string was already validated.
+    let _ = py_params.governance.as_str();
+    let governance_model = GovernanceModel::SingleAdmin;
+
+    let template_id = py_params.template_id.as_deref().and_then(|tid| match tid {
+        "BilateralEphemeral" => Some(TemplateId::BilateralEphemeral),
+        "BilateralPersistent" => Some(TemplateId::BilateralPersistent),
+        "Coordination" => Some(TemplateId::Coordination),
+        "GroupDiscussion" => Some(TemplateId::GroupDiscussion),
+        "PublicBroadcast" => Some(TemplateId::PublicBroadcast),
+        "GatedBroadcast" => Some(TemplateId::GatedBroadcast),
+        "scp:template/tool-interface" => Some(TemplateId::ToolInterfaceTemplate),
+        "scp:template/paid-service" => Some(TemplateId::PaidService),
+        "scp:template/paid-broadcast" => Some(TemplateId::PaidBroadcast),
+        _ => None,
+    });
+
+    let ceiling: Vec<scp_core::context::roles::Capability> = py_params
+        .ceiling
+        .iter()
+        .map(scp_core::context::roles::Capability::new)
+        .collect();
+
+    let roles = py_params
+        .roles
+        .keys()
+        .map(|name| scp_core::context::params::RoleDefinition {
+            name: name.clone(),
+            capabilities: HashSet::new(),
+        })
+        .collect();
+
+    let tools = py_params
+        .tools
+        .iter()
+        .map(|name| scp_core::context::params::ToolRegistration {
+            tool_id: name.clone(),
+            name: name.clone(),
+            description: String::new(),
+            schema: scp_core::context::tools::ToolSchema {
+                input_schema: serde_json::Value::Object(serde_json::Map::default()),
+                output_schema: serde_json::Value::Object(serde_json::Map::default()),
+            },
+            implementation_hash: [0u8; 32],
+            test_vectors: vec![],
+            operator_did: scp_identity::DID("did:key:placeholder".to_owned()),
+            economic_metadata: None,
+            registered_at: 0,
+            signature: Vec::new(),
+        })
+        .collect();
+
+    let ttl = py_params.ttl.map(std::time::Duration::from_secs_f64);
+
+    scp_core::context::ContextParams {
+        mode,
+        ceiling,
+        ceiling_policy,
+        promotion_policy,
+        roles,
+        tools,
+        ttl,
+        memory_scope,
+        governance: governance_model,
+        template_id,
+        economic_policy: None,
+        metadata_visibility: scp_core::context::params::MetadataVisibilityPolicy::default(),
+        projection_policy: None,
+        discoverable: false,
+        max_chain_depth: None,
+        participation_requirements: Vec::new(),
+        incomplete_verification_policy:
+            scp_core::context::params::IncompleteVerificationPolicy::default(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Economic policy bridge (§19.3, ADR-033)
+// ---------------------------------------------------------------------------
+
+/// Sets the economic policy for a context (§19.3).
+///
+/// Accepts the economic policy as a JSON string. Validates the JSON against
+/// the `EconomicPolicy` schema before storing.
+///
+/// # Errors
+///
+/// - `ValueError` if the JSON is invalid or does not parse as `EconomicPolicy`.
+/// - `ScpContextError` if the context handle is not valid.
+#[pyfunction]
+#[pyo3(signature = (handle, policy_json))]
+fn py_set_economic_policy(handle: &mut PyContextHandle, policy_json: &str) -> PyResult<()> {
+    let _policy: scp_core::economy::types::EconomicPolicy = serde_json::from_str(policy_json)
+        .map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid economic policy JSON: {e}"))
+        })?;
+    handle.params.economic_policy = Some(policy_json.to_owned());
+    Ok(())
+}
+
+/// Returns the economic policy for a context as a JSON string, or `None`.
+///
+/// # Errors
+///
+/// Returns `PyErr` if the context handle is not valid.
+#[pyfunction]
+#[pyo3(signature = (handle,))]
+fn py_get_economic_policy(handle: &PyContextHandle) -> Option<String> {
+    handle.params.economic_policy.clone()
+}
+
+// ---------------------------------------------------------------------------
+// Context export/import bridge (#363)
+// ---------------------------------------------------------------------------
+
+/// Exports a context's full state as serialized `MessagePack` bytes.
+///
+/// The returned bytes are a [`StoredValue<ContextExport>`] envelope per §17.5,
+/// suitable for backup, migration, or transfer to another node.
+///
+/// # Arguments
+///
+/// * `context_id` -- The context to export.
+///
+/// # Returns
+///
+/// Serialized bytes of the context export.
+///
+/// # Errors
+///
+/// - `RuntimeError` if the context does not exist or export fails.
+#[pyfunction]
+#[pyo3(signature = (context_id,))]
+fn py_context_export(context_id: &str) -> PyResult<Vec<u8>> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let ctx_id = context_id.to_owned();
+
+    // Use the first registered local DID as the exporter.
+    let exporter_did = rt
+        .block_on(async {
+            // Get a local DID from the context's membership.
+            let contexts = mgr.member_dids(&ctx_id).await;
+            contexts.into_iter().next()
+        })
+        .map_or_else(
+            || scp_identity::DID::from("did:key:unknown-exporter"),
+            scp_identity::DID::from,
+        );
+
+    let export = rt
+        .block_on(mgr.export_context(&ctx_id, exporter_did))
+        .map_err(|e| PyRuntimeError::new_err(format!("context export failed: {e}")))?;
+
+    scp_core::context::export_import::serialize_export(&export)
+        .map_err(|e| PyRuntimeError::new_err(format!("export serialization failed: {e}")))
+}
+
+/// Imports a context from serialized `MessagePack` bytes.
+///
+/// The bytes must be a [`StoredValue<ContextExport>`] envelope per §17.5,
+/// as produced by [`py_context_export`].
+///
+/// # Arguments
+///
+/// * `data` -- Serialized context export bytes.
+///
+/// # Returns
+///
+/// The context ID string of the imported context.
+///
+/// # Errors
+///
+/// - `RuntimeError` if deserialization, validation, or import fails.
+/// - `ValueError` if the data is malformed.
+#[pyfunction]
+#[pyo3(signature = (data,))]
+fn py_context_import(data: &[u8]) -> PyResult<String> {
+    let export = scp_core::context::export_import::deserialize_export(data).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("invalid export data: {e}"))
+    })?;
+
+    let context_id = export.snapshot.context_id.clone();
+
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+
+    rt.block_on(mgr.import_context(export))
+        .map_err(|e| PyRuntimeError::new_err(format!("context import failed: {e}")))?;
+
+    Ok(context_id)
+}
+
+// ---------------------------------------------------------------------------
+// No-op UCAN validation trait stubs for subscribe_broadcast (#369)
+//
+// Minimal implementations satisfying the generic bounds on
+// ContextManager::subscribe_broadcast. Broadcast subscription in open mode
+// does not require UCAN validation; gated mode validation will be wired
+// when the full UCAN pipeline is integrated with the FFI layer.
+// ---------------------------------------------------------------------------
+
+struct NoOpDidResolver;
+impl scp_core::crypto::ucan::validate::DidResolver for NoOpDidResolver {
+    fn resolve_public_key(
+        &self,
+        _did: &str,
+    ) -> Result<[u8; 32], scp_core::crypto::ucan::UcanError> {
+        Err(scp_core::crypto::ucan::UcanError::MalformedToken(
+            "NoOpDidResolver: no DID resolution available".into(),
+        ))
+    }
+}
+
+struct NoOpNonceTracker;
+impl scp_core::crypto::ucan::validate::NonceTracker for NoOpNonceTracker {
+    fn check_and_record(
+        &mut self,
+        _nonce: &str,
+        _token_expiry: u64,
+    ) -> Result<(), scp_core::crypto::ucan::UcanError> {
+        Ok(())
+    }
+}
+
+struct NoOpRevocationChecker;
+impl scp_core::crypto::ucan::validate::RevocationChecker for NoOpRevocationChecker {
+    fn is_revoked(&self, _token_cid: &str) -> bool {
+        false
+    }
+}
+
+struct NoOpProofResolver;
+impl scp_core::crypto::ucan::validate::ProofResolver for NoOpProofResolver {
+    fn resolve_proof(
+        &self,
+        cid: &str,
+    ) -> Result<scp_core::crypto::ucan::UcanToken, scp_core::crypto::ucan::UcanError> {
+        Err(scp_core::crypto::ucan::UcanError::DelegationChainBroken(
+            format!("NoOpProofResolver: no proof available for CID {cid}"),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Governance bridge (#369)
+// ---------------------------------------------------------------------------
+
+/// Executes a governance action on a context.
+///
+/// # Arguments
+///
+/// * `handle` -- The context handle.
+/// * `proposal_json` -- JSON-serialized `GovernanceProposal`.
+///
+/// # Returns
+///
+/// A string describing the governance action result (e.g., `"MemberAdded"`).
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the context manager is not initialized, the
+/// proposal JSON is invalid, or governance execution fails.
+#[pyfunction]
+#[pyo3(signature = (handle, proposal_json))]
+fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyResult<String> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let proposal_json_owned = proposal_json.to_owned();
+
+    rt.block_on(async move {
+        let proposal: scp_core::context::governance::GovernanceProposal =
+            serde_json::from_str(&proposal_json_owned).map_err(|e| {
+                PyValueError::new_err(format!("invalid governance proposal JSON: {e}"))
+            })?;
+        let result = mgr
+            .execute_governance_action(&context_id, &proposal)
+            .await
+            .map_err(|e| PyRuntimeError::new_err(format!("governance execution failed: {e}")))?;
+
+        use scp_core::context::manager::GovernanceActionResult;
+        let result_str = match result {
+            GovernanceActionResult::MemberAdded => "MemberAdded",
+            GovernanceActionResult::MemberRemoved => "MemberRemoved",
+            GovernanceActionResult::RoleChanged => "RoleChanged",
+            GovernanceActionResult::ToolRegistered => "ToolRegistered",
+            GovernanceActionResult::ToolRemoved => "ToolRemoved",
+            GovernanceActionResult::CeilingModified => "CeilingModified",
+            GovernanceActionResult::ContextClosed => "ContextClosed",
+            GovernanceActionResult::TtlExtended => "TtlExtended",
+            GovernanceActionResult::PruningPolicyModified => "PruningPolicyModified",
+            GovernanceActionResult::AdminTransferred => "AdminTransferred",
+            GovernanceActionResult::SignerAdded => "SignerAdded",
+            GovernanceActionResult::SignerRemoved => "SignerRemoved",
+            GovernanceActionResult::ThresholdModified => "ThresholdModified",
+            GovernanceActionResult::ChildContextCreated => "ChildContextCreated",
+            GovernanceActionResult::ToolInterfaceEstablished => "ToolInterfaceEstablished",
+            GovernanceActionResult::MemberReset => "MemberReset",
+            GovernanceActionResult::ConflictResolved => "ConflictResolved",
+            GovernanceActionResult::ContextPromoted => "ContextPromoted",
+            GovernanceActionResult::ReadAccessRevoked(_) => "ReadAccessRevoked",
+            GovernanceActionResult::ReadAccessRestored(_) => "ReadAccessRestored",
+            GovernanceActionResult::WriteAccessRevoked(_) => "WriteAccessRevoked",
+            GovernanceActionResult::WriteAccessRestored(_) => "WriteAccessRestored",
+            GovernanceActionResult::ContentKeysRotated(_) => "ContentKeysRotated",
+            GovernanceActionResult::GovernanceReconfigured(_) => "GovernanceReconfigured",
+            GovernanceActionResult::AuthorBlocked(_) => "AuthorBlocked",
+            GovernanceActionResult::SubscriberBanned(_) => "SubscriberBanned",
+            GovernanceActionResult::SubscriberUnbanned { .. } => "SubscriberUnbanned",
+            GovernanceActionResult::Executed => "Executed",
+        };
+        Ok(result_str.to_owned())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Broadcast bridge (#369)
+// ---------------------------------------------------------------------------
+
+/// Subscribes a DID to a broadcast context.
+///
+/// For open broadcast contexts, any DID can subscribe. For gated contexts,
+/// a valid `messagesRead` UCAN is required.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the context is not active, not a broadcast
+/// context, or if subscription fails.
+#[pyfunction]
+#[pyo3(signature = (handle, subscriber_did))]
+fn py_broadcast_subscribe(handle: &PyContextHandle, subscriber_did: &str) -> PyResult<()> {
+    validate::validate_did(subscriber_did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let did: scp_identity::DID = subscriber_did.to_owned().into();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    rt.block_on(async move {
+        mgr.subscribe_broadcast::<
+            NoOpDidResolver,
+            NoOpNonceTracker,
+            NoOpRevocationChecker,
+            NoOpProofResolver,
+            std::hash::RandomState,
+        >(&context_id, &did, None, timestamp, None)
+        .await
+        .map_err(|e| PyRuntimeError::new_err(format!("broadcast subscribe failed: {e}")))?;
+        Ok(())
+    })
+}
+
+/// Unsubscribes a DID from a broadcast context.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the context is not active or not broadcast.
+#[pyfunction]
+#[pyo3(signature = (handle, subscriber_did, rotate_keys=false))]
+fn py_broadcast_unsubscribe(
+    handle: &PyContextHandle,
+    subscriber_did: &str,
+    rotate_keys: bool,
+) -> PyResult<()> {
+    validate::validate_did(subscriber_did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let did: scp_identity::DID = subscriber_did.to_owned().into();
+
+    rt.block_on(async move {
+        mgr.unsubscribe_broadcast(&context_id, &did, rotate_keys)
+            .await
+            .map_err(|e| PyRuntimeError::new_err(format!("broadcast unsubscribe failed: {e}")))?;
+        Ok(())
+    })
+}
+
+/// Publishes a message to a broadcast context.
+///
+/// The payload is encrypted with the author's broadcast key. The author's
+/// identity must have been previously created via `py_identity_create` so
+/// that the key custody provider and signing key handle are available.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the context is not active, not broadcast,
+/// the sender is not an author, or the identity is not registered.
+#[pyfunction]
+#[pyo3(signature = (handle, author_did, payload))]
+fn py_broadcast_publish(
+    handle: &PyContextHandle,
+    author_did: &str,
+    payload: Vec<u8>,
+) -> PyResult<()> {
+    validate::validate_did(author_did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let author_did_owned = author_did.to_owned();
+
+    crate::runtime::with_identity(&author_did_owned, |entry| {
+        let custody = entry.custody.clone();
+        let signing_key_handle = entry.identity.active_signing_key;
+        let did: scp_identity::DID = author_did_owned.clone().into();
+
+        rt.block_on(async move {
+            mgr.publish_broadcast(
+                &context_id,
+                &did,
+                &payload,
+                custody.as_ref(),
+                &signing_key_handle,
+            )
+            .await
+            .map_err(|e| {
+                crate::error::ScpPyError::context(format!("broadcast publish failed: {e}"))
+            })?;
+            Ok(())
+        })
+    })
+    .map_err(|e: crate::error::ScpPyError| -> PyErr { e.into() })
+}
+
+/// Blocks a subscriber's read access in a broadcast context.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the operation fails.
+#[pyfunction]
+#[pyo3(signature = (handle, subscriber_did, blocker_did))]
+fn py_broadcast_block_subscriber(
+    handle: &PyContextHandle,
+    subscriber_did: &str,
+    blocker_did: &str,
+) -> PyResult<()> {
+    validate::validate_did(subscriber_did)?;
+    validate::validate_did(blocker_did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let subscriber: scp_identity::DID = subscriber_did.to_owned().into();
+    let blocker: scp_identity::DID = blocker_did.to_owned().into();
+
+    rt.block_on(async move {
+        mgr.block_broadcast_subscriber(&context_id, &subscriber, &blocker)
+            .await
+            .map_err(|e| PyRuntimeError::new_err(format!("broadcast block failed: {e}")))?;
+        Ok(())
+    })
+}
+
+/// Handles a broadcast key request from a subscriber.
+///
+/// # Returns
+///
+/// A debug string describing the key request decision.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the operation fails.
+#[pyfunction]
+#[pyo3(signature = (handle, author_did, requester_did))]
+fn py_broadcast_handle_key_request(
+    handle: &PyContextHandle,
+    author_did: &str,
+    requester_did: &str,
+) -> PyResult<String> {
+    validate::validate_did(author_did)?;
+    validate::validate_did(requester_did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let author: scp_identity::DID = author_did.to_owned().into();
+    let requester: scp_identity::DID = requester_did.to_owned().into();
+
+    rt.block_on(async move {
+        let decision = mgr
+            .handle_broadcast_key_request(&context_id, &author, &requester)
+            .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("broadcast key request handling failed: {e}"))
+            })?;
+        Ok(format!("{decision:?}"))
+    })
+}
+
+/// Returns the number of broadcast subscribers for a context.
+///
+/// Returns `None` if the context is not registered or not a broadcast context.
+#[pyfunction]
+#[pyo3(signature = (handle,))]
+fn py_broadcast_subscriber_count(handle: &PyContextHandle) -> PyResult<Option<u64>> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let context_id = handle.context_id.clone();
+    Ok(rt
+        .block_on(mgr.broadcast_subscriber_count(&context_id))
+        .map(|n| n as u64))
+}
+
+/// Returns `True` if the given DID is a broadcast subscriber.
+#[pyfunction]
+#[pyo3(signature = (handle, did))]
+fn py_broadcast_is_subscriber(handle: &PyContextHandle, did: &str) -> PyResult<bool> {
+    validate::validate_did(did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let context_id = handle.context_id.clone();
+    Ok(rt.block_on(mgr.is_broadcast_subscriber(&context_id, did)))
+}
+
+/// Returns the broadcast admission policy for a context.
+///
+/// Returns the policy as a string: `"Open"` or `"Gated"`.
+/// Returns `None` if the context is not a broadcast context.
+#[pyfunction]
+#[pyo3(signature = (handle,))]
+fn py_broadcast_admission(handle: &PyContextHandle) -> PyResult<Option<String>> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let context_id = handle.context_id.clone();
+    Ok(rt
+        .block_on(mgr.broadcast_admission(&context_id))
+        .map(|a| format!("{a:?}")))
+}
+
+// ---------------------------------------------------------------------------
+// Membership query bridge (#369)
+// ---------------------------------------------------------------------------
+
+/// Returns the current member count for a context.
+///
+/// Returns `None` if the context is not registered.
+#[pyfunction]
+#[pyo3(signature = (handle,))]
+fn py_context_member_count(handle: &PyContextHandle) -> PyResult<Option<u64>> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let context_id = handle.context_id.clone();
+    Ok(rt.block_on(mgr.member_count(&context_id)).map(|n| n as u64))
+}
+
+/// Returns `True` if the given DID is a member of the context.
+#[pyfunction]
+#[pyo3(signature = (handle, did))]
+fn py_context_is_member(handle: &PyContextHandle, did: &str) -> PyResult<bool> {
+    validate::validate_did(did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let context_id = handle.context_id.clone();
+    Ok(rt.block_on(mgr.is_member(&context_id, did)))
+}
+
+/// Returns all member DIDs for a context.
+#[pyfunction]
+#[pyo3(signature = (handle,))]
+fn py_context_member_dids(handle: &PyContextHandle) -> PyResult<Vec<String>> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let context_id = handle.context_id.clone();
+    Ok(rt.block_on(mgr.member_dids(&context_id)))
+}
+
+/// Returns the role assignment for a specific member as a debug string.
+///
+/// Returns `None` if the member is not found or the context is not registered.
+#[pyfunction]
+#[pyo3(signature = (handle, did))]
+fn py_context_member_role(handle: &PyContextHandle, did: &str) -> PyResult<Option<String>> {
+    validate::validate_did(did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let context_id = handle.context_id.clone();
+    Ok(rt
+        .block_on(mgr.member_role(&context_id, did))
+        .map(|r| format!("{r:?}")))
+}
+
+// ---------------------------------------------------------------------------
+// Events bridge (#369)
+// ---------------------------------------------------------------------------
+
+/// Drains all pending events from the context's receive buffer.
+///
+/// Returns a list of event descriptions as debug strings. Returns empty
+/// if the context is not registered.
+#[pyfunction]
+#[pyo3(signature = (handle,))]
+fn py_context_drain_events(handle: &PyContextHandle) -> PyResult<Vec<String>> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    Ok(rt
+        .block_on(mgr.drain_events(&context_id))
+        .into_iter()
+        .map(|e| format!("{e:?}"))
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// TTL bridge (#369)
+// ---------------------------------------------------------------------------
+
+/// Handles TTL expiry for a context.
+///
+/// Transitions from `Active` to `Expired`, destroys keys per memory scope.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the context is not active.
+#[pyfunction]
+#[pyo3(signature = (handle,))]
+fn py_context_handle_ttl_expiry(handle: &PyContextHandle) -> PyResult<()> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let core_params = build_core_context_params(&handle.params);
+
+    rt.block_on(async move {
+        let core_handle = scp_core::context::ContextHandle::new(context_id, core_params);
+        let _ = core_handle
+            .transition_to(&scp_core::context::ContextState::Active)
+            .await;
+        mgr.handle_ttl_expiry(&core_handle)
+            .await
+            .map_err(|e| PyRuntimeError::new_err(format!("TTL expiry handling failed: {e}")))?;
+        Ok::<(), PyErr>(())
+    })?;
+
+    // Update FFI handle state to reflect expiry.
+    let mut state = handle
+        .state
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
+    "expired".clone_into(&mut state);
+
+    Ok(())
+}
+
+/// Proposes a TTL extension. Records consent from the given member.
+///
+/// Returns `True` if all members have consented (unanimous approval).
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the context is not registered or the member
+/// is not found.
+#[pyfunction]
+#[pyo3(signature = (handle, member_did, proposed_seconds))]
+fn py_context_propose_ttl_extension(
+    handle: &PyContextHandle,
+    member_did: &str,
+    proposed_seconds: u64,
+) -> PyResult<bool> {
+    validate::validate_did(member_did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let did: scp_identity::DID = member_did.to_owned().into();
+    let duration = std::time::Duration::from_secs(proposed_seconds);
+
+    rt.block_on(async move {
+        mgr.propose_ttl_extension(&context_id, &did, duration)
+            .await
+            .map_err(|e| PyRuntimeError::new_err(format!("TTL extension proposal failed: {e}")))
+    })
+}
+
+/// Resets the TTL timer after a successful unanimous extension.
+///
+/// Cancels the old timer and spawns a new one with the given duration.
+#[pyfunction]
+#[pyo3(signature = (handle, new_seconds))]
+fn py_context_reset_ttl_timer(handle: &PyContextHandle, new_seconds: u64) -> PyResult<()> {
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let context_id = handle.context_id.clone();
+    let core_params = build_core_context_params(&handle.params);
+
+    rt.block_on(async move {
+        let core_handle = scp_core::context::ContextHandle::new(context_id.clone(), core_params);
+        let _ = core_handle
+            .transition_to(&scp_core::context::ContextState::Active)
+            .await;
+        let duration = std::time::Duration::from_secs(new_seconds);
+        mgr.reset_ttl_timer(&context_id, duration, core_handle)
+            .await;
+    });
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,6 +2084,32 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_context_close, m)?)?;
     m.add_function(wrap_pyfunction!(py_context_send, m)?)?;
     m.add_function(wrap_pyfunction!(py_context_receive, m)?)?;
+    m.add_function(wrap_pyfunction!(py_set_economic_policy, m)?)?;
+    m.add_function(wrap_pyfunction!(py_get_economic_policy, m)?)?;
+    m.add_function(wrap_pyfunction!(py_context_export, m)?)?;
+    m.add_function(wrap_pyfunction!(py_context_import, m)?)?;
+    // Governance (#369)
+    m.add_function(wrap_pyfunction!(py_governance_execute, m)?)?;
+    // Broadcast (#369)
+    m.add_function(wrap_pyfunction!(py_broadcast_subscribe, m)?)?;
+    m.add_function(wrap_pyfunction!(py_broadcast_unsubscribe, m)?)?;
+    m.add_function(wrap_pyfunction!(py_broadcast_publish, m)?)?;
+    m.add_function(wrap_pyfunction!(py_broadcast_block_subscriber, m)?)?;
+    m.add_function(wrap_pyfunction!(py_broadcast_handle_key_request, m)?)?;
+    m.add_function(wrap_pyfunction!(py_broadcast_subscriber_count, m)?)?;
+    m.add_function(wrap_pyfunction!(py_broadcast_is_subscriber, m)?)?;
+    m.add_function(wrap_pyfunction!(py_broadcast_admission, m)?)?;
+    // Membership (#369)
+    m.add_function(wrap_pyfunction!(py_context_member_count, m)?)?;
+    m.add_function(wrap_pyfunction!(py_context_is_member, m)?)?;
+    m.add_function(wrap_pyfunction!(py_context_member_dids, m)?)?;
+    m.add_function(wrap_pyfunction!(py_context_member_role, m)?)?;
+    // Events (#369)
+    m.add_function(wrap_pyfunction!(py_context_drain_events, m)?)?;
+    // TTL (#369)
+    m.add_function(wrap_pyfunction!(py_context_handle_ttl_expiry, m)?)?;
+    m.add_function(wrap_pyfunction!(py_context_propose_ttl_extension, m)?)?;
+    m.add_function(wrap_pyfunction!(py_context_reset_ttl_timer, m)?)?;
     Ok(())
 }
 
@@ -1597,5 +2618,63 @@ mod tests {
         assert_eq!(handle.promotion_policy(), "no_promotion");
         assert!(handle.template_id().is_none());
         assert!(handle.economic_policy().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Economic policy bridge tests (#334)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn set_economic_policy_valid_json() {
+        let mut handle = PyContextHandle::new(
+            "ctx-econ-1".to_owned(),
+            "did:test:creator".to_owned(),
+            default_params(),
+        );
+        assert!(handle.params.economic_policy.is_none());
+
+        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":1,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
+        py_set_economic_policy(&mut handle, json).unwrap();
+        assert_eq!(handle.params.economic_policy.as_deref(), Some(json));
+    }
+
+    #[test]
+    fn set_economic_policy_invalid_json_rejects() {
+        let mut handle = PyContextHandle::new(
+            "ctx-econ-2".to_owned(),
+            "did:test:creator".to_owned(),
+            default_params(),
+        );
+
+        let result = py_set_economic_policy(&mut handle, "not valid json");
+        assert!(result.is_err());
+        // Original value should be unchanged.
+        assert!(handle.params.economic_policy.is_none());
+    }
+
+    #[test]
+    fn get_economic_policy_none() {
+        let handle = PyContextHandle::new(
+            "ctx-econ-3".to_owned(),
+            "did:test:creator".to_owned(),
+            default_params(),
+        );
+        let result = py_get_economic_policy(&handle);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn get_economic_policy_some() {
+        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":1,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
+        let handle = PyContextHandle::new(
+            "ctx-econ-4".to_owned(),
+            "did:test:creator".to_owned(),
+            PyContextParams {
+                economic_policy: Some(json.to_owned()),
+                ..default_params()
+            },
+        );
+        let result = py_get_economic_policy(&handle);
+        assert_eq!(result.as_deref(), Some(json));
     }
 }

@@ -144,6 +144,18 @@
 - Sender key HPKE, nonce gen, wire format, routing_id (encrypted), participation signing key derivation all MISSING
 - Canonical serialization for signed structures (attestations, profiles, checkpoints) MISSING entirely
 
+### Phase 0/1 Production Readiness Review (2026-03-06)
+- Sender key protocol: JSON->MessagePack (to_vec_named) SOUND, all 4 serialization points + 25 test sites
+- HPKE domain separator: "scp-sender-key-hpke-v1" -> "scp-sender-key-v1" per spec. Prefix matches but full info param still incomplete (see spec-audit)
+- PRE-EXISTING HIGH: hpke_seal/hpke_open pass only domain prefix to HKDF info, NOT context_id||sender_did||epoch_bytes per spec 9.16.2. No AAD on AES-GCM. Tracked in spec-audit.
+- InnerEnvelope: deny_unknown_fields added, SOUND. Provenance nested struct lacks it (mitigated by provenance_hash). Sender key wire types also lack it.
+- ProtocolStore: to_vec -> to_vec_named SOUND, backward-compatible deserialization
+- Dedup cache TTL: 1h -> 24h per spec 9.8.2(b), SOUND
+- Wire format: 10 ref_id -> "ref" renames + event_type -> "type", comprehensive tests, SOUND
+- Conflict detection: RemoveMember same-target + RotateContentKeys self-conflict added, SOUND
+- [u8;16] nonce fields lack serde_bytes (integer array in msgpack, not binary blob) -- wire format interop risk
+- Block notification future-timestamp rejection added but no dedicated test for that code path
+
 ### Key Files
 - `crates/scp-core/src/event_log/tree.rs` -- Merkle tree, leaf/interior hashing
 - `crates/scp-core/src/event_log/proof.rs` -- inclusion/absence proofs

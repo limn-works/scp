@@ -39,11 +39,72 @@
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md` for the full specification.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use js_sys::Promise;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
 use crate::error::ScpWasmError;
+
+// ---------------------------------------------------------------------------
+// WASM-local identity registry
+// ---------------------------------------------------------------------------
+
+/// Per-identity state stored in the WASM-local registry.
+#[derive(Debug, Clone)]
+struct IdentityEntry {
+    /// Ed25519 public key bytes (32 bytes).
+    public_key_bytes: [u8; 32],
+    /// Custody type string. Retained for future use when custody operations
+    /// are wired (e.g., signing, key rotation).
+    #[allow(dead_code)]
+    custody_type: String,
+}
+
+thread_local! {
+    /// Maps DID strings to identity state. WASM is single-threaded, so
+    /// `RefCell` is sufficient.
+    static IDENTITY_REGISTRY: RefCell<HashMap<String, IdentityEntry>> =
+        RefCell::new(HashMap::new());
+}
+
+// ---------------------------------------------------------------------------
+// z-base-32 encoding (mirrors ucan.rs zbase32_encode)
+// ---------------------------------------------------------------------------
+
+/// Minimal z-base-32 encoder for did:dht DID derivation.
+///
+/// z-base-32 uses the alphabet `ybndrfg8ejkmcpqxot1uwisza345h769`.
+fn zbase32_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+
+    let mut bits: u64 = 0;
+    let mut bit_count: u32 = 0;
+    let mut output = String::new();
+
+    for &byte in input {
+        bits = (bits << 8) | u64::from(byte);
+        bit_count += 8;
+        while bit_count >= 5 {
+            bit_count -= 5;
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = ((bits >> bit_count) & 0x1f) as usize;
+            output.push(ALPHABET[idx] as char);
+            bits &= (1u64 << bit_count) - 1;
+        }
+    }
+
+    // Encode remaining bits (padded to 5 bits).
+    if bit_count > 0 {
+        #[allow(clippy::cast_possible_truncation)]
+        let idx = ((bits << (5 - bit_count)) & 0x1f) as usize;
+        output.push(ALPHABET[idx] as char);
+    }
+
+    output
+}
 
 // ---------------------------------------------------------------------------
 // WasmIdentity — opaque JS object for SCP identity
@@ -391,6 +452,144 @@ impl WasmDIDDocument {
 // ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
+
+/// Creates a new SCP identity.
+///
+/// Generates an Ed25519 keypair using the browser's cryptographic random
+/// number generator (`crypto.getRandomValues` via `getrandom/js`), derives
+/// a `did:dht` DID string from the public key, and returns a
+/// [`WasmIdentity`] handle.
+///
+/// # Arguments
+///
+/// * `custody` — The custody type string. Must be `"js_custody"` or
+///   `"in_memory"` for browser targets.
+///
+/// # Returns
+///
+/// `Promise<WasmIdentity>` — resolves to the newly created identity handle.
+///
+/// # Errors
+///
+/// - Rejects with `[SCP-IDENT-1000]` if key generation fails.
+/// - Rejects with `[SCP-IDENT-1004]` if the custody type is not supported.
+///
+/// See ADR-022 acceptance criterion 1.
+#[wasm_bindgen]
+pub fn identity_create(custody: String) -> Promise {
+    future_to_promise(async move {
+        if custody != "js_custody" && custody != "in_memory" {
+            return Err(ScpWasmError::Identity {
+                message: format!(
+                    "unsupported custody type {custody:?} — only \"js_custody\" and \"in_memory\" \
+                     are supported in the browser WASM bridge"
+                ),
+                code: "SCP-IDENT-1004".to_owned(),
+            }
+            .into_js()
+            .into());
+        }
+
+        // Generate Ed25519 keypair.
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let verifying_key = signing_key.verifying_key();
+        let pub_bytes = verifying_key.to_bytes();
+
+        // Derive did:dht DID from the public key using z-base-32 encoding.
+        let did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
+
+        // Store the signing key in the WASM-local identity registry so that
+        // identity_resolve can return the public key from the DID document.
+        IDENTITY_REGISTRY.with(|reg| {
+            let mut map = reg.borrow_mut();
+            map.insert(
+                did.clone(),
+                IdentityEntry {
+                    public_key_bytes: pub_bytes,
+                    custody_type: custody.clone(),
+                },
+            );
+        });
+
+        Ok(JsValue::from(WasmIdentity {
+            did,
+            custody_type: custody,
+            has_agent_key: false,
+            agent_public_key_multibase: None,
+        }))
+    })
+}
+
+/// Resolves a DID to its DID Document.
+///
+/// For locally-created identities, returns a DID document with the Ed25519
+/// public key from the WASM-local identity registry. For unknown DIDs,
+/// returns a minimal document with just the DID ID (the TypeScript SDK
+/// performs full DHT resolution for remote DIDs).
+///
+/// # Arguments
+///
+/// * `did` — The DID string to resolve (e.g., `"did:dht:z6Mk..."`).
+///
+/// # Returns
+///
+/// `Promise<WasmDIDDocument>` — resolves to the DID document.
+///
+/// # Errors
+///
+/// Rejects with `[SCP-IDENT-1004]` if the DID method is not supported.
+///
+/// See ADR-022 acceptance criterion 1.
+#[wasm_bindgen]
+pub fn identity_resolve(did: String) -> Promise {
+    future_to_promise(async move {
+        if !did.starts_with("did:dht:") {
+            return Err(ScpWasmError::Identity {
+                message: format!("unsupported DID method in {did:?} — only did:dht is supported"),
+                code: "SCP-IDENT-1004".to_owned(),
+            }
+            .into_js()
+            .into());
+        }
+
+        // Look up in the local identity registry.
+        let entry = IDENTITY_REGISTRY.with(|reg| {
+            let map = reg.borrow();
+            map.get(&did).cloned()
+        });
+
+        let (verification_methods_json, authentication_json, assertion_methods_json) =
+            if let Some(entry) = entry {
+                // Build a verification method from the stored public key.
+                let multibase_key = format!("z{}", zbase32_encode(&entry.public_key_bytes));
+                let vm = serde_json::json!([{
+                    "id": format!("{did}#0"),
+                    "type": "Ed25519VerificationKey2020",
+                    "controller": did,
+                    "publicKeyMultibase": multibase_key,
+                }]);
+                let auth = serde_json::json!([format!("{did}#0")]);
+                let assertion = serde_json::json!([format!("{did}#0")]);
+                (
+                    serde_json::to_string(&vm).unwrap_or_else(|_| "[]".to_owned()),
+                    serde_json::to_string(&auth).unwrap_or_else(|_| "[]".to_owned()),
+                    serde_json::to_string(&assertion).unwrap_or_else(|_| "[]".to_owned()),
+                )
+            } else {
+                // Unknown DID — return minimal document.
+                ("[]".to_owned(), "[]".to_owned(), "[]".to_owned())
+            };
+
+        Ok(JsValue::from(WasmDIDDocument::from_fields(
+            did,
+            verification_methods_json,
+            "[]".to_owned(),
+            "[]".to_owned(),
+            authentication_json,
+            assertion_methods_json,
+        )))
+    })
+}
 
 /// Loads an existing identity from a DID string.
 ///

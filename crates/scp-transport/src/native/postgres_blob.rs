@@ -281,6 +281,15 @@ impl BlobStorage for PostgresBlobStore {
         #[allow(clippy::cast_possible_truncation)]
         Ok(result.rows_affected() as usize)
     }
+
+    async fn count(&self) -> Result<usize, StorageError> {
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM blobs")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(format!("postgres count: {e}")))?;
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        Ok(row.0 as usize)
+    }
 }
 
 // ---------------------------------------------------------------------------

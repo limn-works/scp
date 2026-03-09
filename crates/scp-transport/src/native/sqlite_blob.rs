@@ -332,4 +332,13 @@ impl BlobStorage for SqliteBlobStore {
 
         Ok(rows_affected)
     }
+
+    async fn count(&self) -> Result<usize, StorageError> {
+        let conn = self.conn.lock().await;
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
+            .map_err(|e| StorageError::Internal(format!("sqlite count: {e}")))?;
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        Ok(count as usize)
+    }
 }

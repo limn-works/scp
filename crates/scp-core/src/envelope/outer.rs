@@ -34,8 +34,26 @@ use crate::crypto::sender_keys::encrypt::{decrypt_sender_layer, encrypt_sender_l
 /// They learn nothing about the sender, context, or message content.
 ///
 /// Binary fields use `serde_bytes` for efficient `MessagePack` encoding.
+/// The current SCP protocol version for outer envelopes.
+///
+/// See spec §13.2.3 for outer envelope versioning.
+pub const SCP_OUTER_ENVELOPE_VERSION: u16 = super::SCP_PROTOCOL_VERSION;
+
+/// Serde default for the `version` field on [`OuterEnvelope`].
+const fn default_outer_version() -> u16 {
+    super::SCP_PROTOCOL_VERSION
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OuterEnvelope {
+    /// Protocol version (§13.2.3). SCP/1.0 = `0x0100`.
+    /// Used for deserialization routing — tells the recipient which version's
+    /// deserializer to use. Since the outer envelope is unsigned, this is
+    /// purely informational.
+    #[serde(default = "default_outer_version")]
+    pub version: u16,
+
     /// Per-context pseudonym derived via `HMAC-SHA256`. Used as the routing
     /// key by relays. 32 bytes.
     #[serde(with = "serde_bytes")]
@@ -51,7 +69,8 @@ pub struct OuterEnvelope {
     pub blob_ttl: u32,
 
     /// The MLS-encrypted blob containing the serialized inner envelope.
-    #[serde(with = "serde_bytes")]
+    /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
+    #[serde(with = "crate::serde_util::serde_bounded_bytes")]
     pub encrypted_blob: Vec<u8>,
 }
 
@@ -89,6 +108,7 @@ pub fn create_outer_envelope(
     }
 
     Ok(OuterEnvelope {
+        version: super::SCP_PROTOCOL_VERSION,
         routing_id: routing_id.to_vec(),
         recipient_hint: recipient_hint.map(<[u8]>::to_vec),
         blob_ttl,
@@ -108,13 +128,55 @@ impl OuterEnvelope {
 
     /// Deserializes an outer envelope from `MessagePack` binary format.
     ///
+    /// Performs a pre-deserialization size check against
+    /// [`MAX_ENVELOPE_SIZE`] to reject obviously oversized inputs before the
+    /// deserializer allocates memory (#347). Individual fields are further
+    /// bounded by serde-level helpers (e.g., `serde_bounded_bytes` for
+    /// `encrypted_blob`).
+    ///
+    /// [`MAX_ENVELOPE_SIZE`]: crate::serde_util::MAX_ENVELOPE_SIZE
+    ///
     /// # Errors
     ///
+    /// Returns [`EnvelopeError::EnvelopeTooLarge`] if `bytes.len()` exceeds
+    /// `MAX_ENVELOPE_SIZE`.
     /// Returns [`EnvelopeError::DeserializationFailed`] if the bytes are not
     /// a valid `MessagePack`-encoded `OuterEnvelope`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, EnvelopeError> {
-        rmp_serde::from_slice(bytes)
-            .map_err(|e| EnvelopeError::DeserializationFailed(e.to_string()))
+        use crate::serde_util::MAX_ENVELOPE_SIZE;
+
+        if bytes.len() > MAX_ENVELOPE_SIZE {
+            return Err(EnvelopeError::EnvelopeTooLarge {
+                size: bytes.len(),
+                max: MAX_ENVELOPE_SIZE,
+            });
+        }
+        let envelope: Self = rmp_serde::from_slice(bytes)
+            .map_err(|e| EnvelopeError::DeserializationFailed(e.to_string()))?;
+        if envelope.version != SCP_OUTER_ENVELOPE_VERSION {
+            return Err(EnvelopeError::UnsupportedVersion {
+                version: envelope.version,
+            });
+        }
+        Ok(envelope)
+    }
+
+    /// Validates that this outer envelope's version field is supported (§13.2.3).
+    ///
+    /// Currently only SCP/1.0 (`0x0100`) is recognized. Call this after
+    /// deserialization to reject envelopes from incompatible protocol versions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvelopeError::UnsupportedVersion`] if `self.version` is not
+    /// `SCP_PROTOCOL_VERSION`.
+    pub const fn validate_version(&self) -> Result<(), EnvelopeError> {
+        if self.version != super::SCP_PROTOCOL_VERSION {
+            return Err(EnvelopeError::UnsupportedVersion {
+                version: self.version,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -178,9 +240,16 @@ pub fn seal_envelope(
     let serialized = rmp_serde::to_vec_named(inner)
         .map_err(|e| EnvelopeError::SerializationFailed(e.to_string()))?;
 
-    // 2. Encrypt with sender key (AES-256-GCM).
-    let sender_encrypted = encrypt_sender_layer(sender_key, &serialized)
-        .map_err(|e| EnvelopeError::SenderKeyEncryptionFailed(e.to_string()))?;
+    // 2. Encrypt with sender key (AES-256-GCM), binding context metadata as AAD.
+    let sender_encrypted = encrypt_sender_layer(
+        sender_key,
+        &serialized,
+        &inner.context_id,
+        &inner.sender_did,
+        inner.epoch,
+        inner.sequence,
+    )
+    .map_err(|e| EnvelopeError::SenderKeyEncryptionFailed(e.to_string()))?;
 
     // 3. Encrypt via MLS.
     let mls_message = encrypt(group, &sender_encrypted)
@@ -251,18 +320,48 @@ pub fn open_envelope(
     outer: &OuterEnvelope,
     group: &mut ScpMlsGroup,
     sender_key: &SenderKey,
+    context_id: &str,
+    sender_did: &str,
+    epoch: u64,
+    sequence: u64,
 ) -> Result<InnerEnvelope, EnvelopeError> {
     // 1. MLS decrypt and extract sender's signature key from MLS tree.
     let (mls_plaintext, sender_public_key) = decrypt_with_sender_key(group, &outer.encrypted_blob)
         .map_err(|e| EnvelopeError::MlsDecryptionFailed(e.to_string()))?;
 
-    // 2. Decrypt sender key layer (AES-256-GCM).
-    let plaintext = decrypt_sender_layer(sender_key, &mls_plaintext)
-        .map_err(|e| EnvelopeError::SenderKeyDecryptionFailed(e.to_string()))?;
+    // 2. Decrypt sender key layer (AES-256-GCM), verifying AAD binding.
+    let plaintext = decrypt_sender_layer(
+        sender_key,
+        &mls_plaintext,
+        context_id,
+        sender_did,
+        epoch,
+        sequence,
+    )
+    .map_err(|e| EnvelopeError::SenderKeyDecryptionFailed(e.to_string()))?;
 
-    // 3. Deserialize inner envelope.
+    // 3. Size-check then deserialize inner envelope (#347).
+    //    Defense in depth: reject oversized decrypted payloads before
+    //    deserializing. The BOUNDED_BYTES_MAX limit on `encrypted_blob`
+    //    bounds the decrypted size transitively, but we check explicitly.
+    {
+        use crate::serde_util::BOUNDED_BYTES_MAX;
+        if plaintext.len() > BOUNDED_BYTES_MAX {
+            return Err(EnvelopeError::EnvelopeTooLarge {
+                size: plaintext.len(),
+                max: BOUNDED_BYTES_MAX,
+            });
+        }
+    }
     let inner: InnerEnvelope = rmp_serde::from_slice(&plaintext)
         .map_err(|e| EnvelopeError::DeserializationFailed(e.to_string()))?;
+
+    // 3a. Reject unsupported protocol versions early (§13.2.1).
+    if inner.version != super::inner::SCP_INNER_ENVELOPE_VERSION {
+        return Err(EnvelopeError::UnsupportedVersion {
+            version: inner.version,
+        });
+    }
 
     // 4. Verify sender_did is a member of the MLS group.
     verify_sender_in_group(group, &inner.sender_did)?;
@@ -272,7 +371,7 @@ pub fn open_envelope(
 
     // 6. Verify content integrity: payload_hash == SHA-256(stripped_payload).
     let computed_hash = Sha256::digest(&stripped_payload);
-    if computed_hash.as_slice() != inner.payload_hash.as_slice() {
+    if computed_hash.as_slice() != &inner.payload_hash[..] {
         return Err(EnvelopeError::ContentIntegrityFailed);
     }
 
@@ -384,6 +483,42 @@ mod tests {
 
         assert!(restored.recipient_hint.is_none());
     }
+
+    /// #347: `from_bytes` rejects input exceeding `MAX_ENVELOPE_SIZE` before
+    /// invoking the deserializer.
+    #[test]
+    fn from_bytes_rejects_oversized_input() {
+        use crate::serde_util::MAX_ENVELOPE_SIZE;
+
+        let oversized = vec![0u8; MAX_ENVELOPE_SIZE + 1];
+        let result = OuterEnvelope::from_bytes(&oversized);
+        assert!(result.is_err());
+
+        let err_msg = format!("{result:?}");
+        assert!(
+            err_msg.contains("EnvelopeTooLarge"),
+            "error should be EnvelopeTooLarge, got: {err_msg}"
+        );
+    }
+
+    /// #347: `from_bytes` accepts input at exactly `MAX_ENVELOPE_SIZE` (the
+    /// size check is not off-by-one). The deserialization itself will fail
+    /// because the bytes are not valid `MessagePack`, but the size check passes.
+    #[test]
+    fn from_bytes_accepts_at_limit() {
+        use crate::serde_util::MAX_ENVELOPE_SIZE;
+
+        let at_limit = vec![0u8; MAX_ENVELOPE_SIZE];
+        let result = OuterEnvelope::from_bytes(&at_limit);
+        // Should fail with DeserializationFailed (invalid msgpack), not
+        // EnvelopeTooLarge.
+        assert!(result.is_err());
+        let err_msg = format!("{result:?}");
+        assert!(
+            err_msg.contains("DeserializationFailed"),
+            "should be DeserializationFailed at the limit, got: {err_msg}"
+        );
+    }
 }
 
 /// Integration tests for the high-level seal/open envelope operations.
@@ -403,7 +538,9 @@ mod seal_open_tests {
     use crate::crypto::mls::credential::ScpCredential;
     use crate::crypto::mls::group::{add_member, create_group, generate_key_package, join_group};
     use crate::crypto::sender_keys::generate_sender_key;
-    use crate::envelope::inner::{InnerEnvelopeParams, Provenance, create_inner_envelope};
+    use crate::envelope::inner::{
+        InnerEnvelopeParams, MessageType, Provenance, create_inner_envelope,
+    };
     use crate::envelope::padding::strip_padding;
     use crate::identity::SigningKeyId;
 
@@ -468,12 +605,14 @@ mod seal_open_tests {
 
         create_inner_envelope(
             &InnerEnvelopeParams {
+                version: crate::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: &scp_cred.did,
                 epoch: group.epoch().unwrap(),
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload,
                 provenance,
                 signing_key_id: SigningKeyId::Active,
@@ -493,12 +632,14 @@ mod seal_open_tests {
 
         create_inner_envelope(
             &InnerEnvelopeParams {
+                version: crate::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did,
                 epoch: 1,
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload,
                 provenance: None,
                 signing_key_id: SigningKeyId::Active,
@@ -603,7 +744,16 @@ mod seal_open_tests {
         .unwrap();
 
         // Open (Bob receives) — no sender_public_key needed (SCP-177).
-        let recovered = open_envelope(&outer, &mut bob_group, &sender_key).unwrap();
+        let recovered = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        )
+        .unwrap();
 
         // Verify all inner envelope fields match.
         assert_eq!(recovered.context_id, inner.context_id);
@@ -646,7 +796,16 @@ mod seal_open_tests {
             3600,
         )
         .unwrap();
-        let recovered = open_envelope(&outer, &mut bob_group, &sender_key).unwrap();
+        let recovered = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        )
+        .unwrap();
 
         assert_eq!(recovered.provenance, Some(provenance));
         assert_eq!(recovered.provenance_hash, inner.provenance_hash);
@@ -676,7 +835,15 @@ mod seal_open_tests {
 
         // Previously OpenMLS panicked on AEAD decryption failure; the
         // catch_unwind guard now converts the panic to an error.
-        let result = open_envelope(&outer, &mut bob_group, &sender_key);
+        let result = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        );
         assert!(
             result.is_err(),
             "open_envelope must reject tampered encrypted_blob"
@@ -708,12 +875,14 @@ mod seal_open_tests {
         // Create a legitimate inner envelope.
         let mut inner = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: crate::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: &scp_cred.did,
                 epoch: alice_group.epoch().unwrap(),
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload: b"original data",
                 provenance: None,
                 signing_key_id: SigningKeyId::Active,
@@ -726,7 +895,7 @@ mod seal_open_tests {
 
         // Tamper with payload_hash (this also breaks the signature, but
         // content integrity check runs first).
-        inner.payload_hash = vec![0xFF; 32];
+        inner.payload_hash = [0xFF; 32];
 
         let sender_key = generate_sender_key();
         let routing_id = [0xAA; 32];
@@ -740,7 +909,15 @@ mod seal_open_tests {
         )
         .unwrap();
 
-        let result = open_envelope(&outer, &mut bob_group, &sender_key);
+        let result = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        );
         assert!(
             result.is_err(),
             "open_envelope must reject mismatched payload_hash"
@@ -783,7 +960,15 @@ mod seal_open_tests {
         )
         .unwrap();
 
-        let result = open_envelope(&outer, &mut bob_group, &sender_key);
+        let result = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        );
         assert!(
             result.is_err(),
             "open_envelope must reject wrong sender public key"
@@ -814,11 +999,28 @@ mod seal_open_tests {
         .unwrap();
 
         // First open succeeds.
-        let _recovered = open_envelope(&outer, &mut bob_group, &sender_key).unwrap();
+        let _recovered = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        )
+        .unwrap();
 
         // Second open with same ciphertext should fail (MLS generation
         // number replay prevention).
-        let replay_result = open_envelope(&outer, &mut bob_group, &sender_key);
+        let replay_result = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        );
         assert!(
             replay_result.is_err(),
             "open_envelope must reject replayed ciphertext"
@@ -834,7 +1036,17 @@ mod seal_open_tests {
         let outer =
             create_outer_envelope(&routing_id, None, 3600, vec![0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
 
-        let result = open_envelope(&outer, &mut bob_group, &sender_key);
+        // AAD values are irrelevant: MLS decrypt fails on garbage before
+        // the sender key layer is reached.
+        let result = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            "ctx-1",
+            "did:dht:z6MkDummy",
+            0,
+            0,
+        );
         assert!(
             result.is_err(),
             "open_envelope must reject garbage encrypted_blob"
@@ -857,13 +1069,22 @@ mod seal_open_tests {
             3600,
         )
         .unwrap();
-        let recovered = open_envelope(&outer, &mut bob_group, &sender_key).unwrap();
+        let recovered = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        )
+        .unwrap();
 
         let stripped = strip_padding(&recovered.payload).unwrap();
         assert!(stripped.is_empty(), "empty payload should roundtrip");
 
         // Verify payload_hash matches SHA-256 of empty bytes.
-        let expected_hash = Sha256::digest(b"").to_vec();
+        let expected_hash: [u8; 32] = Sha256::digest(b"").into();
         assert_eq!(recovered.payload_hash, expected_hash);
     }
 
@@ -875,8 +1096,9 @@ mod seal_open_tests {
 
         let messages: &[&[u8]] = &[b"first", b"second", b"third"];
 
-        // Seal all messages.
+        // Seal all messages, keeping the inner envelopes for open_envelope AAD.
         let mut outers = Vec::new();
+        let mut inners = Vec::new();
         for msg in messages {
             let inner = create_test_inner(&alice_group, msg, None).await;
             let outer = seal_envelope(
@@ -889,11 +1111,22 @@ mod seal_open_tests {
             )
             .unwrap();
             outers.push(outer);
+            inners.push(inner);
         }
 
         // Open all messages in order.
         for (i, outer) in outers.iter().enumerate() {
-            let recovered = open_envelope(outer, &mut bob_group, &sender_key).unwrap();
+            let ref_inner = &inners[i];
+            let recovered = open_envelope(
+                outer,
+                &mut bob_group,
+                &sender_key,
+                &ref_inner.context_id,
+                &ref_inner.sender_did,
+                ref_inner.epoch,
+                ref_inner.sequence,
+            )
+            .unwrap();
             let stripped = strip_padding(&recovered.payload).unwrap();
             assert_eq!(
                 stripped, messages[i],
@@ -926,7 +1159,16 @@ mod seal_open_tests {
         .unwrap();
 
         // open_envelope resolves the sender key internally — no public key arg.
-        let recovered = open_envelope(&outer, &mut bob_group, &sender_key).unwrap();
+        let recovered = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        )
+        .unwrap();
         let stripped = strip_padding(&recovered.payload).unwrap();
         assert_eq!(stripped, b"internally resolved key test");
     }
@@ -947,12 +1189,14 @@ mod seal_open_tests {
 
         let inner = create_inner_envelope(
             &InnerEnvelopeParams {
+                version: crate::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
                 context_id: "ctx-1",
                 sender_did: "did:dht:z6MkNOBODY",
                 epoch: alice_group.epoch().unwrap(),
                 generation: 0,
                 sequence: 1,
                 timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
                 payload: b"from unknown sender",
                 provenance: None,
                 signing_key_id: SigningKeyId::Active,
@@ -976,7 +1220,15 @@ mod seal_open_tests {
         )
         .unwrap();
 
-        let result = open_envelope(&outer, &mut bob_group, &sender_key);
+        let result = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        );
         assert!(
             result.is_err(),
             "open_envelope must reject unknown sender DID"
@@ -1017,7 +1269,15 @@ mod seal_open_tests {
 
         // Open with a different sender key — MLS decryption succeeds, but
         // sender key decryption must fail.
-        let result = open_envelope(&outer, &mut bob_group, &wrong_sender_key);
+        let result = open_envelope(
+            &outer,
+            &mut bob_group,
+            &wrong_sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        );
         assert!(
             result.is_err(),
             "open_envelope must reject wrong sender key"
@@ -1051,7 +1311,15 @@ mod seal_open_tests {
         let serialized = rmp_serde::to_vec_named(&inner).unwrap();
 
         // Step 2: Encrypt with sender key.
-        let mut sender_encrypted = encrypt_sender_layer(&sender_key, &serialized).unwrap();
+        let mut sender_encrypted = encrypt_sender_layer(
+            &sender_key,
+            &serialized,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        )
+        .unwrap();
 
         // Step 3: Tamper with the sender-key ciphertext (flip a byte in
         // the encrypted portion, after the 12-byte nonce).
@@ -1068,7 +1336,15 @@ mod seal_open_tests {
 
         // Step 6: Try to open — MLS decryption succeeds, but sender key
         // authentication tag verification must fail.
-        let result = open_envelope(&outer, &mut bob_group, &sender_key);
+        let result = open_envelope(
+            &outer,
+            &mut bob_group,
+            &sender_key,
+            &inner.context_id,
+            &inner.sender_did,
+            inner.epoch,
+            inner.sequence,
+        );
         assert!(
             result.is_err(),
             "open_envelope must reject tampered sender-key ciphertext"
@@ -1118,6 +1394,10 @@ mod seal_open_tests {
                         &outer,
                         &mut bob_group,
                         &sender_key,
+                        &inner.context_id,
+                        &inner.sender_did,
+                        inner.epoch,
+                        inner.sequence,
                     ).unwrap();
 
                     let stripped = strip_padding(&recovered.payload).unwrap();

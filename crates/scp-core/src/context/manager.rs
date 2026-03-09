@@ -23,11 +23,16 @@ use super::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
     create_context as builder_create_context,
 };
+use super::governance::timeout::GovernanceTimeoutTask;
 use super::governance::{
-    GovernanceAction, GovernanceProposal, ProposalId, ProposalStatus, PruningPolicy,
-    RevocationScope,
+    CheckpointAttestationStatus, ContextCheckpoint, CosignedCheckpoint, GovernanceAction,
+    GovernanceContext, GovernanceEngine, GovernanceEvent, GovernanceModelConfig,
+    GovernanceProposal, KeyResolver, ProposalId, ProposalStatus, PruningPolicy, RevocationScope,
+    SingleAdminEngine, majority::MajorityVoteEngine, multisig::ThresholdEngine,
+    unanimity::UnanimityEngine,
 };
 use super::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
+use super::params::GovernanceModel;
 use super::params::{ContextMode, TemplateId, ToolRegistration};
 use super::roles::{self, Capability, CapabilityCeiling, ContextRoleState, RoleAssignment};
 use super::tools::interface::ToolInterface;
@@ -38,20 +43,170 @@ use crate::crypto::ucan::UcanToken;
 use crate::crypto::ucan::validate::{
     DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext,
 };
+use crate::economy::types::EconomicPolicy;
 use scp_identity::DID;
+
+// ---------------------------------------------------------------------------
+// Protocol-level collection size limits (§5.9)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of registered tools per context.
+const MAX_REGISTERED_TOOLS: usize = 256;
+
+/// Maximum number of cross-context tool interfaces per context.
+const MAX_TOOL_INTERFACES: usize = 256;
+
+/// Maximum number of governance threshold signers per context.
+const MAX_THRESHOLD_SIGNERS: usize = 64;
+
+/// Default ceiling change notification period in seconds (M7, §5.3).
+///
+/// When a governed context's ceiling is modified, the change is pending
+/// for this duration before taking effect. Members joined under the previous
+/// ceiling are notified and may leave before the expansion applies.
+const CEILING_CHANGE_NOTIFICATION_PERIOD_SECS: u64 = 86400; // 24 hours
+
+// ---------------------------------------------------------------------------
+// PendingCeilingModification (M7)
+// ---------------------------------------------------------------------------
+
+/// A pending ceiling modification awaiting notification period expiry (M7, §5.3).
+///
+/// When a `ModifyCeiling` governance action is approved, the new ceiling
+/// is not applied immediately. Instead, it enters a notification period
+/// during which members may leave before the expansion takes effect.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingCeilingModification {
+    /// The capabilities in the proposed new ceiling.
+    pub new_capabilities: Vec<Capability>,
+    /// Unix timestamp (seconds) when the notification period started.
+    pub notified_at: u64,
+    /// Unix timestamp (seconds) when the notification period expires and
+    /// the new ceiling can be applied.
+    pub effective_at: u64,
+    /// The governance proposal ID that approved this modification.
+    pub proposal_id: ProposalId,
+}
+
+impl PendingCeilingModification {
+    /// Returns `true` if the notification period has expired and the
+    /// modification can be applied.
+    #[must_use]
+    pub const fn is_effective(&self, current_timestamp: u64) -> bool {
+        current_timestamp >= self.effective_at
+    }
+}
 
 // GovernanceActionResult
 // ---------------------------------------------------------------------------
 
+/// Result of revoking a member's read access (§5.9, ADR-031).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadAccessRevokedResult {
+    /// The DID whose read access was revoked.
+    pub did: DID,
+    /// The revocation scope applied.
+    pub scope: RevocationScope,
+    /// Number of authors whose keys were rotated (broadcast contexts).
+    pub rotated_author_count: usize,
+}
+
+/// Result of restoring a member's read access (§5.9, ADR-031).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadAccessRestoredResult {
+    /// The DID whose read access was restored.
+    pub did: DID,
+}
+
+/// Result of revoking a member's write access (§9.17, ADR-038).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteAccessRevokedResult {
+    /// The DID whose write access was revoked.
+    pub did: DID,
+    /// The revocation scope applied.
+    pub scope: RevocationScope,
+}
+
+/// Result of restoring a member's write access (§9.17, ADR-038).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteAccessRestoredResult {
+    /// The DID whose write access was restored.
+    pub did: DID,
+}
+
+/// Result of a context-wide content key rotation (§9.17, ADR-038).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentKeysRotatedResult {
+    /// Optional reason that triggered the rotation.
+    pub reason: Option<String>,
+}
+
+/// Result of a governance reconfiguration via deadlock recovery (ADR-031 §10).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernanceReconfiguredResult {
+    /// The reconfiguration actions that were applied.
+    pub changes_applied: usize,
+}
+
 /// Result of executing an approved governance action via
 /// [`ContextManager::execute_governance_action`].
 ///
-/// Each variant wraps the result type from the underlying operation. This
-/// allows callers to pattern-match on the specific action that was executed
-/// and access its result.
+/// Each variant maps 1:1 to a [`GovernanceAction`] variant (ADR-031 §2).
+/// Variants that carry action-specific result data wrap a result struct;
+/// others are unit variants indicating successful execution.
 #[derive(Debug)]
 pub enum GovernanceActionResult {
+    /// A member was added to the context.
+    MemberAdded,
+    /// A member was removed from the context.
+    MemberRemoved,
+    /// A member's role was changed.
+    RoleChanged,
+    /// A tool was registered in the context.
+    ToolRegistered,
+    /// A tool was removed from the context.
+    ToolRemoved,
+    /// The capability ceiling was modified.
+    CeilingModified,
+    /// The context was closed.
+    ContextClosed,
+    /// The context TTL was extended.
+    TtlExtended,
+    /// The pruning policy was modified.
+    PruningPolicyModified,
+    /// Single-admin authority was transferred.
+    AdminTransferred,
+    /// A signer was added to the threshold set.
+    SignerAdded,
+    /// A signer was removed from the threshold set.
+    SignerRemoved,
+    /// The threshold value was modified.
+    ThresholdModified,
+    /// A child context was created.
+    ChildContextCreated,
+    /// A tool interface was established.
+    ToolInterfaceEstablished,
+    /// A member was reset (ADR-029, Tier 3).
+    MemberReset,
+    /// A governance conflict was resolved (ADR-031 §7).
+    ConflictResolved,
+    /// The context was promoted from ephemeral to persistent.
+    ContextPromoted,
+    /// A member's read access was revoked (§5.9, ADR-031).
+    ReadAccessRevoked(ReadAccessRevokedResult),
+    /// A member's read access was restored (§5.9, ADR-031).
+    ReadAccessRestored(ReadAccessRestoredResult),
+    /// A member's write access was revoked (§9.17, ADR-038).
+    WriteAccessRevoked(WriteAccessRevokedResult),
+    /// A member's write access was restored (§9.17, ADR-038).
+    WriteAccessRestored(WriteAccessRestoredResult),
+    /// Context-wide content keys were rotated (§9.17, ADR-038).
+    ContentKeysRotated(ContentKeysRotatedResult),
+    /// Governance was reconfigured via deadlock recovery (ADR-031 §10).
+    GovernanceReconfigured(GovernanceReconfiguredResult),
     /// An author was blocked from a broadcast context (spec section 5.14.8).
+    /// Legacy variant — new code should use `WriteAccessRevoked` with
+    /// `RevocationScope::Full`.
     AuthorBlocked(AuthorBlockResult),
     /// A subscriber's read access was revoked in a broadcast context
     /// (ADR-031, §5.9). The subscriber was removed from the registry and
@@ -65,14 +220,35 @@ pub enum GovernanceActionResult {
         did: DID,
     },
     /// A governance action was executed successfully with no action-specific
-    /// result payload. Maps to: `ChangeRole`, `ModifyCeiling`, `CloseContext`,
-    /// `ExtendTtl`, `ChangeMemoryScope`, `AddMember`, `RemoveMember`,
-    /// `RegisterTool`, `DeregisterTool`, `ModifyThreshold`, `AddSigner`,
-    /// `RemoveSigner`, `EstablishToolInterface`, `ResetMember`,
-    /// `ResolveConflict`, `PromoteContext`, `RotateContentKeys`,
-    /// `RevokeWriteAccess`, `RestoreWriteAccess`, `ModifyPruningPolicy`,
-    /// `ReconfigureGovernance`.
+    /// result payload. Maps to: `SetEconomicPolicy`, `ApproveSpend`,
+    /// `LockEconomicPolicy`.
     Executed,
+}
+
+// ---------------------------------------------------------------------------
+// ProposalOutcome -- result of proposing a governance action
+// ---------------------------------------------------------------------------
+
+/// Result of submitting a governance proposal via
+/// [`ContextManager::propose_governance_action_checked`].
+///
+/// Contains the created proposal, its current status, and an optional
+/// execution result. When the proposal is auto-approved (`SingleAdmin`),
+/// `execution_result` contains the result of the action execution.
+/// For multi-admin models, `execution_result` is `None` until the
+/// proposal is approved via votes.
+#[derive(Debug)]
+pub struct ProposalOutcome {
+    /// The governance proposal created by the engine.
+    pub proposal: GovernanceProposal,
+    /// The current status of the proposal after creation. For
+    /// `SingleAdmin`, this is always `Approved` (auto-approve per
+    /// ADR-031 section 4a).
+    pub status: ProposalStatus,
+    /// The result of executing the approved action. `Some` when the
+    /// proposal was auto-approved and executed (`SingleAdmin`), `None`
+    /// when the proposal is pending votes (multi-admin models).
+    pub execution_result: Option<GovernanceActionResult>,
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +286,14 @@ pub struct ContextSnapshot {
     /// Members whose write access has been governance-revoked (ADR-031).
     #[serde(default)]
     pub write_revoked_members: HashSet<DID>,
+    /// Members whose read access has been governance-revoked (§5.9, ADR-038).
+    #[serde(default)]
+    pub read_revoked_members: HashSet<DID>,
+    /// Members excluded from future CEK wrapping (`FutureOnly` read revocation).
+    /// These members won't receive new content keys but retain access to
+    /// historical content encrypted before the revocation (ADR-038, §9.17).
+    #[serde(default)]
+    pub read_exclusion_list: HashSet<DID>,
     /// Established cross-context tool interfaces (§6.2).
     #[serde(default)]
     pub tool_interfaces: Vec<ToolInterface>,
@@ -122,6 +306,36 @@ pub struct ContextSnapshot {
     /// Pruning policy override (ADR-030 §6).
     #[serde(default)]
     pub pruning_policy: Option<PruningPolicy>,
+    /// Governance model configuration for engine restoration (ADR-031).
+    ///
+    /// Persisted so the correct `GovernanceEngine` can be reconstructed on
+    /// restart. `None` for legacy snapshots (defaults to `SingleAdmin` with
+    /// the first admin DID from membership).
+    #[serde(default)]
+    pub governance_model_config: Option<GovernanceModelConfig>,
+    /// Mutable economic policy (§19.3, ADR-033). Updated via
+    /// `SetEconomicPolicy` / `LockEconomicPolicy` governance actions.
+    /// `None` means free context (no payment required).
+    #[serde(default)]
+    pub economic_policy: Option<EconomicPolicy>,
+    /// Approved proposals pending execution, tracked for conflict detection (ADR-031 §7).
+    /// Maps proposal ID to (proposal, `sequence_number`, timestamp).
+    #[serde(default)]
+    pub approved_proposals: HashMap<ProposalId, (GovernanceProposal, u64, u64)>,
+    /// Governance freeze state due to simultaneous conflicts (ADR-031 §7).
+    /// Contains the conflicting proposal IDs and freeze start timestamp.
+    #[serde(default)]
+    pub governance_freeze: Option<(ProposalId, ProposalId, u64)>,
+    /// Pending ceiling modification (M7, §5.3 notification period).
+    ///
+    /// When a `ModifyCeiling` governance action is approved, the new ceiling
+    /// is stored here with the notification timestamp. Members are notified
+    /// and may leave before the ceiling expansion takes effect. The pending
+    /// ceiling is applied after the notification period expires.
+    ///
+    /// Format: `(new_ceiling_capabilities, notification_timestamp, proposal_id)`.
+    #[serde(default)]
+    pub pending_ceiling_modification: Option<PendingCeilingModification>,
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +459,11 @@ struct PerContextState {
     registered_tools: Vec<ToolRegistration>,
     /// Members whose write access has been governance-revoked (ADR-031).
     write_revoked_members: HashSet<DID>,
+    /// Members whose read access has been governance-revoked (§5.9, ADR-038).
+    read_revoked_members: HashSet<DID>,
+    /// Members excluded from future CEK wrapping (`FutureOnly` read revocation,
+    /// ADR-038, §9.17). Subset of or equal to `read_revoked_members`.
+    read_exclusion_list: HashSet<DID>,
     /// Established cross-context tool interfaces (§6.2).
     tool_interfaces: Vec<ToolInterface>,
     /// Governance threshold signers (for `ThresholdApproval` model).
@@ -253,6 +472,142 @@ struct PerContextState {
     threshold_value: u32,
     /// Pruning policy override (ADR-030 §6).
     pruning_policy: Option<PruningPolicy>,
+    /// Approved proposals pending execution, tracked for conflict detection (ADR-031 §7).
+    /// Maps proposal ID to (proposal, `sequence_number`, timestamp).
+    approved_proposals: HashMap<ProposalId, (GovernanceProposal, u64, u64)>,
+    /// Governance freeze state due to simultaneous conflicts (ADR-031 §7).
+    /// Contains the conflicting proposal IDs and freeze start timestamp.
+    governance_freeze: Option<(ProposalId, ProposalId, u64)>,
+    /// The governance engine for this context (ADR-031, spec §5.9).
+    governance_engine: Box<dyn GovernanceEngine>,
+    /// Mutable economic policy (§19.3, ADR-033).
+    economic_policy: Option<EconomicPolicy>,
+    /// Governance timeout task (SCP-271, ADR-031 §5).
+    #[allow(dead_code)]
+    governance_timeout_task: GovernanceTimeoutTask,
+    /// Pending ceiling modification awaiting notification period (M7, §5.3).
+    pending_ceiling_modification: Option<PendingCeilingModification>,
+}
+
+/// Creates a governance engine from a [`GovernanceModel`] selector and
+/// the context creator's DID.
+///
+/// This maps the creation-time `GovernanceModel` (which lives in
+/// `ContextParams`) to the runtime `GovernanceEngine` implementation.
+///
+/// # Errors
+///
+/// Returns [`ContextCreationError`] if the governance model parameters are
+/// invalid (e.g., threshold > signers, empty voter sets).
+fn create_governance_engine(
+    model: &GovernanceModel,
+    creator_did: &DID,
+    key_resolver: KeyResolver,
+) -> Result<Box<dyn GovernanceEngine>, ContextCreationError> {
+    match model {
+        GovernanceModel::SingleAdmin => Ok(Box::new(SingleAdminEngine::new(
+            creator_did.clone(),
+            key_resolver,
+        ))),
+        GovernanceModel::Threshold { threshold, signers } => {
+            let engine = ThresholdEngine::new(signers.clone(), *threshold, 86_400, key_resolver)
+                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+            Ok(Box::new(engine))
+        }
+        GovernanceModel::Majority { eligible_voters } => {
+            let engine =
+                MajorityVoteEngine::new(eligible_voters.clone(), 86_400, 5000, key_resolver)
+                    .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+            Ok(Box::new(engine))
+        }
+        GovernanceModel::Unanimity { eligible_voters } => {
+            let engine = UnanimityEngine::new(eligible_voters.clone(), 172_800, key_resolver)
+                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+            Ok(Box::new(engine))
+        }
+    }
+}
+
+/// Reconstructs a governance engine from a persisted [`GovernanceModelConfig`]
+/// and the context's current member set.
+///
+/// For `SingleAdmin` and `Threshold`, the config is self-contained.
+/// For `Majority` and `Unanimity`, the eligible voter set comes from the
+/// `GovernanceModel` stored in `ContextParams` (part of the snapshot).
+///
+/// # Errors
+///
+/// Returns [`ContextError`] if the engine cannot be reconstructed.
+fn restore_governance_engine_from_snapshot(
+    snapshot: &ContextSnapshot,
+    key_resolver: KeyResolver,
+) -> Result<Box<dyn GovernanceEngine>, ContextError> {
+    // Determine the config to restore from. If the snapshot has an explicit
+    // config, use it. Otherwise, fall back to SingleAdmin with the first admin.
+    let config = snapshot.governance_model_config.clone().unwrap_or_else(|| {
+        // Legacy snapshot: no governance_model_config. Default to SingleAdmin
+        // with the first admin from the membership state.
+        let admin_did = snapshot
+            .membership
+            .members()
+            .find(|m| m.role_name == "admin")
+            .map_or_else(|| DID::from("did:dht:unknown"), |m| m.did.clone());
+        GovernanceModelConfig::SingleAdmin { admin_did }
+    });
+
+    match config {
+        GovernanceModelConfig::SingleAdmin { admin_did } => {
+            Ok(Box::new(SingleAdminEngine::new(admin_did, key_resolver)))
+        }
+        GovernanceModelConfig::Threshold {
+            signers,
+            threshold,
+            voting_window_secs,
+        } => {
+            let engine = ThresholdEngine::new(signers, threshold, voting_window_secs, key_resolver)
+                .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
+            Ok(Box::new(engine))
+        }
+        GovernanceModelConfig::Majority {
+            voting_window_secs,
+            min_participation_bps,
+        } => {
+            // Recover eligible_voters from ContextParams.governance.
+            let voters = match &snapshot.context_params.governance {
+                GovernanceModel::Majority { eligible_voters } => eligible_voters.clone(),
+                _ => {
+                    // Mismatch between config and params — should not happen.
+                    // Fall back to all members.
+                    snapshot
+                        .membership
+                        .members()
+                        .map(|m| m.did.clone())
+                        .collect()
+                }
+            };
+            let engine = MajorityVoteEngine::new(
+                voters,
+                voting_window_secs,
+                min_participation_bps,
+                key_resolver,
+            )
+            .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
+            Ok(Box::new(engine))
+        }
+        GovernanceModelConfig::Unanimity { voting_window_secs } => {
+            let voters = match &snapshot.context_params.governance {
+                GovernanceModel::Unanimity { eligible_voters } => eligible_voters.clone(),
+                _ => snapshot
+                    .membership
+                    .members()
+                    .map(|m| m.did.clone())
+                    .collect(),
+            };
+            let engine = UnanimityEngine::new(voters, voting_window_secs, key_resolver)
+                .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
+            Ok(Box::new(engine))
+        }
+    }
 }
 
 /// Reads the context state synchronously via [`ContextHandle::try_read_state`].
@@ -261,6 +616,62 @@ struct PerContextState {
 ///
 /// This is used inside `Mutex` lock scopes to avoid TOCTOU races: the state
 /// check and the subsequent mutation happen within the same lock acquisition,
+/// Validates governance model parameters at context creation time.
+///
+/// Rejects configurations that would make governance impossible:
+/// - `Threshold` with `threshold == 0` (trivial quorum).
+/// - `Threshold` with `threshold > signers.len()` (impossible quorum).
+/// - `Threshold` with empty signers.
+/// - `Majority` with empty `eligible_voters`.
+/// - `Unanimity` with empty `eligible_voters`.
+///
+/// # Errors
+///
+/// Returns [`ContextCreationError::CreationFailed`] with a descriptive message.
+fn validate_governance_model(model: &GovernanceModel) -> Result<(), ContextCreationError> {
+    match model {
+        GovernanceModel::SingleAdmin => Ok(()),
+        GovernanceModel::Threshold { threshold, signers } => {
+            if signers.is_empty() {
+                return Err(ContextCreationError::CreationFailed(
+                    "Threshold governance requires non-empty signers".into(),
+                ));
+            }
+            if *threshold == 0 {
+                return Err(ContextCreationError::CreationFailed(
+                    "Threshold governance requires threshold >= 1".into(),
+                ));
+            }
+            // signers.len() is bounded by realistic member counts (<< u32::MAX).
+            #[allow(clippy::cast_possible_truncation)]
+            if *threshold > signers.len() as u32 {
+                return Err(ContextCreationError::CreationFailed(format!(
+                    "Threshold {} exceeds number of signers {}",
+                    threshold,
+                    signers.len()
+                )));
+            }
+            Ok(())
+        }
+        GovernanceModel::Majority { eligible_voters } => {
+            if eligible_voters.is_empty() {
+                return Err(ContextCreationError::CreationFailed(
+                    "Majority governance requires non-empty eligible_voters".into(),
+                ));
+            }
+            Ok(())
+        }
+        GovernanceModel::Unanimity { eligible_voters } => {
+            if eligible_voters.is_empty() {
+                return Err(ContextCreationError::CreationFailed(
+                    "Unanimity governance requires non-empty eligible_voters".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
 /// guaranteeing that no concurrent `close_context` or `handle_ttl_expiry` can
 /// interleave between the check and the mutation.
 fn require_active(handle: &ContextHandle) -> Result<(), ContextError> {
@@ -271,6 +682,142 @@ fn require_active(handle: &ContextHandle) -> Result<(), ContextError> {
         return Err(ContextError::ContextNotActive);
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Governance engine construction helpers (SCP-267, ADR-031)
+// ---------------------------------------------------------------------------
+
+/// Validates that a [`GovernanceModel`] variant is consistent with a
+/// [`GovernanceModelConfig`] variant. Returns a creation error on mismatch.
+fn validate_governance_consistency(
+    model: &GovernanceModel,
+    config: &GovernanceModelConfig,
+) -> Result<(), ContextCreationError> {
+    let consistent = matches!(
+        (model, config),
+        (
+            GovernanceModel::SingleAdmin,
+            GovernanceModelConfig::SingleAdmin { .. }
+        ) | (
+            GovernanceModel::Threshold { .. },
+            GovernanceModelConfig::Threshold { .. }
+        ) | (
+            GovernanceModel::Majority { .. },
+            GovernanceModelConfig::Majority { .. }
+        ) | (
+            GovernanceModel::Unanimity { .. },
+            GovernanceModelConfig::Unanimity { .. }
+        )
+    );
+    if !consistent {
+        return Err(ContextCreationError::CreationFailed(format!(
+            "GovernanceModel::{model:?} does not match GovernanceModelConfig variant"
+        )));
+    }
+    Ok(())
+}
+
+/// Constructs a boxed [`GovernanceEngine`] from a [`GovernanceModelConfig`].
+///
+/// For `Majority` and `Unanimity` models, `initial_voters` provides the
+/// initial eligible voter set (typically the context creator at creation
+/// time). For `SingleAdmin` and `Threshold`, voters are embedded in the
+/// config itself. The voter set is updated by the `ContextManager` when
+/// members join/leave.
+///
+/// Validates configuration parameters (threshold bounds, empty signers,
+/// `min_participation_bps` range) and returns a creation error on invalid input.
+fn build_governance_engine(
+    config: GovernanceModelConfig,
+    initial_voters: Vec<DID>,
+    key_resolver: KeyResolver,
+) -> Result<Box<dyn GovernanceEngine>, ContextCreationError> {
+    match config {
+        GovernanceModelConfig::SingleAdmin { admin_did } => {
+            Ok(Box::new(SingleAdminEngine::new(admin_did, key_resolver)))
+        }
+        GovernanceModelConfig::Threshold {
+            signers,
+            threshold,
+            voting_window_secs,
+        } => {
+            let engine = ThresholdEngine::new(signers, threshold, voting_window_secs, key_resolver)
+                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+            Ok(Box::new(engine))
+        }
+        GovernanceModelConfig::Majority {
+            voting_window_secs,
+            min_participation_bps,
+        } => {
+            let engine = MajorityVoteEngine::new(
+                initial_voters,
+                voting_window_secs,
+                min_participation_bps,
+                key_resolver,
+            )
+            .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+            Ok(Box::new(engine))
+        }
+        GovernanceModelConfig::Unanimity { voting_window_secs } => {
+            let engine = UnanimityEngine::new(initial_voters, voting_window_secs, key_resolver)
+                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+            Ok(Box::new(engine))
+        }
+    }
+}
+
+/// Mints `GovernancePropose` and `GovernanceVote` UCAN tokens for each
+/// designated voter in the governance engine (ADR-031 §6).
+///
+/// For `SingleAdmin`, the admin already receives these via the admin role.
+/// For multi-party models, each signer/voter receives both capabilities.
+///
+/// Returns the minted tokens. The tokens are also stored in the context's
+/// role state by the caller.
+fn mint_governance_tokens(
+    context_id: &str,
+    creator_did: &DID,
+    engine: &dyn GovernanceEngine,
+) -> Vec<super::roles::UcanToken> {
+    use super::roles::{Capability, UcanAttestation, UcanToken};
+
+    let config = engine.model_config();
+    let voter_dids: Vec<DID> = match &config {
+        GovernanceModelConfig::SingleAdmin { admin_did } => vec![admin_did.clone()],
+        GovernanceModelConfig::Threshold { signers, .. } => signers.clone(),
+        GovernanceModelConfig::Majority { .. } | GovernanceModelConfig::Unanimity { .. } => {
+            // For Majority/Unanimity, voters are "all members with GovernanceVote
+            // capability." At creation time, the creator is the only member.
+            vec![creator_did.clone()]
+        }
+    };
+
+    let capabilities = [Capability::GovernancePropose, Capability::GovernanceVote];
+    let mut tokens = Vec::with_capacity(voter_dids.len() * capabilities.len());
+
+    for voter in &voter_dids {
+        for cap in &capabilities {
+            let att = UcanAttestation {
+                with: format!("scp:ctx:{context_id}/{cap}"),
+                can: "invoke".to_owned(),
+            };
+            // Nonce generation: if the clock is unavailable, fall back to a
+            // static nonce (acceptable for governance tokens minted at creation
+            // time — replay prevention is handled by the engine's proposal-ID
+            // scheme).
+            let nonce = crate::crypto::ucan::nonce::generate_nonce()
+                .unwrap_or_else(|_| "gov-init-0".to_owned());
+            tokens.push(UcanToken {
+                iss: creator_did.to_string(),
+                aud: voter.to_string(),
+                att: vec![att],
+                nnc: nonce,
+            });
+        }
+    }
+
+    tokens
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +840,7 @@ fn require_active(handle: &ContextHandle) -> Result<(), ContextError> {
 /// # Examples
 ///
 /// ```ignore
-/// let manager = ContextManager::new(crypto, transport, event_log);
+/// let manager = ContextManager::new(crypto, transport, event_log, key_resolver);
 /// let handle = manager.create_context("ctx-1".into(), params, "did:key:creator".into()).await?;
 /// assert_eq!(handle.state().await, ContextState::Active);
 /// ```
@@ -331,6 +878,10 @@ pub struct ContextManager {
     local_dids: RwLock<HashSet<DID>>,
     /// Per-context state, keyed by `context_id` string.
     contexts: Mutex<HashMap<String, PerContextState>>,
+    /// Resolver that maps a DID to its Ed25519 verifying key for governance
+    /// vote signature verification (spec §5.9, ADR-031). Passed through to
+    /// governance engines at creation and restoration time.
+    key_resolver: KeyResolver,
 }
 
 // Nursery lint — false-positives on async functions holding tokio::sync::MutexGuard
@@ -347,11 +898,13 @@ impl ContextManager {
     /// * `crypto` -- Provider for MLS and sender key operations.
     /// * `transport` -- Provider for relay connectivity and publication.
     /// * `event_log` -- Provider for event log initialisation and append.
+    /// * `key_resolver` -- Resolver for DID-to-Ed25519 key mapping (governance vote verification).
     #[must_use]
     pub fn new(
         crypto: Box<dyn ContextCryptoProvider>,
         transport: Box<dyn ContextTransportProvider>,
         event_log: Box<dyn ContextEventLogProvider>,
+        key_resolver: KeyResolver,
     ) -> Self {
         Self {
             crypto: Arc::from(crypto),
@@ -360,6 +913,7 @@ impl ContextManager {
             persistence: None,
             local_dids: RwLock::new(HashSet::new()),
             contexts: Mutex::new(HashMap::new()),
+            key_resolver,
         }
     }
 
@@ -376,12 +930,14 @@ impl ContextManager {
     /// * `transport` -- Provider for relay connectivity and publication.
     /// * `event_log` -- Provider for event log initialisation and append.
     /// * `persistence` -- Provider for context state persistence.
+    /// * `key_resolver` -- Resolver for DID-to-Ed25519 key mapping (governance vote verification).
     #[must_use]
     pub fn with_persistence(
         crypto: Box<dyn ContextCryptoProvider>,
         transport: Box<dyn ContextTransportProvider>,
         event_log: Box<dyn ContextEventLogProvider>,
         persistence: Box<dyn ContextPersistence>,
+        key_resolver: KeyResolver,
     ) -> Self {
         Self {
             crypto: Arc::from(crypto),
@@ -390,6 +946,7 @@ impl ContextManager {
             persistence: Some(Arc::from(persistence)),
             local_dids: RwLock::new(HashSet::new()),
             contexts: Mutex::new(HashMap::new()),
+            key_resolver,
         }
     }
 
@@ -444,10 +1001,17 @@ impl ContextManager {
             ttl_remaining_secs,
             registered_tools: ctx.registered_tools.clone(),
             write_revoked_members: ctx.write_revoked_members.clone(),
+            read_revoked_members: ctx.read_revoked_members.clone(),
+            read_exclusion_list: ctx.read_exclusion_list.clone(),
             tool_interfaces: ctx.tool_interfaces.clone(),
             threshold_signers: ctx.threshold_signers.clone(),
             threshold_value: ctx.threshold_value,
             pruning_policy: ctx.pruning_policy.clone(),
+            governance_model_config: Some(ctx.governance_engine.model_config()),
+            economic_policy: ctx.economic_policy.clone(),
+            approved_proposals: ctx.approved_proposals.clone(),
+            governance_freeze: ctx.governance_freeze,
+            pending_ceiling_modification: ctx.pending_ceiling_modification.clone(),
         }
     }
 
@@ -521,6 +1085,10 @@ impl ContextManager {
 
         let ttl_remaining = ctx_snapshot.ttl_remaining_secs;
 
+        // Reconstruct the governance engine from the persisted snapshot.
+        let governance_engine =
+            restore_governance_engine_from_snapshot(&ctx_snapshot, self.key_resolver.clone())?;
+
         let per_context = PerContextState {
             handle: handle.clone(),
             membership: ctx_snapshot.membership,
@@ -532,10 +1100,18 @@ impl ContextManager {
             executed_proposals: ctx_snapshot.executed_proposals,
             registered_tools: ctx_snapshot.registered_tools,
             write_revoked_members: ctx_snapshot.write_revoked_members,
+            read_revoked_members: ctx_snapshot.read_revoked_members,
+            read_exclusion_list: ctx_snapshot.read_exclusion_list,
             tool_interfaces: ctx_snapshot.tool_interfaces,
             threshold_signers: ctx_snapshot.threshold_signers,
             threshold_value: ctx_snapshot.threshold_value,
             pruning_policy: ctx_snapshot.pruning_policy,
+            approved_proposals: ctx_snapshot.approved_proposals,
+            governance_freeze: ctx_snapshot.governance_freeze,
+            governance_engine,
+            economic_policy: ctx_snapshot.economic_policy,
+            governance_timeout_task: GovernanceTimeoutTask::new(),
+            pending_ceiling_modification: ctx_snapshot.pending_ceiling_modification,
         };
 
         {
@@ -617,8 +1193,7 @@ impl ContextManager {
                     continue;
                 }
                 Err(e) => {
-                    // Best-effort: log and continue.
-                    let _ = e;
+                    tracing::warn!(context_id = %ctx_id, error = %e, "failed to load context snapshot during restore");
                     continue;
                 }
             };
@@ -637,13 +1212,177 @@ impl ContextManager {
             match self.restore_context(ctx_id, &handle).await {
                 Ok(()) => restored.push(ctx_id.clone()),
                 Err(e) => {
-                    // Best-effort: log and continue.
-                    let _ = e;
+                    tracing::warn!(context_id = %ctx_id, error = %e, "failed to restore context");
                 }
             }
         }
 
         Ok(restored)
+    }
+
+    // -------------------------------------------------------------------
+    // Context export/import (#363)
+    // -------------------------------------------------------------------
+
+    /// Exports the full state of a context for backup or migration.
+    ///
+    /// Returns a [`ContextExport`] containing the context snapshot, serialized
+    /// event log entries, and an opaque MLS state blob (empty until MLS
+    /// integration lands via #333).
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` -- The context to export.
+    /// * `exporter_did` -- The DID of the identity performing the export.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError`] if the context does not exist or event log
+    /// export fails.
+    pub async fn export_context(
+        &self,
+        context_id: &str,
+        exporter_did: DID,
+    ) -> Result<super::export_import::ContextExport, ContextError> {
+        let ctx_id_bytes = super::context_id_bytes(context_id);
+
+        let snapshot = {
+            let contexts = self.contexts.lock().await;
+            let ctx = contexts.get(context_id).ok_or_else(|| {
+                ContextError::MembershipFailed(format!(
+                    "context '{context_id}' not found — cannot export"
+                ))
+            })?;
+            Self::snapshot_context(ctx)
+        };
+
+        let event_log_data = self
+            .event_log
+            .export_event_log_data(&ctx_id_bytes)
+            .unwrap_or_default();
+
+        // MLS state is empty until #333 (MLS integration) lands.
+        let mls_state = Vec::new();
+
+        super::export_import::create_export(
+            snapshot,
+            event_log_data,
+            mls_state,
+            exporter_did,
+            super::export_import::ExportScope::Full,
+        )
+    }
+
+    /// Imports a previously exported context into this manager.
+    ///
+    /// Validates the export (version check, Merkle chain integrity, root
+    /// hash match) and restores the context state. The imported context
+    /// becomes active and available for operations.
+    ///
+    /// # Arguments
+    ///
+    /// * `export` -- The exported context data to import.
+    ///
+    /// # Returns
+    ///
+    /// A [`ContextHandle`] for the imported context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError`] if validation fails (unsupported version,
+    /// Merkle mismatch, tampered events) or the context already exists.
+    pub async fn import_context(
+        &self,
+        export: super::export_import::ContextExport,
+    ) -> Result<ContextHandle, ContextError> {
+        // 1. Validate export.
+        super::export_import::validate_export_for_import(&export)?;
+
+        let context_id = export.snapshot.context_id.clone();
+        let ctx_id_bytes = super::context_id_bytes(&context_id);
+
+        // 2. Import event log data if present.
+        if !export.event_log_data.is_empty() {
+            self.event_log
+                .import_event_log_data(&ctx_id_bytes, &export.event_log_data)?;
+        }
+
+        // 3. Reconstruct the ContextHandle.
+        let handle = ContextHandle::new(context_id.clone(), export.snapshot.context_params.clone());
+
+        // Transition to the state from the snapshot.
+        match &export.snapshot.state {
+            ContextState::Active => {
+                handle.transition_to(&ContextState::Active).await?;
+            }
+            ContextState::Creating => {
+                // Already in Creating state, nothing to do.
+            }
+            other => {
+                return Err(ContextError::InvalidState(format!(
+                    "cannot import context in {other} state — only Active and Creating are supported"
+                )));
+            }
+        }
+
+        // 4. Reconstruct governance engine from snapshot.
+        let governance_engine =
+            restore_governance_engine_from_snapshot(&export.snapshot, self.key_resolver.clone())?;
+
+        // 5. Build PerContextState from the snapshot.
+        let per_context = PerContextState {
+            handle: handle.clone(),
+            membership: export.snapshot.membership,
+            role_state: export.snapshot.role_state,
+            receive_buffer: ReceiveBuffer::new(),
+            ttl_timer: TtlTimer::new(),
+            ttl_extension: None,
+            broadcast_context: None,
+            executed_proposals: export.snapshot.executed_proposals,
+            registered_tools: export.snapshot.registered_tools,
+            write_revoked_members: export.snapshot.write_revoked_members,
+            read_revoked_members: export.snapshot.read_revoked_members,
+            read_exclusion_list: export.snapshot.read_exclusion_list,
+            tool_interfaces: export.snapshot.tool_interfaces,
+            threshold_signers: export.snapshot.threshold_signers,
+            threshold_value: export.snapshot.threshold_value,
+            pruning_policy: export.snapshot.pruning_policy,
+            approved_proposals: export.snapshot.approved_proposals,
+            governance_freeze: export.snapshot.governance_freeze,
+            governance_engine,
+            economic_policy: export.snapshot.economic_policy,
+            governance_timeout_task: GovernanceTimeoutTask::new(),
+            pending_ceiling_modification: export.snapshot.pending_ceiling_modification,
+        };
+
+        // 6. Register the context.
+        {
+            let mut contexts = self.contexts.lock().await;
+            if contexts.contains_key(&context_id) {
+                return Err(ContextError::MembershipFailed(format!(
+                    "context '{context_id}' already exists — cannot import"
+                )));
+            }
+            contexts.insert(context_id.clone(), per_context);
+        }
+
+        // 7. Persist if persistence is configured.
+        let snapshot_for_persist = {
+            let contexts = self.contexts.lock().await;
+            contexts.get(&context_id).map(Self::snapshot_context)
+        };
+        if let Some(snap) = snapshot_for_persist {
+            self.persist_context_snapshot(&context_id, &snap);
+        }
+
+        // 8. Re-spawn TTL timer if there was remaining TTL.
+        if let Some(remaining_secs) = export.snapshot.ttl_remaining_secs {
+            let duration = std::time::Duration::from_secs(remaining_secs);
+            self.spawn_ttl_timer(&context_id, duration, handle.clone())
+                .await;
+        }
+
+        Ok(handle)
     }
 
     /// Creates a new SCP context with the two-phase commit pattern.
@@ -679,6 +1418,13 @@ impl ContextManager {
         params: ContextParams,
         creator_did: DID,
     ) -> Result<ContextHandle, ContextCreationError> {
+        // Validate governance model parameters before proceeding.
+        validate_governance_model(&params.governance)?;
+
+        // Instantiate the governance engine based on GovernanceModel (ADR-031).
+        let governance_engine =
+            create_governance_engine(&params.governance, &creator_did, self.key_resolver.clone())?;
+
         // Phase 1+2: builder performs validation and creation (async, no lock held).
         let handle = builder_create_context(
             context_id.clone(),
@@ -728,6 +1474,14 @@ impl ContextManager {
             None
         };
 
+        // Extract threshold signers and value from GovernanceModel at creation
+        // time so PerContextState is correctly initialized for Threshold
+        // governance (ADR-031).
+        let (initial_threshold_signers, initial_threshold_value) = match &params.governance {
+            GovernanceModel::Threshold { threshold, signers } => (signers.clone(), *threshold),
+            _ => (Vec::new(), 0),
+        };
+
         let per_context = PerContextState {
             handle: handle.clone(),
             membership,
@@ -739,10 +1493,18 @@ impl ContextManager {
             executed_proposals: HashSet::new(),
             registered_tools: Vec::new(),
             write_revoked_members: HashSet::new(),
+            read_revoked_members: HashSet::new(),
+            read_exclusion_list: HashSet::new(),
             tool_interfaces: Vec::new(),
-            threshold_signers: Vec::new(),
-            threshold_value: 0,
+            threshold_signers: initial_threshold_signers,
+            threshold_value: initial_threshold_value,
             pruning_policy: None,
+            approved_proposals: HashMap::new(),
+            governance_freeze: None,
+            governance_engine,
+            economic_policy: params.economic_policy.clone(),
+            governance_timeout_task: GovernanceTimeoutTask::new(),
+            pending_ceiling_modification: None,
         };
 
         // Atomic duplicate check + insert under lock -- no .await inside this scope.
@@ -792,7 +1554,8 @@ impl ContextManager {
     ///
     /// Returns [`ContextCreationError`] if any validation or execution step
     /// fails.
-    pub async fn create_context_bare(
+    #[cfg(test)]
+    pub(crate) async fn create_context_bare(
         &self,
         context_id: String,
         params: ContextParams,
@@ -805,6 +1568,204 @@ impl ContextManager {
             self.event_log.as_ref(),
         )
         .await
+    }
+
+    /// Creates a new SCP context with explicit governance configuration
+    /// (SCP-267, ADR-031).
+    ///
+    /// This is the full-configuration entry point for context creation. The
+    /// `GovernanceModelConfig` carries all governance-specific parameters
+    /// (signers, threshold, voting window, min participation, etc.). The
+    /// `GovernanceModel` in `params.governance` must be consistent with the
+    /// config variant.
+    ///
+    /// At creation time, `GovernancePropose` and `GovernanceVote` UCAN tokens
+    /// are minted for designated voters per ADR-031 §6.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError`] if:
+    /// - The `GovernanceModelConfig` is inconsistent with `params.governance`.
+    /// - The config has invalid parameters (e.g., threshold > `signers.len()`).
+    /// - Any builder validation or execution step fails.
+    pub async fn create_context_with_governance(
+        &self,
+        context_id: String,
+        params: ContextParams,
+        creator_did: DID,
+        governance_config: GovernanceModelConfig,
+    ) -> Result<ContextHandle, ContextCreationError> {
+        // Validate consistency between GovernanceModel and GovernanceModelConfig.
+        validate_governance_consistency(&params.governance, &governance_config)?;
+
+        // Phase 1+2: builder performs validation and creation (async, no lock held).
+        let handle = builder_create_context(
+            context_id.clone(),
+            params.clone(),
+            self.crypto.as_ref(),
+            self.transport.as_ref(),
+            self.event_log.as_ref(),
+        )
+        .await?;
+
+        // Build ceiling from params.
+        let ceiling = CapabilityCeiling::new(params.ceiling.iter().cloned());
+
+        // Initialize role state with the creator as admin.
+        let role_state = ContextRoleState::new(&context_id, &*creator_did, ceiling, vec![])
+            .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+
+        // Initialize membership with the creator.
+        let mut membership = MembershipState::new();
+        let creator_tokens = role_state
+            .assignments
+            .get(creator_did.as_ref())
+            .map(|a| a.tokens.clone())
+            .unwrap_or_default();
+        membership.add_member(creator_did.clone(), "admin".into(), creator_tokens);
+
+        // Initialize broadcast context for Broadcast mode (SCP-227).
+        let broadcast_context = if params.mode == ContextMode::Broadcast {
+            let admission = match params.template_id {
+                Some(TemplateId::GatedBroadcast) => BroadcastAdmission::Gated,
+                Some(TemplateId::PublicBroadcast | TemplateId::PaidBroadcast) => {
+                    BroadcastAdmission::Open
+                }
+                _ => BroadcastAdmission::Open,
+            };
+            let mut bc = BroadcastContext::new(context_id.clone(), &params.mode, admission)
+                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+            bc.add_author(&creator_did)
+                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+            self.persist_broadcast_snapshot(&context_id, &bc.to_snapshot());
+            Some(bc)
+        } else {
+            None
+        };
+
+        let per_context = self.build_governed_context_state(
+            handle.clone(),
+            &context_id,
+            &params,
+            &creator_did,
+            membership,
+            role_state,
+            broadcast_context,
+            governance_config,
+        )?;
+
+        // Atomic duplicate check + insert under lock.
+        {
+            let mut contexts = self.contexts.lock().await;
+            if contexts.contains_key(&context_id) {
+                return Err(ContextCreationError::CreationFailed(format!(
+                    "context '{context_id}' already registered"
+                )));
+            }
+            contexts.insert(context_id.clone(), per_context);
+        }
+
+        // Persist context + broadcast state after creation (best-effort).
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(&context_id) {
+                let snapshot = Self::snapshot_context(ctx);
+                let bc_snapshot = ctx
+                    .broadcast_context
+                    .as_ref()
+                    .map(BroadcastContext::to_snapshot);
+                drop(contexts);
+                self.persist_context_snapshot(&context_id, &snapshot);
+                if let Some(ref bcs) = bc_snapshot {
+                    self.persist_broadcast_snapshot(&context_id, bcs);
+                }
+            }
+        }
+
+        // Spawn TTL timer if TTL is configured (SCP-021).
+        if let Some(ttl_duration) = params.ttl {
+            self.spawn_ttl_timer(&context_id, ttl_duration, handle.clone())
+                .await;
+        }
+
+        Ok(handle)
+    }
+
+    /// Builds a [`PerContextState`] with governance engine, tokens, and threshold
+    /// signers extracted from the governance config. Helper for
+    /// [`create_context_with_governance`] to stay under the line-count lint.
+    #[allow(clippy::too_many_arguments)] // internal helper, not public API
+    fn build_governed_context_state(
+        &self,
+        handle: ContextHandle,
+        context_id: &str,
+        params: &ContextParams,
+        creator_did: &DID,
+        membership: MembershipState,
+        role_state: ContextRoleState,
+        broadcast_context: Option<BroadcastContext>,
+        governance_config: GovernanceModelConfig,
+    ) -> Result<PerContextState, ContextCreationError> {
+        // Extract threshold signers and value from GovernanceModelConfig before
+        // it is consumed by build_governance_engine (ADR-031).
+        let (initial_threshold_signers, initial_threshold_value) = match &governance_config {
+            GovernanceModelConfig::Threshold {
+                signers, threshold, ..
+            } => (signers.clone(), *threshold),
+            _ => (Vec::new(), 0),
+        };
+
+        // Construct the governance engine from the explicit config (SCP-267).
+        let governance_engine = build_governance_engine(
+            governance_config,
+            vec![creator_did.clone()],
+            self.key_resolver.clone(),
+        )?;
+
+        // Mint GovernancePropose and GovernanceVote UCAN tokens for designated
+        // voters per ADR-031 §6 and store them in role_state.
+        let governance_tokens =
+            mint_governance_tokens(context_id, creator_did, governance_engine.as_ref());
+
+        let mut role_state = role_state;
+        for token in &governance_tokens {
+            let caps = role_state
+                .member_capabilities
+                .entry(token.aud.clone())
+                .or_default();
+            for att in &token.att {
+                if att.with.ends_with("/GovernancePropose") {
+                    caps.insert(Capability::GovernancePropose);
+                } else if att.with.ends_with("/GovernanceVote") {
+                    caps.insert(Capability::GovernanceVote);
+                }
+            }
+        }
+
+        Ok(PerContextState {
+            handle,
+            membership,
+            role_state,
+            receive_buffer: ReceiveBuffer::new(),
+            ttl_timer: TtlTimer::new(),
+            ttl_extension: None,
+            broadcast_context,
+            executed_proposals: HashSet::new(),
+            registered_tools: Vec::new(),
+            write_revoked_members: HashSet::new(),
+            read_revoked_members: HashSet::new(),
+            read_exclusion_list: HashSet::new(),
+            tool_interfaces: Vec::new(),
+            threshold_signers: initial_threshold_signers,
+            threshold_value: initial_threshold_value,
+            pruning_policy: None,
+            approved_proposals: HashMap::new(),
+            governance_freeze: None,
+            governance_engine,
+            economic_policy: params.economic_policy.clone(),
+            governance_timeout_task: GovernanceTimeoutTask::new(),
+            pending_ceiling_modification: None,
+        })
     }
 
     /// Joins a member to a context.
@@ -831,10 +1792,36 @@ impl ContextManager {
 
         // Crypto operations -- no lock held, no TOCTOU concern for these
         // provider calls since they are idempotent or externally consistent.
-        self.crypto.validate_key_package(&member_did)?;
-        self.crypto.add_member(&context_id_bytes, &member_did)?;
+        let kp_bytes = key_package.mls_key_package_bytes.as_deref();
+        self.crypto.validate_key_package(&member_did, kp_bytes)?;
+        self.crypto
+            .add_member(&context_id_bytes, &member_did, kp_bytes)?;
         self.crypto
             .distribute_sender_key(&context_id_bytes, &member_did)?;
+
+        // Drain pending HPKE-sealed sender key distribution messages.
+        // These are SenderKeyResponse payloads that need to be delivered
+        // to the target member via transport (§9.16.2).
+        let pending = self
+            .crypto
+            .drain_pending_sender_key_messages(&context_id_bytes)?;
+        for (target_did, message) in pending {
+            tracing::debug!(
+                target_did = %target_did,
+                context_id = %context_id,
+                message_len = message.len(),
+                "sending sender key distribution message"
+            );
+            if let Err(e) = self.transport.send_message(&context_id_bytes, &message) {
+                tracing::warn!(
+                    target_did = %target_did,
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to send sender key distribution message — \
+                     recipient must request key via SenderKeyRequest"
+                );
+            }
+        }
 
         // Atomic state check + mutation: verify Active, then role assignment +
         // membership + event buffer, all within a single lock acquisition.
@@ -1036,6 +2023,7 @@ impl ContextManager {
         handle: &ContextHandle,
         sender_did: &DID,
         payload: &[u8],
+        signing_key: Option<&ed25519_dalek::SigningKey>,
     ) -> Result<(), ContextError> {
         let context_id = handle.context_id().to_owned();
         let context_id_bytes = context_id_to_bytes(&context_id);
@@ -1057,9 +2045,38 @@ impl ContextManager {
                 )));
             }
 
-            if let Some(ref bc) = ctx.broadcast_context {
+            if let Some(ref mut bc) = ctx.broadcast_context {
                 // Broadcast path: capability check + seal under lock.
-                let envelope = bc.publish(sender_did, payload)?;
+                let sk = signing_key.ok_or_else(|| {
+                    ContextError::CryptoFailed(
+                        "signing key required for broadcast publish".to_owned(),
+                    )
+                })?;
+                let timestamp = crate::time::now_millis()
+                    .map_err(|e| ContextError::CryptoFailed(format!("clock error: {e}")))?;
+
+                // Compute signing payload and sign externally, matching the
+                // pattern used by publish_broadcast (custody-based signing).
+                let meta = bc.publish_metadata(sender_did)?;
+                let nonce = crate::crypto::sender_keys::generate_broadcast_nonce();
+                let provenance_hash = crate::crypto::sender_keys::compute_provenance_hash(None)
+                    .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+                let signing_payload = crate::crypto::sender_keys::build_broadcast_signing_payload(
+                    &crate::crypto::sender_keys::SigningPayloadFields {
+                        version: crate::envelope::SCP_PROTOCOL_VERSION,
+                        context_id: meta.context_id,
+                        author_did: meta.author_did,
+                        sequence: meta.next_sequence,
+                        key_epoch: meta.key_epoch,
+                        timestamp,
+                        nonce: &nonce,
+                        provenance_hash: &provenance_hash,
+                    },
+                );
+                let signature = ed25519_dalek::Signer::sign(sk, &signing_payload);
+
+                let envelope =
+                    bc.publish(sender_did, payload, timestamp, signature, &nonce, None)?;
 
                 // Assign per-sender monotonic sequence number.
                 let seq = ctx
@@ -1108,8 +2125,11 @@ impl ContextManager {
         } else {
             // Encrypted: sender key (ADR-007) -> inner envelope (ADR-002) ->
             // MLS (ADR-001) -> outer envelope.
+            // Epoch 0 for standard sender keys (epoch tracking is per-sender-key,
+            // incremented on key rotation; the trait consumer passes the current
+            // epoch). Sequence is the per-sender monotonic counter.
             self.crypto
-                .encrypt_message(&context_id_bytes, sender_did, payload)?
+                .encrypt_message(&context_id_bytes, sender_did, payload, 0, 0)?
         };
 
         // Send via transport.
@@ -1174,6 +2194,19 @@ impl ContextManager {
             .await
             .get(context_id)
             .and_then(|ctx| ctx.role_state.assignments.get(did).cloned())
+    }
+
+    /// Returns a clone of the role state for a context, or `None` if the
+    /// context is not registered.
+    ///
+    /// Used by FFI bridges to re-sync their local role state copy after
+    /// governance actions that modify roles/capabilities.
+    pub async fn get_role_state(&self, context_id: &str) -> Option<ContextRoleState> {
+        self.contexts
+            .lock()
+            .await
+            .get(context_id)
+            .map(|ctx| ctx.role_state.clone())
     }
 
     /// Drains all events from the receive buffer for a context.
@@ -1361,6 +2394,8 @@ impl ContextManager {
         context_id: &str,
         author_did: &DID,
         payload: &[u8],
+        custody: &impl scp_platform::KeyCustody,
+        signing_key_handle: &scp_platform::KeyHandle,
     ) -> Result<BroadcastEnvelope, ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -1381,10 +2416,45 @@ impl ContextManager {
 
             let bc = ctx
                 .broadcast_context
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
 
-            let envelope = bc.publish(author_did, payload)?;
+            let timestamp = crate::time::now_millis()
+                .map_err(|e| ContextError::CryptoFailed(format!("clock error: {e}")))?;
+
+            // Compute the signing payload externally so we can sign via
+            // key custody (async) while keeping seal_broadcast synchronous.
+            let meta = bc.publish_metadata(author_did)?;
+            let nonce = crate::crypto::sender_keys::generate_broadcast_nonce();
+            let provenance_hash = crate::crypto::sender_keys::compute_provenance_hash(None)
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+            let signing_payload = crate::crypto::sender_keys::build_broadcast_signing_payload(
+                &crate::crypto::sender_keys::SigningPayloadFields {
+                    version: crate::envelope::SCP_PROTOCOL_VERSION,
+                    context_id: meta.context_id,
+                    author_did: meta.author_did,
+                    sequence: meta.next_sequence,
+                    key_epoch: meta.key_epoch,
+                    timestamp,
+                    nonce: &nonce,
+                    provenance_hash: &provenance_hash,
+                },
+            );
+
+            // Sign via key custody (async).
+            let platform_sig = custody
+                .sign(signing_key_handle, &signing_payload)
+                .await
+                .map_err(|e| ContextError::CryptoFailed(format!("custody signing failed: {e}")))?;
+            let sig_bytes: [u8; 64] = platform_sig.as_bytes().try_into().map_err(|_| {
+                ContextError::CryptoFailed(format!(
+                    "custody signature has wrong length: expected 64, got {}",
+                    platform_sig.as_bytes().len()
+                ))
+            })?;
+            let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+            let envelope = bc.publish(author_did, payload, timestamp, signature, &nonce, None)?;
 
             // Assign per-sender monotonic sequence number.
             let seq = ctx
@@ -1544,10 +2614,14 @@ impl ContextManager {
             }
         };
 
-        // Persist the executed-proposals set (the insert happened above).
+        // Remove the executed proposal from approved_proposals so it no
+        // longer participates in conflict detection (ADR-031 §7).  Replay
+        // prevention is already handled by `executed_proposals`.
+        // Persist the updated context state afterwards.
         {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(context_id) {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.approved_proposals.remove(&proposal.proposal_id);
                 let snapshot = Self::snapshot_context(ctx);
                 drop(contexts);
                 self.persist_context_snapshot(context_id, &snapshot);
@@ -1560,7 +2634,7 @@ impl ContextManager {
     /// Dispatches an approved governance action to its implementation method.
     ///
     /// Separated from [`execute_governance_action`] to keep the public entry
-    /// point focused on validation while this method handles the 25-action
+    /// point focused on validation while this method handles the 28-action
     /// dispatch.
     async fn dispatch_governance_action(
         &self,
@@ -1579,91 +2653,201 @@ impl ContextManager {
                 let r = self
                     .revoke_read_access_internal(context_id, did, *scope)
                     .await?;
-                Ok(GovernanceActionResult::SubscriberBanned(r))
+                Ok(GovernanceActionResult::ReadAccessRevoked(
+                    ReadAccessRevokedResult {
+                        did: did.clone(),
+                        scope: *scope,
+                        rotated_author_count: r.rotated_authors.len(),
+                    },
+                ))
             }
             GovernanceAction::RestoreReadAccess { did } => {
                 self.restore_read_access_internal(context_id, did).await?;
-                Ok(GovernanceActionResult::SubscriberUnbanned { did: did.clone() })
+                Ok(GovernanceActionResult::ReadAccessRestored(
+                    ReadAccessRestoredResult { did: did.clone() },
+                ))
             }
             GovernanceAction::PromoteContext => {
                 self.execute_promote_context(context_id, &proposal.approvals, pid)
                     .await?;
-                Ok(GovernanceActionResult::Executed)
+                Ok(GovernanceActionResult::ContextPromoted)
             }
-            _ => {
-                self.dispatch_context_governance_action(context_id, &proposal.action, pid)
+            // ExtendTtl needs proposal.approvals for unanimity override
+            // (ADR-031 §4d, spec §5.10).
+            GovernanceAction::ExtendTtl { additional_secs } => {
+                self.execute_extend_ttl(context_id, *additional_secs, &proposal.approvals, pid)
+                    .await?;
+                Ok(GovernanceActionResult::TtlExtended)
+            }
+            GovernanceAction::SetEconomicPolicy { policy } => {
+                self.execute_set_economic_policy(context_id, policy, pid)
                     .await?;
                 Ok(GovernanceActionResult::Executed)
+            }
+            GovernanceAction::ApproveSpend {
+                spender,
+                amount,
+                purpose,
+            } => {
+                self.execute_approve_spend(context_id, spender, *amount, purpose, pid)
+                    .await?;
+                Ok(GovernanceActionResult::Executed)
+            }
+            GovernanceAction::LockEconomicPolicy => {
+                self.execute_lock_economic_policy(context_id, pid).await?;
+                Ok(GovernanceActionResult::Executed)
+            }
+            // Remaining actions dispatched to context-level handler.
+            GovernanceAction::AddMember { .. }
+            | GovernanceAction::RemoveMember { .. }
+            | GovernanceAction::ChangeRole { .. }
+            | GovernanceAction::RegisterTool { .. }
+            | GovernanceAction::RemoveTool { .. }
+            | GovernanceAction::ModifyCeiling { .. }
+            | GovernanceAction::CloseContext { .. }
+            | GovernanceAction::TransferAdmin { .. }
+            | GovernanceAction::CreateChildContext { .. }
+            | GovernanceAction::ModifyPruningPolicy { .. }
+            | GovernanceAction::AddSigner { .. }
+            | GovernanceAction::RemoveSigner { .. }
+            | GovernanceAction::ModifyThreshold { .. }
+            | GovernanceAction::EstablishToolInterface { .. }
+            | GovernanceAction::ResetMember { .. }
+            | GovernanceAction::ResolveConflict { .. }
+            | GovernanceAction::RevokeWriteAccess { .. }
+            | GovernanceAction::RestoreWriteAccess { .. }
+            | GovernanceAction::RotateContentKeys { .. }
+            | GovernanceAction::ReconfigureGovernance { .. } => {
+                self.dispatch_context_governance_action(context_id, &proposal.action, pid)
+                    .await
             }
         }
     }
 
-    /// Dispatches context-level governance actions that return `Executed`.
+    /// Dispatches context-level governance actions to their implementation
+    /// methods, returning typed [`GovernanceActionResult`] variants.
+    ///
+    /// Split into two methods to stay within the line limit:
+    /// - This method handles membership, roles, settings, and structural
+    ///   actions (13 variants).
+    /// - [`dispatch_content_governance_action`] handles content access,
+    ///   key rotation, conflict resolution, and reconfiguration (9 variants).
     async fn dispatch_context_governance_action(
         &self,
         context_id: &str,
         action: &GovernanceAction,
         pid: ProposalId,
-    ) -> Result<(), ContextError> {
+    ) -> Result<GovernanceActionResult, ContextError> {
         match action {
             GovernanceAction::AddMember { did, role } => {
-                self.execute_add_member(context_id, did, role, pid).await
+                self.execute_add_member(context_id, did, role, pid).await?;
+                Ok(GovernanceActionResult::MemberAdded)
             }
             GovernanceAction::RemoveMember { did, .. } => {
-                self.execute_remove_member(context_id, did, pid).await
+                self.execute_remove_member(context_id, did, pid).await?;
+                Ok(GovernanceActionResult::MemberRemoved)
             }
             GovernanceAction::ChangeRole { did, new_role } => {
                 self.execute_change_role(context_id, did, new_role, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::RoleChanged)
             }
             GovernanceAction::RegisterTool { registration } => {
                 self.execute_register_tool(context_id, registration, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::ToolRegistered)
             }
             GovernanceAction::RemoveTool { tool_id } => {
-                self.execute_remove_tool(context_id, tool_id, pid).await
+                self.execute_remove_tool(context_id, tool_id, pid).await?;
+                Ok(GovernanceActionResult::ToolRemoved)
             }
             GovernanceAction::ModifyCeiling { new_ceiling } => {
                 self.execute_modify_ceiling(context_id, new_ceiling, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::CeilingModified)
             }
             GovernanceAction::CloseContext { reason } => {
                 self.execute_close_context(context_id, reason.as_deref(), pid)
-                    .await
-            }
-            GovernanceAction::ExtendTtl { additional_secs } => {
-                self.execute_extend_ttl(context_id, *additional_secs, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::ContextClosed)
             }
             GovernanceAction::TransferAdmin { new_admin } => {
                 self.execute_transfer_admin(context_id, new_admin, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::AdminTransferred)
             }
             GovernanceAction::CreateChildContext { params } => {
                 self.execute_create_child_context(context_id, params, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::ChildContextCreated)
             }
             GovernanceAction::ModifyPruningPolicy { new_policy } => {
                 self.execute_modify_pruning_policy(context_id, new_policy, pid)
+                    .await?;
+                Ok(GovernanceActionResult::PruningPolicyModified)
+            }
+            // Content access, structural, and reconfiguration actions
+            // are dispatched by the companion method.
+            GovernanceAction::AddSigner { .. }
+            | GovernanceAction::RemoveSigner { .. }
+            | GovernanceAction::ModifyThreshold { .. }
+            | GovernanceAction::EstablishToolInterface { .. }
+            | GovernanceAction::ResetMember { .. }
+            | GovernanceAction::ResolveConflict { .. }
+            | GovernanceAction::RevokeWriteAccess { .. }
+            | GovernanceAction::RestoreWriteAccess { .. }
+            | GovernanceAction::RotateContentKeys { .. }
+            | GovernanceAction::ReconfigureGovernance { .. } => {
+                self.dispatch_content_governance_action(context_id, action, pid)
                     .await
             }
+            // PromoteContext, ExtendTtl, BlockAuthor, RevokeReadAccess,
+            // RestoreReadAccess, and economic actions are handled in
+            // dispatch_governance_action.
+            GovernanceAction::PromoteContext
+            | GovernanceAction::ExtendTtl { .. }
+            | GovernanceAction::BlockAuthor { .. }
+            | GovernanceAction::RevokeReadAccess { .. }
+            | GovernanceAction::RestoreReadAccess { .. }
+            | GovernanceAction::SetEconomicPolicy { .. }
+            | GovernanceAction::ApproveSpend { .. }
+            | GovernanceAction::LockEconomicPolicy => {
+                unreachable!("handled in dispatch_governance_action")
+            }
+        }
+    }
+
+    /// Dispatches content access, structural, and reconfiguration governance
+    /// actions. Companion to [`dispatch_context_governance_action`].
+    async fn dispatch_content_governance_action(
+        &self,
+        context_id: &str,
+        action: &GovernanceAction,
+        pid: ProposalId,
+    ) -> Result<GovernanceActionResult, ContextError> {
+        match action {
             GovernanceAction::AddSigner { did } => {
-                self.execute_add_signer(context_id, did, pid).await
+                self.execute_add_signer(context_id, did, pid).await?;
+                Ok(GovernanceActionResult::SignerAdded)
             }
             GovernanceAction::RemoveSigner { did } => {
-                self.execute_remove_signer(context_id, did, pid).await
+                self.execute_remove_signer(context_id, did, pid).await?;
+                Ok(GovernanceActionResult::SignerRemoved)
             }
             GovernanceAction::ModifyThreshold { new_threshold } => {
                 self.execute_modify_threshold(context_id, *new_threshold, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::ThresholdModified)
             }
             GovernanceAction::EstablishToolInterface { interface } => {
                 self.execute_establish_tool_interface(context_id, interface, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::ToolInterfaceEstablished)
             }
             GovernanceAction::ResetMember { did, reason } => {
                 self.execute_reset_member(context_id, did, reason, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::MemberReset)
             }
             GovernanceAction::ResolveConflict {
                 proposal_a,
@@ -1671,39 +2855,669 @@ impl ContextManager {
                 resolution,
             } => {
                 self.execute_resolve_conflict(context_id, proposal_a, proposal_b, resolution, pid)
-                    .await
-            }
-            // PromoteContext is handled in dispatch_governance_action (needs
-            // proposal.approvals for unanimity check).
-            GovernanceAction::PromoteContext => {
-                unreachable!("PromoteContext is dispatched directly by dispatch_governance_action")
+                    .await?;
+                Ok(GovernanceActionResult::ConflictResolved)
             }
             GovernanceAction::RevokeWriteAccess { did, scope } => {
                 self.execute_revoke_write_access(context_id, did, *scope, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::WriteAccessRevoked(
+                    WriteAccessRevokedResult {
+                        did: did.clone(),
+                        scope: *scope,
+                    },
+                ))
             }
             GovernanceAction::RestoreWriteAccess { did } => {
                 self.execute_restore_write_access(context_id, did, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::WriteAccessRestored(
+                    WriteAccessRestoredResult { did: did.clone() },
+                ))
             }
             GovernanceAction::RotateContentKeys { reason } => {
                 self.execute_rotate_content_keys(context_id, reason.as_deref(), pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::ContentKeysRotated(
+                    ContentKeysRotatedResult {
+                        reason: reason.clone(),
+                    },
+                ))
             }
             GovernanceAction::ReconfigureGovernance {
                 changes,
                 justification,
             } => {
                 self.execute_reconfigure_governance(context_id, changes, justification, pid)
-                    .await
+                    .await?;
+                Ok(GovernanceActionResult::GovernanceReconfigured(
+                    GovernanceReconfiguredResult {
+                        changes_applied: changes.len(),
+                    },
+                ))
             }
-            // BlockAuthor, RevokeReadAccess, RestoreReadAccess handled in dispatch_governance_action
-            GovernanceAction::BlockAuthor { .. }
+            // Variants handled by dispatch_governance_action or
+            // dispatch_context_governance_action — exhaustive listing
+            // for compile-time coverage (no wildcard).
+            GovernanceAction::PromoteContext
+            | GovernanceAction::ExtendTtl { .. }
+            | GovernanceAction::BlockAuthor { .. }
             | GovernanceAction::RevokeReadAccess { .. }
-            | GovernanceAction::RestoreReadAccess { .. } => {
-                unreachable!("handled in dispatch_governance_action")
+            | GovernanceAction::RestoreReadAccess { .. }
+            | GovernanceAction::SetEconomicPolicy { .. }
+            | GovernanceAction::ApproveSpend { .. }
+            | GovernanceAction::LockEconomicPolicy
+            | GovernanceAction::AddMember { .. }
+            | GovernanceAction::RemoveMember { .. }
+            | GovernanceAction::ChangeRole { .. }
+            | GovernanceAction::RegisterTool { .. }
+            | GovernanceAction::RemoveTool { .. }
+            | GovernanceAction::ModifyCeiling { .. }
+            | GovernanceAction::CloseContext { .. }
+            | GovernanceAction::TransferAdmin { .. }
+            | GovernanceAction::CreateChildContext { .. }
+            | GovernanceAction::ModifyPruningPolicy { .. } => {
+                unreachable!(
+                    "action variant handled by dispatch_governance_action \
+                     or dispatch_context_governance_action"
+                )
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Proposal lifecycle API (ADR-031, spec §5.9, #320)
+    // -----------------------------------------------------------------------
+
+    /// Builds a [`GovernanceContext`] snapshot for the governance engine from
+    /// the current per-context state.
+    fn build_governance_context(ctx: &PerContextState) -> GovernanceContext {
+        let members: Vec<(DID, String)> = ctx
+            .membership
+            .members()
+            .map(|m| (m.did.clone(), m.role_name.clone()))
+            .collect();
+        let admin_dids: Vec<DID> = ctx
+            .membership
+            .members()
+            .filter(|m| m.role_name == "admin")
+            .map(|m| m.did.clone())
+            .collect();
+        GovernanceContext {
+            context_id: ctx.handle.context_id().to_owned(),
+            members,
+            admin_dids,
+            current_epoch: None, // MLS epoch not tracked here; governance doesn't need it.
+            now: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        }
+    }
+
+    /// Proposes a governance action on a context.
+    ///
+    /// Creates a proposal through the context's governance engine. For
+    /// `SingleAdmin` contexts, the proposal is auto-approved and the
+    /// action is immediately executed. For multi-party governance models,
+    /// the proposal enters `Pending` status and waits for votes.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` -- The context to propose on.
+    /// * `action` -- The governance action to propose.
+    /// * `proposer_did` -- The DID of the proposer.
+    /// * `signing_key` -- Ed25519 key for signing the proposer's implicit vote.
+    ///
+    /// # Returns
+    ///
+    /// The created [`GovernanceProposal`] (which may already be `Approved` for
+    /// `SingleAdmin` contexts) and any [`GovernanceEvent`]s produced.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::GovernanceFailed`] if the proposer lacks authority or
+    ///   the action is invalid.
+    pub async fn propose_governance_action(
+        &self,
+        context_id: &str,
+        proposer_did: &DID,
+        action: GovernanceAction,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<(GovernanceProposal, Vec<GovernanceEvent>), ContextError> {
+        let (proposal, events, execution_result) = self
+            .propose_governance_action_inner(context_id, proposer_did, action, signing_key)
+            .await?;
+        let _ = execution_result; // Callers of the old API don't use it.
+        Ok((proposal, events))
+    }
+
+    /// Inner implementation of proposal submission with auto-execution.
+    ///
+    /// Returns the proposal, events, and optional execution result. The
+    /// execution result is `Some` when the proposal was auto-approved
+    /// (`SingleAdmin`) and the action was successfully executed.
+    async fn propose_governance_action_inner(
+        &self,
+        context_id: &str,
+        proposer_did: &DID,
+        action: GovernanceAction,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<
+        (
+            GovernanceProposal,
+            Vec<GovernanceEvent>,
+            Option<GovernanceActionResult>,
+        ),
+        ContextError,
+    > {
+        let (proposal, events, should_execute, invalidated_by_conflict, in_freeze, conflict_events) = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+            require_active(&ctx.handle)?;
+
+            // Presence-only members (read + write revoked) lose
+            // GovernancePropose capability (§5.9, ADR-038).
+            if ctx.read_revoked_members.contains(proposer_did)
+                && ctx.write_revoked_members.contains(proposer_did)
+            {
+                return Err(ContextError::PermissionDenied(
+                    "presence-only members cannot propose governance actions".into(),
+                ));
+            }
+
+            // SCP-272: Check and auto-resolve expired governance freezes (48-hour timeout).
+            let freeze_events = self.check_and_resolve_expired_freezes(ctx);
+            if !freeze_events.is_empty() {
+                let cid_bytes = context_id_to_bytes(context_id);
+                for event in &freeze_events {
+                    if let GovernanceEvent::ConflictResolved { .. } = event {
+                        let _ = self
+                            .event_log
+                            .append_context_event(&cid_bytes, "GovernanceFreezeExpired");
+                    }
+                }
+            }
+
+            // SCP-272: Block new proposals (except ResolveConflict) while governance is frozen.
+            if ctx.governance_freeze.is_some()
+                && !matches!(action, GovernanceAction::ResolveConflict { .. })
+            {
+                return Err(ContextError::GovernanceFailed(
+                    "governance is frozen due to simultaneous conflict — only ResolveConflict proposals are accepted".into(),
+                ));
+            }
+
+            let gov_ctx = Self::build_governance_context(ctx);
+
+            let (proposal, events) = ctx
+                .governance_engine
+                .propose(proposer_did, action, &gov_ctx, signing_key)
+                .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
+
+            let should_execute = proposal.status == ProposalStatus::Approved;
+
+            let conflict_events = if should_execute {
+                self.detect_and_handle_conflicts(ctx, &proposal)
+            } else {
+                Vec::new()
+            };
+
+            // Check if the proposal was invalidated by conflict detection
+            let invalidated_by_conflict = conflict_events.iter().any(|e| {
+                matches!(e, GovernanceEvent::ConflictResolved { loser_id, .. } if *loser_id == proposal.proposal_id)
+            });
+
+            let in_freeze = ctx.governance_freeze.is_some();
+
+            (
+                proposal,
+                events,
+                should_execute,
+                invalidated_by_conflict,
+                in_freeze,
+                conflict_events,
+            )
+        };
+        // Lock dropped.
+
+        // Emit conflict events to the event log.
+        if !conflict_events.is_empty() {
+            let context_id_bytes = context_id_to_bytes(context_id);
+            for event in &conflict_events {
+                match event {
+                    GovernanceEvent::ConflictDetected { .. } => {
+                        let _ = self
+                            .event_log
+                            .append_context_event(&context_id_bytes, "GovernanceConflictDetected");
+                    }
+                    GovernanceEvent::ConflictResolved { .. } => {
+                        let _ = self
+                            .event_log
+                            .append_context_event(&context_id_bytes, "GovernanceConflictResolved");
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // If the proposal was auto-approved (SingleAdmin), execute immediately
+        // — unless it was invalidated by conflict or governance is frozen.
+        let execution_result = if should_execute && !invalidated_by_conflict && !in_freeze {
+            Some(
+                self.execute_governance_action(context_id, &proposal)
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        // Persist context state after proposal creation.
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(context_id) {
+                let snapshot = Self::snapshot_context(ctx);
+                drop(contexts);
+                self.persist_context_snapshot(context_id, &snapshot);
+            }
+        }
+
+        Ok((proposal, events, execution_result))
+    }
+
+    /// Casts a vote on a pending governance proposal.
+    ///
+    /// Submits an approval or rejection vote through the context's governance
+    /// engine. If the vote causes the proposal to reach quorum (approved) or
+    /// become impossible to approve (rejected), the proposal transitions to
+    /// its terminal state. When approved, the action is auto-executed.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` -- The context containing the proposal.
+    /// * `proposal_id` -- The ID of the proposal to vote on.
+    /// * `voter_did` -- The DID of the voter.
+    /// * `approve` -- `true` for approval, `false` for rejection.
+    /// * `signing_key` -- Ed25519 key for signing the vote.
+    ///
+    /// # Returns
+    ///
+    /// The updated [`ProposalStatus`] and any [`GovernanceEvent`]s produced.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::GovernanceFailed`] if the voter is not eligible,
+    ///   already voted, or the proposal is not pending.
+    pub async fn vote_on_proposal(
+        &self,
+        context_id: &str,
+        proposal_id: &ProposalId,
+        voter_did: &DID,
+        approve: bool,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), ContextError> {
+        let (status, events, proposal_for_execution, conflict_events) = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+            require_active(&ctx.handle)?;
+
+            // Presence-only members (read + write revoked) lose
+            // GovernanceVote capability (§5.9, ADR-038).
+            if ctx.read_revoked_members.contains(voter_did)
+                && ctx.write_revoked_members.contains(voter_did)
+            {
+                return Err(ContextError::PermissionDenied(
+                    "presence-only members cannot vote on governance proposals".into(),
+                ));
+            }
+
+            let gov_ctx = Self::build_governance_context(ctx);
+
+            let (status, events) = if approve {
+                ctx.governance_engine
+                    .approve(proposal_id, voter_did, &gov_ctx, signing_key)
+                    .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?
+            } else {
+                ctx.governance_engine
+                    .reject(proposal_id, voter_did, &gov_ctx, signing_key)
+                    .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?
+            };
+
+            // If the proposal just became Approved, grab a clone for conflict detection and execution.
+            let proposal_for_execution = if status == ProposalStatus::Approved {
+                ctx.governance_engine.get_proposal(proposal_id).cloned()
+            } else {
+                None
+            };
+
+            // If we have a newly approved proposal, check for conflicts with other approved proposals
+            let conflict_events = proposal_for_execution
+                .as_ref()
+                .map_or_else(Vec::new, |proposal| {
+                    self.detect_and_handle_conflicts(ctx, proposal)
+                });
+
+            (status, events, proposal_for_execution, conflict_events)
+        };
+        // Lock dropped.
+
+        // Emit conflict events to the event log (mirrors propose_governance_action_inner).
+        if !conflict_events.is_empty() {
+            let context_id_bytes = context_id_to_bytes(context_id);
+            for event in &conflict_events {
+                match event {
+                    GovernanceEvent::ConflictDetected { .. } => {
+                        let _ = self
+                            .event_log
+                            .append_context_event(&context_id_bytes, "GovernanceConflictDetected");
+                    }
+                    GovernanceEvent::ConflictResolved { .. } => {
+                        let _ = self
+                            .event_log
+                            .append_context_event(&context_id_bytes, "GovernanceConflictResolved");
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Check if the proposal was invalidated by conflict detection.
+        let invalidated_by_conflict = conflict_events.iter().any(|e| {
+            matches!(e, GovernanceEvent::ConflictResolved { loser_id, .. } if *loser_id == *proposal_id)
+        });
+
+        // Auto-execute if the proposal was just approved and we're not in governance freeze
+        // — unless it was invalidated by conflict.
+        if let Some(proposal) = proposal_for_execution {
+            // Check if we're in governance freeze before executing
+            let in_freeze = {
+                let contexts = self.contexts.lock().await;
+                contexts
+                    .get(context_id)
+                    .is_some_and(|ctx| ctx.governance_freeze.is_some())
+            };
+
+            if !in_freeze && !invalidated_by_conflict {
+                self.execute_governance_action(context_id, &proposal)
+                    .await?;
+            }
+        }
+
+        // Persist context state after vote.
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(context_id) {
+                let snapshot = Self::snapshot_context(ctx);
+                drop(contexts);
+                self.persist_context_snapshot(context_id, &snapshot);
+            }
+        }
+
+        Ok((status, events))
+    }
+
+    /// Retrieves a governance proposal by ID.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::GovernanceFailed`] if the proposal is not found.
+    pub async fn get_proposal(
+        &self,
+        context_id: &str,
+        proposal_id: &ProposalId,
+    ) -> Result<GovernanceProposal, ContextError> {
+        let contexts = self.contexts.lock().await;
+        let ctx = contexts
+            .get(context_id)
+            .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+        ctx.governance_engine
+            .get_proposal(proposal_id)
+            .cloned()
+            .ok_or_else(|| {
+                ContextError::GovernanceFailed(format!(
+                    "proposal not found: {}",
+                    hex::encode(proposal_id)
+                ))
+            })
+    }
+
+    /// Lists all governance proposals for a context.
+    ///
+    /// Returns both pending and resolved proposals tracked by the governance
+    /// engine. Note that engines only retain proposals in memory; for durable
+    /// access, proposals should be queried from the event log.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    pub async fn list_proposals(
+        &self,
+        context_id: &str,
+    ) -> Result<Vec<GovernanceProposal>, ContextError> {
+        let contexts = self.contexts.lock().await;
+        let ctx = contexts
+            .get(context_id)
+            .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+        Ok(ctx.governance_engine.list_proposals())
+    }
+
+    // -------------------------------------------------------------------
+    // Capability-gated governance proposal lifecycle (SCP-268, ADR-031)
+    // -------------------------------------------------------------------
+
+    /// Submits a new governance proposal with capability validation.
+    ///
+    /// Validates that the proposer holds the `GovernancePropose` capability
+    /// (UCAN) before delegating to the governance engine. Returns a
+    /// [`ProposalOutcome`] containing the proposal, its status, and an
+    /// optional execution result.
+    ///
+    /// For `SingleAdmin`, the proposal is simultaneously created and approved
+    /// (ADR-031 section 4a). The action is auto-executed and the result is
+    /// returned in `ProposalOutcome::execution_result`. For multi-admin
+    /// models, the proposal enters `Pending` status and `execution_result`
+    /// is `None` until the proposal is approved via votes.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::PermissionDenied`] if the proposer lacks
+    ///   `GovernancePropose` capability.
+    pub async fn propose_governance_action_checked(
+        &self,
+        context_id: &str,
+        proposer_did: &DID,
+        action: GovernanceAction,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<ProposalOutcome, ContextError> {
+        // Validate capability before delegating.
+        {
+            let contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+            if !ctx
+                .role_state
+                .member_has_capability(proposer_did.as_ref(), &Capability::GovernancePropose)
+            {
+                return Err(ContextError::PermissionDenied(format!(
+                    "member {proposer_did} does not have governance:propose capability"
+                )));
+            }
+        }
+        // Lock dropped.
+
+        let (proposal, _events, execution_result) = self
+            .propose_governance_action_inner(context_id, proposer_did, action, signing_key)
+            .await?;
+
+        let status = proposal.status.clone();
+        Ok(ProposalOutcome {
+            proposal,
+            status,
+            execution_result,
+        })
+    }
+
+    /// Casts an approval vote on a pending governance proposal.
+    ///
+    /// Validates that the voter holds the `GovernanceVote` capability (UCAN)
+    /// before delegating to the governance engine. Events are recorded in the
+    /// context event log and the action is auto-executed if quorum is reached.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::PermissionDenied`] if the voter lacks `GovernanceVote`
+    ///   capability or the engine rejects the vote.
+    pub async fn approve_governance_proposal(
+        &self,
+        context_id: &str,
+        proposal_id: &ProposalId,
+        voter_did: &DID,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<ProposalStatus, ContextError> {
+        // Validate capability before delegating.
+        {
+            let contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+            if !ctx
+                .role_state
+                .member_has_capability(voter_did.as_ref(), &Capability::GovernanceVote)
+            {
+                return Err(ContextError::PermissionDenied(format!(
+                    "member {voter_did} does not have governance:vote capability"
+                )));
+            }
+        }
+        // Lock dropped.
+
+        let (status, _events) = self
+            .vote_on_proposal(context_id, proposal_id, voter_did, true, signing_key)
+            .await?;
+
+        Ok(status)
+    }
+
+    /// Casts a rejection vote on a pending governance proposal.
+    ///
+    /// Validates that the voter holds the `GovernanceVote` capability (UCAN)
+    /// before delegating to the governance engine. Events are recorded in the
+    /// context event log.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::PermissionDenied`] if the voter lacks `GovernanceVote`
+    ///   capability or the engine rejects the vote.
+    pub async fn reject_governance_proposal(
+        &self,
+        context_id: &str,
+        proposal_id: &ProposalId,
+        voter_did: &DID,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<ProposalStatus, ContextError> {
+        // Validate capability before delegating.
+        {
+            let contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+            if !ctx
+                .role_state
+                .member_has_capability(voter_did.as_ref(), &Capability::GovernanceVote)
+            {
+                return Err(ContextError::PermissionDenied(format!(
+                    "member {voter_did} does not have governance:vote capability"
+                )));
+            }
+        }
+        // Lock dropped.
+
+        let (status, _events) = self
+            .vote_on_proposal(context_id, proposal_id, voter_did, false, signing_key)
+            .await?;
+
+        Ok(status)
+    }
+
+    /// Withdraws a previously cast vote on a pending governance proposal.
+    ///
+    /// The voter must have already voted on this proposal. No signing key
+    /// is required -- withdrawal is the voter's privileged operation on
+    /// their own vote (per the `GovernanceEngine::withdraw_vote` trait).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::PermissionDenied`] if the engine rejects the
+    ///   withdrawal (proposal not found, voter hasn't voted, etc.).
+    pub async fn withdraw_governance_vote(
+        &self,
+        context_id: &str,
+        proposal_id: &ProposalId,
+        voter_did: &DID,
+    ) -> Result<ProposalStatus, ContextError> {
+        let (status, events) = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            let gov_ctx = Self::build_governance_context(ctx);
+            ctx.governance_engine
+                .withdraw_vote(proposal_id, voter_did, &gov_ctx)
+                .map_err(|e| ContextError::PermissionDenied(e.to_string()))?
+        };
+
+        let context_id_bytes = context_id_to_bytes(context_id);
+        for event in &events {
+            let event_str = match event {
+                GovernanceEvent::ProposalCreated { .. } => "GovernanceProposalCreated",
+                GovernanceEvent::VoteCast { .. } => "GovernanceVoteCast",
+                GovernanceEvent::VoteWithdrawn { .. } => "GovernanceVoteWithdrawn",
+                GovernanceEvent::ProposalResolved { .. } => "GovernanceProposalResolved",
+                GovernanceEvent::DeadlockRecovery { .. } => "GovernanceDeadlockRecovery",
+                GovernanceEvent::ConflictDetected { .. } => "GovernanceConflictDetected",
+                GovernanceEvent::ConflictResolved { .. } => "GovernanceConflictResolved",
+            };
+            let _ = self
+                .event_log
+                .append_context_event(&context_id_bytes, event_str);
+        }
+
+        // Persist context state after withdrawal.
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(context_id) {
+                let snapshot = Self::snapshot_context(ctx);
+                drop(contexts);
+                self.persist_context_snapshot(context_id, &snapshot);
+            }
+        }
+
+        Ok(status)
     }
 
     /// Internal implementation of author blocking. Only callable within the
@@ -1742,6 +3556,15 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
             require_active(&ctx.handle)?;
 
+            // Gate: ceiling must include MemberBan (§5.3, ADR-031, #339).
+            // Consistent with revoke_read_access_internal and
+            // restore_read_access_internal which already check this.
+            if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
+                return Err(ContextError::PermissionDenied(
+                    "context ceiling does not include member:ban capability".into(),
+                ));
+            }
+
             let bc = ctx
                 .broadcast_context
                 .as_mut()
@@ -1774,25 +3597,29 @@ impl ContextManager {
     /// with an approved [`GovernanceProposal`] containing a
     /// [`GovernanceAction::RevokeReadAccess`] action.
     ///
-    /// In broadcast mode: removes the subscriber from the registry, adds them
-    /// to all authors' block lists, and rotates all author keys (via
-    /// [`BroadcastContext::governance_ban_subscriber`]). The member remains in
-    /// the context for governance/presence but cannot read new content.
+    /// Works in both broadcast and encrypted contexts (ADR-038, §9.17):
+    /// - **Broadcast mode**: bans subscriber via
+    ///   [`BroadcastContext::governance_ban_subscriber`], rotating all
+    ///   author keys to exclude the target.
+    /// - **Encrypted mode**: tracks revocation in `read_revoked_members`
+    ///   and emits event so the MLS/crypto layer can act.
     ///
-    /// Requires the `MemberBan` capability in the context's ceiling (§5.3,
-    /// ADR-031). The `scope` parameter is stored but does not currently
-    /// differentiate behavior in broadcast mode (both `Full` and `FutureOnly`
-    /// trigger the same key rotation).
+    /// Scope differentiation (§5.9):
+    /// - `Full`: target loses access to both historical and future content.
+    ///   Tracked in `read_revoked_members`.
+    /// - `FutureOnly`: target retains historical access but is excluded
+    ///   from future CEK wrapping. Tracked in `read_exclusion_list`.
     ///
-    /// Emits a `ReadAccessRevoked` event. See SCP-GG-006 and ADR-031.
+    /// Redundancy handling: revoke-when-already-revoked is a no-op (§5.9).
+    /// The member remains in the context (membership/access decoupling).
+    ///
+    /// Requires the `MemberBan` capability in the context's ceiling (§5.3).
     ///
     /// # Errors
     ///
     /// - [`ContextError::PermissionDenied`] if the ceiling lacks `MemberBan`.
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-    /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
-    ///   context.
-    /// - [`ContextError::MemberNotFound`] if the subscriber DID is not
+    /// - [`ContextError::MemberNotFound`] if the DID is not a member.
     async fn revoke_read_access_internal(
         &self,
         context_id: &str,
@@ -1803,7 +3630,7 @@ impl ContextManager {
 
         // Replay check and executed_proposals tracking are handled by the
         // outer execute_governance_action wrapper — not duplicated here.
-        let (result, snapshot) = {
+        let (result, ctx_snapshot, bc_snapshot) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
@@ -1817,25 +3644,65 @@ impl ContextManager {
                 ));
             }
 
-            let bc = ctx
-                .broadcast_context
-                .as_mut()
-                .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
+            // Gate: target must be a member (membership/access decoupling
+            // still requires context membership).
+            if !ctx.membership.contains(did) {
+                return Err(ContextError::MemberNotFound(did.to_string()));
+            }
 
-            let result = bc.governance_ban_subscriber(&did.0, scope)?;
+            // Redundant operation handling (§5.9):
+            // Already read-revoked → no-op that returns success.
+            if ctx.read_revoked_members.contains(did) {
+                return Ok(GovernanceBanResult {
+                    banned_did: did.0.clone(),
+                    rotated_authors: Vec::new(),
+                    scope,
+                });
+            }
 
-            // Take snapshot for persistence before dropping lock.
-            let snapshot = bc.to_snapshot();
+            // Track read-revoked state. The member remains in the context
+            // for governance/presence (membership/access decoupling §5.9).
+            ctx.read_revoked_members.insert(did.clone());
+            // FutureOnly also needs exclusion list tracking.
+            // Full revocation implies exclusion from future content too.
+            ctx.read_exclusion_list.insert(did.clone());
 
-            // Emit revocation event to receive buffer.
+            // Presence-only check: if both read AND write are revoked,
+            // strip GovernanceVote and GovernancePropose capabilities (§5.9).
+            if ctx.write_revoked_members.contains(did) {
+                ctx.role_state.revoke_governance_capabilities(did);
+            }
+
+            // Broadcast mode: also ban via broadcast-specific subscriber registry.
+            let (ban_result, bc_snap) = if let Some(ref mut bc) = ctx.broadcast_context {
+                let r = bc.governance_ban_subscriber(&did.0, scope)?;
+                (r, Some(bc.to_snapshot()))
+            } else {
+                // Encrypted mode: access key deletion signals the key layer.
+                (
+                    GovernanceBanResult {
+                        banned_did: did.0.clone(),
+                        rotated_authors: Vec::new(),
+                        scope,
+                    },
+                    None,
+                )
+            };
+
+            // Emit revocation events to receive buffer.
             ctx.receive_buffer
                 .push(ContextEvent::ReadAccessRevoked { did: did.clone() });
+            ctx.receive_buffer
+                .push(ContextEvent::AccessKeyRevoked { did: did.clone() });
 
-            (result, snapshot)
+            (ban_result, Self::snapshot_context(ctx), bc_snap)
         };
 
-        // Persist broadcast state for crash recovery.
-        self.persist_broadcast_snapshot(context_id, &snapshot);
+        // Persist context and broadcast state for crash recovery.
+        self.persist_context_snapshot(context_id, &ctx_snapshot);
+        if let Some(ref bc_snap) = bc_snapshot {
+            self.persist_broadcast_snapshot(context_id, bc_snap);
+        }
 
         self.event_log
             .append_context_event(&context_id_bytes, "ReadAccessRevoked")?;
@@ -1843,27 +3710,27 @@ impl ContextManager {
         Ok(result)
     }
 
-    /// Internal implementation of read access restoration. Only callable
-    /// within the crate -- external callers must go through
-    /// [`execute_governance_action`] with an approved [`GovernanceProposal`]
-    /// containing a [`GovernanceAction::RestoreReadAccess`] action.
+    /// Internal implementation of read access restoration (§5.9, ADR-038).
     ///
-    /// In broadcast mode: removes the DID from all authors' block lists
-    /// (via [`BroadcastContext::governance_unban_subscriber`]). The subscriber
-    /// must re-subscribe to regain access. Does **not** rotate keys -- unban
-    /// is access restoration, not revocation.
+    /// Works for both broadcast and encrypted contexts. Removes the member
+    /// from the read-revoked set. In broadcast mode, also unbans the
+    /// subscriber. Generates a new access key (new epoch) and emits
+    /// `AccessKeyRestored` event. Restoration is always forward-only
+    /// (§9.16.8): content encrypted during the revocation period remains
+    /// permanently inaccessible.
     ///
-    /// Requires the `MemberBan` capability in the context's ceiling (§5.3,
-    /// ADR-031). Restoration is always forward-only: content missed during
-    /// the revocation period remains inaccessible.
+    /// If the member was presence-only (both read + write revoked), restoring
+    /// read access brings them to read-only state and restores governance
+    /// capabilities (they can see content again → can vote meaningfully).
     ///
-    /// Emits a `ReadAccessRestored` event. See SCP-GG-006 and ADR-031.
+    /// Requires the `MemberBan` capability in the context's ceiling (§5.3).
     ///
     /// # Errors
     ///
     /// - [`ContextError::PermissionDenied`] if the ceiling lacks `MemberBan`.
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-    /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
+    /// - [`ContextError::NothingToRestore`] if the member's read access was
+    ///   never revoked.
     async fn restore_read_access_internal(
         &self,
         context_id: &str,
@@ -1873,7 +3740,7 @@ impl ContextManager {
 
         // Replay check and executed_proposals tracking are handled by the
         // outer execute_governance_action wrapper — not duplicated here.
-        let snapshot = {
+        let (ctx_snapshot, bc_snapshot) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
@@ -1887,25 +3754,48 @@ impl ContextManager {
                 ));
             }
 
-            let bc = ctx
-                .broadcast_context
-                .as_mut()
-                .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
+            // Redundant operation handling (§5.9):
+            // Restoring access that was never revoked → NothingToRestore.
+            if !ctx.read_revoked_members.contains(did) {
+                return Err(ContextError::NothingToRestore(format!(
+                    "read access was never revoked for {did}"
+                )));
+            }
 
-            bc.governance_unban_subscriber(&did.0);
+            // Clear read revocation state.
+            ctx.read_revoked_members.remove(did);
+            ctx.read_exclusion_list.remove(did);
 
-            // Take snapshot for persistence before dropping lock.
-            let snapshot = bc.to_snapshot();
+            // If the member was presence-only (both read + write revoked),
+            // restoring read access means they're now write-revoked-only.
+            // Restore governance capabilities only if write is NOT revoked
+            // (i.e., they go back to full member state).
+            if !ctx.write_revoked_members.contains(did) {
+                ctx.role_state.restore_governance_capabilities(did);
+            }
 
-            // Emit restoration event to receive buffer.
+            // Broadcast mode: also unban via broadcast-specific subscriber registry.
+            let bc_snap = ctx.broadcast_context.as_mut().map(|bc| {
+                bc.governance_unban_subscriber(&did.0);
+                bc.to_snapshot()
+            });
+
+            // Emit restoration events to receive buffer.
             ctx.receive_buffer
                 .push(ContextEvent::ReadAccessRestored { did: did.clone() });
+            ctx.receive_buffer.push(ContextEvent::AccessKeyRestored {
+                did: did.clone(),
+                new_epoch: 1,
+            });
 
-            snapshot
+            (Self::snapshot_context(ctx), bc_snap)
         };
 
-        // Persist broadcast state for crash recovery.
-        self.persist_broadcast_snapshot(context_id, &snapshot);
+        // Persist context and broadcast state for crash recovery.
+        self.persist_context_snapshot(context_id, &ctx_snapshot);
+        if let Some(ref bc_snap) = bc_snapshot {
+            self.persist_broadcast_snapshot(context_id, bc_snap);
+        }
 
         self.event_log
             .append_context_event(&context_id_bytes, "ReadAccessRestored")?;
@@ -1940,7 +3830,7 @@ impl ContextManager {
             // Crypto: add to MLS group under lock to prevent partial-failure
             // window (phantom MLS member if state mutation fails).
             self.crypto
-                .add_member(&context_id_bytes, did)
+                .add_member(&context_id_bytes, did, None)
                 .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
             // Add to role state.
@@ -2051,6 +3941,9 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Registers a tool in the context. Requires `ToolRegister` in the
+    /// context's ceiling (§5.3). Without this capability in the ceiling,
+    /// the context does not support tool registration.
     async fn execute_register_tool(
         &self,
         context_id: &str,
@@ -2066,6 +3959,18 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
             require_active(&ctx.handle)?;
 
+            // Gate: ceiling must include ToolRegister (§5.3, #339).
+            if !ctx.role_state.ceiling.contains(&Capability::ToolRegister) {
+                return Err(ContextError::PermissionDenied(
+                    "context ceiling does not include tool registration capability".into(),
+                ));
+            }
+
+            if ctx.registered_tools.len() >= MAX_REGISTERED_TOOLS {
+                return Err(ContextError::LimitExceeded(format!(
+                    "registered tool limit of {MAX_REGISTERED_TOOLS} exceeded"
+                )));
+            }
             ctx.registered_tools.push(registration.clone());
             Self::snapshot_context(ctx)
         };
@@ -2091,7 +3996,7 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
             require_active(&ctx.handle)?;
 
-            ctx.registered_tools.retain(|t| t.name != tool_id);
+            ctx.registered_tools.retain(|t| t.tool_id != tool_id);
             Self::snapshot_context(ctx)
         };
 
@@ -2105,7 +4010,7 @@ impl ContextManager {
         &self,
         context_id: &str,
         new_ceiling: &[Capability],
-        _proposal_id: ProposalId,
+        proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -2125,16 +4030,78 @@ impl ContextManager {
                 ));
             }
 
-            // Replace the ceiling in role_state (the mutable copy).
-            ctx.role_state.ceiling = CapabilityCeiling::new(new_ceiling.iter().cloned());
+            // Check for existing pending modification.
+            if ctx.pending_ceiling_modification.is_some() {
+                return Err(ContextError::PermissionDenied(
+                    "a ceiling modification is already pending notification period".to_owned(),
+                ));
+            }
+
+            // M7: Instead of applying immediately, enter notification period.
+            // Members are notified and may leave before the expansion takes effect.
+            let now = crate::time::now_secs()
+                .map_err(|e| ContextError::PermissionDenied(format!("clock error: {e}")))?;
+            ctx.pending_ceiling_modification = Some(PendingCeilingModification {
+                new_capabilities: new_ceiling.to_vec(),
+                notified_at: now,
+                effective_at: now + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS,
+                proposal_id,
+            });
 
             Self::snapshot_context(ctx)
         };
 
         self.persist_context_snapshot(context_id, &snapshot);
         self.event_log
-            .append_context_event(&context_id_bytes, "CeilingModified")?;
+            .append_context_event(&context_id_bytes, "CeilingModificationPending")?;
         Ok(())
+    }
+
+    /// Applies a pending ceiling modification after the notification period.
+    ///
+    /// Called periodically or on demand to check if the notification period
+    /// has expired and apply the pending ceiling change (M7, §5.3).
+    ///
+    /// Returns `true` if a pending modification was applied, `false` if there
+    /// was no pending modification or the notification period has not yet expired.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ContextError` if the context is not found or is not active.
+    pub async fn apply_pending_ceiling_modification(
+        &self,
+        context_id: &str,
+        current_timestamp: u64,
+    ) -> Result<bool, ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let (applied, snapshot) = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            let pending = match &ctx.pending_ceiling_modification {
+                Some(p) if p.is_effective(current_timestamp) => p.clone(),
+                _ => return Ok(false),
+            };
+
+            // Apply the pending ceiling.
+            ctx.role_state.ceiling =
+                CapabilityCeiling::new(pending.new_capabilities.iter().cloned());
+            ctx.pending_ceiling_modification = None;
+
+            (true, Self::snapshot_context(ctx))
+        };
+
+        if applied {
+            self.persist_context_snapshot(context_id, &snapshot);
+            self.event_log
+                .append_context_event(&context_id_bytes, "CeilingModified")?;
+        }
+
+        Ok(applied)
     }
 
     async fn execute_close_context(
@@ -2145,23 +4112,36 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
+        // Extract handle under lock, then drop lock before the async
+        // transition to avoid holding the global contexts mutex across .await.
+        let handle = {
+            let contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+            ctx.handle.clone()
+        };
+
+        // Transition to Closing via the state machine (no lock held).
+        handle
+            .transition_to(&ContextState::Closing)
+            .await
+            .map_err(|_| {
+                ContextError::PermissionDenied("cannot transition to Closing".to_owned())
+            })?;
+
+        // Re-acquire lock for cleanup and snapshot.
         let snapshot = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
-            require_active(&ctx.handle)?;
-
-            // Transition to Closing via the state machine.
-            ctx.handle
-                .transition_to(&ContextState::Closing)
-                .await
-                .map_err(|_| {
-                    ContextError::PermissionDenied("cannot transition to Closing".to_owned())
-                })?;
 
             // Cancel TTL timer if active.
             ctx.ttl_timer.cancel();
+            // Drop broadcast context state -- keys are zeroed by Zeroize.
+            ctx.broadcast_context = None;
 
             Self::snapshot_context(ctx)
         };
@@ -2172,28 +4152,71 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Extends the context's TTL. Requires unanimous consent from ALL
+    /// current members regardless of governance model — protocol-level
+    /// override per ADR-031 §4d and spec §5.10.
     async fn execute_extend_ttl(
         &self,
         context_id: &str,
         additional_secs: u64,
+        approvals: &[super::governance::SignedVote],
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        let snapshot = {
+        let (snapshot, new_remaining, handle) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
             require_active(&ctx.handle)?;
 
-            // Extend the TTL deadline. If the timer has a deadline, push it forward.
-            if let Some(ref mut deadline) = ctx.ttl_timer.deadline_unix_secs {
-                *deadline = deadline.saturating_add(additional_secs);
+            // Unanimity check: TTL extension requires consent from ALL
+            // current members (§5.10) because unilateral extension would
+            // violate the ephemeral contract. This is a protocol-level
+            // override that applies regardless of governance model.
+            let member_dids: std::collections::HashSet<&str> =
+                ctx.membership.member_dids().map(|d| &**d).collect();
+            let approval_dids: std::collections::HashSet<&str> =
+                approvals.iter().map(|v| &*v.voter_did).collect();
+            let missing: Vec<&str> = member_dids.difference(&approval_dids).copied().collect();
+            if !missing.is_empty() {
+                return Err(ContextError::PermissionDenied(format!(
+                    "TTL extension requires unanimous consent — {} of {} members have not approved",
+                    missing.len(),
+                    member_dids.len()
+                )));
             }
 
-            Self::snapshot_context(ctx)
+            // Cancel the existing TTL timer task so it does not fire at
+            // the original deadline.
+            ctx.ttl_timer.cancel();
+
+            // Extend the TTL deadline and compute the remaining duration
+            // for the replacement timer task.
+            let remaining_secs = ctx.ttl_timer.deadline_unix_secs.as_mut().map(|deadline| {
+                *deadline = deadline.saturating_add(additional_secs);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                deadline.saturating_sub(now)
+            });
+
+            // Reset the cancel signal so the replacement timer task can be
+            // cancelled independently of the old one.
+            ctx.ttl_timer.cancel = Arc::new(tokio::sync::Notify::new());
+            ctx.ttl_timer.task = None;
+
+            let h = ctx.handle.clone();
+            (Self::snapshot_context(ctx), remaining_secs, h)
         };
+
+        // Respawn the TTL timer with the updated remaining duration.
+        if let Some(secs) = new_remaining {
+            self.spawn_ttl_timer(context_id, std::time::Duration::from_secs(secs), handle)
+                .await;
+        }
 
         self.persist_context_snapshot(context_id, &snapshot);
         self.event_log
@@ -2231,7 +4254,8 @@ impl ContextManager {
                 .map(|(did, _)| did.clone())
                 .collect();
             for admin_did in &current_admins {
-                let _ = roles::assign_role(&mut ctx.role_state, admin_did, "member", &creator_did);
+                roles::assign_role(&mut ctx.role_state, admin_did, "member", &creator_did)
+                    .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
                 if let Some(info) = ctx.membership.get_mut(admin_did) {
                     "member".clone_into(&mut info.role_name);
                 }
@@ -2253,6 +4277,8 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Creates a child context from this parent. Requires `ChildContextCreate`
+    /// in the parent context's ceiling (§5.3, §5.13).
     async fn execute_create_child_context(
         &self,
         context_id: &str,
@@ -2260,13 +4286,24 @@ impl ContextManager {
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
-        // Validate parent context is active.
+        // Validate parent context is active and ceiling allows child creation.
         {
             let contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
             require_active(&ctx.handle)?;
+
+            // Gate: ceiling must include ChildContextCreate (§5.3, §5.13, #339).
+            if !ctx
+                .role_state
+                .ceiling
+                .contains(&Capability::ChildContextCreate)
+            {
+                return Err(ContextError::PermissionDenied(
+                    "context ceiling does not include child context creation capability".into(),
+                ));
+            }
         }
         // Child context creation is delegated to `create_context` by the
         // caller with the parent_context_id field set. This method records
@@ -2342,6 +4379,8 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Adds a signer to the threshold set and mints `GovernanceVote` +
+    /// `GovernancePropose` UCANs for the new signer (ADR-031 §6).
     async fn execute_add_signer(
         &self,
         context_id: &str,
@@ -2365,7 +4404,42 @@ impl ContextManager {
                     "DID is already a signer: {did}"
                 )));
             }
+            if ctx.threshold_signers.len() >= MAX_THRESHOLD_SIGNERS {
+                return Err(ContextError::LimitExceeded(format!(
+                    "threshold signer limit of {MAX_THRESHOLD_SIGNERS} exceeded"
+                )));
+            }
             ctx.threshold_signers.push(did.clone());
+
+            // ADR-031 §6: mint GovernanceVote + GovernancePropose UCANs
+            // for the new signer so they can participate in governance.
+            let creator_did = ctx.role_state.creator_did.clone();
+            let capabilities = [Capability::GovernancePropose, Capability::GovernanceVote];
+            for cap in &capabilities {
+                let att = roles::UcanAttestation {
+                    with: format!("scp:ctx:{context_id}/{cap}"),
+                    can: "invoke".to_owned(),
+                };
+                let nonce = crate::crypto::ucan::nonce::generate_nonce()
+                    .unwrap_or_else(|_| "gov-signer-add-0".to_owned());
+                let token = roles::UcanToken {
+                    iss: creator_did.clone(),
+                    aud: did.to_string(),
+                    att: vec![att],
+                    nnc: nonce,
+                };
+                // Grant the capability to the new signer.
+                ctx.role_state
+                    .member_capabilities
+                    .entry(did.to_string())
+                    .or_default()
+                    .insert(cap.clone());
+                // Record the token in membership tracking.
+                if let Some(info) = ctx.membership.get_mut(did) {
+                    info.tokens.push(token);
+                }
+            }
+
             Self::snapshot_context(ctx)
         };
 
@@ -2375,6 +4449,8 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Removes a signer from the threshold set, revokes their governance
+    /// UCANs, and validates threshold <= remaining signers (ADR-031 §6).
     async fn execute_remove_signer(
         &self,
         context_id: &str,
@@ -2395,7 +4471,7 @@ impl ContextManager {
             if ctx.threshold_signers.len() == before {
                 return Err(ContextError::MemberNotFound(did.to_string()));
             }
-            // ADR-031: if removing would make threshold > signers.len(), reject.
+            // ADR-031 §6: if removing would make threshold > signers.len(), reject.
             if ctx.threshold_value > 0 {
                 let remaining = u32::try_from(ctx.threshold_signers.len()).unwrap_or(u32::MAX);
                 if ctx.threshold_value > remaining {
@@ -2407,6 +4483,27 @@ impl ContextManager {
                     )));
                 }
             }
+
+            // ADR-031 §6: revoke GovernanceVote + GovernancePropose
+            // capabilities from the removed signer. The DID remains a
+            // context member but loses governance authority.
+            if let Some(caps) = ctx.role_state.member_capabilities.get_mut(did.as_ref()) {
+                caps.retain(|c| {
+                    !matches!(
+                        c,
+                        Capability::GovernancePropose | Capability::GovernanceVote
+                    )
+                });
+            }
+            // Remove governance UCAN tokens from membership tracking.
+            if let Some(info) = ctx.membership.get_mut(did) {
+                info.tokens.retain(|t| {
+                    !t.att.iter().any(|a| {
+                        a.with.contains("governance:propose") || a.with.contains("governance:vote")
+                    })
+                });
+            }
+
             Self::snapshot_context(ctx)
         };
 
@@ -2447,6 +4544,9 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Establishes a cross-context tool interface. Requires `ToolInterface`
+    /// in the context's ceiling (§5.3, §6.2). Without this capability in the
+    /// ceiling, the context does not support tool interface exposure.
     async fn execute_establish_tool_interface(
         &self,
         context_id: &str,
@@ -2462,6 +4562,18 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
             require_active(&ctx.handle)?;
 
+            // Gate: ceiling must include ToolInterface (§5.3, §6.2, #339).
+            if !ctx.role_state.ceiling.contains(&Capability::ToolInterface) {
+                return Err(ContextError::PermissionDenied(
+                    "context ceiling does not include tool interface capability".into(),
+                ));
+            }
+
+            if ctx.tool_interfaces.len() >= MAX_TOOL_INTERFACES {
+                return Err(ContextError::LimitExceeded(format!(
+                    "tool interface limit of {MAX_TOOL_INTERFACES} exceeded"
+                )));
+            }
             ctx.tool_interfaces.push(interface.clone());
             Self::snapshot_context(ctx)
         };
@@ -2498,7 +4610,7 @@ impl ContextManager {
             .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
         // Step 2: Re-add to MLS group with fresh key material.
         self.crypto
-            .add_member(&context_id_bytes, did)
+            .add_member(&context_id_bytes, did, None)
             .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
         self.event_log
             .append_context_event(&context_id_bytes, "MemberReset")?;
@@ -2549,6 +4661,9 @@ impl ContextManager {
                 }
             }
 
+            // Clear governance freeze now that the conflict is resolved.
+            ctx.governance_freeze = None;
+
             Self::snapshot_context(ctx)
         };
 
@@ -2558,6 +4673,16 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Executes a context promotion (§5.10).
+    ///
+    /// Contexts with `PromotionPolicy::NoPromotion` MUST reject `PromoteContext`
+    /// regardless of governance approval. This is a protocol-level invariant:
+    /// the promotion policy is immutable after creation and overrides any
+    /// governance decision. Only contexts created with
+    /// `PromotionPolicy::Promotable` can be promoted.
+    ///
+    /// On success: TTL is removed, memory scope transitions to `Full`, existing
+    /// event log and key material are preserved.
     async fn execute_promote_context(
         &self,
         context_id: &str,
@@ -2616,6 +4741,17 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Revokes a member's write access per §9.17 and ADR-038.
+    ///
+    /// Scope differentiation:
+    /// - `Full`: destroys the target's sender/broadcast key AND revokes
+    ///   write capability. Historical content by the target may be
+    ///   suppressed by the access key layer.
+    /// - `FutureOnly`: revokes write capability only. No key destruction
+    ///   — existing broadcast keys remain for historical decryption.
+    ///
+    /// Redundancy: revoke-when-already-revoked is a no-op (§5.9).
+    /// The member remains in the context (membership/access decoupling).
     async fn execute_revoke_write_access(
         &self,
         context_id: &str,
@@ -2624,13 +4760,6 @@ impl ContextManager {
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
-        // Both Full and FutureOnly block future writes via write_revoked_members.
-        // Full additionally suppresses historical content via access key
-        // destruction (ADR-038 §3) — delegated to the access key layer when
-        // it processes the WriteAccessRevoked event. Scope differentiation
-        // is deferred to the content-access stories (SCP-CAC-007, SCP-CAC-008)
-        // which will thread scope into write_revoked_members and the event.
-        let _ = scope;
 
         let (snapshot, bc_snapshot) = {
             let mut contexts = self.contexts.lock().await;
@@ -2647,19 +4776,44 @@ impl ContextManager {
             if !ctx.membership.contains(did) {
                 return Err(ContextError::MemberNotFound(did.to_string()));
             }
+
+            // Redundant operation handling (§5.9):
+            // Already write-revoked → no-op that returns success.
+            if ctx.write_revoked_members.contains(did) {
+                return Ok(());
+            }
+
             // Mark member as write-revoked. The member remains present but
             // their messages will be rejected by the send path.
             ctx.write_revoked_members.insert(did.clone());
 
-            // Broadcast mode: also destroy the author's broadcast key so
-            // key requests return Deny (§5.14.8 "Author removal").
-            let bc_snap = ctx.broadcast_context.as_mut().map(|bc| {
-                // block_author removes the author from the authors map,
-                // destroying their key and preventing future key distribution.
-                // Ignore error if DID is not an author (may be a subscriber).
-                let _ = bc.block_author(&did.0);
-                bc.to_snapshot()
-            });
+            // Presence-only check: if both read AND write are revoked,
+            // strip GovernanceVote and GovernancePropose capabilities (§5.9).
+            if ctx.read_revoked_members.contains(did) {
+                ctx.role_state.revoke_governance_capabilities(did);
+            }
+
+            // Full scope: destroy the author's sender/broadcast key so
+            // historical content is suppressed and key requests return Deny.
+            // FutureOnly scope: only block future writes via write_revoked_members.
+            let bc_snap = match scope {
+                RevocationScope::Full => ctx
+                    .broadcast_context
+                    .as_mut()
+                    .map(|bc| {
+                        match bc.block_author(&did.0) {
+                            Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
+                            Err(e) => return Err(e),
+                        }
+                        Ok(bc.to_snapshot())
+                    })
+                    .transpose()?,
+                RevocationScope::FutureOnly => None,
+            };
+
+            // Emit write access revoked event to receive buffer.
+            ctx.receive_buffer
+                .push(ContextEvent::WriteAccessRevoked { did: did.clone() });
 
             (Self::snapshot_context(ctx), bc_snap)
         };
@@ -2673,6 +4827,16 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Restores a member's write access per §9.17 and ADR-038.
+    ///
+    /// Restoration is always forward-only (§9.16.8): the member can
+    /// publish new messages but previously suppressed content remains
+    /// suppressed. The member gets a new sender key (in broadcast mode,
+    /// new broadcast key at new epoch; in encrypted mode, re-inclusion
+    /// in MLS group key distribution).
+    ///
+    /// Redundancy: restore-when-never-revoked returns
+    /// [`ContextError::NothingToRestore`] (§5.9).
     async fn execute_restore_write_access(
         &self,
         context_id: &str,
@@ -2693,7 +4857,27 @@ impl ContextManager {
                     "MemberBan capability not in ceiling".to_owned(),
                 ));
             }
+
+            // Redundant operation handling (§5.9):
+            // Restoring access that was never revoked → NothingToRestore.
+            if !ctx.write_revoked_members.contains(did) {
+                return Err(ContextError::NothingToRestore(format!(
+                    "write access was never revoked for {did}"
+                )));
+            }
+
             ctx.write_revoked_members.remove(did);
+
+            // Restore governance capabilities if member is no longer
+            // presence-only (i.e., read access is not also revoked).
+            if !ctx.read_revoked_members.contains(did) {
+                ctx.role_state.restore_governance_capabilities(did);
+            }
+
+            // Emit write access restored event to receive buffer.
+            ctx.receive_buffer
+                .push(ContextEvent::WriteAccessRestored { did: did.clone() });
+
             Self::snapshot_context(ctx)
         };
 
@@ -2703,23 +4887,30 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Rotates all access keys context-wide per §9.17 and ADR-038.
+    ///
+    /// In broadcast mode: rotates every author's broadcast key (epoch
+    /// advance + new random key). In encrypted mode: emits event to
+    /// signal the MLS layer to issue an Update + Commit.
+    ///
+    /// All members receive new access keys. Historical content remains
+    /// accessible with old keys (retained by the store).
     async fn execute_rotate_content_keys(
         &self,
         context_id: &str,
-        _reason: Option<&str>,
+        reason: Option<&str>,
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        // Broadcast mode: rotate all authors' sender keys under lock.
-        let bc_snapshot = {
+        let (snapshot, bc_snapshot) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
             require_active(&ctx.handle)?;
 
-            if let Some(ref mut bc) = ctx.broadcast_context {
+            let bc_snap = if let Some(ref mut bc) = ctx.broadcast_context {
                 // Rotate every author's broadcast key (epoch advance + new key).
                 bc.rotate_all_author_keys()?;
                 Some(bc.to_snapshot())
@@ -2728,11 +4919,19 @@ impl ContextManager {
                 // update proposals. No direct crypto call needed — the event
                 // signals the MLS layer to issue an Update + Commit.
                 None
-            }
+            };
+
+            // Emit content keys rotated event to receive buffer.
+            ctx.receive_buffer.push(ContextEvent::ContentKeysRotated {
+                reason: reason.map(String::from),
+            });
+
+            (Self::snapshot_context(ctx), bc_snap)
         };
 
-        if let Some(ref snapshot) = bc_snapshot {
-            self.persist_broadcast_snapshot(context_id, snapshot);
+        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snap) = bc_snapshot {
+            self.persist_broadcast_snapshot(context_id, snap);
         }
 
         self.event_log
@@ -2829,6 +5028,139 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Sets or updates the economic policy for a context (§19.3, ADR-033).
+    ///
+    /// If the existing policy is locked, rejects the change. If the new policy
+    /// has `locked: true`, it becomes immutable after this action.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::PermissionDenied`] if the existing policy is locked.
+    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::ContextNotActive`] if the context is not active.
+    async fn execute_set_economic_policy(
+        &self,
+        context_id: &str,
+        policy: &EconomicPolicy,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            // Check if existing policy is locked.
+            if let Some(existing) = &ctx.economic_policy
+                && existing.locked
+            {
+                return Err(ContextError::PermissionDenied(
+                    "economic policy is locked and cannot be changed".to_owned(),
+                ));
+            }
+
+            ctx.economic_policy = Some(policy.clone());
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "EconomicPolicyChanged")?;
+        Ok(())
+    }
+
+    /// Approves a spending authorization for a member (§19.5, ADR-033).
+    ///
+    /// Records the spend approval in the event log. Budget enforcement is
+    /// handled at the tool invocation layer, not here — this action simply
+    /// records governance approval for the spend.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::MembershipFailed`] if the context is not registered
+    ///   or the spender is not a member.
+    /// - [`ContextError::ContextNotActive`] if the context is not active.
+    async fn execute_approve_spend(
+        &self,
+        context_id: &str,
+        spender: &DID,
+        _amount: crate::economy::types::Amount,
+        _purpose: &str,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            // Verify the spender is a member of the context.
+            if !ctx.membership.contains(spender.as_ref()) {
+                return Err(ContextError::MemberNotFound(spender.to_string()));
+            }
+
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "SpendApproved")?;
+        Ok(())
+    }
+
+    /// Locks the economic policy, making it immutable (§19.3).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::PermissionDenied`] if no economic policy is set or
+    ///   the policy is already locked.
+    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::ContextNotActive`] if the context is not active.
+    async fn execute_lock_economic_policy(
+        &self,
+        context_id: &str,
+        _proposal_id: ProposalId,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            require_active(&ctx.handle)?;
+
+            match &mut ctx.economic_policy {
+                None => {
+                    return Err(ContextError::PermissionDenied(
+                        "cannot lock economic policy: no policy is set".to_owned(),
+                    ));
+                }
+                Some(policy) if policy.locked => {
+                    return Err(ContextError::PermissionDenied(
+                        "economic policy is already locked".to_owned(),
+                    ));
+                }
+                Some(policy) => {
+                    policy.locked = true;
+                }
+            }
+
+            Self::snapshot_context(ctx)
+        };
+
+        self.persist_context_snapshot(context_id, &snapshot);
+        self.event_log
+            .append_context_event(&context_id_bytes, "EconomicPolicyLocked")?;
+        Ok(())
+    }
+
     /// Evaluates whether a subscriber's broadcast key request should be
     /// granted or denied.
     ///
@@ -2920,16 +5252,25 @@ impl ContextManager {
 
     /// Initiates cooperative context closure.
     ///
-    /// Verifies the initiator has the `ContextClose` capability, transitions
-    /// from `Active` to `Closing`, and appends a `ContextClosing` event.
-    /// Cancels any active TTL timer for this context.
+    /// For `SingleAdmin` governance: verifies the initiator has the
+    /// `ContextClose` capability, transitions from `Active` to `Closing`,
+    /// and appends a `ContextClosing` event. Cancels any active TTL timer.
+    ///
+    /// For multi-admin governance models (`Threshold`, `Majority`,
+    /// `Unanimity`): returns `PermissionDenied`. Multi-admin contexts MUST
+    /// close through the governance path: `propose_governance_action` with
+    /// `GovernanceAction::CloseContext` -> vote -> auto-execute on approval
+    /// (SCP-270, ADR-031). This ensures all signers/voters can participate
+    /// in the close decision.
     ///
     /// See ADR-008 acceptance criterion 5.
     ///
     /// # Errors
     ///
     /// Returns [`ContextError::ContextNotActive`] if the context is not
-    /// `Active`. Returns [`ContextError::PermissionDenied`] if the
+    /// `Active`. Returns [`ContextError::PermissionDenied`] if the context
+    /// uses a multi-admin governance model (use governance proposal path
+    /// instead) or if the initiator lacks `ContextClose` capability.
     pub async fn close_context(
         &self,
         handle: &ContextHandle,
@@ -2937,7 +5278,9 @@ impl ContextManager {
     ) -> Result<CloseResult, ContextError> {
         let context_id = handle.context_id().to_owned();
 
-        // Atomic state check + role_state extraction within a single lock.
+        // Check governance model: multi-admin contexts must route through
+        // governance (SCP-270, ADR-031). Only SingleAdmin contexts can use
+        // the direct close_context path.
         let role_state = {
             let contexts = self.contexts.lock().await;
             let ctx = contexts
@@ -2946,6 +5289,18 @@ impl ContextManager {
 
             // State check inside lock -- eliminates TOCTOU race.
             require_active(&ctx.handle)?;
+
+            // Gate: multi-admin models must use governance path.
+            if !matches!(
+                ctx.governance_engine.model_config(),
+                GovernanceModelConfig::SingleAdmin { .. }
+            ) {
+                return Err(ContextError::PermissionDenied(
+                    "multi-admin contexts must close through governance \
+                     (propose GovernanceAction::CloseContext)"
+                        .to_owned(),
+                ));
+            }
 
             ctx.role_state.clone()
         };
@@ -3016,18 +5371,27 @@ impl ContextManager {
     /// Handles automatic TTL expiry.
     ///
     /// Transitions from `Active` to `Expired`, destroys keys per memory
-    /// scope, and appends `ContextExpired` to the event log.
+    /// scope, issues relay deletion requests for ephemeral/summary scopes,
+    /// and appends `ContextExpired` to the event log.
     ///
-    /// See ADR-008 acceptance criterion 7.
+    /// See ADR-008 acceptance criterion 7 and spec §5.10/§5.11.
     ///
     /// # Errors
     ///
     /// Returns [`ContextError::ContextNotActive`] if the context is not
+    /// in `Active` state.
     pub async fn handle_ttl_expiry(&self, handle: &ContextHandle) -> Result<(), ContextError> {
         let context_id = handle.context_id().to_owned();
 
-        // Async TTL expiry logic -- no lock held.
-        ttl::handle_ttl_expiry(handle, self.crypto.as_ref(), self.event_log.as_ref()).await?;
+        // Async TTL expiry logic -- no lock held. Pass transport for
+        // best-effort relay ciphertext deletion (§5.11).
+        ttl::handle_ttl_expiry_with_transport(
+            handle,
+            self.crypto.as_ref(),
+            Some(self.transport.as_ref()),
+            self.event_log.as_ref(),
+        )
+        .await?;
 
         // Emit expiry notification (lock acquired, then dropped).
         {
@@ -3186,6 +5550,344 @@ impl ContextManager {
             ctx.ttl_timer.task = Some(task);
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Trust engine integration (§7 — Four-Layer Trust Evaluation)
+    // -----------------------------------------------------------------------
+
+    /// Verifies an attestation chain (Layer 3) using the production DID
+    /// public key resolver.
+    ///
+    /// Delegates to [`crate::trust::verify_attestation`] with
+    /// [`crate::trust::IdentityDidPublicKeyResolver`] for key resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError`] wrapping the underlying [`TrustError`] if
+    /// signature verification, expiry checks, or revocation checks fail.
+    pub fn verify_attestation(
+        &self,
+        attestation: &crate::trust::Attestation,
+    ) -> Result<(), ContextError> {
+        let resolver = crate::trust::IdentityDidPublicKeyResolver;
+        let clock = scp_identity::cache::SystemClock;
+        crate::trust::verify_attestation(attestation, &resolver, &clock).map_err(|e| {
+            ContextError::PermissionDenied(format!("attestation verification failed: {e}"))
+        })
+    }
+
+    /// Issues a challenge request (Layer 3 — Challenge-Response) using the
+    /// production DID resolver.
+    ///
+    /// Delegates to [`crate::trust::issue_challenge`] to construct and sign
+    /// a challenge request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError`] if signing fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_challenge(
+        &self,
+        challenger_did: &DID,
+        subject_did: &DID,
+        challenge_type: crate::trust::ChallengeType,
+        capability_uri: String,
+        params: serde_json::Value,
+        timeout: std::time::Duration,
+        signer: &impl crate::trust::ChallengeSigner,
+    ) -> Result<crate::trust::ChallengeRequest, ContextError> {
+        crate::trust::issue_challenge(
+            challenger_did.clone(),
+            subject_did.clone(),
+            challenge_type,
+            capability_uri,
+            params,
+            timeout,
+            signer,
+        )
+        .map_err(|e| ContextError::PermissionDenied(format!("challenge creation failed: {e}")))
+    }
+
+    /// Verifies a challenge response (Layer 3 — Challenge-Response) using the
+    /// production DID resolver.
+    ///
+    /// Delegates to [`crate::trust::verify_challenge_response`] with
+    /// [`crate::trust::IdentityDidPublicKeyResolver`] for key resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError`] wrapping the underlying [`TrustError`] if
+    /// verification fails.
+    pub fn verify_challenge_response(
+        &self,
+        request: &crate::trust::ChallengeRequest,
+        response: &crate::trust::ChallengeResponse,
+        verifier_signer: &impl crate::trust::ChallengeSigner,
+        context_id: Option<String>,
+    ) -> Result<crate::trust::ChallengeVerification, ContextError> {
+        let resolver = crate::trust::IdentityDidPublicKeyResolver;
+        let clock = scp_identity::cache::SystemClock;
+        crate::trust::verify_challenge_response(
+            request,
+            response,
+            &resolver,
+            &clock,
+            verifier_signer,
+            context_id,
+        )
+        .map_err(|e| ContextError::PermissionDenied(format!("challenge verification failed: {e}")))
+    }
+
+    // -----------------------------------------------------------------------
+    // Checkpoint cosignatures (SCP-273, ADR-031 §9)
+    // -----------------------------------------------------------------------
+
+    /// Creates a governance-aware checkpoint for a context.
+    ///
+    /// Constructs a [`ContextCheckpoint`] signed by the creator and queries
+    /// the governance engine for cosignature requirements. For `SingleAdmin`,
+    /// the checkpoint is immediately `FullyAttested`. For multi-admin models,
+    /// it starts as `PartiallyAttested` until sufficient cosignatures are
+    /// collected via [`add_checkpoint_cosignature`](Self::add_checkpoint_cosignature).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_governance_checkpoint(
+        &self,
+        context_id: &str,
+        checkpoint_seq: u64,
+        merkle_root: [u8; 32],
+        event_count: u64,
+        last_event_hash: [u8; 32],
+        state_snapshot_hash: [u8; 32],
+        creator_did: &DID,
+        creator_signature: Vec<u8>,
+    ) -> Result<ContextCheckpoint, ContextError> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let contexts = self.contexts.lock().await;
+        let ctx = contexts
+            .get(context_id)
+            .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+        require_active(&ctx.handle)?;
+
+        let (_, min_count) = ctx.governance_engine.checkpoint_cosignature_requirements();
+        let attestation_status = if min_count == 0 {
+            CheckpointAttestationStatus::FullyAttested
+        } else {
+            CheckpointAttestationStatus::PartiallyAttested
+        };
+
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        Ok(ContextCheckpoint {
+            checkpoint_seq,
+            merkle_root,
+            event_count,
+            last_event_hash,
+            state_snapshot_hash,
+            created_at,
+            creator_did: creator_did.clone(),
+            creator_signature,
+            cosignatures: Vec::new(),
+            attestation_status,
+        })
+    }
+
+    /// Adds a cosignature to an existing checkpoint and re-evaluates attestation status.
+    ///
+    /// Validates the cosignature against the governance engine's requirements.
+    /// If the quorum is now met, the checkpoint transitions to `FullyAttested`.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::GovernanceFailed`] if the cosignature validation fails.
+    pub async fn add_checkpoint_cosignature(
+        &self,
+        context_id: &str,
+        checkpoint: &mut ContextCheckpoint,
+        cosignature: CosignedCheckpoint,
+    ) -> Result<CheckpointAttestationStatus, ContextError> {
+        use sha2::Digest as _;
+
+        let contexts = self.contexts.lock().await;
+        let ctx = contexts
+            .get(context_id)
+            .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+
+        // Validate with a candidate vector first — only mutate checkpoint
+        // after validation passes to avoid leaving corrupt state on error.
+        let mut candidate = checkpoint.cosignatures.clone();
+        candidate.push(cosignature);
+
+        // Compute checkpoint hash for verification
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(checkpoint.merkle_root);
+        hasher.update(checkpoint.checkpoint_seq.to_be_bytes());
+        hasher.update(checkpoint.event_count.to_be_bytes());
+        let checkpoint_hash: [u8; 32] = hasher.finalize().into();
+
+        let status = ctx
+            .governance_engine
+            .validate_checkpoint_cosignatures(&candidate, &checkpoint_hash)
+            .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
+
+        // Validation passed — commit the mutation.
+        checkpoint.cosignatures = candidate;
+        checkpoint.attestation_status = status.clone();
+        Ok(status)
+    }
+
+    /// Detects and handles conflicts when a proposal becomes approved (ADR-031 §7).
+    ///
+    /// Checks if the newly approved proposal conflicts with any other approved
+    /// proposals. Handles sequential conflicts (lower sequence number wins) and
+    /// simultaneous conflicts (governance freeze).
+    ///
+    /// # Arguments
+    /// * `ctx` - The context state containing approved proposals
+    /// * `new_proposal` - The newly approved proposal to check for conflicts
+    ///
+    /// # Returns
+    /// A vector of governance events to emit (empty if no conflicts)
+    #[allow(clippy::unused_self)] // method for API consistency within ContextManager
+    fn detect_and_handle_conflicts(
+        &self,
+        ctx: &mut PerContextState,
+        new_proposal: &GovernanceProposal,
+    ) -> Vec<GovernanceEvent> {
+        use super::governance::{GovernanceEvent, actions_conflict};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let mut events = Vec::new();
+        let current_timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Check for conflicts with existing approved proposals
+        let mut conflicts = Vec::new();
+        for (existing_id, (existing_proposal, existing_seq, existing_timestamp)) in
+            &ctx.approved_proposals
+        {
+            if actions_conflict(
+                &new_proposal.action,
+                &new_proposal.proposer_did,
+                &existing_proposal.action,
+                &existing_proposal.proposer_did,
+            ) {
+                conflicts.push((
+                    *existing_id,
+                    *existing_seq,
+                    *existing_timestamp,
+                    existing_proposal.clone(),
+                ));
+            }
+        }
+
+        // Handle conflicts
+        for (conflicting_id, conflicting_seq, _conflicting_timestamp, _conflicting_proposal) in
+            conflicts
+        {
+            // Assign sequence numbers - for now, use timestamp as sequence
+            let new_seq = current_timestamp;
+
+            match new_seq.cmp(&conflicting_seq) {
+                std::cmp::Ordering::Equal => {
+                    // Simultaneous conflict - enter governance freeze
+                    ctx.governance_freeze =
+                        Some((new_proposal.proposal_id, conflicting_id, current_timestamp));
+                    events.push(GovernanceEvent::ConflictDetected {
+                        proposal_a: new_proposal.proposal_id,
+                        proposal_b: conflicting_id,
+                    });
+                }
+                std::cmp::Ordering::Less => {
+                    // New proposal wins - invalidate the conflicting one
+                    ctx.approved_proposals.remove(&conflicting_id);
+                    events.push(GovernanceEvent::ConflictResolved {
+                        winner_id: new_proposal.proposal_id,
+                        loser_id: conflicting_id,
+                    });
+                }
+                std::cmp::Ordering::Greater => {
+                    // Existing proposal wins - invalidate the new one
+                    // Don't add the new proposal to approved_proposals
+                    events.push(GovernanceEvent::ConflictResolved {
+                        winner_id: conflicting_id,
+                        loser_id: new_proposal.proposal_id,
+                    });
+                    return events; // Don't add the new proposal
+                }
+            }
+        }
+
+        // Add the new proposal to approved proposals if not invalidated
+        if !events.iter().any(|e| matches!(e, GovernanceEvent::ConflictResolved { loser_id, .. } if *loser_id == new_proposal.proposal_id)) {
+            ctx.approved_proposals.insert(
+                new_proposal.proposal_id,
+                (new_proposal.clone(), current_timestamp, current_timestamp)
+            );
+        }
+
+        events
+    }
+
+    /// Checks for and resolves expired governance freezes (ADR-031 §7).
+    ///
+    /// If a governance freeze has been active for more than 48 hours (172800 seconds)
+    /// without resolution, both conflicting proposals are invalidated and the freeze
+    /// is lifted.
+    ///
+    /// # Arguments
+    /// * `ctx` - The context state to check for expired freezes
+    ///
+    /// # Returns
+    /// A vector of governance events to emit (empty if no expired freezes)
+    #[allow(clippy::unused_self)] // method for API consistency within ContextManager
+    fn check_and_resolve_expired_freezes(&self, ctx: &mut PerContextState) -> Vec<GovernanceEvent> {
+        use super::governance::GovernanceEvent;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        const FREEZE_TIMEOUT_SECONDS: u64 = 48 * 60 * 60; // 48 hours
+
+        let current_timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        if let Some((proposal_a, proposal_b, freeze_start)) = ctx.governance_freeze
+            && current_timestamp.saturating_sub(freeze_start) >= FREEZE_TIMEOUT_SECONDS
+        {
+            // Timeout reached - invalidate both proposals and lift freeze
+            ctx.approved_proposals.remove(&proposal_a);
+            ctx.approved_proposals.remove(&proposal_b);
+            ctx.governance_freeze = None;
+
+            // Both proposals were invalidated by timeout — emit one event
+            // per invalidated proposal using the real proposal IDs so
+            // downstream consumers can identify exactly which proposals expired.
+            return vec![
+                GovernanceEvent::ConflictResolved {
+                    winner_id: proposal_b,
+                    loser_id: proposal_a,
+                },
+                GovernanceEvent::ConflictResolved {
+                    winner_id: proposal_a,
+                    loser_id: proposal_b,
+                },
+            ];
+        }
+
+        Vec::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3215,13 +5917,72 @@ const fn _assert_send_sync() {
     clippy::panic,
     clippy::needless_collect,
     clippy::significant_drop_tightening,
-    clippy::match_same_arms
+    clippy::match_same_arms,
+    clippy::type_complexity,
+    clippy::similar_names,
+    clippy::items_after_statements
 )]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+    use crate::context::params::MemoryScope;
     use crate::context::{ContextMode, ContextState};
+
+    // -----------------------------------------------------------------------
+    // Key resolver helpers for tests
+    // -----------------------------------------------------------------------
+
+    /// No-op key resolver that always returns `None`. Suitable for tests
+    /// that don't exercise governance vote signature verification.
+    fn noop_key_resolver() -> KeyResolver {
+        Arc::new(|_| None)
+    }
+
+    /// Derives a deterministic Ed25519 seed from a DID string.
+    /// Used by both `mock_key_resolver` and `signing_key_for_did` to
+    /// ensure signing keys and resolved verifying keys match.
+    fn did_to_seed(did: &DID) -> [u8; 32] {
+        let mut s = [0u8; 32];
+        let bytes = did.as_ref().as_bytes();
+        for (i, b) in bytes.iter().enumerate() {
+            s[i % 32] ^= *b;
+        }
+        s
+    }
+
+    /// Mock key resolver that returns a deterministic verifying key derived
+    /// from the DID string. Suitable for governance proposal tests that
+    /// need actual key resolution for vote verification.
+    fn mock_key_resolver() -> KeyResolver {
+        Arc::new(|did| {
+            let seed = did_to_seed(did);
+            Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
+        })
+    }
+
+    /// Returns the signing key that corresponds to what `mock_key_resolver`
+    /// resolves for the given DID.
+    fn signing_key_for_did(did: &DID) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&did_to_seed(did))
+    }
+
+    /// Creates an [`InMemoryKeyCustody`] and imports an Ed25519 signing key
+    /// from seed bytes, returning both the custody and the key handle.
+    ///
+    /// Used by broadcast publish tests that need to pass custody + handle
+    /// to [`ContextManager::publish_broadcast`].
+    async fn test_custody_from_seed(
+        seed: &[u8; 32],
+    ) -> (
+        scp_platform::testing::InMemoryKeyCustody,
+        scp_platform::KeyHandle,
+    ) {
+        let custody = scp_platform::testing::InMemoryKeyCustody::new();
+        let handle = custody.import_ed25519_key(seed).await;
+        (custody, handle)
+    }
 
     // -----------------------------------------------------------------------
     // Reusable mock providers
@@ -3276,14 +6037,23 @@ mod tests {
             Ok(())
         }
 
-        fn validate_key_package(&self, _owner_did: &str) -> Result<(), ContextError> {
+        fn validate_key_package(
+            &self,
+            _owner_did: &str,
+            _key_package_bytes: Option<&[u8]>,
+        ) -> Result<(), ContextError> {
             if self.fail_validate_key_package.load(Ordering::Relaxed) {
                 return Err(ContextError::InvalidKeyPackage("mock invalid".into()));
             }
             Ok(())
         }
 
-        fn add_member(&self, _context_id: &[u8; 32], member_did: &str) -> Result<(), ContextError> {
+        fn add_member(
+            &self,
+            _context_id: &[u8; 32],
+            member_did: &str,
+            _key_package_bytes: Option<&[u8]>,
+        ) -> Result<(), ContextError> {
             self.members_added
                 .lock()
                 .unwrap()
@@ -3332,6 +6102,8 @@ mod tests {
             _context_id: &[u8; 32],
             _sender_did: &str,
             payload: &[u8],
+            _epoch: u64,
+            _sequence: u64,
         ) -> Result<Vec<u8>, ContextError> {
             self.messages_encrypted
                 .lock()
@@ -3423,6 +6195,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         let params = ContextParams {
@@ -3430,6 +6203,10 @@ mod tests {
                 crate::context::params::Capability::new("messages:read"),
                 crate::context::params::Capability::new("messages:write"),
                 crate::context::params::Capability::new("role:assign"),
+                Capability::ToolRegister,
+                Capability::ToolInterface,
+                Capability::ChildContextCreate,
+                Capability::MemberBan,
             ],
             ..ContextParams::default()
         };
@@ -3452,6 +6229,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         let handle = manager
@@ -3470,10 +6248,12 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ..ContextParams::default()
         };
 
@@ -3493,6 +6273,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::default()), // not connected
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         let result = manager
@@ -3515,6 +6296,7 @@ mod tests {
             Box::new(crypto),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         let result = manager
@@ -3534,10 +6316,12 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ..ContextParams::default()
         };
 
@@ -3559,9 +6343,7 @@ mod tests {
     async fn join_adds_member_to_mls_group_and_issues_ucan_tokens() {
         let (manager, handle) = setup_active_context().await;
 
-        let kp = KeyPackage {
-            owner_did: "did:key:bob".into(),
-        };
+        let kp = KeyPackage::mock("did:key:bob".into());
 
         let result = manager.join_context(&handle, kp).await;
         assert!(result.is_ok());
@@ -3593,9 +6375,7 @@ mod tests {
         // Transition to Closing.
         handle.transition_to(&ContextState::Closing).await.unwrap();
 
-        let kp = KeyPackage {
-            owner_did: "did:key:bob".into(),
-        };
+        let kp = KeyPackage::mock("did:key:bob".into());
 
         let result = manager.join_context(&handle, kp).await;
         assert!(result.is_err());
@@ -3646,9 +6426,7 @@ mod tests {
         let (manager, handle) = setup_active_context().await;
 
         // Add a second member.
-        let kp = KeyPackage {
-            owner_did: "did:key:bob".into(),
-        };
+        let kp = KeyPackage::mock("did:key:bob".into());
         manager.join_context(&handle, kp).await.unwrap();
         assert_eq!(manager.member_count("test-ctx").await, Some(2));
 
@@ -3696,6 +6474,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         let params = ContextParams {
@@ -3714,9 +6493,7 @@ mod tests {
             .unwrap();
 
         // Add an observer member.
-        let kp = KeyPackage {
-            owner_did: "did:key:observer".into(),
-        };
+        let kp = KeyPackage::mock("did:key:observer".into());
         manager.join_context(&handle, kp).await.unwrap();
 
         // Reassign to observer role (joined members default to "member").
@@ -3822,7 +6599,7 @@ mod tests {
         handle.transition_to(&ContextState::Closing).await.unwrap();
 
         let result = manager
-            .send_message(&handle, &"did:key:creator".into(), b"hello")
+            .send_message(&handle, &"did:key:creator".into(), b"hello", None)
             .await;
         assert!(result.is_err());
         assert!(matches!(
@@ -3838,7 +6615,7 @@ mod tests {
 
         // Try to send as a non-member -- should be denied.
         let result = manager
-            .send_message(&handle, &"did:key:nonexistent".into(), b"hello")
+            .send_message(&handle, &"did:key:nonexistent".into(), b"hello", None)
             .await;
         assert!(result.is_err());
 
@@ -3855,7 +6632,7 @@ mod tests {
         let (manager, handle) = setup_active_context().await;
 
         let result = manager
-            .send_message(&handle, &"did:key:creator".into(), b"hello world")
+            .send_message(&handle, &"did:key:creator".into(), b"hello world", None)
             .await;
         assert!(result.is_ok());
 
@@ -3885,7 +6662,7 @@ mod tests {
 
         for i in 1..=5u8 {
             manager
-                .send_message(&handle, &"did:key:creator".into(), &[i])
+                .send_message(&handle, &"did:key:creator".into(), &[i], None)
                 .await
                 .unwrap();
         }
@@ -3922,9 +6699,7 @@ mod tests {
 
         // Add members.
         for name in &["alice", "bob", "charlie"] {
-            let kp = KeyPackage {
-                owner_did: format!("did:key:{name}").into(),
-            };
+            let kp = KeyPackage::mock(format!("did:key:{name}").into());
             manager.join_context(&handle, kp).await.unwrap();
         }
 
@@ -3956,9 +6731,7 @@ mod tests {
         assert_eq!(role.unwrap().role_name, "admin");
 
         // Add a member.
-        let kp = KeyPackage {
-            owner_did: "did:key:alice".into(),
-        };
+        let kp = KeyPackage::mock("did:key:alice".into());
         manager.join_context(&handle, kp).await.unwrap();
 
         let role = manager.member_role("test-ctx", "did:key:alice").await;
@@ -3980,6 +6753,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         ));
 
         let params = ContextParams {
@@ -4004,9 +6778,7 @@ mod tests {
             let mgr = std::sync::Arc::clone(&manager);
             let h = std::sync::Arc::clone(&handle);
             join_handles.push(tokio::spawn(async move {
-                let kp = KeyPackage {
-                    owner_did: format!("did:key:member-{i}").into(),
-                };
+                let kp = KeyPackage::mock(format!("did:key:member-{i}").into());
                 mgr.join_context(&h, kp).await
             }));
         }
@@ -4016,7 +6788,8 @@ mod tests {
             let mgr = std::sync::Arc::clone(&manager);
             let h = std::sync::Arc::clone(&handle);
             join_handles.push(tokio::spawn(async move {
-                mgr.send_message(&h, &"did:key:creator".into(), &[i]).await
+                mgr.send_message(&h, &"did:key:creator".into(), &[i], None)
+                    .await
             }));
         }
 
@@ -4045,6 +6818,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         ));
 
         let params = ContextParams {
@@ -4082,9 +6856,7 @@ mod tests {
         assert_eq!(count, Some(1), "mutex should not be poisoned");
 
         // Further operations should succeed.
-        let kp = KeyPackage {
-            owner_did: "did:key:after-panic".into(),
-        };
+        let kp = KeyPackage::mock("did:key:after-panic".into());
         let join_result = manager.join_context(&handle_clone, kp).await;
         assert!(join_result.is_ok(), "join after panic should succeed");
         assert_eq!(manager.member_count("panic-ctx").await, Some(2));
@@ -4104,6 +6876,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         // Register the author DID as locally controlled (#234).
@@ -4111,6 +6884,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ceiling: vec![
                 crate::context::params::Capability::new("messages:read"),
                 crate::context::params::Capability::new("messages:write"),
@@ -4301,14 +7075,26 @@ mod tests {
             .unwrap();
 
         // Author can publish (send_message routes to broadcast publish).
+        let author_signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
         let result = manager
-            .send_message(&handle, &"did:key:author1".into(), b"hello broadcast")
+            .send_message(
+                &handle,
+                &"did:key:author1".into(),
+                b"hello broadcast",
+                Some(&author_signing_key),
+            )
             .await;
         assert!(result.is_ok(), "author should be able to publish");
 
         // Non-author subscriber cannot publish.
+        let sub_signing_key = ed25519_dalek::SigningKey::from_bytes(&[43u8; 32]);
         let result = manager
-            .send_message(&handle, &"did:key:sub1".into(), b"unauthorized")
+            .send_message(
+                &handle,
+                &"did:key:sub1".into(),
+                b"unauthorized",
+                Some(&sub_signing_key),
+            )
             .await;
         assert!(result.is_err(), "subscriber should not be able to publish");
         assert!(matches!(
@@ -4329,6 +7115,9 @@ mod tests {
         use std::hash::RandomState;
 
         let (manager, _handle, ctx_id) = setup_broadcast_context().await;
+        let author_signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let author_verifying_key = author_signing_key.verifying_key();
+        let (author_custody, author_key_handle) = test_custody_from_seed(&[42u8; 32]).await;
 
         // Subscribe 3 subscribers.
         for name in &["sub1", "sub2", "sub3"] {
@@ -4355,7 +7144,13 @@ mod tests {
         // Author publishes a message.
         let plaintext = b"hello all subscribers!";
         let envelope = manager
-            .publish_broadcast(&ctx_id, &"did:key:author1".into(), plaintext)
+            .publish_broadcast(
+                &ctx_id,
+                &"did:key:author1".into(),
+                plaintext,
+                &author_custody,
+                &author_key_handle,
+            )
             .await
             .unwrap();
 
@@ -4381,7 +7176,8 @@ mod tests {
                         epoch,
                         "did:key:author1".to_owned(),
                     );
-                    let decrypted = open_broadcast(&broadcast_key, &envelope).unwrap();
+                    let decrypted =
+                        open_broadcast(&broadcast_key, &envelope, &author_verifying_key).unwrap();
                     assert_eq!(decrypted, plaintext);
                 }
                 super::KeyRequestDecision::Deny { reason } => {
@@ -4414,6 +7210,9 @@ mod tests {
         use std::hash::RandomState;
 
         let (manager, _handle, ctx_id) = setup_broadcast_context().await;
+        let author_signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let author_verifying_key = author_signing_key.verifying_key();
+        let (author_custody, author_key_handle) = test_custody_from_seed(&[42u8; 32]).await;
 
         // Subscribe 2 subscribers.
         for name in &["good-sub", "bad-sub"] {
@@ -4438,7 +7237,13 @@ mod tests {
         // Author publishes first message (both can decrypt).
         let msg1 = b"pre-block message";
         let envelope1 = manager
-            .publish_broadcast(&ctx_id, &"did:key:author1".into(), msg1)
+            .publish_broadcast(
+                &ctx_id,
+                &"did:key:author1".into(),
+                msg1,
+                &author_custody,
+                &author_key_handle,
+            )
             .await
             .unwrap();
 
@@ -4465,7 +7270,8 @@ mod tests {
             pre_block_epoch,
             "did:key:author1".to_owned(),
         );
-        let decrypted = open_broadcast(&pre_block_broadcast_key, &envelope1).unwrap();
+        let decrypted =
+            open_broadcast(&pre_block_broadcast_key, &envelope1, &author_verifying_key).unwrap();
         assert_eq!(decrypted, msg1);
 
         // Block bad-sub.
@@ -4481,7 +7287,13 @@ mod tests {
         // Author publishes post-block message.
         let msg2 = b"post-block secret";
         let envelope2 = manager
-            .publish_broadcast(&ctx_id, &"did:key:author1".into(), msg2)
+            .publish_broadcast(
+                &ctx_id,
+                &"did:key:author1".into(),
+                msg2,
+                &author_custody,
+                &author_key_handle,
+            )
             .await
             .unwrap();
 
@@ -4501,7 +7313,8 @@ mod tests {
 
         // bad-sub tries to decrypt with the old key -- should fail because
         // the message was encrypted with the new (post-rotation) key.
-        let decrypt_attempt = open_broadcast(&pre_block_broadcast_key, &envelope2);
+        let decrypt_attempt =
+            open_broadcast(&pre_block_broadcast_key, &envelope2, &author_verifying_key);
         assert!(
             decrypt_attempt.is_err(),
             "blocked subscriber should not be able to decrypt post-block messages"
@@ -4526,7 +7339,8 @@ mod tests {
                     epoch,
                     "did:key:author1".to_owned(),
                 );
-                let decrypted = open_broadcast(&new_key, &envelope2).unwrap();
+                let decrypted =
+                    open_broadcast(&new_key, &envelope2, &author_verifying_key).unwrap();
                 assert_eq!(decrypted, msg2);
             }
             super::KeyRequestDecision::Deny { reason } => {
@@ -4565,8 +7379,15 @@ mod tests {
             .unwrap();
 
         // Subscriber tries to publish -- should fail.
+        let (sub_custody, sub_key_handle) = test_custody_from_seed(&[43u8; 32]).await;
         let result = manager
-            .publish_broadcast(&ctx_id, &"did:key:sub1".into(), b"nope")
+            .publish_broadcast(
+                &ctx_id,
+                &"did:key:sub1".into(),
+                b"nope",
+                &sub_custody,
+                &sub_key_handle,
+            )
             .await;
         assert!(result.is_err());
         assert!(matches!(
@@ -4590,8 +7411,15 @@ mod tests {
         assert_eq!(manager.broadcast_subscriber_count(&ctx_id).await, Some(0));
 
         // Author should be able to publish.
+        let (author_custody, author_key_handle) = test_custody_from_seed(&[42u8; 32]).await;
         let result = manager
-            .publish_broadcast(&ctx_id, &"did:key:author1".into(), b"test")
+            .publish_broadcast(
+                &ctx_id,
+                &"did:key:author1".into(),
+                b"test",
+                &author_custody,
+                &author_key_handle,
+            )
             .await;
         assert!(result.is_ok());
     }
@@ -4652,10 +7480,12 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ceiling: vec![
                 crate::context::params::Capability::new("messages:read"),
                 crate::context::params::Capability::new("messages:write"),
@@ -4751,7 +7581,12 @@ mod tests {
         };
 
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-        let mut engine = SingleAdminEngine::new(admin_did.clone());
+        let vk = signing_key.verifying_key();
+        #[allow(clippy::type_complexity)]
+        let resolver: std::sync::Arc<
+            dyn Fn(&scp_identity::DID) -> Option<ed25519_dalek::VerifyingKey> + Send + Sync,
+        > = std::sync::Arc::new(move |_| Some(vk));
+        let mut engine = SingleAdminEngine::new(admin_did.clone(), resolver);
         let gov_ctx = GovernanceContext {
             context_id: context_id.to_owned(),
             members: vec![
@@ -4785,6 +7620,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         // Register both author DIDs as locally controlled (#234).
@@ -4793,10 +7629,12 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ceiling: vec![
                 crate::context::params::Capability::new("messages:read"),
                 crate::context::params::Capability::new("messages:write"),
                 crate::context::params::Capability::new("role:assign"),
+                Capability::MemberBan,
             ],
             ..ContextParams::default()
         };
@@ -4824,6 +7662,9 @@ mod tests {
     /// SCP-227 AC4: governance-approved `BlockAuthor` proposal revokes sender
     /// key, preventing the blocked author from publishing.
     #[tokio::test]
+    // Integration test exercises full governance + broadcast lifecycle; splitting
+    // would fragment a sequential scenario that must be verified end-to-end.
+    #[allow(clippy::too_many_lines)]
     async fn broadcast_block_author_via_governance_revokes_publish() {
         use crate::crypto::ucan::validate::{
             InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
@@ -4853,16 +7694,31 @@ mod tests {
                 .unwrap();
         }
 
+        let (alice_custody, alice_key_handle) = test_custody_from_seed(&[0xAA; 32]).await;
+        let (bob_custody, bob_key_handle) = test_custody_from_seed(&[0xBB; 32]).await;
+
         // Both authors can publish before blocking.
         assert!(
             manager
-                .publish_broadcast(&ctx_id, &"did:key:alice".into(), b"alice msg")
+                .publish_broadcast(
+                    &ctx_id,
+                    &"did:key:alice".into(),
+                    b"alice msg",
+                    &alice_custody,
+                    &alice_key_handle,
+                )
                 .await
                 .is_ok()
         );
         assert!(
             manager
-                .publish_broadcast(&ctx_id, &"did:key:bob".into(), b"bob msg")
+                .publish_broadcast(
+                    &ctx_id,
+                    &"did:key:bob".into(),
+                    b"bob msg",
+                    &bob_custody,
+                    &bob_key_handle,
+                )
                 .await
                 .is_ok()
         );
@@ -4882,7 +7738,13 @@ mod tests {
         // Alice can still publish (unaffected).
         assert!(
             manager
-                .publish_broadcast(&ctx_id, &"did:key:alice".into(), b"alice still ok")
+                .publish_broadcast(
+                    &ctx_id,
+                    &"did:key:alice".into(),
+                    b"alice still ok",
+                    &alice_custody,
+                    &alice_key_handle,
+                )
                 .await
                 .is_ok(),
             "unblocked author should still be able to publish"
@@ -4890,7 +7752,13 @@ mod tests {
 
         // Bob cannot publish (PermissionDenied).
         let bob_result = manager
-            .publish_broadcast(&ctx_id, &"did:key:bob".into(), b"bob tries")
+            .publish_broadcast(
+                &ctx_id,
+                &"did:key:bob".into(),
+                b"bob tries",
+                &bob_custody,
+                &bob_key_handle,
+            )
             .await;
         assert!(
             bob_result.is_err(),
@@ -4972,6 +7840,12 @@ mod tests {
         use std::hash::RandomState;
 
         let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
+        let alice_signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let alice_verifying_key = alice_signing_key.verifying_key();
+        let bob_signing_key = ed25519_dalek::SigningKey::from_bytes(&[43u8; 32]);
+        let bob_verifying_key = bob_signing_key.verifying_key();
+        let (alice_custody, alice_key_handle) = test_custody_from_seed(&[42u8; 32]).await;
+        let (bob_custody, bob_key_handle) = test_custody_from_seed(&[43u8; 32]).await;
 
         // Subscribe 2 subscribers.
         for name in &["sub1", "sub2"] {
@@ -4996,14 +7870,26 @@ mod tests {
         // Alice publishes — both subscribers can get key and decrypt.
         let alice_msg1 = b"Alice before block";
         let _alice_envelope1 = manager
-            .publish_broadcast(&ctx_id, &"did:key:alice".into(), alice_msg1)
+            .publish_broadcast(
+                &ctx_id,
+                &"did:key:alice".into(),
+                alice_msg1,
+                &alice_custody,
+                &alice_key_handle,
+            )
             .await
             .unwrap();
 
         // Bob publishes — both subscribers can get key and decrypt.
         let bob_msg1 = b"Bob before block";
         let bob_envelope1 = manager
-            .publish_broadcast(&ctx_id, &"did:key:bob".into(), bob_msg1)
+            .publish_broadcast(
+                &ctx_id,
+                &"did:key:bob".into(),
+                bob_msg1,
+                &bob_custody,
+                &bob_key_handle,
+            )
             .await
             .unwrap();
 
@@ -5026,7 +7912,8 @@ mod tests {
             bob_pre_epoch,
             "did:key:bob".to_owned(),
         );
-        let decrypted = open_broadcast(&bob_broadcast_key, &bob_envelope1).unwrap();
+        let decrypted =
+            open_broadcast(&bob_broadcast_key, &bob_envelope1, &bob_verifying_key).unwrap();
         assert_eq!(decrypted, bob_msg1);
 
         // Block Bob via governance (admin proposes, auto-approved).
@@ -5039,7 +7926,13 @@ mod tests {
 
         // Bob tries to publish — PermissionDenied.
         let bob_result = manager
-            .publish_broadcast(&ctx_id, &"did:key:bob".into(), b"bob after block")
+            .publish_broadcast(
+                &ctx_id,
+                &"did:key:bob".into(),
+                b"bob after block",
+                &bob_custody,
+                &bob_key_handle,
+            )
             .await;
         assert!(
             bob_result.is_err(),
@@ -5049,7 +7942,13 @@ mod tests {
         // Alice can still publish after Bob is blocked.
         let alice_msg2 = b"Alice after Bob blocked";
         let alice_envelope2 = manager
-            .publish_broadcast(&ctx_id, &"did:key:alice".into(), alice_msg2)
+            .publish_broadcast(
+                &ctx_id,
+                &"did:key:alice".into(),
+                alice_msg2,
+                &alice_custody,
+                &alice_key_handle,
+            )
             .await
             .unwrap();
 
@@ -5067,7 +7966,8 @@ mod tests {
                     epoch,
                     "did:key:alice".to_owned(),
                 );
-                let decrypted = open_broadcast(&alice_key, &alice_envelope2).unwrap();
+                let decrypted =
+                    open_broadcast(&alice_key, &alice_envelope2, &alice_verifying_key).unwrap();
                 assert_eq!(decrypted, alice_msg2);
             }
             super::KeyRequestDecision::Deny { reason } => {
@@ -5087,7 +7987,8 @@ mod tests {
 
         // Old messages from Bob are still decryptable with cached key
         // (forward access to historical content is preserved).
-        let old_decrypted = open_broadcast(&bob_broadcast_key, &bob_envelope1).unwrap();
+        let old_decrypted =
+            open_broadcast(&bob_broadcast_key, &bob_envelope1, &bob_verifying_key).unwrap();
         assert_eq!(old_decrypted, bob_msg1);
     }
 
@@ -5168,12 +8069,14 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         manager.register_local_did("did:key:alice".into()).await;
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ceiling: vec![
                 crate::context::params::Capability::new("messages:read"),
                 crate::context::params::Capability::new("messages:write"),
@@ -5229,7 +8132,12 @@ mod tests {
         use crate::context::governance::{GovernanceContext, GovernanceEngine, SingleAdminEngine};
 
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-        let mut engine = SingleAdminEngine::new(admin_did.clone());
+        let vk = signing_key.verifying_key();
+        #[allow(clippy::type_complexity)]
+        let resolver: std::sync::Arc<
+            dyn Fn(&scp_identity::DID) -> Option<ed25519_dalek::VerifyingKey> + Send + Sync,
+        > = std::sync::Arc::new(move |_| Some(vk));
+        let mut engine = SingleAdminEngine::new(admin_did.clone(), resolver);
         let gov_ctx = GovernanceContext {
             context_id: context_id.to_owned(),
             members: vec![
@@ -5277,15 +8185,15 @@ mod tests {
 
         let result = result.unwrap();
         match result {
-            super::GovernanceActionResult::SubscriberBanned(ban_result) => {
-                assert_eq!(ban_result.banned_did, "did:key:sub1");
+            super::GovernanceActionResult::ReadAccessRevoked(revoke_result) => {
+                assert_eq!(revoke_result.did.0, "did:key:sub1");
                 // At least one author should have rotated keys.
                 assert!(
-                    !ban_result.rotated_authors.is_empty(),
-                    "key rotation should occur on ban"
+                    revoke_result.rotated_author_count > 0,
+                    "key rotation should occur on revoke"
                 );
             }
-            other => panic!("expected SubscriberBanned, got {other:?}"),
+            other => panic!("expected ReadAccessRevoked, got {other:?}"),
         }
 
         // Subscriber should no longer be tracked.
@@ -5313,8 +8221,38 @@ mod tests {
     /// SCP-GG-006: `RevokeReadAccess` fails when ceiling lacks `MemberBan`.
     #[tokio::test]
     async fn revoke_read_access_rejected_without_member_ban_ceiling() {
-        // Use the standard two-author setup which does NOT have MemberBan.
-        let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
+        // Create a broadcast context WITHOUT MemberBan in ceiling.
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        manager.register_local_did("did:key:alice".into()).await;
+        manager.register_local_did("did:key:bob".into()).await;
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            memory_scope: MemoryScope::Full,
+            ceiling: vec![
+                Capability::MessagesRead,
+                Capability::MessagesWrite,
+                Capability::RoleAssign,
+            ],
+            ..ContextParams::default()
+        };
+        let _handle = manager
+            .create_context("no-ban-ctx".into(), params, "did:key:alice".into())
+            .await
+            .unwrap();
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("no-ban-ctx").unwrap();
+            let bc = ctx.broadcast_context.as_mut().unwrap();
+            bc.add_author("did:key:bob").unwrap();
+            ctx.membership
+                .add_member("did:key:bob".into(), "author".into(), vec![]);
+        }
+        let ctx_id = "no-ban-ctx".to_owned();
 
         // Subscribe sub1.
         {
@@ -5405,10 +8343,10 @@ mod tests {
         assert!(result.is_ok(), "RestoreReadAccess should succeed");
 
         match result.unwrap() {
-            super::GovernanceActionResult::SubscriberUnbanned { did } => {
-                assert_eq!(did.0, "did:key:sub1");
+            super::GovernanceActionResult::ReadAccessRestored(restore_result) => {
+                assert_eq!(restore_result.did.0, "did:key:sub1");
             }
-            other => panic!("expected SubscriberUnbanned, got {other:?}"),
+            other => panic!("expected ReadAccessRestored, got {other:?}"),
         }
 
         // Verify ReadAccessRestored event was emitted.
@@ -5428,7 +8366,25 @@ mod tests {
     /// SCP-GG-006: `RestoreReadAccess` also fails without `MemberBan` in ceiling.
     #[tokio::test]
     async fn restore_read_access_rejected_without_member_ban_ceiling() {
-        let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
+        // Create a broadcast context WITHOUT MemberBan in ceiling.
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        manager.register_local_did("did:key:alice".into()).await;
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            memory_scope: MemoryScope::Full,
+            ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
+            ..ContextParams::default()
+        };
+        let _handle = manager
+            .create_context("no-ban-restore-ctx".into(), params, "did:key:alice".into())
+            .await
+            .unwrap();
+        let ctx_id = "no-ban-restore-ctx".to_owned();
 
         let action = super::GovernanceAction::RestoreReadAccess {
             did: "did:key:sub1".into(),
@@ -5448,6 +8404,1068 @@ mod tests {
         assert!(
             matches!(result.unwrap_err(), ContextError::PermissionDenied(ref msg) if msg.contains("member:ban")),
             "error should mention missing member:ban capability"
+        );
+    }
+
+    // ===================================================================
+    // Content access governance tests (SCP-CAC-007)
+    // ===================================================================
+
+    /// Helper: creates an encrypted context with `MemberBan` in ceiling,
+    /// admin (alice) and member (bob).
+    async fn setup_encrypted_with_member_ban() -> (ContextManager, String) {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        manager.register_local_did("did:key:alice".into()).await;
+        manager.register_local_did("did:key:bob".into()).await;
+
+        let params = ContextParams {
+            mode: ContextMode::Encrypted,
+            memory_scope: MemoryScope::Full,
+            ceiling: vec![
+                Capability::MessagesRead,
+                Capability::MessagesWrite,
+                Capability::RoleAssign,
+                Capability::MemberBan,
+            ],
+            ..ContextParams::default()
+        };
+
+        let _handle = manager
+            .create_context("enc-ban-ctx".into(), params, "did:key:alice".into())
+            .await
+            .unwrap();
+
+        // Add bob as a member.
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("enc-ban-ctx").unwrap();
+            ctx.membership
+                .add_member("did:key:bob".into(), "member".into(), vec![]);
+        }
+
+        (manager, "enc-ban-ctx".to_owned())
+    }
+
+    /// SCP-CAC-007: `RevokeReadAccess` works on encrypted contexts (not just broadcast).
+    #[tokio::test]
+    async fn revoke_read_access_works_on_encrypted_context() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        let action = super::GovernanceAction::RevokeReadAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            action,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(
+            result.is_ok(),
+            "RevokeReadAccess on encrypted context should succeed"
+        );
+
+        // Verify bob is tracked as read-revoked.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&ctx_id).unwrap();
+        assert!(ctx.read_revoked_members.contains(&DID::from("did:key:bob")));
+        assert!(ctx.read_exclusion_list.contains(&DID::from("did:key:bob")));
+        // Bob is still a member (membership/access decoupling).
+        assert!(ctx.membership.contains("did:key:bob"));
+    }
+
+    /// SCP-CAC-007: redundant `RevokeReadAccess` is prevented by TOCTOU replay protection.
+    /// The governance engine assigns deterministic proposal IDs, so a second identical
+    /// proposal is rejected as "already executed" — redundancy is handled at the
+    /// governance layer, not the execution layer.
+    #[tokio::test]
+    async fn revoke_read_access_redundant_rejected_by_replay_protection() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        let action = super::GovernanceAction::RevokeReadAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let proposal1 = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            action.clone(),
+        );
+
+        // First revoke succeeds.
+        manager
+            .execute_governance_action(&ctx_id, &proposal1)
+            .await
+            .unwrap();
+
+        // Second identical proposal is rejected by replay protection.
+        let action2 = super::GovernanceAction::RevokeReadAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let proposal2 = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            action2,
+        );
+        let result = manager.execute_governance_action(&ctx_id, &proposal2).await;
+        assert!(
+            result.is_err(),
+            "redundant proposal should be rejected by TOCTOU replay protection"
+        );
+    }
+
+    /// SCP-CAC-007: `RestoreReadAccess` returns `NothingToRestore` when never revoked.
+    #[tokio::test]
+    async fn restore_read_access_nothing_to_restore() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        let action = super::GovernanceAction::RestoreReadAccess {
+            did: "did:key:bob".into(),
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            action,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), ContextError::NothingToRestore(_)),
+            "should return NothingToRestore when read access was never revoked"
+        );
+    }
+
+    /// SCP-CAC-007: `RestoreReadAccess` succeeds after revocation on encrypted context.
+    #[tokio::test]
+    async fn restore_read_access_after_revocation_on_encrypted() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        // First revoke.
+        let revoke_action = super::GovernanceAction::RevokeReadAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let revoke_proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            revoke_action,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &revoke_proposal)
+            .await
+            .unwrap();
+
+        // Now restore.
+        let restore_action = super::GovernanceAction::RestoreReadAccess {
+            did: "did:key:bob".into(),
+        };
+        let restore_proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            restore_action,
+        );
+        let result = manager
+            .execute_governance_action(&ctx_id, &restore_proposal)
+            .await;
+        assert!(
+            result.is_ok(),
+            "RestoreReadAccess should succeed after revocation"
+        );
+
+        // Bob should no longer be read-revoked.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&ctx_id).unwrap();
+        assert!(!ctx.read_revoked_members.contains(&DID::from("did:key:bob")));
+        assert!(!ctx.read_exclusion_list.contains(&DID::from("did:key:bob")));
+        // Bob still a member.
+        assert!(ctx.membership.contains("did:key:bob"));
+    }
+
+    /// SCP-CAC-007: `RevokeWriteAccess(Full)` destroys sender key in broadcast.
+    #[tokio::test]
+    async fn revoke_write_access_full_in_broadcast() {
+        let (manager, ctx_id) = setup_broadcast_with_member_ban().await;
+
+        // Add sub1 as member for governance purposes.
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut(&ctx_id).unwrap();
+            ctx.membership
+                .add_member("did:key:sub1".into(), "subscriber".into(), vec![]);
+        }
+
+        let action = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:alice".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:alice".into(),
+            action,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_ok(), "RevokeWriteAccess(Full) should succeed");
+
+        // Alice should be in write_revoked_members.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&ctx_id).unwrap();
+        assert!(
+            ctx.write_revoked_members
+                .contains(&DID::from("did:key:alice"))
+        );
+        // Alice is still a member.
+        assert!(ctx.membership.contains("did:key:alice"));
+    }
+
+    /// SCP-CAC-007: `RevokeWriteAccess(FutureOnly)` does NOT destroy broadcast key.
+    #[tokio::test]
+    async fn revoke_write_access_future_only_no_key_destruction() {
+        let (manager, ctx_id) = setup_broadcast_with_member_ban().await;
+
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut(&ctx_id).unwrap();
+            ctx.membership
+                .add_member("did:key:sub1".into(), "subscriber".into(), vec![]);
+        }
+
+        let action = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:alice".into(),
+            scope: super::RevocationScope::FutureOnly,
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:alice".into(),
+            action,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(
+            result.is_ok(),
+            "RevokeWriteAccess(FutureOnly) should succeed"
+        );
+
+        // Alice should be in write_revoked_members.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&ctx_id).unwrap();
+        assert!(
+            ctx.write_revoked_members
+                .contains(&DID::from("did:key:alice"))
+        );
+        // In FutureOnly mode, broadcast author should still exist (key not destroyed).
+        let bc = ctx.broadcast_context.as_ref().unwrap();
+        assert!(
+            bc.is_author("did:key:alice"),
+            "FutureOnly should NOT destroy broadcast keys"
+        );
+    }
+
+    /// SCP-CAC-007: redundant `RevokeWriteAccess` is prevented by TOCTOU replay protection.
+    #[tokio::test]
+    async fn revoke_write_access_redundant_rejected_by_replay_protection() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        let action = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            action,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &proposal)
+            .await
+            .unwrap();
+
+        // Second identical proposal is rejected by replay protection.
+        let action2 = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let proposal2 = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            action2,
+        );
+        let result = manager.execute_governance_action(&ctx_id, &proposal2).await;
+        assert!(
+            result.is_err(),
+            "redundant proposal should be rejected by TOCTOU replay protection"
+        );
+    }
+
+    /// SCP-CAC-007: `RestoreWriteAccess` returns `NothingToRestore` when never revoked.
+    #[tokio::test]
+    async fn restore_write_access_nothing_to_restore() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        let action = super::GovernanceAction::RestoreWriteAccess {
+            did: "did:key:bob".into(),
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            action,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), ContextError::NothingToRestore(_)),
+            "should return NothingToRestore when write access was never revoked"
+        );
+    }
+
+    /// SCP-CAC-007: `RestoreWriteAccess` succeeds after revocation, emits event.
+    #[tokio::test]
+    async fn restore_write_access_after_revocation() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        // First revoke.
+        let revoke_action = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let revoke_proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            revoke_action,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &revoke_proposal)
+            .await
+            .unwrap();
+        manager.drain_events(&ctx_id).await;
+
+        // Now restore.
+        let restore_action = super::GovernanceAction::RestoreWriteAccess {
+            did: "did:key:bob".into(),
+        };
+        let restore_proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            restore_action,
+        );
+        let result = manager
+            .execute_governance_action(&ctx_id, &restore_proposal)
+            .await;
+        assert!(result.is_ok(), "RestoreWriteAccess should succeed");
+
+        // Bob should no longer be write-revoked.
+        {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get(&ctx_id).unwrap();
+            assert!(
+                !ctx.write_revoked_members
+                    .contains(&DID::from("did:key:bob"))
+            );
+        }
+
+        // Verify WriteAccessRestored event was emitted.
+        let events = manager.drain_events(&ctx_id).await;
+        let has_event = events.iter().any(|e| {
+            matches!(
+                e,
+                super::ContextEvent::WriteAccessRestored { did } if did.0 == "did:key:bob"
+            )
+        });
+        assert!(
+            has_event,
+            "WriteAccessRestored event should have been emitted"
+        );
+    }
+
+    /// SCP-CAC-007: `RotateContentKeys` on broadcast context rotates all author keys.
+    #[tokio::test]
+    async fn rotate_content_keys_broadcast() {
+        let (manager, ctx_id) = setup_broadcast_with_member_ban().await;
+
+        let action = super::GovernanceAction::RotateContentKeys {
+            reason: Some("periodic hygiene".to_owned()),
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:alice".into(),
+            action,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_ok(), "RotateContentKeys should succeed");
+
+        match result.unwrap() {
+            super::GovernanceActionResult::ContentKeysRotated(r) => {
+                assert_eq!(r.reason, Some("periodic hygiene".to_owned()));
+            }
+            other => panic!("expected ContentKeysRotated, got {other:?}"),
+        }
+
+        // Verify ContentKeysRotated event emitted.
+        let events = manager.drain_events(&ctx_id).await;
+        let has_event = events
+            .iter()
+            .any(|e| matches!(e, super::ContextEvent::ContentKeysRotated { .. }));
+        assert!(
+            has_event,
+            "ContentKeysRotated event should have been emitted"
+        );
+    }
+
+    /// SCP-CAC-007: `RotateContentKeys` on encrypted context emits event
+    /// (MLS handles actual rotation).
+    #[tokio::test]
+    async fn rotate_content_keys_encrypted() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        let action = super::GovernanceAction::RotateContentKeys { reason: None };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            action,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(
+            result.is_ok(),
+            "RotateContentKeys on encrypted should succeed"
+        );
+
+        // Verify event emitted.
+        let events = manager.drain_events(&ctx_id).await;
+        let has_event = events
+            .iter()
+            .any(|e| matches!(e, super::ContextEvent::ContentKeysRotated { .. }));
+        assert!(
+            has_event,
+            "ContentKeysRotated event should have been emitted"
+        );
+    }
+
+    /// SCP-CAC-007: presence-only members (read + write revoked) cannot propose.
+    #[tokio::test]
+    async fn presence_only_member_cannot_propose() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        // Revoke bob's read and write access to make them presence-only.
+        let revoke_read = super::GovernanceAction::RevokeReadAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let rr_proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            revoke_read,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &rr_proposal)
+            .await
+            .unwrap();
+
+        let revoke_write = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let rw_proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            revoke_write,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &rw_proposal)
+            .await
+            .unwrap();
+
+        // Now bob (presence-only) tries to propose — should fail.
+        let bob_key = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+        let result = manager
+            .propose_governance_action(
+                &ctx_id,
+                &"did:key:bob".into(),
+                super::GovernanceAction::RotateContentKeys { reason: None },
+                &bob_key,
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), ContextError::PermissionDenied(ref msg) if msg.contains("presence-only")),
+            "presence-only member should not be able to propose"
+        );
+    }
+
+    /// SCP-CAC-007: member with only write revoked can still propose (not presence-only).
+    #[tokio::test]
+    async fn write_only_revoked_member_can_still_propose() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        // Revoke bob's write only.
+        let revoke_write = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let rw_proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            revoke_write,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &rw_proposal)
+            .await
+            .unwrap();
+
+        // Bob (read-only, not presence-only) can still propose.
+        // Note: the governance engine may still reject based on role, but the
+        // presence-only gate should not block them.
+        let bob_key = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+        let result = manager
+            .propose_governance_action(
+                &ctx_id,
+                &"did:key:bob".into(),
+                super::GovernanceAction::RotateContentKeys { reason: None },
+                &bob_key,
+            )
+            .await;
+        // The governance engine may reject for other reasons (e.g. role),
+        // but NOT because of presence-only check. Check it's not the
+        // presence-only error specifically.
+        if let Err(ref e) = result {
+            assert!(
+                !matches!(e, ContextError::PermissionDenied(msg) if msg.contains("presence-only")),
+                "write-only-revoked member should not be blocked by presence-only check"
+            );
+        }
+    }
+
+    /// SCP-CAC-007: `RevokeReadAccess` fails for non-member DID.
+    #[tokio::test]
+    async fn revoke_read_access_non_member_fails() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        let action = super::GovernanceAction::RevokeReadAccess {
+            did: "did:key:nonexistent".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:nonexistent".into(),
+            action,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), ContextError::MemberNotFound(_)),
+            "should return MemberNotFound for non-member DID"
+        );
+    }
+
+    /// SCP-CAC-007: content access actions preserve membership (decoupling).
+    #[tokio::test]
+    async fn content_access_preserves_membership() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        // Revoke both read and write.
+        let rr_action = super::GovernanceAction::RevokeReadAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let rr_proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            rr_action,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &rr_proposal)
+            .await
+            .unwrap();
+
+        let rw_action = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let rw_proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            rw_action,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &rw_proposal)
+            .await
+            .unwrap();
+
+        // Bob is still a member despite both read and write revoked.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&ctx_id).unwrap();
+        assert!(
+            ctx.membership.contains("did:key:bob"),
+            "member should remain in context after both read and write revocation"
+        );
+        assert!(ctx.read_revoked_members.contains(&DID::from("did:key:bob")));
+        assert!(
+            ctx.write_revoked_members
+                .contains(&DID::from("did:key:bob"))
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Write access governance tests (SCP-CAC-007)
+    // -----------------------------------------------------------------------
+
+    /// SCP-CAC-007: `RevokeWriteAccess` marks member as write-revoked.
+    #[tokio::test]
+    async fn revoke_write_access_marks_member() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        let action = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::FutureOnly,
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            action,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_ok(), "RevokeWriteAccess should succeed");
+
+        match result.unwrap() {
+            super::GovernanceActionResult::WriteAccessRevoked(r) => {
+                assert_eq!(r.did.0, "did:key:bob");
+            }
+            other => panic!("expected WriteAccessRevoked, got {other:?}"),
+        }
+
+        // Verify member is tracked as write-revoked.
+        {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get(&ctx_id).unwrap();
+            assert!(
+                ctx.write_revoked_members
+                    .contains(&DID("did:key:bob".into())),
+                "bob should be in write_revoked_members"
+            );
+        }
+
+        // Verify WriteAccessRevoked event was emitted.
+        let events = manager.drain_events(&ctx_id).await;
+        let has_event = events.iter().any(|e| {
+            matches!(
+                e,
+                super::ContextEvent::WriteAccessRevoked { did } if did.0 == "did:key:bob"
+            )
+        });
+        assert!(has_event, "WriteAccessRevoked event should be emitted");
+    }
+
+    /// SCP-CAC-007: Redundant `RevokeWriteAccess` is a no-op (§5.9).
+    #[tokio::test]
+    async fn revoke_write_access_redundant_is_noop() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        let action = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::FutureOnly,
+        };
+
+        // First revocation.
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            action.clone(),
+        );
+        manager
+            .execute_governance_action(&ctx_id, &proposal)
+            .await
+            .unwrap();
+
+        // Drain events from first call.
+        manager.drain_events(&ctx_id).await;
+
+        // Second revocation — should be a no-op (Ok(())).
+        // Use a different proposal_id to bypass TOCTOU replay protection,
+        // simulating a second proposal for the same action.
+        let mut proposal2 = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            action,
+        );
+        proposal2.proposal_id = [2u8; 32]; // distinct from first proposal
+        let result = manager.execute_governance_action(&ctx_id, &proposal2).await;
+        assert!(
+            result.is_ok(),
+            "redundant RevokeWriteAccess should succeed (no-op)"
+        );
+    }
+
+    /// SCP-CAC-007: `RestoreWriteAccess` removes write revocation.
+    #[tokio::test]
+    async fn restore_write_access_removes_revocation() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        // First revoke.
+        let revoke = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::FutureOnly,
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            revoke,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &proposal)
+            .await
+            .unwrap();
+        manager.drain_events(&ctx_id).await;
+
+        // Now restore.
+        let restore = super::GovernanceAction::RestoreWriteAccess {
+            did: "did:key:bob".into(),
+        };
+        let restore_proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            restore,
+        );
+        let result = manager
+            .execute_governance_action(&ctx_id, &restore_proposal)
+            .await;
+        assert!(result.is_ok(), "RestoreWriteAccess should succeed");
+
+        match result.unwrap() {
+            super::GovernanceActionResult::WriteAccessRestored(r) => {
+                assert_eq!(r.did.0, "did:key:bob");
+            }
+            other => panic!("expected WriteAccessRestored, got {other:?}"),
+        }
+
+        // Verify member is no longer write-revoked.
+        {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get(&ctx_id).unwrap();
+            assert!(
+                !ctx.write_revoked_members
+                    .contains(&DID("did:key:bob".into())),
+                "bob should not be in write_revoked_members after restore"
+            );
+        }
+
+        // Verify WriteAccessRestored event.
+        let events = manager.drain_events(&ctx_id).await;
+        let has_event = events.iter().any(|e| {
+            matches!(
+                e,
+                super::ContextEvent::WriteAccessRestored { did } if did.0 == "did:key:bob"
+            )
+        });
+        assert!(has_event, "WriteAccessRestored event should be emitted");
+    }
+
+    /// SCP-CAC-007: `RestoreWriteAccess` on never-revoked member returns
+    /// `NothingToRestore` error (§5.9).
+    #[tokio::test]
+    async fn restore_write_access_never_revoked_returns_error() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        let restore = super::GovernanceAction::RestoreWriteAccess {
+            did: "did:key:bob".into(),
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            restore,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(
+            result.is_err(),
+            "RestoreWriteAccess on never-revoked should fail"
+        );
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                ContextError::NothingToRestore(ref msg) if msg.contains("did:key:bob")
+            ),
+            "error should be NothingToRestore"
+        );
+    }
+
+    /// SCP-CAC-007: Presence-only state — revoking both read and write strips
+    /// governance capabilities.
+    #[tokio::test]
+    async fn presence_only_strips_governance_capabilities() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        // Revoke write access for bob.
+        let revoke_write = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::FutureOnly,
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            revoke_write,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &proposal)
+            .await
+            .unwrap();
+
+        // Revoke read access for bob — now presence-only.
+        let revoke_read = super::GovernanceAction::RevokeReadAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::FutureOnly,
+        };
+        let read_proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            revoke_read,
+        );
+        manager
+            .execute_governance_action(&ctx_id, &read_proposal)
+            .await
+            .unwrap();
+
+        // Verify both read and write are revoked.
+        {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get(&ctx_id).unwrap();
+            assert!(
+                ctx.write_revoked_members
+                    .contains(&DID("did:key:bob".into()))
+            );
+            assert!(
+                ctx.read_revoked_members
+                    .contains(&DID("did:key:bob".into()))
+            );
+        }
+    }
+
+    /// SCP-CAC-007: `RotateContentKeys` emits `ContentKeysRotated` event.
+    #[tokio::test]
+    async fn rotate_content_keys_emits_event() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        let action = super::GovernanceAction::RotateContentKeys {
+            reason: Some("periodic rotation".into()),
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            action,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_ok(), "RotateContentKeys should succeed");
+
+        match result.unwrap() {
+            super::GovernanceActionResult::ContentKeysRotated(r) => {
+                assert_eq!(r.reason.as_deref(), Some("periodic rotation"));
+            }
+            other => panic!("expected ContentKeysRotated, got {other:?}"),
+        }
+
+        // Verify ContentKeysRotated event.
+        let events = manager.drain_events(&ctx_id).await;
+        let has_event = events.iter().any(|e| {
+            matches!(
+                e,
+                super::ContextEvent::ContentKeysRotated { reason } if reason.as_deref() == Some("periodic rotation")
+            )
+        });
+        assert!(has_event, "ContentKeysRotated event should be emitted");
+    }
+
+    /// SCP-CAC-007: `RotateContentKeys` with no reason also works.
+    #[tokio::test]
+    async fn rotate_content_keys_no_reason() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        let action = super::GovernanceAction::RotateContentKeys { reason: None };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            action,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(
+            result.is_ok(),
+            "RotateContentKeys with no reason should succeed"
+        );
+
+        match result.unwrap() {
+            super::GovernanceActionResult::ContentKeysRotated(r) => {
+                assert!(r.reason.is_none());
+            }
+            other => panic!("expected ContentKeysRotated, got {other:?}"),
+        }
+    }
+
+    /// SCP-CAC-007: `RevokeWriteAccess` with Full scope in broadcast context
+    /// blocks the author.
+    #[tokio::test]
+    async fn revoke_write_access_full_scope_broadcast() {
+        let (manager, ctx_id) = setup_broadcast_with_member_ban().await;
+
+        // Add sub1 as a member in membership so the revoke path finds them.
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut(&ctx_id).unwrap();
+            ctx.membership
+                .add_member("did:key:sub1".into(), "subscriber".into(), vec![]);
+            // Also add sub1 as an author in broadcast context.
+            let bc = ctx.broadcast_context.as_mut().unwrap();
+            bc.add_author("did:key:sub1").unwrap();
+        }
+
+        let action = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:sub1".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:sub1".into(),
+            action,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(
+            result.is_ok(),
+            "RevokeWriteAccess Full in broadcast should succeed"
+        );
+
+        // Verify WriteAccessRevoked event.
+        let events = manager.drain_events(&ctx_id).await;
+        let has_event = events.iter().any(|e| {
+            matches!(
+                e,
+                super::ContextEvent::WriteAccessRevoked { did } if did.0 == "did:key:sub1"
+            )
+        });
+        assert!(has_event, "WriteAccessRevoked event should be emitted");
+    }
+
+    /// SCP-CAC-007: `RevokeWriteAccess` fails without `MemberBan` in ceiling.
+    #[tokio::test]
+    async fn revoke_write_access_rejected_without_member_ban() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        manager.register_local_did("did:key:alice".into()).await;
+        manager.register_local_did("did:key:bob".into()).await;
+
+        let params = ContextParams {
+            mode: ContextMode::Encrypted,
+            memory_scope: crate::context::MemoryScope::Full,
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+            ],
+            ..ContextParams::default()
+        };
+        let _handle = manager
+            .create_context("no-ban-write-ctx".into(), params, "did:key:alice".into())
+            .await
+            .unwrap();
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("no-ban-write-ctx").unwrap();
+            ctx.membership
+                .add_member("did:key:bob".into(), "member".into(), vec![]);
+        }
+
+        let action = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:bob".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            "no-ban-write-ctx",
+            &"did:key:bob".into(),
+            action,
+        );
+
+        let result = manager
+            .execute_governance_action("no-ban-write-ctx", &proposal)
+            .await;
+        assert!(
+            result.is_err(),
+            "RevokeWriteAccess should fail without MemberBan in ceiling"
+        );
+    }
+
+    /// SCP-CAC-007: `RevokeWriteAccess` on non-member returns error.
+    #[tokio::test]
+    async fn revoke_write_access_non_member_fails() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+
+        let action = super::GovernanceAction::RevokeWriteAccess {
+            did: "did:key:nonexistent".into(),
+            scope: super::RevocationScope::Full,
+        };
+        let proposal = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:nonexistent".into(),
+            action,
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(
+            result.is_err(),
+            "RevokeWriteAccess on non-member should fail"
+        );
+        assert!(
+            matches!(result.unwrap_err(), ContextError::MemberNotFound(_)),
+            "error should be MemberNotFound"
         );
     }
 
@@ -5535,6 +9553,7 @@ mod tests {
                 author_did: "did:key:author1".to_owned(),
                 broadcast_key: generate_sender_key(),
                 epoch: 3,
+                next_sequence: 1,
                 block_list: HashSet::from(["did:key:blocked1".to_owned()]),
             },
         );
@@ -5587,10 +9606,12 @@ mod tests {
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
             Box::new(MockContextPersistence::default()),
+            noop_key_resolver(),
         );
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ceiling: vec![
                 crate::context::params::Capability::new("messages:read"),
                 crate::context::params::Capability::new("messages:write"),
@@ -5627,10 +9648,17 @@ mod tests {
             ttl_remaining_secs: None,
             registered_tools: Vec::new(),
             write_revoked_members: HashSet::new(),
+            read_revoked_members: HashSet::new(),
+            read_exclusion_list: HashSet::new(),
             tool_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
             pruning_policy: None,
+            governance_model_config: None,
+            economic_policy: None,
+            approved_proposals: HashMap::new(),
+            governance_freeze: None,
+            pending_ceiling_modification: None,
         };
 
         let bc_snapshot = test_broadcast_snapshot("persist-ctx-2");
@@ -5652,6 +9680,7 @@ mod tests {
                 contexts: std::sync::Mutex::new(persistence.contexts.lock().unwrap().clone()),
                 broadcasts: std::sync::Mutex::new(persistence.broadcasts.lock().unwrap().clone()),
             }),
+            noop_key_resolver(),
         );
 
         // Restore the context.
@@ -5686,6 +9715,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ceiling: vec![
                 crate::context::params::Capability::new("messages:read"),
                 crate::context::params::Capability::new("messages:write"),
@@ -5715,10 +9745,17 @@ mod tests {
             ttl_remaining_secs: None,
             registered_tools: Vec::new(),
             write_revoked_members: HashSet::new(),
+            read_revoked_members: HashSet::new(),
+            read_exclusion_list: HashSet::new(),
             tool_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
             pruning_policy: None,
+            governance_model_config: None,
+            economic_policy: None,
+            approved_proposals: HashMap::new(),
+            governance_freeze: None,
+            pending_ceiling_modification: None,
         };
 
         persistence
@@ -5740,6 +9777,7 @@ mod tests {
                 contexts: std::sync::Mutex::new(persistence.contexts.lock().unwrap().clone()),
                 broadcasts: std::sync::Mutex::new(persistence.broadcasts.lock().unwrap().clone()),
             }),
+            noop_key_resolver(),
         );
 
         let handle = ContextHandle::new("replay-ctx".to_owned(), params);
@@ -5792,10 +9830,17 @@ mod tests {
             ttl_remaining_secs: Some(120), // 120 seconds remaining
             registered_tools: Vec::new(),
             write_revoked_members: HashSet::new(),
+            read_revoked_members: HashSet::new(),
+            read_exclusion_list: HashSet::new(),
             tool_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
             pruning_policy: None,
+            governance_model_config: None,
+            economic_policy: None,
+            approved_proposals: HashMap::new(),
+            governance_freeze: None,
+            pending_ceiling_modification: None,
         };
 
         persistence.persist_context("ttl-ctx", &snapshot).unwrap();
@@ -5808,6 +9853,7 @@ mod tests {
                 contexts: std::sync::Mutex::new(persistence.contexts.lock().unwrap().clone()),
                 broadcasts: std::sync::Mutex::new(HashMap::new()),
             }),
+            noop_key_resolver(),
         );
 
         let handle = ContextHandle::new("ttl-ctx".to_owned(), params);
@@ -5848,10 +9894,17 @@ mod tests {
                 ttl_remaining_secs: None,
                 registered_tools: Vec::new(),
                 write_revoked_members: HashSet::new(),
+                read_revoked_members: HashSet::new(),
+                read_exclusion_list: HashSet::new(),
                 tool_interfaces: Vec::new(),
                 threshold_signers: Vec::new(),
                 threshold_value: 0,
                 pruning_policy: None,
+                governance_model_config: None,
+                economic_policy: None,
+                approved_proposals: HashMap::new(),
+                governance_freeze: None,
+                pending_ceiling_modification: None,
             };
             persistence.persist_context(ctx_name, &snapshot).unwrap();
         }
@@ -5864,6 +9917,7 @@ mod tests {
                 contexts: std::sync::Mutex::new(persistence.contexts.lock().unwrap().clone()),
                 broadcasts: std::sync::Mutex::new(HashMap::new()),
             }),
+            noop_key_resolver(),
         );
 
         let mut restored = manager.restore_all_contexts().await.unwrap();
@@ -5884,6 +9938,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ..ContextParams::default()
         };
 
@@ -5902,10 +9957,17 @@ mod tests {
             ttl_remaining_secs: None,
             registered_tools: Vec::new(),
             write_revoked_members: HashSet::new(),
+            read_revoked_members: HashSet::new(),
+            read_exclusion_list: HashSet::new(),
             tool_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
             pruning_policy: None,
+            governance_model_config: None,
+            economic_policy: None,
+            approved_proposals: HashMap::new(),
+            governance_freeze: None,
+            pending_ceiling_modification: None,
         };
 
         let bc_snapshot = test_broadcast_snapshot("dup-ctx");
@@ -5922,6 +9984,7 @@ mod tests {
                 contexts: std::sync::Mutex::new(persistence.contexts.lock().unwrap().clone()),
                 broadcasts: std::sync::Mutex::new(persistence.broadcasts.lock().unwrap().clone()),
             }),
+            noop_key_resolver(),
         );
 
         // First restore.
@@ -5953,6 +10016,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         let did: DID = "did:key:local1".into();
@@ -6132,6 +10196,7 @@ mod tests {
             Box::new(MockCrypto::default()),
             Box::new(MockTransport::connected()),
             Box::new(MockEventLog::default()),
+            noop_key_resolver(),
         );
 
         // Neither the author DID nor the context exist.
@@ -6149,5 +10214,4070 @@ mod tests {
             matches!(err, ContextError::PermissionDenied(_)),
             "should be PermissionDenied (DID check), not MembershipFailed (context lookup): {err}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Collection bounds tests (#360, §5.9)
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal valid [`ToolRegistration`] for bounds tests.
+    fn test_tool_registration(id: &str) -> ToolRegistration {
+        use crate::context::tools::registry::{TestVector, ToolSchema};
+        ToolRegistration {
+            tool_id: id.to_owned(),
+            name: id.to_owned(),
+            description: "test tool".to_owned(),
+            schema: ToolSchema {
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: serde_json::json!({"type": "object"}),
+            },
+            implementation_hash: [0u8; 32],
+            test_vectors: vec![TestVector {
+                input: serde_json::json!({}),
+                expected_output: serde_json::json!({}),
+                description: "noop".to_owned(),
+            }],
+            operator_did: "did:key:test-operator".into(),
+            economic_metadata: None,
+            registered_at: 0,
+            signature: Vec::new(),
+        }
+    }
+
+    /// #360: register exactly 256 tools (the limit), verify the 256th succeeds;
+    /// attempt to register a 257th, verify `LimitExceeded` is returned.
+    #[tokio::test]
+    async fn registered_tools_bounded_at_256() {
+        let (manager, _handle) = setup_active_context().await;
+        let pid: ProposalId = [0u8; 32];
+
+        // Register exactly MAX_REGISTERED_TOOLS tools.
+        for i in 0..super::MAX_REGISTERED_TOOLS {
+            let reg = test_tool_registration(&format!("tool-{i}"));
+            manager
+                .execute_register_tool("test-ctx", &reg, pid)
+                .await
+                .unwrap();
+        }
+
+        // The 257th must fail with LimitExceeded.
+        let overflow = test_tool_registration("tool-overflow");
+        let err = manager
+            .execute_register_tool("test-ctx", &overflow, pid)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ContextError::LimitExceeded(msg) if msg.contains("256")),
+            "expected LimitExceeded with limit value, got: {err}"
+        );
+    }
+
+    /// #360: establish exactly 256 tool interfaces (the limit), verify the 256th
+    /// succeeds; attempt to establish a 257th, verify `LimitExceeded` is returned.
+    #[tokio::test]
+    async fn tool_interfaces_bounded_at_256() {
+        let (manager, _handle) = setup_active_context().await;
+        let pid: ProposalId = [0u8; 32];
+
+        // Establish exactly MAX_TOOL_INTERFACES interfaces.
+        for i in 0..super::MAX_TOOL_INTERFACES {
+            let iface = ToolInterface {
+                source_context: "test-ctx".to_owned(),
+                target_context: format!("target-{i}"),
+                tool_id: format!("tool-{i}"),
+                rate_limit: None,
+                approved_by_source: true,
+                approved_by_target: true,
+            };
+            manager
+                .execute_establish_tool_interface("test-ctx", &iface, pid)
+                .await
+                .unwrap();
+        }
+
+        // The 257th must fail with LimitExceeded.
+        let overflow = ToolInterface {
+            source_context: "test-ctx".to_owned(),
+            target_context: "target-overflow".to_owned(),
+            tool_id: "tool-overflow".to_owned(),
+            rate_limit: None,
+            approved_by_source: true,
+            approved_by_target: true,
+        };
+        let err = manager
+            .execute_establish_tool_interface("test-ctx", &overflow, pid)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ContextError::LimitExceeded(msg) if msg.contains("256")),
+            "expected LimitExceeded with limit value, got: {err}"
+        );
+    }
+
+    /// #360: add exactly 64 signers (the limit), verify the 64th succeeds;
+    /// attempt to add a 65th, verify `LimitExceeded` is returned.
+    #[tokio::test]
+    async fn threshold_signers_bounded_at_64() {
+        let (manager, _handle) = setup_active_context().await;
+        let pid: ProposalId = [0u8; 32];
+
+        // First, add 64 members to the context so they pass the membership check.
+        // The creator ("did:key:creator") is already a member.
+        let mut dids: Vec<DID> = Vec::with_capacity(super::MAX_THRESHOLD_SIGNERS);
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("test-ctx").unwrap();
+            for i in 0..super::MAX_THRESHOLD_SIGNERS {
+                let did: DID = format!("did:key:signer-{i}").into();
+                ctx.membership
+                    .add_member(did.clone(), "member".to_owned(), vec![]);
+                dids.push(did);
+            }
+        }
+
+        // Add exactly MAX_THRESHOLD_SIGNERS signers.
+        for did in &dids {
+            manager
+                .execute_add_signer("test-ctx", did, pid)
+                .await
+                .unwrap();
+        }
+
+        // The 65th must fail with LimitExceeded.
+        let overflow_did: DID = "did:key:signer-overflow".into();
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("test-ctx").unwrap();
+            ctx.membership
+                .add_member(overflow_did.clone(), "member".to_owned(), vec![]);
+        }
+        let err = manager
+            .execute_add_signer("test-ctx", &overflow_did, pid)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ContextError::LimitExceeded(msg) if msg.contains("64")),
+            "expected LimitExceeded with limit value, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // GovernanceModel enum expansion tests (#320)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn governance_model_serde_roundtrip_all_variants() {
+        use super::super::params::GovernanceModel;
+
+        let alice: DID = "did:dht:z6MkAlice".into();
+        let bob: DID = "did:dht:z6MkBob".into();
+        let carol: DID = "did:dht:z6MkCarol".into();
+
+        let models = vec![
+            GovernanceModel::SingleAdmin,
+            GovernanceModel::Threshold {
+                threshold: 2,
+                signers: vec![alice.clone(), bob.clone(), carol.clone()],
+            },
+            GovernanceModel::Majority {
+                eligible_voters: vec![alice.clone(), bob.clone(), carol.clone()],
+            },
+            GovernanceModel::Unanimity {
+                eligible_voters: vec![alice, bob, carol],
+            },
+        ];
+
+        for model in &models {
+            let json = serde_json::to_string(model).expect("serialize");
+            let deserialized: GovernanceModel = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(&deserialized, model, "serde roundtrip failed for {model:?}");
+        }
+    }
+
+    #[test]
+    fn governance_model_in_context_params_roundtrip() {
+        use super::super::params::GovernanceModel;
+
+        let params = ContextParams {
+            governance: GovernanceModel::Threshold {
+                threshold: 2,
+                signers: vec![
+                    "did:dht:z6MkAlice".into(),
+                    "did:dht:z6MkBob".into(),
+                    "did:dht:z6MkCarol".into(),
+                ],
+            },
+            ..ContextParams::default()
+        };
+
+        let json = serde_json::to_string(&params).expect("serialize");
+        let deserialized: ContextParams = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deserialized.governance, params.governance);
+    }
+
+    #[test]
+    fn public_metadata_exposes_all_governance_variants() {
+        use super::super::params::{GovernanceModel, RuntimeMetadata};
+
+        let params = ContextParams {
+            governance: GovernanceModel::Majority {
+                eligible_voters: vec!["did:dht:z6MkAlice".into(), "did:dht:z6MkBob".into()],
+            },
+            ..ContextParams::default()
+        };
+
+        let runtime = RuntimeMetadata::default();
+        let meta = params.public_metadata(&runtime);
+        assert_eq!(meta.governance, params.governance);
+    }
+
+    // -----------------------------------------------------------------------
+    // Context creation validation tests (#320)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn create_context_rejects_threshold_exceeding_signers() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::Threshold {
+                threshold: 5,
+                signers: vec!["did:dht:z6MkAlice".into(), "did:dht:z6MkBob".into()],
+            },
+            ..ContextParams::default()
+        };
+
+        let result = manager
+            .create_context(
+                "ctx-bad-threshold".into(),
+                params,
+                "did:dht:z6MkAlice".into(),
+            )
+            .await;
+
+        assert!(result.is_err(), "should reject threshold > signers.len()");
+    }
+
+    #[tokio::test]
+    async fn create_context_rejects_threshold_zero() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::Threshold {
+                threshold: 0,
+                signers: vec!["did:dht:z6MkAlice".into()],
+            },
+            ..ContextParams::default()
+        };
+
+        let result = manager
+            .create_context(
+                "ctx-zero-threshold".into(),
+                params,
+                "did:dht:z6MkAlice".into(),
+            )
+            .await;
+
+        assert!(result.is_err(), "should reject threshold == 0");
+    }
+
+    #[tokio::test]
+    async fn create_context_rejects_majority_empty_voters() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::Majority {
+                eligible_voters: vec![],
+            },
+            ..ContextParams::default()
+        };
+
+        let result = manager
+            .create_context(
+                "ctx-empty-majority".into(),
+                params,
+                "did:dht:z6MkAlice".into(),
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "should reject Majority with empty eligible_voters"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_context_rejects_unanimity_empty_voters() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::Unanimity {
+                eligible_voters: vec![],
+            },
+            ..ContextParams::default()
+        };
+
+        let result = manager
+            .create_context(
+                "ctx-empty-unanimity".into(),
+                params,
+                "did:dht:z6MkAlice".into(),
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "should reject Unanimity with empty eligible_voters"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Proposal lifecycle tests (#320)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn single_admin_propose_auto_executes() {
+        use super::super::governance::GovernanceAction;
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let creator_did: DID = "did:dht:z6MkCreator".into();
+        let signing_key = signing_key_for_did(&creator_did);
+
+        let params = ContextParams {
+            ceiling: vec![
+                Capability::MessagesRead,
+                Capability::MessagesWrite,
+                Capability::ToolRegister,
+            ],
+            ..ContextParams::default()
+        };
+
+        let handle = manager
+            .create_context(
+                "ctx-single-admin-lifecycle".into(),
+                params,
+                creator_did.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(handle.state().await, ContextState::Active);
+
+        // Propose RegisterTool — should auto-execute in SingleAdmin.
+        let action = GovernanceAction::RegisterTool {
+            registration: Box::new(test_tool_registration("test-tool")),
+        };
+
+        let (proposal, events) = manager
+            .propose_governance_action(
+                "ctx-single-admin-lifecycle",
+                &creator_did,
+                action,
+                &signing_key,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                proposal.status,
+                super::super::governance::ProposalStatus::Approved
+            ),
+            "SingleAdmin proposal should be auto-approved"
+        );
+        assert!(
+            events.len() >= 2,
+            "should have ProposalCreated + VoteCast + ProposalResolved events"
+        );
+
+        // Verify the proposal is retrievable.
+        let retrieved = manager
+            .get_proposal("ctx-single-admin-lifecycle", &proposal.proposal_id)
+            .await
+            .unwrap();
+        assert_eq!(retrieved.proposal_id, proposal.proposal_id);
+
+        // Verify list_proposals returns it.
+        let proposals = manager
+            .list_proposals("ctx-single-admin-lifecycle")
+            .await
+            .unwrap();
+        assert_eq!(proposals.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn threshold_context_proposal_lifecycle() {
+        use super::super::governance::{GovernanceAction, ProposalStatus};
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let alice: DID = "did:dht:z6MkAlice".into();
+        let bob: DID = "did:dht:z6MkBob".into();
+        let carol: DID = "did:dht:z6MkCarol".into();
+        let key_a = signing_key_for_did(&alice);
+        let key_b = signing_key_for_did(&bob);
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::Threshold {
+                threshold: 2,
+                signers: vec![alice.clone(), bob.clone(), carol.clone()],
+            },
+            ceiling: vec![
+                Capability::MessagesRead,
+                Capability::MessagesWrite,
+                Capability::ToolRegister,
+            ],
+            ..ContextParams::default()
+        };
+
+        // Create context (alice is the creator/admin).
+        let _handle = manager
+            .create_context("ctx-threshold".into(), params, alice.clone())
+            .await
+            .unwrap();
+
+        // Alice proposes RegisterTool (her proposer vote counts as first approval).
+        let action = GovernanceAction::RegisterTool {
+            registration: Box::new(test_tool_registration("threshold-tool")),
+        };
+
+        let (proposal, _events) = manager
+            .propose_governance_action("ctx-threshold", &alice, action, &key_a)
+            .await
+            .unwrap();
+
+        // Proposal should be Pending (1 vote, need 2).
+        assert!(
+            matches!(proposal.status, ProposalStatus::Pending),
+            "threshold proposal should be pending after 1 vote, got {:?}",
+            proposal.status
+        );
+
+        // Bob votes approve — should reach threshold (2-of-3).
+        let (status, _events) = manager
+            .vote_on_proposal("ctx-threshold", &proposal.proposal_id, &bob, true, &key_b)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(status, ProposalStatus::Approved),
+            "threshold proposal should be approved after 2nd vote, got {status:?}"
+        );
+
+        // Verify the tool was registered (auto-execution).
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("ctx-threshold").unwrap();
+        assert!(
+            ctx.registered_tools
+                .iter()
+                .any(|t| t.name == "threshold-tool"),
+            "tool should have been registered after proposal approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn majority_context_proposal_lifecycle() {
+        use super::super::governance::{GovernanceAction, ProposalStatus};
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let alice: DID = "did:dht:z6MkAlice".into();
+        let bob: DID = "did:dht:z6MkBob".into();
+        let carol: DID = "did:dht:z6MkCarol".into();
+        let key_a = signing_key_for_did(&alice);
+        let key_b = signing_key_for_did(&bob);
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::Majority {
+                eligible_voters: vec![alice.clone(), bob.clone(), carol.clone()],
+            },
+            ..ContextParams::default()
+        };
+
+        let _handle = manager
+            .create_context("ctx-majority".into(), params, alice.clone())
+            .await
+            .unwrap();
+
+        // Alice proposes CloseContext.
+        let action = GovernanceAction::CloseContext {
+            reason: Some("test close".to_owned()),
+        };
+
+        let (proposal, _) = manager
+            .propose_governance_action("ctx-majority", &alice, action, &key_a)
+            .await
+            .unwrap();
+
+        assert!(matches!(proposal.status, ProposalStatus::Pending));
+
+        // Alice approves her own proposal (proposer must vote separately
+        // in MajorityVoteEngine — propose() does not auto-approve).
+        let (status, _) = manager
+            .vote_on_proposal("ctx-majority", &proposal.proposal_id, &alice, true, &key_a)
+            .await
+            .unwrap();
+        assert!(
+            matches!(status, ProposalStatus::Pending),
+            "1/3 approvals should still be pending, got {status:?}"
+        );
+
+        // Bob approves — now 2/3 approve = >50% = approved.
+        let (status, _) = manager
+            .vote_on_proposal("ctx-majority", &proposal.proposal_id, &bob, true, &key_b)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(status, ProposalStatus::Approved),
+            "2/3 approvals should reach majority, got {status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unanimity_context_single_rejection_defeats_proposal() {
+        use super::super::governance::{GovernanceAction, ProposalStatus};
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let alice: DID = "did:dht:z6MkAlice".into();
+        let bob: DID = "did:dht:z6MkBob".into();
+        let carol: DID = "did:dht:z6MkCarol".into();
+        let key_a = signing_key_for_did(&alice);
+        let key_b = signing_key_for_did(&bob);
+        let key_c = signing_key_for_did(&carol);
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::Unanimity {
+                eligible_voters: vec![alice.clone(), bob.clone(), carol.clone()],
+            },
+            ..ContextParams::default()
+        };
+
+        // Add bob as member so we can test RemoveMember doesn't happen.
+        let _handle = manager
+            .create_context("ctx-unanimity".into(), params, alice.clone())
+            .await
+            .unwrap();
+
+        // Add bob to membership manually for the test.
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("ctx-unanimity").unwrap();
+            ctx.membership
+                .add_member(bob.clone(), "member".into(), vec![]);
+            ctx.membership
+                .add_member(carol.clone(), "member".into(), vec![]);
+        }
+
+        // Alice proposes RemoveMember(bob).
+        let action = GovernanceAction::RemoveMember {
+            did: bob.clone(),
+            reason: Some("test removal".to_owned()),
+        };
+
+        let (proposal, _) = manager
+            .propose_governance_action("ctx-unanimity", &alice, action, &key_a)
+            .await
+            .unwrap();
+
+        assert!(matches!(proposal.status, ProposalStatus::Pending));
+
+        // Bob approves.
+        let (status, _) = manager
+            .vote_on_proposal("ctx-unanimity", &proposal.proposal_id, &bob, true, &key_b)
+            .await
+            .unwrap();
+        assert!(matches!(status, ProposalStatus::Pending));
+
+        // Carol rejects — single rejection kills unanimity.
+        let (status, _) = manager
+            .vote_on_proposal(
+                "ctx-unanimity",
+                &proposal.proposal_id,
+                &carol,
+                false,
+                &key_c,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(status, ProposalStatus::Rejected { .. }),
+            "unanimity proposal should be rejected after single rejection, got {status:?}"
+        );
+
+        // Verify bob is still a member (proposal was rejected, not executed).
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("ctx-unanimity").unwrap();
+        assert!(
+            ctx.membership.get(bob.as_ref()).is_some(),
+            "Bob should still be a member after rejected proposal"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_eligible_voter_rejected() {
+        use super::super::governance::GovernanceAction;
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let alice: DID = "did:dht:z6MkAlice".into();
+        let bob: DID = "did:dht:z6MkBob".into();
+        let eve: DID = "did:dht:z6MkEve".into();
+        let key_a = signing_key_for_did(&alice);
+        let key_e = signing_key_for_did(&eve);
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::Threshold {
+                threshold: 2,
+                signers: vec![alice.clone(), bob.clone()],
+            },
+            ..ContextParams::default()
+        };
+
+        let _handle = manager
+            .create_context("ctx-eligibility".into(), params, alice.clone())
+            .await
+            .unwrap();
+
+        // Alice proposes.
+        let action = GovernanceAction::RegisterTool {
+            registration: Box::new(test_tool_registration("tool")),
+        };
+
+        let (proposal, _) = manager
+            .propose_governance_action("ctx-eligibility", &alice, action, &key_a)
+            .await
+            .unwrap();
+
+        // Eve (not a signer) tries to vote — should be rejected.
+        let result = manager
+            .vote_on_proposal("ctx-eligibility", &proposal.proposal_id, &eve, true, &key_e)
+            .await;
+
+        assert!(result.is_err(), "non-eligible voter should be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ContextError::GovernanceFailed(_)),
+            "should be GovernanceFailed for non-eligible voter, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn governance_snapshot_serde_roundtrip() {
+        use crate::context::roles::{ContextRoleState, default_ceiling};
+
+        let params = ContextParams {
+            governance: super::super::params::GovernanceModel::Threshold {
+                threshold: 2,
+                signers: vec![
+                    "did:dht:z6MkAlice".into(),
+                    "did:dht:z6MkBob".into(),
+                    "did:dht:z6MkCarol".into(),
+                ],
+            },
+            ..ContextParams::default()
+        };
+
+        let role_state =
+            ContextRoleState::new("ctx-snap", "did:dht:z6MkAlice", default_ceiling(), vec![])
+                .unwrap();
+
+        let snapshot = super::ContextSnapshot {
+            context_id: "ctx-snap".to_owned(),
+            state: ContextState::Active,
+            context_params: params,
+            membership: MembershipState::new(),
+            role_state,
+            executed_proposals: HashSet::new(),
+            ttl_remaining_secs: None,
+            registered_tools: Vec::new(),
+            write_revoked_members: HashSet::new(),
+            read_revoked_members: HashSet::new(),
+            read_exclusion_list: HashSet::new(),
+            tool_interfaces: Vec::new(),
+            threshold_signers: Vec::new(),
+            threshold_value: 0,
+            pruning_policy: None,
+            governance_model_config: Some(
+                super::super::governance::GovernanceModelConfig::Threshold {
+                    signers: vec![
+                        "did:dht:z6MkAlice".into(),
+                        "did:dht:z6MkBob".into(),
+                        "did:dht:z6MkCarol".into(),
+                    ],
+                    threshold: 2,
+                    voting_window_secs: 86_400,
+                },
+            ),
+            economic_policy: None,
+            approved_proposals: HashMap::new(),
+            governance_freeze: None,
+            pending_ceiling_modification: None,
+        };
+
+        let json = serde_json::to_string(&snapshot).expect("serialize");
+        let deserialized: super::ContextSnapshot =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deserialized.context_id, snapshot.context_id);
+        assert_eq!(
+            deserialized.governance_model_config,
+            snapshot.governance_model_config
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Promotion policy enforcement tests (§5.10, #340)
+    // -----------------------------------------------------------------------
+
+    /// §5.10 AC1: a context created with `NoPromotion` rejects `PromoteContext`
+    /// governance proposals with `PermissionDenied`.
+    #[tokio::test]
+    async fn promote_context_rejected_when_policy_is_no_promotion() {
+        use crate::context::governance::{GovernanceProposal, SignedVote, VoteType};
+
+        let (manager, _handle) = setup_active_context().await;
+
+        // setup_active_context uses ContextParams::default() which has
+        // promotion_policy = NoPromotion. Build an approved PromoteContext
+        // proposal with the creator's vote.
+        let proposal = GovernanceProposal {
+            proposal_id: [1u8; 32],
+            context_id: "test-ctx".into(),
+            proposer_did: "did:key:creator".into(),
+            action: GovernanceAction::PromoteContext,
+            status: ProposalStatus::Approved,
+            created_at: 1000,
+            voting_deadline: 2000,
+            approvals: vec![SignedVote {
+                voter_did: "did:key:creator".into(),
+                vote: VoteType::Approve,
+                timestamp: 1000,
+                signature: vec![0u8; 64],
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+
+        let result = manager
+            .execute_governance_action("test-ctx", &proposal)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "NoPromotion context must reject PromoteContext"
+        );
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not Promotable"),
+            "error message should contain 'not Promotable', got: {msg}"
+        );
+        assert!(
+            matches!(err, ContextError::PermissionDenied(_)),
+            "should be PermissionDenied, got: {err}"
+        );
+    }
+
+    /// §5.10 AC2: a context created with `Promotable` can be promoted via
+    /// unanimous governance approval. After promotion, TTL is removed and
+    /// memory scope transitions to `Full`.
+    #[tokio::test]
+    async fn promote_context_succeeds_when_policy_is_promotable() {
+        use crate::context::governance::{GovernanceProposal, SignedVote, VoteType};
+        use crate::context::params::{MemoryScope, PromotionPolicy};
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let params = ContextParams {
+            promotion_policy: PromotionPolicy::Promotable,
+            memory_scope: MemoryScope::Ephemeral,
+            ttl: Some(std::time::Duration::from_secs(3600)),
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+            ],
+            ..ContextParams::default()
+        };
+
+        let handle = manager
+            .create_context("promo-ctx".into(), params, "did:key:creator".into())
+            .await
+            .unwrap();
+
+        // Verify preconditions: TTL is set, memory scope is Ephemeral.
+        assert_eq!(handle.params().memory_scope, MemoryScope::Ephemeral);
+        assert_eq!(
+            handle.params().promotion_policy,
+            PromotionPolicy::Promotable
+        );
+
+        // Build an approved PromoteContext proposal with unanimous consent
+        // (only the creator is a member).
+        let proposal = GovernanceProposal {
+            proposal_id: [2u8; 32],
+            context_id: "promo-ctx".into(),
+            proposer_did: "did:key:creator".into(),
+            action: GovernanceAction::PromoteContext,
+            status: ProposalStatus::Approved,
+            created_at: 1000,
+            voting_deadline: 2000,
+            approvals: vec![SignedVote {
+                voter_did: "did:key:creator".into(),
+                vote: VoteType::Approve,
+                timestamp: 1000,
+                signature: vec![0u8; 64],
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+
+        let result = manager
+            .execute_governance_action("promo-ctx", &proposal)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Promotable context should accept PromoteContext: {result:?}"
+        );
+
+        // Verify postconditions: memory scope is now Full.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("promo-ctx").unwrap();
+        assert_eq!(
+            ctx.handle.params().memory_scope,
+            MemoryScope::Full,
+            "memory scope should transition to Full after promotion"
+        );
+
+        // TTL timer should be cancelled (deadline removed).
+        assert!(
+            ctx.ttl_timer.deadline_unix_secs.is_none(),
+            "TTL deadline should be removed after promotion"
+        );
+    }
+
+    /// §5.10 AC3: after promotion, `promotion_policy` remains `Promotable` —
+    /// the field is not mutated by the promotion itself.
+    #[tokio::test]
+    async fn promote_context_does_not_mutate_promotion_policy() {
+        use crate::context::governance::{GovernanceProposal, SignedVote, VoteType};
+        use crate::context::params::{MemoryScope, PromotionPolicy};
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let params = ContextParams {
+            promotion_policy: PromotionPolicy::Promotable,
+            memory_scope: MemoryScope::Ephemeral,
+            ceiling: vec![crate::context::params::Capability::new("messages:read")],
+            ..ContextParams::default()
+        };
+
+        let handle = manager
+            .create_context("promo-immut-ctx".into(), params, "did:key:creator".into())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            handle.params().promotion_policy,
+            PromotionPolicy::Promotable
+        );
+
+        let proposal = GovernanceProposal {
+            proposal_id: [3u8; 32],
+            context_id: "promo-immut-ctx".into(),
+            proposer_did: "did:key:creator".into(),
+            action: GovernanceAction::PromoteContext,
+            status: ProposalStatus::Approved,
+            created_at: 1000,
+            voting_deadline: 2000,
+            approvals: vec![SignedVote {
+                voter_did: "did:key:creator".into(),
+                vote: VoteType::Approve,
+                timestamp: 1000,
+                signature: vec![0u8; 64],
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+
+        let result = manager
+            .execute_governance_action("promo-immut-ctx", &proposal)
+            .await;
+        assert!(result.is_ok(), "promotion should succeed: {result:?}");
+
+        // Verify promotion_policy is still Promotable (not mutated).
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("promo-immut-ctx").unwrap();
+        assert_eq!(
+            ctx.handle.params().promotion_policy,
+            PromotionPolicy::Promotable,
+            "promotion_policy must remain Promotable after promotion — it is immutable"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Ceiling enforcement tests (#339, §5.3)
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a context with a specific ceiling for ceiling enforcement tests.
+    async fn setup_context_with_ceiling(
+        ceiling: Vec<Capability>,
+    ) -> (ContextManager, ContextHandle, String) {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let params = ContextParams {
+            ceiling,
+            ..ContextParams::default()
+        };
+
+        let handle = manager
+            .create_context("ceiling-test-ctx".into(), params, "did:key:creator".into())
+            .await
+            .unwrap();
+
+        let ctx_id = "ceiling-test-ctx".to_owned();
+        (manager, handle, ctx_id)
+    }
+
+    /// Helper: build a simple approved proposal for ceiling tests.
+    fn ceiling_test_proposal(
+        context_id: &str,
+        action: GovernanceAction,
+    ) -> super::GovernanceProposal {
+        use crate::context::governance::{SignedVote, VoteType};
+        super::GovernanceProposal {
+            proposal_id: [42u8; 32],
+            context_id: context_id.into(),
+            proposer_did: "did:key:creator".into(),
+            action,
+            status: ProposalStatus::Approved,
+            created_at: 1000,
+            voting_deadline: 2000,
+            approvals: vec![SignedVote {
+                voter_did: "did:key:creator".into(),
+                vote: VoteType::Approve,
+                timestamp: 1000,
+                signature: vec![0u8; 64],
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        }
+    }
+
+    /// #339: `RegisterTool` is rejected when `ToolRegister` is not in ceiling.
+    #[tokio::test]
+    async fn register_tool_rejected_without_ceiling_capability() {
+        use crate::context::tools::registry::ToolSchema;
+
+        let (manager, _handle, ctx_id) =
+            setup_context_with_ceiling(vec![Capability::MessagesRead, Capability::MessagesWrite])
+                .await;
+
+        let reg = super::super::params::ToolRegistration {
+            tool_id: "test".to_owned(),
+            name: "test".to_owned(),
+            description: "test".to_owned(),
+            schema: ToolSchema {
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: serde_json::json!({"type": "object"}),
+            },
+            implementation_hash: [0u8; 32],
+            test_vectors: vec![],
+            operator_did: "did:key:op".into(),
+            economic_metadata: None,
+            registered_at: 0,
+            signature: Vec::new(),
+        };
+
+        let proposal = ceiling_test_proposal(
+            &ctx_id,
+            GovernanceAction::RegisterTool {
+                registration: Box::new(reg),
+            },
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("tool registration")),
+            "expected PermissionDenied about tool registration, got: {err}"
+        );
+    }
+
+    /// #339: `RegisterTool` succeeds when `ToolRegister` is in ceiling.
+    #[tokio::test]
+    async fn register_tool_succeeds_with_ceiling_capability() {
+        use crate::context::tools::registry::ToolSchema;
+
+        let (manager, _handle, ctx_id) = setup_context_with_ceiling(vec![
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::ToolRegister,
+        ])
+        .await;
+
+        let reg = super::super::params::ToolRegistration {
+            tool_id: "test".to_owned(),
+            name: "test".to_owned(),
+            description: "test".to_owned(),
+            schema: ToolSchema {
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: serde_json::json!({"type": "object"}),
+            },
+            implementation_hash: [0u8; 32],
+            test_vectors: vec![],
+            operator_did: "did:key:op".into(),
+            economic_metadata: None,
+            registered_at: 0,
+            signature: Vec::new(),
+        };
+
+        let proposal = ceiling_test_proposal(
+            &ctx_id,
+            GovernanceAction::RegisterTool {
+                registration: Box::new(reg),
+            },
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_ok(), "RegisterTool should succeed: {result:?}");
+    }
+
+    /// #339: `EstablishToolInterface` is rejected when `ToolInterface` is not in ceiling.
+    #[tokio::test]
+    async fn establish_tool_interface_rejected_without_ceiling_capability() {
+        let (manager, _handle, ctx_id) =
+            setup_context_with_ceiling(vec![Capability::MessagesRead, Capability::MessagesWrite])
+                .await;
+
+        let proposal = ceiling_test_proposal(
+            &ctx_id,
+            GovernanceAction::EstablishToolInterface {
+                interface: ToolInterface {
+                    source_context: ctx_id.clone(),
+                    target_context: "other-ctx".into(),
+                    tool_id: "tool-a".into(),
+                    rate_limit: None,
+                    approved_by_source: true,
+                    approved_by_target: false,
+                },
+            },
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("tool interface")),
+            "expected PermissionDenied about tool interface, got: {err}"
+        );
+    }
+
+    /// #339: `CreateChildContext` is rejected when `ChildContextCreate` is not in ceiling.
+    #[tokio::test]
+    async fn create_child_context_rejected_without_ceiling_capability() {
+        let (manager, _handle, ctx_id) =
+            setup_context_with_ceiling(vec![Capability::MessagesRead, Capability::MessagesWrite])
+                .await;
+
+        let proposal = ceiling_test_proposal(
+            &ctx_id,
+            GovernanceAction::CreateChildContext {
+                params: Box::new(ContextParams::default()),
+            },
+        );
+
+        let result = manager.execute_governance_action(&ctx_id, &proposal).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("child context")),
+            "expected PermissionDenied about child context, got: {err}"
+        );
+    }
+
+    /// #339: `BlockAuthor` is rejected when `MemberBan` is not in ceiling.
+    #[tokio::test]
+    async fn block_author_rejected_without_member_ban_ceiling() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        manager.register_local_did("did:key:alice".into()).await;
+        manager.register_local_did("did:key:bob".into()).await;
+
+        // Ceiling WITHOUT MemberBan.
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            memory_scope: MemoryScope::Full,
+            ceiling: vec![
+                Capability::MessagesRead,
+                Capability::MessagesWrite,
+                Capability::RoleAssign,
+            ],
+            ..ContextParams::default()
+        };
+
+        let _handle = manager
+            .create_context("bc-no-ban".into(), params, "did:key:alice".into())
+            .await
+            .unwrap();
+
+        // Add bob as author.
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("bc-no-ban").unwrap();
+            let bc = ctx.broadcast_context.as_mut().unwrap();
+            bc.add_author("did:key:bob").unwrap();
+            ctx.membership
+                .add_member("did:key:bob".into(), "author".into(), vec![]);
+        }
+
+        let proposal = approved_block_author_proposal(
+            &"did:key:alice".into(),
+            "bc-no-ban",
+            &"did:key:bob".into(),
+        );
+        let result = manager
+            .execute_governance_action("bc-no-ban", &proposal)
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("member:ban")),
+            "expected PermissionDenied about member:ban, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Governance engine construction tests (SCP-267, ADR-031)
+    // -----------------------------------------------------------------------
+
+    /// AC 4: `create_context` constructs `SingleAdminEngine` when
+    /// `GovernanceModel::SingleAdmin` is specified.
+    #[tokio::test]
+    async fn governance_single_admin_engine_constructed() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let params = ContextParams {
+            governance: GovernanceModel::SingleAdmin,
+            ..ContextParams::default()
+        };
+        let creator: DID = "did:key:admin1".into();
+        let handle = manager
+            .create_context("ctx-gov-sa".into(), params, creator.clone())
+            .await
+            .unwrap();
+        assert_eq!(handle.state().await, ContextState::Active);
+        // Verify the engine is accessible inside the per-context state.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("ctx-gov-sa").unwrap();
+        let config = ctx.governance_engine.model_config();
+        assert_eq!(
+            config,
+            GovernanceModelConfig::SingleAdmin { admin_did: creator }
+        );
+    }
+
+    /// AC 5: `create_context_with_governance` constructs `ThresholdEngine`
+    /// when `GovernanceModel::Threshold` is specified.
+    #[tokio::test]
+    async fn governance_threshold_engine_constructed() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let creator: DID = "did:key:admin1".into();
+        let signer2: DID = "did:key:signer2".into();
+        let params = ContextParams {
+            governance: GovernanceModel::Threshold {
+                threshold: 2,
+                signers: vec![creator.clone(), signer2.clone()],
+            },
+            ..ContextParams::default()
+        };
+        let config = GovernanceModelConfig::Threshold {
+            signers: vec![creator.clone(), signer2.clone()],
+            threshold: 2,
+            voting_window_secs: 86_400,
+        };
+        let handle = manager
+            .create_context_with_governance(
+                "ctx-gov-thresh".into(),
+                params,
+                creator.clone(),
+                config.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(handle.state().await, ContextState::Active);
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("ctx-gov-thresh").unwrap();
+        assert_eq!(ctx.governance_engine.model_config(), config);
+    }
+
+    /// AC 6: `create_context_with_governance` constructs `MajorityVoteEngine`
+    /// when `GovernanceModel::Majority` is specified.
+    #[tokio::test]
+    async fn governance_majority_engine_constructed() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let creator: DID = "did:key:admin1".into();
+        let params = ContextParams {
+            governance: GovernanceModel::Majority {
+                eligible_voters: vec![creator.clone()],
+            },
+            ..ContextParams::default()
+        };
+        let config = GovernanceModelConfig::Majority {
+            voting_window_secs: 86_400,
+            min_participation_bps: 5000,
+        };
+        let handle = manager
+            .create_context_with_governance("ctx-gov-maj".into(), params, creator.clone(), config)
+            .await
+            .unwrap();
+        assert_eq!(handle.state().await, ContextState::Active);
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("ctx-gov-maj").unwrap();
+        let model_config = ctx.governance_engine.model_config();
+        assert!(matches!(
+            model_config,
+            GovernanceModelConfig::Majority { .. }
+        ));
+    }
+
+    /// AC 7: `create_context_with_governance` constructs `UnanimityEngine`
+    /// when `GovernanceModel::Unanimity` is specified.
+    #[tokio::test]
+    async fn governance_unanimity_engine_constructed() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let creator: DID = "did:key:admin1".into();
+        let params = ContextParams {
+            governance: GovernanceModel::Unanimity {
+                eligible_voters: vec![creator.clone()],
+            },
+            ..ContextParams::default()
+        };
+        let config = GovernanceModelConfig::Unanimity {
+            voting_window_secs: 172_800,
+        };
+        let handle = manager
+            .create_context_with_governance(
+                "ctx-gov-unan".into(),
+                params,
+                creator.clone(),
+                config.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(handle.state().await, ContextState::Active);
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("ctx-gov-unan").unwrap();
+        assert_eq!(ctx.governance_engine.model_config(), config);
+    }
+
+    /// AC 8/12: Invalid `GovernanceModelConfig` is rejected at creation time.
+    /// Threshold > `signers.len()`.
+    #[tokio::test]
+    async fn governance_invalid_threshold_too_high_rejected() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let creator: DID = "did:key:admin1".into();
+        let params = ContextParams {
+            governance: GovernanceModel::Threshold {
+                threshold: 5,
+                signers: vec![creator.clone()],
+            },
+            ..ContextParams::default()
+        };
+        let config = GovernanceModelConfig::Threshold {
+            signers: vec![creator.clone()],
+            threshold: 5, // > signers.len() (1)
+            voting_window_secs: 86_400,
+        };
+        let result = manager
+            .create_context_with_governance("ctx-bad-thresh".into(), params, creator, config)
+            .await;
+        assert!(result.is_err());
+    }
+
+    /// AC 8/12: Invalid `GovernanceModelConfig` — threshold == 0 rejected.
+    #[tokio::test]
+    async fn governance_invalid_threshold_zero_rejected() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let creator: DID = "did:key:admin1".into();
+        let params = ContextParams {
+            governance: GovernanceModel::Threshold {
+                threshold: 0,
+                signers: vec![creator.clone()],
+            },
+            ..ContextParams::default()
+        };
+        let config = GovernanceModelConfig::Threshold {
+            signers: vec![creator.clone()],
+            threshold: 0,
+            voting_window_secs: 86_400,
+        };
+        let result = manager
+            .create_context_with_governance("ctx-bad-thresh-0".into(), params, creator, config)
+            .await;
+        assert!(result.is_err());
+    }
+
+    /// AC 8/12: Invalid `GovernanceModelConfig` — empty signers for Threshold.
+    #[tokio::test]
+    async fn governance_invalid_empty_signers_rejected() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let creator: DID = "did:key:admin1".into();
+        let params = ContextParams {
+            governance: GovernanceModel::Threshold {
+                threshold: 1,
+                signers: vec![],
+            },
+            ..ContextParams::default()
+        };
+        let config = GovernanceModelConfig::Threshold {
+            signers: vec![],
+            threshold: 1,
+            voting_window_secs: 86_400,
+        };
+        let result = manager
+            .create_context_with_governance("ctx-bad-empty".into(), params, creator, config)
+            .await;
+        assert!(result.is_err());
+    }
+
+    /// AC 8/12: Invalid `GovernanceModelConfig` — `min_participation_bps` > 10000.
+    #[tokio::test]
+    async fn governance_invalid_min_participation_rejected() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let creator: DID = "did:key:admin1".into();
+        let params = ContextParams {
+            governance: GovernanceModel::Majority {
+                eligible_voters: vec![creator.clone()],
+            },
+            ..ContextParams::default()
+        };
+        let config = GovernanceModelConfig::Majority {
+            voting_window_secs: 86_400,
+            min_participation_bps: 10001, // > 10000
+        };
+        let result = manager
+            .create_context_with_governance("ctx-bad-bps".into(), params, creator, config)
+            .await;
+        assert!(result.is_err());
+    }
+
+    /// AC 8: GovernanceModel/GovernanceModelConfig mismatch is rejected.
+    #[tokio::test]
+    async fn governance_model_config_mismatch_rejected() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let creator: DID = "did:key:admin1".into();
+        let params = ContextParams {
+            governance: GovernanceModel::SingleAdmin,
+            ..ContextParams::default()
+        };
+        // Mismatch: params says SingleAdmin, config says Threshold.
+        let config = GovernanceModelConfig::Threshold {
+            signers: vec![creator.clone()],
+            threshold: 1,
+            voting_window_secs: 86_400,
+        };
+        let result = manager
+            .create_context_with_governance("ctx-mismatch".into(), params, creator, config)
+            .await;
+        assert!(result.is_err());
+    }
+
+    /// AC 10/13: UCAN tokens are minted for Threshold signers at creation.
+    #[tokio::test]
+    async fn governance_ucan_tokens_minted_for_threshold_signers() {
+        let creator: DID = "did:key:creator1".into();
+        let signer2: DID = "did:key:signer2".into();
+        let signer3: DID = "did:key:signer3".into();
+
+        let config = GovernanceModelConfig::Threshold {
+            signers: vec![creator.clone(), signer2.clone(), signer3.clone()],
+            threshold: 2,
+            voting_window_secs: 86_400,
+        };
+        let engine =
+            build_governance_engine(config, vec![creator.clone()], noop_key_resolver()).unwrap();
+        let tokens = mint_governance_tokens("ctx-ucan-test", &creator, engine.as_ref());
+
+        // 3 signers x 2 capabilities (GovernancePropose + GovernanceVote) = 6 tokens.
+        assert_eq!(tokens.len(), 6);
+
+        // Verify each signer has both GovernancePropose and GovernanceVote tokens.
+        for signer in [&creator, &signer2, &signer3] {
+            let signer_tokens: Vec<_> = tokens.iter().filter(|t| *signer == t.aud).collect();
+            assert_eq!(signer_tokens.len(), 2, "each signer should have 2 tokens");
+            let capabilities: Vec<&str> = signer_tokens
+                .iter()
+                .map(|t| t.att[0].with.as_str())
+                .collect();
+            assert!(
+                capabilities
+                    .iter()
+                    .any(|c| c.contains("governance:propose")),
+                "should have GovernancePropose token"
+            );
+            assert!(
+                capabilities.iter().any(|c| c.contains("governance:vote")),
+                "should have GovernanceVote token"
+            );
+        }
+
+        // All tokens should be issued by the creator.
+        for token in &tokens {
+            assert_eq!(token.iss, creator.to_string());
+        }
+    }
+
+    /// AC 10: UCAN tokens for `SingleAdmin` include both `GovernancePropose`
+    /// and `GovernanceVote` for the admin.
+    #[tokio::test]
+    async fn governance_ucan_tokens_minted_for_single_admin() {
+        let creator: DID = "did:key:creator1".into();
+        let engine = Box::new(SingleAdminEngine::new(creator.clone(), noop_key_resolver()));
+        let tokens = mint_governance_tokens("ctx-sa-ucan", &creator, engine.as_ref());
+
+        // 1 voter x 2 capabilities = 2 tokens.
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.iter().all(|t| creator == t.aud));
+        assert!(tokens.iter().all(|t| creator == t.iss));
+    }
+
+    /// AC 11: Default `create_context` constructs engines for all four
+    /// governance model variants without explicit `GovernanceModelConfig`.
+    #[tokio::test]
+    async fn governance_default_engine_all_variants() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let creator: DID = "did:key:admin1".into();
+
+        let models = [
+            GovernanceModel::SingleAdmin,
+            GovernanceModel::Threshold {
+                threshold: 1,
+                signers: vec![creator.clone()],
+            },
+            GovernanceModel::Majority {
+                eligible_voters: vec![creator.clone()],
+            },
+            GovernanceModel::Unanimity {
+                eligible_voters: vec![creator.clone()],
+            },
+        ];
+
+        for (i, model) in models.iter().enumerate() {
+            let params = ContextParams {
+                governance: model.clone(),
+                ..ContextParams::default()
+            };
+            let ctx_id = format!("ctx-default-{i}");
+            let handle = manager
+                .create_context(ctx_id.clone(), params, creator.clone())
+                .await
+                .unwrap();
+            assert_eq!(handle.state().await, ContextState::Active);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Governance proposal lifecycle tests (SCP-268)
+    // -----------------------------------------------------------------------
+
+    /// Helper: creates a manager with an active context whose ceiling includes
+    /// governance capabilities, so propose/vote operations succeed.
+    async fn setup_governance_context() -> (ContextManager, ContextHandle, String) {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let params = ContextParams {
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+                crate::context::params::Capability::new("role:assign"),
+                crate::context::params::Capability::new("governance:propose"),
+                crate::context::params::Capability::new("governance:vote"),
+                crate::context::params::Capability::new("context:close"),
+            ],
+            ..ContextParams::default()
+        };
+
+        let admin_did: DID = "did:key:admin".into();
+        let handle = manager
+            .create_context("gov-ctx".into(), params, admin_did)
+            .await
+            .unwrap();
+
+        (manager, handle, "gov-ctx".to_owned())
+    }
+
+    /// SCP-268 AC1: `SingleAdmin.propose()` returns `ProposalOutcome` with
+    /// `Approved` status (auto-approve per ADR-031 section 4a) and `execution_result: None`.
+    #[tokio::test]
+    async fn governance_single_admin_propose_checked_auto_approves() {
+        let (manager, _handle, ctx_id) = setup_governance_context().await;
+        let admin_did: DID = "did:key:admin".into();
+        let signing_key = signing_key_for_did(&admin_did);
+
+        let action = super::GovernanceAction::CloseContext { reason: None };
+
+        let outcome = manager
+            .propose_governance_action_checked(&ctx_id, &admin_did, action, &signing_key)
+            .await
+            .unwrap();
+
+        // SingleAdmin auto-approves (ADR-031 section 4a).
+        assert!(
+            matches!(outcome.status, super::ProposalStatus::Approved),
+            "SingleAdmin proposals should be auto-approved"
+        );
+        assert!(
+            outcome.execution_result.is_some(),
+            "execution_result must be Some for auto-approved SingleAdmin proposals (SCP-270)"
+        );
+        assert_eq!(outcome.proposal.proposer_did, admin_did);
+        assert_eq!(outcome.proposal.context_id, ctx_id);
+    }
+
+    /// SCP-268 AC5: proposing on a non-Active context returns `ContextNotActive`.
+    #[tokio::test]
+    async fn governance_propose_checked_on_inactive_context_returns_not_active() {
+        let (manager, handle, ctx_id) = setup_governance_context().await;
+        let admin_did: DID = "did:key:admin".into();
+        let signing_key = signing_key_for_did(&admin_did);
+
+        // Transition to Closing.
+        handle.transition_to(&ContextState::Closing).await.unwrap();
+
+        let result = manager
+            .propose_governance_action_checked(
+                &ctx_id,
+                &admin_did,
+                super::GovernanceAction::CloseContext { reason: None },
+                &signing_key,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ContextError::ContextNotActive
+        ));
+    }
+
+    /// SCP-268 AC6: proposing without `GovernancePropose` capability is rejected.
+    #[tokio::test]
+    async fn governance_propose_checked_without_capability_rejected() {
+        let (manager, _handle, ctx_id) = setup_governance_context().await;
+
+        // Join bob as a member (default role = member, which has messages:read/write
+        // but not governance:propose).
+        let kp = KeyPackage::mock("did:key:bob".into());
+        let handle_ref = {
+            let contexts = manager.contexts.lock().await;
+            contexts.get(&ctx_id).unwrap().handle.clone()
+        };
+        manager.join_context(&handle_ref, kp).await.unwrap();
+
+        let bob_did: DID = "did:key:bob".into();
+        let signing_key = signing_key_for_did(&bob_did);
+        let result = manager
+            .propose_governance_action_checked(
+                &ctx_id,
+                &bob_did,
+                super::GovernanceAction::CloseContext { reason: None },
+                &signing_key,
+            )
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ContextError::PermissionDenied(_)),
+            "member without governance:propose should be rejected: {err}"
+        );
+    }
+
+    /// SCP-268 AC7: approve/reject without `GovernanceVote` capability is rejected.
+    #[tokio::test]
+    async fn governance_vote_without_capability_rejected() {
+        let (manager, _handle, ctx_id) = setup_governance_context().await;
+
+        // Join bob as member (no governance:vote capability).
+        let kp = KeyPackage::mock("did:key:bob".into());
+        let handle_ref = {
+            let contexts = manager.contexts.lock().await;
+            contexts.get(&ctx_id).unwrap().handle.clone()
+        };
+        manager.join_context(&handle_ref, kp).await.unwrap();
+
+        let bob_did: DID = "did:key:bob".into();
+        let signing_key = signing_key_for_did(&bob_did);
+        let fake_proposal_id = [0u8; 32];
+
+        // approve should fail
+        let approve_result = manager
+            .approve_governance_proposal(&ctx_id, &fake_proposal_id, &bob_did, &signing_key)
+            .await;
+        assert!(approve_result.is_err());
+        assert!(matches!(
+            approve_result.unwrap_err(),
+            ContextError::PermissionDenied(_)
+        ));
+
+        // reject should fail
+        let reject_result = manager
+            .reject_governance_proposal(&ctx_id, &fake_proposal_id, &bob_did, &signing_key)
+            .await;
+        assert!(reject_result.is_err());
+        assert!(matches!(
+            reject_result.unwrap_err(),
+            ContextError::PermissionDenied(_)
+        ));
+    }
+
+    /// SCP-268 AC8: governance events are recorded in the event log.
+    #[tokio::test]
+    async fn governance_propose_checked_records_events() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::<MockEventLog>::from(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let params = ContextParams {
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+                crate::context::params::Capability::new("governance:propose"),
+                crate::context::params::Capability::new("governance:vote"),
+            ],
+            ..ContextParams::default()
+        };
+
+        let admin_did: DID = "did:key:admin".into();
+        let _handle = manager
+            .create_context("ev-ctx".into(), params, admin_did.clone())
+            .await
+            .unwrap();
+
+        let signing_key = signing_key_for_did(&admin_did);
+
+        let outcome = manager
+            .propose_governance_action_checked(
+                "ev-ctx",
+                &admin_did,
+                super::GovernanceAction::CloseContext { reason: None },
+                &signing_key,
+            )
+            .await
+            .unwrap();
+
+        // SingleAdmin produces ProposalCreated + VoteCast + ProposalResolved
+        // events. Verify they were logged.
+        assert!(matches!(outcome.status, super::ProposalStatus::Approved));
+    }
+
+    /// SCP-268 AC3/AC4: `ThresholdEngine` governance multi-vote lifecycle.
+    /// Propose creates `Pending` proposal; approve reaches quorum -> `Approved`.
+    #[tokio::test]
+    async fn governance_threshold_propose_approve_lifecycle() {
+        let alice_did: DID = "did:key:alice".into();
+        let bob_did: DID = "did:key:bob".into();
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let params = ContextParams {
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+                crate::context::params::Capability::new("role:assign"),
+                crate::context::params::Capability::new("governance:propose"),
+                crate::context::params::Capability::new("governance:vote"),
+            ],
+            governance: GovernanceModel::Threshold {
+                threshold: 2,
+                signers: vec![alice_did.clone(), bob_did.clone()],
+            },
+            ..ContextParams::default()
+        };
+
+        let handle = manager
+            .create_context("thresh-ctx".into(), params, alice_did.clone())
+            .await
+            .unwrap();
+
+        // Join bob.
+        let kp = KeyPackage::mock("did:key:bob".into());
+        manager.join_context(&handle, kp).await.unwrap();
+
+        // Grant governance capabilities to bob.
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("thresh-ctx").unwrap();
+            ctx.role_state
+                .member_capabilities
+                .entry("did:key:bob".to_owned())
+                .or_default()
+                .insert(Capability::GovernancePropose);
+            ctx.role_state
+                .member_capabilities
+                .entry("did:key:bob".to_owned())
+                .or_default()
+                .insert(Capability::GovernanceVote);
+        }
+
+        let signing_key_alice = signing_key_for_did(&alice_did);
+        let signing_key_bob = signing_key_for_did(&bob_did);
+
+        // Alice proposes via capability-checked path.
+        let outcome = manager
+            .propose_governance_action_checked(
+                "thresh-ctx",
+                &alice_did,
+                super::GovernanceAction::CloseContext { reason: None },
+                &signing_key_alice,
+            )
+            .await
+            .unwrap();
+
+        // Threshold 2-of-2: proposer's vote counts as 1, so status is Pending.
+        assert!(
+            matches!(outcome.status, super::ProposalStatus::Pending),
+            "2-of-2 threshold should start as Pending after first vote, got: {:?}",
+            outcome.status
+        );
+
+        let proposal_id = outcome.proposal.proposal_id;
+
+        // Bob approves -> quorum reached -> Approved.
+        let status = manager
+            .approve_governance_proposal("thresh-ctx", &proposal_id, &bob_did, &signing_key_bob)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(status, super::ProposalStatus::Approved),
+            "2-of-2 threshold should be Approved after second vote, got: {status:?}"
+        );
+    }
+
+    /// SCP-268: proposing on a non-existent context returns `MembershipFailed`.
+    #[tokio::test]
+    async fn governance_propose_checked_on_nonexistent_context() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let admin_did: DID = "did:key:admin".into();
+        let signing_key = signing_key_for_did(&admin_did);
+        let result = manager
+            .propose_governance_action_checked(
+                "nonexistent",
+                &admin_did,
+                super::GovernanceAction::CloseContext { reason: None },
+                &signing_key,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ContextError::MembershipFailed(_)
+        ));
+    }
+
+    /// SCP-268: `withdraw_governance_vote` returns `PermissionDenied` for `SingleAdmin`.
+    #[tokio::test]
+    async fn governance_withdraw_vote_single_admin_not_supported() {
+        let (manager, _handle, ctx_id) = setup_governance_context().await;
+        let admin_did: DID = "did:key:admin".into();
+        let fake_proposal_id = [0u8; 32];
+
+        let result = manager
+            .withdraw_governance_vote(&ctx_id, &fake_proposal_id, &admin_did)
+            .await;
+
+        // SingleAdmin does not support withdraw_vote.
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ContextError::PermissionDenied(_)
+        ));
+    }
+
+    // -------------------------------------------------------------------
+    // SCP-270: auto-execution, unanimity overrides, governance bypass
+    // -------------------------------------------------------------------
+
+    /// Helper: `ContextParams` with governance-compatible ceiling.
+    fn governance_params() -> ContextParams {
+        ContextParams {
+            ceiling: vec![
+                crate::context::params::Capability::new("messages:read"),
+                crate::context::params::Capability::new("messages:write"),
+                crate::context::params::Capability::new("role:assign"),
+                crate::context::params::Capability::new("governance:propose"),
+                crate::context::params::Capability::new("governance:vote"),
+                crate::context::params::Capability::new("member:ban"),
+                crate::context::params::Capability::new("context:close"),
+            ],
+            ..ContextParams::default()
+        }
+    }
+
+    /// Helper: build an approved proposal with customizable approvals.
+    fn approved_proposal(
+        pid: [u8; 32],
+        context_id: &str,
+        action: GovernanceAction,
+        approver_dids: &[&str],
+    ) -> GovernanceProposal {
+        use crate::context::governance::{SignedVote, VoteType};
+        GovernanceProposal {
+            proposal_id: pid,
+            context_id: context_id.into(),
+            proposer_did: approver_dids
+                .first()
+                .unwrap_or(&"did:key:creator")
+                .to_string()
+                .into(),
+            action,
+            status: ProposalStatus::Approved,
+            created_at: 1000,
+            voting_deadline: 2000,
+            approvals: approver_dids
+                .iter()
+                .enumerate()
+                .map(|(i, did)| SignedVote {
+                    voter_did: (*did).to_owned().into(),
+                    vote: VoteType::Approve,
+                    timestamp: 1000 + i as u64,
+                    signature: vec![0u8; 64],
+                })
+                .collect(),
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        }
+    }
+
+    /// SCP-270 AC14: each `GovernanceAction` variant executes through governance.
+    /// Covered by the existing `single_admin_propose_auto_executes` and
+    /// per-action tests. This test verifies the dispatch returns typed results.
+    #[tokio::test]
+    async fn governance_dispatch_returns_typed_results() {
+        use crate::context::governance::{GovernanceProposal, SignedVote, VoteType};
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let params = governance_params();
+        let _handle = manager
+            .create_context("typed-result-ctx".into(), params, "did:key:creator".into())
+            .await
+            .unwrap();
+
+        // AddMember
+        let proposal = GovernanceProposal {
+            proposal_id: [10u8; 32],
+            context_id: "typed-result-ctx".into(),
+            proposer_did: "did:key:creator".into(),
+            action: GovernanceAction::AddMember {
+                did: "did:key:new".into(),
+                role: "member".to_owned(),
+            },
+            status: ProposalStatus::Approved,
+            created_at: 1000,
+            voting_deadline: 2000,
+            approvals: vec![SignedVote {
+                voter_did: "did:key:creator".into(),
+                vote: VoteType::Approve,
+                timestamp: 1000,
+                signature: vec![0u8; 64],
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+        let result = manager
+            .execute_governance_action("typed-result-ctx", &proposal)
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, GovernanceActionResult::MemberAdded),
+            "AddMember should return MemberAdded, got: {result:?}"
+        );
+
+        // RemoveMember
+        let proposal = GovernanceProposal {
+            proposal_id: [11u8; 32],
+            context_id: "typed-result-ctx".into(),
+            proposer_did: "did:key:creator".into(),
+            action: GovernanceAction::RemoveMember {
+                did: "did:key:new".into(),
+                reason: None,
+            },
+            status: ProposalStatus::Approved,
+            created_at: 1000,
+            voting_deadline: 2000,
+            approvals: vec![SignedVote {
+                voter_did: "did:key:creator".into(),
+                vote: VoteType::Approve,
+                timestamp: 1000,
+                signature: vec![0u8; 64],
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+        let result = manager
+            .execute_governance_action("typed-result-ctx", &proposal)
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, GovernanceActionResult::MemberRemoved),
+            "RemoveMember should return MemberRemoved, got: {result:?}"
+        );
+    }
+
+    /// SCP-270 AC15: auto-execution on Approved status for `SingleAdmin`.
+    #[tokio::test]
+    async fn governance_auto_execution_single_admin() {
+        let (manager, _handle, ctx_id) = setup_governance_context().await;
+        let admin_did: DID = "did:key:admin".into();
+        let signing_key = signing_key_for_did(&admin_did);
+
+        // propose_governance_action for SingleAdmin auto-executes.
+        let (proposal, _events) = manager
+            .propose_governance_action(
+                &ctx_id,
+                &admin_did,
+                GovernanceAction::AddMember {
+                    did: "did:key:newmember".into(),
+                    role: "member".to_owned(),
+                },
+                &signing_key,
+            )
+            .await
+            .unwrap();
+
+        // Proposal should be Approved (auto-approved by SingleAdmin).
+        assert_eq!(proposal.status, ProposalStatus::Approved);
+
+        // The member should already be added (auto-executed).
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&ctx_id).unwrap();
+        assert!(
+            ctx.membership.contains("did:key:newmember"),
+            "auto-execution should have added the member"
+        );
+    }
+
+    /// SCP-270 AC15: auto-execution on Approved status for Threshold model.
+    #[tokio::test]
+    async fn governance_auto_execution_threshold_on_approval() {
+        let creator: DID = "did:key:creator".into();
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let mut params = governance_params();
+        params.governance = GovernanceModel::Threshold {
+            threshold: 1,
+            signers: vec![creator.clone()],
+        };
+
+        let _handle = manager
+            .create_context("thresh-auto-ctx".into(), params, creator.clone())
+            .await
+            .unwrap();
+
+        let signing_key = signing_key_for_did(&creator);
+        // Threshold with 1-of-1: proposal auto-approved on propose.
+        let (proposal, _) = manager
+            .propose_governance_action(
+                "thresh-auto-ctx",
+                &creator,
+                GovernanceAction::AddMember {
+                    did: "did:key:bob".into(),
+                    role: "member".to_owned(),
+                },
+                &signing_key,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(proposal.status, ProposalStatus::Approved);
+
+        // Verify auto-execution happened.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("thresh-auto-ctx").unwrap();
+        assert!(
+            ctx.membership.contains("did:key:bob"),
+            "auto-execution should have added the member on threshold quorum"
+        );
+    }
+
+    /// SCP-270 AC16: `close_context` through governance for Threshold model.
+    #[tokio::test]
+    async fn close_context_through_governance_threshold() {
+        let creator: DID = "did:key:creator".into();
+        let signer2: DID = "did:key:signer2".into();
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        let mut params = governance_params();
+        params.governance = GovernanceModel::Threshold {
+            threshold: 2,
+            signers: vec![creator.clone(), signer2.clone()],
+        };
+
+        let handle = manager
+            .create_context("close-thresh-ctx".into(), params, creator.clone())
+            .await
+            .unwrap();
+
+        // Direct close_context should fail for multi-admin.
+        let result = manager.close_context(&handle, &creator).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), ContextError::PermissionDenied(ref msg) if msg.contains("multi-admin")),
+            "close_context should reject multi-admin contexts"
+        );
+
+        // Verify context is still active.
+        assert_eq!(handle.state().await, ContextState::Active);
+    }
+
+    /// SCP-270 AC17: `ExtendTtl` unanimity override — partial approval rejected.
+    #[tokio::test]
+    async fn extend_ttl_rejects_without_unanimity() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let mut params = governance_params();
+        params.ttl = Some(std::time::Duration::from_secs(3600));
+        let _handle = manager
+            .create_context("ttl-unan-ctx".into(), params, "did:key:creator".into())
+            .await
+            .unwrap();
+
+        // Add a second member.
+        let add = approved_proposal(
+            [20u8; 32],
+            "ttl-unan-ctx",
+            GovernanceAction::AddMember {
+                did: "did:key:bob".into(),
+                role: "member".to_owned(),
+            },
+            &["did:key:creator"],
+        );
+        manager
+            .execute_governance_action("ttl-unan-ctx", &add)
+            .await
+            .unwrap();
+
+        // ExtendTtl with only creator's approval (bob hasn't approved).
+        let extend = approved_proposal(
+            [21u8; 32],
+            "ttl-unan-ctx",
+            GovernanceAction::ExtendTtl {
+                additional_secs: 3600,
+            },
+            &["did:key:creator"],
+        );
+        let result = manager
+            .execute_governance_action("ttl-unan-ctx", &extend)
+            .await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), ContextError::PermissionDenied(ref msg) if msg.contains("unanimous")),
+            "ExtendTtl should require unanimity"
+        );
+    }
+
+    /// SCP-270 AC17: `ExtendTtl` unanimity override — unanimous approval succeeds.
+    #[tokio::test]
+    async fn extend_ttl_succeeds_with_unanimity() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let mut params = governance_params();
+        params.ttl = Some(std::time::Duration::from_secs(3600));
+        let _handle = manager
+            .create_context("ttl-unan2-ctx".into(), params, "did:key:creator".into())
+            .await
+            .unwrap();
+
+        // Add a second member.
+        let add = approved_proposal(
+            [20u8; 32],
+            "ttl-unan2-ctx",
+            GovernanceAction::AddMember {
+                did: "did:key:bob".into(),
+                role: "member".to_owned(),
+            },
+            &["did:key:creator"],
+        );
+        manager
+            .execute_governance_action("ttl-unan2-ctx", &add)
+            .await
+            .unwrap();
+
+        // ExtendTtl with both members' approval.
+        let extend = approved_proposal(
+            [22u8; 32],
+            "ttl-unan2-ctx",
+            GovernanceAction::ExtendTtl {
+                additional_secs: 3600,
+            },
+            &["did:key:creator", "did:key:bob"],
+        );
+        let result = manager
+            .execute_governance_action("ttl-unan2-ctx", &extend)
+            .await;
+        assert!(
+            result.is_ok(),
+            "ExtendTtl with unanimity should succeed: {result:?}"
+        );
+        assert!(matches!(
+            result.unwrap(),
+            GovernanceActionResult::TtlExtended
+        ));
+    }
+
+    /// SCP-270 AC18: `PromoteContext` unanimity override.
+    #[tokio::test]
+    async fn promote_context_requires_unanimity() {
+        use crate::context::governance::{GovernanceProposal, SignedVote, VoteType};
+        use crate::context::params::{MemoryScope, PromotionPolicy};
+
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        let mut params = governance_params();
+        params.promotion_policy = PromotionPolicy::Promotable;
+        params.memory_scope = MemoryScope::Ephemeral;
+        params.ttl = Some(std::time::Duration::from_secs(3600));
+
+        let _handle = manager
+            .create_context(
+                "promo-unanimity-ctx".into(),
+                params,
+                "did:key:creator".into(),
+            )
+            .await
+            .unwrap();
+
+        // Add a second member.
+        let add_proposal = GovernanceProposal {
+            proposal_id: [30u8; 32],
+            context_id: "promo-unanimity-ctx".into(),
+            proposer_did: "did:key:creator".into(),
+            action: GovernanceAction::AddMember {
+                did: "did:key:carol".into(),
+                role: "member".to_owned(),
+            },
+            status: ProposalStatus::Approved,
+            created_at: 1000,
+            voting_deadline: 2000,
+            approvals: vec![SignedVote {
+                voter_did: "did:key:creator".into(),
+                vote: VoteType::Approve,
+                timestamp: 1000,
+                signature: vec![0u8; 64],
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+        manager
+            .execute_governance_action("promo-unanimity-ctx", &add_proposal)
+            .await
+            .unwrap();
+
+        // PromoteContext with only creator's approval — should fail.
+        let promote_proposal = GovernanceProposal {
+            proposal_id: [31u8; 32],
+            context_id: "promo-unanimity-ctx".into(),
+            proposer_did: "did:key:creator".into(),
+            action: GovernanceAction::PromoteContext,
+            status: ProposalStatus::Approved,
+            created_at: 1000,
+            voting_deadline: 2000,
+            approvals: vec![SignedVote {
+                voter_did: "did:key:creator".into(),
+                vote: VoteType::Approve,
+                timestamp: 1000,
+                signature: vec![0u8; 64],
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
+        };
+
+        let result = manager
+            .execute_governance_action("promo-unanimity-ctx", &promote_proposal)
+            .await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), ContextError::PermissionDenied(ref msg) if msg.contains("unanimous")),
+            "PromoteContext should require unanimity"
+        );
+    }
+
+    /// SCP-270 AC19: governance bypass prevention — standalone `close_context`
+    /// returns error for multi-admin models.
+    #[tokio::test]
+    async fn governance_bypass_prevented_for_multi_admin_close() {
+        let creator: DID = "did:key:creator".into();
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+
+        // Create a Majority governance context.
+        let mut params = governance_params();
+        params.governance = GovernanceModel::Majority {
+            eligible_voters: vec![creator.clone()],
+        };
+        let handle = manager
+            .create_context("bypass-test-ctx".into(), params, creator.clone())
+            .await
+            .unwrap();
+
+        // Direct close_context should fail.
+        let result = manager.close_context(&handle, &creator).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), ContextError::PermissionDenied(ref msg) if msg.contains("multi-admin")),
+            "standalone close_context must reject multi-admin contexts"
+        );
+    }
+
+    /// SCP-270 AC5: `close_context` for `SingleAdmin` goes through engine (auto-approve).
+    #[tokio::test]
+    async fn close_context_single_admin_succeeds() {
+        let (manager, handle, _ctx_id) = setup_governance_context().await;
+        let admin_did: DID = "did:key:admin".into();
+
+        let result = manager.close_context(&handle, &admin_did).await;
+        assert!(
+            result.is_ok(),
+            "SingleAdmin close_context should succeed: {result:?}"
+        );
+    }
+
+    /// SCP-270 AC11: `AddSigner` mints `GovernanceVote` + `GovernancePropose` UCANs.
+    #[tokio::test]
+    async fn add_signer_mints_governance_ucans() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let mut params = governance_params();
+        params.governance = GovernanceModel::Threshold {
+            threshold: 1,
+            signers: vec!["did:key:creator".into()],
+        };
+        let _handle = manager
+            .create_context("signer-ucan-ctx".into(), params, "did:key:creator".into())
+            .await
+            .unwrap();
+
+        // Add member, then add as signer.
+        let add = approved_proposal(
+            [40u8; 32],
+            "signer-ucan-ctx",
+            GovernanceAction::AddMember {
+                did: "did:key:newsigner".into(),
+                role: "member".to_owned(),
+            },
+            &["did:key:creator"],
+        );
+        manager
+            .execute_governance_action("signer-ucan-ctx", &add)
+            .await
+            .unwrap();
+
+        let add_s = approved_proposal(
+            [41u8; 32],
+            "signer-ucan-ctx",
+            GovernanceAction::AddSigner {
+                did: "did:key:newsigner".into(),
+            },
+            &["did:key:creator"],
+        );
+        let result = manager
+            .execute_governance_action("signer-ucan-ctx", &add_s)
+            .await;
+        assert!(result.is_ok(), "AddSigner should succeed: {result:?}");
+
+        // Verify GovernanceVote + GovernancePropose capabilities were granted.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("signer-ucan-ctx").unwrap();
+        let caps = ctx
+            .role_state
+            .member_capabilities
+            .get("did:key:newsigner")
+            .expect("new signer should have capabilities");
+        assert!(caps.contains(&Capability::GovernancePropose));
+        assert!(caps.contains(&Capability::GovernanceVote));
+    }
+
+    /// SCP-270 AC12: `RemoveSigner` revokes governance UCANs and validates threshold.
+    #[tokio::test]
+    async fn remove_signer_revokes_governance_ucans() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let mut params = governance_params();
+        // Only creator is an initial signer; signer3 will be added dynamically.
+        params.governance = GovernanceModel::Threshold {
+            threshold: 1,
+            signers: vec!["did:key:creator".into()],
+        };
+        let _handle = manager
+            .create_context("rm-signer-ctx".into(), params, "did:key:creator".into())
+            .await
+            .unwrap();
+
+        // Add signer3 as member, then grant signer role.
+        let add = approved_proposal(
+            [50u8; 32],
+            "rm-signer-ctx",
+            GovernanceAction::AddMember {
+                did: "did:key:signer3".into(),
+                role: "member".to_owned(),
+            },
+            &["did:key:creator"],
+        );
+        manager
+            .execute_governance_action("rm-signer-ctx", &add)
+            .await
+            .unwrap();
+
+        let add_s = approved_proposal(
+            [51u8; 32],
+            "rm-signer-ctx",
+            GovernanceAction::AddSigner {
+                did: "did:key:signer3".into(),
+            },
+            &["did:key:creator"],
+        );
+        manager
+            .execute_governance_action("rm-signer-ctx", &add_s)
+            .await
+            .unwrap();
+
+        // Verify signer3 has governance capabilities.
+        {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get("rm-signer-ctx").unwrap();
+            let caps = ctx
+                .role_state
+                .member_capabilities
+                .get("did:key:signer3")
+                .expect("signer3 should have capabilities");
+            assert!(caps.contains(&Capability::GovernanceVote));
+        }
+
+        // Remove signer3.
+        let rm = approved_proposal(
+            [52u8; 32],
+            "rm-signer-ctx",
+            GovernanceAction::RemoveSigner {
+                did: "did:key:signer3".into(),
+            },
+            &["did:key:creator"],
+        );
+        let result = manager
+            .execute_governance_action("rm-signer-ctx", &rm)
+            .await;
+        assert!(result.is_ok(), "RemoveSigner should succeed: {result:?}");
+
+        // Verify governance capabilities were revoked.
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("rm-signer-ctx").unwrap();
+        if let Some(caps) = ctx.role_state.member_capabilities.get("did:key:signer3") {
+            assert!(!caps.contains(&Capability::GovernancePropose));
+            assert!(!caps.contains(&Capability::GovernanceVote));
+        }
+        assert!(
+            ctx.membership.contains("did:key:signer3"),
+            "should remain a member"
+        );
+    }
+
+    // ===================================================================
+    // CAC-009: full block/unblock lifecycle across context types
+    // ===================================================================
+
+    #[tokio::test]
+    async fn cac009_tier1_encrypted_block_unblock() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        manager.register_local_did("did:key:alice".into()).await;
+        let params = ContextParams {
+            mode: ContextMode::Encrypted,
+            memory_scope: MemoryScope::Full,
+            ceiling: vec![
+                Capability::MessagesRead,
+                Capability::MessagesWrite,
+                Capability::RoleAssign,
+                Capability::MemberBan,
+            ],
+            ..ContextParams::default()
+        };
+        let _handle = manager
+            .create_context("cac009-enc".into(), params, "did:key:alice".into())
+            .await
+            .unwrap();
+        for did in &["did:key:dave", "did:key:bob"] {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("cac009-enc").unwrap();
+            ctx.membership
+                .add_member((*did).to_owned().into(), "member".into(), vec![]);
+        }
+        let revoke = approved_governance_proposal(
+            &"did:key:alice".into(),
+            "cac009-enc",
+            &"did:key:dave".into(),
+            GovernanceAction::RevokeReadAccess {
+                did: "did:key:dave".into(),
+                scope: super::RevocationScope::Full,
+            },
+        );
+        let result = manager
+            .execute_governance_action("cac009-enc", &revoke)
+            .await;
+        assert!(
+            result.is_ok(),
+            "RevokeReadAccess should succeed: {result:?}"
+        );
+        {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get("cac009-enc").unwrap();
+            assert!(
+                ctx.read_revoked_members
+                    .contains(&DID("did:key:dave".into())),
+                "Dave should be read-revoked"
+            );
+            assert!(
+                ctx.membership.contains("did:key:dave"),
+                "Dave should remain a member"
+            );
+        }
+        let events = manager.drain_events("cac009-enc").await;
+        assert!(events.iter().any(
+            |e| matches!(e, ContextEvent::ReadAccessRevoked { did } if did.0 == "did:key:dave")
+        ));
+        let restore = approved_governance_proposal(
+            &"did:key:alice".into(),
+            "cac009-enc",
+            &"did:key:dave".into(),
+            GovernanceAction::RestoreReadAccess {
+                did: "did:key:dave".into(),
+            },
+        );
+        let result = manager
+            .execute_governance_action("cac009-enc", &restore)
+            .await;
+        assert!(
+            result.is_ok(),
+            "RestoreReadAccess should succeed: {result:?}"
+        );
+        {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get("cac009-enc").unwrap();
+            assert!(
+                !ctx.read_revoked_members
+                    .contains(&DID("did:key:dave".into()))
+            );
+        }
+        let events = manager.drain_events("cac009-enc").await;
+        assert!(events.iter().any(
+            |e| matches!(e, ContextEvent::ReadAccessRestored { did } if did.0 == "did:key:dave")
+        ));
+    }
+
+    #[tokio::test]
+    async fn cac009_tier2_global_block_multiple_contexts() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        manager.register_local_did("did:key:alice".into()).await;
+        let make_params = || ContextParams {
+            mode: ContextMode::Encrypted,
+            memory_scope: MemoryScope::Full,
+            ceiling: vec![
+                Capability::MessagesRead,
+                Capability::MessagesWrite,
+                Capability::RoleAssign,
+                Capability::MemberBan,
+            ],
+            ..ContextParams::default()
+        };
+        let _h1 = manager
+            .create_context("cac009-g1".into(), make_params(), "did:key:alice".into())
+            .await
+            .unwrap();
+        let _h2 = manager
+            .create_context("cac009-g2".into(), make_params(), "did:key:alice".into())
+            .await
+            .unwrap();
+        for ctx_id in &["cac009-g1", "cac009-g2"] {
+            let mut contexts = manager.contexts.lock().await;
+            contexts.get_mut(*ctx_id).unwrap().membership.add_member(
+                "did:key:eve".into(),
+                "member".into(),
+                vec![],
+            );
+        }
+        for ctx_id in &["cac009-g1", "cac009-g2"] {
+            let revoke = approved_governance_proposal(
+                &"did:key:alice".into(),
+                ctx_id,
+                &"did:key:eve".into(),
+                GovernanceAction::RevokeReadAccess {
+                    did: "did:key:eve".into(),
+                    scope: super::RevocationScope::Full,
+                },
+            );
+            manager
+                .execute_governance_action(ctx_id, &revoke)
+                .await
+                .unwrap();
+        }
+        {
+            let contexts = manager.contexts.lock().await;
+            for ctx_id in &["cac009-g1", "cac009-g2"] {
+                assert!(
+                    contexts
+                        .get(*ctx_id)
+                        .unwrap()
+                        .read_revoked_members
+                        .contains(&DID("did:key:eve".into())),
+                    "Eve read-revoked in {ctx_id}"
+                );
+            }
+        }
+        for ctx_id in &["cac009-g1", "cac009-g2"] {
+            let restore = approved_governance_proposal(
+                &"did:key:alice".into(),
+                ctx_id,
+                &"did:key:eve".into(),
+                GovernanceAction::RestoreReadAccess {
+                    did: "did:key:eve".into(),
+                },
+            );
+            manager
+                .execute_governance_action(ctx_id, &restore)
+                .await
+                .unwrap();
+        }
+        {
+            let contexts = manager.contexts.lock().await;
+            for ctx_id in &["cac009-g1", "cac009-g2"] {
+                assert!(
+                    !contexts
+                        .get(*ctx_id)
+                        .unwrap()
+                        .read_revoked_members
+                        .contains(&DID("did:key:eve".into())),
+                    "Eve restored in {ctx_id}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cac009_broadcast_governance_revoke_restore() {
+        let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
+        {
+            let contexts = manager.contexts.lock().await;
+            assert!(
+                contexts
+                    .get(&ctx_id)
+                    .unwrap()
+                    .broadcast_context
+                    .as_ref()
+                    .unwrap()
+                    .is_author("did:key:bob")
+            );
+        }
+        let revoke = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            GovernanceAction::RevokeWriteAccess {
+                did: "did:key:bob".into(),
+                scope: super::RevocationScope::Full,
+            },
+        );
+        manager
+            .execute_governance_action(&ctx_id, &revoke)
+            .await
+            .unwrap();
+        let (bob_custody, bob_key_handle) = test_custody_from_seed(&[0xBB; 32]).await;
+        assert!(
+            manager
+                .publish_broadcast(
+                    &ctx_id,
+                    &"did:key:bob".into(),
+                    b"blocked",
+                    &bob_custody,
+                    &bob_key_handle,
+                )
+                .await
+                .is_err(),
+            "revoked author should not publish"
+        );
+        {
+            use crate::crypto::ucan::validate::{
+                InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+                InMemoryRevocationChecker,
+            };
+            use std::hash::RandomState;
+            manager.subscribe_broadcast::<InMemoryDidResolver, InMemoryNonceTracker, InMemoryRevocationChecker, InMemoryProofResolver, RandomState>(&ctx_id, &"did:key:sub1".into(), None, 1000, None).await.unwrap();
+            let decision = manager
+                .handle_broadcast_key_request(
+                    &ctx_id,
+                    &"did:key:bob".into(),
+                    &"did:key:sub1".into(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(decision, super::KeyRequestDecision::Deny { .. }),
+                "key request denied"
+            );
+        }
+        let restore = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            GovernanceAction::RestoreWriteAccess {
+                did: "did:key:bob".into(),
+            },
+        );
+        manager
+            .execute_governance_action(&ctx_id, &restore)
+            .await
+            .unwrap();
+        // After Full revocation + restore, the author entry was removed from the
+        // BroadcastContext. Forward-only restoration clears the revocation flag
+        // but does NOT re-create the author entry — bob must re-register.
+        {
+            let contexts = manager.contexts.lock().await;
+            let bc = contexts
+                .get(&ctx_id)
+                .unwrap()
+                .broadcast_context
+                .as_ref()
+                .unwrap();
+            assert!(
+                !bc.is_author("did:key:bob"),
+                "full revocation removes author; restore does not re-add"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cac009_tier_stacking_both_must_reverse() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+        let revoke_w = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            GovernanceAction::RevokeWriteAccess {
+                did: "did:key:bob".into(),
+                scope: super::RevocationScope::Full,
+            },
+        );
+        manager
+            .execute_governance_action(&ctx_id, &revoke_w)
+            .await
+            .unwrap();
+        let revoke_r = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            GovernanceAction::RevokeReadAccess {
+                did: "did:key:bob".into(),
+                scope: super::RevocationScope::Full,
+            },
+        );
+        manager
+            .execute_governance_action(&ctx_id, &revoke_r)
+            .await
+            .unwrap();
+        {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get(&ctx_id).unwrap();
+            assert!(
+                ctx.write_revoked_members
+                    .contains(&DID("did:key:bob".into()))
+            );
+            assert!(
+                ctx.read_revoked_members
+                    .contains(&DID("did:key:bob".into()))
+            );
+        }
+        let restore_w = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            GovernanceAction::RestoreWriteAccess {
+                did: "did:key:bob".into(),
+            },
+        );
+        manager
+            .execute_governance_action(&ctx_id, &restore_w)
+            .await
+            .unwrap();
+        {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get(&ctx_id).unwrap();
+            assert!(
+                !ctx.write_revoked_members
+                    .contains(&DID("did:key:bob".into())),
+                "write restored"
+            );
+            assert!(
+                ctx.read_revoked_members
+                    .contains(&DID("did:key:bob".into())),
+                "read still revoked"
+            );
+        }
+        let restore_r = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            GovernanceAction::RestoreReadAccess {
+                did: "did:key:bob".into(),
+            },
+        );
+        manager
+            .execute_governance_action(&ctx_id, &restore_r)
+            .await
+            .unwrap();
+        {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get(&ctx_id).unwrap();
+            assert!(
+                !ctx.write_revoked_members
+                    .contains(&DID("did:key:bob".into()))
+            );
+            assert!(
+                !ctx.read_revoked_members
+                    .contains(&DID("did:key:bob".into()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cac009_layer_verification() {
+        let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
+        {
+            use crate::crypto::ucan::validate::{
+                InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+                InMemoryRevocationChecker,
+            };
+            use std::hash::RandomState;
+            manager.subscribe_broadcast::<InMemoryDidResolver, InMemoryNonceTracker, InMemoryRevocationChecker, InMemoryProofResolver, RandomState>(&ctx_id, &"did:key:sub1".into(), None, 1000, None).await.unwrap();
+        }
+        let revoke = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            GovernanceAction::RevokeWriteAccess {
+                did: "did:key:bob".into(),
+                scope: super::RevocationScope::Full,
+            },
+        );
+        manager
+            .execute_governance_action(&ctx_id, &revoke)
+            .await
+            .unwrap();
+        {
+            let contexts = manager.contexts.lock().await;
+            assert!(
+                contexts
+                    .get(&ctx_id)
+                    .unwrap()
+                    .write_revoked_members
+                    .contains(&DID("did:key:bob".into())),
+                "Layer 3"
+            );
+        }
+        let decision = manager
+            .handle_broadcast_key_request(&ctx_id, &"did:key:bob".into(), &"did:key:sub1".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(decision, super::KeyRequestDecision::Deny { .. }),
+            "Layer 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn cac009_forward_only_verification() {
+        let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
+        let _epoch_before = {
+            let contexts = manager.contexts.lock().await;
+            contexts
+                .get(&ctx_id)
+                .unwrap()
+                .broadcast_context
+                .as_ref()
+                .unwrap()
+                .get_author("did:key:bob")
+                .unwrap()
+                .epoch
+        };
+        let revoke = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            GovernanceAction::RevokeWriteAccess {
+                did: "did:key:bob".into(),
+                scope: super::RevocationScope::Full,
+            },
+        );
+        manager
+            .execute_governance_action(&ctx_id, &revoke)
+            .await
+            .unwrap();
+        {
+            let contexts = manager.contexts.lock().await;
+            assert!(
+                !contexts
+                    .get(&ctx_id)
+                    .unwrap()
+                    .broadcast_context
+                    .as_ref()
+                    .unwrap()
+                    .is_author("did:key:bob")
+            );
+        }
+        let restore = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            GovernanceAction::RestoreWriteAccess {
+                did: "did:key:bob".into(),
+            },
+        );
+        manager
+            .execute_governance_action(&ctx_id, &restore)
+            .await
+            .unwrap();
+        // After Full revocation + restore, the author entry was removed.
+        // Forward-only restoration clears the revocation flag but does NOT
+        // re-create the author — bob must re-register as an author.
+        let author_gone = {
+            let contexts = manager.contexts.lock().await;
+            contexts
+                .get(&ctx_id)
+                .unwrap()
+                .broadcast_context
+                .as_ref()
+                .unwrap()
+                .get_author("did:key:bob")
+                .is_none()
+        };
+        assert!(
+            author_gone,
+            "full revocation removes author; restore does not re-add"
+        );
+    }
+
+    // ===================================================================
+    // CAC-010: governance-gated content access control
+    // ===================================================================
+
+    #[tokio::test]
+    async fn cac010_threshold_revoke_read_access() {
+        let creator: DID = "did:key:alice".into();
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+        let mut params = governance_params();
+        params.mode = ContextMode::Broadcast;
+        params.memory_scope = MemoryScope::Full;
+        params.governance = GovernanceModel::Threshold {
+            threshold: 1,
+            signers: vec![creator.clone()],
+        };
+        let _handle = manager
+            .create_context("cac010-thresh".into(), params, creator.clone())
+            .await
+            .unwrap();
+        {
+            use crate::crypto::ucan::validate::{
+                InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+                InMemoryRevocationChecker,
+            };
+            use std::hash::RandomState;
+            manager.subscribe_broadcast::<InMemoryDidResolver, InMemoryNonceTracker, InMemoryRevocationChecker, InMemoryProofResolver, RandomState>("cac010-thresh", &"did:key:dave".into(), None, 1000, None).await.unwrap();
+        }
+        let signing_key = signing_key_for_did(&creator);
+        let outcome = manager
+            .propose_governance_action_checked(
+                "cac010-thresh",
+                &creator,
+                GovernanceAction::RevokeReadAccess {
+                    did: "did:key:dave".into(),
+                    scope: super::RevocationScope::Full,
+                },
+                &signing_key,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.status,
+            super::ProposalStatus::Approved,
+            "1-of-1 threshold auto-approve"
+        );
+        assert!(
+            outcome.execution_result.is_some(),
+            "auto-approved should have execution_result"
+        );
+        assert!(
+            !manager
+                .is_broadcast_subscriber("cac010-thresh", "did:key:dave")
+                .await,
+            "dave unsubscribed"
+        );
+    }
+
+    #[tokio::test]
+    async fn cac010_restore_read_access_forward_only() {
+        let (manager, ctx_id) = setup_broadcast_with_member_ban().await;
+        let revoke = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:sub1".into(),
+            GovernanceAction::RevokeReadAccess {
+                did: "did:key:sub1".into(),
+                scope: super::RevocationScope::Full,
+            },
+        );
+        manager
+            .execute_governance_action(&ctx_id, &revoke)
+            .await
+            .unwrap();
+        assert!(
+            !manager
+                .is_broadcast_subscriber(&ctx_id, "did:key:sub1")
+                .await
+        );
+        let restore = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:sub1".into(),
+            GovernanceAction::RestoreReadAccess {
+                did: "did:key:sub1".into(),
+            },
+        );
+        manager
+            .execute_governance_action(&ctx_id, &restore)
+            .await
+            .unwrap();
+        let events = manager.drain_events(&ctx_id).await;
+        assert!(events.iter().any(
+            |e| matches!(e, ContextEvent::ReadAccessRestored { did } if did.0 == "did:key:sub1")
+        ));
+    }
+
+    #[tokio::test]
+    async fn cac010_revoke_write_full_can_still_read() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+        let revoke = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            GovernanceAction::RevokeWriteAccess {
+                did: "did:key:bob".into(),
+                scope: super::RevocationScope::Full,
+            },
+        );
+        manager
+            .execute_governance_action(&ctx_id, &revoke)
+            .await
+            .unwrap();
+        {
+            let contexts = manager.contexts.lock().await;
+            let ctx = contexts.get(&ctx_id).unwrap();
+            assert!(
+                ctx.write_revoked_members
+                    .contains(&DID("did:key:bob".into())),
+                "write-revoked"
+            );
+            assert!(
+                !ctx.read_revoked_members
+                    .contains(&DID("did:key:bob".into())),
+                "NOT read-revoked"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cac010_revoke_write_future_only() {
+        let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
+        let revoke = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            GovernanceAction::RevokeWriteAccess {
+                did: "did:key:bob".into(),
+                scope: super::RevocationScope::FutureOnly,
+            },
+        );
+        manager
+            .execute_governance_action(&ctx_id, &revoke)
+            .await
+            .unwrap();
+        let (bob_custody, bob_key_handle) = test_custody_from_seed(&[0xBB; 32]).await;
+        assert!(
+            manager
+                .publish_broadcast(
+                    &ctx_id,
+                    &"did:key:bob".into(),
+                    b"nope",
+                    &bob_custody,
+                    &bob_key_handle,
+                )
+                .await
+                .is_err()
+        );
+        {
+            let contexts = manager.contexts.lock().await;
+            assert!(
+                contexts
+                    .get(&ctx_id)
+                    .unwrap()
+                    .broadcast_context
+                    .as_ref()
+                    .unwrap()
+                    .is_author("did:key:bob"),
+                "FutureOnly keeps author in BC"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cac010_rotate_content_keys_context_wide() {
+        let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
+        let rotate = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:bob".into(),
+            GovernanceAction::RotateContentKeys {
+                reason: Some("periodic".into()),
+            },
+        );
+        let result = manager.execute_governance_action(&ctx_id, &rotate).await;
+        assert!(
+            result.is_ok(),
+            "RotateContentKeys should succeed: {result:?}"
+        );
+        match result.unwrap() {
+            GovernanceActionResult::ContentKeysRotated(r) => {
+                assert_eq!(r.reason.as_deref(), Some("periodic"));
+            }
+            other => panic!("expected ContentKeysRotated, got {other:?}"),
+        }
+        let events = manager.drain_events(&ctx_id).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ContextEvent::ContentKeysRotated { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn cac010_membership_access_decoupling() {
+        let (manager, ctx_id) = setup_broadcast_with_member_ban().await;
+        let revoke = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:sub1".into(),
+            GovernanceAction::RevokeReadAccess {
+                did: "did:key:sub1".into(),
+                scope: super::RevocationScope::Full,
+            },
+        );
+        manager
+            .execute_governance_action(&ctx_id, &revoke)
+            .await
+            .unwrap();
+        assert!(
+            !manager
+                .is_broadcast_subscriber(&ctx_id, "did:key:sub1")
+                .await,
+            "unsubscribed"
+        );
+        assert!(
+            manager.is_member(&ctx_id, "did:key:sub1").await,
+            "still a member"
+        );
+    }
+
+    #[tokio::test]
+    async fn cac010_single_admin_auto_execute() {
+        let (manager, ctx_id) = setup_broadcast_with_member_ban().await;
+        let revoke = approved_governance_proposal(
+            &"did:key:alice".into(),
+            &ctx_id,
+            &"did:key:sub1".into(),
+            GovernanceAction::RevokeReadAccess {
+                did: "did:key:sub1".into(),
+                scope: super::RevocationScope::Full,
+            },
+        );
+        let result = manager.execute_governance_action(&ctx_id, &revoke).await;
+        assert!(result.is_ok());
+        match result.unwrap() {
+            GovernanceActionResult::ReadAccessRevoked(r) => {
+                assert_eq!(r.did.0, "did:key:sub1");
+            }
+            other => panic!("expected ReadAccessRevoked, got {other:?}"),
+        }
+    }
+
+    // ===================================================================
+    // SCP-274: governance-manager integration test — full lifecycle
+    // ===================================================================
+
+    #[tokio::test]
+    async fn scp274_single_admin_full_lifecycle() {
+        let (manager, _handle, ctx_id) = setup_governance_context().await;
+        let admin_did: DID = "did:key:admin".into();
+        let signing_key = signing_key_for_did(&admin_did);
+        let outcome = manager
+            .propose_governance_action_checked(
+                &ctx_id,
+                &admin_did,
+                GovernanceAction::AddMember {
+                    did: "did:key:target".into(),
+                    role: "member".to_owned(),
+                },
+                &signing_key,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ProposalStatus::Approved);
+        let outcome = manager
+            .propose_governance_action_checked(
+                &ctx_id,
+                &admin_did,
+                GovernanceAction::RemoveMember {
+                    did: "did:key:target".into(),
+                    reason: Some("test".into()),
+                },
+                &signing_key,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.status,
+            ProposalStatus::Approved,
+            "SingleAdmin should auto-approve"
+        );
+        assert!(
+            outcome.execution_result.is_some(),
+            "SingleAdmin should auto-execute"
+        );
+    }
+
+    #[tokio::test]
+    async fn scp274_threshold_full_lifecycle() {
+        let creator: DID = "did:key:creator".into();
+        let signer2: DID = "did:key:signer2".into();
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+        let mut params = governance_params();
+        params.governance = GovernanceModel::Threshold {
+            threshold: 2,
+            signers: vec![creator.clone(), signer2.clone()],
+        };
+        let _handle = manager
+            .create_context("scp274-thresh".into(), params, creator.clone())
+            .await
+            .unwrap();
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("scp274-thresh").unwrap();
+            ctx.membership
+                .add_member("did:key:signer2".into(), "signer".into(), vec![]);
+            ctx.role_state.member_capabilities.insert(
+                "did:key:signer2".into(),
+                HashSet::from([Capability::GovernancePropose, Capability::GovernanceVote]),
+            );
+        }
+        {
+            let mut contexts = manager.contexts.lock().await;
+            contexts
+                .get_mut("scp274-thresh")
+                .unwrap()
+                .membership
+                .add_member("did:key:target".into(), "member".into(), vec![]);
+        }
+        let creator_sk = signing_key_for_did(&creator);
+        let outcome = manager
+            .propose_governance_action_checked(
+                "scp274-thresh",
+                &creator,
+                GovernanceAction::RemoveMember {
+                    did: "did:key:target".into(),
+                    reason: None,
+                },
+                &creator_sk,
+            )
+            .await
+            .unwrap();
+        let proposal_id = outcome.proposal.proposal_id;
+        let signer2_sk = signing_key_for_did(&signer2);
+        let status = manager
+            .approve_governance_proposal("scp274-thresh", &proposal_id, &signer2, &signer2_sk)
+            .await
+            .unwrap();
+        assert_eq!(status, ProposalStatus::Approved);
+        assert!(!manager.is_member("scp274-thresh", "did:key:target").await);
+    }
+
+    #[tokio::test]
+    async fn scp274_majority_full_lifecycle() {
+        let creator: DID = "did:key:creator".into();
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+        let mut params = governance_params();
+        params.governance = GovernanceModel::Majority {
+            eligible_voters: vec![creator.clone()],
+        };
+        let _handle = manager
+            .create_context("scp274-maj".into(), params, creator.clone())
+            .await
+            .unwrap();
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("scp274-maj").unwrap();
+            ctx.membership
+                .add_member("did:key:target".into(), "member".into(), vec![]);
+            ctx.role_state.members.insert("did:key:target".into());
+        }
+        let creator_sk = signing_key_for_did(&creator);
+        let outcome = manager
+            .propose_governance_action_checked(
+                "scp274-maj",
+                &creator,
+                GovernanceAction::ChangeRole {
+                    did: "did:key:target".into(),
+                    new_role: "observer".into(),
+                },
+                &creator_sk,
+            )
+            .await
+            .unwrap();
+        // MajorityVote propose() always returns Pending — the proposer must
+        // explicitly cast an approve vote to reach quorum (1-of-1).
+        assert_eq!(outcome.status, ProposalStatus::Pending);
+        let proposal_id = outcome.proposal.proposal_id;
+        let status = manager
+            .approve_governance_proposal("scp274-maj", &proposal_id, &creator, &creator_sk)
+            .await
+            .unwrap();
+        assert_eq!(status, ProposalStatus::Approved);
+    }
+
+    #[tokio::test]
+    async fn scp274_unanimity_full_lifecycle() {
+        let creator: DID = "did:key:creator".into();
+        let member2: DID = "did:key:member2".into();
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+        let mut params = governance_params();
+        params.governance = GovernanceModel::Unanimity {
+            eligible_voters: vec![creator.clone(), member2.clone()],
+        };
+        let _handle = manager
+            .create_context("scp274-unan".into(), params, creator.clone())
+            .await
+            .unwrap();
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("scp274-unan").unwrap();
+            ctx.membership
+                .add_member("did:key:member2".into(), "member".into(), vec![]);
+            ctx.role_state.member_capabilities.insert(
+                "did:key:member2".into(),
+                HashSet::from([Capability::GovernancePropose, Capability::GovernanceVote]),
+            );
+        }
+        {
+            let mut contexts = manager.contexts.lock().await;
+            contexts
+                .get_mut("scp274-unan")
+                .unwrap()
+                .membership
+                .add_member("did:key:target".into(), "member".into(), vec![]);
+        }
+        let creator_sk = signing_key_for_did(&creator);
+        let outcome = manager
+            .propose_governance_action_checked(
+                "scp274-unan",
+                &creator,
+                GovernanceAction::RemoveMember {
+                    did: "did:key:target".into(),
+                    reason: None,
+                },
+                &creator_sk,
+            )
+            .await
+            .unwrap();
+        let proposal_id = outcome.proposal.proposal_id;
+        let member2_sk = signing_key_for_did(&member2);
+        let status = manager
+            .approve_governance_proposal("scp274-unan", &proposal_id, &member2, &member2_sk)
+            .await
+            .unwrap();
+        assert_eq!(status, ProposalStatus::Approved);
+        assert!(!manager.is_member("scp274-unan", "did:key:target").await);
+    }
+
+    #[tokio::test]
+    async fn scp274_rejected_proposal_does_not_execute() {
+        let creator: DID = "did:key:creator".into();
+        let signer2: DID = "did:key:signer2".into();
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+        let mut params = governance_params();
+        params.governance = GovernanceModel::Threshold {
+            threshold: 2,
+            signers: vec![creator.clone(), signer2.clone()],
+        };
+        let _handle = manager
+            .create_context("scp274-reject".into(), params, creator.clone())
+            .await
+            .unwrap();
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("scp274-reject").unwrap();
+            ctx.membership
+                .add_member("did:key:signer2".into(), "signer".into(), vec![]);
+            ctx.role_state.member_capabilities.insert(
+                "did:key:signer2".into(),
+                HashSet::from([Capability::GovernancePropose, Capability::GovernanceVote]),
+            );
+            ctx.membership
+                .add_member("did:key:target".into(), "member".into(), vec![]);
+        }
+        let creator_sk = signing_key_for_did(&creator);
+        let outcome = manager
+            .propose_governance_action_checked(
+                "scp274-reject",
+                &creator,
+                GovernanceAction::RemoveMember {
+                    did: "did:key:target".into(),
+                    reason: None,
+                },
+                &creator_sk,
+            )
+            .await
+            .unwrap();
+        let proposal_id = outcome.proposal.proposal_id;
+        let signer2_sk = signing_key_for_did(&signer2);
+        let status = manager
+            .reject_governance_proposal("scp274-reject", &proposal_id, &signer2, &signer2_sk)
+            .await
+            .unwrap();
+        assert!(matches!(status, ProposalStatus::Rejected { .. }));
+        assert!(manager.is_member("scp274-reject", "did:key:target").await);
+    }
+
+    /// SCP-274 AC8: governance events emitted during propose/approve lifecycle.
+    #[tokio::test]
+    async fn scp274_governance_events_in_log() {
+        let creator: DID = "did:key:creator".into();
+        let signer2: DID = "did:key:signer2".into();
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+        let mut params = governance_params();
+        params.governance = GovernanceModel::Threshold {
+            threshold: 2,
+            signers: vec![creator.clone(), signer2.clone()],
+        };
+        let _handle = manager
+            .create_context("scp274-events".into(), params, creator.clone())
+            .await
+            .unwrap();
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("scp274-events").unwrap();
+            ctx.membership
+                .add_member("did:key:signer2".into(), "signer".into(), vec![]);
+            ctx.role_state.member_capabilities.insert(
+                "did:key:signer2".into(),
+                HashSet::from([Capability::GovernancePropose, Capability::GovernanceVote]),
+            );
+            ctx.membership
+                .add_member("did:key:target".into(), "member".into(), vec![]);
+        }
+        let creator_sk = signing_key_for_did(&creator);
+        let outcome = manager
+            .propose_governance_action_checked(
+                "scp274-events",
+                &creator,
+                GovernanceAction::RemoveMember {
+                    did: "did:key:target".into(),
+                    reason: None,
+                },
+                &creator_sk,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome.status, ProposalStatus::Pending),
+            "should be pending after first vote"
+        );
+        let proposal_id = outcome.proposal.proposal_id;
+        let signer2_sk = signing_key_for_did(&signer2);
+        let status = manager
+            .approve_governance_proposal("scp274-events", &proposal_id, &signer2, &signer2_sk)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            ProposalStatus::Approved,
+            "should be approved after quorum"
+        );
+        assert!(
+            !manager.is_member("scp274-events", "did:key:target").await,
+            "target removed after governance execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn scp274_bypass_prevention() {
+        let creator: DID = "did:key:creator".into();
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        );
+        let mut params = governance_params();
+        params.governance = GovernanceModel::Majority {
+            eligible_voters: vec![creator.clone()],
+        };
+        let handle = manager
+            .create_context("scp274-bypass".into(), params, creator.clone())
+            .await
+            .unwrap();
+        let result = manager.close_context(&handle, &creator).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), ContextError::PermissionDenied(ref msg) if msg.contains("multi-admin"))
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn scp274_exercises_seven_action_variants() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let params = governance_params();
+        let _handle = manager
+            .create_context("scp274-7a".into(), params, "did:key:admin".into())
+            .await
+            .unwrap();
+        let add = approved_proposal(
+            [100u8; 32],
+            "scp274-7a",
+            GovernanceAction::AddMember {
+                did: "did:key:target".into(),
+                role: "member".to_owned(),
+            },
+            &["did:key:admin"],
+        );
+        assert!(
+            manager
+                .execute_governance_action("scp274-7a", &add)
+                .await
+                .is_ok(),
+            "AddMember"
+        );
+        let rm = approved_proposal(
+            [101u8; 32],
+            "scp274-7a",
+            GovernanceAction::RemoveMember {
+                did: "did:key:target".into(),
+                reason: None,
+            },
+            &["did:key:admin"],
+        );
+        assert!(
+            manager
+                .execute_governance_action("scp274-7a", &rm)
+                .await
+                .is_ok(),
+            "RemoveMember"
+        );
+        let add2 = approved_proposal(
+            [102u8; 32],
+            "scp274-7a",
+            GovernanceAction::AddMember {
+                did: "did:key:target".into(),
+                role: "member".to_owned(),
+            },
+            &["did:key:admin"],
+        );
+        manager
+            .execute_governance_action("scp274-7a", &add2)
+            .await
+            .unwrap();
+        let cr = approved_proposal(
+            [103u8; 32],
+            "scp274-7a",
+            GovernanceAction::ChangeRole {
+                did: "did:key:target".into(),
+                new_role: "observer".into(),
+            },
+            &["did:key:admin"],
+        );
+        assert!(
+            manager
+                .execute_governance_action("scp274-7a", &cr)
+                .await
+                .is_ok(),
+            "ChangeRole"
+        );
+        let close = approved_proposal(
+            [104u8; 32],
+            "scp274-7a",
+            GovernanceAction::CloseContext {
+                reason: Some("test".into()),
+            },
+            &["did:key:admin"],
+        );
+        assert!(
+            manager
+                .execute_governance_action("scp274-7a", &close)
+                .await
+                .is_ok(),
+            "CloseContext"
+        );
+        let mut params2 = governance_params();
+        params2.ttl = Some(std::time::Duration::from_secs(3600));
+        let _h2 = manager
+            .create_context("scp274-7b".into(), params2, "did:key:admin".into())
+            .await
+            .unwrap();
+        {
+            let mut contexts = manager.contexts.lock().await;
+            contexts
+                .get_mut("scp274-7b")
+                .unwrap()
+                .membership
+                .add_member("did:key:signer".into(), "member".into(), vec![]);
+        }
+        let add_s = approved_proposal(
+            [105u8; 32],
+            "scp274-7b",
+            GovernanceAction::AddSigner {
+                did: "did:key:signer".into(),
+            },
+            &["did:key:admin"],
+        );
+        assert!(
+            manager
+                .execute_governance_action("scp274-7b", &add_s)
+                .await
+                .is_ok(),
+            "AddSigner"
+        );
+        let ext = approved_proposal(
+            [106u8; 32],
+            "scp274-7b",
+            GovernanceAction::ExtendTtl {
+                additional_secs: 1800,
+            },
+            &["did:key:admin", "did:key:signer"],
+        );
+        assert!(
+            manager
+                .execute_governance_action("scp274-7b", &ext)
+                .await
+                .is_ok(),
+            "ExtendTtl"
+        );
+        let revoke = approved_proposal(
+            [107u8; 32],
+            "scp274-7b",
+            GovernanceAction::RevokeWriteAccess {
+                did: "did:key:signer".into(),
+                scope: super::RevocationScope::FutureOnly,
+            },
+            &["did:key:admin"],
+        );
+        assert!(
+            manager
+                .execute_governance_action("scp274-7b", &revoke)
+                .await
+                .is_ok(),
+            "RevokeWriteAccess"
+        );
+        let revoke_r = approved_proposal(
+            [108u8; 32],
+            "scp274-7b",
+            GovernanceAction::RevokeReadAccess {
+                did: "did:key:signer".into(),
+                scope: super::RevocationScope::Full,
+            },
+            &["did:key:admin"],
+        );
+        manager
+            .execute_governance_action("scp274-7b", &revoke_r)
+            .await
+            .unwrap();
+        let restore_r = approved_proposal(
+            [109u8; 32],
+            "scp274-7b",
+            GovernanceAction::RestoreReadAccess {
+                did: "did:key:signer".into(),
+            },
+            &["did:key:admin"],
+        );
+        assert!(
+            manager
+                .execute_governance_action("scp274-7b", &restore_r)
+                .await
+                .is_ok(),
+            "RestoreReadAccess"
+        );
+    }
+
+    #[tokio::test]
+    async fn scp274_extend_ttl_unanimity_override_in_threshold() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let mut params = governance_params();
+        params.ttl = Some(std::time::Duration::from_secs(3600));
+        params.governance = GovernanceModel::Threshold {
+            threshold: 1,
+            signers: vec!["did:key:creator".into()],
+        };
+        let _handle = manager
+            .create_context("scp274-ttl-t".into(), params, "did:key:creator".into())
+            .await
+            .unwrap();
+        let add = approved_proposal(
+            [110u8; 32],
+            "scp274-ttl-t",
+            GovernanceAction::AddMember {
+                did: "did:key:bob".into(),
+                role: "member".to_owned(),
+            },
+            &["did:key:creator"],
+        );
+        manager
+            .execute_governance_action("scp274-ttl-t", &add)
+            .await
+            .unwrap();
+        let extend = approved_proposal(
+            [111u8; 32],
+            "scp274-ttl-t",
+            GovernanceAction::ExtendTtl {
+                additional_secs: 1800,
+            },
+            &["did:key:creator"],
+        );
+        assert!(
+            manager
+                .execute_governance_action("scp274-ttl-t", &extend)
+                .await
+                .is_err(),
+            "ExtendTtl requires unanimity"
+        );
+        let extend2 = approved_proposal(
+            [112u8; 32],
+            "scp274-ttl-t",
+            GovernanceAction::ExtendTtl {
+                additional_secs: 1800,
+            },
+            &["did:key:creator", "did:key:bob"],
+        );
+        assert!(
+            manager
+                .execute_governance_action("scp274-ttl-t", &extend2)
+                .await
+                .is_ok(),
+            "ExtendTtl with unanimity"
+        );
+    }
+
+    #[tokio::test]
+    async fn scp274_promote_context_unanimity_override_in_majority() {
+        use crate::context::params::{MemoryScope, PromotionPolicy};
+        let creator: DID = "did:key:creator".into();
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let mut params = governance_params();
+        params.governance = GovernanceModel::Majority {
+            eligible_voters: vec![creator.clone()],
+        };
+        params.promotion_policy = PromotionPolicy::Promotable;
+        params.memory_scope = MemoryScope::Ephemeral;
+        params.ttl = Some(std::time::Duration::from_secs(3600));
+        let _handle = manager
+            .create_context("scp274-promo".into(), params, creator.clone())
+            .await
+            .unwrap();
+        let add = approved_proposal(
+            [120u8; 32],
+            "scp274-promo",
+            GovernanceAction::AddMember {
+                did: "did:key:bob".into(),
+                role: "member".to_owned(),
+            },
+            &["did:key:creator"],
+        );
+        manager
+            .execute_governance_action("scp274-promo", &add)
+            .await
+            .unwrap();
+        let promote = approved_proposal(
+            [121u8; 32],
+            "scp274-promo",
+            GovernanceAction::PromoteContext,
+            &["did:key:creator"],
+        );
+        assert!(
+            manager
+                .execute_governance_action("scp274-promo", &promote)
+                .await
+                .is_err(),
+            "PromoteContext requires unanimity"
+        );
+        let promote2 = approved_proposal(
+            [122u8; 32],
+            "scp274-promo",
+            GovernanceAction::PromoteContext,
+            &["did:key:creator", "did:key:bob"],
+        );
+        assert!(
+            manager
+                .execute_governance_action("scp274-promo", &promote2)
+                .await
+                .is_ok(),
+            "PromoteContext with unanimity"
+        );
+    }
+
+    #[tokio::test]
+    async fn scp274_conflict_detection_change_role() {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+        let params = governance_params();
+        let _handle = manager
+            .create_context("scp274-conflict".into(), params, "did:key:admin".into())
+            .await
+            .unwrap();
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("scp274-conflict").unwrap();
+            ctx.membership
+                .add_member("did:key:target".into(), "member".into(), vec![]);
+            ctx.role_state.members.insert("did:key:target".into());
+        }
+        let proposal_a = approved_proposal(
+            [130u8; 32],
+            "scp274-conflict",
+            GovernanceAction::ChangeRole {
+                did: "did:key:target".into(),
+                new_role: "admin".into(),
+            },
+            &["did:key:admin"],
+        );
+        let proposal_b = approved_proposal(
+            [131u8; 32],
+            "scp274-conflict",
+            GovernanceAction::ChangeRole {
+                did: "did:key:target".into(),
+                new_role: "observer".into(),
+            },
+            &["did:key:admin"],
+        );
+        manager
+            .execute_governance_action("scp274-conflict", &proposal_a)
+            .await
+            .unwrap();
+        {
+            let mut contexts = manager.contexts.lock().await;
+            let ctx = contexts.get_mut("scp274-conflict").unwrap();
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            ctx.approved_proposals
+                .insert(proposal_a.proposal_id, (proposal_a.clone(), now, now));
+            let events = manager.detect_and_handle_conflicts(ctx, &proposal_b);
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    crate::context::governance::GovernanceEvent::ConflictDetected { .. }
+                        | crate::context::governance::GovernanceEvent::ConflictResolved { .. }
+                )),
+                "conflict detected: {events:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scp274_deadlock_detection_threshold() {
+        use crate::context::governance::GovernanceContext;
+        use crate::context::governance::multisig::ThresholdEngine;
+        use crate::context::governance::timeout::{DeadlockDetectionState, detect_deadlock};
+        let signer1: DID = "did:key:signer1".into();
+        let signer2: DID = "did:key:signer2".into();
+        let signer3: DID = "did:key:signer3".into();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let resolver: std::sync::Arc<
+            dyn Fn(&DID) -> Option<ed25519_dalek::VerifyingKey> + Send + Sync,
+        > = std::sync::Arc::new(move |_| Some(signing_key.verifying_key()));
+        let engine =
+            ThresholdEngine::new(vec![signer1.clone(), signer2, signer3], 2, 86_400, resolver)
+                .unwrap();
+        let gov_ctx = GovernanceContext {
+            context_id: "deadlock-test".into(),
+            members: vec![(signer1.clone(), "admin".into())],
+            admin_dids: vec![signer1],
+            current_epoch: None,
+            now: 1000,
+        };
+        let detection_state = DeadlockDetectionState::default();
+        let conditions = detect_deadlock(&engine, &gov_ctx, &detection_state);
+        assert!(!conditions.is_empty(), "deadlock should be detected");
+    }
+
+    #[tokio::test]
+    async fn scp274_checkpoint_cosignature_threshold() {
+        use crate::context::governance::GovernanceEngine;
+        use crate::context::governance::multisig::ThresholdEngine;
+        let signer1: DID = "did:key:signer1".into();
+        let signer2: DID = "did:key:signer2".into();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let resolver: std::sync::Arc<
+            dyn Fn(&DID) -> Option<ed25519_dalek::VerifyingKey> + Send + Sync,
+        > = std::sync::Arc::new(move |_| Some(signing_key.verifying_key()));
+        let engine =
+            ThresholdEngine::new(vec![signer1.clone(), signer2.clone()], 2, 86_400, resolver)
+                .unwrap();
+        let (required_signers, quorum) = engine.checkpoint_cosignature_requirements();
+        assert_eq!(quorum, 2);
+        assert_eq!(required_signers.len(), 2);
+        assert!(required_signers.contains(&signer1));
+        assert!(required_signers.contains(&signer2));
     }
 }

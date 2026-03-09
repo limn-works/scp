@@ -4,94 +4,53 @@
 
 ### Adversarial Review (PR#4) -- Black Hat Findings
 - See `/tmp/black-hat-review.md` and PR#4 comment for full details
-- 10 attack narratives (BLACK-001 through BLACK-010)
-- 5 creative abuse scenarios (ABUSE-1 through ABUSE-5)
 - Key themes: relay metadata surveillance, missing auth guards, no rate limiting, schema bypass, Sybil weakness
 
-### PR#76 Audit Findings (2026-02-26) -- Initial Review
-- See `pr76-findings.md` for full details
-
-### PR#76 Fix Verification (2026-02-26)
-- FIXED: claim_shadow Ed25519 sigs, RFC 6962 domain separation, allowed_adapters, CertificateData redaction, FFI expect() removal, content_hash Result, validate_child_ttl, standing channel TOCTOU
-- REMAINING (HIGH): GovernanceAction (shadow.rs) no signature field; SingleAdminEngine duplicate check after construction
-- REMAINING (MEDIUM): Attestation canonical hash uses Debug format for type tag; shutdown_runtime blocks GIL 100ms; SHUTDOWN_TIMEOUT const stale
+### PR#76 Audit Findings (2026-02-26)
+- See `pr76-findings.md` for full details (initial review + fix verification)
 - UNFIXED: CurrencyCode Deserialize bypasses ASCII; EventLogMetrics Vecs unbounded; SenderVelocityTracker unbounded HashMap
 
+### Production Readiness Commits (2026-03-06)
+- See `production-readiness-commits.md` for full details
+- 7 commits reviewed: sender key msgpack, HPKE domain sep, deny_unknown_fields, ProtocolStore named msgpack, dedup TTL, serde rename, conflict pairs
+- MEDIUM x2 on 7f341b8 (future timestamp window + missing test); rest CLEAN
+- Pre-existing gaps: sender key wire types lack deny_unknown_fields; handle_sender_key_request no timestamp/nonce check; RestoreReadAccess self-conflict missing
+
 ### MCP Server (`crates/scp-mcp/src/server.rs`)
-- `tools/list` filters by role + UCAN capability -- good
-- `tools/call` validates UCAN before invocation -- good
-- FINDING (PR#4): No pre-initialization guard on `handle_request`
-- FINDING (PR#4): `resources/read` has no UCAN capability check
-- FINDING (PR#4): Schema validation is type-check-only, not full JSON Schema
+- FINDING (PR#4): No pre-initialization guard; `resources/read` no UCAN check; schema validation type-check-only
+- GOOD: `tools/list` filters by role + UCAN; `tools/call` validates UCAN before invocation
 
 ### Relay Server (`crates/scp-transport/src/native/server.rs`)
-- FINDING (PR#4): Zero rate limiting; no storage quota; DELETE unauthenticated
 - PARTIAL FIX (2026-03-03): Shared PublishRateLimiter + ConnectionTracker across WS/QUIC
-- REMAINING (MEDIUM): Total connection limit TOCTOU -- two-step (register_connection then separate read lock) vs QUIC single write lock
-- GOOD: Per-IP register_connection is atomic (check+increment under single write lock)
+- REMAINING (MEDIUM): Total connection limit TOCTOU
 
 ### Transport Expansion Audit (2026-03-04) -- QUIC/HTTP3/WebTransport/UDP/CoAP
 - See `transport-expansion-audit.md` for full finding list (SEC-001 through SEC-008)
-- HIGH: UDP TOCTOU on max_sessions (read lock, handshake, write lock)
-- MEDIUM x6: HTTP/3 conn limit TOCTOU, HTTP/3 bypasses ConnectionTracker, QUIC 0-RTT not explicitly disabled, SubscriptionRegistry unbounded, QUIC query() unbounded Vec, HTTP/3 doc/code mismatch
-- GOOD: QUIC accept_loop single write lock (exemplary); shared rate limiting across WS/QUIC/UDP; global owner ID counter; cover traffic constant-rate invariant; delivery jitter; DTLS ECDHE-ECDSA-AES-GCM only
 
 ### UCAN (`crates/scp-core/src/crypto/ucan/`)
 - 11-step validation pipeline thorough; SpendingCapability attenuation correct
-- FINDING (PR#4): `validate_ucan_stateless` skips nonce, revocation, chain, attenuation
-- FINDING (PR#4): `now_secs()` uses `unwrap_or_default()` -- returns 0 on clock error
-- UNFIXED: `CurrencyCode` serde deserialize bypasses ASCII validation
+- FINDING: `validate_ucan_stateless` skips nonce, revocation, chain, attenuation
+- FINDING: `now_secs()` uses `unwrap_or_default()` -- returns 0 on clock error
 
 ### Shadow Identity (`crates/scp-core/src/bridge/`)
-- REMAINING (HIGH): `GovernanceAction` has no signature
-- REMAINING (MEDIUM): Attestation canonical hash uses Debug format; attestation.claim JSON not canonically ordered
-- NEW FINDING (HIGH): Canonical hash no field separators -- concatenation collision risk
-- NEW FINDING (MEDIUM): did:key:<hex> non-standard, not gated behind cfg(test); shadow governance check only compares shadow_id
+- HIGH: GovernanceAction no signature; canonical hash no field separators
+- MEDIUM: did:key:<hex> non-standard not gated behind cfg(test)
 
 ### FFI Bridge -- PyO3 (`crates/scp-ffi/src/`) -- Audit 2026-02-28
 - See `pyo3-audit-20260228.md` for full PR#112 fix list
-- HIGH: expect() panic across FFI in py_context_create (line 457) -- unguarded clock call
-- REMAINING (MEDIUM): docker/podman in default allowlist
-- TRACKED (TODO #106): validate_capability always Ok(()) -- defense-in-depth gap
-- TRACKED: registries unbounded (#108), recursion depth (#110), clock drift (#107)
-- SCP-212 (2026-02-28): invoke_tool dispatches to registered ToolHandler closures
-  - HIGH: No ToolInvokedEvent appended to event_log -- ADR-010 spec gap (no audit trail)
-  - HIGH: mcp_register_tool_handler Rust fn not wrapped in Python SDK (mcp.py) -- unreachable to SDK users
-  - MEDIUM: DashMap shard lock held during Python handler execution -- free-threaded Python shard starvation risk; fix by cloning handler Arc before entering with_context
-  - MEDIUM: No timeout on Python handler call -- blocking handler can starve tokio runtime
-  - BUG: Redundant second tool_registry.get() in output-schema validation; make unconditional (fail-closed)
-  - GOOD: Callable check at registration; tool-existence gate before handler stored; input+output schema validation
-- Routing ID derivation (2026-02-28): FIXED -- now uses HMAC-SHA256(per-identity random secret, context_id || "scp-pseudonym") instead of SHA-256(context_id). Previous version had no unlinkability.
-  - MEDIUM: Routing secret not zeroized; IDENTITY_ROUTING_SECRETS DashMap grows unboundedly; no eviction on identity close
-  - MEDIUM: HMAC domain separation uses concatenation without length prefix (consistent with scp-core spec; both should fix)
-  - GOOD: OsRng for secret generation; error handling on HMAC init; interim design matches scp-core pseudonym.rs pattern
+- SCP-212: invoke_tool, routing ID derivation findings documented there
 
 ### FFI Bridge -- UniFFI (`crates/scp-ffi/uniffi/`) -- PR#86 + PR#127
-- CRITICAL: scp-platform testing feature in production deps (cdylib)
-- HIGH: transport_connect accepts ANY URL scheme -- no wss:// enforcement
-- HIGH: did:key: hex format not gated behind cfg(test) in BridgeDidResolver
-- MEDIUM: std::sync::Mutex in async context; serde_json errors may leak struct details
-- MEDIUM: generate_nonce uses thread_rng() instead of OsRng (diverges from NAPI)
-- MEDIUM: custody_type() returns Hardware as silent default on lock contention
+- CRITICAL: scp-platform testing feature in production deps
+- HIGH: transport_connect accepts ANY URL scheme; did:key hex not gated
 
 ### FFI Bridge -- WASM (`crates/scp-ffi/wasm/`) -- PR#86 + PR#127 R2
-- FIXED (SA-01): Full 11-step UCAN validation pipeline in wasm/ucan.rs with Ed25519 verify_strict, delegation chain, aud/iss/ceiling/nonce/revocation
-- FIXED (SA-01): compute_revocation_cid returns Result<String, String> instead of unwrap_or_default()
-- REMAINING (HIGH): did:key: hex format in production resolve_public_key (line 274) -- not gated behind cfg(test)
-- REMAINING (MEDIUM): ucan_mint returns error stub (metadata-only, no Ed25519 signing) -- SCP-218 scope
-- NEW (MEDIUM): WasmUcanContextState default empty creator_did could bypass root issuer check
-- NEW (MEDIUM): UCAN nonce state (seen_nonces HashSet) unbounded per context
-- HIGH: runtime.rs reimplements scp-core logic (Merkle tree, schema, tool registry) -- divergence risk
-- MEDIUM: context_send base64 check is_empty() only; panic hook leaks file paths
-- MEDIUM: Context IDs use UUID format not crypto-random hex per spec 18.4.1
-- GOOD: RED-105 trailing-slash prefix collision protection in CapabilityUri::matches_context_scope
-- GOOD: MAX_CHAIN_DEPTH=32 and MAX_EXPIRY_SECS=86400 match scp-core limits
+- HIGH: did:key hex in production; runtime.rs reimplements scp-core logic
+- GOOD: Full 11-step UCAN validation; RED-105 prefix collision protection
 
 ### FFI Bridge -- NAPI (`crates/scp-ffi/napi/`) -- PR#86 + PR#127
 - CRITICAL: ucan_mint uses [0u8; 64] placeholder zero signature
-- HIGH: did:key: hex format not gated behind cfg(test) in BridgeDidResolver
-- MEDIUM: Context IDs use UUID format not crypto-random hex per spec 18.4.1
-- MEDIUM: std::sync::Mutex in async context; missing #![forbid(unsafe_code)]
+- HIGH: did:key hex not gated behind cfg(test)
 
 ### TLS (`crates/scp-node/src/tls.rs`)
 - TLS 1.3 enforced; ACME HTTP-01 correct; CertificateData Debug redacts key
@@ -99,108 +58,87 @@
 
 ### Economy
 - UNFIXED: SenderVelocityTracker unbounded HashMap growth
-- SCP-156: HIGH: Step 5 missing adapter.verify() -- no cryptographic auth validity check
-- SCP-156: MEDIUM: Dummy PaymentAuthorization (zeroed auth_id) on 3 free paths; IntegrationError erased to string
-- SCP-160 tests: TestAdapter::verify_authorization() no-op; Invariant 7 test self-referential
+- SCP-156: HIGH: Step 5 missing adapter.verify()
 
-### Android Platform Adapter (SCP-110, SCP-111, SCP-112, SCP-113) -- 2026-02-28
-- AndroidKeyCustody.kt: HIGH CRYPTO BUG: derivePseudonym uses publicKey() as HMAC key -- correct per ADR-027 amendment, BUT InMemoryKeyCustody (Rust) still uses private key bytes. Cross-platform mismatch. See below.
-- AndroidKeyCustody.kt: HIGH BUG: publicKeyFromKeystore takeLast(32) is fragile -- assumes SubjectPublicKeyInfo header is exactly 12 bytes
-- AndroidKeyCustody.kt: MEDIUM: softwareKeys ConcurrentHashMap uses keyHandle.id as key but dispatches on custodyType field
-- AndroidDeviceAttestation.kt: MEDIUM LEAKAGE: catch block passes e.message to ScpException
-- dhAgree: no validation that peerPublic is exactly 32 bytes
-- AndroidStorage.kt (SCP-113): FIXED in 0b14afe: setRandomizedEncryptionRequired(false), passphrase ByteArray zeroing, SQL LIKE escaping, deletePrefix transaction, error message sanitization, store/retrieve->set/get rename
-  - REMAINING: JVM String immutability limits passphrase zeroing (documented, accepted risk)
-  - REMAINING: InMemoryStorageProvider tests don't exercise SQLCipher code paths (documented in test header)
+### Android Platform Adapter (SCP-110 through SCP-113) -- 2026-02-28
+- HIGH: publicKeyFromKeystore takeLast(32) fragile
+- See pseudonym HMAC key material inconsistency below
 
-### Pseudonym HMAC Key Material Inconsistency -- HIGH (discovered 2026-02-28)
-- InMemoryKeyCustody (key_custody.rs line 333) uses `signing_key.to_bytes()` (PRIVATE key) as HMAC key
-- ADR-006 (phase-1.md line 200), ADR-027 (phase-6.md lines 173-177), traits.rs (line 340), WASM custody.rs (line 97), 09-security-model.md all say PUBLIC key bytes
-- Android adapter uses publicKey() (correct per ADR-027 amendment)
-- Golden vector test (key_custody.rs line 638) uses private seed bytes -- self-consistent but wrong
-- Fix: change InMemoryKeyCustody to use `signing_key.verifying_key().to_bytes()` and regenerate golden vectors
-- This breaks cross-platform pseudonym determinism until fixed
+### Pseudonym HMAC Key Material Inconsistency -- HIGH
+- InMemoryKeyCustody uses PRIVATE key; spec/ADR-027/Android/WASM say PUBLIC key
+- Fix: change InMemoryKeyCustody to verifying_key().to_bytes(); regenerate golden vectors
 
 ### Tiered Storage & Context Discovery
-- See `tiered-storage-scp213.md` for full finding details (SCP-127, SCP-213)
-- SCP-127: HIGH x2 (checkpoint_root clobbered, index reset); MEDIUM x5
-- SCP-213: HIGH BUG x2 (register_known_context never called; `h.context_id` AttributeError)
+- See `tiered-storage-scp213.md` for full details
 
-### Kotlin SDK (`bindings/kotlin/scp-sdk-kotlin/`)
-- CoroutineBridge awaitClose uses runBlocking(ioDispatcher) -- safe for Dispatchers.IO but deadlock risk on single-threaded test dispatchers
-- callbackFlow subscribe/unsubscribe pattern is correct; trySend with overflow detection is good
+### Governance Engines (PR#127 R2)
+- HIGH: compute_vote_hash omits proposal_id -- cross-proposal vote replay
+- MEDIUM: verify_vote() defined but never called in any engine
+- GOOD: Deadline guards, duplicate proposal rejection, deterministic IDs
 
-### Governance Engines (PR#127 R2 -- `scp-core/src/context/governance/`)
-- FIXED (SA-09): SignedVote now has real Ed25519 signatures via sign_vote() with SCP-VOTE-V1: domain separator
-- FIXED (SA-05): compute_proposal_id now has SCP-PROPOSAL-V1: domain separator + u32 BE length prefixes
-- NEW (HIGH): compute_vote_hash omits proposal_id -- cross-proposal vote replay risk. Fix: add proposal_id as first hashed field
-- NEW (MEDIUM): verify_vote() defined and tested but never called in any engine -- votes produced but never verified on receipt
-- GOOD: Deadline guards on approve/reject/withdraw in all engines (multisig, unanimity, majority)
-- GOOD: Duplicate proposal rejection; deterministic proposal IDs; early resolution rules correct
-- GOOD: All engines are Send + Sync; GovernanceEngine trait is object-safe
-- mls_integration.rs: clean separation of governance/MLS concerns; epoch coordinator correct
+### CI/CD Security (PR#127)
+- MEDIUM: pr-review.yml/claude.yml contents:write with untrusted input
+- GOOD: cargo-deny, PyPI OIDC Trusted Publishers
 
-### CI/CD Security (PR#127 -- `.github/workflows/`)
-- MEDIUM: pr-review.yml grants contents:write with Claude agent reading untrusted diffs
-- MEDIUM: claude.yml grants contents:write triggered by any @claude comment (no collaborator check)
-- MEDIUM: release.yml uses --allow-dirty for cargo publish
-- MEDIUM: build-matrix.yml uses curl|sh for wasm-pack install
-- GOOD: build-matrix.yml uses permissions: contents: read (minimal)
-- GOOD: rust-deny job runs cargo-deny for supply chain security
-- GOOD: PyPI uses OIDC Trusted Publishers (no stored token)
+### Broadcast Context (`scp-core/src/context/broadcast.rs`)
+- REMAINING (MEDIUM): subscribers/authors/block_list unbounded
 
-### Broadcast Context (`scp-core/src/context/broadcast.rs`) -- PR#127 R2
-- FIXED (SA-04): validate_messages_read_ucan now delegates to full 11-step validate_ucan from scp-core
-- REMAINING (MEDIUM): subscribers/authors/block_list HashMaps unbounded -- Sybil risk on open broadcast contexts
-- GOOD: Wildcard UCAN rejection (RED-012); epoch overflow via checked_add; per-author key isolation
-
-### Event Log Checkpoint (`scp-core/src/event_log/checkpoint.rs`) -- PR#127 R2
-- FIXED (SA-05): compute_checkpoint_canonical_hash now has SCP-CHECKPOINT-V1: domain separator + u32 BE length prefixes
-- FIXED (SA-06): current_timestamp() now returns Result<u64, ClockError> via crate::time::now_secs()
-- REMAINING (MEDIUM): CheckpointManager::checkpoints Vec unbounded growth
-- GOOD: Cross-checkpoint verification; pruned inclusion proofs; RFC 6962 interior node hashing; epoch Option encoded as flag byte
-
-### PyO3 UCAN Bridge (PR#127)
-- GOOD: Full 11-step ADR-016 pipeline via scp-core delegation with real Ed25519 signing
-- GOOD: MintParams uses real KeyCustody; build_proof_resolver indexes by CID
-- GOOD: Tool handler cloned (Arc) before execution -- DashMap shard lock no longer held
+### Event Log Checkpoint (`scp-core/src/event_log/checkpoint.rs`)
+- REMAINING (MEDIUM): CheckpointManager::checkpoints Vec unbounded
 
 ### scp-node HTTP Features (SCP-242/245/249) -- 2026-03-02
-- dev_api.rs: constant-time bearer token via subtle::ConstantTimeEq -- GOOD
-- dev_api.rs: generic error messages on auth failure -- GOOD
-- http.rs: bridge secret via query param ws://localhost -- acceptable, document limitation
-- projection.rs: public endpoints (no auth) per spec 18.11.6 -- correct by design
-- projection.rs: routing_id cross-check on blob fetch prevents cross-context leakage -- GOOD
-- projection.rs: BroadcastKey ZeroizeOnDrop; cloned snapshot also zeroed -- GOOD
-- HIGH: dev_token logged at INFO level in plaintext (lib.rs line 697-703) -- credential leak to log aggregators
-- HIGH: dev_token uses thread_rng() not OsRng (lib.rs line 689) -- also bridge_secret (line 660)
-- MEDIUM: No localhost enforcement on local_api() bind address (lib.rs line 485)
-- MEDIUM: CreateContextRequest no input validation; name not URL-encoded in well_known.rs URI
-- MEDIUM: ProjectedContext.keys HashMap unbounded epoch growth
-- MEDIUM: broadcast_contexts Vec unbounded growth + no duplicate check via dev API
-- MEDIUM: Bridge secret in WebSocket URL query param (http.rs line 144)
+- HIGH: dev_token logged at INFO plaintext; uses thread_rng() not OsRng
+- MEDIUM: No localhost enforcement; unbounded epoch growth; bridge secret in query param
 
-### Persistence Layer (feat/broadcast-persistence-across-restarts) -- 2026-03-03
-- See `persistence-layer-findings.md` for detailed finding list
-- HIGH x3: identity keys not zeroized; MLS bridge bypasses sanitize_key_component; SyncableStorage apply_changeset no auth
-- MEDIUM x7: IP in storage key; no key length validation; encryptionKey retained; non-atomic count; TTL reset; MLS JSON key material; error echoes input
-- GOOD: Parameterized SQL; B-tree range scans; atomic fs writes; SQLCipher 256000 KDF
+### Persistence Layer (2026-03-03)
+- See `persistence-layer-findings.md` for details
+- HIGH x3: identity keys not zeroized; MLS bridge bypasses sanitize_key_component; SyncableStorage no auth
 
 ### Governance Gaps (closes #266) -- 2026-03-05
-- See `governance-gaps-findings.md` for full details
-- HIGH: validate_projection_ucan skips Ed25519 sig verify, expiry, delegation, revocation -- structural-only validation is auth theater
-- HIGH: message_handler per-author Gated override checked AFTER decryption -- timing oracle + content leak
-- MEDIUM: feed_handler ignores per-author Gated overrides -- content protected per-message is open via feed
-- MEDIUM: RevocationScope accepted but ignored (_scope) -- Full/FutureOnly identical in broadcast
-- MEDIUM: governance_unban_subscriber no check if DID was actually banned -- meaningless proposals
-- MEDIUM: conflict_resolution missing RestoreReadAccess vs RestoreReadAccess pair
-- GOOD: BLACK-HTTP-005 cross-context blob oracle defense; private cache-control on gated; proposal replay protection; key zeroization; uniform deny reasons; MemberBan ceiling enforcement
+- See `governance-gaps-findings.md` for details
+- HIGH: validate_projection_ucan structural-only; message_handler Gated check after decryption
+- MEDIUM: conflict_resolution missing RestoreReadAccess vs RestoreReadAccess pair (still open)
+
+### UCAN Ceiling Enforcement (#339) -- 2026-03-06
+- HIGH: FFI bridges (PyO3/NAPI/UniFFI) pass Some(empty_set) not None for contexts without ceiling -- blocks ALL ucan_mint/delegate
+- HIGH: Option<HashSet<String>> on MintParams/DelegateParams is fail-open; all ~70 test sites pass ceiling: None
+- MEDIUM: mint_ucan parses capabilities twice (ceiling check + attestation build) -- TOCTOU-class divergence risk
+- GOOD: WASM bridge handles empty ceiling correctly (skips when empty); delegate ordering correct (attenuation before ceiling)
+- Pattern: empty-collection-wrapped-in-Some vs None -- recurring FFI bridge issue. Always convert empty to None at boundary.
+
+### Production Providers (#385) -- 2026-03-06
+- HIGH: encrypt_message skips sender key layer -- only MLS, no ADR-007 sender key encryption. Defeats blocking/content access control.
+- HIGH: init_broadcast_key generates broadcast key then discards it, stores unrelated sender key material. Three keys generated, none correct.
+- MEDIUM: Merkle hash lacks length prefix on variable-length event name -- collision possible at event/timestamp boundary
+- MEDIUM: unwrap_or_default() on SystemTime in event log (recurring pattern)
+- MEDIUM: init_broadcast_key and destroy_sender_key acquire broadcast_keys/sender_keys mutexes in opposite order -- deadlock risk
+- MEDIUM: validate_key_package only checks "did:" prefix -- no ciphersuite, signature, or credential validation
+- GOOD: PoisonError::into_inner consistent; lock scopes minimal; encrypt/decrypt round-trip test real crypto; Merkle chain verification tested
+
+### Iteration 17 (2026-03-07) -- SCP-270, SCP-CAC-001, SCP-CAC-004, SCP-ACR-001
+- HIGH: access_keys/wire.rs build_hpke_info lacks length separators -- boundary-shift collision on context_id||member_did
+- HIGH: AccessKeyRequest has no nonce/dedup -- replay within 30s freshness window (sender keys have NonceDedup, access keys don't)
+- HIGH: validate_request_freshness accepts future timestamps (saturating_sub returns 0)
+- MEDIUM: AccessKeyRequest/Response and BlockListEvent lack deny_unknown_fields
+- MEDIUM: execute_add_signer nonce fallback "gov-signer-add-0" static on clock failure
+- MEDIUM: RemoveSigner token revocation uses substring contains() not exact match
+- MEDIUM: BlockListState/event log unbounded growth; append_block_list_event load-modify-store race
+- GOOD: AccessKey Zeroize/ZeroizeOnDrop + Debug redacts; store_value_zeroize; CanonicalField::VarBytes in request hash
+- GOOD: Exhaustive match arms in governance dispatch (no wildcards)
+- GOOD: Unanimity check via set-difference pattern in ExtendTtl and PromoteContext
 
 ### General Patterns
 - clippy deny unwrap/expect in lib code; thiserror; Rust 2024; #![forbid(unsafe_code)] except scp-ffi
 - zeroize inconsistent: store layer yes, identity signing keys and MLS key pairs no
-- unwrap_or_default() on clock ops is recurring systemic pattern
+- unwrap_or_default() on clock ops is recurring systemic pattern (also unwrap_or_else with static fallback)
 - DashMap shard locks must not cross Python GIL; clone Arc first
-- Static DashMap registries (CONTEXT_REGISTRY, KNOWN_CONTEXTS, IDENTITY_ROUTING_SECRETS) lack eviction
-- validate_projection_ucan (scp-node) is structural-only -- recurring UCAN validation gap pattern (see also validate_ucan_stateless)
-- B-tree range scans eliminate LIKE wildcard injection risk across all platforms
+- Static DashMap registries lack eviction
+- validate_projection_ucan structural-only -- recurring UCAN validation gap
+- Signed wire types should have deny_unknown_fields (InnerEnvelope fixed; sender key types + access key types + BlockListEvent still missing)
+- handle_sender_key_request has no timestamp freshness or NonceDedup integration
+- Access key request also lacks NonceDedup -- both key protocols need nonce replay protection
+- Multiple Mutex locks on same struct: enforce consistent acquisition order to prevent deadlock (crypto.rs broadcast_keys vs sender_keys)
+- Hash inputs with variable-length fields need length prefixes or domain separators to prevent boundary-shift collisions
+- HKDF info strings are NOT the same as canonical hashes -- build_hpke_info concatenates raw bytes without length prefixes (found in access keys; check sender keys too)
+- Future timestamp rejection: always check BOTH directions (past staleness AND future clock skew) in freshness validators
+- Load-modify-store on shared storage (append_block_list_event pattern) needs atomicity or caller-side serialization

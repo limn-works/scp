@@ -15,6 +15,7 @@
 //! | `SCP-TRANS-` | 5000–5999 | Transport errors |
 //! | `SCP-TOOL-` | 6000–6999 | Tool errors |
 //! | `SCP-VALID-` | 7000–7999 | Validation errors |
+//! | `SCP-TRUST-` | 8000–8999 | Trust engine errors |
 //!
 //! # Error message format
 //!
@@ -34,7 +35,7 @@
 //!
 //! See ADR-022 and `.docs/standards/sdk-common.md` for the full spec.
 
-use wasm_bindgen::JsError;
+use wasm_bindgen::{JsError, JsValue};
 
 // ---------------------------------------------------------------------------
 // ScpWasmError — unified error type for the WASM bridge layer
@@ -116,6 +117,15 @@ pub enum ScpWasmError {
         /// Stable error code (e.g. `SCP-VALID-7000`).
         code: String,
     },
+
+    /// A trust engine operation failed (attestation, challenge, verification).
+    #[error("[{code}] trust error: {message}")]
+    Trust {
+        /// Human-readable error message.
+        message: String,
+        /// Stable error code (e.g. `SCP-VALID-7070`).
+        code: String,
+    },
 }
 
 impl ScpWasmError {
@@ -128,11 +138,30 @@ impl ScpWasmError {
     pub fn into_js(self) -> JsError {
         JsError::new(&self.to_string())
     }
+
+    /// Creates a `Validation` error with the standard error code.
+    #[must_use]
+    pub fn validation(message: &str) -> JsValue {
+        let err = Self::Validation {
+            message: message.to_owned(),
+            code: "SCP-VALID-7000".to_owned(),
+        };
+        JsValue::from_str(&err.to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
 // From implementations for ergonomic conversion
 // ---------------------------------------------------------------------------
+
+impl From<scp_ffi_common::validate::ValidationError> for ScpWasmError {
+    fn from(e: scp_ffi_common::validate::ValidationError) -> Self {
+        Self::Validation {
+            message: e.message,
+            code: "SCP-VALID-7000".to_owned(),
+        }
+    }
+}
 
 impl From<serde_json::Error> for ScpWasmError {
     fn from(e: serde_json::Error) -> Self {

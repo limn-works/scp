@@ -31,17 +31,22 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub use broadcast::{
-    BroadcastEnvelope, BroadcastKey, BroadcastKeyEpochAdvance, generate_broadcast_key,
-    open_broadcast, rotate_broadcast_key, seal_broadcast,
+    BroadcastEnvelope, BroadcastKey, BroadcastKeyEpochAdvance, BroadcastReplayDetector,
+    SealBroadcastParams, SigningPayloadFields, build_broadcast_signing_payload,
+    compute_provenance_hash, generate_broadcast_key, generate_broadcast_nonce, open_broadcast,
+    open_broadcast_trusted, rotate_broadcast_key, seal_broadcast, validate_broadcast_version,
 };
 pub use encrypt::{decrypt_sender_layer, encrypt_sender_layer};
 pub use key_protocol::{
-    BlockNotification, NonceDedup, RotateForBlockParams, RotateForBlockResult,
+    BlockNotification, BridgeShadowKeyParams, HandleRequestParams, NonceDedup,
+    RotateForBlockParams, RotateForBlockResult, SenderKeyDistributionMessage,
     SenderKeyEpochAdvance, SenderKeyRequest, SenderKeyRequestResult, SenderKeyResponse,
-    expand_block_list, handle_sender_key_request, open_sender_key_response,
-    publish_sender_key_epoch_advance, request_sender_key, rotate_sender_key_for_block,
-    send_block_notification, validate_block_notification_freshness, verify_block_notification,
-    verify_epoch_advance, verify_sender_key_request,
+    expand_block_list, generate_wrapping_keypair, handle_bridge_shadow_key_request,
+    handle_sender_key_request, hpke_open_sender_key, hpke_seal_sender_key,
+    list_shadow_sender_key_dids, open_sender_key_response, publish_sender_key_epoch_advance,
+    request_sender_key, rotate_sender_key_for_block, send_block_notification,
+    validate_block_notification_freshness, validate_sender_key_request_freshness,
+    verify_block_notification, verify_epoch_advance, verify_sender_key_request,
 };
 
 // ---------------------------------------------------------------------------
@@ -162,6 +167,24 @@ pub enum SenderKeyError {
     /// A block notification timestamp is too old to be considered fresh.
     #[error("stale block notification: timestamp outside freshness window")]
     StaleBlockNotification,
+
+    /// A sender key request timestamp is outside the freshness window.
+    ///
+    /// The request is either too old (stale) or too far in the future,
+    /// indicating clock skew or a replay attempt.
+    #[error("stale sender key request: timestamp outside freshness window")]
+    StaleSenderKeyRequest,
+
+    /// The envelope's `version` field is not supported by this implementation.
+    ///
+    /// Currently only version `0x0100` (SCP/1.0) is supported. Returned by
+    /// [`broadcast::validate_broadcast_version`] when the version doesn't
+    /// match (§13.2.2).
+    #[error("unsupported broadcast envelope version: {version:#06x}")]
+    UnsupportedVersion {
+        /// The version value from the wire.
+        version: u16,
+    },
 
     /// The epoch counter overflowed (reached `u64::MAX`).
     #[error("epoch counter overflow: already at u64::MAX")]

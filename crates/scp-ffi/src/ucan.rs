@@ -46,7 +46,7 @@ use scp_core::crypto::ucan::validate::{
 };
 
 use crate::bridge_adapters::{
-    BridgeDidResolver, BridgeNonceTracker, BridgeProofResolver, BridgeRevocationChecker,
+    BridgeNonceTracker, BridgeProofResolver, BridgeRevocationChecker, DispatchDidResolver,
 };
 use crate::error::ScpPyError;
 use crate::validate;
@@ -172,7 +172,7 @@ pub fn py_ucan_validate(
 
     // Parse the required capability URI.
     let required_cap: CapabilityUri = capability.parse().map_err(|e: CoreUcanError| {
-        ScpPyError::UcanError(format!("invalid capability URI '{capability}': {e}"))
+        ScpPyError::ucan(format!("invalid capability URI '{capability}': {e}"))
     })?;
 
     // Determine the presenting agent DID: explicit parameter or token audience.
@@ -182,8 +182,11 @@ pub fn py_ucan_validate(
     let proof_resolver = build_proof_resolver(proof_tokens.as_deref())?;
 
     // Execute the full 11-step validation pipeline within the context runtime.
+    // Use production DID resolver when available (#311), fallback to string-only.
     crate::runtime::with_context(context_id, |rt| {
-        let did_resolver = BridgeDidResolver;
+        let production_resolver = crate::runtime::did_resolver();
+        let did_resolver =
+            DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
         let revocation_checker = BridgeRevocationChecker {
             revocation_list: &rt.revocation_list,
         };
@@ -261,6 +264,10 @@ pub fn py_ucan_mint(
     // Mint using real scp_core::mint_ucan with Ed25519 signing via
     // the retained KeyCustody. See SCP-214 criterion 7.
     let token = crate::runtime::with_identity(&creator_did, |entry| {
+        // Get the ceiling from the context runtime for mint-time enforcement (#339).
+        let ceiling_strings =
+            crate::runtime::with_context(&context_id_owned, |rt| Ok(rt.ceiling_strings.clone()))?;
+
         let params = MintParams {
             issuer_did: &creator_did,
             issuer_key: &entry.identity.active_signing_key,
@@ -273,6 +280,7 @@ pub fn py_ucan_mint(
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: Some(ceiling_strings),
         };
 
         let result = rt.block_on(async { mint_ucan(&params, entry.custody.as_ref()).await });
@@ -367,6 +375,10 @@ pub fn py_ucan_delegate(
 
     let rt = crate::runtime()?;
 
+    // Get the ceiling from the context runtime for delegation-time enforcement (#339).
+    let ceiling_strings =
+        crate::runtime::with_context(context_id, |rt| Ok(rt.ceiling_strings.clone()))?;
+
     let token = crate::runtime::with_identity(delegator_did, |entry| {
         let params = DelegateParams {
             parent_token: &parsed_parent,
@@ -378,6 +390,7 @@ pub fn py_ucan_delegate(
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: Some(ceiling_strings.clone()),
         };
 
         let result = rt.block_on(async { delegate_ucan(&params, entry.custody.as_ref()).await });
@@ -425,12 +438,10 @@ pub fn py_ucan_delegate(
 pub fn py_ucan_revoke(context_id: &str, token: &str) -> PyResult<()> {
     validate::validate_context_id(context_id)?;
     validate::validate_ucan_token(token)?;
-    // Parse the token to extract its payload for CID computation.
-    let parsed = parse_ucan(token).map_err(ScpPyError::from)?;
-
     crate::runtime::with_context(context_id, |rt| {
-        // Compute the content-hash CID matching scp-core's format.
-        let token_cid = compute_revocation_cid(&parsed.payload);
+        // Compute the revocation CID from the raw JWT string, matching
+        // scp-core's format (SHA-256 of the encoded token).
+        let token_cid = compute_revocation_cid(token);
         rt.revocation_list.revoke(token_cid);
         Ok(())
     })?;
@@ -446,7 +457,7 @@ pub fn py_ucan_revoke(context_id: &str, token: &str) -> PyResult<()> {
 ///
 /// Parses each proof token and indexes it by its CID (SHA-256 of the encoded
 /// JWT) so that the delegation chain verifier can resolve proof references.
-fn build_proof_resolver(
+pub(crate) fn build_proof_resolver(
     proof_tokens: Option<&[String]>,
 ) -> Result<BridgeProofResolver, ScpPyError> {
     let mut proofs = HashMap::new();
@@ -460,6 +471,15 @@ fn build_proof_resolver(
     }
 
     Ok(BridgeProofResolver { proofs })
+}
+
+/// Public alias for `build_proof_resolver` used by `tools.rs` and `mcp.rs`.
+///
+/// Accepts the same `Option<&[String]>` parameter as the internal function.
+pub(crate) fn build_proof_resolver_from_tokens(
+    proof_tokens: Option<&[String]>,
+) -> Result<BridgeProofResolver, ScpPyError> {
+    build_proof_resolver(proof_tokens)
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +542,7 @@ mod tests {
     use scp_core::crypto::ucan::validate::{
         DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
     };
+    use scp_ffi_common::BridgeDidResolver;
 
     // -----------------------------------------------------------------------
     // BridgeDidResolver

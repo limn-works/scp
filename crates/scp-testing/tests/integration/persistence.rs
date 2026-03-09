@@ -17,15 +17,19 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use scp_core::context::broadcast::{
     AuthorStateSnapshot, BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot,
     SubscriberRecord,
 };
+use scp_core::context::governance::{
+    GovernanceAction, GovernanceContext, GovernanceEngine, KeyResolver, ProposalStatus,
+    SingleAdminEngine,
+};
 use scp_core::context::manager::{ContextManager, ContextPersistence, ContextSnapshot};
 use scp_core::context::{
-    Capability, CapabilityCeiling, ContextHandle, ContextParams, ContextRoleState, ContextState,
-    MembershipState,
+    Capability, ContextHandle, ContextMode, ContextParams, ContextState, MemoryScope,
 };
 use scp_core::crypto::sender_keys::generate_sender_key;
 use scp_core::store::ProtocolStore;
@@ -76,6 +80,7 @@ fn make_broadcast_snapshot(context_id: &str) -> BroadcastContextSnapshot {
             author_did: "did:dht:z6MkAuthor1".to_owned(),
             broadcast_key: generate_sender_key(),
             epoch: 3,
+            next_sequence: 0,
             block_list,
         },
     );
@@ -945,6 +950,49 @@ impl ContextPersistence for InMemoryContextPersistence {
     }
 }
 
+/// Newtype wrapper enabling multiple `ContextManager` instances to share
+/// the same `InMemoryContextPersistence` backing store, simulating a
+/// restart against the same durable storage. Required because the orphan
+/// rule prevents implementing `ContextPersistence` for `Arc<T>` directly.
+struct SharedPersistence(Arc<InMemoryContextPersistence>);
+
+impl ContextPersistence for SharedPersistence {
+    fn persist_context(
+        &self,
+        context_id: &str,
+        snapshot: &ContextSnapshot,
+    ) -> Result<(), BoxError> {
+        self.0.persist_context(context_id, snapshot)
+    }
+
+    fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
+        self.0.load_context(context_id)
+    }
+
+    fn persist_broadcast(
+        &self,
+        context_id: &str,
+        snapshot: &BroadcastContextSnapshot,
+    ) -> Result<(), BoxError> {
+        self.0.persist_broadcast(context_id, snapshot)
+    }
+
+    fn load_broadcast(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<BroadcastContextSnapshot>, BoxError> {
+        self.0.load_broadcast(context_id)
+    }
+
+    fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
+        self.0.delete_context(context_id)
+    }
+
+    fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
+        self.0.list_persisted_contexts()
+    }
+}
+
 /// Minimal mock providers for `ContextManager` construction.
 /// These are never called in the broadcast restoration path -- only the
 /// persistence provider is exercised.
@@ -975,10 +1023,19 @@ mod mock_providers {
         fn destroy_sender_key(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn validate_key_package(&self, _owner_did: &str) -> Result<(), ContextError> {
+        fn validate_key_package(
+            &self,
+            _owner_did: &str,
+            _key_package_bytes: Option<&[u8]>,
+        ) -> Result<(), ContextError> {
             Ok(())
         }
-        fn add_member(&self, _ctx_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
+        fn add_member(
+            &self,
+            _ctx_id: &[u8; 32],
+            _member_did: &str,
+            _key_package_bytes: Option<&[u8]>,
+        ) -> Result<(), ContextError> {
             Ok(())
         }
         fn remove_member(&self, _ctx_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
@@ -1003,6 +1060,8 @@ mod mock_providers {
             _ctx_id: &[u8; 32],
             _sender_did: &str,
             _payload: &[u8],
+            _epoch: u64,
+            _sequence: u64,
         ) -> Result<Vec<u8>, ContextError> {
             Ok(vec![])
         }
@@ -1050,64 +1109,147 @@ mod mock_providers {
     }
 }
 
+/// Creates a mock key resolver that maps known test DIDs to verifying keys.
+fn mock_key_resolver() -> KeyResolver {
+    Arc::new(|did: &DID| {
+        let did_str: &str = did.as_ref();
+        match did_str {
+            "did:dht:z6MkAuthor1" => {
+                Some(ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]).verifying_key())
+            }
+            "did:dht:z6MkBob" => {
+                Some(ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]).verifying_key())
+            }
+            _ => None,
+        }
+    })
+}
+
 /// End-to-end test: persist a broadcast context snapshot via
 /// `InMemoryContextPersistence`, then restore it into a fresh
-/// `ContextManager` via `restore_context`.
+/// `ContextManager` via `restore_context`. Also verifies that
+/// `executed_proposals` (the replay protection set) persists across
+/// restart: a governance action executed before restart is rejected
+/// as a replay after restore.
 #[tokio::test]
 async fn context_manager_broadcast_restore_roundtrip() {
     use mock_providers::*;
 
-    let persistence = InMemoryContextPersistence::new();
+    let persistence = Arc::new(InMemoryContextPersistence::new());
     let ctx_id = "ctx-manager-restore";
+    let creator_did = scp_identity::DID::from("did:dht:z6MkAuthor1");
+    let bob_did = scp_identity::DID::from("did:dht:z6MkBob");
 
-    // Persist a context snapshot (required for restore_context).
-    let ceiling = CapabilityCeiling::new(vec![Capability::MessagesRead, Capability::MessagesWrite]);
-    let role_state = ContextRoleState::new(ctx_id, "did:dht:z6MkAuthor1", ceiling, vec![]).unwrap();
+    // --- Phase 1: Create context, execute governance action, persist ---
 
-    let context_snapshot = ContextSnapshot {
-        context_id: ctx_id.to_owned(),
-        state: ContextState::Active,
-        context_params: ContextParams::default(),
-        membership: MembershipState::new(),
-        role_state,
-        executed_proposals: HashSet::new(),
-        ttl_remaining_secs: None,
-        registered_tools: Vec::new(),
-        write_revoked_members: HashSet::new(),
-        tool_interfaces: Vec::new(),
-        threshold_signers: Vec::new(),
-        threshold_value: 0,
-        pruning_policy: None,
+    let params = ContextParams {
+        mode: ContextMode::Broadcast,
+        memory_scope: MemoryScope::Full,
+        ceiling: vec![
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::RoleAssign,
+        ],
+        ..ContextParams::default()
     };
-    persistence
-        .persist_context(ctx_id, &context_snapshot)
-        .unwrap();
 
-    // Persist a broadcast snapshot.
-    let broadcast_snapshot = make_broadcast_snapshot(ctx_id);
-    persistence
-        .persist_broadcast(ctx_id, &broadcast_snapshot)
-        .unwrap();
-
-    // Create a ContextManager with persistence.
     let manager = ContextManager::with_persistence(
         Box::new(MockCrypto),
         Box::new(MockTransport),
         Box::new(MockEventLog),
-        Box::new(persistence),
+        Box::new(SharedPersistence(Arc::clone(&persistence))),
+        mock_key_resolver(),
     );
 
-    // Create a context handle in Active state (simulating post-restart).
-    let handle = ContextHandle::new(ctx_id.to_owned(), ContextParams::default());
-    handle.transition_to(&ContextState::Active).await.unwrap();
+    // Register creator DID as locally controlled.
+    manager.register_local_did(creator_did.clone()).await;
 
-    // Restore the context from persistence.
-    manager.restore_context(ctx_id, &handle).await.unwrap();
+    let _handle = manager
+        .create_context(ctx_id.into(), params.clone(), creator_did.clone())
+        .await
+        .unwrap();
 
-    // Verify the context is registered by trying to restore again (should fail
-    // with "already registered").
-    let handle2 = ContextHandle::new(ctx_id.to_owned(), ContextParams::default());
+    // Build an approved AddMember governance proposal via SingleAdminEngine.
+    // AddMember does not require broadcast-specific setup -- it works with
+    // the context as created above.
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let mut engine = SingleAdminEngine::new(creator_did.clone(), mock_key_resolver());
+    let gov_ctx = GovernanceContext {
+        context_id: ctx_id.to_owned(),
+        members: vec![(creator_did.clone(), "admin".to_owned())],
+        admin_dids: vec![creator_did.clone()],
+        current_epoch: None,
+        now: 1000,
+    };
+    let action = GovernanceAction::AddMember {
+        did: bob_did.clone(),
+        role: "member".to_owned(),
+    };
+    let (proposal, _events) = engine
+        .propose(&creator_did, action, &gov_ctx, &signing_key)
+        .unwrap();
+    assert!(matches!(proposal.status, ProposalStatus::Approved));
+
+    // Capture the proposal_id for replay verification after restart.
+    let proposal_id = proposal.proposal_id;
+
+    // Execute the governance action (this persists the snapshot including
+    // executed_proposals via the shared persistence).
+    let result = manager.execute_governance_action(ctx_id, &proposal).await;
+    assert!(result.is_ok(), "first execution should succeed");
+
+    // Verify bob was actually added.
+    assert!(
+        manager.is_member(ctx_id, "did:dht:z6MkBob").await,
+        "bob should be a member after AddMember governance action"
+    );
+
+    // --- Phase 2: Verify persistence contains executed_proposals ---
+
+    let persisted = persistence.load_context(ctx_id).unwrap().unwrap();
+    assert!(
+        persisted.executed_proposals.contains(&proposal_id),
+        "executed_proposals should be persisted after governance action"
+    );
+
+    // --- Phase 3: Drop first manager (simulates process exit) ---
+    drop(manager);
+
+    // --- Phase 4: Create a new manager, restore, and verify replay rejection ---
+
+    let manager2 = ContextManager::with_persistence(
+        Box::new(MockCrypto),
+        Box::new(MockTransport),
+        Box::new(MockEventLog),
+        Box::new(SharedPersistence(Arc::clone(&persistence))),
+        mock_key_resolver(),
+    );
+
+    let handle2 = ContextHandle::new(ctx_id.to_owned(), params);
     handle2.transition_to(&ContextState::Active).await.unwrap();
-    let result = manager.restore_context(ctx_id, &handle2).await;
-    assert!(result.is_err(), "double-restore should fail");
+    manager2.restore_context(ctx_id, &handle2).await.unwrap();
+
+    // Verify membership survived restart.
+    assert!(
+        manager2.is_member(ctx_id, &creator_did.0).await,
+        "creator membership should survive restart"
+    );
+    assert!(
+        manager2.is_member(ctx_id, "did:dht:z6MkBob").await,
+        "bob membership should survive restart"
+    );
+
+    // Attempt to replay the SAME governance proposal after restart.
+    // This must be rejected -- the executed_proposals set should have
+    // been restored from persistence.
+    let replay_result = manager2.execute_governance_action(ctx_id, &proposal).await;
+    assert!(
+        replay_result.is_err(),
+        "replayed governance proposal must be rejected after restart"
+    );
+    let err_msg = format!("{}", replay_result.unwrap_err());
+    assert!(
+        err_msg.contains("already been executed"),
+        "error should indicate replay: {err_msg}"
+    );
 }

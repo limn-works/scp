@@ -31,7 +31,9 @@ use sha2::{Digest, Sha256};
 
 use scp_platform::traits::{KeyCustody, KeyHandle};
 
-use super::capability::CapabilityUri;
+use std::collections::HashSet;
+
+use super::capability::{CapabilityUri, verify_ceiling_compliance};
 use super::nonce::generate_nonce;
 use super::{Attenuation, UcanError, UcanHeader, UcanPayload, UcanToken};
 use crate::identity::SigningKeyId;
@@ -68,6 +70,29 @@ fn reject_self_delegation_without_scope(
         ));
     }
     Ok(())
+}
+
+/// Verifies that attestation capability URIs are within the ceiling.
+///
+/// Parses each attestation's `with` field as a [`CapabilityUri`] and checks
+/// it against the ceiling set. Returns an error if any capability is outside
+/// the ceiling or if any URI is unparseable.
+fn verify_attestation_ceiling_compliance(
+    attenuations: &[Attenuation],
+    ceiling: &HashSet<String>,
+) -> Result<(), UcanError> {
+    let cap_uris: Vec<CapabilityUri> = attenuations
+        .iter()
+        .map(|att| {
+            att.with.parse::<CapabilityUri>().map_err(|e: UcanError| {
+                UcanError::AttenuationViolation(format!(
+                    "invalid capability URI '{}': {e}",
+                    att.with
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    verify_ceiling_compliance(&cap_uris, ceiling)
 }
 
 /// Builds the `fct` (facts) section, merging `scp_key_scope` when present.
@@ -174,6 +199,17 @@ pub struct MintParams<'a> {
     /// If neither is set, the header has no `kid` field, which verifiers
     /// interpret as `#active` (the default human key).
     pub signing_key_id: Option<SigningKeyId>,
+    /// Optional capability ceiling for the context (§5.3, ADR-016 step 8).
+    ///
+    /// When set, the requested capabilities are checked against the ceiling
+    /// **before** the token is signed. Any capability not in the ceiling is
+    /// rejected with [`UcanError::CapabilityOutsideCeiling`].
+    ///
+    /// The ceiling contains `{resource}:{action}` strings (e.g.,
+    /// `"messages:read"`, `"tool_invoke:assistant"`).
+    ///
+    /// `None` means no ceiling enforcement (backward-compatible default).
+    pub ceiling: Option<HashSet<String>>,
 }
 
 /// Returns the current Unix timestamp in seconds.
@@ -224,6 +260,23 @@ pub async fn mint_ucan(
     // Enforce 24-hour maximum expiry.
     if params.lifetime_secs > MAX_EXPIRY_SECS {
         return Err(UcanError::ExpiryTooFar(params.lifetime_secs));
+    }
+
+    // Enforce ceiling compliance before doing any work (§5.3, #339).
+    if let Some(ref ceiling) = params.ceiling {
+        let cap_uris: Vec<CapabilityUri> = params
+            .capabilities
+            .iter()
+            .map(|cap| {
+                let (resource, action) = cap.split_once(':').ok_or_else(|| {
+                    UcanError::MalformedToken(format!(
+                        "capability must be in 'resource:action' format, got: {cap}"
+                    ))
+                })?;
+                Ok(CapabilityUri::new(params.context_id, resource, action))
+            })
+            .collect::<Result<Vec<_>, UcanError>>()?;
+        verify_ceiling_compliance(&cap_uris, ceiling)?;
     }
 
     let now = now_secs()?;
@@ -382,6 +435,15 @@ pub struct DelegateParams<'a> {
     ///
     /// See [`MintParams::signing_key_id`] for full documentation.
     pub signing_key_id: Option<SigningKeyId>,
+    /// Optional capability ceiling for the context (§5.3, ADR-016 step 8).
+    ///
+    /// When set, delegated capabilities are checked against the ceiling
+    /// **after** the attenuation check but **before** the token is signed.
+    /// Any capability not in the ceiling is rejected with
+    /// [`UcanError::CapabilityOutsideCeiling`].
+    ///
+    /// `None` means no ceiling enforcement (backward-compatible default).
+    pub ceiling: Option<HashSet<String>>,
 }
 
 /// Creates a delegated UCAN token from a parent token.
@@ -466,6 +528,11 @@ pub async fn delegate_ucan(
                 child_att.with
             )));
         }
+    }
+
+    // Step 2b: Enforce ceiling compliance on delegated capabilities (#339).
+    if let Some(ref ceiling) = params.ceiling {
+        verify_attestation_ceiling_compliance(params.attenuated_capabilities, ceiling)?;
     }
 
     // Step 3: Enforce 24-hour maximum expiry.
@@ -573,6 +640,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -622,6 +690,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -663,6 +732,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -700,6 +770,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token1 = mint_ucan(&params, &custody).await.unwrap();
@@ -728,6 +799,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let err = mint_ucan(&params, &custody).await.unwrap_err();
@@ -751,6 +823,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         assert!(mint_ucan(&params, &custody).await.is_ok());
@@ -777,6 +850,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -813,6 +887,7 @@ mod tests {
             facts: Some(serde_json::json!({"role": "member"})),
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -842,6 +917,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -879,6 +955,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -907,6 +984,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -933,6 +1011,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token1 = mint_ucan(&params, &custody).await.unwrap();
@@ -964,6 +1043,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -1005,6 +1085,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
         mint_ucan(&params, custody).await.unwrap()
     }
@@ -1043,6 +1124,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
@@ -1098,6 +1180,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
@@ -1140,6 +1223,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
@@ -1196,6 +1280,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
@@ -1238,6 +1323,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
@@ -1276,6 +1362,7 @@ mod tests {
             facts: Some(serde_json::json!({"delegated_by": "bob"})),
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
@@ -1316,6 +1403,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let d1 = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
@@ -1375,6 +1463,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let bob_to_carol = delegate_ucan(&bob_delegate_params, &bob_custody)
@@ -1402,6 +1491,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let carol_to_dave = delegate_ucan(&carol_delegate_params, &carol_custody)
@@ -1452,6 +1542,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let err = delegate_ucan(&delegate_params, &eve_custody)
@@ -1496,6 +1587,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let err = delegate_ucan(&delegate_params, &bob_custody)
@@ -1545,6 +1637,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let err = delegate_ucan(&delegate_params, &bob_custody)
@@ -1588,6 +1681,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let err = delegate_ucan(&delegate_params, &bob_custody)
@@ -1630,6 +1724,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let err = delegate_ucan(&delegate_params, &bob_custody)
@@ -1672,6 +1767,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let err = delegate_ucan(&delegate_params, &bob_custody)
@@ -1712,6 +1808,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
@@ -1743,6 +1840,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
         let mut root_token = mint_ucan(&params, &alice_custody).await.unwrap();
         // Overwrite att to use the explicitly wildcard form.
@@ -1764,6 +1862,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody).await.unwrap();
@@ -1794,6 +1893,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -1837,6 +1937,7 @@ mod tests {
             facts: None,
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -1878,6 +1979,7 @@ mod tests {
             facts: None,
             key_scope: Some("#active".to_owned()),
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -1919,6 +2021,7 @@ mod tests {
             facts: None,
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -1956,6 +2059,7 @@ mod tests {
             facts: None,
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -1993,6 +2097,7 @@ mod tests {
             facts: None,
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -2029,6 +2134,7 @@ mod tests {
             facts: None,
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -2075,6 +2181,7 @@ mod tests {
             facts: Some(serde_json::json!({"role": "admin", "note": "test"})),
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -2110,6 +2217,7 @@ mod tests {
             facts: Some(serde_json::json!({"role": "member"})),
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -2144,6 +2252,7 @@ mod tests {
             facts: Some(serde_json::json!({"scp_key_scope": "#wrong"})),
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None,
+            ceiling: None,
         };
 
         let err = mint_ucan(&params, &custody).await.unwrap_err();
@@ -2171,6 +2280,7 @@ mod tests {
             facts: Some(serde_json::json!({"scp_key_scope": "#agent"})),
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -2198,6 +2308,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let err = mint_ucan(&params, &custody).await.unwrap_err();
@@ -2224,6 +2335,7 @@ mod tests {
             facts: None,
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -2247,6 +2359,7 @@ mod tests {
             facts: None,
             key_scope: Some("agent".to_owned()),
             signing_key_id: None,
+            ceiling: None,
         };
 
         let err = mint_ucan(&params, &custody).await.unwrap_err();
@@ -2276,6 +2389,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody,
         )
@@ -2293,6 +2407,7 @@ mod tests {
                 facts: None,
                 key_scope: Some("no-hash".to_owned()),
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_b,
         )
@@ -2323,6 +2438,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody,
         )
@@ -2340,6 +2456,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_b,
         )
@@ -2370,6 +2487,7 @@ mod tests {
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody,
         )
@@ -2387,6 +2505,7 @@ mod tests {
                 facts: Some(serde_json::json!({"scp_key_scope": "#wrong"})),
                 key_scope: Some("#agent".to_owned()),
                 signing_key_id: None,
+                ceiling: None,
             },
             &custody_b,
         )
@@ -2419,6 +2538,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: Some(SigningKeyId::Agent),
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -2448,6 +2568,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: Some(SigningKeyId::Active),
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -2480,6 +2601,7 @@ mod tests {
             facts: None,
             key_scope: Some("#active".to_owned()),
             signing_key_id: Some(SigningKeyId::Agent),
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -2517,6 +2639,7 @@ mod tests {
             facts: None,
             key_scope: None,
             signing_key_id: None,
+            ceiling: None,
         };
 
         let token = mint_ucan(&params, &custody).await.unwrap();
@@ -2525,6 +2648,202 @@ mod tests {
         assert_eq!(
             token.header.kid, None,
             "kid must be None when neither signing_key_id nor key_scope is set"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Ceiling enforcement — mint (#339)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn mint_ucan_rejects_capability_outside_ceiling() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["tool_invoke:assistant".to_owned()];
+        let ceiling: HashSet<String> = ["messages:read".to_owned(), "messages:write".to_owned()]
+            .into_iter()
+            .collect();
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-ceiling",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(ceiling),
+        };
+
+        let err = mint_ucan(&params, &custody).await.unwrap_err();
+        assert!(
+            matches!(err, UcanError::CapabilityOutsideCeiling(_)),
+            "expected CapabilityOutsideCeiling, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_ucan_succeeds_within_ceiling() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["tool_invoke:assistant".to_owned()];
+        let ceiling: HashSet<String> = [
+            "messages:read".to_owned(),
+            "messages:write".to_owned(),
+            "tool_invoke:assistant".to_owned(),
+        ]
+        .into_iter()
+        .collect();
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-ceiling",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(ceiling),
+        };
+
+        assert!(
+            mint_ucan(&params, &custody).await.is_ok(),
+            "minting with capabilities within the ceiling must succeed"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_ucan_no_ceiling_allows_any_capability() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec![
+            "tool_invoke:assistant".to_owned(),
+            "messages:write".to_owned(),
+        ];
+
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-no-ceiling",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+        };
+
+        assert!(
+            mint_ucan(&params, &custody).await.is_ok(),
+            "minting with ceiling: None must succeed regardless of capabilities"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Ceiling enforcement — delegate (#339)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn delegate_ucan_rejects_capability_outside_ceiling() {
+        let (alice_custody, alice_key, alice_did) = setup_custody().await;
+        let (bob_custody, bob_key, bob_did) = setup_custody().await;
+
+        // Root token grants messages:read + tool_invoke:assistant.
+        let caps = vec![
+            "messages:read".to_owned(),
+            "tool_invoke:assistant".to_owned(),
+        ];
+        let root_token = mint_root_token(
+            &alice_custody,
+            &alice_key,
+            &alice_did,
+            &bob_did,
+            "ctx-1",
+            &caps,
+        )
+        .await;
+
+        // Ceiling only allows messages:read — tool_invoke:assistant is outside.
+        let ceiling: HashSet<String> = std::iter::once("messages:read".to_owned()).collect();
+
+        let attenuated = vec![Attenuation {
+            with: "scp:ctx:ctx-1/tool_invoke:assistant".to_owned(),
+            can: "assistant".to_owned(),
+        }];
+
+        let delegate_params = DelegateParams {
+            parent_token: &root_token,
+            delegator_did: &bob_did,
+            delegator_key: &bob_key,
+            delegatee_did: "did:dht:z6MkCarol",
+            attenuated_capabilities: &attenuated,
+            lifetime_secs: 1800,
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(ceiling),
+        };
+
+        let err = delegate_ucan(&delegate_params, &bob_custody)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, UcanError::CapabilityOutsideCeiling(_)),
+            "expected CapabilityOutsideCeiling, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_ucan_succeeds_narrowing_within_ceiling() {
+        let (alice_custody, alice_key, alice_did) = setup_custody().await;
+        let (bob_custody, bob_key, bob_did) = setup_custody().await;
+
+        let caps = vec!["messages:read".to_owned(), "messages:write".to_owned()];
+        let root_token = mint_root_token(
+            &alice_custody,
+            &alice_key,
+            &alice_did,
+            &bob_did,
+            "ctx-1",
+            &caps,
+        )
+        .await;
+
+        // Ceiling allows both capabilities.
+        let ceiling: HashSet<String> = ["messages:read".to_owned(), "messages:write".to_owned()]
+            .into_iter()
+            .collect();
+
+        // Delegate only messages:read — narrowing within ceiling.
+        let attenuated = vec![Attenuation {
+            with: "scp:ctx:ctx-1/messages:read".to_owned(),
+            can: "read".to_owned(),
+        }];
+
+        let delegate_params = DelegateParams {
+            parent_token: &root_token,
+            delegator_did: &bob_did,
+            delegator_key: &bob_key,
+            delegatee_did: "did:dht:z6MkCarol",
+            attenuated_capabilities: &attenuated,
+            lifetime_secs: 1800,
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(ceiling),
+        };
+
+        assert!(
+            delegate_ucan(&delegate_params, &bob_custody).await.is_ok(),
+            "delegation narrowing within ceiling must succeed"
         );
     }
 }

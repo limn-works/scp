@@ -32,17 +32,29 @@ use crate::profile::TransportProfile;
 // TransportConfig
 // ---------------------------------------------------------------------------
 
+/// Default maximum publish jitter in milliseconds for cross-relay fanout
+/// decorrelation (§9.10.10, §9.10.11).
+///
+/// When publishing to multiple relays, a random delay drawn from
+/// `[0, max_publish_jitter_ms)` is applied independently to each relay
+/// submission after the first. This prevents an observer monitoring multiple
+/// relays from correlating that the same message was published simultaneously.
+///
+/// Set to 0 to disable jitter.
+const DEFAULT_MAX_PUBLISH_JITTER_MS: u64 = 200;
+
 /// Default deduplication cache capacity (number of entries).
 ///
 /// See ADR-012 acceptance criterion 3 for the rationale behind 10,000 entries.
 const DEFAULT_DEDUP_CACHE_SIZE: usize = 10_000;
 
-/// Default deduplication cache entry TTL.
+/// Default deduplication cache entry TTL (24 hours per spec §9.8.2(b)).
 ///
-/// Entries older than this duration are evicted even if the capacity has not
-/// been reached. This prevents stale entries from consuming memory in
-/// low-throughput scenarios.
-const DEFAULT_DEDUP_CACHE_TTL: Duration = Duration::from_secs(3600);
+/// The spec requires "10,000 envelopes or 24 hours, whichever is larger" for
+/// the deduplication sliding window. Entries older than this duration are
+/// evicted even if the capacity has not been reached. This prevents stale
+/// entries from consuming memory in low-throughput scenarios.
+const DEFAULT_DEDUP_CACHE_TTL: Duration = Duration::from_secs(86_400);
 
 /// Transport layer configuration.
 ///
@@ -62,7 +74,8 @@ const DEFAULT_DEDUP_CACHE_TTL: Duration = Duration::from_secs(3600);
 /// assert!(config.relay_urls.is_empty());
 /// assert!(config.bootstrap_domain.is_none());
 /// assert_eq!(config.dedup_cache_size, 10_000);
-/// assert_eq!(config.dedup_cache_ttl, Duration::from_secs(3600));
+/// assert_eq!(config.dedup_cache_ttl, Duration::from_secs(86_400));
+/// assert_eq!(config.max_publish_jitter_ms, 200);
 /// // Profile is platform-inferred by default.
 /// let _ = config.profile;
 /// ```
@@ -105,11 +118,29 @@ pub struct TransportConfig {
     /// Time-to-live for deduplication cache entries.
     ///
     /// Entries older than this duration are evicted even if the cache has not
-    /// reached capacity. Defaults to 1 hour. This prevents stale entries from
-    /// consuming memory in low-throughput scenarios and ensures that a slow
-    /// relay delivering a blob after the LRU entry was evicted does not bypass
-    /// deduplication.
+    /// reached capacity. Defaults to 24 hours per spec §9.8.2(b). This
+    /// prevents stale entries from consuming memory in low-throughput scenarios
+    /// and ensures that a slow relay delivering a blob after the LRU entry was
+    /// evicted does not bypass deduplication.
     pub dedup_cache_ttl: Duration,
+
+    /// Maximum publish jitter in milliseconds for cross-relay fanout
+    /// decorrelation (§9.10.10, §9.10.11).
+    ///
+    /// When publishing to N relays (N > 1), the first relay receives the
+    /// message immediately (zero delay). Each subsequent relay submission is
+    /// delayed by a random duration drawn independently from the uniform
+    /// distribution `[0, max_publish_jitter_ms)`. This prevents an observer
+    /// watching multiple relays from using timing correlation to link
+    /// simultaneous publishes to the same sender.
+    ///
+    /// Defaults to 200ms. Set to 0 to disable jitter (all relays receive
+    /// the message without delay).
+    ///
+    /// Complements relay-side delivery jitter (§9.10.10) which decorrelates
+    /// the relay-to-subscriber path. This field decorrelates the
+    /// client-to-relay path across multiple relays.
+    pub max_publish_jitter_ms: u64,
 }
 
 impl Default for TransportConfig {
@@ -120,6 +151,7 @@ impl Default for TransportConfig {
             bootstrap_domain: None,
             dedup_cache_size: DEFAULT_DEDUP_CACHE_SIZE,
             dedup_cache_ttl: DEFAULT_DEDUP_CACHE_TTL,
+            max_publish_jitter_ms: DEFAULT_MAX_PUBLISH_JITTER_MS,
         }
     }
 }
@@ -348,7 +380,8 @@ mod tests {
         assert!(config.relay_urls.is_empty());
         assert!(config.bootstrap_domain.is_none());
         assert_eq!(config.dedup_cache_size, 10_000);
-        assert_eq!(config.dedup_cache_ttl, Duration::from_secs(3600));
+        assert_eq!(config.dedup_cache_ttl, Duration::from_secs(86_400));
+        assert_eq!(config.max_publish_jitter_ms, 200);
     }
 
     #[test]

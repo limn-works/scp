@@ -1,9 +1,18 @@
 //! Global runtime registry mapping context IDs to live `scp-core` objects.
 //!
 //! The FFI bridge functions accept `context_id: &str` parameters but need
-//! access to real `scp-core` runtime objects (tool registries, event logs,
-//! UCAN state). This module provides a global registry that maps context IDs
-//! to their associated runtime state.
+//! access to both the shared [`ContextManager`] (for lifecycle, membership,
+//! governance, and messaging operations) and per-context FFI-specific state
+//! (tool registries, event logs, UCAN state, message channels).
+//!
+//! # Architecture (post-#386 rewrite)
+//!
+//! Context lifecycle is delegated to a shared [`ContextManager`] which holds
+//! the canonical membership, role, governance, broadcast, and TTL state.
+//! Per-context FFI-specific state (tool registries, event logs, UCAN
+//! revocation/nonce tracking, tool handlers, message channels) lives in
+//! [`FfiBridgeState`] — a thin struct that does NOT duplicate any
+//! `ContextManager` state.
 //!
 //! # Safety: Single-Tenant Only (RED-017)
 //!
@@ -19,16 +28,18 @@
 //! # Pattern
 //!
 //! Uses [`DashMap`] for lock-free concurrent reads. Most bridge operations
-//! read context state (`with_context`); writes (`register_context`,
-//! `remove_context`) are infrequent. `DashMap` uses internal sharding to
-//! eliminate reader contention — critical for free-threaded Python (PEP 703)
-//! and high-throughput async workloads.
+//! read per-context state (`with_ffi_state`); writes are infrequent. `DashMap`
+//! uses internal sharding to eliminate reader contention — critical for
+//! free-threaded Python (PEP 703) and high-throughput async workloads.
 //!
 //! # Lifecycle
 //!
-//! 1. `py_context_create` calls [`register_context`] to create runtime objects.
-//! 2. Bridge functions call [`with_context`] to access runtime objects.
-//! 3. `py_context_close` calls [`remove_context`] to clean up.
+//! 1. `py_context_create` delegates to `ContextManager::create_context`, then
+//!    registers FFI-specific state via [`register_ffi_state`].
+//! 2. Bridge functions call [`with_ffi_state`] for FFI-specific state and
+//!    [`context_manager`] for the shared `ContextManager`.
+//! 3. `py_context_close` delegates to `ContextManager::close_context`, then
+//!    removes FFI state via [`remove_ffi_state`].
 //!
 //! # Context Discovery (SCP-213)
 //!
@@ -37,32 +48,31 @@
 //! Context discovery is therefore **client-side**: the [`KnownContext`]
 //! registry tracks context-to-routing-id-to-relay mappings locally.
 //!
-//! When `py_mcp_load_contexts` runs, it:
-//! 1. Reads locally registered contexts from the [`ContextRuntime`] registry
-//! 2. Reads the [`KnownContext`] registry for relay routing metadata
-//! 3. If a relay connection is active, probes known routing IDs via QUERY
-//! 4. Falls back to local-only when the relay is unreachable
-//!
 //! # Error Propagation
 //!
 //! All public functions return `Result<T, ScpPyError>`, propagating typed
 //! errors directly to the Python exception hierarchy without string
 //! roundtripping.
-//!
-//! See SCP-163 for the wiring story.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use dashmap::DashMap;
+use scp_core::context::builder::{
+    ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
+};
+use scp_core::context::manager::{ContextManager, ContextPersistence};
+use scp_core::context::providers::ProtocolStorePersistence;
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
 use scp_core::context::tools::ToolRegistry;
+use scp_core::context::{ContextError, ContextParams};
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
+use scp_core::store::ProtocolStore;
 use scp_event_log::EventLog;
 use scp_identity::cache::SystemClock;
 use scp_identity::{DidDocument, ScpIdentity};
-use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+use scp_platform::testing::InMemoryStorage;
 use scp_transport::native::adapter::NativeRelayAdapter;
 use tokio::sync::mpsc;
 
@@ -71,7 +81,7 @@ use crate::error::ScpPyError;
 
 /// A sync tool handler function that takes JSON input and returns JSON output.
 ///
-/// Stored in the runtime registry when Python callers register tool handlers
+/// Stored in the FFI bridge state when Python callers register tool handlers
 /// via [`register_tool_handler`]. The FFI bridge dispatches tool invocations
 /// through these handlers instead of echoing validated input.
 ///
@@ -79,198 +89,338 @@ use crate::error::ScpPyError;
 pub type ToolHandler =
     Arc<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync>;
 
-/// Global registry of per-context runtime state.
-///
-/// # Safety: Single-Tenant Only
-///
-/// This registry is process-global. In multi-tenant deployments (e.g., a web
-/// server serving multiple SCP users), ALL tenants share this registry. Context
-/// IDs and identity DIDs from one tenant are accessible to another. This is a
-/// known architectural limitation tracked for resolution before production
-/// multi-tenant deployment.
-///
-/// See RED-017 in the security review. Follow-on story: SCP-228.
-static CONTEXT_REGISTRY: OnceLock<DashMap<String, ContextRuntime>> = OnceLock::new();
-
-/// Global registry of known context-to-relay mappings for discovery (SCP-213).
-///
-/// Tracks contexts that have been created/joined locally, along with their
-/// routing IDs and relay URLs. This allows `py_mcp_load_contexts` to probe
-/// relays for context activity even across process restarts (when combined
-/// with persistence, a future story).
-///
-/// # Safety: Single-Tenant Only
-///
-/// This registry is process-global. In multi-tenant deployments (e.g., a web
-/// server serving multiple SCP users), ALL tenants share this registry. Context
-/// IDs and identity DIDs from one tenant are accessible to another. This is a
-/// known architectural limitation tracked for resolution before production
-/// multi-tenant deployment.
-///
-/// See RED-017 in the security review. Follow-on story: SCP-228.
-static KNOWN_CONTEXTS: OnceLock<DashMap<String, KnownContext>> = OnceLock::new();
-
-/// Global relay connection for context discovery probing.
-///
-/// Set by [`set_relay_connection`] when `py_transport_connect` succeeds.
-/// Read by `py_mcp_load_contexts` to probe routing IDs on the relay.
-/// Uses `RwLock` for infrequent writes (connect) and concurrent reads (probe).
-///
-/// # Safety: Single-Tenant Only
-///
-/// This registry is process-global. In multi-tenant deployments (e.g., a web
-/// server serving multiple SCP users), ALL tenants share this registry. Context
-/// IDs and identity DIDs from one tenant are accessible to another. This is a
-/// known architectural limitation tracked for resolution before production
-/// multi-tenant deployment.
-///
-/// See RED-017 in the security review. Follow-on story: SCP-228.
-static RELAY_CONNECTION: OnceLock<RwLock<Option<Arc<NativeRelayAdapter>>>> = OnceLock::new();
-
-/// Global identity registry mapping DID strings to retained identity state.
-///
-/// Stores the [`ScpIdentity`] (with opaque [`KeyHandle`]s), the
-/// [`Arc<InMemoryKeyCustody>`] that owns the key material, and the
-/// [`DidDocument`]. This allows bridge functions to perform crypto
-/// operations (signing, pseudonym derivation, key rotation) without private
-/// key material crossing the FFI boundary (ADR-006).
-///
-/// Uses [`DashMap`] for lock-free concurrent access matching the context
-/// registry pattern.
-static IDENTITY_REGISTRY: OnceLock<DashMap<String, IdentityEntry>> = OnceLock::new();
-
-/// Returns a reference to the global context registry.
-fn registry() -> &'static DashMap<String, ContextRuntime> {
-    CONTEXT_REGISTRY.get_or_init(DashMap::new)
-}
-
-/// Returns a reference to the global known-contexts registry.
-fn known_contexts_registry() -> &'static DashMap<String, KnownContext> {
-    KNOWN_CONTEXTS.get_or_init(DashMap::new)
-}
-
-/// Returns a reference to the global relay connection state.
-fn relay_state() -> &'static RwLock<Option<Arc<NativeRelayAdapter>>> {
-    RELAY_CONNECTION.get_or_init(|| RwLock::new(None))
-}
-
-/// Buffer capacity for the receive channel (SCP-216, sketch.md §receive).
-///
-/// When the buffer is full, the oldest unconsumed event is dropped and a
-/// `BufferOverflow` warning is injected into the stream.
-pub const RECEIVE_BUFFER_CAPACITY: usize = 1000;
-
-/// Returns a reference to the global identity registry.
-fn identity_registry() -> &'static DashMap<String, IdentityEntry> {
-    IDENTITY_REGISTRY.get_or_init(DashMap::new)
-}
-
 // ---------------------------------------------------------------------------
-// Identity registry (SCP-214: KeyCustody wiring)
+// ContextManager (shared, process-global)
 // ---------------------------------------------------------------------------
 
-/// Retained identity state for a single DID.
+/// Global shared [`ContextManager`] that owns all context lifecycle state.
 ///
-/// Stores the [`ScpIdentity`] (opaque key handles), the [`InMemoryKeyCustody`]
-/// that owns the key material, and the [`DidDocument`]. The custody provider
-/// is behind an `Arc` so it can be shared with context-scoped operations
-/// (pseudonym derivation, signing, UCAN minting) without moving or cloning
-/// the key material.
+/// Initialized once via [`init_context_manager`]. All context lifecycle
+/// operations (create, join, leave, close, send, governance, broadcast, TTL)
+/// delegate to this instance.
 ///
-/// See ADR-006 and SCP-214 criterion 3.
-pub struct IdentityEntry {
-    /// The scp-core identity handle (DID string, key handles, pre-rotation).
-    pub identity: ScpIdentity,
-    /// The key custody provider that manages the actual key material.
-    pub custody: Arc<InMemoryKeyCustody>,
-    /// The DID document for this identity.
-    pub document: DidDocument,
-}
+/// # Safety: Single-Tenant Only
+///
+/// See module-level documentation.
+static CONTEXT_MANAGER: OnceLock<Arc<ContextManager>> = OnceLock::new();
 
-/// Registers an identity in the global identity registry.
-///
-/// Called by `py_identity_create` after successfully creating an identity.
-/// Subsequent bridge functions (UCAN minting, pseudonym derivation, key
-/// rotation) look up the identity by DID to access the retained custody
-/// provider and key handles.
-///
-/// Overwrites any existing entry for the same DID (idempotent).
-pub fn register_identity(did: &str, entry: IdentityEntry) {
-    identity_registry().insert(did.to_owned(), entry);
-}
-
-/// Executes a closure with a reference to an identity's retained state.
-///
-/// Looks up the identity by DID in the global registry and calls `f` with
-/// a reference to the [`IdentityEntry`]. Uses `DashMap::get` for fine-grained
-/// per-key locking.
+/// Returns a reference to the shared [`ContextManager`].
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError::IdentityError` if the DID is not found.
-pub fn with_identity<T, F>(did: &str, f: F) -> Result<T, ScpPyError>
-where
-    F: FnOnce(&IdentityEntry) -> Result<T, ScpPyError>,
-{
-    let entry = identity_registry().get(did).ok_or_else(|| {
-        ScpPyError::IdentityError(format!(
-            "identity '{did}' not found in registry \
-             -- was it created with py_identity_create?"
-        ))
-    })?;
-
-    f(entry.value())
+/// Returns `ScpPyError::ContextError` if the context manager has not been
+/// initialized via [`init_context_manager`].
+pub fn context_manager() -> Result<&'static Arc<ContextManager>, ScpPyError> {
+    CONTEXT_MANAGER.get().ok_or_else(|| {
+        ScpPyError::context(
+            "ContextManager not initialized — call py_context_create or \
+             init_context_manager first"
+                .to_owned(),
+        )
+    })
 }
 
-/// Executes a closure with mutable access to an identity's retained state.
+/// Initializes the global [`ContextManager`] with mock providers.
 ///
-/// # Errors
+/// Uses no-op mock providers suitable for the current bridge layer where
+/// MLS, transport, and event log are not yet fully wired through the
+/// `ContextManager` path. The bridge-level `EventLog`, `ToolRegistry`, etc.
+/// remain in [`FfiBridgeState`] for subsystem operations (tools.rs, ucan.rs,
+/// `event_log.rs`).
 ///
-/// Returns `ScpPyError::IdentityError` if the DID is not found.
-pub fn with_identity_mut<T, F>(did: &str, f: F) -> Result<T, ScpPyError>
-where
-    F: FnOnce(&mut IdentityEntry) -> Result<T, ScpPyError>,
-{
-    let mut entry = identity_registry().get_mut(did).ok_or_else(|| {
-        ScpPyError::IdentityError(format!(
-            "identity '{did}' not found in registry \
-             -- was it created with py_identity_create?"
-        ))
-    })?;
-
-    f(entry.value_mut())
+/// When the global storage provider ([`STORAGE_PROVIDER`]) has been
+/// initialized via [`init_storage`], a [`ProtocolStorePersistence`] is
+/// constructed from it and injected into the `ContextManager`. This enables
+/// context state persistence across process restarts without requiring
+/// callers to manually wire persistence. See issue #329.
+///
+/// This function is idempotent -- subsequent calls are no-ops.
+pub fn init_context_manager() {
+    let _ = CONTEXT_MANAGER.get_or_init(|| {
+        let persistence = build_persistence_provider();
+        build_context_manager(
+            Box::new(NoOpCryptoProvider),
+            Box::new(NoOpTransportProvider),
+            Box::new(NoOpEventLogProvider),
+            persistence,
+        )
+    });
 }
 
-/// Returns `true` if the identity registry contains an entry for the given DID.
+/// Initializes the global [`ContextManager`] with custom providers.
 ///
-/// Used by `py_identity_load` to check whether a loaded identity has live
-/// crypto state before returning it. Without registry presence, a loaded
-/// identity would be a dangling handle (SCP-IDENT-1010).
+/// Allows injecting real or custom provider implementations. If the manager
+/// is already initialized, this is a no-op (first call wins).
+///
+/// When `persistence` is `None` but the global storage provider has been
+/// initialized, a [`ProtocolStorePersistence`] is automatically constructed
+/// from it. Pass `Some(...)` to override with a custom implementation.
+pub fn init_context_manager_with(
+    crypto: Box<dyn ContextCryptoProvider>,
+    transport: Box<dyn ContextTransportProvider>,
+    event_log: Box<dyn ContextEventLogProvider>,
+    persistence: Option<Box<dyn ContextPersistence>>,
+) {
+    let _ = CONTEXT_MANAGER.get_or_init(|| {
+        let persistence = persistence.or_else(build_persistence_provider);
+        build_context_manager(crypto, transport, event_log, persistence)
+    });
+}
+
+/// Constructs a [`ProtocolStorePersistence`] from the global storage provider,
+/// if it has been initialized.
+///
+/// Returns `None` if [`init_storage`] has not been called yet. This is
+/// expected during early initialization -- the `ContextManager` will operate
+/// without persistence until the storage provider is available.
+///
+/// Uses `Arc<InMemoryStorage>` as the storage backend for
+/// `ProtocolStore`, sharing the same underlying storage instance as the
+/// identity layer. This ensures that identity and context data coexist in
+/// the same store, matching the `ApplicationNode` pattern in `scp-node`.
+fn build_persistence_provider() -> Option<Box<dyn ContextPersistence>> {
+    STORAGE_PROVIDER.get().map(|storage| {
+        let protocol_store = Arc::new(ProtocolStore::new(Arc::clone(storage)));
+        Box::new(ProtocolStorePersistence::new(protocol_store)) as Box<dyn ContextPersistence>
+    })
+}
+
+/// Constructs a `ContextManager` with or without persistence.
+fn build_context_manager(
+    crypto: Box<dyn ContextCryptoProvider>,
+    transport: Box<dyn ContextTransportProvider>,
+    event_log: Box<dyn ContextEventLogProvider>,
+    persistence: Option<Box<dyn ContextPersistence>>,
+) -> Arc<ContextManager> {
+    match persistence {
+        Some(p) => Arc::new(ContextManager::with_persistence(
+            crypto,
+            transport,
+            event_log,
+            p,
+            noop_key_resolver(),
+        )),
+        None => Arc::new(ContextManager::new(
+            crypto,
+            transport,
+            event_log,
+            noop_key_resolver(),
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DID resolver (global, production)
+// ---------------------------------------------------------------------------
+
+/// Global production DID resolver that delegates to `scp_identity::resolver::DidResolver`
+/// for full DID document validation (BEP44 signature verification, self-certification,
+/// sequence number comparison, caching, healing).
+///
+/// Initialized by [`init_did_resolver`] when the identity layer is first set up.
+/// Used by UCAN validation and attestation verification when available; falls back
+/// to [`scp_ffi_common::BridgeDidResolver`] (string-only) when `None`.
+///
+/// See #311 for the unification design.
+static DID_RESOLVER: OnceLock<Arc<scp_ffi_common::IdentityBackedDidResolver>> = OnceLock::new();
+
+/// Returns the global production DID resolver, if initialized.
 #[must_use]
-pub fn identity_registry_contains(did: &str) -> bool {
-    identity_registry().contains_key(did)
+pub fn did_resolver() -> Option<&'static Arc<scp_ffi_common::IdentityBackedDidResolver>> {
+    DID_RESOLVER.get()
 }
 
-/// Removes an identity from the global registry.
+/// Initializes the global production DID resolver.
 ///
-/// Called when an identity is migrated to a new DID. The old entry is
-/// removed and the new entry is registered under the new DID.
-pub fn remove_identity(did: &str) {
-    identity_registry().remove(did);
+/// Wraps any `scp_identity::resolver::DidResolver` implementation (typically
+/// `DualLayerResolver`) in an [`IdentityBackedDidResolver`] and stores it
+/// as the process-global resolver for UCAN validation and attestation
+/// verification.
+///
+/// Called once during identity system setup. Subsequent calls are no-ops
+/// (the resolver is initialized via `OnceLock`).
+pub fn init_did_resolver<R>(resolver: Arc<R>, handle: tokio::runtime::Handle)
+where
+    R: scp_identity::resolver::DidResolver + 'static,
+{
+    let _ = DID_RESOLVER.set(Arc::new(scp_ffi_common::IdentityBackedDidResolver::new(
+        resolver, handle,
+    )));
 }
 
-/// Per-context runtime state: the live objects needed by bridge functions.
+// ---------------------------------------------------------------------------
+// Key resolver helper
+// ---------------------------------------------------------------------------
+
+/// Returns a no-op key resolver for bridge-layer `ContextManager` initialization.
 ///
-/// Each context gets its own tool registry, event log, role state, UCAN
-/// revocation list, nonce tracker, and capability ceiling string set. These
-/// are created when `py_context_create` is called and destroyed when
-/// `py_context_close` is called.
-pub struct ContextRuntime {
+/// Governance vote signature verification is not yet wired at the FFI layer —
+/// the no-op resolver returns `None` for all DIDs, which causes vote
+/// verification to be skipped (permissive mode).
+fn noop_key_resolver() -> scp_core::context::governance::KeyResolver {
+    Arc::new(|_: &scp_identity::DID| -> Option<ed25519_dalek::VerifyingKey> { None })
+}
+
+// ---------------------------------------------------------------------------
+// No-op provider implementations for ContextManager initialization
+// ---------------------------------------------------------------------------
+
+/// No-op crypto provider for bridge-layer `ContextManager` initialization.
+///
+/// All operations succeed without performing real cryptographic work. The
+/// bridge layer performs its own crypto operations (inner envelope signing
+/// via `KeyCustody`, MLS group operations via future wiring). The
+/// `ContextManager`'s crypto provider is used for the two-phase context
+/// creation flow and membership operations, which currently succeed as
+/// no-ops at the FFI bridge level.
+struct NoOpCryptoProvider;
+
+impl ContextCryptoProvider for NoOpCryptoProvider {
+    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    fn create_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    fn generate_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    fn init_broadcast_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    fn destroy_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    fn destroy_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    fn validate_key_package(
+        &self,
+        _owner_did: &str,
+        _key_package_bytes: Option<&[u8]>,
+    ) -> Result<(), ContextError> {
+        Ok(())
+    }
+    fn add_member(
+        &self,
+        _context_id: &[u8; 32],
+        _member_did: &str,
+        _key_package_bytes: Option<&[u8]>,
+    ) -> Result<(), ContextError> {
+        Ok(())
+    }
+    fn remove_member(&self, _context_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
+        Ok(())
+    }
+    fn distribute_sender_key(
+        &self,
+        _context_id: &[u8; 32],
+        _member_did: &str,
+    ) -> Result<(), ContextError> {
+        Ok(())
+    }
+    fn remove_member_sender_key(
+        &self,
+        _context_id: &[u8; 32],
+        _member_did: &str,
+    ) -> Result<(), ContextError> {
+        Ok(())
+    }
+    fn encrypt_message(
+        &self,
+        _context_id: &[u8; 32],
+        _sender_did: &str,
+        payload: &[u8],
+        _epoch: u64,
+        _sequence: u64,
+    ) -> Result<Vec<u8>, ContextError> {
+        // Return payload as-is (no real encryption at bridge layer).
+        Ok(payload.to_vec())
+    }
+}
+
+/// No-op transport provider for bridge-layer `ContextManager` initialization.
+struct NoOpTransportProvider;
+
+impl ContextTransportProvider for NoOpTransportProvider {
+    fn is_connected(&self) -> bool {
+        true
+    }
+    fn publish_context(
+        &self,
+        _context_id: &[u8; 32],
+        _params: &ContextParams,
+    ) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    fn send_message(
+        &self,
+        _context_id: &[u8; 32],
+        _encrypted_payload: &[u8],
+    ) -> Result<(), ContextError> {
+        Ok(())
+    }
+}
+
+/// No-op event log provider for bridge-layer `ContextManager` initialization.
+struct NoOpEventLogProvider;
+
+impl ContextEventLogProvider for NoOpEventLogProvider {
+    fn init_event_log(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    fn append_event(
+        &self,
+        _context_id: &[u8; 32],
+        _event: &str,
+    ) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+    fn destroy_event_log(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FfiBridgeState -- per-context FFI-specific state
+// ---------------------------------------------------------------------------
+
+/// Global registry of per-context FFI-specific state.
+///
+/// Stores state that is NOT managed by [`ContextManager`]: tool registries,
+/// event logs, UCAN revocation/nonce tracking, tool handlers, and message
+/// channels. Context lifecycle state (membership, roles, governance, broadcast,
+/// TTL) lives in the `ContextManager`.
+///
+/// # Safety: Single-Tenant Only
+///
+/// This registry is process-global. See module-level documentation.
+static FFI_BRIDGE_STATE: OnceLock<DashMap<String, FfiBridgeState>> = OnceLock::new();
+
+/// Returns a reference to the global FFI bridge state registry.
+fn ffi_state_registry() -> &'static DashMap<String, FfiBridgeState> {
+    FFI_BRIDGE_STATE.get_or_init(DashMap::new)
+}
+
+/// Per-context FFI-specific state that does NOT duplicate [`ContextManager`].
+///
+/// Contains subsystem state used by `tools.rs`, `ucan.rs`, `event_log.rs`,
+/// and `mcp.rs`, plus FFI-specific message channel and tool handler state.
+pub struct FfiBridgeState {
     /// Tool registry for this context.
     pub tool_registry: ToolRegistry,
     /// Event log (Merkle tree) for this context.
     pub event_log: EventLog,
     /// Role state tracking member capabilities.
+    ///
+    /// Also maintained by `ContextManager` for lifecycle operations.
+    /// This copy is used by UCAN validation (`ucan.rs`) and tool capability
+    /// checking (`tools.rs`, `mcp.rs`) which access state via `with_ffi_state`.
+    /// Both copies are kept in sync: `register_ffi_state` initializes from
+    /// the same parameters, and `py_context_join` updates both.
     pub role_state: ContextRoleState,
     /// UCAN revocation list for this context.
     pub revocation_list: RevocationList,
@@ -307,11 +457,20 @@ pub struct ContextRuntime {
     /// Uses `tokio::sync::Mutex` so the lock can be held across `.await`
     /// points in `__anext__`.
     pub message_rx: Option<Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>>,
+    /// Session store for stateful tool sessions (spec section 6.2.1).
+    ///
+    /// Stores active tool sessions keyed by session ID. Sessions are created
+    /// via `py_tool_session_create` and cleaned up on context close.
+    pub session_store: scp_core::context::tools::SessionStore,
 }
 
-// default_ceiling() imported from scp_core::context::roles.
+/// Buffer capacity for the receive channel (SCP-216, sketch.md §receive).
+///
+/// When the buffer is full, the oldest unconsumed event is dropped and a
+/// `BufferOverflow` warning is injected into the stream.
+pub const RECEIVE_BUFFER_CAPACITY: usize = 1000;
 
-/// Registers a new context in the global runtime registry.
+/// Registers FFI-specific state for a new context.
 ///
 /// Creates a [`ToolRegistry`], [`EventLog`], [`ContextRoleState`], and
 /// [`RevocationList`] for the context. The creator DID is assigned admin
@@ -321,15 +480,15 @@ pub struct ContextRuntime {
 ///
 /// Returns `ScpPyError::ContextError` if the context ID is already registered
 /// or if role state creation fails.
-pub fn register_context(context_id: &str, creator_did: &str) -> Result<(), ScpPyError> {
+pub fn register_ffi_state(context_id: &str, creator_did: &str) -> Result<(), ScpPyError> {
     use dashmap::mapref::entry::Entry;
 
-    let map = registry();
+    let map = ffi_state_registry();
 
     match map.entry(context_id.to_owned()) {
         Entry::Occupied(_) => {
-            return Err(ScpPyError::ContextError(format!(
-                "context '{context_id}' is already registered"
+            return Err(ScpPyError::context(format!(
+                "context '{context_id}' FFI state is already registered"
             )));
         }
         Entry::Vacant(vacant) => {
@@ -342,13 +501,11 @@ pub fn register_context(context_id: &str, creator_did: &str) -> Result<(), ScpPy
                 .map(std::string::ToString::to_string)
                 .collect::<HashSet<String>>();
             let role_state = ContextRoleState::new(context_id, creator_did, ceiling, vec![])
-                .map_err(|e| {
-                    ScpPyError::ContextError(format!("failed to create role state: {e}"))
-                })?;
+                .map_err(|e| ScpPyError::context(format!("failed to create role state: {e}")))?;
             let revocation_list = RevocationList::new(context_id.to_owned());
             let nonce_tracker = NonceTracker::new(context_id.to_owned(), SystemClock);
 
-            let runtime = ContextRuntime {
+            let state = FfiBridgeState {
                 tool_registry,
                 event_log,
                 role_state,
@@ -359,34 +516,35 @@ pub fn register_context(context_id: &str, creator_did: &str) -> Result<(), ScpPy
                 tool_handlers: HashMap::new(),
                 message_tx: None,
                 message_rx: None,
+                session_store: scp_core::context::tools::SessionStore::new(),
             };
 
-            vacant.insert(runtime);
+            vacant.insert(state);
         }
     }
 
     Ok(())
 }
 
-/// Executes a closure with mutable access to a context's runtime state.
+/// Executes a closure with mutable access to a context's FFI bridge state.
 ///
-/// Looks up the context by ID in the global registry and calls `f` with a
-/// mutable reference to the [`ContextRuntime`]. Uses `DashMap::get_mut` for
-/// fine-grained per-key locking — only the accessed shard is locked, not the
-/// entire registry.
+/// Looks up the context by ID in the global FFI state registry and calls `f`
+/// with a mutable reference to the [`FfiBridgeState`]. Uses `DashMap::get_mut`
+/// for fine-grained per-key locking — only the accessed shard is locked, not
+/// the entire registry.
 ///
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` if the context is not found.
-pub fn with_context<T, F>(context_id: &str, f: F) -> Result<T, ScpPyError>
+pub fn with_ffi_state<T, F>(context_id: &str, f: F) -> Result<T, ScpPyError>
 where
-    F: FnOnce(&mut ContextRuntime) -> Result<T, ScpPyError>,
+    F: FnOnce(&mut FfiBridgeState) -> Result<T, ScpPyError>,
 {
-    let map = registry();
+    let map = ffi_state_registry();
 
     let mut entry = map.get_mut(context_id).ok_or_else(|| {
-        ScpPyError::ContextError(format!(
-            "context '{context_id}' not found in runtime registry \
+        ScpPyError::context(format!(
+            "context '{context_id}' not found in FFI state registry \
                  -- was it created with py_context_create?"
         ))
     })?;
@@ -401,7 +559,7 @@ where
 /// match.
 #[must_use]
 pub fn context_ids_for_member(member_did: &str) -> Vec<String> {
-    registry()
+    ffi_state_registry()
         .iter()
         .filter(|entry| entry.value().role_state.members.contains(member_did))
         .map(|entry| entry.key().clone())
@@ -425,28 +583,56 @@ pub fn register_tool_handler(
     tool_id: &str,
     handler: ToolHandler,
 ) -> Result<(), ScpPyError> {
-    with_context(context_id, |rt| {
+    with_ffi_state(context_id, |st| {
         // Verify the tool exists in the registry before accepting a handler.
-        if rt.tool_registry.get(tool_id).is_none() {
-            return Err(ScpPyError::ContextError(format!(
+        if st.tool_registry.get(tool_id).is_none() {
+            return Err(ScpPyError::context(format!(
                 "tool '{tool_id}' not found in context '{context_id}' \
                  -- register the tool before adding a handler"
             )));
         }
-        rt.tool_handlers.insert(tool_id.to_owned(), handler);
+        st.tool_handlers.insert(tool_id.to_owned(), handler);
         Ok(())
     })
 }
 
-/// Removes a context from the global runtime registry.
+/// Removes a context's FFI state from the registry.
 ///
-/// Called when a context is closed. All associated runtime objects are dropped.
-/// Dropping the `ContextRuntime` also drops `message_tx`, which closes the
-/// receive channel and causes `__anext__` to raise `StopAsyncIteration`.
-/// Does not error if the context was not found (idempotent).
-pub fn remove_context(context_id: &str) {
-    registry().remove(context_id);
+/// Called when a context is closed. All associated FFI state objects are
+/// dropped. Dropping the `FfiBridgeState` also drops `message_tx`, which
+/// closes the receive channel and causes `__anext__` to raise
+/// `StopAsyncIteration`. Does not error if the context was not found
+/// (idempotent).
+pub fn remove_ffi_state(context_id: &str) {
+    ffi_state_registry().remove(context_id);
     known_contexts_registry().remove(context_id);
+}
+
+/// Re-syncs the `FfiBridgeState.role_state` for a context from the shared
+/// `ContextManager`.
+///
+/// Must be called after any governance action that modifies role state
+/// (`ChangeRole`, `ModifyCeiling`, `AddMember`, `RemoveMember`, etc.) so that the
+/// FFI-side copy used by UCAN/tool capability checks stays current.
+///
+/// # Errors
+///
+/// Returns `ScpPyError` if the context manager is not initialized, the
+/// context is not registered in either the manager or the FFI state registry,
+/// or the tokio runtime is unavailable.
+pub fn sync_role_state_from_manager(context_id: &str) -> Result<(), ScpPyError> {
+    let mgr = context_manager()?;
+    let rt = super::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
+    let new_role_state = rt.block_on(mgr.get_role_state(context_id)).ok_or_else(|| {
+        ScpPyError::context(format!(
+            "context '{context_id}' not found in ContextManager"
+        ))
+    })?;
+
+    with_ffi_state(context_id, |st| {
+        st.role_state = new_role_state;
+        Ok(())
+    })
 }
 
 /// Closes the receive channel for a context by dropping the sender (SCP-216).
@@ -462,9 +648,9 @@ pub fn remove_context(context_id: &str) {
 ///
 /// Returns `ScpPyError::ContextError` if the context is not found.
 pub fn close_receive_channel(context_id: &str) -> Result<(), ScpPyError> {
-    with_context(context_id, |rt| {
-        rt.message_tx.take();
-        rt.message_rx.take();
+    with_ffi_state(context_id, |st| {
+        st.message_tx.take();
+        st.message_rx.take();
         Ok(())
     })
 }
@@ -478,24 +664,24 @@ pub fn close_receive_channel(context_id: &str) -> Result<(), ScpPyError> {
 /// between the pop and the send), a `BufferOverflow` warning is also
 /// injected so consumers can track drop events.
 ///
-/// The function extracts channel references from the runtime registry (brief
-/// `DashMap` shard lock), then operates on the channel outside the lock to
-/// avoid holding the shard lock during overflow handling.
+/// The function extracts channel references from the FFI state registry
+/// (brief `DashMap` shard lock), then operates on the channel outside the
+/// lock to avoid holding the shard lock during overflow handling.
 ///
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` if the context is not found, has no
 /// active receive channel, or if the channel is closed.
 pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPyError> {
-    let (tx, rx_arc) = with_context(context_id, |rt| {
-        let tx = rt.message_tx.clone().ok_or_else(|| {
-            ScpPyError::ContextError(format!(
+    let (tx, rx_arc) = with_ffi_state(context_id, |st| {
+        let tx = st.message_tx.clone().ok_or_else(|| {
+            ScpPyError::context(format!(
                 "context '{context_id}' has no active receive channel \
                  -- call py_context_receive first"
             ))
         })?;
-        let rx = rt.message_rx.clone().ok_or_else(|| {
-            ScpPyError::ContextError("receive channel has no shared receiver reference".to_owned())
+        let rx = st.message_rx.clone().ok_or_else(|| {
+            ScpPyError::context("receive channel has no shared receiver reference".to_owned())
         })?;
         Ok((tx, rx))
     })?;
@@ -514,7 +700,7 @@ pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPy
             drop(rx_guard);
 
             tx.try_send(message).map_err(|e| {
-                ScpPyError::ContextError(format!(
+                ScpPyError::context(format!(
                     "failed to deliver message to context '{context_id}' \
                      after overflow drop: {e}"
                 ))
@@ -531,7 +717,7 @@ pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPy
             let _ = tx.try_send(overflow_warning);
             Ok(())
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => Err(ScpPyError::ContextError(format!(
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(ScpPyError::context(format!(
             "receive channel for context '{context_id}' is closed"
         ))),
     }
@@ -540,6 +726,23 @@ pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPy
 // ---------------------------------------------------------------------------
 // Known context registry (SCP-213: context discovery)
 // ---------------------------------------------------------------------------
+
+/// Global registry of known context-to-relay mappings for discovery (SCP-213).
+///
+/// Tracks contexts that have been created/joined locally, along with their
+/// routing IDs and relay URLs. This allows `py_mcp_load_contexts` to probe
+/// relays for context activity even across process restarts (when combined
+/// with persistence, a future story).
+///
+/// # Safety: Single-Tenant Only
+///
+/// This registry is process-global. See module-level documentation.
+static KNOWN_CONTEXTS: OnceLock<DashMap<String, KnownContext>> = OnceLock::new();
+
+/// Returns a reference to the global known-contexts registry.
+fn known_contexts_registry() -> &'static DashMap<String, KnownContext> {
+    KNOWN_CONTEXTS.get_or_init(DashMap::new)
+}
 
 /// Metadata about a known context's relay presence.
 ///
@@ -594,6 +797,122 @@ pub fn known_contexts_for_member(member_did: &str) -> Vec<(String, KnownContext)
 }
 
 // ---------------------------------------------------------------------------
+// Identity registry (SCP-214: KeyCustody wiring)
+// ---------------------------------------------------------------------------
+
+/// Global identity registry mapping DID strings to retained identity state.
+///
+/// Stores the [`ScpIdentity`] (with opaque [`KeyHandle`]s), the
+/// [`Arc<FfiKeyCustody>`](crate::custody::FfiKeyCustody) that owns the key
+/// material, and the [`DidDocument`]. This allows bridge functions to perform
+/// crypto operations (signing, pseudonym derivation, key rotation) without
+/// private key material crossing the FFI boundary (ADR-006).
+///
+/// Uses [`DashMap`] for lock-free concurrent access matching the context
+/// registry pattern.
+static IDENTITY_REGISTRY: OnceLock<DashMap<String, IdentityEntry>> = OnceLock::new();
+
+/// Returns a reference to the global identity registry.
+fn identity_registry() -> &'static DashMap<String, IdentityEntry> {
+    IDENTITY_REGISTRY.get_or_init(DashMap::new)
+}
+
+/// Retained identity state for a single DID.
+///
+/// Stores the [`ScpIdentity`] (opaque key handles), the [`FfiKeyCustody`]
+/// that owns the key material, and the [`DidDocument`]. The custody provider
+/// is behind an `Arc` so it can be shared with context-scoped operations
+/// (pseudonym derivation, signing, UCAN minting) without moving or cloning
+/// the key material.
+///
+/// The `custody` field uses [`FfiKeyCustody`] — an enum dispatch wrapper —
+/// because [`KeyCustody`] uses RPITIT and is not object-safe. This allows
+/// the FFI bridge to support both in-memory (testing) and file-backed
+/// (production) custody without dynamic dispatch via `dyn`.
+///
+/// See ADR-006, SCP-214 criterion 3, and issue #323.
+pub struct IdentityEntry {
+    /// The scp-core identity handle (DID string, key handles, pre-rotation).
+    pub identity: ScpIdentity,
+    /// The key custody provider that manages the actual key material.
+    pub custody: Arc<crate::custody::FfiKeyCustody>,
+    /// The DID document for this identity.
+    pub document: DidDocument,
+}
+
+/// Registers an identity in the global identity registry.
+///
+/// Called by `py_identity_create` after successfully creating an identity.
+/// Subsequent bridge functions (UCAN minting, pseudonym derivation, key
+/// rotation) look up the identity by DID to access the retained custody
+/// provider and key handles.
+///
+/// Overwrites any existing entry for the same DID (idempotent).
+pub fn register_identity(did: &str, entry: IdentityEntry) {
+    identity_registry().insert(did.to_owned(), entry);
+}
+
+/// Executes a closure with a reference to an identity's retained state.
+///
+/// Looks up the identity by DID in the global registry and calls `f` with
+/// a reference to the [`IdentityEntry`]. Uses `DashMap::get` for fine-grained
+/// per-key locking.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::IdentityError` if the DID is not found.
+pub fn with_identity<T, F>(did: &str, f: F) -> Result<T, ScpPyError>
+where
+    F: FnOnce(&IdentityEntry) -> Result<T, ScpPyError>,
+{
+    let entry = identity_registry().get(did).ok_or_else(|| {
+        ScpPyError::identity(format!(
+            "identity '{did}' not found in registry \
+             -- was it created with py_identity_create?"
+        ))
+    })?;
+
+    f(entry.value())
+}
+
+/// Executes a closure with mutable access to an identity's retained state.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::IdentityError` if the DID is not found.
+pub fn with_identity_mut<T, F>(did: &str, f: F) -> Result<T, ScpPyError>
+where
+    F: FnOnce(&mut IdentityEntry) -> Result<T, ScpPyError>,
+{
+    let mut entry = identity_registry().get_mut(did).ok_or_else(|| {
+        ScpPyError::identity(format!(
+            "identity '{did}' not found in registry \
+             -- was it created with py_identity_create?"
+        ))
+    })?;
+
+    f(entry.value_mut())
+}
+
+/// Returns `true` if the identity registry contains an entry for the given DID.
+///
+/// Used by `py_identity_load` to check whether a loaded identity has live
+/// crypto state before returning it. Without registry presence, a loaded
+/// identity would be a dangling handle (SCP-IDENT-1010).
+#[must_use]
+pub fn identity_registry_contains(did: &str) -> bool {
+    identity_registry().contains_key(did)
+}
+
+/// Removes an identity from the global registry.
+///
+/// Called when an identity is migrated to a new DID. The old entry is
+/// removed and the new entry is registered under the new DID.
+pub fn remove_identity(did: &str) {
+    identity_registry().remove(did);
+}
+
+// ---------------------------------------------------------------------------
 // Storage provider registry (SCP-217: identity persistence)
 // ---------------------------------------------------------------------------
 
@@ -605,7 +924,7 @@ pub fn known_contexts_for_member(member_did: &str) -> Vec<(String, KnownContext)
 /// now -- persistent backends (`SQLite` via [`SqliteStorage`]) will replace it
 /// when platform storage adapters land.
 ///
-/// Uses the same `OnceLock` pattern as `CONTEXT_REGISTRY` and
+/// Uses the same `OnceLock` pattern as `FFI_BRIDGE_STATE` and
 /// `RELAY_CONNECTION`. The `Arc` enables shared ownership across bridge
 /// functions without lifetime issues.
 ///
@@ -638,7 +957,7 @@ pub fn init_storage(storage_type: &str) -> Result<(), ScpPyError> {
             let _ = STORAGE_PROVIDER.set(Arc::new(InMemoryStorage::new()));
             Ok(())
         }
-        other => Err(ScpPyError::ValidationError(format!(
+        other => Err(ScpPyError::validation(format!(
             "unknown storage type: {other:?} — expected \"in_memory\""
         ))),
     }
@@ -652,7 +971,7 @@ pub fn init_storage(storage_type: &str) -> Result<(), ScpPyError> {
 /// via [`init_storage`].
 pub fn get_storage() -> Result<&'static Arc<InMemoryStorage>, ScpPyError> {
     STORAGE_PROVIDER.get().ok_or_else(|| {
-        ScpPyError::IdentityError(
+        ScpPyError::identity(
             "storage not initialized — call py_init_storage(\"in_memory\") first".to_owned(),
         )
     })
@@ -661,6 +980,22 @@ pub fn get_storage() -> Result<&'static Arc<InMemoryStorage>, ScpPyError> {
 // ---------------------------------------------------------------------------
 // Relay connection state (SCP-213: transport wiring)
 // ---------------------------------------------------------------------------
+
+/// Global relay connection for context discovery probing.
+///
+/// Set by [`set_relay_connection`] when `py_transport_connect` succeeds.
+/// Read by `py_mcp_load_contexts` to probe routing IDs on the relay.
+/// Uses `RwLock` for infrequent writes (connect) and concurrent reads (probe).
+///
+/// # Safety: Single-Tenant Only
+///
+/// This registry is process-global. See module-level documentation.
+static RELAY_CONNECTION: OnceLock<RwLock<Option<Arc<NativeRelayAdapter>>>> = OnceLock::new();
+
+/// Returns a reference to the global relay connection state.
+fn relay_state() -> &'static RwLock<Option<Arc<NativeRelayAdapter>>> {
+    RELAY_CONNECTION.get_or_init(|| RwLock::new(None))
+}
 
 /// Stores a relay adapter connection for use by context discovery.
 ///
@@ -673,7 +1008,7 @@ pub fn get_storage() -> Result<&'static Arc<InMemoryStorage>, ScpPyError> {
 /// Returns `ScpPyError::TransportError` if the relay state lock is poisoned.
 pub fn set_relay_connection(adapter: Arc<NativeRelayAdapter>) -> Result<(), ScpPyError> {
     *relay_state().write().map_err(|_| {
-        ScpPyError::TransportError("relay connection state lock is poisoned".to_owned())
+        ScpPyError::transport("relay connection state lock is poisoned".to_owned())
     })? = Some(adapter);
     Ok(())
 }
@@ -688,9 +1023,9 @@ pub fn set_relay_connection(adapter: Arc<NativeRelayAdapter>) -> Result<(), ScpP
 ///
 /// Returns `ScpPyError::TransportError` if the relay state lock is poisoned.
 pub fn get_relay_connection() -> Result<Option<Arc<NativeRelayAdapter>>, ScpPyError> {
-    let guard = relay_state().read().map_err(|_| {
-        ScpPyError::TransportError("relay connection state lock is poisoned".to_owned())
-    })?;
+    let guard = relay_state()
+        .read()
+        .map_err(|_| ScpPyError::transport("relay connection state lock is poisoned".to_owned()))?;
     Ok(guard.clone())
 }
 
@@ -705,9 +1040,54 @@ pub fn get_relay_connection() -> Result<Option<Arc<NativeRelayAdapter>>, ScpPyEr
 /// Returns `ScpPyError::TransportError` if the relay state lock is poisoned.
 pub fn clear_relay_connection() -> Result<(), ScpPyError> {
     *relay_state().write().map_err(|_| {
-        ScpPyError::TransportError("relay connection state lock is poisoned".to_owned())
+        ScpPyError::transport("relay connection state lock is poisoned".to_owned())
     })? = None;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Backward-compatibility aliases
+// ---------------------------------------------------------------------------
+
+/// Backward-compatible alias: registers context in both `ContextManager` and
+/// FFI state registry.
+///
+/// This function ensures that both the shared `ContextManager` (for lifecycle
+/// operations) and the FFI bridge state (for tool/UCAN/event-log operations)
+/// are initialized for the given context. Used during the transition period
+/// where the full `ContextManager` flow is being connected.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` if registration fails.
+pub fn register_context(context_id: &str, creator_did: &str) -> Result<(), ScpPyError> {
+    // Ensure the ContextManager is initialized.
+    init_context_manager();
+
+    // Register FFI-specific state.
+    register_ffi_state(context_id, creator_did)
+}
+
+/// Backward-compatible alias for [`with_ffi_state`].
+///
+/// Modules that previously used `with_context` to access `ContextRuntime`
+/// now access [`FfiBridgeState`] through this alias. The function signature
+/// is identical.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` if the context is not found, or
+/// propagates any error returned by the closure `f`.
+pub fn with_context<T, F>(context_id: &str, f: F) -> Result<T, ScpPyError>
+where
+    F: FnOnce(&mut FfiBridgeState) -> Result<T, ScpPyError>,
+{
+    with_ffi_state(context_id, f)
+}
+
+/// Backward-compatible alias for [`remove_ffi_state`].
+pub fn remove_context(context_id: &str) {
+    remove_ffi_state(context_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -721,7 +1101,7 @@ pub fn clear_relay_connection() -> Result<(), ScpPyError> {
 /// without accessing the registries directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryStats {
-    /// Number of entries in the context runtime registry.
+    /// Number of entries in the FFI bridge state registry.
     pub contexts: usize,
     /// Number of entries in the known-contexts discovery registry.
     pub known_contexts: usize,
@@ -742,17 +1122,48 @@ pub struct RegistryStats {
 pub fn registry_stats() -> Result<RegistryStats, ScpPyError> {
     let relay_connected = relay_state()
         .read()
-        .map_err(|_| {
-            ScpPyError::TransportError("relay connection state lock is poisoned".to_owned())
-        })?
+        .map_err(|_| ScpPyError::transport("relay connection state lock is poisoned".to_owned()))?
         .is_some();
 
     Ok(RegistryStats {
-        contexts: registry().len(),
+        contexts: ffi_state_registry().len(),
         known_contexts: known_contexts_registry().len(),
         identities: identity_registry().len(),
         relay_connected,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Trust engine helpers
+// ---------------------------------------------------------------------------
+
+/// Queries event counts for trust scoring within a context.
+///
+/// Returns `(message_count, governance_count)` derived from the context's
+/// event log. The event log stores leaf hashes (Merkle tree), not full event
+/// payloads, so per-DID filtering is not possible at this level. The returned
+/// counts represent total context-level event counts.
+///
+/// For per-DID behavioral data, use the full participation record computation
+/// in `scp-core::trust::participation::compute_participation_record` with
+/// the actual event objects.
+///
+/// Returns `(0, 0)` if the context is not registered.
+#[must_use]
+pub fn query_trust_event_counts(context_id: &str, _did: &str) -> (u64, u64) {
+    let map = ffi_state_registry();
+    match map.get(context_id) {
+        Some(entry) => {
+            let total = entry.event_log.leaves().len() as u64;
+            // The event log records all event types as leaf hashes without
+            // type discrimination. We report total events as message_count
+            // and 0 governance_count as a best-effort approximation. For
+            // precise per-type counts, callers should use the full
+            // participation record computation with event objects.
+            (total, 0)
+        }
+        None => (0, 0),
+    }
 }
 
 /// Removes an identity from the global registry.
@@ -769,6 +1180,7 @@ pub fn remove_identity_if_present(did: &str) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use scp_platform::testing::InMemoryKeyCustody;
 
     /// Helper to generate unique context IDs for parallel test isolation.
     fn unique_ctx_id(prefix: &str) -> String {
@@ -811,13 +1223,13 @@ mod tests {
 
         // Verify the specific entry exists via direct registry access.
         assert!(
-            registry().contains_key(&ctx_id),
+            ffi_state_registry().contains_key(&ctx_id),
             "registered context should be in registry"
         );
 
         remove_context(&ctx_id);
         assert!(
-            !registry().contains_key(&ctx_id),
+            !ffi_state_registry().contains_key(&ctx_id),
             "removed context should not be in registry"
         );
     }
@@ -834,7 +1246,9 @@ mod tests {
                 agent_signing_key: None,
                 pre_rotation_commitment: [0u8; 32],
             },
-            custody: Arc::new(InMemoryKeyCustody::new()),
+            custody: Arc::new(crate::custody::FfiKeyCustody::InMemory(
+                InMemoryKeyCustody::new(),
+            )),
             document: test_did_document(did),
         };
         register_identity(did, entry);
@@ -899,7 +1313,9 @@ mod tests {
                 agent_signing_key: None,
                 pre_rotation_commitment: [0u8; 32],
             },
-            custody: Arc::new(InMemoryKeyCustody::new()),
+            custody: Arc::new(crate::custody::FfiKeyCustody::InMemory(
+                InMemoryKeyCustody::new(),
+            )),
             document: test_did_document(did),
         };
         register_identity(did, entry);
@@ -928,5 +1344,33 @@ mod tests {
         let _: usize = known_contexts;
         let _: usize = identities;
         let _: bool = relay_connected;
+    }
+
+    #[test]
+    fn context_manager_initializes_once() {
+        init_context_manager();
+        let mgr1 = context_manager().unwrap();
+        init_context_manager();
+        let mgr2 = context_manager().unwrap();
+        // Same Arc (same pointer).
+        assert!(Arc::ptr_eq(mgr1, mgr2));
+    }
+
+    #[test]
+    fn with_ffi_state_finds_registered_context() {
+        let ctx_id = unique_ctx_id("ffi-find");
+        let creator = "did:dht:z6MkFfiFind";
+        register_context(&ctx_id, creator).unwrap();
+
+        let creator_did = with_ffi_state(&ctx_id, |st| Ok(st.creator_did.clone())).unwrap();
+        assert_eq!(creator_did, creator);
+
+        remove_context(&ctx_id);
+    }
+
+    #[test]
+    fn with_ffi_state_errors_on_missing_context() {
+        let result = with_ffi_state("nonexistent-ctx-id", |_| Ok(()));
+        assert!(result.is_err());
     }
 }

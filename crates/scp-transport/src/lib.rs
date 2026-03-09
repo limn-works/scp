@@ -28,6 +28,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod backoff;
 #[cfg(feature = "coap")]
 pub mod coap;
 pub mod config;
@@ -39,8 +40,11 @@ pub mod http3;
 pub mod manager;
 pub mod nat;
 pub mod native;
+#[cfg(feature = "nostr")]
+pub mod nostr;
 pub mod pool;
 pub mod profile;
+pub mod provider;
 #[cfg(feature = "quic")]
 pub mod quic;
 pub mod relay;
@@ -48,10 +52,13 @@ pub mod scoring;
 pub mod traits;
 #[cfg(feature = "udp")]
 pub mod udp;
+#[cfg(feature = "webrtc")]
+pub mod webrtc;
 #[cfg(any(feature = "http3", feature = "webtransport-wasm"))]
 pub mod webtransport;
 
 // Re-export primary types at the crate level for convenience.
+pub use backoff::ReconnectBackoff;
 pub use config::{DefaultRelayResolver, ResolveRelays, TransportConfig};
 pub use cover_traffic::{
     CoverAction, CoverTrafficConfig, CoverTrafficGenerator, CoverTrafficSender, pad_to_bucket,
@@ -67,5 +74,6 @@ pub use nat::{
 };
 pub use pool::{ConnectionPool, PoolKey, TransportType};
 pub use profile::{CoverTrafficTier, TransportProfile};
+pub use provider::RelayTransportProvider;
 pub use scoring::SuppressionWarning;
 pub use traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};

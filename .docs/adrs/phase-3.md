@@ -753,7 +753,7 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
 3. **`mint_ucan(issuer, audience, capabilities, context_id, expiry, signing_key_ref) -> UcanToken`:**
    - Creates a new UCAN token.
    - The `signing_key_ref` parameter (ADR-039) identifies which verification method to sign with (e.g., `"#active"` or `"#agent"`). This value is stored in the UCAN header as `kid`.
-   - Generates a unique nonce (UUID v4 or 32 random bytes, hex-encoded).
+   - Generates a unique nonce in `{unix_millis}-{hex16}` format (Unix millisecond timestamp, hyphen, 16 random bytes hex-encoded). This matches the validation format in Step 9.
    - Constructs the `att` array from the `capabilities` list, scoped to the context: `"scp:ctx:{context_id}/{capability}"`.
    - Signs with the issuer's Ed25519 key identified by `signing_key_ref`.
    - Returns the signed token.

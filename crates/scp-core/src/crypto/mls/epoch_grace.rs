@@ -37,14 +37,17 @@
 //!   `delete_previous_epoch_keypairs()` automatically, which removes the
 //!   previous epoch's encryption key pairs from the storage provider.
 //! - Past epoch message secrets are managed by `OpenMLS`'s `MessageSecretsStore`,
-//!   a bounded `VecDeque` controlled by `max_past_epochs` config (default: 0,
-//!   meaning no past epoch secrets are retained).
-//! - Therefore, forward secrecy of actual cryptographic material is enforced by
-//!   `OpenMLS`, not by this grace store. This store's role is to tell the SCP
-//!   decrypt path whether to *attempt* decryption for a given epoch. Evicting
-//!   an epoch from this store means the SCP layer will reject messages from
-//!   that epoch with a [`StaleEpochMessage`] error, even if `OpenMLS` might
-//!   still technically hold the keys (e.g., within its own past-secrets window).
+//!   a bounded `VecDeque` controlled by `max_past_epochs` config. SCP sets
+//!   `max_past_epochs = 2` (in both `MlsGroupCreateConfig` and
+//!   `MlsGroupJoinConfig`) so that the 2 most recent past epochs' message
+//!   secrets are retained, aligning with the 30-second sender key grace window
+//!   (§9.16.2, §9.7). See issue #324.
+//! - Forward secrecy of actual cryptographic material is enforced by `OpenMLS`,
+//!   not by this grace store. This store's role is to tell the SCP decrypt path
+//!   whether to *attempt* decryption for a given epoch. Evicting an epoch from
+//!   this store means the SCP layer will reject messages from that epoch with a
+//!   [`StaleEpochMessage`] error, even if `OpenMLS` might still technically
+//!   hold the keys (within its 2-epoch past-secrets window).
 //!
 //! # Epoch expiration callback (SCP-171)
 //!

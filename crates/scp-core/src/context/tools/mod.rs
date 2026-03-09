@@ -42,17 +42,20 @@
 //! - [`ToolErrorCode`] -- Error code enum. (Re-exported from [`lifecycle`].)
 //! - [`ToolCancel`] -- Cancellation request. (Re-exported from [`lifecycle`].)
 
+pub mod integrity;
 pub mod interface;
 pub mod invoke;
 pub mod lifecycle;
 pub mod registry;
 pub mod schema;
 pub mod session;
+pub mod summary;
 
 use crate::context::roles;
 
 pub use invoke::{
     InvocationError, has_tool_invoke_capability, invoke_tool, invoke_tool_with_cancellation,
+    validate_tool_invocation_ucan,
 };
 pub use lifecycle::{
     DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, Provenance, ToolCancel, ToolErrorCode, ToolExecutionError,
@@ -63,6 +66,10 @@ pub use registry::{
     ToolVerificationResult, VectorResult, register_tool, update_tool, verify_tool,
 };
 pub use schema::{SchemaValidationError, validate_schema, validate_value_against_schema};
+pub use session::{
+    DEFAULT_SESSION_CAP_PER_CALLER, SessionStore, ToolSession, cleanup_expired, create_session,
+    invoke_session,
+};
 
 // ---------------------------------------------------------------------------
 // ToolId
@@ -280,6 +287,17 @@ pub enum ToolError {
         field_count: usize,
         /// Minimum number of fields required.
         min_fields: usize,
+    },
+
+    /// Tool registration signature verification failed (M15).
+    ///
+    /// The `signature` field on a [`ToolRegistration`] is a Ed25519 signature
+    /// over the canonical registration bytes. If the signature is non-empty,
+    /// it MUST verify against the registrant's signing key.
+    #[error("tool registration signature verification failed: {reason}")]
+    SignatureVerificationFailed {
+        /// Human-readable description of the failure.
+        reason: String,
     },
 
     /// The system clock is unavailable or before the Unix epoch.

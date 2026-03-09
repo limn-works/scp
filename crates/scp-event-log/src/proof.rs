@@ -63,6 +63,44 @@ pub struct InclusionProof {
     pub root: [u8; 32],
 }
 
+/// A Merkle consistency proof: proves that the log at `old_size` is a prefix
+/// of the log at `new_size` (CT-style per RFC 6962).
+///
+/// The proof stores the leaf hashes for the full new tree. A verifier
+/// reconstructs both roots independently: the old root from the first
+/// `old_size` leaf hashes, and the new root from all `new_size` leaf hashes.
+/// The prefix relationship is guaranteed because both roots are computed
+/// from the same ordered sequence of leaf hashes.
+///
+/// See ADR-011 and RFC 6962 Section 2.1.2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsistencyProof {
+    /// The size (number of leaves) of the old tree.
+    pub old_size: u64,
+    /// The size (number of leaves) of the new tree.
+    pub new_size: u64,
+    /// The Merkle root of the old tree.
+    pub old_root: [u8; 32],
+    /// The Merkle root of the new tree.
+    pub new_root: [u8; 32],
+    /// Leaf hashes for the new tree (first `new_size` leaves). The first
+    /// `old_size` entries reconstruct the old root; all entries reconstruct
+    /// the new root.
+    pub leaf_hashes: Vec<[u8; 32]>,
+}
+
+/// An event paired with its Merkle inclusion proof.
+///
+/// Returned by [`query_events`] to provide both the event data and a
+/// cryptographic proof of its inclusion in the log.
+#[derive(Debug, Clone)]
+pub struct EventWithProof {
+    /// The full event data.
+    pub event: super::Event,
+    /// The Merkle inclusion proof for this event.
+    pub inclusion_proof: InclusionProof,
+}
+
 /// A leaf hash paired with its inclusion proof, used in absence proofs.
 ///
 /// See ADR-011 acceptance criterion 4.
@@ -171,13 +209,9 @@ pub fn prove_inclusion(log: &EventLog, leaf_index: u64) -> Result<InclusionProof
             sibling_hash: leaves[sibling_idx],
             direction,
         });
-    } else {
-        // Odd node at the end: sibling is itself (promoted).
-        path.push(ProofStep {
-            sibling_hash: leaves[idx],
-            direction: Direction::Right,
-        });
     }
+    // Odd node at the end: no proof step needed -- node is promoted
+    // directly to the next level per RFC 6962.
 
     // Move to the parent index for the next level.
     idx /= 2;
@@ -195,13 +229,9 @@ pub fn prove_inclusion(log: &EventLog, leaf_index: u64) -> Result<InclusionProof
                 sibling_hash: layer[sibling_idx],
                 direction,
             });
-        } else {
-            // Odd node: sibling is itself (promoted).
-            path.push(ProofStep {
-                sibling_hash: layer[idx],
-                direction: Direction::Right,
-            });
         }
+        // Odd node: no proof step needed -- node is promoted directly
+        // per RFC 6962.
         idx /= 2;
     }
 
@@ -318,11 +348,183 @@ pub fn verify_inclusion(proof: &InclusionProof) -> bool {
     current_hash == proof.root
 }
 
+/// Generates a consistency proof between two tree sizes (CT-style per RFC 6962).
+///
+/// Proves that the log at `old_size` is a prefix of the log at `new_size`.
+/// Stores the leaf hashes for the new tree, enabling independent
+/// reconstruction of both roots.
+///
+/// # Errors
+///
+/// Returns [`EventLogError::EmptyLog`] if the log is empty.
+/// Returns [`EventLogError::LeafIndexOutOfBounds`] if `old_size` is 0,
+/// `old_size > new_size`, or `new_size` exceeds the log size.
+pub fn prove_consistency(
+    log: &EventLog,
+    old_size: u64,
+    new_size: u64,
+) -> Result<ConsistencyProof, EventLogError> {
+    let total = tree::event_count(log);
+
+    if total == 0 {
+        return Err(EventLogError::EmptyLog);
+    }
+
+    if old_size == 0 || old_size > new_size || new_size > total {
+        return Err(EventLogError::LeafIndexOutOfBounds {
+            index: if old_size == 0 || old_size > new_size {
+                old_size
+            } else {
+                new_size
+            },
+            count: total,
+        });
+    }
+
+    let leaves = log.leaves();
+    // Safety: old_size <= new_size <= total, and total == leaves.len() which fits in usize.
+    #[allow(clippy::cast_possible_truncation)]
+    let old_end = old_size as usize;
+    #[allow(clippy::cast_possible_truncation)]
+    let new_end = new_size as usize;
+    let old_root = compute_root_from_leaves(&leaves[..old_end]);
+    let new_root = compute_root_from_leaves(&leaves[..new_end]);
+
+    Ok(ConsistencyProof {
+        old_size,
+        new_size,
+        old_root,
+        new_root,
+        leaf_hashes: leaves[..new_end].to_vec(),
+    })
+}
+
+/// Verifies a consistency proof: confirms the old tree is a prefix of the new tree.
+///
+/// Reconstructs both Merkle roots from the stored leaf hashes: the old root
+/// from the first `old_size` hashes, and the new root from all `new_size`
+/// hashes. Both must match their stated values.
+///
+/// This is a **pure function** -- no access to the log needed.
+///
+/// See RFC 6962 Section 2.1.2.
+#[must_use]
+pub fn verify_consistency(proof: &ConsistencyProof) -> bool {
+    if proof.old_size == 0 || proof.old_size > proof.new_size {
+        return false;
+    }
+
+    // The leaf_hashes must have exactly new_size entries.
+    if proof.leaf_hashes.len() as u64 != proof.new_size {
+        return false;
+    }
+
+    // old_size must not exceed the available leaf hashes.
+    if proof.old_size > proof.leaf_hashes.len() as u64 {
+        return false;
+    }
+
+    // Reconstruct the old root from the first old_size leaf hashes.
+    // Safety: old_size <= leaf_hashes.len() validated above.
+    #[allow(clippy::cast_possible_truncation)]
+    let old_end = proof.old_size as usize;
+    let reconstructed_old = compute_root_from_leaves(&proof.leaf_hashes[..old_end]);
+    if reconstructed_old != proof.old_root {
+        return false;
+    }
+
+    // Reconstruct the new root from all new_size leaf hashes.
+    let reconstructed_new = compute_root_from_leaves(&proof.leaf_hashes);
+    if reconstructed_new != proof.new_root {
+        return false;
+    }
+
+    true
+}
+
+/// Queries events in the given range and returns them with inclusion proofs.
+///
+/// Returns events at sequence numbers in `[start, end)` (half-open range),
+/// each paired with its Merkle inclusion proof.
+///
+/// # Errors
+///
+/// Returns [`EventLogError::EmptyLog`] if the log is empty.
+/// Returns [`EventLogError::LeafIndexOutOfBounds`] if the range exceeds
+/// the number of events.
+pub fn query_events(
+    log: &EventLog,
+    start: u64,
+    end: u64,
+) -> Result<Vec<EventWithProof>, EventLogError> {
+    let total = tree::event_count(log);
+
+    if total == 0 {
+        return Err(EventLogError::EmptyLog);
+    }
+
+    if end > total {
+        return Err(EventLogError::LeafIndexOutOfBounds {
+            index: end,
+            count: total,
+        });
+    }
+
+    if start >= end {
+        return Ok(Vec::new());
+    }
+
+    // Safety: end <= total which fits in leaves.len() (usize).
+    #[allow(clippy::cast_possible_truncation)]
+    let capacity = (end - start) as usize;
+    let mut results = Vec::with_capacity(capacity);
+    for seq in start..end {
+        let event = log.get_event(seq)?.clone();
+        let inclusion_proof = prove_inclusion(log, seq)?;
+        results.push(EventWithProof {
+            event,
+            inclusion_proof,
+        });
+    }
+
+    Ok(results)
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
 use super::tree::hash_pair;
+
+/// Computes the Merkle root from a slice of leaf hashes.
+///
+/// Uses the same RFC 6962 structure as the main tree: odd nodes are
+/// promoted directly to the next level (not hashed with themselves).
+fn compute_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
+    if leaves.is_empty() {
+        return [0u8; 32];
+    }
+    if leaves.len() == 1 {
+        return leaves[0];
+    }
+
+    let mut current: Vec<[u8; 32]> = leaves.to_vec();
+    while current.len() > 1 {
+        let mut next = Vec::with_capacity(current.len().div_ceil(2));
+        let mut i = 0;
+        while i < current.len() {
+            if i + 1 < current.len() {
+                next.push(hash_pair(&current[i], &current[i + 1]));
+            } else {
+                // Odd node: promote directly per RFC 6962.
+                next.push(current[i]);
+            }
+            i += 2;
+        }
+        current = next;
+    }
+    current[0]
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -685,5 +887,230 @@ mod tests {
             let upper_pos = sorted.iter().position(|h| *h == upper.leaf_hash).unwrap();
             assert_eq!(upper_pos, lower_pos + 1, "neighbors are not adjacent");
         }
+    }
+
+    // -------------------------------------------------------------------
+    // prove_consistency: basic consistency proof
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn prove_consistency_basic() {
+        let (log, _) = build_log(10);
+        let proof = prove_consistency(&log, 5, 10).unwrap();
+
+        assert_eq!(proof.old_size, 5);
+        assert_eq!(proof.new_size, 10);
+        assert_eq!(proof.leaf_hashes.len(), 10);
+        assert!(verify_consistency(&proof));
+    }
+
+    // -------------------------------------------------------------------
+    // prove_consistency: tampered intermediate hash fails
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn prove_consistency_tampered_leaf_hash_fails() {
+        let (log, _) = build_log(10);
+        let mut proof = prove_consistency(&log, 5, 10).unwrap();
+
+        // Tamper with a leaf hash in the middle.
+        proof.leaf_hashes[3] = [0xFF; 32];
+
+        assert!(!verify_consistency(&proof));
+    }
+
+    #[test]
+    fn prove_consistency_tampered_new_leaf_fails() {
+        let (log, _) = build_log(10);
+        let mut proof = prove_consistency(&log, 5, 10).unwrap();
+
+        // Tamper with a new leaf hash (beyond old_size).
+        proof.leaf_hashes[7] = [0xFF; 32];
+
+        assert!(!verify_consistency(&proof));
+    }
+
+    // -------------------------------------------------------------------
+    // prove_consistency: same size returns valid proof with empty path
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn prove_consistency_same_size() {
+        let (log, _) = build_log(5);
+        let proof = prove_consistency(&log, 5, 5).unwrap();
+
+        assert_eq!(proof.old_size, 5);
+        assert_eq!(proof.new_size, 5);
+        assert_eq!(proof.old_root, proof.new_root);
+        assert_eq!(proof.leaf_hashes.len(), 5);
+        assert!(verify_consistency(&proof));
+    }
+
+    // -------------------------------------------------------------------
+    // prove_consistency: power-of-two sizes
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn prove_consistency_power_of_two() {
+        let (log, _) = build_log(16);
+        for old in [1, 2, 4, 8] {
+            let proof = prove_consistency(&log, old, 16).unwrap();
+            assert!(
+                verify_consistency(&proof),
+                "failed for old_size={old}, new_size=16"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // prove_consistency: non-power-of-two sizes
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn prove_consistency_non_power_of_two() {
+        let (log, _) = build_log(13);
+        for old in [1, 3, 5, 7, 9, 11] {
+            let proof = prove_consistency(&log, old, 13).unwrap();
+            assert!(
+                verify_consistency(&proof),
+                "failed for old_size={old}, new_size=13"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // prove_consistency: errors
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn prove_consistency_rejects_empty_log() {
+        let log = EventLog::new("ctx-empty".to_owned());
+        let result = prove_consistency(&log, 1, 2);
+        assert!(matches!(result.unwrap_err(), EventLogError::EmptyLog));
+    }
+
+    #[test]
+    fn prove_consistency_rejects_zero_old_size() {
+        let (log, _) = build_log(5);
+        let result = prove_consistency(&log, 0, 5);
+        assert!(matches!(
+            result.unwrap_err(),
+            EventLogError::LeafIndexOutOfBounds { .. }
+        ));
+    }
+
+    #[test]
+    fn prove_consistency_rejects_old_greater_than_new() {
+        let (log, _) = build_log(5);
+        let result = prove_consistency(&log, 5, 3);
+        assert!(matches!(
+            result.unwrap_err(),
+            EventLogError::LeafIndexOutOfBounds { .. }
+        ));
+    }
+
+    #[test]
+    fn prove_consistency_rejects_new_exceeding_log() {
+        let (log, _) = build_log(5);
+        let result = prove_consistency(&log, 3, 10);
+        assert!(matches!(
+            result.unwrap_err(),
+            EventLogError::LeafIndexOutOfBounds { .. }
+        ));
+    }
+
+    // -------------------------------------------------------------------
+    // get_event: retrieval tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn get_event_returns_correct_event() {
+        let (log, _) = build_log(10);
+        let event = log.get_event(5).unwrap();
+
+        assert_eq!(event.sequence, 5);
+        assert_eq!(event.payload.data, b"message 5");
+    }
+
+    #[test]
+    fn get_event_all_events_match() {
+        let (log, _) = build_log(10);
+        for i in 0..10u64 {
+            let event = log.get_event(i).unwrap();
+            assert_eq!(event.sequence, i);
+            assert_eq!(event.payload.data, format!("message {i}").into_bytes());
+        }
+    }
+
+    #[test]
+    fn get_event_out_of_bounds() {
+        let (log, _) = build_log(5);
+        let result = log.get_event(5);
+        assert!(matches!(
+            result.unwrap_err(),
+            EventLogError::LeafIndexOutOfBounds { index: 5, count: 5 }
+        ));
+    }
+
+    #[test]
+    fn get_event_empty_log() {
+        let log = EventLog::new("ctx-empty".to_owned());
+        let result = log.get_event(0);
+        assert!(matches!(result.unwrap_err(), EventLogError::EmptyLog));
+    }
+
+    // -------------------------------------------------------------------
+    // query_events: range query with proofs
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn query_events_returns_events_with_valid_proofs() {
+        let (log, _) = build_log(10);
+        let results = query_events(&log, 3, 7).unwrap();
+
+        assert_eq!(results.len(), 4);
+        for (i, result) in results.iter().enumerate() {
+            let expected_seq = 3 + i as u64;
+            assert_eq!(result.event.sequence, expected_seq);
+            assert!(verify_inclusion(&result.inclusion_proof));
+        }
+    }
+
+    #[test]
+    fn query_events_empty_range_returns_empty() {
+        let (log, _) = build_log(10);
+        let results = query_events(&log, 5, 5).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn query_events_full_range() {
+        let (log, _) = build_log(5);
+        let results = query_events(&log, 0, 5).unwrap();
+        assert_eq!(results.len(), 5);
+        for (i, result) in results.iter().enumerate() {
+            assert_eq!(result.event.sequence, i as u64);
+            assert!(verify_inclusion(&result.inclusion_proof));
+        }
+    }
+
+    #[test]
+    fn query_events_rejects_out_of_bounds() {
+        let (log, _) = build_log(5);
+        let result = query_events(&log, 3, 10);
+        assert!(matches!(
+            result.unwrap_err(),
+            EventLogError::LeafIndexOutOfBounds {
+                index: 10,
+                count: 5
+            }
+        ));
+    }
+
+    #[test]
+    fn query_events_rejects_empty_log() {
+        let log = EventLog::new("ctx-empty".to_owned());
+        let result = query_events(&log, 0, 1);
+        assert!(matches!(result.unwrap_err(), EventLogError::EmptyLog));
     }
 }

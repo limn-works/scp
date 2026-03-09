@@ -6,29 +6,24 @@ This crate generates Swift and Kotlin bindings from a single Rust definition via
 
 ## Architecture
 
-### Runtime Registry (`runtime.rs`)
+### Shared ContextManager (`runtime.rs`) — issue #387
 
-A global `OnceLock<DashMap<String, ContextRuntime>>` maps context IDs to live runtime state:
-- `EventLog` — Merkle tree for event recording, querying, proofs
-- `RevocationList` — UCAN token revocation tracking
-- `NonceTracker<SystemClock>` — per-context UCAN nonce replay prevention (ADR-016 step 9)
-- `ceiling_strings: HashSet<String>` — capability ceiling as `{resource}:{action}` strings (ADR-016 step 8)
-- `creator_did` — the DID of the context creator
+A single `Arc<ContextManager>` (from `scp-core`) is created once via `OnceLock` and shared across all bridge functions. The `ContextManager` owns all per-context state (membership, roles, governance, broadcast, TTL) and the injected providers. This replaced the old `DashMap<String, ContextRuntime>` global registry.
 
-DashMap provides lock-free concurrent access with internal sharding. The `with_context` function takes a closure receiving `&mut ContextRuntime` and returns `Result<T, ScpError>`.
+The manager is initialized with stub provider implementations (`FfiBridgeCrypto`, `FfiBridgeTransport`, `FfiBridgeEventLog`) that succeed by default, allowing the manager to track state while actual crypto/transport operations are handled by platform callbacks.
 
-`context_create` in `bridge.rs` calls `register_context`. `context_close` calls `remove_context`. UCAN and event-log bridge functions access state via `with_context`.
+Bridge functions access the manager via `crate::runtime::context_manager()`.
 
-### Bridge Trait Adapters (`bridge.rs`)
+### No-Op Validation Trait Stubs (`bridge.rs`)
 
-Four adapter structs implement scp-core's UCAN validation traits, bridging runtime registry state to the 11-step validation pipeline:
+Four no-op adapter structs satisfy the generic bounds on `ContextManager::subscribe_broadcast`:
 
 | Adapter | Implements | Purpose |
 |---------|-----------|---------|
-| `BridgeDidResolver` | `DidResolver` | Resolves `did:dht:z` (zbase32) and `did:key:` (hex) DIDs to Ed25519 public keys |
-| `BridgeRevocationChecker` | `RevocationChecker` | Wraps `&RevocationList` for revocation lookups |
-| `BridgeProofResolver` | `ProofResolver` | HashMap-backed resolver for UCAN delegation chain proofs |
-| `BridgeNonceTracker` | `NonceTracker` | Adapts `nonce::NonceTracker` to `validate::NonceTracker` trait |
+| `NoOpDidResolver` | `DidResolver` | Returns error (no resolution in FFI layer) |
+| `NoOpNonceTracker` | `NonceTracker` | Always accepts (no replay prevention in FFI layer) |
+| `NoOpRevocationChecker` | `RevocationChecker` | Never revoked |
+| `NoOpProofResolver` | `ProofResolver` | Returns error (no proof resolution in FFI layer) |
 
 ### Module Structure
 
@@ -37,7 +32,13 @@ Single-file bridge (`bridge.rs`) containing all UniFFI exports. Key function gro
 | Category | Functions |
 |----------|-----------|
 | Identity | `identity_create`, `identity_load`, `identity_resolve` |
-| Context | `context_create`, `context_join`, `context_leave`, `context_close`, `context_send`, `context_subscribe` |
+| Context lifecycle | `context_create`, `context_join`, `context_leave`, `context_close`, `context_send`, `context_subscribe` |
+| Membership queries | `context_member_count`, `context_is_member`, `context_member_dids`, `context_member_role` |
+| Events | `context_drain_events` |
+| Governance | `governance_execute` |
+| Broadcast | `broadcast_subscribe`, `broadcast_unsubscribe`, `broadcast_publish`, `broadcast_block_subscriber`, `broadcast_handle_key_request`, `broadcast_subscriber_count`, `broadcast_is_subscriber`, `broadcast_admission` |
+| TTL | `context_handle_ttl_expiry`, `context_propose_ttl_extension`, `context_reset_ttl_timer` |
+| Local DID | `register_local_did`, `is_local_did` |
 | Tools | `tool_register`, `tool_invoke`, `tool_verify` |
 | UCAN | `ucan_validate`, `ucan_mint`, `ucan_revoke` |
 | Event Log | `event_log_query`, `event_log_verify` |
@@ -64,13 +65,11 @@ All I/O-bound functions are `async fn`. UniFFI generates Swift `async` functions
 ## Gotchas
 
 - The tokio runtime (`RUNTIME` in `lib.rs`) must be initialized before any async bridge call. It is created as a `OnceLock<Runtime>` and exposed via `runtime()`.
-- `context_create` registers runtime state; `context_close` removes it. If context creation fails partway, the registry entry must be cleaned up.
-- `with_context` closures must return `Result<T, ScpError>` — use typed error variants, not raw strings.
-- UCAN validation delegates to scp-core's full 11-step ADR-016 pipeline. `BridgeDidResolver` handles both `did:dht:z` (zbase32 decode) and `did:key:` (hex decode) formats. Invalid DID methods return `DidNotFound`.
-- `ucan_mint` currently uses `InMemoryKeyCustody` for signing. Real `KeyCustody` wiring is deferred to SCP-214.
-- `EventLog` is a Merkle tree storing only leaf hashes, not event payloads. `event_log_query` returns event count and Merkle root as a JSON `LogSummary`.
-- `event_log_verify` supports two claim types: `"inclusion"` (prove event exists at index) and `"absence"` (prove no event at index). Both use scp-core's `prove_inclusion`/`prove_absence` + `verify_inclusion`.
+- **Shared ContextManager (post-#387):** All context lifecycle/membership/governance/broadcast/TTL operations delegate to `crate::runtime::context_manager()`. The old `ContextRuntime` struct and `DashMap` registry are deleted. Context state lives in the `ContextManager`, not in the bridge.
+- Bridge functions create ephemeral `scp_core::context::ContextHandle` instances to pass `context_id` to the manager. The FFI `ContextHandle` (in `bridge.rs`) remains a separate opaque object with its own state lock for handle counting and state queries.
+- **Close authorization**: `context_close` does NOT perform bridge-layer authorization. It delegates to `ContextManager::close_context`, which checks the `ContextClose` capability via `ttl::close_context`. The ContextManager is the authoritative auth layer.
+- **register_local_did**: `context_create` calls `manager.register_local_did(identity.did)` after creating the context, matching NAPI's behavior for defense-in-depth.
+- `ucan_mint` uses `InMemoryKeyCustody` for signing (feature-gated). Real `KeyCustody` wiring deferred to platform integration.
 - Opaque objects (`Identity`, `ContextHandle`, `UcanToken`, `TransportManager`) use `Arc<T>` wrapping and manual handle counting (`increment_handle_count`/`decrement_handle_count` in `lib.rs`). `Drop` impls decrement counts.
-- `generate_nonce` produces 16 random bytes encoded as hex (32 chars). Used by `ucan_mint` for UCAN nonce field.
 - `OpaqueInMemoryKeyCustody` wrapper implements `Debug` with redacted output to prevent key material in logs.
-- The `scp.udl` file defines callback interfaces (which proc-macros cannot express). Both UDL and proc-macro exports are required for complete binding generation.
+- The `scp.udl` file is minimal (namespace anchor only). All types and functions are defined via proc-macros.

@@ -156,9 +156,13 @@ pub struct PaymentAuthorization {
     pub adapter_id: String,
     pub created_at: u64,
     pub expires_at: u64,                   // authorization hold expiry
-    pub adapter_state: Vec<u8>,            // adapter-specific opaque state
+    pub adapter_state: Vec<u8>,            // adapter-specific opaque state (max 4096 bytes)
 }
+```
 
+**Authorization hold duration.** The maximum hold duration (`expires_at - created_at`) MUST NOT exceed 3600 seconds (1 hour). This is a protocol-level maximum, not adapter-configurable. Adapters MAY use shorter hold durations appropriate to their payment rail (e.g., Lightning invoices typically expire in 60 seconds). If `expires_at > created_at + 3600`, the SDK MUST reject the authorization. After expiry, uncaptured authorizations are automatically voided — the payer's SDK calls `adapter.void(auth)` on expiry. The `adapter_state` field MUST NOT exceed 4096 bytes — the SDK rejects authorizations with larger adapter state.
+
+```rust
 /// Result of verifying a PaymentReceipt against the payment rail.
 pub struct VerificationResult {
     pub valid: bool,
@@ -288,7 +292,7 @@ Documented for implementers, not protocol-specified:
 
 Economic policy is a context setting governed through the context's governance model (§5.9).
 
-**Mutable by default.** Changes go through governance, are logged in the event log, visible to all members, take effect after a notification period. This follows the governance pattern but does NOT mirror the ceiling policy immutability default — pricing changes are normal business operations, not security boundary changes.
+**Mutable by default.** Changes go through governance, are logged in the event log, visible to all members, take effect after a notification period. The minimum notification period is 86,400 seconds (24 hours) — economic policy changes MUST NOT take effect sooner than 24 hours after the `EconomicPolicyChanged` event is committed to the event log. Contexts MAY configure a longer notification period via `economic_policy_notification_period_secs` in `ContextParams` (no maximum). During the notification period, the previous policy remains in effect. This prevents surprise pricing changes that could trap agents with queued messages or active sessions. This follows the governance pattern but does NOT mirror the ceiling policy immutability default — pricing changes are normal business operations, not security boundary changes.
 
 **Optional immutability lock.** Creator MAY lock economic policy at creation — "always free forever" or "price locked at $X forever." Voluntary commitment, not the default. The lock is itself immutable (once locked, cannot unlock). Use cases: public goods contexts, trust signals, permanent free tiers.
 
@@ -345,12 +349,21 @@ pub enum PricingVariable {
 }
 
 pub enum PricingMetric {
-    ContextMessageRate,    // messages/min in this context
-    MemberCount,           // current member count
-    RelayQueueDepth,       // relay-level only
-    TimeOfDay,             // UTC hour (0-23), enables off-peak pricing
-    SenderVelocity,        // sender's messages in sliding window (anti-spam)
-    StorageUsage,          // context storage in bytes
+    ContextMessageRate,    // messages/min in this context (measurement: count of MessageSent events
+                           // in the context's event log within the last 60 seconds, divided by 1.
+                           // Window: trailing 60-second sliding window, evaluated at action time.)
+    MemberCount,           // current member count (measurement: count of active memberships in
+                           // context state at evaluation time. No window — point-in-time snapshot.)
+    RelayQueueDepth,       // relay-level only (measurement: number of unacknowledged blobs for the
+                           // routing_id at evaluation time. No window — point-in-time snapshot.)
+    TimeOfDay,             // UTC hour (0-23), enables off-peak pricing (measurement: current UTC
+                           // hour truncated to integer. No window — point-in-time.)
+    SenderVelocity,        // sender's messages in sliding window (measurement: count of MessageSent
+                           // events by the specific sender DID within the last 60 seconds.
+                           // Window: trailing 60-second sliding window, evaluated at action time.)
+    StorageUsage,          // context storage in bytes (measurement: sum of value sizes for all keys
+                           // under context/{context_id}/ in ProtocolStore. Measured on the payer's
+                           // local storage. Window: point-in-time snapshot at evaluation.)
 }
 ```
 
@@ -391,6 +404,10 @@ pub struct SpendingCapability {
 }
 ```
 
+**`time_window` semantics.** The `time_window` is a rolling window measured from the current time backwards. The running total is the sum of all `PaymentReceipt.amount` values for receipts with `timestamp >= (now - time_window.as_secs())`. The window rolls forward continuously — old receipts age out as time passes. The window starts at UCAN issuance time (not at first spend).
+
+**Enforcement location.** `max_total` is enforced by the **payer's SDK** as a self-imposed spending limit. The payer SDK maintains a local spending ledger: a list of `(receipt_id, amount, timestamp)` tuples stored under `identity/{did}/spending_ledger/{ucan_token_id}/` in `ProtocolStore`. Before each `authorize()` call, the SDK sums receipts within `time_window` and rejects if `running_total + new_amount > max_total` with a `SpendingLimitExceeded` error. Payees do NOT enforce `max_total` — they cannot know the payer's total spending across all payees. This is a deliberate design choice: `SpendingCapability` is a self-governance mechanism for the human delegating spending authority to their agent, not a protocol-enforced global limit. The human trusts their own SDK to enforce the limit honestly. A compromised SDK that ignores the limit can overspend, but the blast radius is bounded by the UCAN's 24-hour expiry (§9.5) and the adapter's balance.
+
 **AND composition:** Action UCAN + spending UCAN both required for paid actions. Agent with `messagesWrite` but no spending UCAN cannot send paid messages. Agent with spending UCAN but no `messagesWrite` cannot spend on messages. Both capabilities are independently verified before any paid action proceeds.
 
 **Delegation chain:** Human DID (`#active`) → spending UCAN (self-delegation with `fct.scp_key_scope: "#agent"`) → same DID (`#agent` scoped). Attenuation applies: sub-delegation must narrow, never widen. An agent granted $100/day can delegate $10/day to a sub-agent. UCAN standard attenuation rules (§7.2) apply unchanged.
@@ -420,9 +437,26 @@ pub struct PaymentReceipt {
                                       //   Lightning: preimage
                                       //   SPL: tx signature
     pub timestamp: u64,
-    pub signature: Vec<u8>,           // Ed25519 signature by payer
+    pub signature: Vec<u8>,           // Ed25519 signature by payer (see signature scope below)
 }
 ```
+
+**PaymentReceipt signature scope.** The `signature` field is an Ed25519 signature by the payer's `#active` key (or `#agent` key if the agent initiated the payment under a spending UCAN) over the following canonical byte sequence:
+
+```
+signed_payload = receipt_id (32 bytes)
+              || payer_did (UTF-8 bytes, length-prefixed with u16 big-endian)
+              || payee_did (UTF-8 bytes, length-prefixed with u16 big-endian)
+              || amount (u64 big-endian, 8 bytes)
+              || currency (4 bytes, raw CurrencyCode)
+              || action_type (u8: 0=MessageSend, 1=ToolInvoke, 2=ContextJoin,
+                              3=SubscriptionPeriod, 4=ByteStored)
+              || context_id (32 bytes if Some, 0x00 if None)
+              || adapter_id (UTF-8 bytes, length-prefixed with u16 big-endian)
+              || timestamp (u64 big-endian, 8 bytes)
+```
+
+The `adapter_proof` field is deliberately excluded from the signature scope — it is adapter-specific opaque data that may not be available at signing time (e.g., Lightning preimage is revealed after payment, not before). Verification of payment integrity uses `adapter.verify(receipt)` against the payment rail; the payer's signature proves the payer authorized this specific payment.
 
 **Verification:** Any party calls `adapter.verify(receipt)` — adapter checks proof against the payment rail (on-chain state, preimage hash, etc.).
 
@@ -490,6 +524,8 @@ Relay economics are SEPARATE from context economics — different trust model. R
   }
 }
 ```
+
+**`per_byte_stored` billing model.** The `per_byte_stored` amount is a **one-time storage fee** charged when a blob is published to the relay. The fee is `per_byte_stored * blob_size_bytes`, charged once at publish time. There is no recurring charge — once paid, the blob is stored until its TTL expires. Example: with `per_byte_stored: 1` (1 cent) and `currency: "USD"`, a 256 KiB blob costs `1 * 262144 = 262144 cents = $2,621.44`. Relay operators SHOULD set `per_byte_stored` to values appropriate for their cost structure — the example value of `1` is illustrative, not recommended. A more realistic value for a USD-denominated relay might be `per_byte_stored: 0` (free, subsidized by `per_publish`) or use sub-cent amounts via a different currency unit (e.g., SAT with `per_byte_stored: 1` = 1 satoshi per byte = ~$0.0004 per byte at $40k/BTC).
 
 **JSON Amount serialization:** `Amount` values in `.well-known/scp` are serialized as JSON integers in the smallest currency unit specified by `currency`. For USD (unit: cent), `10` = $0.10. For BTC (unit: satoshi), `100` = 100 satoshis. Parsers convert JSON integer → `Amount(u64)` directly. Decimal string representations are NOT valid — all amounts are integers. The `currency` field determines the interpretation scale.
 

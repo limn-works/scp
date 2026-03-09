@@ -234,6 +234,10 @@ impl<S: BlobStorage> BlobStorage for LocalBlobCache<S> {
         }
         Ok(purged)
     }
+
+    async fn count(&self) -> Result<usize, StorageError> {
+        self.inner.count().await
+    }
 }
 
 #[cfg(test)]

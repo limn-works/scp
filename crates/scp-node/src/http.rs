@@ -23,10 +23,12 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use zeroize::Zeroizing;
 
+use scp_identity::document::DidDocument;
 use scp_platform::traits::Storage;
 use scp_transport::native::server::RelayConfig as TransportRelayConfig;
 use scp_transport::native::storage::BlobStorageBackend;
-use scp_transport::relay::rate_limit::PublishRateLimiter;
+use scp_transport::relay::rate_limit::{ConnectionTracker, PublishRateLimiter};
+use scp_transport::relay::subscription::SubscriptionRegistry;
 
 use crate::tls;
 
@@ -148,6 +150,37 @@ pub struct NodeState {
     ///
     /// See spec section 18.6.3 (auto-renewal).
     pub(crate) cert_resolver: Option<Arc<crate::tls::CertResolver>>,
+    /// The operator's DID document, populated at build time.
+    ///
+    /// Used by the dev API identity endpoint to return the full document
+    /// (spec section 18.10.3).
+    pub(crate) did_document: DidDocument,
+    /// Shared connection tracker from the relay server.
+    ///
+    /// Tracks active connections per IP address across all transports.
+    /// Used by the dev API health and relay status endpoints to report
+    /// real connection counts (spec section 18.10.3).
+    pub(crate) connection_tracker: ConnectionTracker,
+    /// Shared subscription registry from the relay server.
+    ///
+    /// Maps routing IDs to subscriber entries. Used by the dev API
+    /// context endpoint to report real subscriber counts (spec section 18.10.3).
+    pub(crate) subscription_registry: SubscriptionRegistry,
+    /// Shared ACME challenge map (token → key authorization).
+    ///
+    /// Mounted in [`serve()`](crate::ApplicationNode::serve) at
+    /// `GET /.well-known/acme-challenge/{token}` so that ACME renewal
+    /// challenges can be served without restarting the server (issue #305).
+    /// When `None` (no-domain or self-signed mode), no challenge router is
+    /// mounted.
+    pub(crate) acme_challenges: Option<Arc<RwLock<HashMap<String, String>>>>,
+
+    /// Shared state for bridge shadow operations.
+    ///
+    /// Holds per-context shadow registries and sender key stores for the
+    /// bridge shadow creation endpoint (`POST /v1/scp/bridge/shadow`).
+    /// See SCP-BCH-002.
+    pub(crate) bridge_state: Arc<crate::bridge_handlers::BridgeState>,
 }
 
 // ---------------------------------------------------------------------------
@@ -442,6 +475,17 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
         crate::projection::broadcast_projection_router(Arc::clone(&self.state))
     }
 
+    /// Returns an axum [`Router`] serving bridge endpoints.
+    ///
+    /// Includes `POST /v1/scp/bridge/shadow` for shadow identity creation.
+    /// Requires bridge authentication middleware to be applied by the caller.
+    ///
+    /// See SCP-BCH-002 and spec section 12.10.
+    #[must_use = "returns the bridge router, which must be mounted into an axum application"]
+    pub fn bridge_router(&self) -> Router {
+        crate::bridge_handlers::bridge_router(Arc::clone(&self.state.bridge_state))
+    }
+
     /// Returns the dev API router if the dev API is enabled.
     ///
     /// Returns `Some(Router)` when [`ApplicationNodeBuilder::local_api`] was
@@ -534,28 +578,31 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
         let projection =
             crate::projection::broadcast_projection_router(Arc::clone(&self.state)).layer(cors);
 
-        // Extract dev API configuration before building the merged router.
-        let dev_router = {
-            let token = self.state.dev_token.clone();
-            token.map(|t| crate::dev_api::dev_router(Arc::clone(&self.state), t))
-        };
+        let dev_router = self
+            .state
+            .dev_token
+            .clone()
+            .map(|t| crate::dev_api::dev_router(Arc::clone(&self.state), t));
         let dev_bind_addr = self.state.dev_bind_addr;
         let tls_config = self.state.tls_config.clone();
-
-        // Extract HTTP/3 config before destructuring self.
         #[cfg(feature = "http3")]
         let http3_config = self.http3_config;
 
-        // Destructure self so we own the relay handle and state directly.
+        let bridge = crate::bridge_handlers::bridge_router(Arc::clone(&self.state.bridge_state));
         let relay = self.relay;
         let state = self.state;
 
         // SCP routes take precedence: merge them last so they override
-        // any conflicting paths in app_router.
-        let merged = app_router
-            .merge(well_known)
-            .merge(relay_rt)
-            .merge(projection);
+        // any conflicting paths in app_router. ACME challenge router is
+        // included for renewal support (issue #305).
+        let merged = build_merged_router(
+            app_router,
+            well_known,
+            relay_rt,
+            projection,
+            bridge,
+            state.acme_challenges.as_ref(),
+        );
 
         let dev_api_handle = spawn_dev_api(dev_router, dev_bind_addr, state.shutdown_token.clone());
 
@@ -565,55 +612,26 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
             spawn_http3_listener(http3_config, &state);
         }
 
-        let bind_addr = state.http_bind_addr;
-
-        let listener = tokio::net::TcpListener::bind(bind_addr)
+        let listener = tokio::net::TcpListener::bind(state.http_bind_addr)
             .await
             .map_err(|e| NodeError::Serve(e.to_string()))?;
-
         let local_addr = listener
             .local_addr()
             .map_err(|e| NodeError::Serve(e.to_string()))?;
-
-        // Wire the caller-provided shutdown future to the node's cancellation
-        // token so that both the main server and the dev API shut down together.
         let shutdown_token = state.shutdown_token.clone();
-        {
-            let token = shutdown_token.clone();
-            tokio::spawn(async move {
-                shutdown.await;
-                token.cancel();
-            });
-        }
+        let token = shutdown_token.clone();
+        tokio::spawn(async move {
+            shutdown.await;
+            token.cancel();
+        });
 
-        // Branch: TLS-terminated HTTPS or plain HTTP.
-        let main_server: std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(), NodeError>> + Send>,
-        > = if let Some(tls_cfg) = tls_config {
-            let scheme = "HTTPS";
-            tracing::info!(
-                addr = %local_addr, %scheme,
-                "application node server started (TLS active, broadcast projection endpoints active)"
-            );
-            Box::pin(tls::serve_tls(
-                listener,
-                tls_cfg,
-                merged,
-                shutdown_token.clone(),
-            ))
-        } else {
-            tracing::info!(
-                addr = %local_addr, scheme = "HTTP",
-                "application node server started (plain HTTP, broadcast projection endpoints active)"
-            );
-            let token = shutdown_token.clone();
-            Box::pin(async move {
-                axum::serve(listener, merged)
-                    .with_graceful_shutdown(token.cancelled_owned())
-                    .await
-                    .map_err(|e| NodeError::Serve(e.to_string()))
-            })
-        };
+        let main_server = build_main_server(
+            listener,
+            merged,
+            tls_config,
+            shutdown_token.clone(),
+            local_addr,
+        );
 
         // If a dev API task is running, select! on both: if either exits
         // early we propagate the result. This ensures a dev API bind
@@ -663,6 +681,33 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
 // Dev API spawning (extracted for clippy::too_many_lines)
 // ---------------------------------------------------------------------------
 
+/// Builds the merged axum router for `serve()`, combining SCP protocol
+/// routes (well-known, relay, projection, ACME challenges) with the
+/// application router. Extracted from `serve()` for clippy line limits.
+fn build_merged_router(
+    app_router: Router,
+    well_known: Router,
+    relay_rt: Router,
+    projection: Router,
+    bridge: Router,
+    acme_challenges: Option<&Arc<RwLock<HashMap<String, String>>>>,
+) -> Router {
+    let merged = app_router
+        .merge(well_known)
+        .merge(relay_rt)
+        .merge(projection)
+        .merge(bridge);
+
+    // Mount ACME challenge router for renewal challenges (issue #305).
+    // Serves `GET /.well-known/acme-challenge/{token}` so the ACME CA can
+    // validate domain ownership during certificate renewal.
+    if let Some(challenges) = acme_challenges {
+        merged.merge(tls::acme_challenge_router(Arc::clone(challenges)))
+    } else {
+        merged
+    }
+}
+
 /// Spawns the dev API listener if configured.
 ///
 /// Returns a `JoinHandle` so the caller can detect early exit (e.g., bind
@@ -688,6 +733,41 @@ fn spawn_dev_api(
             .await
             .map_err(|e| NodeError::Serve(format!("dev API server error: {e}")))
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Main server construction (extracted for clippy::too_many_lines)
+// ---------------------------------------------------------------------------
+
+/// Builds the main server future, branching on TLS configuration.
+///
+/// Returns a boxed future that resolves when the server shuts down.
+/// Extracted from `serve()` for clippy line limits.
+fn build_main_server(
+    listener: tokio::net::TcpListener,
+    merged: Router,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    shutdown_token: CancellationToken,
+    local_addr: SocketAddr,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), NodeError>> + Send>> {
+    if let Some(tls_cfg) = tls_config {
+        tracing::info!(
+            addr = %local_addr, scheme = "HTTPS",
+            "application node server started (TLS active)"
+        );
+        Box::pin(tls::serve_tls(listener, tls_cfg, merged, shutdown_token))
+    } else {
+        tracing::info!(
+            addr = %local_addr, scheme = "HTTP",
+            "application node server started (plain HTTP, broadcast projection endpoints active)"
+        );
+        Box::pin(async move {
+            axum::serve(listener, merged)
+                .with_graceful_shutdown(shutdown_token.cancelled_owned())
+                .await
+                .map_err(|e| NodeError::Serve(e.to_string()))
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -755,6 +835,19 @@ mod tests {
             ),
             tls_config: None,
             cert_resolver: None,
+            did_document: scp_identity::document::DidDocument {
+                context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+                id: "did:dht:cors_test".to_owned(),
+                verification_method: vec![],
+                authentication: vec![],
+                assertion_method: vec![],
+                also_known_as: vec![],
+                service: vec![],
+            },
+            connection_tracker: scp_transport::relay::rate_limit::new_connection_tracker(),
+            subscription_registry: scp_transport::relay::subscription::new_registry(),
+            acme_challenges: None,
+            bridge_state: Arc::new(crate::bridge_handlers::BridgeState::new()),
         })
     }
 

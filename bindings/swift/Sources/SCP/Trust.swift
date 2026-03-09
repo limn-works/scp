@@ -4,6 +4,15 @@ import Foundation
 //   subjectDid, contextId, verifiedAttestationCount, participationCount,
 //   triggeredConsequences, evaluatedAt
 //
+// TrustScoreResult is defined by UniFFI in ScpBindings.swift as a struct with:
+//   messageCount, governanceCount, compositeScore
+//
+// AttestationVerificationResult is defined by UniFFI in ScpBindings.swift as a struct with:
+//   valid, chainDepth, errorMessage
+//
+// ChallengeResult is defined by UniFFI in ScpBindings.swift as a struct with:
+//   challengeId, challengeJson
+//
 // TrustEvaluation and BehavioralRecord are pure Swift convenience types
 // that compose trust data from multiple sources.
 
@@ -18,7 +27,7 @@ import Foundation
 ///
 /// - ADR-017 (Trust Model) in `.docs/adrs/phase-4.md`
 /// - `.docs/sketch.md` section 5 "Trust & Capabilities"
-/// - Story SCP-221
+/// - Story SCP-221, #331
 public nonisolated struct TrustEvaluation: Sendable {
 
     // MARK: - Layer 1: Protocol Enforcement
@@ -86,14 +95,42 @@ public nonisolated struct TrustEvaluation: Sendable {
         self.notRevoked = true
         self.behavioralRecord = BehavioralRecord(
             contextsParticipated: Int(input.participationCount),
+            // TrustInput provides participation count and consequence count only.
+            // Duration, tool invocations, and role transitions require event log
+            // queries not exposed in the current UniFFI bridge.
             totalDurationSecs: 0,
-            governanceActionsAgainst: 0,
+            governanceActionsAgainst: Int(input.triggeredConsequences),
             toolInvocations: 0,
             roleTransitions: 0
         )
         self.verifiedAttestationCount = Int(input.verifiedAttestationCount)
         self.challengeResultCount = 0
         self.consequenceRuleCount = Int(input.triggeredConsequences)
+    }
+
+    /// Creates a ``TrustEvaluation`` from a UniFFI ``TrustScoreResult``.
+    ///
+    /// Maps the participation-based trust score to the four-layer model.
+    /// Protocol enforcement fields (Layer 1) default to `true` since the
+    /// Rust engine enforces these mechanically.
+    internal init(from score: TrustScoreResult) {
+        self.tokensValid = true
+        self.signaturesValid = true
+        self.withinCeiling = true
+        self.notRevoked = true
+        self.behavioralRecord = BehavioralRecord(
+            // TrustScoreResult provides message_count and governance_count only.
+            // Context participation count requires cross-context event log queries
+            // not exposed in the current UniFFI bridge.
+            contextsParticipated: 0,
+            totalDurationSecs: 0,
+            governanceActionsAgainst: Int(score.governanceCount),
+            toolInvocations: 0,
+            roleTransitions: 0
+        )
+        self.verifiedAttestationCount = 0
+        self.challengeResultCount = 0
+        self.consequenceRuleCount = 0
     }
 }
 
@@ -139,13 +176,8 @@ public nonisolated struct BehavioralRecord: Sendable {
 
 /// Namespace for trust evaluation bridge function references.
 ///
-/// Trust evaluation is a composed operation: it queries event log data and
-/// UCAN validation results to build a ``TrustEvaluation``. The UniFFI
-/// ``TrustInput`` record provides the raw data; the Swift layer structures
-/// it into the four-layer model.
-///
-/// No single UniFFI bridge function exists for trust evaluation (it composes
-/// multiple bridge calls). The injectable bridge pattern allows testing with
+/// Trust evaluation composes multiple UniFFI bridge calls to build a
+/// ``TrustEvaluation``. The injectable bridge pattern allows testing with
 /// mock inputs.
 ///
 /// See ADR-017 for the trust model and ADR-026 for the delegation pattern.
@@ -156,20 +188,57 @@ internal enum TrustBridge {
         _ contextId: String
     ) async throws -> TrustEvaluation
 
-    /// Default evaluate function that constructs a TrustInput and maps it.
-    /// The Rust engine does not yet expose a single trust evaluation bridge
-    /// function, so this constructs the evaluation from the TrustInput record
-    /// fields available via UniFFI.
+    /// Query participation-based trust score for a DID in a context.
+    internal typealias QueryScoreFn = @Sendable (
+        _ did: String,
+        _ contextId: String
+    ) throws -> TrustScoreResult
+
+    /// Verify an attestation's Ed25519 signature, evidence, expiry, and
+    /// revocation status.
+    internal typealias VerifyAttestationFn = @Sendable (
+        _ attestationJson: String
+    ) throws -> AttestationVerificationResult
+
+    /// Create a challenge request for capability verification.
+    internal typealias CreateChallengeFn = @Sendable (
+        _ targetDid: String
+    ) throws -> ChallengeResult
+
+    /// Verify a challenge response against its original challenge request.
+    internal typealias VerifyResponseFn = @Sendable (
+        _ challengeJson: String,
+        _ responseJson: String
+    ) throws -> Bool
+
+    /// Default evaluate function that delegates to the UniFFI
+    /// ``trustQueryScore`` bridge function.
     internal static let defaultEvaluate: EvaluateFn = { subjectDid, contextId in
-        let input = TrustInput(
-            subjectDid: subjectDid,
-            contextId: contextId,
-            verifiedAttestationCount: 0,
-            participationCount: 0,
-            triggeredConsequences: 0,
-            evaluatedAt: UInt64(Date().timeIntervalSince1970)
-        )
-        return TrustEvaluation(from: input)
+        let score = try trustQueryScore(did: subjectDid, contextId: contextId)
+        return TrustEvaluation(from: score)
+    }
+
+    /// Default query score function — delegates to UniFFI ``trustQueryScore``.
+    internal static let defaultQueryScore: QueryScoreFn = { did, contextId in
+        try trustQueryScore(did: did, contextId: contextId)
+    }
+
+    /// Default verify attestation function — delegates to UniFFI
+    /// ``trustVerifyAttestation``.
+    internal static let defaultVerifyAttestation: VerifyAttestationFn = { attestationJson in
+        try trustVerifyAttestation(attestationJson: attestationJson)
+    }
+
+    /// Default create challenge function — delegates to UniFFI
+    /// ``trustCreateChallenge``.
+    internal static let defaultCreateChallenge: CreateChallengeFn = { targetDid in
+        try trustCreateChallenge(targetDid: targetDid)
+    }
+
+    /// Default verify response function — delegates to UniFFI
+    /// ``trustVerifyResponse``.
+    internal static let defaultVerifyResponse: VerifyResponseFn = { challengeJson, responseJson in
+        try trustVerifyResponse(challengeJson: challengeJson, responseJson: responseJson)
     }
 }
 
@@ -186,17 +255,121 @@ internal enum TrustBridge {
 ///   - contextId: The context ID in which the evaluation is performed.
 ///   - evaluateFn: Bridge function override for testing.
 /// - Returns: A ``TrustEvaluation`` with facts from all four trust layers.
-/// - Throws: ``ScpError/Validation(message:code:)`` if evaluation fails.
+/// - Throws: ``ScpError`` if evaluation fails.
 ///
 /// ## Provenance
 ///
 /// - ADR-017 (Trust Model) in `.docs/adrs/phase-4.md`
 /// - `.docs/sketch.md` section 5 "Trust & Capabilities"
-/// - Story SCP-221
+/// - Story SCP-221, #331
 public func evaluateTrust(
     subjectDid: String,
     contextId: String,
     evaluateFn: TrustBridge.EvaluateFn = TrustBridge.defaultEvaluate
 ) async throws -> TrustEvaluation {
     try await evaluateFn(subjectDid, contextId)
+}
+
+/// Queries participation-based trust score for a DID within a context.
+///
+/// Returns a ``TrustScoreResult`` containing message count, governance
+/// action count, and a normalized composite score (0.0-1.0). The score
+/// is participation-based, not a judgment — agents apply their own
+/// criteria to these inputs.
+///
+/// Delegates to the UniFFI ``trustQueryScore`` bridge function.
+///
+/// - Parameters:
+///   - did: The DID of the subject being scored.
+///   - contextId: The context ID in which the score is queried.
+///   - queryScoreFn: Bridge function override for testing.
+/// - Returns: A ``TrustScoreResult`` with participation metrics.
+/// - Throws: ``ScpError`` if the query fails.
+///
+/// ## Provenance
+///
+/// - ADR-017 Layer 2 in `.docs/adrs/phase-4.md`
+/// - Story #331
+public func queryTrustScore(
+    did: String,
+    contextId: String,
+    queryScoreFn: TrustBridge.QueryScoreFn = TrustBridge.defaultQueryScore
+) throws -> TrustScoreResult {
+    try queryScoreFn(did, contextId)
+}
+
+/// Verifies an attestation's Ed25519 signature, evidence, expiry, and
+/// revocation status.
+///
+/// Returns an ``AttestationVerificationResult`` indicating whether the
+/// attestation is valid, the chain depth, and an error message if invalid.
+///
+/// Delegates to the UniFFI ``trustVerifyAttestation`` bridge function.
+///
+/// - Parameters:
+///   - attestationJson: The attestation as a serialized JSON string.
+///   - verifyAttestationFn: Bridge function override for testing.
+/// - Returns: An ``AttestationVerificationResult``.
+/// - Throws: ``ScpError`` if verification fails (e.g., invalid JSON).
+///
+/// ## Provenance
+///
+/// - ADR-017 Layer 3 in `.docs/adrs/phase-4.md`
+/// - Story #331
+public func verifyAttestation(
+    attestationJson: String,
+    verifyAttestationFn: TrustBridge.VerifyAttestationFn = TrustBridge.defaultVerifyAttestation
+) throws -> AttestationVerificationResult {
+    try verifyAttestationFn(attestationJson)
+}
+
+/// Creates a challenge request for capability verification.
+///
+/// Generates an ephemeral Ed25519 keypair, constructs a challenge request
+/// targeting the specified DID, and returns the challenge ID and serialized
+/// challenge JSON.
+///
+/// Delegates to the UniFFI ``trustCreateChallenge`` bridge function.
+///
+/// - Parameters:
+///   - targetDid: The DID of the entity being challenged.
+///   - createChallengeFn: Bridge function override for testing.
+/// - Returns: A ``ChallengeResult`` with the challenge ID and JSON payload.
+/// - Throws: ``ScpError`` if challenge creation fails.
+///
+/// ## Provenance
+///
+/// - ADR-017 Layer 3 (Challenge-Response) in `.docs/adrs/phase-4.md`
+/// - Story #331
+public func createChallenge(
+    targetDid: String,
+    createChallengeFn: TrustBridge.CreateChallengeFn = TrustBridge.defaultCreateChallenge
+) throws -> ChallengeResult {
+    try createChallengeFn(targetDid)
+}
+
+/// Verifies a challenge response against its original challenge request.
+///
+/// Checks that the response correctly answers the challenge, including
+/// signature verification and challenge ID matching.
+///
+/// Delegates to the UniFFI ``trustVerifyResponse`` bridge function.
+///
+/// - Parameters:
+///   - challengeJson: The original challenge request as serialized JSON.
+///   - responseJson: The response to verify as serialized JSON.
+///   - verifyResponseFn: Bridge function override for testing.
+/// - Returns: `true` if the response is valid, `false` otherwise.
+/// - Throws: ``ScpError`` if verification fails (e.g., invalid JSON).
+///
+/// ## Provenance
+///
+/// - ADR-017 Layer 3 (Challenge-Response) in `.docs/adrs/phase-4.md`
+/// - Story #331
+public func verifyChallengeResponse(
+    challengeJson: String,
+    responseJson: String,
+    verifyResponseFn: TrustBridge.VerifyResponseFn = TrustBridge.defaultVerifyResponse
+) throws -> Bool {
+    try verifyResponseFn(challengeJson, responseJson)
 }

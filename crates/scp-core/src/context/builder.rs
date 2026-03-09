@@ -132,17 +132,39 @@ pub trait ContextCryptoProvider: Send + Sync {
 
     /// Validates a joiner's key package.
     ///
+    /// # Arguments
+    ///
+    /// * `owner_did` - The DID of the key package owner.
+    /// * `key_package_bytes` - Optional TLS-serialized MLS `KeyPackage` bytes.
+    ///   `None` for mock providers; production providers require `Some`.
+    ///
     /// # Errors
     ///
     /// Returns [`ContextError::InvalidKeyPackage`] if the key package is invalid.
-    fn validate_key_package(&self, owner_did: &str) -> Result<(), ContextError>;
+    fn validate_key_package(
+        &self,
+        owner_did: &str,
+        key_package_bytes: Option<&[u8]>,
+    ) -> Result<(), ContextError>;
 
     /// Adds a member to the MLS group (ADR-001 `add_member()`).
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` - The 32-byte context identifier.
+    /// * `member_did` - The DID of the member to add.
+    /// * `key_package_bytes` - Optional TLS-serialized MLS `KeyPackage` bytes.
+    ///   `None` for mock providers; production providers require `Some`.
     ///
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if the MLS operation fails.
-    fn add_member(&self, context_id: &[u8; 32], member_did: &str) -> Result<(), ContextError>;
+    fn add_member(
+        &self,
+        context_id: &[u8; 32],
+        member_did: &str,
+        key_package_bytes: Option<&[u8]>,
+    ) -> Result<(), ContextError>;
 
     /// Removes a member from the MLS group (ADR-001 `remove_member()`).
     ///
@@ -173,8 +195,84 @@ pub trait ContextCryptoProvider: Send + Sync {
         member_did: &str,
     ) -> Result<(), ContextError>;
 
+    /// Drains pending sender key distribution messages for a context.
+    ///
+    /// Returns `(target_did, serialized_message)` pairs that should be
+    /// delivered to the target members via transport. Each message is a
+    /// serialized [`SenderKeyDistributionMessage::KeyResponse`] containing
+    /// an HPKE-sealed sender key.
+    ///
+    /// The default implementation returns an empty vector (no pending
+    /// distributions). Production providers that HPKE-seal sender keys
+    /// during [`distribute_sender_key`](Self::distribute_sender_key) should
+    /// override this to drain their pending queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if the internal lock is
+    /// poisoned.
+    fn drain_pending_sender_key_messages(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<Vec<(String, Vec<u8>)>, ContextError> {
+        Ok(Vec::new())
+    }
+
+    /// Processes an incoming sender key distribution message from a remote
+    /// member.
+    ///
+    /// Deserializes the message, extracts the sender key, and stores it in
+    /// the local sender key store so subsequent messages from `sender_did`
+    /// can be decrypted.
+    ///
+    /// The default implementation is a no-op. Production providers that
+    /// support HPKE sender key distribution should override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if deserialization, HPKE
+    /// decryption, or storage fails.
+    fn process_incoming_sender_key(
+        &self,
+        _context_id: &[u8; 32],
+        _sender_did: &str,
+        _message_bytes: &[u8],
+    ) -> Result<(), ContextError> {
+        Ok(())
+    }
+
+    /// Handles an incoming sender key request from a remote member.
+    ///
+    /// Verifies the request, checks replay protection, and HPKE-seals the
+    /// local sender key to the requester's wrapping pubkey.
+    ///
+    /// Returns `Some(serialized_response)` if the requester should receive
+    /// a key, or `None` if the request was silently dropped (e.g., blocked).
+    ///
+    /// The default implementation returns an error indicating the provider
+    /// does not support sender key request handling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if signature verification,
+    /// HPKE encryption, or serialization fails.
+    fn handle_sender_key_request(
+        &self,
+        _context_id: &[u8; 32],
+        _request_bytes: &[u8],
+        _requester_public_key: &[u8],
+    ) -> Result<Option<Vec<u8>>, ContextError> {
+        Err(ContextError::CryptoFailed(
+            "sender key request handling not supported by this provider".to_string(),
+        ))
+    }
+
     /// Encrypts a payload with sender key (ADR-007), wraps in inner envelope
     /// (ADR-002), encrypts with MLS (ADR-001), wraps in outer envelope.
+    ///
+    /// `epoch` and `sequence` are bound as Additional Authenticated Data
+    /// (AAD) in the sender-key AES-256-GCM layer to prevent ciphertext
+    /// relocation across contexts, epochs, and sequence positions.
     ///
     /// # Errors
     ///
@@ -184,6 +282,8 @@ pub trait ContextCryptoProvider: Send + Sync {
         context_id: &[u8; 32],
         sender_did: &str,
         payload: &[u8],
+        epoch: u64,
+        sequence: u64,
     ) -> Result<Vec<u8>, ContextError>;
 }
 
@@ -268,6 +368,57 @@ pub trait ContextEventLogProvider: Send + Sync {
     fn append_context_event(&self, context_id: &[u8; 32], event: &str) -> Result<(), ContextError> {
         self.append_event(context_id, event)
             .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    }
+
+    // -- Export/import for context state portability (#363) -------------------
+
+    /// Exports the event log entries for a context as serialized bytes
+    /// (MessagePack-encoded `Vec<EventLogEntry>`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if the context has no event
+    /// log or serialization fails.
+    fn export_event_log_data(&self, context_id: &[u8; 32]) -> Result<Vec<u8>, ContextError> {
+        let _ = context_id;
+        Err(ContextError::EventLogFailed(
+            "event log export not supported by this provider".into(),
+        ))
+    }
+
+    /// Imports serialized event log entries into this provider, replacing
+    /// any existing log for the context. The implementation must verify
+    /// Merkle chain integrity before accepting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if deserialization fails or
+    /// the Merkle chain is broken.
+    fn import_event_log_data(
+        &self,
+        context_id: &[u8; 32],
+        data: &[u8],
+    ) -> Result<(), ContextError> {
+        let _ = (context_id, data);
+        Err(ContextError::EventLogFailed(
+            "event log import not supported by this provider".into(),
+        ))
+    }
+
+    /// Returns the Merkle root hash of the event log for a context.
+    ///
+    /// Returns all zeros if the log is empty. Returns an error if no log
+    /// exists for the context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if the provider does not
+    /// support Merkle root computation.
+    fn event_log_merkle_root(&self, context_id: &[u8; 32]) -> Result<[u8; 32], ContextError> {
+        let _ = context_id;
+        Err(ContextError::EventLogFailed(
+            "merkle root not supported by this provider".into(),
+        ))
     }
 }
 
@@ -412,13 +563,24 @@ impl CreationReceipt {
 /// Returns [`ContextCreationError::TemplateValidationFailed`] if a template
 /// is specified and the params do not match the template definition.
 fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
-    // Governance model must be set (currently only SingleAdmin is supported).
-    // ContextParams always has a governance field, so this is a placeholder
-    // for future governance model validation.
+    // Governance model validation (SCP-267, ADR-031).
+    // GovernanceModel is a variant-only enum in ContextParams. Structural
+    // validation (e.g., threshold bounds, signer counts) happens in the
+    // ContextManager's create_context/create_context_with_governance methods
+    // where the rich GovernanceModelConfig is available. Here we validate
+    // only that the governance field is set (it always is — enforced by the
+    // type system, since GovernanceModel has no Option wrapper).
+    let _ = &params.governance; // field presence guaranteed by the type
 
     // Validate ceiling policy / ceiling consistency: if ceiling is empty and
     // policy is Governed, that is technically valid (no capabilities to
     // narrow). No structural constraint to enforce here.
+
+    // Validate memory scope is permitted for the context mode (§5.11).
+    // Broadcast contexts only support MemoryScope::Full — Ephemeral and
+    // Summary require MLS group state destruction which broadcast mode lacks.
+    super::memory_scope::validate_memory_scope_for_broadcast(params.mode, params.memory_scope)
+        .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
 
     // If a template is specified, validate all params match the template
     // definition exactly.
@@ -663,7 +825,11 @@ mod tests {
             Ok(())
         }
 
-        fn validate_key_package(&self, _owner_did: &str) -> Result<(), ContextError> {
+        fn validate_key_package(
+            &self,
+            _owner_did: &str,
+            _key_package_bytes: Option<&[u8]>,
+        ) -> Result<(), ContextError> {
             Ok(())
         }
 
@@ -671,6 +837,7 @@ mod tests {
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
+            _key_package_bytes: Option<&[u8]>,
         ) -> Result<(), ContextError> {
             Ok(())
         }
@@ -704,6 +871,8 @@ mod tests {
             _context_id: &[u8; 32],
             _sender_did: &str,
             payload: &[u8],
+            _epoch: u64,
+            _sequence: u64,
         ) -> Result<Vec<u8>, ContextError> {
             Ok(payload.to_vec())
         }
@@ -848,6 +1017,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ..ContextParams::default()
         };
 
@@ -1003,6 +1173,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ..ContextParams::default()
         };
 
@@ -1202,6 +1373,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
             ..ContextParams::default()
         };
 
@@ -1406,6 +1578,10 @@ mod tests {
         let event_log = MockEventLogProvider::default();
 
         // BilateralEphemeral expects Encrypted mode; switch to Broadcast.
+        // This now fails at broadcast scope validation (§5.11) because
+        // BilateralEphemeral has Ephemeral memory scope, which is invalid
+        // for broadcast contexts. The scope validation runs before template
+        // validation, so CreationFailed is the expected error.
         let mut params = template_params(&TemplateId::BilateralEphemeral);
         params.ttl = Some(Duration::from_secs(300));
         params.mode = ContextMode::Broadcast;
@@ -1422,7 +1598,7 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            ContextCreationError::TemplateValidationFailed(_)
+            ContextCreationError::CreationFailed(msg) if msg.contains("MemoryScope::Full")
         ));
 
         // No side effects.
@@ -1442,6 +1618,102 @@ mod tests {
 
         let result = create_context(
             "ctx-no-template".into(),
+            params,
+            &crypto,
+            &transport,
+            &event_log,
+        )
+        .await;
+
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Broadcast context scope restriction (#337, §5.11)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn create_broadcast_context_with_ephemeral_scope_rejected() {
+        let crypto = MockCryptoProvider::default();
+        let transport = MockTransportProvider::connected();
+        let event_log = MockEventLogProvider::default();
+
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Ephemeral,
+            ..ContextParams::default()
+        };
+
+        let result =
+            create_context("ctx-bc-eph".into(), params, &crypto, &transport, &event_log).await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ContextCreationError::CreationFailed(msg) if msg.contains("MemoryScope::Full")
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_broadcast_context_with_summary_scope_rejected() {
+        let crypto = MockCryptoProvider::default();
+        let transport = MockTransportProvider::connected();
+        let event_log = MockEventLogProvider::default();
+
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Summary,
+            ..ContextParams::default()
+        };
+
+        let result =
+            create_context("ctx-bc-sum".into(), params, &crypto, &transport, &event_log).await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ContextCreationError::CreationFailed(msg) if msg.contains("MemoryScope::Full")
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_broadcast_context_with_full_scope_succeeds() {
+        let crypto = MockCryptoProvider::default();
+        let transport = MockTransportProvider::connected();
+        let event_log = MockEventLogProvider::default();
+
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
+            ..ContextParams::default()
+        };
+
+        let result = create_context(
+            "ctx-bc-full".into(),
+            params,
+            &crypto,
+            &transport,
+            &event_log,
+        )
+        .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn create_encrypted_context_with_ephemeral_scope_succeeds() {
+        let crypto = MockCryptoProvider::default();
+        let transport = MockTransportProvider::connected();
+        let event_log = MockEventLogProvider::default();
+
+        let params = ContextParams {
+            mode: ContextMode::Encrypted,
+            memory_scope: crate::context::MemoryScope::Ephemeral,
+            ..ContextParams::default()
+        };
+
+        let result = create_context(
+            "ctx-enc-eph".into(),
             params,
             &crypto,
             &transport,

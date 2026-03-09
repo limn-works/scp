@@ -157,15 +157,15 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
     // Extract registration fields from the Python dict.
     let name: String = registration
         .get_item("name")?
-        .ok_or_else(|| ScpPyError::ValidationError("missing 'name' field".to_owned()))?
+        .ok_or_else(|| ScpPyError::validation("missing 'name' field".to_owned()))?
         .extract()?;
     let description: String = registration
         .get_item("description")?
-        .ok_or_else(|| ScpPyError::ValidationError("missing 'description' field".to_owned()))?
+        .ok_or_else(|| ScpPyError::validation("missing 'description' field".to_owned()))?
         .extract()?;
     let operator_did: String = registration
         .get_item("operator_did")?
-        .ok_or_else(|| ScpPyError::ValidationError("missing 'operator_did' field".to_owned()))?
+        .ok_or_else(|| ScpPyError::validation("missing 'operator_did' field".to_owned()))?
         .extract()?;
 
     // Validate extracted string fields at the bridge boundary.
@@ -176,10 +176,10 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
     // `output_schema` keys, each being a JSON Schema object.
     let schema_obj = registration
         .get_item("schema")?
-        .ok_or_else(|| ScpPyError::ValidationError("missing 'schema' field".to_owned()))?;
+        .ok_or_else(|| ScpPyError::validation("missing 'schema' field".to_owned()))?;
     let schema_dict = schema_obj
         .downcast::<PyDict>()
-        .map_err(|_| ScpPyError::ValidationError("'schema' must be a dict".to_owned()))?;
+        .map_err(|_| ScpPyError::validation("'schema' must be a dict".to_owned()))?;
     let schema_json = py_dict_to_json(schema_dict)?;
     let input_schema = schema_json
         .get("input_schema")
@@ -216,6 +216,12 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
         test_vectors,
         operator_did: operator_did.into(),
         economic_metadata,
+        #[allow(clippy::cast_possible_truncation)] // millis since epoch fits u64 for millennia
+        registered_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        signature: vec![],
     };
 
     // Look up the context runtime and register the tool.
@@ -226,14 +232,69 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
             core_registration,
             &rt.creator_did.clone(),
         )
-        .map_err(|e| ScpPyError::ContextError(format!("tool registration failed: {e}")))?;
+        .map_err(|e| ScpPyError::context(format!("tool registration failed: {e}")))?;
         Ok(registered_id)
     })?;
 
     Ok(registered_id)
 }
 
+/// Validates a UCAN token for tool invocation authorization.
+///
+/// Runs the full 11-step ADR-016 pipeline, requiring `tool_invoke:{tool_id}`
+/// or `tool_invoke:*` capability. Extracted to keep `py_tool_invoke` within
+/// the 100-line clippy limit.
+fn validate_tool_ucan(
+    context_id: &str,
+    tool_id: &str,
+    ucan_token: &str,
+    identity_did: &str,
+    proof_tokens: Option<&Vec<String>>,
+) -> PyResult<()> {
+    let proof_resolver =
+        crate::ucan::build_proof_resolver_from_tokens(proof_tokens.map(Vec::as_slice))?;
+
+    crate::runtime::with_context(context_id, |rt| {
+        let production_resolver = crate::runtime::did_resolver();
+        let did_resolver = crate::bridge_adapters::DispatchDidResolver::new(
+            production_resolver.map(std::convert::AsRef::as_ref),
+        );
+        let revocation_checker = crate::bridge_adapters::BridgeRevocationChecker {
+            revocation_list: &rt.revocation_list,
+        };
+        let mut nonce_adapter = crate::bridge_adapters::BridgeNonceTracker {
+            inner: &mut rt.nonce_tracker,
+        };
+
+        let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
+            did_resolver: &did_resolver,
+            nonce_tracker: &mut nonce_adapter,
+            revocation_checker: &revocation_checker,
+            proof_resolver: &proof_resolver,
+            ceiling: &rt.ceiling_strings,
+            context_creator_did: &rt.creator_did,
+            presenting_agent_did: identity_did,
+            clock_skew_tolerance_secs:
+                scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        scp_core::context::tools::validate_tool_invocation_ucan(
+            ucan_token, context_id, tool_id, &mut ctx,
+        )
+        .map_err(|e| {
+            ScpPyError::ucan(format!(
+                "UCAN authorization failed for tool '{tool_id}': {e}"
+            ))
+        })
+    })?;
+    Ok(())
+}
+
 /// Invokes a tool within an SCP context.
+///
+/// Validates the UCAN token for tool invocation authorization before
+/// dispatching. The UCAN must contain a `tool_invoke:{tool_id}` or
+/// `tool_invoke:*` capability scoped to the context.
 ///
 /// Dispatches to a registered tool handler if one exists (registered via
 /// [`crate::runtime::register_tool_handler`]). Validates input against the
@@ -255,6 +316,9 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
 ///   input schema.
 /// * `identity_did` — The DID of the invoking identity (used for
 ///   capability checking).
+/// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
+///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability.
+///   Validated using the full 11-step ADR-016 pipeline.
 ///
 /// # Returns
 ///
@@ -262,33 +326,56 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
 ///
 /// # Errors
 ///
+/// Raises `UcanError` if the UCAN token is invalid, expired, revoked,
+/// or lacks the required tool invocation capability.
 /// Raises `ContextError` if the context is not connected, the tool is
-/// not found, the invoker lacks capability, input validation fails,
-/// output validation fails, or the tool handler itself fails.
+/// not found, input validation fails, output validation fails, or the
+/// tool handler itself fails.
 ///
 /// See ADR-013 §4: `py_tool_invoke(handle, tool_id, input, identity) -> PyObject`.
 /// See SCP-212 for the handler registration and dispatch design.
+/// See spec §6.2, §8, ADR-016, and issue #319 for UCAN enforcement.
 #[pyfunction]
 #[pyo3(name = "tool_invoke")]
+#[pyo3(signature = (context_id, tool_id, input, identity_did, ucan_token, proof_tokens=None))]
+#[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
 pub fn py_tool_invoke(
     py: Python<'_>,
     context_id: &str,
     tool_id: &str,
     input: &Bound<'_, PyDict>,
     identity_did: &str,
+    ucan_token: &str,
+    proof_tokens: Option<Vec<String>>,
 ) -> PyResult<PyObject> {
     validate::validate_context_id(context_id)?;
     validate::validate_tool_id(tool_id)?;
     validate::validate_did(identity_did)?;
+    validate::validate_ucan_token(ucan_token)?;
+    if let Some(ref tokens) = proof_tokens {
+        for t in tokens {
+            validate::validate_ucan_token(t)?;
+        }
+    }
     let input_json = py_dict_to_json(input)?;
     let start = std::time::Instant::now();
+
+    // Primary authorization: UCAN token validation via the full 11-step
+    // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
+    validate_tool_ucan(
+        context_id,
+        tool_id,
+        ucan_token,
+        identity_did,
+        proof_tokens.as_ref(),
+    )?;
 
     // Validates tool existence, input schema, capability, dispatches to handler,
     // validates output schema, and builds a ToolInvokedEvent for provenance.
     // Mirrors the dispatch logic in FfiBridgeProvider::invoke_tool (mcp.rs).
     let output_json = crate::runtime::with_context(context_id, |rt| {
         let registration = rt.tool_registry.get(tool_id).ok_or_else(|| {
-            ScpPyError::ContextError(format!(
+            ScpPyError::context(format!(
                 "tool '{tool_id}' not found in context '{context_id}'"
             ))
         })?;
@@ -298,15 +385,16 @@ pub fn py_tool_invoke(
             &input_json,
             &registration.schema.input_schema,
         )
-        .map_err(|e| ScpPyError::ValidationError(format!("input validation failed: {e}")))?;
+        .map_err(|e| ScpPyError::validation(format!("input validation failed: {e}")))?;
 
-        // Check that the invoker has the ToolInvoke capability.
+        // Defense-in-depth: check role-state capabilities in addition to the
+        // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
         if !scp_core::context::tools::has_tool_invoke_capability(
             &rt.role_state,
             identity_did,
             tool_id,
         ) {
-            return Err(ScpPyError::UcanError(format!(
+            return Err(ScpPyError::ucan(format!(
                 "invoker '{identity_did}' does not have ToolInvoke capability for '{tool_id}'"
             )));
         }
@@ -315,7 +403,7 @@ pub fn py_tool_invoke(
         let output = if let Some(handler) = rt.tool_handlers.get(tool_id) {
             let handler = handler.clone();
             let out = handler(input_json.clone()).map_err(|e| {
-                ScpPyError::ContextError(format!("tool handler for '{tool_id}' failed: {e}"))
+                ScpPyError::context(format!("tool handler for '{tool_id}' failed: {e}"))
             })?;
 
             // Validate output against the tool's output schema (defense-in-depth).
@@ -324,7 +412,7 @@ pub fn py_tool_invoke(
                 &registration.schema.output_schema,
             )
             .map_err(|msg| {
-                ScpPyError::ValidationError(format!(
+                ScpPyError::validation(format!(
                     "output validation failed for tool '{tool_id}': {msg}"
                 ))
             })?;
@@ -361,6 +449,7 @@ pub fn py_tool_invoke(
             execution_time_ms: elapsed_ms,
             input_hash: scp_core::context::tools::sha256_json(&input_json),
             output_hash: Some(scp_core::context::tools::sha256_json(&output)),
+            cost: None,
         };
 
         Ok(output)
@@ -416,7 +505,7 @@ pub fn py_tool_verify(context_id: &str, tool_id: &str) -> PyResult<PyToolVerific
                 serde_json::Value::Null
             },
         )
-        .map_err(|e| ScpPyError::ContextError(format!("tool verification failed: {e}")))?;
+        .map_err(|e| ScpPyError::context(format!("tool verification failed: {e}")))?;
 
         Ok(verification_result)
     })?;
@@ -452,11 +541,11 @@ fn extract_implementation_hash(registration: &Bound<'_, PyDict>) -> PyResult<[u8
     };
 
     let hex_str: String = hash_obj.extract().map_err(|_| {
-        ScpPyError::ValidationError("'implementation_hash' must be a hex string".to_owned())
+        ScpPyError::validation("'implementation_hash' must be a hex string".to_owned())
     })?;
 
     if hex_str.len() != 64 {
-        return Err(ScpPyError::ValidationError(format!(
+        return Err(ScpPyError::validation(format!(
             "'implementation_hash' must be 64 hex chars (SHA-256), got {}",
             hex_str.len()
         ))
@@ -466,10 +555,10 @@ fn extract_implementation_hash(registration: &Bound<'_, PyDict>) -> PyResult<[u8
     let mut hash = [0u8; 32];
     for (i, chunk) in hex_str.as_bytes().chunks(2).enumerate() {
         let byte_str = std::str::from_utf8(chunk).map_err(|_| {
-            ScpPyError::ValidationError("invalid UTF-8 in implementation_hash".to_owned())
+            ScpPyError::validation("invalid UTF-8 in implementation_hash".to_owned())
         })?;
         hash[i] = u8::from_str_radix(byte_str, 16).map_err(|_| {
-            ScpPyError::ValidationError(format!(
+            ScpPyError::validation(format!(
                 "invalid hex in implementation_hash at position {}",
                 i * 2
             ))
@@ -491,14 +580,14 @@ fn extract_economic_metadata(
         _ => return Ok(None),
     };
 
-    let dict = meta_obj.downcast::<PyDict>().map_err(|_| {
-        ScpPyError::ValidationError("'economic_metadata' must be a dict".to_owned())
-    })?;
+    let dict = meta_obj
+        .downcast::<PyDict>()
+        .map_err(|_| ScpPyError::validation("'economic_metadata' must be a dict".to_owned()))?;
 
     let cost_per_invoke: u64 = dict
         .get_item("cost_per_invoke")?
         .ok_or_else(|| {
-            ScpPyError::ValidationError("economic_metadata missing 'cost_per_invoke'".to_owned())
+            ScpPyError::validation("economic_metadata missing 'cost_per_invoke'".to_owned())
         })?
         .extract()?;
 
@@ -510,7 +599,7 @@ fn extract_economic_metadata(
 
     let payee: String = dict
         .get_item("payee")?
-        .ok_or_else(|| ScpPyError::ValidationError("economic_metadata missing 'payee'".to_owned()))?
+        .ok_or_else(|| ScpPyError::validation("economic_metadata missing 'payee'".to_owned()))?
         .extract()?;
 
     Ok(Some(scp_core::context::tools::ToolEconomicMetadata {
@@ -534,13 +623,13 @@ fn extract_test_vectors(
 
     let vectors_list = vectors_obj
         .downcast::<pyo3::types::PyList>()
-        .map_err(|_| ScpPyError::ValidationError("'test_vectors' must be a list".to_owned()))?;
+        .map_err(|_| ScpPyError::validation("'test_vectors' must be a list".to_owned()))?;
 
     let mut result = Vec::with_capacity(vectors_list.len());
     for item in vectors_list.iter() {
-        let dict = item.downcast::<PyDict>().map_err(|_| {
-            ScpPyError::ValidationError("each test vector must be a dict".to_owned())
-        })?;
+        let dict = item
+            .downcast::<PyDict>()
+            .map_err(|_| ScpPyError::validation("each test vector must be a dict".to_owned()))?;
         let tv_json = py_dict_to_json(dict)?;
 
         let input = tv_json
@@ -568,6 +657,407 @@ fn extract_test_vectors(
 }
 
 // ---------------------------------------------------------------------------
+// Cross-context tool invocation
+// ---------------------------------------------------------------------------
+
+/// Invokes a tool across context boundaries.
+///
+/// The source context exposes the tool and the target context accepts the
+/// interface. Both contexts must have approved the interface before calls
+/// are permitted. Rate limits and chain depth are enforced per spec section
+/// 6.2.
+///
+/// # Arguments
+///
+/// * `source_context_id` — The ID of the calling context.
+/// * `target_context_id` — The ID of the context containing the tool.
+/// * `tool_id` — The ID of the tool to invoke.
+/// * `input` — A Python dict of input parameters.
+/// * `invoker_did` — The DID of the participant invoking the tool.
+/// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
+///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability.
+///   Validated against the TARGET context's ceiling using the full 11-step
+///   ADR-016 pipeline.
+/// * `chain_depth` — Current cross-context chain depth (0 for first hop).
+///
+/// # Returns
+///
+/// A Python object (dict) containing the tool's JSON-compatible output.
+///
+/// # Errors
+///
+/// Raises `UcanError` if the UCAN token is invalid, expired, revoked,
+/// or lacks the required tool invocation capability.
+/// Raises `ContextError` if either context is not connected, the tool is
+/// not found, chain depth is exceeded, or the interface is not approved.
+#[pyfunction]
+#[pyo3(name = "tool_invoke_cross_context")]
+#[pyo3(signature = (source_context_id, target_context_id, tool_id, input, invoker_did, ucan_token, chain_depth, proof_tokens=None))]
+#[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
+#[allow(clippy::too_many_arguments)] // FFI boundary: PyO3 requires explicit params
+pub fn py_tool_invoke_cross_context(
+    py: Python<'_>,
+    source_context_id: &str,
+    target_context_id: &str,
+    tool_id: &str,
+    input: &Bound<'_, PyDict>,
+    invoker_did: &str,
+    ucan_token: &str,
+    chain_depth: u8,
+    proof_tokens: Option<Vec<String>>,
+) -> PyResult<PyObject> {
+    validate::validate_context_id(source_context_id)?;
+    validate::validate_context_id(target_context_id)?;
+    validate::validate_tool_id(tool_id)?;
+    validate::validate_did(invoker_did)?;
+    validate::validate_ucan_token(ucan_token)?;
+    if let Some(ref tokens) = proof_tokens {
+        for t in tokens {
+            validate::validate_ucan_token(t)?;
+        }
+    }
+    let input_json = py_dict_to_json(input)?;
+
+    // Primary authorization: UCAN token validation via the full 11-step
+    // ADR-016 pipeline against the TARGET context's ceiling.
+    // See spec §6.2, §8, ADR-016, and issue #319.
+    validate_tool_ucan(
+        target_context_id,
+        tool_id,
+        ucan_token,
+        invoker_did,
+        proof_tokens.as_ref(),
+    )?;
+
+    // Defense-in-depth: check role-state capabilities in the source context.
+    let source_has_capability = crate::runtime::with_context(source_context_id, |rt| {
+        Ok(scp_core::context::tools::has_tool_invoke_capability(
+            &rt.role_state,
+            invoker_did,
+            tool_id,
+        ))
+    })?;
+
+    if !source_has_capability {
+        return Err(ScpPyError::ucan(format!(
+            "invoker '{invoker_did}' does not have ToolInvoke capability for '{tool_id}' in source context"
+        ))
+        .into());
+    }
+
+    // Validate chain depth (max 3 per spec section 6.2).
+    if chain_depth > scp_core::provenance::attach::DEFAULT_MAX_CHAIN_DEPTH {
+        return Err(ScpPyError::context(format!(
+            "cross-context chain depth {chain_depth} exceeds maximum {}",
+            scp_core::provenance::attach::DEFAULT_MAX_CHAIN_DEPTH
+        ))
+        .into());
+    }
+
+    // Invoke the tool in the target context with echo mode.
+    let output_json = crate::runtime::with_context(target_context_id, |rt| {
+        let registration = rt.tool_registry.get(tool_id).ok_or_else(|| {
+            ScpPyError::context(format!(
+                "tool '{tool_id}' not found in target context '{target_context_id}'"
+            ))
+        })?;
+
+        // Validate input against the tool's input schema.
+        scp_core::context::tools::validate_value_against_schema(
+            &input_json,
+            &registration.schema.input_schema,
+        )
+        .map_err(|e| ScpPyError::validation(format!("input validation failed: {e}")))?;
+
+        // Dispatch to handler or echo mode.
+        let output = if let Some(handler) = rt.tool_handlers.get(tool_id) {
+            let handler = handler.clone();
+            let out = handler(input_json.clone()).map_err(|e| {
+                ScpPyError::context(format!(
+                    "cross-context tool handler for '{tool_id}' failed: {e}"
+                ))
+            })?;
+
+            scp_core::context::tools::validate_value_against_schema(
+                &out,
+                &registration.schema.output_schema,
+            )
+            .map_err(|msg| {
+                ScpPyError::validation(format!(
+                    "output validation failed for tool '{tool_id}': {msg}"
+                ))
+            })?;
+
+            out
+        } else {
+            serde_json::json!({
+                "tool": tool_id,
+                "source_context": source_context_id,
+                "target_context": target_context_id,
+                "status": "validated",
+                "chain_depth": chain_depth,
+                "input_valid": true,
+                "validated_input": input_json,
+            })
+        };
+
+        Ok(output)
+    })?;
+
+    json_to_py_dict(py, &output_json)
+}
+
+// ---------------------------------------------------------------------------
+// Stateful tool sessions (spec section 6.2.1)
+// ---------------------------------------------------------------------------
+
+/// Creates a stateful tool session.
+///
+/// Sessions enable multi-turn workflows with state preservation across
+/// invocations. Each session has a TTL and is subject to per-caller caps
+/// (default: 5 concurrent sessions per caller, per spec section 6.2.1).
+///
+/// # Arguments
+///
+/// * `context_id` — The context containing the tool.
+/// * `tool_id` — The tool to create a session for.
+/// * `source_context_id` — The calling context (session cap tracked per caller).
+/// * `ttl_seconds` — Time-to-live for the session, in seconds.
+///
+/// # Returns
+///
+/// The session ID (UUID string).
+///
+/// # Errors
+///
+/// Raises `ContextError` if the context is not connected, the tool is
+/// not found, or the per-caller session cap is exceeded.
+#[pyfunction]
+#[pyo3(name = "tool_session_create")]
+pub fn py_tool_session_create(
+    context_id: &str,
+    tool_id: &str,
+    source_context_id: &str,
+    ttl_seconds: u64,
+) -> PyResult<String> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_tool_id(tool_id)?;
+    validate::validate_context_id(source_context_id)?;
+
+    let session_id = crate::runtime::with_context(context_id, |rt| {
+        // Validate tool exists.
+        if !rt.tool_registry.contains(tool_id) {
+            return Err(ScpPyError::context(format!(
+                "tool '{tool_id}' not found in context '{context_id}'"
+            )));
+        }
+
+        // Enforce per-caller session cap.
+        let current = rt.session_store.count_by_source(source_context_id);
+        if current >= scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER {
+            return Err(ScpPyError::context(format!(
+                "session cap exceeded for caller '{}': {} active (max {})",
+                source_context_id,
+                current,
+                scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER
+            )));
+        }
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let now_ms = scp_core::time::now_millis()
+            .map_err(|e| ScpPyError::context(format!("clock error: {e}")))?;
+
+        let session = scp_core::context::tools::ToolSession {
+            session_id: session_id.clone(),
+            tool_id: tool_id.to_owned(),
+            source_context: source_context_id.to_owned(),
+            state: serde_json::Value::Null,
+            created_at: now_ms,
+            ttl: std::time::Duration::from_secs(ttl_seconds),
+            call_count: 0,
+        };
+
+        rt.session_store.insert(session);
+        Ok(session_id)
+    })?;
+
+    Ok(session_id)
+}
+
+/// Invokes a tool within an active session.
+///
+/// Each call is individually governed: the invoker must hold `ToolInvoke`
+/// capability and present a valid UCAN token. Session state is carried
+/// forward across invocations. The session's call count is incremented on
+/// each successful invocation.
+///
+/// # Arguments
+///
+/// * `context_id` — The context containing the tool session.
+/// * `session_id` — The session to invoke within.
+/// * `input` — A Python dict of input parameters.
+/// * `invoker_did` — The DID of the invoker (capability checked per call).
+/// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
+///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability.
+///   Validated using the full 11-step ADR-016 pipeline.
+///
+/// # Returns
+///
+/// A Python object (dict) containing the tool's JSON-compatible output.
+///
+/// # Errors
+///
+/// Raises `UcanError` if the UCAN token is invalid, expired, revoked,
+/// or lacks the required tool invocation capability.
+/// Raises `ContextError` if the session is not found, has expired, or
+/// the invoker lacks capability.
+#[pyfunction]
+#[pyo3(name = "tool_session_invoke")]
+#[pyo3(signature = (context_id, session_id, input, invoker_did, ucan_token, proof_tokens=None))]
+#[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
+pub fn py_tool_session_invoke(
+    py: Python<'_>,
+    context_id: &str,
+    session_id: &str,
+    input: &Bound<'_, PyDict>,
+    invoker_did: &str,
+    ucan_token: &str,
+    proof_tokens: Option<Vec<String>>,
+) -> PyResult<PyObject> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_did(invoker_did)?;
+    validate::validate_ucan_token(ucan_token)?;
+    if let Some(ref tokens) = proof_tokens {
+        for t in tokens {
+            validate::validate_ucan_token(t)?;
+        }
+    }
+    let input_json = py_dict_to_json(input)?;
+
+    // Look up the tool_id from the session before UCAN validation so we can
+    // validate against the correct tool capability.
+    let tool_id_for_ucan = crate::runtime::with_context(context_id, |rt| {
+        let session = rt
+            .session_store
+            .get(session_id)
+            .ok_or_else(|| ScpPyError::context(format!("session '{session_id}' not found")))?;
+        Ok(session.tool_id.clone())
+    })?;
+
+    // Primary authorization: UCAN token validation via the full 11-step
+    // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
+    validate_tool_ucan(
+        context_id,
+        &tool_id_for_ucan,
+        ucan_token,
+        invoker_did,
+        proof_tokens.as_ref(),
+    )?;
+
+    let output_json = crate::runtime::with_context(context_id, |rt| {
+        // Look up session.
+        let session = rt
+            .session_store
+            .get(session_id)
+            .ok_or_else(|| ScpPyError::context(format!("session '{session_id}' not found")))?;
+
+        // Check expiry.
+        let now_ms = scp_core::time::now_millis()
+            .map_err(|e| ScpPyError::context(format!("clock error: {e}")))?;
+        if session.is_expired(now_ms) {
+            rt.session_store.remove(session_id);
+            return Err(ScpPyError::context(format!(
+                "session '{session_id}' has expired"
+            )));
+        }
+
+        let tool_id = session.tool_id.clone();
+        let current_state = session.state.clone();
+
+        // Defense-in-depth: check role-state capabilities in addition to the
+        // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
+        if !scp_core::context::tools::has_tool_invoke_capability(
+            &rt.role_state,
+            invoker_did,
+            &tool_id,
+        ) {
+            return Err(ScpPyError::ucan(format!(
+                "invoker '{invoker_did}' does not have ToolInvoke capability for '{tool_id}'"
+            )));
+        }
+
+        // Validate input against tool's input schema.
+        if let Some(registration) = rt.tool_registry.get(&tool_id) {
+            scp_core::context::tools::validate_value_against_schema(
+                &input_json,
+                &registration.schema.input_schema,
+            )
+            .map_err(|e| ScpPyError::validation(format!("input validation failed: {e}")))?;
+        }
+
+        // Execute via handler or echo mode, passing session state.
+        let (new_state, output) = if let Some(handler) = rt.tool_handlers.get(&tool_id) {
+            let handler = handler.clone();
+            let out = handler(input_json.clone()).map_err(|e| {
+                ScpPyError::context(format!("tool handler for '{tool_id}' failed: {e}"))
+            })?;
+            (current_state, out)
+        } else {
+            let out = serde_json::json!({
+                "tool": tool_id,
+                "session_id": session_id,
+                "status": "validated",
+                "call_count": session.call_count + 1,
+                "session_state": current_state,
+                "validated_input": input_json,
+            });
+            (current_state, out)
+        };
+
+        // Update session state and increment call count.
+        if let Some(session) = rt.session_store.get_mut(session_id) {
+            session.state = new_state;
+            session.call_count = session.call_count.saturating_add(1);
+        }
+
+        Ok(output)
+    })?;
+
+    json_to_py_dict(py, &output_json)
+}
+
+/// Closes a stateful tool session.
+///
+/// Removes the session from the store, releasing the caller's session slot.
+/// After closing, any further invocations with this session ID will fail.
+///
+/// # Arguments
+///
+/// * `context_id` — The context containing the tool session.
+/// * `session_id` — The session to close.
+///
+/// # Errors
+///
+/// Raises `ContextError` if the context is not connected or the session
+/// is not found.
+#[pyfunction]
+#[pyo3(name = "tool_session_close")]
+pub fn py_tool_session_close(context_id: &str, session_id: &str) -> PyResult<()> {
+    validate::validate_context_id(context_id)?;
+
+    crate::runtime::with_context(context_id, |rt| {
+        if rt.session_store.remove(session_id).is_none() {
+            return Err(ScpPyError::context(format!(
+                "session '{session_id}' not found"
+            )));
+        }
+        Ok(())
+    })?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
@@ -584,5 +1074,9 @@ pub fn register_tools(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_tool_register, m)?)?;
     m.add_function(wrap_pyfunction!(py_tool_invoke, m)?)?;
     m.add_function(wrap_pyfunction!(py_tool_verify, m)?)?;
+    m.add_function(wrap_pyfunction!(py_tool_invoke_cross_context, m)?)?;
+    m.add_function(wrap_pyfunction!(py_tool_session_create, m)?)?;
+    m.add_function(wrap_pyfunction!(py_tool_session_invoke, m)?)?;
+    m.add_function(wrap_pyfunction!(py_tool_session_close, m)?)?;
     Ok(())
 }

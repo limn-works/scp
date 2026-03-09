@@ -12,6 +12,7 @@
 //! See ADR-010 in `.docs/adrs/phase-2.md` for the full design.
 
 use std::future::Future;
+use std::hash::BuildHasher;
 use std::time::Duration;
 
 use super::lifecycle::{
@@ -22,6 +23,12 @@ use super::schema::validate_value_against_schema;
 use super::{DID, ToolId};
 use crate::context::roles::{Capability, ContextRoleState};
 use crate::context::{ContextHandle, ContextState};
+use crate::crypto::ucan::UcanError;
+use crate::crypto::ucan::capability::CapabilityUri;
+use crate::crypto::ucan::validate::{
+    DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext, parse_ucan,
+    validate_ucan,
+};
 
 // ---------------------------------------------------------------------------
 // InvocationError
@@ -89,6 +96,23 @@ pub enum InvocationError {
     ExecutionFailed {
         /// Description of the execution failure.
         message: String,
+    },
+
+    /// The invoker's spending budget has been exceeded (§19.5, ADR-033).
+    ///
+    /// Returned when the context has an economic policy with a per-tool-invoke
+    /// cost and the invoker's cumulative spending would exceed their
+    /// governance-approved budget.
+    ///
+    /// Error code: `SCP-PERM-3030`.
+    #[error("budget exceeded for invoker \"{did}\": cost {cost}, remaining {remaining}")]
+    BudgetExceeded {
+        /// The DID that attempted invocation.
+        did: String,
+        /// The cost of the tool invocation.
+        cost: u64,
+        /// The remaining budget for the invoker.
+        remaining: u64,
     },
 }
 
@@ -206,6 +230,7 @@ where
         execution_time_ms,
         input_hash,
         output_hash,
+        cost: None,
     };
 
     // 8. Return tool output and event.
@@ -322,6 +347,7 @@ where
         execution_time_ms,
         input_hash,
         output_hash,
+        cost: None,
     };
 
     Ok((output, event))
@@ -362,6 +388,50 @@ pub fn has_tool_invoke_capability(role_state: &ContextRoleState, did: &str, tool
     }
     // Check for specific ToolInvoke(tool_id).
     role_state.member_has_capability(did, &Capability::ToolInvoke(tool_id.to_owned()))
+}
+
+// ---------------------------------------------------------------------------
+// UCAN validation at tool invocation boundary (#319)
+// ---------------------------------------------------------------------------
+
+/// Validates a UCAN token for tool invocation authorization.
+///
+/// Parses the encoded JWT token and runs the full 11-step ADR-016 validation
+/// pipeline, requiring `tool_invoke:{tool_name}` or `tool_invoke:*` capability
+/// scoped to the given context.
+///
+/// This is the primary authorization gate for tool invocations. Role-based
+/// `has_tool_invoke_capability` remains as defense-in-depth.
+///
+/// # Arguments
+///
+/// * `encoded_token` — JWT-encoded UCAN token.
+/// * `context_id` — The context ID the tool belongs to.
+/// * `tool_name` — The name of the tool being invoked.
+/// * `ctx` — The validation context with resolvers, trackers, and ceiling.
+///
+/// # Errors
+///
+/// Returns [`UcanError`] if the token is malformed, expired, revoked, lacks
+/// the required capability, or fails any of the 11 validation steps.
+///
+/// See spec §6.2, §8, ADR-016, and issue #319.
+pub fn validate_tool_invocation_ucan<D, N, R, P, S>(
+    encoded_token: &str,
+    context_id: &str,
+    tool_name: &str,
+    ctx: &mut ValidationContext<'_, D, N, R, P, S>,
+) -> Result<(), UcanError>
+where
+    D: DidResolver,
+    N: NonceTracker,
+    R: RevocationChecker,
+    P: ProofResolver,
+    S: BuildHasher,
+{
+    let parsed = parse_ucan(encoded_token)?;
+    let required_cap = CapabilityUri::new(context_id, "tool_invoke", tool_name);
+    validate_ucan(&parsed, &required_cap, ctx)
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +517,8 @@ mod tests {
             test_vectors: vec![],
             operator_did: "did:dht:z6MkOperator".into(),
             economic_metadata: None,
+            registered_at: 0,
+            signature: Vec::new(),
         };
         register_tool(&mut registry, role_state, registration, registrant_did).unwrap();
         registry
@@ -965,5 +1037,86 @@ mod tests {
 
         let err = InvocationError::Cancelled;
         assert!(err.to_string().contains("cancelled"));
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_tool_invocation_ucan: rejects non-tool capability (#319)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn validate_tool_invocation_ucan_rejects_non_tool_capability() {
+        use crate::crypto::ucan::mint::{MintParams, mint_ucan};
+        use crate::crypto::ucan::validate::{
+            DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryNonceTracker,
+            InMemoryProofResolver, InMemoryRevocationChecker, ValidationContext,
+        };
+        use scp_platform::testing::InMemoryKeyCustody;
+        use scp_platform::traits::{KeyCustody, KeyType};
+
+        // Set up issuer identity.
+        let custody = InMemoryKeyCustody::new();
+        let key_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let pubkey = custody.public_key(&key_handle).await.unwrap();
+        let pk_bytes: [u8; 32] = pubkey.as_bytes().try_into().unwrap();
+        let issuer_did = format!("did:dht:z{}", zbase32::encode(pubkey.as_bytes()));
+
+        // Mint a UCAN with messages:write capability (NOT tool_invoke).
+        let caps = vec!["messages:write".to_owned()];
+        let params = MintParams {
+            issuer_did: &issuer_did,
+            issuer_key: &key_handle,
+            audience_did: "did:dht:z6MkMember",
+            context_id: "ctx-test",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+        };
+        let token = mint_ucan(&params, &custody).await.unwrap();
+
+        // Build validation context.
+        let resolver = InMemoryDidResolver {
+            keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+            kid_keys: std::collections::HashMap::new(),
+        };
+        let mut nonce_tracker = InMemoryNonceTracker::new();
+        let revocation_checker = InMemoryRevocationChecker::new();
+        let proof_resolver = InMemoryProofResolver::new();
+        let ceiling: HashSet<String> = [
+            "messages:write".to_owned(),
+            "tool_invoke:calculator".to_owned(),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut ctx = ValidationContext {
+            did_resolver: &resolver,
+            nonce_tracker: &mut nonce_tracker,
+            revocation_checker: &revocation_checker,
+            proof_resolver: &proof_resolver,
+            ceiling: &ceiling,
+            context_creator_did: &issuer_did,
+            presenting_agent_did: "did:dht:z6MkMember",
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        };
+
+        // validate_tool_invocation_ucan expects tool_invoke:calculator,
+        // but the token only has messages:write — must be rejected.
+        let result =
+            validate_tool_invocation_ucan(&token.encoded, "ctx-test", "calculator", &mut ctx);
+
+        assert!(
+            result.is_err(),
+            "UCAN with messages:write must be rejected for tool invocation"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, UcanError::CapabilityNotGranted(..)),
+            "expected CapabilityNotGranted, got {err:?}"
+        );
     }
 }

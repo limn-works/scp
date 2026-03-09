@@ -40,21 +40,23 @@ Three approaches were considered:
 
 The thin trait approach was chosen. Adapters are dumb storage. The protocol is smart.
 
-## 17.2 Storage Trait Evolution
+## 17.2 Storage Trait
 
-The existing `Storage` trait (ADR-006) provides four methods: `store`, `retrieve`, `delete`, `list_keys`. Two additions are required for the protocol's actual access patterns:
+The `Storage` trait (ADR-006, `scp-platform/src/traits.rs`) provides six async methods operating on `(key: &str, data: &[u8])` pairs:
 
 ```rust
-/// scp-platform/src/trait.rs (additions to existing Storage trait)
-
 pub trait Storage: Send + Sync {
-    // Existing methods (ADR-006):
+    /// Store a byte slice under the given key. Overwrites any existing value.
     async fn store(&self, key: &str, data: &[u8]) -> Result<(), PlatformError>;
-    async fn retrieve(&self, key: &str) -> Result<Option<Vec<u8>>, PlatformError>;
-    async fn delete(&self, key: &str) -> Result<(), PlatformError>;
-    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, PlatformError>;
 
-    // New methods:
+    /// Retrieve the byte slice stored under the given key. Returns None if absent.
+    async fn retrieve(&self, key: &str) -> Result<Option<Vec<u8>>, PlatformError>;
+
+    /// Delete the value stored under the given key. No-op if absent.
+    async fn delete(&self, key: &str) -> Result<(), PlatformError>;
+
+    /// List all keys matching a prefix, in lexicographic order.
+    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, PlatformError>;
 
     /// Delete all keys matching a prefix. Returns the count of keys deleted.
     /// Atomic: either all matching keys are deleted or none are (on error).
@@ -87,6 +89,7 @@ context/{context_id}/membership/{did}
 context/{context_id}/sender_key/{did}
 context/{context_id}/nonce/{nonce_hash}
 context/{context_id}/event/{seq:020d}
+context/{context_id}/event_data/{seq:020d}
 context/{context_id}/event_meta/count
 context/{context_id}/event_meta/root
 context/{context_id}/event_tree/{level}/{index}
@@ -113,6 +116,8 @@ mls/{context_id}/...
 ```
 
 **Zero-padded sequences.** Event sequence numbers and private state sequence numbers use `:020d` formatting (20-digit zero-padded decimal). This ensures lexicographic ordering matches numeric ordering, enabling efficient range queries via `list_keys`. Example: event 42 is stored at `context/{id}/event/00000000000000000042`.
+
+**Event data payloads.** The `event/{seq:020d}` key stores only the 32-byte SHA-256 leaf hash for Merkle tree verification. The `event_data/{seq:020d}` key stores the full MessagePack-serialized `Event` struct (event type, actor DID, timestamp, sequence, payload, prev_hash, signature). This dual-key design preserves the compact Merkle tree structure while enabling event replay and query without transport-layer round-trips. Events persisted before the `event_data/` key convention was introduced will have hash-only entries; `load_event_data` returns `None` for these (backward compatible).
 
 **Nonce keys.** UCAN nonce replay prevention uses `context/{context_id}/nonce/{SHA256(nonce_string)}` — the nonce string is hashed to a fixed-length key. The value stores `(first_seen_timestamp, token_expiry_timestamp)` for pruning. The `exists()` method enables O(1) replay checks without deserializing.
 
@@ -280,7 +285,7 @@ Every value written by `ProtocolStore` is wrapped in `StoredValue`. On read, `ve
 | Platform | Mechanism | Notes |
 |----------|-----------|-------|
 | Native (iOS, Android, macOS, Linux, Windows, Python, Node) | `rusqlite` with `bundled-sqlcipher` feature | AES-256 encryption, PBKDF2 with SHA-512 key derivation (256K iterations). Encryption key derived from identity key material stored in platform key custody (Keychain/Keystore). |
-| Browser (WASM) | Value-level AES-GCM encryption | SQLCipher unavailable in WASM. Each value is encrypted with a key derived from the identity's WebCrypto key before writing to wa-sqlite. |
+| Browser (WASM) | Value-level AES-256-GCM encryption | SQLCipher unavailable in WASM. Each value is encrypted individually before writing to wa-sqlite. Key derivation: the identity's `#0` key is imported into WebCrypto as raw key material, then `HKDF` is used with `salt = SHA-256("SCP-WASM-STORAGE-V1")`, `info = "scp-wasm-storage:" || did` (UTF-8), `hash = SHA-256`, `derivedKeyLength = 256` to produce an AES-256-GCM key. Per-value encryption: 12-byte nonce generated via `crypto.getRandomValues()` for each `store()` call. Stored format: `nonce (12 bytes) \|\| ciphertext \|\| tag (16 bytes)`. The key is stored in memory only (non-extractable WebCrypto key object). AAD (additional authenticated data): the storage key string (UTF-8 bytes), binding each encrypted value to its key path to prevent value relocation attacks. |
 | iOS | `NSFileProtectionCompleteUntilFirstUserAuthentication` | Allows background processing while device is locked. Applied to the SQLite database file. |
 | Android | TEE-backed key for SQLCipher key derivation | Android Keystore generates the key; SQLCipher uses it for database encryption. StrongBox opt-in only (dramatically slow). |
 
@@ -307,6 +312,19 @@ CREATE TABLE kv (
 ```
 
 `WITHOUT ROWID` uses a clustered index on the primary key, which is optimal for KV workloads (no secondary rowid lookup). WAL mode enables concurrent readers with one writer. The schema is intentionally minimal — all structure lives in the key convention, not the table schema.
+
+**SQLCipher key derivation.** The SQLCipher encryption key is derived from identity key material using HKDF-SHA-256 (RFC 5869), NOT used directly as a signing key:
+
+```
+ikm  = identity_key_private_bytes          // 32 bytes, #0 Identity Key from platform key custody
+salt = SHA-256("SCP-SQLCIPHER-KEY-V1")     // fixed salt, 32 bytes
+info = "scp-sqlcipher:" || did             // DID as UTF-8 bytes — binds key to specific identity
+prk  = HKDF-Extract(salt, ikm)            // 32 bytes
+okm  = HKDF-Expand(prk, info, 32)         // 32 bytes — SQLCipher PRAGMA key
+derived_key = hex_encode(okm)             // 64 hex characters for PRAGMA key
+```
+
+The `ikm` is the raw private key bytes of the `#0` Identity Key, retrieved from platform key custody (iOS Keychain, Android Keystore, macOS Keychain, or OS keyring). The HKDF domain separation (`"SCP-SQLCIPHER-KEY-V1"`) ensures the derived key is distinct from any signing key, preventing cross-protocol attacks. The DID in the `info` parameter binds the database to a specific identity — databases for different identities on the same device use different encryption keys.
 
 **SQLCipher configuration:**
 

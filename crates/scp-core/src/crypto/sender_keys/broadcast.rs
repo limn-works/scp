@@ -24,11 +24,12 @@
 //!
 //! # AAD Binding (Security)
 //!
-//! The `author_did` and `key_epoch` fields in [`BroadcastEnvelope`] are cleartext
-//! metadata that must be authenticated by the AEAD tag. Both [`seal_broadcast`]
-//! and [`open_broadcast`] bind these fields as Additional Authenticated Data
-//! (AAD) in the AES-256-GCM construction using a length-prefixed binary format:
-//! `[4-byte DID length (BE)][DID bytes][8-byte epoch (BE)]`.
+//! The `context_id`, `author_did`, `key_epoch`, and `sequence` fields in
+//! [`BroadcastEnvelope`] are cleartext metadata that must be authenticated by
+//! the AEAD tag. Both [`seal_broadcast`] and [`open_broadcast`] bind these
+//! fields as Additional Authenticated Data (AAD) in the AES-256-GCM
+//! construction using a length-prefixed binary format:
+//! `[4-byte context_id len (BE)][context_id bytes][4-byte DID len (BE)][DID bytes][8-byte epoch (BE)][8-byte sequence (BE)]`.
 //! This prevents attribution forgery by context members who possess the
 //! broadcast key (issue #228, cryptographer review finding 1, RED-210).
 //!
@@ -143,24 +144,73 @@ pub struct BroadcastKeyEpochAdvance {
 
 /// Encrypted broadcast message envelope per §5.14.5.
 ///
-/// Contains AES-256-GCM encrypted content along with the metadata needed for
-/// decryption and verification. The `encrypted_content` field uses the same
-/// wire format as [`encrypt_sender_layer`]: `nonce (12 bytes) || ciphertext || tag (16 bytes)`.
+/// Contains AES-256-GCM encrypted content along with all 8 spec-defined fields
+/// (minus `content_hash` per ADR-038). The `nonce` field holds the 12-byte
+/// AES-256-GCM nonce separately from `encrypted_content` (which contains only
+/// `ciphertext || tag`), per §5.14.5.
 ///
-/// The `author_did` and `key_epoch` fields are authenticated via AES-256-GCM
-/// AAD binding (length-prefixed binary format). Tampering with either field
-/// causes AEAD tag verification to fail on decryption. See issue #228.
+/// The `context_id`, `author_did`, `key_epoch`, and `sequence` fields are
+/// authenticated via AES-256-GCM AAD binding (length-prefixed binary format).
+/// Tampering with any of these fields causes AEAD tag verification to fail on
+/// decryption. See issue #228, #396.
+///
+/// The `signature` field is an Ed25519 signature over the canonical hash
+/// `SHA-256("SCP-BROADCAST-ENVELOPE-V1:" || version || len(context_id) || context_id || len(author_did) || author_did || sequence || key_epoch || timestamp || nonce || provenance_hash)`.
+/// The nonce is included to prevent content substitution by broadcast key
+/// holders. The `provenance_hash` binds provenance metadata to the signature.
+/// `content_hash` is intentionally omitted. Content integrity is provided by the
+/// AES-256-GCM authentication tag, and omitting it allows signature verification
+/// before decryption (reject forgeries without touching the key material).
+/// Verified BEFORE decryption in [`open_broadcast`] to reject forgeries early.
+/// See issue #352, §5.14.5.
 ///
 /// [`encrypt_sender_layer`]: super::encrypt::encrypt_sender_layer
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BroadcastEnvelope {
+    /// Protocol version (§13.2.2). SCP/1.0 = `0x0100`.
+    /// Part of the signature commitment.
+    pub version: u16,
+    /// The context ID this envelope belongs to.
+    pub context_id: String,
     /// The DID of the author who sealed this envelope.
     pub author_did: String,
+    /// Monotonically increasing per-author sequence number within this context.
+    /// Used for replay detection: receivers reject `sequence <= last_seen`.
+    pub sequence: u64,
+    /// Unix timestamp in milliseconds when the message was sealed.
+    pub timestamp: u64,
     /// The broadcast key epoch used to encrypt the content.
     pub key_epoch: u64,
-    /// AES-256-GCM encrypted payload: `nonce || ciphertext || auth_tag`.
-    #[serde(with = "serde_bytes")]
+    /// Optional provenance metadata for cross-context data flows (§7.7.1).
+    pub provenance: Option<crate::provenance::DataProvenance>,
+    /// Ed25519 signature over `canonical_hash("SCP-BROADCAST-ENVELOPE-V1:", ...)`
+    /// with fields: `version`, `context_id`, `author_did`, `sequence`,
+    /// `key_epoch`, `timestamp`, `nonce`, `provenance_hash`.
+    #[serde(with = "crate::serde_util::serde_signature_64")]
+    pub signature: [u8; 64],
+    /// AES-256-GCM nonce (12 bytes), stored as a top-level field per §5.14.5.
+    #[serde(with = "serde_nonce")]
+    pub nonce: [u8; 12],
+    /// AES-256-GCM encrypted payload: `ciphertext || auth_tag`.
+    /// Bounded to 512 KiB on deserialization to prevent OOM (#347).
+    #[serde(with = "crate::serde_util::serde_bounded_bytes")]
     pub encrypted_content: Vec<u8>,
+}
+
+/// Serde module for `[u8; 12]` nonce fields.
+mod serde_nonce {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(data: &[u8; 12], serializer: S) -> Result<S::Ok, S::Error> {
+        data.as_slice().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 12], D::Error> {
+        let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
+        bytes.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!("expected 12-byte nonce, got {} bytes", v.len()))
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -239,24 +289,35 @@ pub fn rotate_broadcast_key(
 /// Constructs the Additional Authenticated Data (AAD) for `BroadcastEnvelope`
 /// AES-256-GCM operations.
 ///
-/// Format: length-prefixed binary — `[4-byte DID length (BE)][DID bytes][8-byte epoch (BE)]`.
-/// This binds the cleartext metadata fields to the AEAD tag, preventing
-/// attribution forgery and epoch substitution by context members who possess
-/// the broadcast key. Both [`seal_broadcast`] and [`open_broadcast`] use this
-/// identical construction.
+/// Format: length-prefixed binary —
+/// `[4-byte context_id len (BE)][context_id bytes][4-byte DID len (BE)][DID bytes][8-byte epoch (BE)][8-byte sequence (BE)]`.
+///
+/// This binds all cleartext metadata fields to the AEAD tag, preventing
+/// attribution forgery, epoch substitution, context confusion, and sequence
+/// manipulation by context members who possess the broadcast key. Both
+/// [`seal_broadcast`] and [`open_broadcast`] use this identical construction.
 ///
 /// The binary format is canonically parseable by construction. The previous
 /// colon-delimited string format (`"{did}:{epoch}"`) was ambiguous because
 /// DIDs themselves contain colons (e.g., `did:dht:abc`, `did:web:host:path`).
 ///
-/// See issue #228, cryptographer review finding 1, RED-210.
-#[allow(clippy::cast_possible_truncation)] // DID strings are always < 4 GiB
-fn build_broadcast_aad(author_did: &str, key_epoch: u64) -> Vec<u8> {
+/// See issue #228, #396, cryptographer review finding 1, RED-210.
+#[allow(clippy::cast_possible_truncation)] // String lengths are always < 4 GiB
+fn build_broadcast_aad(
+    context_id: &str,
+    author_did: &str,
+    key_epoch: u64,
+    sequence: u64,
+) -> Vec<u8> {
+    let ctx_bytes = context_id.as_bytes();
     let did_bytes = author_did.as_bytes();
-    let mut aad = Vec::with_capacity(4 + did_bytes.len() + 8);
+    let mut aad = Vec::with_capacity(4 + ctx_bytes.len() + 4 + did_bytes.len() + 8 + 8);
+    aad.extend_from_slice(&(ctx_bytes.len() as u32).to_be_bytes());
+    aad.extend_from_slice(ctx_bytes);
     aad.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
     aad.extend_from_slice(did_bytes);
     aad.extend_from_slice(&key_epoch.to_be_bytes());
+    aad.extend_from_slice(&sequence.to_be_bytes());
     aad
 }
 
@@ -264,40 +325,186 @@ fn build_broadcast_aad(author_did: &str, key_epoch: u64) -> Vec<u8> {
 // Seal / Open
 // ---------------------------------------------------------------------------
 
+/// Parameters for [`seal_broadcast`] beyond the broadcast key and payload.
+///
+/// Groups the metadata fields required by the expanded `BroadcastEnvelope`
+/// (issue #352, §5.14.5).
+pub struct SealBroadcastParams<'a> {
+    /// The context ID for this broadcast message.
+    pub context_id: &'a str,
+    /// The per-author monotonic sequence number for this message.
+    pub sequence: u64,
+    /// Unix timestamp in milliseconds when the message is sealed.
+    pub timestamp: u64,
+    /// Optional provenance metadata (§7.7.1).
+    pub provenance: Option<crate::provenance::DataProvenance>,
+    /// Pre-computed Ed25519 signature over the canonical signing payload.
+    ///
+    /// Callers must compute this externally via [`build_broadcast_signing_payload`]
+    /// and their key custody provider. This design keeps `seal_broadcast`
+    /// synchronous while allowing async custody-based signing in the caller.
+    pub signature: ed25519_dalek::Signature,
+}
+
+/// Computes `SHA-256(serialize(provenance))` if present, or `SHA-256(0x00)` if
+/// absent. Returns a fixed-size 32-byte array (SHA-256 output).
+///
+/// This mirrors [`compute_provenance_hash`](crate::envelope::inner) and uses
+/// the same serialization format (`MessagePack` via `rmp_serde::to_vec`) to ensure
+/// cross-envelope consistency.
+///
+/// Public so callers can compute the provenance hash externally for use in
+/// [`SigningPayloadFields::provenance_hash`] when constructing the signing
+/// payload via [`build_broadcast_signing_payload`].
+///
+/// # Errors
+///
+/// Returns [`SenderKeyError::EncryptionFailed`] if provenance serialization
+/// fails.
+pub fn compute_provenance_hash(
+    provenance: Option<&crate::provenance::DataProvenance>,
+) -> Result<[u8; 32], SenderKeyError> {
+    use sha2::{Digest, Sha256};
+    match provenance {
+        Some(p) => {
+            let serialized = rmp_serde::to_vec(p).map_err(|e| {
+                SenderKeyError::EncryptionFailed(format!("provenance serialization failed: {e}"))
+            })?;
+            Ok(Sha256::digest(&serialized).into())
+        }
+        None => Ok(Sha256::digest([0x00]).into()),
+    }
+}
+
+/// Fields for constructing the canonical signing payload of a
+/// `BroadcastEnvelope`. Avoids exceeding clippy's argument limit.
+///
+/// Public so callers can compute the signing payload externally and sign
+/// it via their key custody provider before passing the signature to
+/// [`seal_broadcast`] via [`SealBroadcastParams::signature`].
+pub struct SigningPayloadFields<'a> {
+    /// Protocol version (§13.2.2). SCP/1.0 = `0x0100`.
+    pub version: u16,
+    /// The context ID for this broadcast message.
+    pub context_id: &'a str,
+    /// The DID of the author who is signing.
+    pub author_did: &'a str,
+    /// Per-author monotonic sequence number.
+    pub sequence: u64,
+    /// Broadcast key epoch.
+    pub key_epoch: u64,
+    /// Unix timestamp in milliseconds.
+    pub timestamp: u64,
+    /// AES-256-GCM nonce (12 bytes).
+    pub nonce: &'a [u8; 12],
+    /// SHA-256 hash of the provenance metadata (or `SHA-256(0x00)` if absent).
+    pub provenance_hash: &'a [u8; 32],
+}
+
+/// Constructs the canonical signing payload for a `BroadcastEnvelope`.
+///
+/// Uses [`canonical_hash`] with domain separator `"SCP-BROADCAST-ENVELOPE-V1:"`
+/// and length-prefixed variable-length fields, matching the pattern used by
+/// [`compute_block_notification_hash`] in `key_protocol.rs`.
+///
+/// Field order per §5.14.5 (lines 987-988):
+/// `version`, `context_id`, `author_did`, `sequence`, `key_epoch`, `timestamp`,
+/// `nonce`, `provenance_hash`.
+///
+/// **Security:** The nonce MUST be included in the signature commitment.
+/// Without it, any broadcast key holder can re-encrypt different content under
+/// a fresh nonce and reuse the original author's valid signature (the AEAD
+/// succeeds because they hold the key). Including the nonce binds the signature
+/// to the specific ciphertext operation.
+///
+/// `content_hash` is intentionally omitted. Content integrity is provided by the
+/// AES-256-GCM authentication tag, and omitting it allows signature verification
+/// before decryption (reject forgeries without touching the key material).
+///
+/// Used by both [`seal_broadcast`] (sign) and [`open_broadcast`] (verify).
+///
+/// Public so callers can compute the payload, sign it via key custody, and
+/// pass the resulting signature to [`SealBroadcastParams`].
+#[must_use]
+pub fn build_broadcast_signing_payload(fields: &SigningPayloadFields<'_>) -> [u8; 32] {
+    use crate::crypto::canonical::{CanonicalField, canonical_hash};
+
+    canonical_hash(
+        "SCP-BROADCAST-ENVELOPE-V1:",
+        &[
+            CanonicalField::U16(fields.version),
+            CanonicalField::VarBytes(fields.context_id.as_bytes()),
+            CanonicalField::VarBytes(fields.author_did.as_bytes()),
+            CanonicalField::U64(fields.sequence),
+            CanonicalField::U64(fields.key_epoch),
+            CanonicalField::U64(fields.timestamp),
+            CanonicalField::RawBytes(fields.nonce),
+            CanonicalField::Fixed32(fields.provenance_hash),
+        ],
+    )
+}
+
 /// Encrypts a payload with the author's broadcast key and packages it into a
 /// [`BroadcastEnvelope`].
 ///
-/// Uses AES-256-GCM with a random 12-byte nonce per invocation. The wire
-/// format matches [`encrypt_sender_layer`]: `nonce (12 bytes) || ciphertext || auth_tag (16 bytes)`.
+/// Uses AES-256-GCM with a random 12-byte nonce per invocation. The nonce is
+/// stored as a top-level field in the envelope (per §5.14.5), and
+/// `encrypted_content` contains only `ciphertext || auth_tag`.
 ///
-/// The `author_did` and `key_epoch` from the broadcast key are bound as
+/// The `context_id`, `author_did`, `key_epoch`, and `sequence` are bound as
 /// Additional Authenticated Data (AAD) in the AES-256-GCM construction.
 /// This cryptographically authenticates the cleartext metadata fields,
-/// preventing attribution forgery. See issue #228.
+/// preventing attribution forgery and context/sequence confusion. See issue
+/// #228, #396.
+///
+/// The `params.signature` field must be a pre-computed Ed25519 signature
+/// over the canonical signing payload (see [`build_broadcast_signing_payload`]).
+/// The signature is verified BEFORE decryption in [`open_broadcast`] to reject
+/// forgeries early (issue #352).
+///
+/// # Signing workflow
+///
+/// Because `seal_broadcast` is synchronous but key custody signing is async,
+/// callers must:
+/// 1. Generate a 12-byte nonce via [`generate_broadcast_nonce`].
+/// 2. Compute the provenance hash via [`compute_provenance_hash`].
+/// 3. Build the signing payload via [`build_broadcast_signing_payload`].
+/// 4. Sign the payload via their async key custody provider.
+/// 5. Pass the nonce and signature to `seal_broadcast` via `SealBroadcastParams`.
+///
+/// For convenience, callers who hold an `ed25519_dalek::SigningKey` directly
+/// (e.g., tests) can sign the payload inline.
 ///
 /// # Arguments
 ///
 /// * `key` — The author's current broadcast key.
 /// * `payload` — The plaintext content to encrypt.
+/// * `nonce_bytes` — A random 12-byte AES-256-GCM nonce (from [`generate_broadcast_nonce`]).
+/// * `params` — Metadata and pre-computed signature for the expanded envelope fields.
 ///
 /// # Errors
 ///
-/// Returns [`SenderKeyError::EncryptionFailed`] if the AES-256-GCM operation fails.
+/// - [`SenderKeyError::EncryptionFailed`] if AES-256-GCM fails.
 ///
 /// [`encrypt_sender_layer`]: super::encrypt::encrypt_sender_layer
 pub fn seal_broadcast(
     key: &BroadcastKey,
     payload: &[u8],
+    nonce_bytes: &[u8; NONCE_SIZE],
+    params: &SealBroadcastParams<'_>,
 ) -> Result<BroadcastEnvelope, SenderKeyError> {
     let cipher = Aes256Gcm::new_from_slice(key.key.as_bytes())
         .map_err(|e| SenderKeyError::EncryptionFailed(e.to_string()))?;
 
-    let mut nonce_bytes = [0u8; NONCE_SIZE];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::from_slice(nonce_bytes);
 
-    let aad = build_broadcast_aad(&key.author_did, key.epoch);
-    let ciphertext = cipher
+    let aad = build_broadcast_aad(
+        params.context_id,
+        &key.author_did,
+        key.epoch,
+        params.sequence,
+    );
+    let encrypted_content = cipher
         .encrypt(
             nonce,
             Payload {
@@ -307,38 +514,38 @@ pub fn seal_broadcast(
         )
         .map_err(|e| SenderKeyError::EncryptionFailed(e.to_string()))?;
 
-    let mut encrypted_content = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
-    encrypted_content.extend_from_slice(&nonce_bytes);
-    encrypted_content.extend_from_slice(&ciphertext);
-
     Ok(BroadcastEnvelope {
+        version: crate::envelope::SCP_PROTOCOL_VERSION,
+        context_id: params.context_id.to_owned(),
         author_did: key.author_did.clone(),
+        sequence: params.sequence,
+        timestamp: params.timestamp,
         key_epoch: key.epoch,
+        provenance: params.provenance.clone(),
+        signature: params.signature.to_bytes(),
+        nonce: *nonce_bytes,
         encrypted_content,
     })
 }
 
-/// Decrypts a [`BroadcastEnvelope`] using the author's broadcast key.
+/// Generates a random 12-byte AES-256-GCM nonce for use with [`seal_broadcast`].
 ///
-/// Verifies that the envelope's `key_epoch` matches the provided key's epoch.
-/// If the epochs do not match, returns [`SenderKeyError::EpochMismatch`].
-/// Then decrypts the AES-256-GCM ciphertext and verifies the authentication
-/// tag, including AAD verification of the envelope's `author_did` and
-/// `key_epoch` fields. If the cleartext metadata was tampered with, the AEAD
-/// tag verification will fail. See issue #228.
+/// Uses the platform's cryptographically secure RNG. The nonce is included
+/// in the signing payload (via [`build_broadcast_signing_payload`]) to bind
+/// the signature to the specific ciphertext operation.
+#[must_use]
+pub fn generate_broadcast_nonce() -> [u8; NONCE_SIZE] {
+    let mut nonce_bytes = [0u8; NONCE_SIZE];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    nonce_bytes
+}
+
+/// Internal: decrypts a `BroadcastEnvelope` without signature verification.
 ///
-/// # Arguments
-///
-/// * `key` — The author's broadcast key at the epoch specified in the envelope.
-/// * `envelope` — The sealed broadcast envelope to decrypt.
-///
-/// # Errors
-///
-/// - [`SenderKeyError::EpochMismatch`] if the key epoch does not match the envelope epoch.
-/// - [`SenderKeyError::CiphertextTooShort`] if the encrypted content is too short.
-/// - [`SenderKeyError::AuthenticationFailed`] if the AEAD tag verification fails
-///   (including AAD mismatch from tampered `author_did` or `key_epoch`).
-pub fn open_broadcast(
+/// Used by both [`open_broadcast`] (after signature check) and
+/// [`open_broadcast_trusted`] (for projection layer which already holds
+/// the decryption key).
+fn decrypt_envelope(
     key: &BroadcastKey,
     envelope: &BroadcastEnvelope,
 ) -> Result<Vec<u8>, SenderKeyError> {
@@ -349,32 +556,194 @@ pub fn open_broadcast(
         });
     }
 
-    if envelope.encrypted_content.len() < NONCE_SIZE {
-        return Err(SenderKeyError::CiphertextTooShort {
-            actual: envelope.encrypted_content.len(),
-            minimum: NONCE_SIZE,
-        });
-    }
-
-    let (nonce_bytes, encrypted) = envelope.encrypted_content.split_at(NONCE_SIZE);
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::from_slice(&envelope.nonce);
 
     let cipher = Aes256Gcm::new_from_slice(key.key.as_bytes())
         .map_err(|e| SenderKeyError::EncryptionFailed(e.to_string()))?;
 
-    // Reconstruct AAD from the envelope's metadata. This MUST match the AAD
-    // used during seal_broadcast. If author_did or key_epoch were tampered
-    // with in the envelope, the AAD will differ and AEAD decryption will fail.
-    let aad = build_broadcast_aad(&envelope.author_did, envelope.key_epoch);
+    let aad = build_broadcast_aad(
+        &envelope.context_id,
+        &envelope.author_did,
+        envelope.key_epoch,
+        envelope.sequence,
+    );
     cipher
         .decrypt(
             nonce,
             Payload {
-                msg: encrypted,
+                msg: &envelope.encrypted_content,
                 aad: &aad,
             },
         )
         .map_err(|_| SenderKeyError::AuthenticationFailed)
+}
+
+/// Decrypts a [`BroadcastEnvelope`] using the author's broadcast key, with
+/// Ed25519 signature verification.
+///
+/// Verification order (issue #352):
+/// 1. Verify Ed25519 signature over canonical metadata BEFORE decryption.
+/// 2. Check epoch match.
+/// 3. Decrypt AES-256-GCM with AAD binding.
+///
+/// This ordering rejects forgeries cheaply (signature check is ~10x cheaper
+/// than AES-GCM decrypt) and prevents chosen-ciphertext probing.
+///
+/// # Arguments
+///
+/// * `key` — The author's broadcast key at the epoch specified in the envelope.
+/// * `envelope` — The sealed broadcast envelope to decrypt.
+/// * `verifying_key` — The author's Ed25519 verifying key for signature check.
+///
+/// # Errors
+///
+/// - [`SenderKeyError::VerificationFailed`] if the Ed25519 signature is invalid.
+/// - [`SenderKeyError::EpochMismatch`] if the key epoch does not match the envelope epoch.
+/// - [`SenderKeyError::CiphertextTooShort`] if the encrypted content is too short.
+/// - [`SenderKeyError::AuthenticationFailed`] if the AEAD tag verification fails
+///   (including AAD mismatch from tampered `author_did` or `key_epoch`).
+pub fn open_broadcast(
+    key: &BroadcastKey,
+    envelope: &BroadcastEnvelope,
+    verifying_key: &ed25519_dalek::VerifyingKey,
+) -> Result<Vec<u8>, SenderKeyError> {
+    // Step 1: Verify signature BEFORE decryption (issue #352).
+    // Use the envelope's version (not the constant) so that tampering with
+    // the version field causes verification to fail (§13.2.2).
+    let provenance_hash = compute_provenance_hash(envelope.provenance.as_ref())
+        .map_err(|e| SenderKeyError::VerificationFailed(format!("provenance hash failed: {e}")))?;
+    let signing_payload = build_broadcast_signing_payload(&SigningPayloadFields {
+        version: envelope.version,
+        context_id: &envelope.context_id,
+        author_did: &envelope.author_did,
+        sequence: envelope.sequence,
+        key_epoch: envelope.key_epoch,
+        timestamp: envelope.timestamp,
+        nonce: &envelope.nonce,
+        provenance_hash: &provenance_hash,
+    });
+    let signature = ed25519_dalek::Signature::from_bytes(&envelope.signature);
+    verifying_key
+        .verify_strict(&signing_payload, &signature)
+        .map_err(|e| {
+            SenderKeyError::VerificationFailed(format!("signature verification failed: {e}"))
+        })?;
+
+    // Steps 2-3: Epoch check + decrypt.
+    decrypt_envelope(key, envelope)
+}
+
+/// Decrypts a [`BroadcastEnvelope`] without signature verification.
+///
+/// This is for trusted contexts where the caller already possesses the
+/// decryption key (e.g., the projection layer which holds all broadcast keys
+/// for contexts it projects). The AEAD tag still provides integrity over both
+/// the ciphertext and the AAD-bound metadata fields.
+///
+/// **Security note:** Only use when the caller is already trusted (holds the
+/// broadcast key). Peer-to-peer consumers MUST use [`open_broadcast`] which
+/// verifies the Ed25519 signature before decryption.
+///
+/// # Errors
+///
+/// - [`SenderKeyError::EpochMismatch`] if the key epoch does not match the envelope epoch.
+/// - [`SenderKeyError::CiphertextTooShort`] if the encrypted content is too short.
+/// - [`SenderKeyError::AuthenticationFailed`] if the AEAD tag verification fails.
+pub fn open_broadcast_trusted(
+    key: &BroadcastKey,
+    envelope: &BroadcastEnvelope,
+) -> Result<Vec<u8>, SenderKeyError> {
+    decrypt_envelope(key, envelope)
+}
+
+/// Validates that a broadcast envelope's version field is supported (§13.2.2).
+///
+/// Currently only SCP/1.0 (`0x0100`) is recognized. Call this after
+/// deserialization to reject envelopes from incompatible protocol versions.
+///
+/// # Errors
+///
+/// Returns [`SenderKeyError::UnsupportedVersion`] if `envelope.version` is not
+/// `SCP_PROTOCOL_VERSION`.
+pub const fn validate_broadcast_version(
+    envelope: &BroadcastEnvelope,
+) -> Result<(), SenderKeyError> {
+    if envelope.version != crate::envelope::SCP_PROTOCOL_VERSION {
+        return Err(SenderKeyError::UnsupportedVersion {
+            version: envelope.version,
+        });
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Replay detection
+// ---------------------------------------------------------------------------
+
+/// Maximum number of distinct authors tracked by [`BroadcastReplayDetector`].
+///
+/// When this limit is reached, the entry with the oldest (lowest) timestamp
+/// is evicted to make room for the new author. This prevents unbounded memory
+/// growth from a flood of distinct author DIDs.
+const REPLAY_DETECTOR_MAX_AUTHORS: usize = 10_000;
+
+/// Per-author sequence tracker for broadcast replay detection.
+///
+/// Maintains the last-seen sequence number per author DID. Messages with
+/// `sequence <= last_seen` are rejected as replays (§5.14.5).
+///
+/// Bounded to [`REPLAY_DETECTOR_MAX_AUTHORS`] entries. When full, the entry
+/// with the lowest timestamp is evicted (oldest-first).
+#[derive(Debug, Default)]
+pub struct BroadcastReplayDetector {
+    /// Map of author DID to (last-seen sequence number, last-seen timestamp).
+    last_seen: std::collections::HashMap<String, (u64, u64)>,
+}
+
+impl BroadcastReplayDetector {
+    /// Creates a new empty replay detector.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Checks whether a message should be accepted (not a replay).
+    ///
+    /// Returns `true` and updates the tracker if `sequence > last_seen` for
+    /// the given author. Returns `false` if `sequence <= last_seen` (replay).
+    ///
+    /// When the detector is at capacity and a new author is seen, the entry
+    /// with the oldest timestamp is evicted.
+    pub fn check_and_advance(&mut self, author_did: &str, sequence: u64, timestamp: u64) -> bool {
+        if let Some(entry) = self.last_seen.get_mut(author_did) {
+            if sequence > entry.0 {
+                *entry = (sequence, timestamp);
+                return true;
+            }
+            return false;
+        }
+
+        // New author — evict oldest if at capacity.
+        if self.last_seen.len() >= REPLAY_DETECTOR_MAX_AUTHORS
+            && let Some(oldest_key) = self
+                .last_seen
+                .iter()
+                .min_by_key(|(_, (_, ts))| *ts)
+                .map(|(k, _)| k.clone())
+        {
+            self.last_seen.remove(&oldest_key);
+        }
+
+        self.last_seen
+            .insert(author_did.to_owned(), (sequence, timestamp));
+        true
+    }
+
+    /// Returns the last-seen sequence for an author, or `None` if never seen.
+    #[must_use]
+    pub fn last_seen(&self, author_did: &str) -> Option<u64> {
+        self.last_seen.get(author_did).map(|(seq, _)| *seq)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -389,7 +758,60 @@ pub fn open_broadcast(
 )]
 mod tests {
     use super::*;
+    use ed25519_dalek::Signer;
     use proptest::prelude::*;
+
+    /// Test signing key (deterministic for reproducible tests).
+    fn test_signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[0xAA; 32])
+    }
+
+    /// Computes a signature over the broadcast signing payload using a test
+    /// signing key. This is the test equivalent of calling `KeyCustody::sign`.
+    fn test_sign_with_fields(
+        sk: &ed25519_dalek::SigningKey,
+        fields: &SigningPayloadFields<'_>,
+    ) -> ed25519_dalek::Signature {
+        let payload = build_broadcast_signing_payload(fields);
+        sk.sign(&payload)
+    }
+
+    /// Seals a broadcast envelope with test defaults.
+    fn test_seal(key: &BroadcastKey, payload: &[u8]) -> BroadcastEnvelope {
+        let sk = test_signing_key();
+        let nonce = generate_broadcast_nonce();
+        let provenance_hash = compute_provenance_hash(None).unwrap();
+        let signature = test_sign_with_fields(
+            &sk,
+            &SigningPayloadFields {
+                version: crate::envelope::SCP_PROTOCOL_VERSION,
+                context_id: "test-ctx",
+                author_did: &key.author_did,
+                sequence: 1,
+                key_epoch: key.epoch,
+                timestamp: 1_700_000_000_000,
+                nonce: &nonce,
+                provenance_hash: &provenance_hash,
+            },
+        );
+        let params = SealBroadcastParams {
+            context_id: "test-ctx",
+            sequence: 1,
+            timestamp: 1_700_000_000_000,
+            provenance: None,
+            signature,
+        };
+        seal_broadcast(key, payload, &nonce, &params).unwrap()
+    }
+
+    /// Opens a broadcast envelope using the trusted (no signature check) path.
+    /// Used in tests that focus on AEAD behavior rather than signatures.
+    fn test_open(
+        key: &BroadcastKey,
+        envelope: &BroadcastEnvelope,
+    ) -> Result<Vec<u8>, SenderKeyError> {
+        open_broadcast_trusted(key, envelope)
+    }
 
     // -----------------------------------------------------------------------
     // Key generation tests
@@ -530,31 +952,31 @@ mod tests {
     fn seal_open_roundtrip_succeeds() {
         let key = generate_broadcast_key("did:dht:alice");
         let plaintext = b"hello broadcast world";
-        let envelope = seal_broadcast(&key, plaintext).unwrap();
+        let envelope = test_seal(&key, plaintext);
 
         assert_eq!(envelope.author_did, "did:dht:alice");
         assert_eq!(envelope.key_epoch, 0);
 
-        let decrypted = open_broadcast(&key, &envelope).unwrap();
+        let decrypted = test_open(&key, &envelope).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
     #[test]
     fn seal_open_empty_payload() {
         let key = generate_broadcast_key("did:dht:alice");
-        let envelope = seal_broadcast(&key, b"").unwrap();
-        let decrypted = open_broadcast(&key, &envelope).unwrap();
+        let envelope = test_seal(&key, b"");
+        let decrypted = test_open(&key, &envelope).unwrap();
         assert!(decrypted.is_empty());
     }
 
     #[test]
     fn open_with_wrong_epoch_fails() {
         let key0 = generate_broadcast_key("did:dht:alice");
-        let envelope = seal_broadcast(&key0, b"secret").unwrap();
+        let envelope = test_seal(&key0, b"secret");
 
         let (key1, _advance) = rotate_broadcast_key(&key0, 1_000).unwrap();
 
-        let result = open_broadcast(&key1, &envelope);
+        let result = test_open(&key1, &envelope);
         assert!(matches!(
             result,
             Err(SenderKeyError::EpochMismatch {
@@ -568,64 +990,59 @@ mod tests {
     fn open_with_wrong_key_fails() {
         let key_alice = generate_broadcast_key("did:dht:alice");
         let key_bob = generate_broadcast_key("did:dht:bob");
-        let envelope = seal_broadcast(&key_alice, b"alice only").unwrap();
-
-        let forged_envelope = BroadcastEnvelope {
-            author_did: envelope.author_did.clone(),
-            key_epoch: 0,
-            encrypted_content: envelope.encrypted_content,
-        };
+        let envelope = test_seal(&key_alice, b"alice only");
 
         let wrong_key = BroadcastKey {
             key: key_bob.key.clone(),
             epoch: 0,
             author_did: key_alice.author_did.clone(),
         };
-        let result = open_broadcast(&wrong_key, &forged_envelope);
+        let result = test_open(&wrong_key, &envelope);
         assert!(matches!(result, Err(SenderKeyError::AuthenticationFailed)));
     }
 
     #[test]
     fn open_with_tampered_ciphertext_fails() {
         let key = generate_broadcast_key("did:dht:alice");
-        let mut envelope = seal_broadcast(&key, b"tamper test").unwrap();
+        let mut envelope = test_seal(&key, b"tamper test");
 
-        let tamper_idx = NONCE_SIZE + 1;
-        if tamper_idx < envelope.encrypted_content.len() {
-            envelope.encrypted_content[tamper_idx] ^= 0xFF;
+        if !envelope.encrypted_content.is_empty() {
+            envelope.encrypted_content[0] ^= 0xFF;
         }
 
-        let result = open_broadcast(&key, &envelope);
+        let result = test_open(&key, &envelope);
         assert!(matches!(result, Err(SenderKeyError::AuthenticationFailed)));
     }
 
     #[test]
-    fn open_with_too_short_ciphertext_fails() {
+    fn open_with_empty_ciphertext_fails() {
+        // With nonce as a separate field, encrypted_content can be empty
+        // but decryption will still fail due to AEAD tag verification.
         let key = generate_broadcast_key("did:dht:alice");
         let envelope = BroadcastEnvelope {
+            version: crate::envelope::SCP_PROTOCOL_VERSION,
+            context_id: "test-ctx".to_owned(),
             author_did: "did:dht:alice".to_owned(),
+            sequence: 1,
+            timestamp: 1_700_000_000_000,
             key_epoch: 0,
-            encrypted_content: vec![0u8; 5],
+            provenance: None,
+            signature: [0u8; 64],
+            nonce: [0u8; 12],
+            encrypted_content: vec![],
         };
-        let result = open_broadcast(&key, &envelope);
-        assert!(matches!(
-            result,
-            Err(SenderKeyError::CiphertextTooShort {
-                actual: 5,
-                minimum: 12
-            })
-        ));
+        let result = test_open(&key, &envelope);
+        assert!(matches!(result, Err(SenderKeyError::AuthenticationFailed)));
     }
 
     #[test]
-    fn seal_produces_nonce_plus_ciphertext_plus_tag() {
+    fn seal_produces_ciphertext_plus_tag() {
         let key = generate_broadcast_key("did:dht:alice");
         let plaintext = b"size check";
-        let envelope = seal_broadcast(&key, plaintext).unwrap();
-        assert_eq!(
-            envelope.encrypted_content.len(),
-            NONCE_SIZE + plaintext.len() + 16
-        );
+        let envelope = test_seal(&key, plaintext);
+        // Nonce is now a separate field; encrypted_content = ciphertext + 16-byte tag.
+        assert_eq!(envelope.nonce.len(), NONCE_SIZE);
+        assert_eq!(envelope.encrypted_content.len(), plaintext.len() + 16);
     }
 
     #[test]
@@ -633,17 +1050,40 @@ mod tests {
         let key0 = generate_broadcast_key("did:dht:alice");
         let (key1, _advance) = rotate_broadcast_key(&key0, 1_000).unwrap();
 
-        let envelope = seal_broadcast(&key1, b"post-rotation").unwrap();
+        let sk = test_signing_key();
+        let nonce = generate_broadcast_nonce();
+        let provenance_hash = compute_provenance_hash(None).unwrap();
+        let signature = test_sign_with_fields(
+            &sk,
+            &SigningPayloadFields {
+                version: crate::envelope::SCP_PROTOCOL_VERSION,
+                context_id: "test-ctx",
+                author_did: &key1.author_did,
+                sequence: 1,
+                key_epoch: key1.epoch,
+                timestamp: 1_700_000_000_000,
+                nonce: &nonce,
+                provenance_hash: &provenance_hash,
+            },
+        );
+        let params = SealBroadcastParams {
+            context_id: "test-ctx",
+            sequence: 1,
+            timestamp: 1_700_000_000_000,
+            provenance: None,
+            signature,
+        };
+        let envelope = seal_broadcast(&key1, b"post-rotation", &nonce, &params).unwrap();
         assert_eq!(envelope.key_epoch, 1);
 
-        let decrypted = open_broadcast(&key1, &envelope).unwrap();
+        let decrypted = test_open(&key1, &envelope).unwrap();
         assert_eq!(decrypted, b"post-rotation");
     }
 
     #[test]
     fn broadcast_envelope_serialization_roundtrip() {
         let key = generate_broadcast_key("did:dht:alice");
-        let envelope = seal_broadcast(&key, b"serde test").unwrap();
+        let envelope = test_seal(&key, b"serde test");
 
         let json = serde_json::to_string(&envelope).unwrap();
         let deserialized: BroadcastEnvelope = serde_json::from_str(&json).unwrap();
@@ -659,14 +1099,10 @@ mod tests {
         // Seal with Alice's key, then forge the envelope's author_did to Bob.
         // The AAD mismatch must cause AEAD tag verification to fail.
         let key_alice = generate_broadcast_key("did:dht:alice");
-        let envelope = seal_broadcast(&key_alice, b"alice's message").unwrap();
+        let mut forged_envelope = test_seal(&key_alice, b"alice's message");
 
         // Forge: change author_did in the envelope but keep everything else.
-        let forged_envelope = BroadcastEnvelope {
-            author_did: "did:dht:bob".to_owned(),
-            key_epoch: envelope.key_epoch,
-            encrypted_content: envelope.encrypted_content,
-        };
+        forged_envelope.author_did = "did:dht:bob".to_owned();
 
         // Open with a key that has the forged author_did (same key material,
         // same epoch) to match the envelope's metadata. The AAD will differ
@@ -676,7 +1112,7 @@ mod tests {
             epoch: 0,
             author_did: "did:dht:bob".to_owned(),
         };
-        let result = open_broadcast(&forged_key, &forged_envelope);
+        let result = test_open(&forged_key, &forged_envelope);
         assert!(
             matches!(result, Err(SenderKeyError::AuthenticationFailed)),
             "tampered author_did must cause AEAD failure, got {result:?}"
@@ -689,14 +1125,10 @@ mod tests {
         // Create a key at epoch 5 with the same key material.
         // The AAD mismatch must cause AEAD tag verification to fail.
         let key = generate_broadcast_key("did:dht:alice");
-        let envelope = seal_broadcast(&key, b"epoch zero content").unwrap();
+        let mut forged_envelope = test_seal(&key, b"epoch zero content");
 
         // Forge: change key_epoch in the envelope.
-        let forged_envelope = BroadcastEnvelope {
-            author_did: envelope.author_did.clone(),
-            key_epoch: 5,
-            encrypted_content: envelope.encrypted_content,
-        };
+        forged_envelope.key_epoch = 5;
 
         // Create a key with epoch 5 but same key material (simulating an
         // attacker who has the key bytes and wants to replay at a different
@@ -706,7 +1138,7 @@ mod tests {
             epoch: 5,
             author_did: "did:dht:alice".to_owned(),
         };
-        let result = open_broadcast(&forged_key, &forged_envelope);
+        let result = test_open(&forged_key, &forged_envelope);
         assert!(
             matches!(result, Err(SenderKeyError::AuthenticationFailed)),
             "tampered key_epoch must cause AEAD failure, got {result:?}"
@@ -714,23 +1146,54 @@ mod tests {
     }
 
     #[test]
+    fn open_with_tampered_context_id_fails() {
+        // Seal with context "test-ctx", then forge the envelope's context_id.
+        // The AAD mismatch must cause AEAD tag verification to fail.
+        let key = generate_broadcast_key("did:dht:alice");
+        let mut forged_envelope = test_seal(&key, b"context check");
+
+        // Forge: change context_id in the envelope.
+        forged_envelope.context_id = "wrong-ctx".to_owned();
+
+        let result = test_open(&key, &forged_envelope);
+        assert!(
+            matches!(result, Err(SenderKeyError::AuthenticationFailed)),
+            "tampered context_id must cause AEAD failure, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn open_with_tampered_sequence_fails() {
+        // Seal with sequence 1, then forge the envelope's sequence.
+        // The AAD mismatch must cause AEAD tag verification to fail.
+        let key = generate_broadcast_key("did:dht:alice");
+        let mut forged_envelope = test_seal(&key, b"sequence check");
+
+        // Forge: change sequence in the envelope.
+        forged_envelope.sequence = 999;
+
+        let result = test_open(&key, &forged_envelope);
+        assert!(
+            matches!(result, Err(SenderKeyError::AuthenticationFailed)),
+            "tampered sequence must cause AEAD failure, got {result:?}"
+        );
+    }
+
+    #[test]
     fn open_with_both_author_and_epoch_tampered_fails() {
         // Seal as Alice at epoch 0, forge to Bob at epoch 3.
         let key_alice = generate_broadcast_key("did:dht:alice");
-        let envelope = seal_broadcast(&key_alice, b"double forge test").unwrap();
+        let mut forged_envelope = test_seal(&key_alice, b"double forge test");
 
-        let forged_envelope = BroadcastEnvelope {
-            author_did: "did:dht:mallory".to_owned(),
-            key_epoch: 3,
-            encrypted_content: envelope.encrypted_content,
-        };
+        forged_envelope.author_did = "did:dht:mallory".to_owned();
+        forged_envelope.key_epoch = 3;
 
         let forged_key = BroadcastKey {
             key: key_alice.key.clone(),
             epoch: 3,
             author_did: "did:dht:mallory".to_owned(),
         };
-        let result = open_broadcast(&forged_key, &forged_envelope);
+        let result = test_open(&forged_key, &forged_envelope);
         assert!(
             matches!(result, Err(SenderKeyError::AuthenticationFailed)),
             "tampered author_did + key_epoch must cause AEAD failure, got {result:?}"
@@ -741,40 +1204,56 @@ mod tests {
     fn aad_binding_verified_on_build_broadcast_aad() {
         // Verify the AAD construction is deterministic and uses the
         // length-prefixed binary format:
-        //   [4-byte DID length (BE)][DID bytes][8-byte epoch (BE)]
-        let aad = build_broadcast_aad("did:dht:alice", 42);
+        //   [4-byte ctx_id len (BE)][ctx_id bytes][4-byte DID len (BE)][DID bytes][8-byte epoch (BE)][8-byte sequence (BE)]
+        let aad = build_broadcast_aad("test-ctx", "did:dht:alice", 42, 7);
+        let ctx_bytes = b"test-ctx";
         let did_bytes = b"did:dht:alice";
         let mut expected = Vec::new();
+        expected.extend_from_slice(&(ctx_bytes.len() as u32).to_be_bytes());
+        expected.extend_from_slice(ctx_bytes);
         expected.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
         expected.extend_from_slice(did_bytes);
         expected.extend_from_slice(&42_u64.to_be_bytes());
+        expected.extend_from_slice(&7_u64.to_be_bytes());
         assert_eq!(aad, expected);
 
-        let aad_zero = build_broadcast_aad("did:dht:bob", 0);
+        let aad_zero = build_broadcast_aad("ctx-0", "did:dht:bob", 0, 0);
+        let ctx_bytes_0 = b"ctx-0";
         let did_bytes_bob = b"did:dht:bob";
         let mut expected_zero = Vec::new();
+        expected_zero.extend_from_slice(&(ctx_bytes_0.len() as u32).to_be_bytes());
+        expected_zero.extend_from_slice(ctx_bytes_0);
         expected_zero.extend_from_slice(&(did_bytes_bob.len() as u32).to_be_bytes());
         expected_zero.extend_from_slice(did_bytes_bob);
         expected_zero.extend_from_slice(&0_u64.to_be_bytes());
+        expected_zero.extend_from_slice(&0_u64.to_be_bytes());
         assert_eq!(aad_zero, expected_zero);
 
-        let aad_max = build_broadcast_aad("did:dht:charlie", u64::MAX);
+        let aad_max = build_broadcast_aad("ctx-max", "did:dht:charlie", u64::MAX, u64::MAX);
+        let ctx_bytes_max = b"ctx-max";
         let did_bytes_charlie = b"did:dht:charlie";
         let mut expected_max = Vec::new();
+        expected_max.extend_from_slice(&(ctx_bytes_max.len() as u32).to_be_bytes());
+        expected_max.extend_from_slice(ctx_bytes_max);
         expected_max.extend_from_slice(&(did_bytes_charlie.len() as u32).to_be_bytes());
         expected_max.extend_from_slice(did_bytes_charlie);
+        expected_max.extend_from_slice(&u64::MAX.to_be_bytes());
         expected_max.extend_from_slice(&u64::MAX.to_be_bytes());
         assert_eq!(aad_max, expected_max);
     }
 
     #[test]
-    fn aad_empty_author_did_produces_correct_binary_layout() {
-        // Empty DID: 4-byte zero length prefix + no DID bytes + 8-byte epoch.
-        let aad = build_broadcast_aad("", 42);
+    fn aad_empty_fields_produces_correct_binary_layout() {
+        // Empty context_id and DID: 4-byte zero length + 4-byte zero length + 8-byte epoch + 8-byte sequence.
+        let aad = build_broadcast_aad("", "", 42, 1);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&0_u32.to_be_bytes()); // context_id len
+        expected.extend_from_slice(&0_u32.to_be_bytes()); // did len
+        expected.extend_from_slice(&42_u64.to_be_bytes()); // epoch
+        expected.extend_from_slice(&1_u64.to_be_bytes()); // sequence
         assert_eq!(
-            aad,
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 42],
-            "empty DID must produce [4-byte zero length][8-byte epoch BE]"
+            aad, expected,
+            "empty context_id + DID must produce [4-byte zero len][4-byte zero len][8-byte epoch BE][8-byte sequence BE]"
         );
     }
 
@@ -786,9 +1265,152 @@ mod tests {
         // AAD was unparseable for DIDs containing colons.
         let key = generate_broadcast_key("did:web:example.com:path:sub");
         let plaintext = b"colon-heavy DID roundtrip";
-        let envelope = seal_broadcast(&key, plaintext).unwrap();
-        let decrypted = open_broadcast(&key, &envelope).unwrap();
+        let envelope = test_seal(&key, plaintext);
+        let decrypted = test_open(&key, &envelope).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn seal_open_with_signature_verification() {
+        // Full roundtrip with Ed25519 signature verification via open_broadcast.
+        let key = generate_broadcast_key("did:dht:alice");
+        let sk = test_signing_key();
+        let vk = sk.verifying_key();
+        let nonce = generate_broadcast_nonce();
+        let provenance_hash = compute_provenance_hash(None).unwrap();
+        let signature = test_sign_with_fields(
+            &sk,
+            &SigningPayloadFields {
+                version: crate::envelope::SCP_PROTOCOL_VERSION,
+                context_id: "test-ctx",
+                author_did: &key.author_did,
+                sequence: 1,
+                key_epoch: key.epoch,
+                timestamp: 1_700_000_000_000,
+                nonce: &nonce,
+                provenance_hash: &provenance_hash,
+            },
+        );
+        let params = SealBroadcastParams {
+            context_id: "test-ctx",
+            sequence: 1,
+            timestamp: 1_700_000_000_000,
+            provenance: None,
+            signature,
+        };
+        let envelope = seal_broadcast(&key, b"signed message", &nonce, &params).unwrap();
+        let decrypted = open_broadcast(&key, &envelope, &vk).unwrap();
+        assert_eq!(decrypted, b"signed message");
+    }
+
+    #[test]
+    fn open_with_wrong_verifying_key_fails() {
+        // Seal with one key, try to verify with a different key.
+        let key = generate_broadcast_key("did:dht:alice");
+        let envelope = test_seal(&key, b"wrong key test");
+
+        let wrong_signing = ed25519_dalek::SigningKey::from_bytes(&[0xBB; 32]);
+        let wrong_verifying = wrong_signing.verifying_key();
+
+        let result = open_broadcast(&key, &envelope, &wrong_verifying);
+        assert!(
+            matches!(result, Err(SenderKeyError::VerificationFailed(_))),
+            "wrong verifying key must fail, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn replay_detector_accepts_increasing_sequences() {
+        let mut detector = BroadcastReplayDetector::new();
+        assert!(detector.check_and_advance("did:dht:alice", 1, 1000));
+        assert!(detector.check_and_advance("did:dht:alice", 2, 2000));
+        assert!(detector.check_and_advance("did:dht:alice", 5, 5000));
+        assert_eq!(detector.last_seen("did:dht:alice"), Some(5));
+    }
+
+    #[test]
+    fn replay_detector_rejects_duplicate_and_old_sequences() {
+        let mut detector = BroadcastReplayDetector::new();
+        assert!(detector.check_and_advance("did:dht:alice", 3, 3000));
+        assert!(!detector.check_and_advance("did:dht:alice", 3, 3000)); // duplicate
+        assert!(!detector.check_and_advance("did:dht:alice", 1, 1000)); // old
+        assert!(detector.check_and_advance("did:dht:alice", 4, 4000)); // new
+    }
+
+    #[test]
+    fn replay_detector_tracks_authors_independently() {
+        let mut detector = BroadcastReplayDetector::new();
+        assert!(detector.check_and_advance("did:dht:alice", 1, 1000));
+        assert!(detector.check_and_advance("did:dht:bob", 1, 1000));
+        assert!(!detector.check_and_advance("did:dht:alice", 1, 1000));
+        assert!(detector.check_and_advance("did:dht:bob", 2, 2000));
+    }
+
+    #[test]
+    fn replay_detector_evicts_oldest_when_full() {
+        let mut detector = BroadcastReplayDetector::new();
+        // Fill to capacity.
+        for i in 0..super::REPLAY_DETECTOR_MAX_AUTHORS {
+            assert!(detector.check_and_advance(&format!("did:dht:author-{i}"), 1, i as u64));
+        }
+        // The oldest entry (timestamp 0 = "did:dht:author-0") should be evicted.
+        assert!(detector.check_and_advance("did:dht:new-author", 1, 20_000));
+        assert_eq!(detector.last_seen("did:dht:author-0"), None);
+        assert_eq!(detector.last_seen("did:dht:new-author"), Some(1));
+    }
+
+    // -----------------------------------------------------------------------
+    // Deserialization size limit tests (#347)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn oversized_broadcast_envelope_rejected_on_deser() {
+        // A BroadcastEnvelope with >512 KiB encrypted_content must be rejected
+        // during deserialization to prevent OOM from untrusted input (#347).
+        //
+        // We construct a valid-shaped envelope with 1 MiB of encrypted_content,
+        // serialize it to MessagePack (which is the wire format), then verify
+        // that deserialization fails with the bounded-bytes error.
+        use crate::serde_util::BOUNDED_BYTES_MAX;
+
+        // Build a helper struct that serializes the same field names but uses
+        // raw serde_bytes (no bound) so we can create the oversized payload.
+        #[derive(serde::Serialize)]
+        struct UnboundedEnvelope {
+            context_id: String,
+            author_did: String,
+            sequence: u64,
+            timestamp: u64,
+            key_epoch: u64,
+            provenance: Option<()>,
+            #[serde(with = "crate::serde_util::serde_signature_64")]
+            signature: [u8; 64],
+            #[serde(with = "super::serde_nonce")]
+            nonce: [u8; 12],
+            #[serde(with = "serde_bytes")]
+            encrypted_content: Vec<u8>,
+        }
+
+        let oversized = UnboundedEnvelope {
+            context_id: "ctx-test".to_owned(),
+            author_did: "did:dht:test".to_owned(),
+            sequence: 0,
+            timestamp: 0,
+            key_epoch: 0,
+            provenance: None,
+            signature: [0u8; 64],
+            nonce: [0u8; 12],
+            encrypted_content: vec![0xAB; BOUNDED_BYTES_MAX + 1],
+        };
+
+        let serialized = rmp_serde::to_vec_named(&oversized).unwrap();
+        let result = rmp_serde::from_slice::<BroadcastEnvelope>(&serialized);
+        assert!(result.is_err(), "should reject >512 KiB encrypted_content");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("exceeds"),
+            "error should mention size limit: {err}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -802,8 +1424,9 @@ mod tests {
             plaintext in proptest::collection::vec(any::<u8>(), 0..2048)
         ) {
             let key = generate_broadcast_key("did:dht:proptest");
-            let envelope = seal_broadcast(&key, &plaintext).unwrap();
-            let decrypted = open_broadcast(&key, &envelope).unwrap();
+            // test_seal handles nonce generation and signing internally
+            let envelope = test_seal(&key, &plaintext);
+            let decrypted = test_open(&key, &envelope).unwrap();
             prop_assert_eq!(plaintext, decrypted);
         }
     }

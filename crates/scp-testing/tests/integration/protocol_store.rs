@@ -383,6 +383,7 @@ async fn broadcast_state_store_load_roundtrip() {
             author_did: "did:dht:z6MkAuthor".to_owned(),
             broadcast_key: generate_sender_key(),
             epoch: 5,
+            next_sequence: 1,
             block_list,
         },
     );

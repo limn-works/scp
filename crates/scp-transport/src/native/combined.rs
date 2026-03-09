@@ -554,6 +554,15 @@ impl BlobStorage for CombinedNodeStorage {
             .map_err(|e| StorageError::Internal(format!("purge failed: {e}")))?;
         Ok(purged)
     }
+
+    async fn count(&self) -> Result<usize, StorageError> {
+        let conn = self.lock_conn()?;
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
+            .map_err(|e| StorageError::Internal(format!("count failed: {e}")))?;
+        #[allow(clippy::cast_sign_loss)]
+        Ok(count as usize)
+    }
 }
 
 // We need the optional() extension.

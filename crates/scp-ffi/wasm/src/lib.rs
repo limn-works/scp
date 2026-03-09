@@ -77,10 +77,12 @@ pub mod custody;
 pub mod error;
 pub mod event_log;
 pub mod identity;
+pub mod manager;
 pub mod runtime;
 pub mod storage;
 pub mod tools;
 pub mod transport;
+pub mod trust;
 pub mod ucan;
 
 use wasm_bindgen::prelude::*;
