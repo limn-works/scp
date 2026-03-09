@@ -131,16 +131,39 @@ pub fn trust_verify_attestation(attestation_json: String) -> Promise {
 /// challenge metadata. The challenge is not signed (signing requires
 /// `WebCrypto` Ed25519 from the TypeScript wrapper).
 ///
+/// # Arguments
+///
+/// - `challenger_did` — DID of the entity issuing the challenge.
+/// - `target_did` — DID of the entity being challenged.
+///
 /// # JS usage
 ///
 /// ```js
-/// const resultJson = await trust_create_challenge("did:key:target");
+/// const resultJson = await trust_create_challenge("did:key:challenger", "did:key:target");
 /// const result = JSON.parse(resultJson);
 /// console.log(result.challenge_id);
 /// ```
 #[wasm_bindgen]
-pub fn trust_create_challenge(target_did: String) -> Promise {
+pub fn trust_create_challenge(challenger_did: String, target_did: String) -> Promise {
     future_to_promise(async move {
+        if challenger_did.is_empty() {
+            return Err(ScpWasmError::validation(
+                "challenger DID must not be empty",
+            ));
+        }
+        if !challenger_did.starts_with("did:") {
+            return Err(ScpWasmError::validation(
+                "challenger DID must start with 'did:'",
+            ));
+        }
+        if challenger_did
+            .chars()
+            .any(|c| c < '\u{0020}' || c == '\u{007F}')
+        {
+            return Err(ScpWasmError::validation(
+                "challenger DID must not contain control characters",
+            ));
+        }
         if target_did.is_empty() {
             return Err(ScpWasmError::validation("target DID must not be empty"));
         }
@@ -152,7 +175,7 @@ pub fn trust_create_challenge(target_did: String) -> Promise {
             "challenge_json": serde_json::json!({
                 "challenge_id": challenge_id,
                 "challenge_type": "SchemaValidation",
-                "challenger_did": "did:key:ephemeral-challenger",
+                "challenger_did": challenger_did,
                 "subject_did": target_did,
                 "capability_uri": "scp:capability:schema-validation",
                 "parameters": {},
