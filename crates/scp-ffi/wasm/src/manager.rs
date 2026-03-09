@@ -380,6 +380,59 @@ pub struct WasmContextManager {
     contexts: HashMap<String, PerContextState>,
 }
 
+// ---------------------------------------------------------------------------
+// Import validation helpers
+// ---------------------------------------------------------------------------
+
+/// Validates a string field from imported (untrusted) data.
+fn validate_imported_string(
+    value: &str,
+    field_name: &str,
+    max_len: usize,
+) -> Result<(), ScpWasmError> {
+    if value.is_empty() {
+        return Err(ScpWasmError::Context {
+            message: format!("{field_name} must not be empty"),
+            code: "SCP-CTX-2032".to_owned(),
+        });
+    }
+    if value.len() > max_len {
+        return Err(ScpWasmError::Context {
+            message: format!(
+                "{field_name} exceeds maximum length ({} > {max_len})",
+                value.len()
+            ),
+            code: "SCP-CTX-2032".to_owned(),
+        });
+    }
+    if value.chars().any(char::is_control) {
+        return Err(ScpWasmError::Context {
+            message: format!("{field_name} contains control characters"),
+            code: "SCP-CTX-2032".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Validates a DID string from imported (untrusted) data.
+fn validate_imported_did(value: &str, field_name: &str) -> Result<(), ScpWasmError> {
+    validate_imported_string(value, field_name, 512)?;
+    if !value.starts_with("did:") {
+        return Err(ScpWasmError::Context {
+            message: format!("{field_name} must start with 'did:': got '{value}'"),
+            code: "SCP-CTX-2032".to_owned(),
+        });
+    }
+    // Must have at least did:method:id (3 colon-separated parts)
+    if value.splitn(4, ':').count() < 3 {
+        return Err(ScpWasmError::Context {
+            message: format!("{field_name} must have format 'did:method:id': got '{value}'"),
+            code: "SCP-CTX-2032".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 impl Default for WasmContextManager {
     fn default() -> Self {
         Self::new()
@@ -1988,6 +2041,29 @@ impl WasmContextManager {
 
         let snap = &envelope.snapshot;
         let context_id = snap.context_id.clone();
+
+        // Validate imported fields from untrusted data (defense-in-depth)
+        validate_imported_string(&context_id, "context_id", 256)?;
+        validate_imported_did(&snap.creator_did, "creator_did")?;
+        for m in &snap.members {
+            validate_imported_did(&m.did, "member DID")?;
+            if m.role.is_empty() || m.role.len() > 64 {
+                return Err(ScpWasmError::Context {
+                    message: format!("invalid member role '{}': must be 1-64 chars", m.role),
+                    code: "SCP-CTX-2032".to_owned(),
+                });
+            }
+        }
+        let valid_states = ["active", "closed", "suspended", "archived"];
+        if !valid_states.contains(&snap.state.as_str()) {
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "invalid context state '{}': must be one of {valid_states:?}",
+                    snap.state
+                ),
+                code: "SCP-CTX-2032".to_owned(),
+            });
+        }
 
         if self.contexts.contains_key(&context_id) {
             return Err(ScpWasmError::Context {

@@ -809,32 +809,42 @@ impl scp_core::crypto::ucan::validate::DidResolver for NoOpDidResolver {
     }
 }
 
-struct NoOpNonceTracker;
-impl scp_core::crypto::ucan::validate::NonceTracker for NoOpNonceTracker {
+/// Fail-closed nonce tracker: rejects all nonces when no real tracker is
+/// available. Used as a type parameter only — never reached when token is
+/// `None`, but rejects by default if accidentally called.
+struct RejectAllNonceTracker;
+impl scp_core::crypto::ucan::validate::NonceTracker for RejectAllNonceTracker {
     fn check_and_record(
         &mut self,
-        _nonce: &str,
+        nonce: &str,
         _token_expiry: u64,
     ) -> Result<(), scp_core::crypto::ucan::UcanError> {
-        Ok(())
+        Err(scp_core::crypto::ucan::UcanError::NonceReused(
+            nonce.to_owned(),
+        ))
     }
 }
 
-struct NoOpRevocationChecker;
-impl scp_core::crypto::ucan::validate::RevocationChecker for NoOpRevocationChecker {
+/// Fail-closed revocation checker: treats all tokens as revoked when no real
+/// checker is available. Used as a type parameter only — never reached when
+/// token is `None`, but rejects by default if accidentally called.
+struct RejectAllRevocationChecker;
+impl scp_core::crypto::ucan::validate::RevocationChecker for RejectAllRevocationChecker {
     fn is_revoked(&self, _token_cid: &str) -> bool {
-        false
+        true
     }
 }
 
-struct NoOpProofResolver;
-impl scp_core::crypto::ucan::validate::ProofResolver for NoOpProofResolver {
+/// Fail-closed proof resolver: rejects all proof lookups. Used as a type
+/// parameter only — never reached when token is `None`.
+struct RejectAllProofResolver;
+impl scp_core::crypto::ucan::validate::ProofResolver for RejectAllProofResolver {
     fn resolve_proof(
         &self,
         cid: &str,
     ) -> Result<scp_core::crypto::ucan::UcanToken, scp_core::crypto::ucan::UcanError> {
         Err(scp_core::crypto::ucan::UcanError::DelegationChainBroken(
-            format!("NoOpProofResolver: no proof available for CID {cid}"),
+            format!("RejectAllProofResolver: no proof available for CID {cid}"),
         ))
     }
 }
@@ -868,9 +878,9 @@ pub async fn broadcast_subscribe(
     manager
         .subscribe_broadcast::<
             NoOpDidResolver,
-            NoOpNonceTracker,
-            NoOpRevocationChecker,
-            NoOpProofResolver,
+            RejectAllNonceTracker,
+            RejectAllRevocationChecker,
+            RejectAllProofResolver,
             std::hash::RandomState,
         >(&context_id, &did, None, timestamp, None)
         .await
