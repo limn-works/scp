@@ -669,16 +669,16 @@ These types are the tool call schemas for the standard discovery context tools d
 
 | Variant | Tag | Fields | Semantics |
 |---------|-----|--------|-----------|
-| `Registered` | `"registered"` | `did: String`, `capabilities: Vec<String>`, `metadata: Map`, `entry_id: String`, `timestamp: u64` | New registration. |
-| `Updated` | `"updated"` | `did: String`, `capabilities: Vec<String>`, `metadata: Map`, `entry_id: String`, `timestamp: u64` | Updated existing registration. |
-| `Deregistered` | `"deregistered"` | `did: String`, `entry_id: String`, `timestamp: u64` | Removed registration. |
+| `Registered` | `"Registered"` | `did: String`, `capabilities: Vec<String>`, `metadata: Map`, `entry_id: String`, `timestamp: u64` | New registration. |
+| `Updated` | `"Updated"` | `did: String`, `capabilities: Vec<String>`, `metadata: Map`, `entry_id: String`, `timestamp: u64` | Updated existing registration. |
+| `Deregistered` | `"Deregistered"` | `did: String`, `entry_id: String`, `timestamp: u64` | Removed registration. |
 
 **`MembershipTier`** — Enum for discovery context membership levels.
 
 | Variant | Serde Tag | Semantics |
 |---------|-----------|-----------|
-| `Writer` | `"writer"` | MLS group member. Can process registrations and writes. |
-| `Reader` | `"reader"` | DID-authenticated. Can query but not modify. Unbounded membership. |
+| `Writer` | `"Writer"` | MLS group member. Can process registrations and writes. |
+| `Reader` | `"Reader"` | DID-authenticated. Can query but not modify. Unbounded membership. |
 
 ### 22.11.2 Handle Registration and Lookup
 
@@ -760,8 +760,8 @@ These types are the tool call schemas for the standard discovery context tools d
 
 | Variant | Tag | Fields | Semantics |
 |---------|-----|--------|-----------|
-| `Identity` | `"identity"` | `did: String` | Handle points to a DID. |
-| `Context` | `"context"` | `context_id: String`, `relay_urls: Vec<String>` | Handle points to a context. |
+| `Identity` | `"Identity"` | `did: String` | Handle points to a DID. |
+| `Context` | `"Context"` | `context_id: String`, `relay_urls: Vec<String>` | Handle points to a context. |
 
 ### 22.11.3 Address Resolution
 
@@ -769,26 +769,26 @@ These types are the tool call schemas for the standard discovery context tools d
 
 | Variant | Serde Tag | Semantics |
 |---------|-----------|-----------|
-| `Identity` | `"identity"` | Address resolves to a DID. |
-| `Context` | `"context"` | Address resolves to a context ID + relay URLs. |
+| `Identity` | `"Identity"` | Address resolves to a DID. |
+| `Context` | `"Context"` | Address resolves to a context ID + relay URLs. |
 
 **`AddressResolution`** — Tagged enum for resolution results.
 
 | Variant | Tag | Fields | Semantics |
 |---------|-----|--------|-----------|
-| `Identity` | `"identity"` | `did: String`, `trust_level: TrustLevel`, `resolution_path: ResolutionPath` | Resolved to a DID. |
-| `Context` | `"context"` | `context_id: String`, `relay_urls: Vec<String>`, `mode: String`, `trust_level: TrustLevel`, `resolution_path: ResolutionPath` | Resolved to a context. `mode` is `"encrypted"` or `"broadcast"`. |
+| `Identity` | `"Identity"` | `did: String`, `trust_level: TrustLevel`, `resolution_path: ResolutionPath` | Resolved to a DID. |
+| `Context` | `"Context"` | `context_id: String`, `relay_urls: Vec<String>`, `mode: String`, `trust_level: TrustLevel`, `resolution_path: ResolutionPath` | Resolved to a context. `mode` is `"encrypted"` or `"broadcast"`. |
 
 **`TrustLevel`** — Tagged enum indicating binding strength. Not strictly ordered (§22.7).
 
 | Variant | Tag | Fields | Semantics |
 |---------|-----|--------|-----------|
-| `DirectExchange` | `"direct_exchange"` | — | DID exchanged out-of-band and verified. Highest personal trust. |
-| `LocalPetname` | `"local_petname"` | — | User-assigned name. Maximum personal trust, zero shareability. |
-| `MultiLayerCorroborated` | `"multi_layer_corroborated"` | `sources: Vec<ResolutionPath>` | Multiple independent resolution paths agree. |
-| `DomainVerified` | `"domain_verified"` | — | Resolved via `.well-known/scp`. HTTPS-dependent. |
-| `AttestationVerified` | `"attestation_verified"` | — | Resolved via identity attestation. Platform-dependent. |
-| `DiscoveryContextVerified` | `"discovery_context_verified"` | — | Resolved via discovery context handle. Community-governed. |
+| `DirectExchange` | `"DirectExchange"` | — | DID exchanged out-of-band and verified. Highest personal trust. |
+| `LocalPetname` | `"LocalPetname"` | — | User-assigned name. Maximum personal trust, zero shareability. |
+| `MultiLayerCorroborated` | `"MultiLayerCorroborated"` | `sources: Vec<ResolutionPath>` | Multiple independent resolution paths agree. |
+| `DomainVerified` | `"DomainVerified"` | — | Resolved via `.well-known/scp`. HTTPS-dependent. |
+| `AttestationVerified` | `"AttestationVerified"` | — | Resolved via identity attestation. Platform-dependent. |
+| `DiscoveryContextVerified` | `"DiscoveryContextVerified"` | — | Resolved via discovery context handle. Community-governed. |
 
 **`ResolutionPath`** — Provenance for the resolution itself.
 
@@ -803,20 +803,20 @@ These types are the tool call schemas for the standard discovery context tools d
 
 | Variant | Serde Tag | Semantics |
 |---------|-----------|-----------|
-| `Petname` | `"petname"` | Local petname store. |
-| `DiscoveryContext` | `"discovery_context"` | Discovery context handle lookup. |
-| `Attestation` | `"attestation"` | Attestation-backed reverse lookup. |
-| `Domain` | `"domain"` | `.well-known/scp` domain handle. |
-| `MultiLayerCorroborated` | `"multi_layer_corroborated"` | Multiple layers agreed. |
+| `Petname` | `"Petname"` | Local petname store. |
+| `DiscoveryContext` | `"DiscoveryContext"` | Discovery context handle lookup. |
+| `Attestation` | `"Attestation"` | Attestation-backed reverse lookup. |
+| `Domain` | `"Domain"` | `.well-known/scp` domain handle. |
+| `MultiLayerCorroborated` | `"MultiLayerCorroborated"` | Multiple layers agreed. |
 
 **`ParsedAddress`** — Tagged enum for parsed human-readable addresses.
 
 | Variant | Tag | Fields | Semantics |
 |---------|-----|--------|-----------|
-| `DiscoveryHandle` | `"discovery_handle"` | `local_part: String`, `scope: String` | `alice@cooking-community` — scope has no `.` |
-| `DomainHandle` | `"domain_handle"` | `local_part: String`, `domain: String` | `alice@example.com` — scope contains `.` |
-| `AttestationHandle` | `"attestation_handle"` | `handle: String`, `platform: String` | `@alice:x` — leading `@`, optional `:platform` |
-| `Unscoped` | `"unscoped"` | `name: String` | `alice` — bare name, search all layers |
+| `DiscoveryHandle` | `"DiscoveryHandle"` | `local_part: String`, `scope: String` | `alice@cooking-community` — scope has no `.` |
+| `DomainHandle` | `"DomainHandle"` | `local_part: String`, `domain: String` | `alice@example.com` — scope contains `.` |
+| `AttestationHandle` | `"AttestationHandle"` | `handle: String`, `platform: String` | `@alice:x` — leading `@`, optional `:platform` |
+| `Unscoped` | `"Unscoped"` | `name: String` | `alice` — bare name, search all layers |
 
 ### 22.11.4 Push Notifications
 
@@ -824,9 +824,9 @@ These types are the tool call schemas for the standard discovery context tools d
 
 | Variant | Serde Tag | Tag Byte | Semantics |
 |---------|-----------|----------|-----------|
-| `Apns` | `"apns"` | `0x01` | Apple Push Notification Service. |
-| `Fcm` | `"fcm"` | `0x02` | Firebase Cloud Messaging. |
-| `WebPush` | `"web_push"` | `0x03` | Web Push API (RFC 8030). |
+| `Apns` | `"Apns"` | `0x01` | Apple Push Notification Service. |
+| `Fcm` | `"Fcm"` | `0x02` | Firebase Cloud Messaging. |
+| `WebPush` | `"WebPush"` | `0x03` | Web Push API (RFC 8030). |
 
 **`PushRegistration`** — Registers a device for push notifications.
 
@@ -856,10 +856,10 @@ These events are appended to the identity private state event log (§3.7). They 
 
 | Variant | Tag | Fields | Semantics |
 |---------|-----|--------|-----------|
-| `SetPetname` | `"set_petname"` | `did: String`, `name: String` | Assign a local name to a DID. |
-| `RemovePetname` | `"remove_petname"` | `did: String` | Remove a DID's local name. |
-| `SetContextPetname` | `"set_context_petname"` | `context_id: String`, `name: String` | Assign a local name to a context. |
-| `RemoveContextPetname` | `"remove_context_petname"` | `context_id: String` | Remove a context's local name. |
+| `SetPetname` | `"SetPetname"` | `did: String`, `name: String` | Assign a local name to a DID. |
+| `RemovePetname` | `"RemovePetname"` | `did: String` | Remove a DID's local name. |
+| `SetContextPetname` | `"SetContextPetname"` | `context_id: String`, `name: String` | Assign a local name to a context. |
+| `RemoveContextPetname` | `"RemoveContextPetname"` | `context_id: String` | Remove a context's local name. |
 
 ### 22.11.6 Capability and Context Discovery
 

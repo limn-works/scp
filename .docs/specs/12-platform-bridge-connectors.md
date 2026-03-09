@@ -853,18 +853,18 @@ This section tabulates the wire format for all bridge protocol types that cross 
 
 | Variant | Serde Tag | Semantics |
 |---------|-----------|-----------|
-| `Relay` | `"relay"` | Bridge relays messages without platform interaction. Read-only ingestion. |
-| `Puppet` | `"puppet"` | Bridge controls a platform account. Bidirectional but synthetic. |
-| `Api` | `"api"` | Bridge uses official platform API. Bidirectional with rate limits. |
-| `Cooperative` | `"cooperative"` | Platform natively supports SCP. Full fidelity. |
+| `Relay` | `"Relay"` | Bridge relays messages without platform interaction. Read-only ingestion. |
+| `Puppet` | `"Puppet"` | Bridge controls a platform account. Bidirectional but synthetic. |
+| `Api` | `"Api"` | Bridge uses official platform API. Bidirectional with rate limits. |
+| `Cooperative` | `"Cooperative"` | Platform natively supports SCP. Full fidelity. |
 
 **`BridgeStatus`** — Enum for bridge lifecycle states.
 
 | Variant | Serde Tag | Semantics |
 |---------|-----------|-----------|
-| `Active` | `"active"` | Bridge is operational. |
-| `Suspended` | `"suspended"` | Bridge is temporarily suspended by governance. |
-| `Revoked` | `"revoked"` | Bridge is permanently revoked. |
+| `Active` | `"Active"` | Bridge is operational. |
+| `Suspended` | `"Suspended"` | Bridge is temporarily suspended by governance. |
+| `Revoked` | `"Revoked"` | Bridge is permanently revoked. |
 
 **`BridgeConnector`** — A registered bridge connector entity.
 
@@ -896,17 +896,17 @@ This section tabulates the wire format for all bridge protocol types that cross 
 
 | Variant | Serde Tag | Fields | Semantics |
 |---------|-----------|--------|-----------|
-| `Approved` | `"approved"` | — | Registration accepted. |
-| `Rejected` | `"rejected"` | `reason: String` | Registration denied with explanation. |
+| `Approved` | `"Approved"` | — | Registration accepted. |
+| `Rejected` | `"Rejected"` | `reason: String` | Registration denied with explanation. |
 
 **`BridgeRegistrationAction`** — Tagged enum for registration lifecycle actions.
 
 | Variant | Tag | Fields | Semantics |
 |---------|-----|--------|-----------|
-| `Requested` | `"requested"` | — | Registration submitted. |
-| `Approved` | `"approved"` | — | Governance approved the registration. |
-| `Rejected` | `"rejected"` | `reason: String` | Governance rejected with reason. |
-| `Revoked` | `"revoked"` | — | Governance revoked an active bridge. |
+| `Requested` | `"Requested"` | — | Registration submitted. |
+| `Approved` | `"Approved"` | — | Governance approved the registration. |
+| `Rejected` | `"Rejected"` | `reason: String` | Governance rejected with reason. |
+| `Revoked` | `"Revoked"` | — | Governance revoked an active bridge. |
 
 **`BridgeRegistrationEvent`** — Event log entry for bridge registration lifecycle.
 
@@ -925,8 +925,8 @@ This section tabulates the wire format for all bridge protocol types that cross 
 
 | Variant | Serde Tag | Semantics |
 |---------|-----------|-----------|
-| `Shadow` | `"shadow"` | Unclaimed. Attributed to bridge operator. |
-| `Claimed` | `"claimed"` | Claimed by a verified DID via attestation proof. |
+| `Shadow` | `"Shadow"` | Unclaimed. Attributed to bridge operator. |
+| `Claimed` | `"Claimed"` | Claimed by a verified DID via attestation proof. |
 
 **`ShadowIdentity`** — A shadow identity representing a non-SCP platform user.
 
@@ -997,10 +997,10 @@ This section tabulates the wire format for all bridge protocol types that cross 
 
 | Variant | Serde Tag | Numeric Order | Semantics |
 |---------|-----------|---------------|-----------|
-| `ShadowBridged` | `"shadow_bridged"` | 0 | Content from unclaimed shadow identity. Lowest trust. |
-| `ClaimedBridged` | `"claimed_bridged"` | 1 | Content from claimed (DID-verified) shadow. |
-| `NativeBridged` | `"native_bridged"` | 2 | Content from native SCP member via bridge transport. |
-| `NativeNative` | `"native_native"` | 3 | Content from native SCP member via native transport. Highest trust. |
+| `ShadowBridged` | `"ShadowBridged"` | 0 | Content from unclaimed shadow identity. Lowest trust. |
+| `ClaimedBridged` | `"ClaimedBridged"` | 1 | Content from claimed (DID-verified) shadow. |
+| `NativeBridged` | `"NativeBridged"` | 2 | Content from native SCP member via bridge transport. |
+| `NativeNative` | `"NativeNative"` | 3 | Content from native SCP member via native transport. Highest trust. |
 
 **`BridgeProvenance`** — Extended provenance for bridged content (extends `DataProvenance` §24).
 
@@ -1032,11 +1032,11 @@ This section tabulates the wire format for all bridge protocol types that cross 
 
 | Variant | Serde Tag | Semantics |
 |---------|-----------|-----------|
-| `OAuthAccessToken` | `"oauth_access_token"` | OAuth 2.0 access token. |
-| `OAuthRefreshToken` | `"oauth_refresh_token"` | OAuth 2.0 refresh token. |
-| `ApiKey` | `"api_key"` | Platform API key. |
-| `WebhookSecret` | `"webhook_secret"` | Webhook signing secret. |
-| `Custom` | `"custom"` | Custom credential type. Carries `type_name: String`. |
+| `OAuthAccessToken` | `"OAuthAccessToken"` | OAuth 2.0 access token. |
+| `OAuthRefreshToken` | `"OAuthRefreshToken"` | OAuth 2.0 refresh token. |
+| `ApiKey` | `"ApiKey"` | Platform API key. |
+| `WebhookSecret` | `"WebhookSecret"` | Webhook signing secret. |
+| `Custom` | `"Custom"` | Custom credential type. Carries `type_name: String`. |
 
 **`BridgeCredential`** — Encrypted credential storage record.
 

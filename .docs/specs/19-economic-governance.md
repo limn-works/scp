@@ -653,10 +653,10 @@ This section tabulates the wire format for all economy protocol types that cross
 
 | Variant | Serde Tag | Fields | Semantics |
 |---------|-----------|--------|-----------|
-| `Daily` | `"daily"` | — | Billed daily. |
-| `Weekly` | `"weekly"` | — | Billed weekly. |
-| `Monthly` | `"monthly"` | — | Billed monthly. |
-| `Custom` | `"custom"` | `seconds: u64` | Custom period in seconds. |
+| `Daily` | `"Daily"` | — | Billed daily. |
+| `Weekly` | `"Weekly"` | — | Billed weekly. |
+| `Monthly` | `"Monthly"` | — | Billed monthly. |
+| `Custom` | `"Custom"` | `seconds: u64` | Custom period in seconds. |
 
 **`SubscriptionCost`** — Cost definition for recurring subscriptions.
 
@@ -681,11 +681,11 @@ This section tabulates the wire format for all economy protocol types that cross
 
 | Variant | Serde Tag | Semantics |
 |---------|-----------|-----------|
-| `MessageSend` | `"message_send"` | Sending a message. |
-| `ToolInvoke` | `"tool_invoke"` | Invoking a tool. |
-| `ContextJoin` | `"context_join"` | Joining a context. |
-| `SubscriptionPeriod` | `"subscription_period"` | Recurring subscription payment. |
-| `ByteStored` | `"byte_stored"` | Data storage. |
+| `MessageSend` | `"MessageSend"` | Sending a message. |
+| `ToolInvoke` | `"ToolInvoke"` | Invoking a tool. |
+| `ContextJoin` | `"ContextJoin"` | Joining a context. |
+| `SubscriptionPeriod` | `"SubscriptionPeriod"` | Recurring subscription payment. |
+| `ByteStored` | `"ByteStored"` | Data storage. |
 
 ### 19.15.3 Dynamic Pricing
 
@@ -693,19 +693,19 @@ This section tabulates the wire format for all economy protocol types that cross
 
 | Variant | Serde Tag | Measurement Semantics |
 |---------|-----------|----------------------|
-| `ContextMessageRate` | `"context_message_rate"` | Messages per second in the context (sliding window). |
-| `MemberCount` | `"member_count"` | Current context member count. |
-| `RelayQueueDepth` | `"relay_queue_depth"` | Pending messages in relay queue. |
-| `TimeOfDay` | `"time_of_day"` | Current hour (0-23) in UTC. |
-| `SenderVelocity` | `"sender_velocity"` | Messages per minute from the specific sender. |
-| `StorageUsage` | `"storage_usage"` | Bytes currently stored for the context. |
+| `ContextMessageRate` | `"ContextMessageRate"` | Messages per second in the context (sliding window). |
+| `MemberCount` | `"MemberCount"` | Current context member count. |
+| `RelayQueueDepth` | `"RelayQueueDepth"` | Pending messages in relay queue. |
+| `TimeOfDay` | `"TimeOfDay"` | Current hour (0-23) in UTC. |
+| `SenderVelocity` | `"SenderVelocity"` | Messages per minute from the specific sender. |
+| `StorageUsage` | `"StorageUsage"` | Bytes currently stored for the context. |
 
 **`PricingVariable`** — Tagged enum for pricing formula components.
 
 | Variant | Tag | Fields | Semantics |
 |---------|-----|--------|-----------|
-| `Linear` | `"linear"` | `metric: PricingMetric`, `coefficient: Coefficient` | `cost += coefficient * metric / 1,000,000`. |
-| `Step` | `"step"` | `metric: PricingMetric`, `thresholds: Vec<(u64, Amount)>` | Add `Amount` when `metric >= threshold`. Each threshold is `[metric_value, amount]`. |
+| `Linear` | `"Linear"` | `metric: PricingMetric`, `coefficient: Coefficient` | `cost += coefficient * metric / 1,000,000`. |
+| `Step` | `"Step"` | `metric: PricingMetric`, `thresholds: Vec<(u64, Amount)>` | Add `Amount` when `metric >= threshold`. Each threshold is `[metric_value, amount]`. |
 
 **`PricingFormula`** — Complete dynamic pricing specification.
 
@@ -807,11 +807,11 @@ This section tabulates the wire format for all economy protocol types that cross
 
 | Variant | Tag | Fields | Semantics |
 |---------|-----|--------|-----------|
-| `InsufficientBalance` | `"insufficient_balance"` | `available: Amount`, `requested: Amount` | Payer lacks funds. |
-| `UnsupportedCurrency` | `"unsupported_currency"` | `currency: CurrencyCode` | Adapter does not handle this currency. |
-| `AuthorizationExpired` | `"authorization_expired"` | `auth_id: [u8; 32]`, `expired_at: u64` | Authorization timed out. |
-| `AdapterUnavailable` | `"adapter_unavailable"` | `adapter_id: String` | Payment adapter is unreachable. |
-| `DuplicatePayment` | `"duplicate_payment"` | `idempotency_key: [u8; 16]` | Payment already processed for this key. |
+| `InsufficientBalance` | `"InsufficientBalance"` | `available: Amount`, `requested: Amount` | Payer lacks funds. |
+| `UnsupportedCurrency` | `"UnsupportedCurrency"` | `currency: CurrencyCode` | Adapter does not handle this currency. |
+| `AuthorizationExpired` | `"AuthorizationExpired"` | `auth_id: [u8; 32]`, `expired_at: u64` | Authorization timed out. |
+| `AdapterUnavailable` | `"AdapterUnavailable"` | `adapter_id: String` | Payment adapter is unreachable. |
+| `DuplicatePayment` | `"DuplicatePayment"` | `idempotency_key: [u8; 16]` | Payment already processed for this key. |
 
 ### 19.15.6 Spending Capability (UCAN Extension)
 
