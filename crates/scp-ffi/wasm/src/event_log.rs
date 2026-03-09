@@ -323,13 +323,40 @@ pub fn event_log_checkpoint(
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let timestamp_secs = (now / 1000.0) as u64;
 
-        // Build canonical checkpoint payload for signing.
-        // Format: context_id || sender_did || event_count(be) || merkle_root(hex) || epoch(be) || timestamp(be)
+        // Build canonical checkpoint payload for signing, matching native Rust's
+        // compute_checkpoint_canonical_hash in scp-event-log/src/checkpoint.rs.
+        // Format: "SCP-CHECKPOINT-V1:" || BE32(len(ctx)) || ctx || BE32(len(did)) || did
+        //         || event_count_BE || merkle_root(raw 32 bytes) || epoch_flag || [epoch_BE] || timestamp_BE
+        let ctx_bytes = context_id.as_bytes();
+        let did_bytes = identity_did.as_bytes();
+
+        // Decode the hex merkle root to raw bytes for cross-platform compatibility.
+        let merkle_root_bytes: [u8; 32] = {
+            let decoded: Vec<u8> = (0..merkle_root_hex.len())
+                .step_by(2)
+                .map(|i| {
+                    u8::from_str_radix(&merkle_root_hex[i..i + 2], 16)
+                        .unwrap_or(0)
+                })
+                .collect();
+            let mut arr = [0u8; 32];
+            let copy_len = decoded.len().min(32);
+            arr[..copy_len].copy_from_slice(&decoded[..copy_len]);
+            arr
+        };
+
         let mut signing_payload = Vec::new();
-        signing_payload.extend_from_slice(context_id.as_bytes());
-        signing_payload.extend_from_slice(identity_did.as_bytes());
+        signing_payload.extend_from_slice(b"SCP-CHECKPOINT-V1:");
+        #[allow(clippy::cast_possible_truncation)]
+        signing_payload.extend_from_slice(&(ctx_bytes.len() as u32).to_be_bytes());
+        signing_payload.extend_from_slice(ctx_bytes);
+        #[allow(clippy::cast_possible_truncation)]
+        signing_payload.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
+        signing_payload.extend_from_slice(did_bytes);
         signing_payload.extend_from_slice(&event_count.to_be_bytes());
-        signing_payload.extend_from_slice(merkle_root_hex.as_bytes());
+        signing_payload.extend_from_slice(&merkle_root_bytes);
+        // epoch_flag: 0x01 if Some, 0x00 if None (always Some here since we accept epoch param).
+        signing_payload.push(0x01);
         signing_payload.extend_from_slice(&epoch_u64.to_be_bytes());
         signing_payload.extend_from_slice(&timestamp_secs.to_be_bytes());
 
