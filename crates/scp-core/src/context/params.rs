@@ -353,6 +353,76 @@ pub struct ProjectionPolicy {
 }
 
 // ---------------------------------------------------------------------------
+// BridgeDirectionality (§5.7)
+// ---------------------------------------------------------------------------
+
+/// Directionality of a bridge connector (spec §5.7).
+///
+/// Determines whether the bridge relays content in both directions or
+/// one. Visible in context metadata before opt-in so prospective members
+/// can evaluate trust implications of bridge presence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BridgeDirectionality {
+    /// Platform-to-SCP and SCP-to-platform.
+    Full,
+    /// Platform-to-SCP only (external content enters SCP,
+    /// but SCP messages are not forwarded to the platform).
+    ReadOnly,
+    /// SCP-to-platform only (SCP messages are forwarded to the
+    /// platform, but no external content enters SCP).
+    WriteOnly,
+}
+
+// ---------------------------------------------------------------------------
+// BridgeCapability (§5.7)
+// ---------------------------------------------------------------------------
+
+/// Capabilities a bridge connector can exercise in a context (spec §5.7).
+///
+/// These are the four protocol-defined bridge capabilities. A bridge's
+/// `capabilities` field declares which of these it exercises, providing
+/// legibility to prospective members before they join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BridgeCapability {
+    /// Relay messages between SCP and the external platform.
+    RelayMessages,
+    /// Create shadow participants for external users.
+    CreateShadows,
+    /// Attest external user identities.
+    AttestIdentities,
+    /// Forward presence/typing indicators.
+    ForwardPresence,
+}
+
+// ---------------------------------------------------------------------------
+// BridgeMetadata (§5.7)
+// ---------------------------------------------------------------------------
+
+/// Metadata for an active bridge connector as defined in spec §5.7.
+///
+/// This is the spec-aligned bridge metadata type that provides
+/// directionality and capabilities information to prospective members.
+/// Complements [`BridgeInfo`] which carries the implementation-level
+/// bridge mode (Relay/Puppet/Api/Cooperative). `BridgeMetadata` is
+/// the pre-join legibility surface; `BridgeInfo` is the runtime
+/// structural data.
+///
+/// Structural field — always visible before joining (legibility tenet).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeMetadata {
+    /// External platform name (e.g., `"discord"`, `"slack"`, `"x"`).
+    pub platform: String,
+    /// DID of the bridge operator — the human accountable for bridge
+    /// behavior (spec §12.2).
+    pub bridge_did: DID,
+    /// Capabilities the bridge exercises in this context.
+    pub capabilities: Vec<BridgeCapability>,
+    /// Directionality of the bridge.
+    pub mode: BridgeDirectionality,
+}
+
+// ---------------------------------------------------------------------------
 // BridgeInfo
 // ---------------------------------------------------------------------------
 

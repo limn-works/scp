@@ -328,6 +328,23 @@ pub enum ContextEvent {
         /// Optional reason for the rotation.
         reason: Option<String>,
     },
+    /// A governance action was successfully executed (ADR-031 §8).
+    ///
+    /// Emitted after every successful governance action execution so SDK
+    /// consumers can observe governance outcomes through the receive buffer.
+    /// The `action_summary` is a human-readable description (e.g.,
+    /// `"AddMember"`, `"UpdateParams"`) since the full [`GovernanceAction`]
+    /// type lives in the governance module.
+    GovernanceActionExecuted {
+        /// The proposal ID that was executed (SHA-256 hash).
+        proposal_id: [u8; 32],
+        /// Human-readable summary of the action (variant name).
+        action_summary: String,
+        /// The DID of the executor (proposer of the approved proposal).
+        executor_did: DID,
+        /// The MLS epoch after execution, if applicable.
+        resulting_epoch: Option<u64>,
+    },
     /// The context expired due to TTL.
     ///
     /// Replaces the former sentinel DID string `"__ttl_expiry_notification"`.

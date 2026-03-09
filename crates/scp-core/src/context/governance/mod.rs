@@ -694,6 +694,43 @@ pub enum GovernanceAction {
     LockEconomicPolicy,
 }
 
+impl GovernanceAction {
+    /// Returns the variant name as a static string for logging and event summaries.
+    #[must_use]
+    pub const fn variant_name(&self) -> &'static str {
+        match self {
+            Self::AddMember { .. } => "AddMember",
+            Self::RemoveMember { .. } => "RemoveMember",
+            Self::ChangeRole { .. } => "ChangeRole",
+            Self::RegisterTool { .. } => "RegisterTool",
+            Self::RemoveTool { .. } => "RemoveTool",
+            Self::ModifyCeiling { .. } => "ModifyCeiling",
+            Self::CloseContext { .. } => "CloseContext",
+            Self::ExtendTtl { .. } => "ExtendTtl",
+            Self::TransferAdmin { .. } => "TransferAdmin",
+            Self::CreateChildContext { .. } => "CreateChildContext",
+            Self::BlockAuthor { .. } => "BlockAuthor",
+            Self::RevokeReadAccess { .. } => "RevokeReadAccess",
+            Self::RestoreReadAccess { .. } => "RestoreReadAccess",
+            Self::ModifyPruningPolicy { .. } => "ModifyPruningPolicy",
+            Self::AddSigner { .. } => "AddSigner",
+            Self::RemoveSigner { .. } => "RemoveSigner",
+            Self::ModifyThreshold { .. } => "ModifyThreshold",
+            Self::EstablishToolInterface { .. } => "EstablishToolInterface",
+            Self::ResetMember { .. } => "ResetMember",
+            Self::ResolveConflict { .. } => "ResolveConflict",
+            Self::PromoteContext => "PromoteContext",
+            Self::RevokeWriteAccess { .. } => "RevokeWriteAccess",
+            Self::RestoreWriteAccess { .. } => "RestoreWriteAccess",
+            Self::RotateContentKeys { .. } => "RotateContentKeys",
+            Self::ReconfigureGovernance { .. } => "ReconfigureGovernance",
+            Self::SetEconomicPolicy { .. } => "SetEconomicPolicy",
+            Self::ApproveSpend { .. } => "ApproveSpend",
+            Self::LockEconomicPolicy => "LockEconomicPolicy",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // VoteType / SignedVote
 // ---------------------------------------------------------------------------
@@ -1042,6 +1079,23 @@ pub enum GovernanceEvent {
     ConflictResolved {
         winner_id: ProposalId,
         loser_id: ProposalId,
+    },
+    /// A governance action was successfully executed (ADR-031 §8).
+    ///
+    /// Emitted after every successful governance action execution in
+    /// `execute_governance_action`. Records the proposal ID, the action
+    /// that was executed, the DID of the executor (proposer), and the
+    /// resulting MLS epoch (if applicable). This is the 8th governance
+    /// event type per PRD SCP-269/SCP-270.
+    GovernanceActionExecuted {
+        /// The proposal that was executed.
+        proposal_id: ProposalId,
+        /// The governance action that was executed.
+        action: Box<GovernanceAction>,
+        /// The DID of the executor (proposer of the approved proposal).
+        executor_did: DID,
+        /// The MLS epoch after execution, if applicable.
+        resulting_epoch: Option<u64>,
     },
 }
 
