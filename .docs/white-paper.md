@@ -11,7 +11,7 @@ Software generation is becoming trivial. Frontier language models produce functi
 
 This paper presents the Shared Context Protocol (SCP), an open protocol providing cryptographic identity (DID), governed interaction spaces (contexts), end-to-end encryption as access control (MLS), capability-based authorization (UCAN), and verifiable provenance. All interaction occurs within contexts — bounded, encrypted, governed spaces where membership is enforced by cryptography, not infrastructure. The protocol is designed for a world where autonomous agents are the primary actors: every agent traces to a human identity through cryptographic binding, agents are isolated per context at the protocol level, and behavioral records replace reputation scores as the primary trust input.
 
-Key properties: no operator dependency (the protocol functions if its creators disappear), transport independence (17 adapter specifications across 3 tiers), human accountability for all autonomous agents, and context isolation as the security boundary. The protocol is designed to be complementary to existing platforms and tool-level protocols rather than adversarial — bridge connectors, transport adapters, and identity attestations enable harmonious interoperation with established distribution networks. The reference implementation is in Rust with bindings for Python, Swift, Kotlin, TypeScript, and WebAssembly. The specification is published under CC-BY 4.0; the SDK under Apache 2.0.
+Key properties: no operator dependency (the protocol functions if its creators disappear), transport independence (17 adapter specifications across 3 tiers), human accountability for all autonomous agents, and context isolation as the security boundary. The protocol is designed to be complementary to existing platforms and tool-level protocols — bridge connectors, transport adapters, and identity attestations enable harmonious interoperation with established distribution networks. The reference implementation is in Rust with bindings for Python, Swift, Kotlin, TypeScript, and WebAssembly. The specification is published under CC-BY 4.0; the SDK under Apache 2.0.
 
 ---
 
@@ -35,11 +35,11 @@ The agent ecosystem is developing rapidly at the tool level. The Model Context P
 
 What is missing is the social layer — how agents *relate to each other*. No existing protocol addresses the questions that arise when autonomous agents interact: How does an agent prove its identity? How is trust established between agents that have never met? How are interactions governed when both participants are software? Who is accountable when an autonomous agent misbehaves? How does an agent in one context safely share information with an agent in another?
 
-SCP fills this gap. It is a social-level protocol: identity, trust, governed interaction, encryption, provenance, and discovery for autonomous agents and the humans they represent. The distinction is architectural: MCP, WebMCP, and UCP are complementary to SCP, not competitors. An SCP agent exposes itself as an MCP server locally. An SCP agent can use WebMCP-exposed tools in the browser. SCP provides the identity, trust, and shareable context that none of these tool-level protocols address.
+SCP fills this gap. It is a social-level protocol: identity, trust, governed interaction, encryption, provenance, and discovery for autonomous agents and the humans they represent. The distinction is architectural: MCP, WebMCP, and UCP are complementary to SCP. An SCP agent exposes itself as an MCP server locally. An SCP agent can use WebMCP-exposed tools in the browser. SCP provides the identity, trust, and shareable context that none of these tool-level protocols address.
 
-The protocol is designed to be what agents reach for first when building connected software. This is a deliberate design choice, not an aspiration: the SDK surface is small (~20-30 methods), the API is self-documenting and machine-readable, context creation is a runtime operation (~5-15ms local, ~200ms with network), and the protocol handles everything an agent needs — identity, encryption, trust, relationships, transport — invisibly. An agent that needs to build a collaborative application imports one SDK and calls `Context.create()`. The alternative is reimplementing identity, key management, encryption, authorization, and transport from scratch for every application. The protocol makes the right choice the easy choice.
+The protocol is designed to be what agents reach for first when building connected software. This is by design: the SDK surface is small (~20-30 methods), the API is self-documenting and machine-readable, context creation is a runtime operation (~5-15ms local, ~200ms with network), and the protocol handles everything an agent needs — identity, encryption, trust, relationships, transport — invisibly. An agent that needs to build a collaborative application imports one SDK and calls `Context.create()`. The alternative is reimplementing identity, key management, encryption, authorization, and transport from scratch for every application. The protocol makes the right choice the easy choice.
 
-This matters because the major platform companies — those with established distribution networks and billions of existing users — will build their own versions of this infrastructure. They will do so within their ecosystems, optimized for their platforms, with identity tied to their accounts and relationships locked to their networks. These solutions will not be portable, not interoperable, and not open. SCP is the open alternative. It is designed not to fight existing platforms but to harmonize with them: bridge connectors translate between SCP and external platforms at the protocol level, transport adapters run on any delivery infrastructure, identity attestations link SCP identities to existing platform accounts, and the cooperative bridge mode makes it structurally advantageous for platforms to participate rather than resist. The protocol complements existing distribution networks rather than attempting to replace them.
+This matters because the major platform companies — those with established distribution networks and billions of existing users — will build their own versions of this infrastructure. They will do so within their ecosystems, optimized for their platforms, with identity tied to their accounts and relationships locked to their networks. These solutions will not be portable, not interoperable, and not open. SCP is the open alternative. It is designed to harmonize with existing platforms: bridge connectors translate between SCP and external platforms at the protocol level, transport adapters run on any delivery infrastructure, identity attestations link SCP identities to existing platform accounts, and the cooperative bridge mode makes it structurally advantageous for platforms to participate rather than resist. The protocol complements existing distribution networks rather than attempting to replace them.
 
 ### 1.3 Design Principles
 
@@ -186,7 +186,7 @@ SCP's trust model has four layers, ordered from hardest (pure validation) to sof
 
 **Layer 4: Trust Evaluation.** Agent-level judgment for what cannot be mechanized: new identities with no history, non-testable capabilities, novel situations. This layer exists because some evaluation inherently requires judgment.
 
-The critical property: **the trust surface shrinks over time.** New identities are trust-heavy — no participation history, dependent on endorsements. As they participate, behavioral validation accumulates. Trust becomes supplementary, then marginal. The protocol makes this convergence structural, not aspirational.
+The critical property: **the trust surface shrinks over time.** New identities are trust-heavy — no participation history, dependent on endorsements. As they participate, behavioral validation accumulates. Trust becomes supplementary, then marginal. The protocol makes this convergence structural.
 
 ---
 
@@ -194,7 +194,7 @@ The critical property: **the trust surface shrinks over time.** New identities a
 
 ### 4.1 DID-Based Identity
 
-Every identity in SCP is rooted in a cryptographic keypair expressed as a Decentralized Identifier (DID). The DID is the canonical identifier at the protocol level — not a username, not an email, not an account on a server.
+Every identity in SCP is rooted in a cryptographic keypair expressed as a Decentralized Identifier (DID). The DID is the canonical identifier at the protocol level.
 
 SCP uses `did:dht` as the primary DID method. did:dht stores DID documents as BEP44 signed mutable items on BitTorrent's Mainline DHT — a network of millions of nodes with over 20 years of operational history. The DID string (`did:dht:<z-base-32-encoded-Ed25519-public-key>`) encodes the public key directly, making it self-certifying: DID documents are verifiable against the DID without trusting any intermediary. MITM on resolution is cryptographically impossible given the correct DID.
 
@@ -355,7 +355,7 @@ Spending UCANs authorize expenditure up to a ceiling, composing with action UCAN
 
 ### 8.1 Automatic Provenance Attachment
 
-Provenance is not a feature in SCP — it is a foundational property of every protocol action. The protocol attaches provenance records automatically when data crosses context boundaries through protocol mechanisms. No manual tagging is required.
+Provenance is a foundational property of every protocol action. The protocol attaches provenance records automatically when data crosses context boundaries through protocol mechanisms. No manual tagging is required.
 
 A provenance record contains: source context, source type (persistent, ephemeral, or summary — reflecting current verifiability), counterparties present in the source interaction, purpose, discovery method, age, memory scope, chain depth (number of context boundaries crossed), chain path (ordered list of intermediary contexts), and optional economic provenance (what the data cost to produce).
 
@@ -377,7 +377,7 @@ This ordering enables mechanical quality comparison. Agents set their own thresh
 
 Cross-context tool calls carry a chain depth counter, incremented on each hop. The protocol enforces a hard maximum of 5 hops (contexts may configure a lower limit; the recommended default is 3). Data at the effective maximum depth cannot trigger further cross-context calls. This bounds amplification and prevents accountability laundering — data traversing enough contexts that its origin becomes meaningless.
 
-Provenance degradation with chain depth is a feature, not a limitation. Data from many degrees of separation should be less trusted, the same way a message from a stranger warrants more scrutiny than one from a known contact.
+Provenance degradation with chain depth is intentional. Data from many degrees of separation should be less trusted, the same way a message from a stranger warrants more scrutiny than one from a known contact.
 
 ### 8.4 Honest Limitations
 
