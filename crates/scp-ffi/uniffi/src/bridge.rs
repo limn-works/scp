@@ -4981,6 +4981,7 @@ pub fn provenance_attach(
         discovery_method: scp_core::provenance::DiscoveryMethod::None,
         data_age: std::time::Duration::from_secs(0),
         purpose: None,
+        counterparty_policy: scp_core::provenance::CounterpartyPolicy::default(),
     };
 
     let existing_prov = existing_chain_depth.map(|depth| scp_core::provenance::DataProvenance {
@@ -5002,6 +5003,8 @@ pub fn provenance_attach(
         &source_info,
         &target_context_id,
         existing_prov.as_ref(),
+        None,
+        None,
     );
 
     let result = serde_json::json!({

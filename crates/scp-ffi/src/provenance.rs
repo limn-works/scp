@@ -100,6 +100,7 @@ pub fn py_provenance_attach<'py>(
         discovery_method: DiscoveryMethod::None,
         data_age: std::time::Duration::from_secs(0),
         purpose: None,
+        counterparty_policy: scp_core::provenance::CounterpartyPolicy::default(),
     };
 
     let existing_prov = existing_chain_depth.map(|depth| DataProvenance {
@@ -117,7 +118,13 @@ pub fn py_provenance_attach<'py>(
         payment_receipt_id: None,
     });
 
-    let prov = attach_provenance(&source_info, &target_context_id, existing_prov.as_ref());
+    let prov = attach_provenance(
+        &source_info,
+        &target_context_id,
+        existing_prov.as_ref(),
+        None,
+        None,
+    );
 
     provenance_to_dict(py, &prov)
 }

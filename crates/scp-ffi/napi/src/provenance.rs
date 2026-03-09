@@ -88,6 +88,7 @@ pub fn provenance_attach(
         discovery_method: DiscoveryMethod::None,
         data_age: std::time::Duration::from_secs(0),
         purpose: None,
+        counterparty_policy: scp_core::provenance::CounterpartyPolicy::default(),
     };
 
     #[allow(clippy::cast_possible_truncation)]
@@ -106,7 +107,13 @@ pub fn provenance_attach(
         payment_receipt_id: None,
     });
 
-    let prov = attach_provenance(&source_info, &target_context_id, existing_prov.as_ref());
+    let prov = attach_provenance(
+        &source_info,
+        &target_context_id,
+        existing_prov.as_ref(),
+        None,
+        None,
+    );
 
     let result = serde_json::json!({
         "source_context": prov.source_context,

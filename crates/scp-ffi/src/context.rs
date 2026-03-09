@@ -1405,6 +1405,7 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
         projection_policy: None,
         discoverable: false,
         max_chain_depth: None,
+        counterparty_policy: scp_core::provenance::CounterpartyPolicy::default(),
         participation_requirements: Vec::new(),
         incomplete_verification_policy:
             scp_core::context::params::IncompleteVerificationPolicy::default(),
