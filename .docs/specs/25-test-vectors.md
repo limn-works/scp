@@ -102,6 +102,8 @@ Domain: `"SCP-INNER-ENVELOPE-V1:"`
 
 ```
 Input:
+  version:           1
+  message_type:      0x00 (Standard discriminator byte)
   context_id:       "test-context-01"
   sender_did:       "did:dht:z6MkTest"
   epoch:            1
@@ -114,6 +116,8 @@ Input:
 
 Canonical hash input (concatenated bytes):
   "SCP-INNER-ENVELOPE-V1:"                    (22 bytes, no length prefix)
+  || BE16(1)                                   (2 bytes — version)
+  || 0x00                                      (1 byte — message_type discriminator)
   || BE32(15) || "test-context-01"             (4 + 15 = 19 bytes)
   || BE32(16) || "did:dht:z6MkTest"           (4 + 16 = 20 bytes)
   || BE64(1)                                   (8 bytes — epoch)
@@ -124,9 +128,9 @@ Canonical hash input (concatenated bytes):
   || BE32(32) || SHA-256(0x00)                 (4 + 32 = 36 bytes — absent provenance)
   || BE32(7)  || "#active"                     (4 + 7 = 11 bytes)
 
-Total: 22 + 19 + 20 + 8 + 8 + 8 + 8 + 36 + 36 + 11 = 176 bytes
+Total: 22 + 2 + 1 + 19 + 20 + 8 + 8 + 8 + 8 + 36 + 36 + 11 = 179 bytes
 
-Expected: SHA-256 of the above 176 bytes. Sign this hash with the reference Ed25519 key.
+Expected: SHA-256 of the above 179 bytes. Sign this hash with the reference Ed25519 key.
 The signature is 64 bytes. Verify with Ed25519-verify(public_key, hash, signature).
 ```
 
@@ -285,9 +289,10 @@ Input: event_data = 0x48656c6c6f ("Hello")
 
 Leaf hash: SHA-256(0x00 || 0x48656c6c6f)
          = SHA-256(0x0048656c6c6f)
-         = 0x...  (compute with reference implementation)
+         = 0x90b626dbb1e994c962942db2b3b16d97c63f679912a176bb96f4e308c213005b
 
-Root: leaf_hash (single leaf = root)
+Root: 0x90b626dbb1e994c962942db2b3b16d97c63f679912a176bb96f4e308c213005b
+      (single leaf = root)
 ```
 
 ### Vector 17: Two Leaves
@@ -297,10 +302,11 @@ Input:
   event_1 = 0x4576656e7431 ("Event1")
   event_2 = 0x4576656e7432 ("Event2")
 
-Leaf 1: SHA-256(0x00 || event_1)
-Leaf 2: SHA-256(0x00 || event_2)
+Leaf 1: SHA-256(0x00 || event_1) = 0x00d9ea40d70522a7d0aa41e2708afd5dc148a4dcc26011d598cbc28cdbde306f
+Leaf 2: SHA-256(0x00 || event_2) = 0x7a7b6da2a00d46f75c01d0c5a33cb62e99caa7f0ebbd084a169a00874751e7a3
 
 Root: SHA-256(0x01 || leaf_1 || leaf_2)
+    = 0x9f7a0b4b3965ce3eb4dda7c7c56bc9f7fb2c627d5120692d4ff8e531920ebbf9
 ```
 
 ### Vector 18: Three Leaves (Unbalanced)
@@ -311,13 +317,14 @@ Input:
   event_2 = 0x42 ("B")
   event_3 = 0x43 ("C")
 
-Leaf 1: SHA-256(0x00 || 0x41)
-Leaf 2: SHA-256(0x00 || 0x42)
-Leaf 3: SHA-256(0x00 || 0x43)
+Leaf 1: SHA-256(0x00 || 0x41) = 0xc00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d
+Leaf 2: SHA-256(0x00 || 0x42) = 0x87afe6086fe4571e37657e76281301f189c75ebae1d2eaafb56d578067a1d95e
+Leaf 3: SHA-256(0x00 || 0x43) = 0xb563a5e69628743929eddec0ccfeb0745c39577e12a72e84915edd6633cb97f2
 
-Interior 1: SHA-256(0x01 || leaf_1 || leaf_2)
+Interior 1: SHA-256(0x01 || leaf_1 || leaf_2) = 0xed692f01f7f6c46930d7ad8f9adad3f9f38b7379cf6a8d2f399a0ba1e914fe25
 
 Root: SHA-256(0x01 || interior_1 || leaf_3)
+    = 0x961d2e2be20f538ffdf56962a86d1bd165498f222684ee4c5e02c1e9f852adc5
 ```
 
 Note: RFC 6962 tree construction with 3 leaves produces an unbalanced tree where the third leaf is promoted to the right child of the root. Implementations MUST follow the RFC 6962 §2 construction algorithm for this case.
@@ -331,12 +338,16 @@ Input:
   event_3 = 0x43 ("C")
   event_4 = 0x44 ("D")
 
-Leaf 1-4: SHA-256(0x00 || event_N)
+Leaf 1: SHA-256(0x00 || 0x41) = 0xc00b4d3c929cb5cc316691ed4636f634576f2c9b2954767234c5274e9dde185d
+Leaf 2: SHA-256(0x00 || 0x42) = 0x87afe6086fe4571e37657e76281301f189c75ebae1d2eaafb56d578067a1d95e
+Leaf 3: SHA-256(0x00 || 0x43) = 0xb563a5e69628743929eddec0ccfeb0745c39577e12a72e84915edd6633cb97f2
+Leaf 4: SHA-256(0x00 || 0x44) = 0x08a2afecc9feaef6737f055c177a56a363d28a78d7b259b8c5f66b32174f2e7d
 
-Interior L: SHA-256(0x01 || leaf_1 || leaf_2)
-Interior R: SHA-256(0x01 || leaf_3 || leaf_4)
+Interior L: SHA-256(0x01 || leaf_1 || leaf_2) = 0xed692f01f7f6c46930d7ad8f9adad3f9f38b7379cf6a8d2f399a0ba1e914fe25
+Interior R: SHA-256(0x01 || leaf_3 || leaf_4) = 0xd62c77efa9be96355bb8b07aefc985914377de5aec1287998c9a10f11cd8d075
 
 Root: SHA-256(0x01 || interior_L || interior_R)
+    = 0x5c8dc617d287a4297eb2bcb81b37644b5138e57ad461c657db152109e3fc9fca
 ```
 
 ## 25.9 Key Continuity Fingerprint Vectors (§9.11)
@@ -432,14 +443,14 @@ Input:
 
 Info string (concatenated bytes):
   "scp-sender-key-v1"                     (18 bytes)
-  || "hpke-test-context"                   (17 bytes)
-  || "did:dht:z6MkSender"                (18 bytes)
+  || BE32(17) || "hpke-test-context"       (4 + 17 = 21 bytes)
+  || BE32(18) || "did:dht:z6MkSender"     (4 + 18 = 22 bytes)
   || BE64(42)                              (8 bytes)
 
-Total: 18 + 17 + 18 + 8 = 61 bytes
+Total: 18 + 21 + 22 + 8 = 69 bytes
 ```
 
-Note: the sender key info string uses flat concatenation (no length prefixes) for the context_id, sender_did, and epoch fields.
+Note: the sender key info string uses 4-byte BE length-prefixed context_id and sender_did fields, matching the access key info string structure. Length prefixes prevent boundary-shift collisions with adversarial inputs.
 
 ### Vector 25: Access Key HPKE Info String
 
@@ -458,37 +469,47 @@ Info string (concatenated bytes):
 Total: 18 + 21 + 22 + 8 = 69 bytes
 ```
 
-Note: the access key info string uses length-prefixed context_id and member_did fields (with 4-byte BE length), unlike the sender key info string. This structural difference ensures the two info strings can never collide even with adversarial inputs.
+Note: Both the sender key and access key info strings use 4-byte BE length-prefixed context_id and DID fields. Domain separation between the two is provided by distinct prefix strings (`"scp-sender-key-v1"` vs `"scp-access-key-v1"`), which ensures the two info strings can never collide even with adversarial inputs.
 
-## 25.13 Attestation Signing Vectors (§9.5.2)
+## 25.13 Attestation Signing Vectors (§3.5.1, §9.5.1)
 
-Domain: `"SCP-ATTESTATION-V1:"`
+Domain: `"SCP-IDENTITY-LINK-ATTESTATION-V1:"`
 
-### Vector 26: Identity Link Attestation
+### Vector 26: Identity Link Attestation Signature
+
+The signing payload uses the canonical hash construction from §9.5.1 with domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V1:"`. Fields are serialized in a fixed order. Sub-structures (`claim`, `evidence`, `revocation`) are serialized as MessagePack (`rmp_serde::to_vec_named`, sorted-key encoding) and included as variable-length byte fields.
+
+Note: this is the *signature* construction (used by `verify_signature`). The *attestation ID* uses a different domain separator (`"SCP-ATTESTATION-ID-V1:"`) and different fields — see `compute_id()` in `attestation.rs`.
 
 ```
 Input:
   id:                "att-001"
-  attestation_type:  IdentityLink (tag: 0x0001)
+  attestation_type:  "identity_link"
   issuer:            "did:dht:z6MkIssuer"
-  subject:           "did:dht:z6MkSubject"
-  claim:             '{"handle":"@alice","platform":"x"}' (compact JSON, no whitespace)
-  evidence:          absent (use sentinel)
+  subject:           "did:dht:z6MkIssuer"  (same as issuer for self-attestation)
   issued_at:         1700000000
-  expires_at:        0 (no expiry)
+  expires_at:        absent (no expiry — use absent sentinel)
+  claim:             AttestationClaim { platform: "x", platform_handle: "@alice",
+                       platform_id: None, link_type: "self_attestation" }
+  evidence:          AttestationEvidence { method: "oauth", proof: "jwt-token",
+                       verified_at: 1700000000, verifier_did: None }
+  revocation:        AttestationRevocation { method: "did_document",
+                       endpoint: "/revocations" }
 
 Canonical hash input:
-  "SCP-ATTESTATION-V1:"                        (20 bytes)
-  || BE32(7)  || "att-001"                      (4 + 7 = 11 bytes)
-  || BE16(0x0001)                               (2 bytes — attestation type tag)
-  || BE32(18) || "did:dht:z6MkIssuer"          (4 + 18 = 22 bytes)
-  || BE32(19) || "did:dht:z6MkSubject"         (4 + 19 = 23 bytes)
-  || BE32(34) || compact_json_bytes             (4 + 34 = 38 bytes)
-  || SHA-256(0x00)                              (32 bytes — absent evidence sentinel)
-  || BE64(1700000000)                           (8 bytes)
-  || BE64(0)                                    (8 bytes — no expiry)
+  "SCP-IDENTITY-LINK-ATTESTATION-V1:"         (35 bytes, no length prefix)
+  || BE32(7)   || "att-001"                    (4 + 7 = 11 bytes — id)
+  || BE32(13)  || "identity_link"              (4 + 13 = 17 bytes — attestation_type)
+  || BE32(18)  || "did:dht:z6MkIssuer"        (4 + 18 = 22 bytes — issuer)
+  || BE32(18)  || "did:dht:z6MkIssuer"        (4 + 18 = 22 bytes — subject)
+  || BE64(1700000000)                          (8 bytes — issued_at)
+  || BE32(32)  || SHA-256(0x00)                (4 + 32 = 36 bytes — absent expires_at sentinel)
+  || BE32(N_c) || msgpack(claim)               (4 + N_c bytes — claim as MessagePack)
+  || BE32(N_e) || msgpack(evidence)            (4 + N_e bytes — evidence as MessagePack)
+  || BE32(N_r) || msgpack(revocation)          (4 + N_r bytes — revocation as MessagePack)
 
-Total: 20 + 11 + 2 + 22 + 23 + 38 + 32 + 8 + 8 = 164 bytes
+The exact byte count depends on the MessagePack encoding of the sub-structures.
+Compute the expected SHA-256 hash using the Rust reference implementation.
 ```
 
 ## 25.14 Verification Procedure
