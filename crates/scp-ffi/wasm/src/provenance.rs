@@ -337,7 +337,7 @@ pub fn provenance_attach(
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "wasm32"))]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
