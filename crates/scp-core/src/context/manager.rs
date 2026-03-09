@@ -1193,8 +1193,7 @@ impl ContextManager {
                     continue;
                 }
                 Err(e) => {
-                    // Best-effort: log and continue.
-                    let _ = e;
+                    tracing::warn!(context_id = %ctx_id, error = %e, "failed to load context snapshot during restore");
                     continue;
                 }
             };
@@ -1213,8 +1212,7 @@ impl ContextManager {
             match self.restore_context(ctx_id, &handle).await {
                 Ok(()) => restored.push(ctx_id.clone()),
                 Err(e) => {
-                    // Best-effort: log and continue.
-                    let _ = e;
+                    tracing::warn!(context_id = %ctx_id, error = %e, "failed to restore context");
                 }
             }
         }
@@ -1476,6 +1474,14 @@ impl ContextManager {
             None
         };
 
+        // Extract threshold signers and value from GovernanceModel at creation
+        // time so PerContextState is correctly initialized for Threshold
+        // governance (ADR-031).
+        let (initial_threshold_signers, initial_threshold_value) = match &params.governance {
+            GovernanceModel::Threshold { threshold, signers } => (signers.clone(), *threshold),
+            _ => (Vec::new(), 0),
+        };
+
         let per_context = PerContextState {
             handle: handle.clone(),
             membership,
@@ -1490,8 +1496,8 @@ impl ContextManager {
             read_revoked_members: HashSet::new(),
             read_exclusion_list: HashSet::new(),
             tool_interfaces: Vec::new(),
-            threshold_signers: Vec::new(),
-            threshold_value: 0,
+            threshold_signers: initial_threshold_signers,
+            threshold_value: initial_threshold_value,
             pruning_policy: None,
             approved_proposals: HashMap::new(),
             governance_freeze: None,
@@ -1637,6 +1643,15 @@ impl ContextManager {
             None
         };
 
+        // Extract threshold signers and value from GovernanceModelConfig before
+        // it is consumed by build_governance_engine (ADR-031).
+        let (initial_threshold_signers, initial_threshold_value) = match &governance_config {
+            GovernanceModelConfig::Threshold { signers, threshold, .. } => {
+                (signers.clone(), *threshold)
+            }
+            _ => (Vec::new(), 0),
+        };
+
         // Construct the governance engine from the explicit config (SCP-267).
         let governance_engine = build_governance_engine(
             governance_config,
@@ -1645,9 +1660,25 @@ impl ContextManager {
         )?;
 
         // Mint GovernancePropose and GovernanceVote UCAN tokens for designated
-        // voters per ADR-031 §6.
-        let _governance_tokens =
+        // voters per ADR-031 §6 and store them in role_state so voters have
+        // GovernancePropose/GovernanceVote capabilities.
+        let governance_tokens =
             mint_governance_tokens(&context_id, &creator_did, governance_engine.as_ref());
+
+        let mut role_state = role_state;
+        for token in &governance_tokens {
+            let caps = role_state
+                .member_capabilities
+                .entry(token.aud.clone())
+                .or_default();
+            for att in &token.att {
+                if att.with.ends_with("/GovernancePropose") {
+                    caps.insert(Capability::GovernancePropose);
+                } else if att.with.ends_with("/GovernanceVote") {
+                    caps.insert(Capability::GovernanceVote);
+                }
+            }
+        }
 
         let per_context = PerContextState {
             handle: handle.clone(),
@@ -1663,8 +1694,8 @@ impl ContextManager {
             read_revoked_members: HashSet::new(),
             read_exclusion_list: HashSet::new(),
             tool_interfaces: Vec::new(),
-            threshold_signers: Vec::new(),
-            threshold_value: 0,
+            threshold_signers: initial_threshold_signers,
+            threshold_value: initial_threshold_value,
             pruning_policy: None,
             approved_proposals: HashMap::new(),
             governance_freeze: None,
@@ -2044,8 +2075,11 @@ impl ContextManager {
         } else {
             // Encrypted: sender key (ADR-007) -> inner envelope (ADR-002) ->
             // MLS (ADR-001) -> outer envelope.
+            // Epoch 0 for standard sender keys (epoch tracking is per-sender-key,
+            // incremented on key rotation; the trait consumer passes the current
+            // epoch). Sequence is the per-sender monotonic counter.
             self.crypto
-                .encrypt_message(&context_id_bytes, sender_did, payload)?
+                .encrypt_message(&context_id_bytes, sender_did, payload, 0, 0)?
         };
 
         // Send via transport.
@@ -2947,7 +2981,20 @@ impl ContextManager {
             }
 
             // SCP-272: Check and auto-resolve expired governance freezes (48-hour timeout).
-            let _ = self.check_and_resolve_expired_freezes(ctx);
+            let freeze_events = self.check_and_resolve_expired_freezes(ctx);
+            if !freeze_events.is_empty() {
+                let cid_bytes = context_id_to_bytes(context_id);
+                for event in &freeze_events {
+                    match event {
+                        GovernanceEvent::ConflictResolved { .. } => {
+                            let _ = self
+                                .event_log
+                                .append_context_event(&cid_bytes, "GovernanceFreezeExpired");
+                        }
+                        _ => {}
+                    }
+                }
+            }
 
             // SCP-272: Block new proposals (except ResolveConflict) while governance is frozen.
             if ctx.governance_freeze.is_some()
@@ -3115,13 +3162,33 @@ impl ContextManager {
         };
         // Lock dropped.
 
-        // Handle any conflicts first, then auto-execute if not in governance freeze
-        for _event in conflict_events {
-            // Emit the conflict event to the event log
-            {}
+        // Emit conflict events to the event log (mirrors propose_governance_action_inner).
+        if !conflict_events.is_empty() {
+            let context_id_bytes = context_id_to_bytes(context_id);
+            for event in &conflict_events {
+                match event {
+                    GovernanceEvent::ConflictDetected { .. } => {
+                        let _ = self
+                            .event_log
+                            .append_context_event(&context_id_bytes, "GovernanceConflictDetected");
+                    }
+                    GovernanceEvent::ConflictResolved { .. } => {
+                        let _ = self
+                            .event_log
+                            .append_context_event(&context_id_bytes, "GovernanceConflictResolved");
+                    }
+                    _ => {}
+                }
+            }
         }
 
+        // Check if the proposal was invalidated by conflict detection.
+        let invalidated_by_conflict = conflict_events.iter().any(|e| {
+            matches!(e, GovernanceEvent::ConflictResolved { loser_id, .. } if *loser_id == *proposal_id)
+        });
+
         // Auto-execute if the proposal was just approved and we're not in governance freeze
+        // — unless it was invalidated by conflict.
         if let Some(proposal) = proposal_for_execution {
             // Check if we're in governance freeze before executing
             let in_freeze = {
@@ -3131,7 +3198,7 @@ impl ContextManager {
                     .is_some_and(|ctx| ctx.governance_freeze.is_some())
             };
 
-            if !in_freeze {
+            if !in_freeze && !invalidated_by_conflict {
                 self.execute_governance_action(context_id, &proposal)
                     .await?;
             }
@@ -4050,7 +4117,7 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        let snapshot = {
+        let (snapshot, new_remaining, handle) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
@@ -4074,13 +4141,41 @@ impl ContextManager {
                 )));
             }
 
-            // Extend the TTL deadline. If the timer has a deadline, push it forward.
-            if let Some(ref mut deadline) = ctx.ttl_timer.deadline_unix_secs {
-                *deadline = deadline.saturating_add(additional_secs);
-            }
+            // Cancel the existing TTL timer task so it does not fire at
+            // the original deadline.
+            ctx.ttl_timer.cancel();
 
-            Self::snapshot_context(ctx)
+            // Extend the TTL deadline and compute the remaining duration
+            // for the replacement timer task.
+            let remaining_secs = if let Some(ref mut deadline) = ctx.ttl_timer.deadline_unix_secs {
+                *deadline = deadline.saturating_add(additional_secs);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                Some(deadline.saturating_sub(now))
+            } else {
+                None
+            };
+
+            // Reset the cancel signal so the replacement timer task can be
+            // cancelled independently of the old one.
+            ctx.ttl_timer.cancel = Arc::new(tokio::sync::Notify::new());
+            ctx.ttl_timer.task = None;
+
+            let h = ctx.handle.clone();
+            (Self::snapshot_context(ctx), remaining_secs, h)
         };
+
+        // Respawn the TTL timer with the updated remaining duration.
+        if let Some(secs) = new_remaining {
+            self.spawn_ttl_timer(
+                context_id,
+                std::time::Duration::from_secs(secs),
+                handle,
+            )
+            .await;
+        }
 
         self.persist_context_snapshot(context_id, &snapshot);
         self.event_log
@@ -4118,7 +4213,8 @@ impl ContextManager {
                 .map(|(did, _)| did.clone())
                 .collect();
             for admin_did in &current_admins {
-                let _ = roles::assign_role(&mut ctx.role_state, admin_did, "member", &creator_did);
+                roles::assign_role(&mut ctx.role_state, admin_did, "member", &creator_did)
+                    .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
                 if let Some(info) = ctx.membership.get_mut(admin_did) {
                     "member".clone_into(&mut info.role_name);
                 }
@@ -4524,6 +4620,9 @@ impl ContextManager {
                 }
             }
 
+            // Clear governance freeze now that the conflict is resolved.
+            ctx.governance_freeze = None;
+
             Self::snapshot_context(ctx)
         };
 
@@ -4658,9 +4757,12 @@ impl ContextManager {
             // FutureOnly scope: only block future writes via write_revoked_members.
             let bc_snap = match scope {
                 RevocationScope::Full => ctx.broadcast_context.as_mut().map(|bc| {
-                    let _ = bc.block_author(&did.0);
-                    bc.to_snapshot()
-                }),
+                    match bc.block_author(&did.0) {
+                        Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
+                        Err(e) => return Err(e),
+                    }
+                    Ok(bc.to_snapshot())
+                }).transpose()?,
                 RevocationScope::FutureOnly => None,
             };
 
@@ -5575,7 +5677,10 @@ impl ContextManager {
             .get(context_id)
             .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
 
-        checkpoint.cosignatures.push(cosignature);
+        // Validate with a candidate vector first — only mutate checkpoint
+        // after validation passes to avoid leaving corrupt state on error.
+        let mut candidate = checkpoint.cosignatures.clone();
+        candidate.push(cosignature);
 
         // Compute checkpoint hash for verification
         let mut hasher = sha2::Sha256::new();
@@ -5586,9 +5691,11 @@ impl ContextManager {
 
         let status = ctx
             .governance_engine
-            .validate_checkpoint_cosignatures(&checkpoint.cosignatures, &checkpoint_hash)
+            .validate_checkpoint_cosignatures(&candidate, &checkpoint_hash)
             .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
 
+        // Validation passed — commit the mutation.
+        checkpoint.cosignatures = candidate;
         checkpoint.attestation_status = status.clone();
         Ok(status)
     }
@@ -5719,10 +5826,19 @@ impl ContextManager {
             ctx.approved_proposals.remove(&proposal_b);
             ctx.governance_freeze = None;
 
-            return vec![GovernanceEvent::ConflictResolved {
-                winner_id: [0; 32], // Special marker for timeout resolution
-                loser_id: [0; 32],  // Both proposals invalidated
-            }];
+            // Both proposals were invalidated by timeout — emit one event
+            // per invalidated proposal using the real proposal IDs so
+            // downstream consumers can identify exactly which proposals expired.
+            return vec![
+                GovernanceEvent::ConflictResolved {
+                    winner_id: proposal_b,
+                    loser_id: proposal_a,
+                },
+                GovernanceEvent::ConflictResolved {
+                    winner_id: proposal_a,
+                    loser_id: proposal_b,
+                },
+            ];
         }
 
         Vec::new()
@@ -5941,6 +6057,8 @@ mod tests {
             _context_id: &[u8; 32],
             _sender_did: &str,
             payload: &[u8],
+            _epoch: u64,
+            _sequence: u64,
         ) -> Result<Vec<u8>, ContextError> {
             self.messages_encrypted
                 .lock()

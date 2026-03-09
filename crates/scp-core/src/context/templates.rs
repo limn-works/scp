@@ -781,8 +781,8 @@ fn capabilities_match(a: &[Capability], b: &[Capability]) -> bool {
     }
 
     // Sort names for comparison.
-    let mut a_names: Vec<&str> = a.iter().map(Capability::name).collect();
-    let mut b_names: Vec<&str> = b.iter().map(Capability::name).collect();
+    let mut a_names: Vec<String> = a.iter().map(|c| c.name().into_owned()).collect();
+    let mut b_names: Vec<String> = b.iter().map(|c| c.name().into_owned()).collect();
     a_names.sort_unstable();
     b_names.sort_unstable();
     a_names == b_names
@@ -790,7 +790,7 @@ fn capabilities_match(a: &[Capability], b: &[Capability]) -> bool {
 
 /// Formats a capability list for error messages.
 fn format_capabilities(caps: &[Capability]) -> String {
-    let mut names: Vec<&str> = caps.iter().map(Capability::name).collect();
+    let mut names: Vec<String> = caps.iter().map(|c| c.name().into_owned()).collect();
     names.sort_unstable();
     format!("[{}]", names.join(", "))
 }
