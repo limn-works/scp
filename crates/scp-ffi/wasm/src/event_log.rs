@@ -334,10 +334,7 @@ pub fn event_log_checkpoint(
         let merkle_root_bytes: [u8; 32] = {
             let decoded: Vec<u8> = (0..merkle_root_hex.len())
                 .step_by(2)
-                .map(|i| {
-                    u8::from_str_radix(&merkle_root_hex[i..i + 2], 16)
-                        .unwrap_or(0)
-                })
+                .map(|i| u8::from_str_radix(&merkle_root_hex[i..i + 2], 16).unwrap_or(0))
                 .collect();
             let mut arr = [0u8; 32];
             let copy_len = decoded.len().min(32);
