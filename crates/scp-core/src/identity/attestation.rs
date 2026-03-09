@@ -27,6 +27,8 @@ use std::borrow::Cow;
 use scp_identity::DID;
 use serde::{Deserialize, Serialize};
 
+use crate::crypto::ed25519::verify_ed25519_signature;
+
 // ---------------------------------------------------------------------------
 // Renewal interval constants (§3.5.2)
 // ---------------------------------------------------------------------------
@@ -285,6 +287,7 @@ impl AttestationRevocation {
 /// 4. The attestation is not on the issuer's revocation list (§18.2.2).
 /// 5. `evidence.verified_at` is within the method's renewal interval (§3.5.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IdentityLinkAttestation {
     /// Deterministic ID: `hex(SHA-256(issuer || platform || handle || issued_at))`.
     pub id: String,
@@ -388,6 +391,78 @@ impl IdentityLinkAttestation {
         hex::encode(hash)
     }
 
+    /// Verifies the Ed25519 signature on this attestation.
+    ///
+    /// Constructs the canonical signing payload (all fields except `signature`,
+    /// using the domain-separated canonical hash construction per §9.5.1), then
+    /// verifies the signature against the provided public key bytes.
+    ///
+    /// The canonical form uses domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V1:"`
+    /// with fields in a fixed order: `id`, `attestation_type`, `issuer`, `subject`,
+    /// `issued_at`, `expires_at` (or absent sentinel), `claim` (`MessagePack`),
+    /// `evidence` (`MessagePack`), `revocation` (`MessagePack`).
+    ///
+    /// # Arguments
+    ///
+    /// * `public_key` — 32-byte Ed25519 public key (issuer's `#active` or `#agent` key).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttestationSignatureError::SerializationFailed`] if sub-structs
+    /// cannot be serialized to `MessagePack`, or [`AttestationSignatureError::InvalidSignature`]
+    /// if the signature does not verify.
+    pub fn verify_signature(&self, public_key: &[u8]) -> Result<(), AttestationSignatureError> {
+        let canonical = self.canonical_signing_bytes()?;
+        verify_ed25519_signature(public_key, &canonical, &self.signature)
+            .map_err(AttestationSignatureError::InvalidSignature)
+    }
+
+    /// Computes the canonical signing payload for this attestation.
+    ///
+    /// The payload includes all fields except `signature`, serialized using the
+    /// protocol's canonical hash construction (§9.5.1). Sub-structs (`claim`,
+    /// `evidence`, `revocation`) are serialized as `MessagePack` bytes and included
+    /// as variable-length fields.
+    ///
+    /// This method is deterministic: identical attestation data always produces
+    /// identical bytes, regardless of serde field ordering.
+    fn canonical_signing_bytes(&self) -> Result<Vec<u8>, AttestationSignatureError> {
+        use crate::crypto::canonical::{CanonicalField, canonical_hash};
+
+        let claim_bytes = rmp_serde::to_vec_named(&self.claim).map_err(|e| {
+            AttestationSignatureError::SerializationFailed(format!(
+                "claim serialization failed: {e}"
+            ))
+        })?;
+        let evidence_bytes = rmp_serde::to_vec_named(&self.evidence).map_err(|e| {
+            AttestationSignatureError::SerializationFailed(format!(
+                "evidence serialization failed: {e}"
+            ))
+        })?;
+        let revocation_bytes = rmp_serde::to_vec_named(&self.revocation).map_err(|e| {
+            AttestationSignatureError::SerializationFailed(format!(
+                "revocation serialization failed: {e}"
+            ))
+        })?;
+
+        Ok(canonical_hash(
+            "SCP-IDENTITY-LINK-ATTESTATION-V1:",
+            &[
+                CanonicalField::VarBytes(self.id.as_bytes()),
+                CanonicalField::VarBytes(self.attestation_type.as_bytes()),
+                CanonicalField::VarBytes((*self.issuer).as_bytes()),
+                CanonicalField::VarBytes((*self.subject).as_bytes()),
+                CanonicalField::U64(self.issued_at),
+                self.expires_at
+                    .map_or(CanonicalField::Absent, CanonicalField::U64),
+                CanonicalField::VarBytes(&claim_bytes),
+                CanonicalField::VarBytes(&evidence_bytes),
+                CanonicalField::VarBytes(&revocation_bytes),
+            ],
+        )
+        .to_vec())
+    }
+
     /// Validates the structural integrity of this attestation (does NOT
     /// verify the cryptographic signature).
     ///
@@ -437,6 +512,23 @@ impl IdentityLinkAttestation {
 
         errors
     }
+}
+
+// ---------------------------------------------------------------------------
+// AttestationSignatureError
+// ---------------------------------------------------------------------------
+
+/// Error type for identity link attestation signature verification.
+#[derive(Debug, thiserror::Error)]
+pub enum AttestationSignatureError {
+    /// The canonical signing payload could not be serialized.
+    #[error("canonical serialization failed: {0}")]
+    SerializationFailed(String),
+
+    /// The Ed25519 signature is invalid (wrong key, tampered data, or
+    /// malformed signature/key bytes).
+    #[error("signature verification failed: {0}")]
+    InvalidSignature(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -791,5 +883,245 @@ mod tests {
         // 181 days — past renewal
         let now = attestation.evidence.verified_at + 181 * MS_PER_DAY;
         assert!(attestation.needs_renewal(now));
+    }
+
+    // -----------------------------------------------------------------------
+    // deny_unknown_fields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn attestation_rejects_unknown_fields_json() {
+        let attestation = make_attestation();
+        let mut json: serde_json::Value = serde_json::to_value(&attestation).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .insert("unknown_field".to_owned(), serde_json::Value::Bool(true));
+        let result = serde_json::from_value::<IdentityLinkAttestation>(json);
+        assert!(result.is_err(), "should reject unknown fields");
+    }
+
+    // -----------------------------------------------------------------------
+    // Signature verification
+    // -----------------------------------------------------------------------
+
+    /// Creates a properly signed attestation using the given signing key.
+    fn make_signed_attestation(signing_key: &ed25519_dalek::SigningKey) -> IdentityLinkAttestation {
+        use ed25519_dalek::Signer;
+
+        let verifying_key = signing_key.verifying_key();
+        // Encode DID from verifying key bytes
+        let did_str = format!("did:dht:z6Mk{}", hex::encode(verifying_key.as_bytes()));
+        let issuer = did(&did_str);
+        let platform = "github.com";
+        let handle = "alice";
+        let issued_at = 1_700_000_000_000_u64;
+
+        let mut attestation = IdentityLinkAttestation {
+            id: IdentityLinkAttestation::compute_id(&issuer, platform, handle, issued_at),
+            attestation_type: Cow::Borrowed(ATTESTATION_TYPE_IDENTITY_LINK),
+            issuer: issuer.clone(),
+            subject: issuer,
+            issued_at,
+            expires_at: None,
+            claim: AttestationClaim::new(
+                platform.to_owned(),
+                handle.to_owned(),
+                Some("12345".to_owned()),
+            ),
+            evidence: AttestationEvidence {
+                method: VerificationMethod::Oauth,
+                proof: r#"{"provider":"github.com","subject":"12345","issued_at":1700000000}"#
+                    .to_owned(),
+                verified_at: 1_700_000_000_000,
+                verifier_did: None,
+            },
+            revocation: AttestationRevocation::new("/revocations".to_owned()),
+            signature: Vec::new(), // placeholder — will be replaced
+        };
+
+        // Sign the canonical bytes
+        let canonical = attestation.canonical_signing_bytes().unwrap();
+        let sig = signing_key.sign(&canonical);
+        attestation.signature = sig.to_bytes().to_vec();
+
+        attestation
+    }
+
+    fn test_signing_key(seed: u8) -> ed25519_dalek::SigningKey {
+        let mut secret = [0u8; 32];
+        secret[0] = seed;
+        ed25519_dalek::SigningKey::from_bytes(&secret)
+    }
+
+    #[test]
+    fn verify_signature_valid() {
+        let sk = test_signing_key(0xAA);
+        let attestation = make_signed_attestation(&sk);
+        let vk = sk.verifying_key();
+        let result = attestation.verify_signature(vk.as_bytes());
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn verify_signature_wrong_key() {
+        let sk = test_signing_key(0xAA);
+        let wrong_key = test_signing_key(0xBB);
+        let attestation = make_signed_attestation(&sk);
+        let wrong_verifying_key = wrong_key.verifying_key();
+        let result = attestation.verify_signature(wrong_verifying_key.as_bytes());
+        assert!(result.is_err(), "should fail with wrong key");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("signature verification failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_signature_tampered_id() {
+        let sk = test_signing_key(0xAA);
+        let mut attestation = make_signed_attestation(&sk);
+        attestation.id = "tampered-id".to_owned();
+        let vk = sk.verifying_key();
+        let result = attestation.verify_signature(vk.as_bytes());
+        assert!(result.is_err(), "should fail with tampered id");
+    }
+
+    #[test]
+    fn verify_signature_tampered_claim() {
+        let sk = test_signing_key(0xAA);
+        let mut attestation = make_signed_attestation(&sk);
+        attestation.claim.platform_handle = "mallory".to_owned();
+        let vk = sk.verifying_key();
+        let result = attestation.verify_signature(vk.as_bytes());
+        assert!(result.is_err(), "should fail with tampered claim");
+    }
+
+    #[test]
+    fn verify_signature_tampered_issuer() {
+        let sk = test_signing_key(0xAA);
+        let mut attestation = make_signed_attestation(&sk);
+        attestation.issuer = did("did:dht:z6MkTampered");
+        let vk = sk.verifying_key();
+        let result = attestation.verify_signature(vk.as_bytes());
+        assert!(result.is_err(), "should fail with tampered issuer");
+    }
+
+    #[test]
+    fn verify_signature_tampered_evidence() {
+        let sk = test_signing_key(0xAA);
+        let mut attestation = make_signed_attestation(&sk);
+        attestation.evidence.verified_at = 999_999_999_999;
+        let vk = sk.verifying_key();
+        let result = attestation.verify_signature(vk.as_bytes());
+        assert!(result.is_err(), "should fail with tampered evidence");
+    }
+
+    #[test]
+    fn verify_signature_tampered_revocation() {
+        let sk = test_signing_key(0xAA);
+        let mut attestation = make_signed_attestation(&sk);
+        attestation.revocation.endpoint = "/evil".to_owned();
+        let vk = sk.verifying_key();
+        let result = attestation.verify_signature(vk.as_bytes());
+        assert!(result.is_err(), "should fail with tampered revocation");
+    }
+
+    #[test]
+    fn verify_signature_tampered_expires_at() {
+        let sk = test_signing_key(0xAA);
+        let mut attestation = make_signed_attestation(&sk);
+        // Original has expires_at = None; set it to Some to tamper
+        attestation.expires_at = Some(9_999_999_999_999);
+        let vk = sk.verifying_key();
+        let result = attestation.verify_signature(vk.as_bytes());
+        assert!(result.is_err(), "should fail with tampered expires_at");
+    }
+
+    #[test]
+    fn verify_signature_invalid_signature_bytes() {
+        let sk = test_signing_key(0xAA);
+        let mut attestation = make_signed_attestation(&sk);
+        // Corrupt the signature
+        attestation.signature[0] ^= 0xFF;
+        let vk = sk.verifying_key();
+        let result = attestation.verify_signature(vk.as_bytes());
+        assert!(result.is_err(), "should fail with corrupted signature");
+    }
+
+    #[test]
+    fn verify_signature_short_public_key() {
+        let sk = test_signing_key(0xAA);
+        let attestation = make_signed_attestation(&sk);
+        let result = attestation.verify_signature(&[0u8; 16]);
+        assert!(result.is_err(), "should fail with short public key");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("32 bytes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_signature_short_signature() {
+        let sk = test_signing_key(0xAA);
+        let mut attestation = make_signed_attestation(&sk);
+        attestation.signature = vec![0u8; 32]; // too short
+        let vk = sk.verifying_key();
+        let result = attestation.verify_signature(vk.as_bytes());
+        assert!(result.is_err(), "should fail with short signature");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("64 bytes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_signature_with_expires_at_set() {
+        use ed25519_dalek::Signer;
+
+        let sk = test_signing_key(0xCC);
+        let vk = sk.verifying_key();
+        let did_str = format!("did:dht:z6Mk{}", hex::encode(vk.as_bytes()));
+        let issuer = did(&did_str);
+        let platform = "x.com";
+        let handle = "@alice";
+        let issued_at = 1_700_000_000_000_u64;
+
+        let mut attestation = IdentityLinkAttestation {
+            id: IdentityLinkAttestation::compute_id(&issuer, platform, handle, issued_at),
+            attestation_type: Cow::Borrowed(ATTESTATION_TYPE_IDENTITY_LINK),
+            issuer: issuer.clone(),
+            subject: issuer,
+            issued_at,
+            expires_at: Some(1_800_000_000_000),
+            claim: AttestationClaim::new(platform.to_owned(), handle.to_owned(), None),
+            evidence: AttestationEvidence {
+                method: VerificationMethod::SignedPost,
+                proof:
+                    r#"{"post_url":"https://x.com/alice/123","nonce":"abc","posted_at":1700000000}"#
+                        .to_owned(),
+                verified_at: 1_700_000_000_000,
+                verifier_did: None,
+            },
+            revocation: AttestationRevocation::new("/revocations".to_owned()),
+            signature: Vec::new(),
+        };
+
+        let canonical = attestation.canonical_signing_bytes().unwrap();
+        attestation.signature = sk.sign(&canonical).to_bytes().to_vec();
+
+        let result = attestation.verify_signature(vk.as_bytes());
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn canonical_signing_bytes_deterministic() {
+        let sk = test_signing_key(0xDD);
+        let attestation = make_signed_attestation(&sk);
+        let bytes1 = attestation.canonical_signing_bytes().unwrap();
+        let bytes2 = attestation.canonical_signing_bytes().unwrap();
+        assert_eq!(bytes1, bytes2, "canonical bytes must be deterministic");
     }
 }
