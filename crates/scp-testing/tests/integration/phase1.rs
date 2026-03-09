@@ -427,7 +427,16 @@ async fn phase1_alice_bob_encrypted_message_via_relay() {
     let bob_alice_sk = bob_sk_store
         .get(ctx_id, &alice_id.did)
         .expect("Bob must have Alice's sender key");
-    let verified_inner = open_envelope(&received_outer, &mut bob_group, bob_alice_sk).unwrap();
+    let verified_inner = open_envelope(
+        &received_outer,
+        &mut bob_group,
+        bob_alice_sk,
+        &inner_env.context_id,
+        &inner_env.sender_did,
+        inner_env.epoch,
+        inner_env.sequence,
+    )
+    .unwrap();
 
     // 11b. Strip padding to recover original plaintext.
     let decrypted_msg = strip_padding(&verified_inner.payload).unwrap();

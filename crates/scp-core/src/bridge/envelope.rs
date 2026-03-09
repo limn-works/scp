@@ -82,6 +82,12 @@ pub struct SealShadowEnvelopeParams<'a> {
     pub platform_message_id: Option<String>,
     /// Optional platform-reported timestamp.
     pub platform_timestamp: Option<u64>,
+    /// The SCP context identifier (AAD binding).
+    pub context_id: &'a str,
+    /// The sender key epoch (AAD binding).
+    pub epoch: u64,
+    /// The per-sender monotonic sequence number (AAD binding).
+    pub sequence: u64,
 }
 
 /// Constructs a sender-key-encrypted envelope for a shadow message.
@@ -96,7 +102,14 @@ pub struct SealShadowEnvelopeParams<'a> {
 pub fn seal_shadow_envelope(
     params: &SealShadowEnvelopeParams<'_>,
 ) -> Result<SenderKeyEnvelope, SenderKeyError> {
-    let ciphertext = encrypt_sender_layer(params.sender_key, params.plaintext)?;
+    let ciphertext = encrypt_sender_layer(
+        params.sender_key,
+        params.plaintext,
+        params.context_id,
+        &params.shadow.shadow_id,
+        params.epoch,
+        params.sequence,
+    )?;
 
     let bridge_provenance = mark_bridge_provenance(
         params.base_provenance.clone(),
@@ -127,15 +140,29 @@ pub fn is_sender_key_envelope(envelope: &SenderKeyEnvelope) -> bool {
 
 /// Opens a sender-key-encrypted envelope using the shadow's sender key.
 ///
+/// The caller must supply the same AAD fields (`context_id`, `sender_did`,
+/// `epoch`, `sequence`) used at seal time. If any field mismatches,
+/// AES-256-GCM tag verification fails and the message is rejected.
+///
 /// # Errors
 ///
-/// Returns [`SenderKeyError`] if decryption fails (wrong key, tampered
-/// ciphertext, etc.).
+/// Returns [`SenderKeyError`] if decryption or AAD verification fails.
 pub fn open_shadow_envelope(
     envelope: &SenderKeyEnvelope,
     sender_key: &SenderKey,
+    context_id: &str,
+    sender_did: &str,
+    epoch: u64,
+    sequence: u64,
 ) -> Result<Vec<u8>, SenderKeyError> {
-    crate::crypto::sender_keys::decrypt_sender_layer(sender_key, &envelope.ciphertext)
+    crate::crypto::sender_keys::decrypt_sender_layer(
+        sender_key,
+        &envelope.ciphertext,
+        context_id,
+        sender_did,
+        epoch,
+        sequence,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +179,10 @@ mod tests {
     use crate::context::MemoryScope;
     use crate::crypto::sender_keys::generate_sender_key;
     use crate::provenance::{DiscoveryMethod, SourceType};
+
+    const TEST_CTX: &str = "ctx-bridge-test";
+    const TEST_EPOCH: u64 = 0;
+    const TEST_SEQ: u64 = 1;
 
     fn make_base_provenance() -> DataProvenance {
         DataProvenance {
@@ -197,15 +228,19 @@ mod tests {
     fn seal_and_open_roundtrip() {
         let key = generate_sender_key();
         let plaintext = b"Hello from shadow!";
+        let shadow = make_shadow();
 
         let params = SealShadowEnvelopeParams {
-            shadow: &make_shadow(),
+            shadow: &shadow,
             connector: &make_connector(),
             sender_key: &key,
             plaintext,
             base_provenance: make_base_provenance(),
             platform_message_id: Some("msg-ext-001".to_owned()),
             platform_timestamp: Some(1_700_000_200),
+            context_id: TEST_CTX,
+            epoch: TEST_EPOCH,
+            sequence: TEST_SEQ,
         };
 
         let envelope = seal_shadow_envelope(&params).unwrap();
@@ -230,7 +265,15 @@ mod tests {
         );
 
         // Decrypt.
-        let decrypted = open_shadow_envelope(&envelope, &key).unwrap();
+        let decrypted = open_shadow_envelope(
+            &envelope,
+            &key,
+            TEST_CTX,
+            &shadow.shadow_id,
+            TEST_EPOCH,
+            TEST_SEQ,
+        )
+        .unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
@@ -238,19 +281,30 @@ mod tests {
     fn wrong_key_fails_decryption() {
         let key = generate_sender_key();
         let wrong_key = generate_sender_key();
+        let shadow = make_shadow();
 
         let params = SealShadowEnvelopeParams {
-            shadow: &make_shadow(),
+            shadow: &shadow,
             connector: &make_connector(),
             sender_key: &key,
             plaintext: b"secret",
             base_provenance: make_base_provenance(),
             platform_message_id: None,
             platform_timestamp: None,
+            context_id: TEST_CTX,
+            epoch: TEST_EPOCH,
+            sequence: TEST_SEQ,
         };
 
         let envelope = seal_shadow_envelope(&params).unwrap();
-        let result = open_shadow_envelope(&envelope, &wrong_key);
+        let result = open_shadow_envelope(
+            &envelope,
+            &wrong_key,
+            TEST_CTX,
+            &shadow.shadow_id,
+            TEST_EPOCH,
+            TEST_SEQ,
+        );
         assert!(result.is_err());
     }
 
@@ -268,6 +322,9 @@ mod tests {
             base_provenance: make_base_provenance(),
             platform_message_id: None,
             platform_timestamp: None,
+            context_id: TEST_CTX,
+            epoch: TEST_EPOCH,
+            sequence: 1,
         })
         .unwrap();
 
@@ -279,6 +336,9 @@ mod tests {
             base_provenance: make_base_provenance(),
             platform_message_id: None,
             platform_timestamp: None,
+            context_id: TEST_CTX,
+            epoch: TEST_EPOCH,
+            sequence: 2,
         })
         .unwrap();
 
@@ -297,6 +357,9 @@ mod tests {
             base_provenance: make_base_provenance(),
             platform_message_id: None,
             platform_timestamp: None,
+            context_id: TEST_CTX,
+            epoch: TEST_EPOCH,
+            sequence: TEST_SEQ,
         };
 
         let envelope = seal_shadow_envelope(&params).unwrap();
@@ -318,6 +381,9 @@ mod tests {
             base_provenance: make_base_provenance(),
             platform_message_id: None,
             platform_timestamp: None,
+            context_id: TEST_CTX,
+            epoch: TEST_EPOCH,
+            sequence: TEST_SEQ,
         };
 
         let envelope = seal_shadow_envelope(&params).unwrap();
@@ -330,14 +396,18 @@ mod tests {
     #[test]
     fn serialization_roundtrip() {
         let key = generate_sender_key();
+        let shadow = make_shadow();
         let params = SealShadowEnvelopeParams {
-            shadow: &make_shadow(),
+            shadow: &shadow,
             connector: &make_connector(),
             sender_key: &key,
             plaintext: b"roundtrip test",
             base_provenance: make_base_provenance(),
             platform_message_id: Some("ext-123".to_owned()),
             platform_timestamp: Some(1_700_000_300),
+            context_id: TEST_CTX,
+            epoch: TEST_EPOCH,
+            sequence: TEST_SEQ,
         };
 
         let envelope = seal_shadow_envelope(&params).unwrap();
@@ -351,7 +421,15 @@ mod tests {
         assert_eq!(restored.platform_timestamp, envelope.platform_timestamp);
 
         // Can still decrypt after deserialization.
-        let decrypted = open_shadow_envelope(&restored, &key).unwrap();
+        let decrypted = open_shadow_envelope(
+            &restored,
+            &key,
+            TEST_CTX,
+            &shadow.shadow_id,
+            TEST_EPOCH,
+            TEST_SEQ,
+        )
+        .unwrap();
         assert_eq!(decrypted, b"roundtrip test");
     }
 }

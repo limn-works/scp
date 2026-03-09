@@ -332,6 +332,8 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         context_id: &[u8; 32],
         _sender_did: &str,
         payload: &[u8],
+        epoch: u64,
+        sequence: u64,
     ) -> Result<Vec<u8>, ContextError> {
         // Step 1: Encrypt payload with sender key (AES-256-GCM, ADR-007).
         let ctx_str = Self::context_id_str(context_id);
@@ -345,8 +347,15 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                     "no sender key for local DID in this context".to_string(),
                 )
             })?;
-            crate::crypto::sender_keys::encrypt::encrypt_sender_layer(sender_key, payload)
-                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?
+            crate::crypto::sender_keys::encrypt::encrypt_sender_layer(
+                sender_key,
+                payload,
+                &ctx_str,
+                &self.creator_did,
+                epoch,
+                sequence,
+            )
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?
         };
 
         // Step 2: Encrypt via MLS application message (ADR-001).
@@ -495,7 +504,7 @@ mod tests {
         // Alice encrypts a message (sender key layer + MLS layer).
         let plaintext = b"hello from Alice";
         let ciphertext = alice
-            .encrypt_message(&ctx_id, &alice_did, plaintext)
+            .encrypt_message(&ctx_id, &alice_did, plaintext, 0, 0)
             .unwrap();
 
         // Verify ciphertext is different from plaintext.
@@ -515,9 +524,14 @@ mod tests {
             let ctx_str = MlsCryptoProvider::context_id_str(&ctx_id);
             store.get(&ctx_str, &alice_did).unwrap().clone()
         };
+        let ctx_str = MlsCryptoProvider::context_id_str(&ctx_id);
         let fully_decrypted = crate::crypto::sender_keys::encrypt::decrypt_sender_layer(
             &alice_sender_key,
             &mls_decrypted,
+            &ctx_str,
+            &alice_did,
+            0,
+            0,
         )
         .unwrap();
         assert_eq!(fully_decrypted, plaintext);

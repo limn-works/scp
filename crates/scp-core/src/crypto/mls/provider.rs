@@ -397,12 +397,19 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         context_id: &[u8; 32],
         _sender_did: &str,
         payload: &[u8],
+        epoch: u64,
+        sequence: u64,
     ) -> Result<Vec<u8>, ContextError> {
         self.with_context(context_id, |state| {
+            let ctx_str = hex::encode(context_id);
             // Step 1: Encrypt payload with sender key (AES-256-GCM, ADR-007).
             let sender_encrypted = crate::crypto::sender_keys::encrypt::encrypt_sender_layer(
                 &state.sender_key,
                 payload,
+                &ctx_str,
+                &self.local_did,
+                epoch,
+                sequence,
             )
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
@@ -462,14 +469,14 @@ mod tests {
         assert!(provider.create_mls_group(&ctx_id).is_ok());
 
         // Verify group exists by attempting to encrypt.
-        let encrypted = provider.encrypt_message(&ctx_id, TEST_DID, b"hello");
+        let encrypted = provider.encrypt_message(&ctx_id, TEST_DID, b"hello", 0, 0);
         assert!(encrypted.is_ok());
 
         // Destroy.
         assert!(provider.destroy_mls_group(&ctx_id).is_ok());
 
         // After destroy, encrypt should fail.
-        let encrypted = provider.encrypt_message(&ctx_id, TEST_DID, b"hello");
+        let encrypted = provider.encrypt_message(&ctx_id, TEST_DID, b"hello", 0, 0);
         assert!(encrypted.is_err());
     }
 
@@ -541,7 +548,7 @@ mod tests {
 
         let plaintext = b"test message";
         let ciphertext = provider
-            .encrypt_message(&ctx_id, TEST_DID, plaintext)
+            .encrypt_message(&ctx_id, TEST_DID, plaintext, 0, 0)
             .unwrap();
 
         // Ciphertext should be non-empty and different from plaintext.

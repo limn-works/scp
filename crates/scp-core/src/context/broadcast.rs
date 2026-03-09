@@ -1472,6 +1472,14 @@ mod tests {
     };
     use crate::crypto::ucan::{Attenuation, UcanHeader, UcanPayload};
     use std::collections::HashMap as StdHashMap;
+
+    // AAD constants for sender-layer encrypt/decrypt in broadcast tests.
+    // These bind the test ciphertexts to a fixed context so AAD is consistent
+    // between encrypt and decrypt calls.
+    const T_CTX: &str = "ctx-broadcast-test";
+    const T_DID: &str = "did:example:test-author";
+    const T_EPOCH: u64 = 0;
+    const T_SEQ: u64 = 0;
     use std::hash::RandomState;
 
     /// Helper to call subscribe on open contexts without a validation context.
@@ -2095,16 +2103,16 @@ mod tests {
         let bob_key = bob_author.broadcast_key.clone();
 
         let alice_msg = b"Alice's message";
-        let alice_ct = encrypt_sender_layer(&alice_key, alice_msg).unwrap();
+        let alice_ct = encrypt_sender_layer(&alice_key, alice_msg, T_CTX, "did:example:alice", T_EPOCH, T_SEQ).unwrap();
         let bob_msg = b"Bob's message";
-        let bob_ct = encrypt_sender_layer(&bob_key, bob_msg).unwrap();
+        let bob_ct = encrypt_sender_layer(&bob_key, bob_msg, T_CTX, "did:example:bob", T_EPOCH, T_SEQ).unwrap();
 
         // Both subscribers can decrypt both authors.
         assert_eq!(
-            decrypt_sender_layer(&alice_key, &alice_ct).unwrap(),
+            decrypt_sender_layer(&alice_key, &alice_ct, T_CTX, "did:example:alice", T_EPOCH, T_SEQ).unwrap(),
             alice_msg
         );
-        assert_eq!(decrypt_sender_layer(&bob_key, &bob_ct).unwrap(), bob_msg);
+        assert_eq!(decrypt_sender_layer(&bob_key, &bob_ct, T_CTX, "did:example:bob", T_EPOCH, T_SEQ).unwrap(), bob_msg);
 
         // Block Bob (admin action).
         ctx.block_author("did:example:bob").unwrap();
@@ -2128,7 +2136,7 @@ mod tests {
         // Subscribers cannot get Bob's key at any epoch — his key is destroyed.
         // Old messages encrypted with Bob's key are still decryptable with the
         // cached key, but no new messages can be produced.
-        assert_eq!(decrypt_sender_layer(&bob_key, &bob_ct).unwrap(), bob_msg);
+        assert_eq!(decrypt_sender_layer(&bob_key, &bob_ct, T_CTX, "did:example:bob", T_EPOCH, T_SEQ).unwrap(), bob_msg);
     }
 
     // -----------------------------------------------------------------------
@@ -2181,11 +2189,11 @@ mod tests {
         let author = ctx.get_author("did:example:alice").unwrap();
         let plaintext = b"Hello from Alice's broadcast!";
 
-        let ciphertext = encrypt_sender_layer(&author.broadcast_key, plaintext).unwrap();
+        let ciphertext = encrypt_sender_layer(&author.broadcast_key, plaintext, T_CTX, T_DID, T_EPOCH, T_SEQ).unwrap();
 
         for sub_did in &["did:example:sub1", "did:example:sub2", "did:example:sub3"] {
             assert!(ctx.can_read(sub_did, "did:example:alice"));
-            let decrypted = decrypt_sender_layer(&author.broadcast_key, &ciphertext).unwrap();
+            let decrypted = decrypt_sender_layer(&author.broadcast_key, &ciphertext, T_CTX, T_DID, T_EPOCH, T_SEQ).unwrap();
             assert_eq!(decrypted, plaintext);
         }
     }
@@ -2209,10 +2217,10 @@ mod tests {
             .clone();
 
         let pre_block_msg = b"message before block";
-        let pre_block_ct = encrypt_sender_layer(&old_key, pre_block_msg).unwrap();
+        let pre_block_ct = encrypt_sender_layer(&old_key, pre_block_msg, T_CTX, T_DID, T_EPOCH, T_SEQ).unwrap();
 
         assert_eq!(
-            decrypt_sender_layer(&old_key, &pre_block_ct).unwrap(),
+            decrypt_sender_layer(&old_key, &pre_block_ct, T_CTX, T_DID, T_EPOCH, T_SEQ).unwrap(),
             pre_block_msg
         );
 
@@ -2221,13 +2229,13 @@ mod tests {
             .unwrap();
 
         let post_block_msg = b"message after block";
-        let post_block_ct = encrypt_sender_layer(&block_result.new_key, post_block_msg).unwrap();
+        let post_block_ct = encrypt_sender_layer(&block_result.new_key, post_block_msg, T_CTX, T_DID, 1, T_SEQ).unwrap();
 
         let non_blocked_decrypted =
-            decrypt_sender_layer(&block_result.new_key, &post_block_ct).unwrap();
+            decrypt_sender_layer(&block_result.new_key, &post_block_ct, T_CTX, T_DID, 1, T_SEQ).unwrap();
         assert_eq!(non_blocked_decrypted, post_block_msg);
 
-        let blocked_result = decrypt_sender_layer(&old_key, &post_block_ct);
+        let blocked_result = decrypt_sender_layer(&old_key, &post_block_ct, T_CTX, T_DID, 1, T_SEQ);
         assert!(
             blocked_result.is_err(),
             "blocked subscriber should not be able to decrypt post-block messages"
@@ -2251,9 +2259,9 @@ mod tests {
 
         let carol_author = ctx.get_author("did:example:carol").unwrap();
         let carol_msg = b"Carol's message";
-        let carol_ct = encrypt_sender_layer(&carol_author.broadcast_key, carol_msg).unwrap();
+        let carol_ct = encrypt_sender_layer(&carol_author.broadcast_key, carol_msg, T_CTX, "did:example:carol", T_EPOCH, T_SEQ).unwrap();
 
-        let decrypted = decrypt_sender_layer(&carol_author.broadcast_key, &carol_ct).unwrap();
+        let decrypted = decrypt_sender_layer(&carol_author.broadcast_key, &carol_ct, T_CTX, "did:example:carol", T_EPOCH, T_SEQ).unwrap();
         assert_eq!(decrypted, carol_msg);
     }
 
@@ -2286,10 +2294,10 @@ mod tests {
         let old_key = author.broadcast_key.clone();
 
         let msg_before = b"gated message before block";
-        let ct_before = encrypt_sender_layer(&old_key, msg_before).unwrap();
+        let ct_before = encrypt_sender_layer(&old_key, msg_before, T_CTX, T_DID, T_EPOCH, T_SEQ).unwrap();
 
         assert_eq!(
-            decrypt_sender_layer(&old_key, &ct_before).unwrap(),
+            decrypt_sender_layer(&old_key, &ct_before, T_CTX, T_DID, T_EPOCH, T_SEQ).unwrap(),
             msg_before
         );
 
@@ -2298,9 +2306,9 @@ mod tests {
             .unwrap();
 
         let msg_after = b"gated message after block";
-        let ct_after = encrypt_sender_layer(&block_result.new_key, msg_after).unwrap();
+        let ct_after = encrypt_sender_layer(&block_result.new_key, msg_after, T_CTX, T_DID, 1, T_SEQ).unwrap();
 
-        let blocked_result = decrypt_sender_layer(&old_key, &ct_after);
+        let blocked_result = decrypt_sender_layer(&old_key, &ct_after, T_CTX, T_DID, 1, T_SEQ);
         assert!(
             blocked_result.is_err(),
             "blocked subscriber cannot decrypt post-block gated messages"
@@ -3016,9 +3024,9 @@ mod tests {
         // Step 3: Decrypt a broadcast message with the granted key.
         let author_key = &ctx.get_author("did:example:alice").unwrap().broadcast_key;
         let plaintext = b"Hello broadcast subscribers!";
-        let ciphertext = encrypt_sender_layer(author_key, plaintext).unwrap();
+        let ciphertext = encrypt_sender_layer(author_key, plaintext, T_CTX, T_DID, T_EPOCH, T_SEQ).unwrap();
         let received_key = SenderKey::from_bytes(*key_bytes);
-        let decrypted = decrypt_sender_layer(&received_key, &ciphertext).unwrap();
+        let decrypted = decrypt_sender_layer(&received_key, &ciphertext, T_CTX, T_DID, T_EPOCH, T_SEQ).unwrap();
         assert_eq!(decrypted, plaintext);
 
         // Step 4: Unsubscribe with key rotation.
@@ -3038,8 +3046,8 @@ mod tests {
         // Step 7: Old key cannot decrypt new content.
         let new_author_key = &ctx.get_author("did:example:alice").unwrap().broadcast_key;
         let new_plaintext = b"Post-unsubscribe message";
-        let new_ciphertext = encrypt_sender_layer(new_author_key, new_plaintext).unwrap();
-        let old_decrypt_result = decrypt_sender_layer(&received_key, &new_ciphertext);
+        let new_ciphertext = encrypt_sender_layer(new_author_key, new_plaintext, T_CTX, T_DID, 1, T_SEQ).unwrap();
+        let old_decrypt_result = decrypt_sender_layer(&received_key, &new_ciphertext, T_CTX, T_DID, 1, T_SEQ);
         assert!(
             old_decrypt_result.is_err(),
             "old key must not decrypt post-unsubscribe messages"

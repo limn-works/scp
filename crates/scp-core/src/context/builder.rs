@@ -198,6 +198,10 @@ pub trait ContextCryptoProvider: Send + Sync {
     /// Encrypts a payload with sender key (ADR-007), wraps in inner envelope
     /// (ADR-002), encrypts with MLS (ADR-001), wraps in outer envelope.
     ///
+    /// `epoch` and `sequence` are bound as Additional Authenticated Data
+    /// (AAD) in the sender-key AES-256-GCM layer to prevent ciphertext
+    /// relocation across contexts, epochs, and sequence positions.
+    ///
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if any encryption step fails.
@@ -206,6 +210,8 @@ pub trait ContextCryptoProvider: Send + Sync {
         context_id: &[u8; 32],
         sender_did: &str,
         payload: &[u8],
+        epoch: u64,
+        sequence: u64,
     ) -> Result<Vec<u8>, ContextError>;
 }
 
@@ -793,6 +799,8 @@ mod tests {
             _context_id: &[u8; 32],
             _sender_did: &str,
             payload: &[u8],
+            _epoch: u64,
+            _sequence: u64,
         ) -> Result<Vec<u8>, ContextError> {
             Ok(payload.to_vec())
         }
