@@ -133,6 +133,48 @@ impl Ord for ProvenanceQuality {
 }
 
 // ---------------------------------------------------------------------------
+// CounterpartyPolicy (§7.7.1, §24.3.1, §24.3.5)
+// ---------------------------------------------------------------------------
+
+/// Policy governing how counterparty information (membership DIDs) is handled
+/// in outbound provenance when data crosses context boundaries (§7.7.1).
+///
+/// The sending SDK applies this policy at attachment time. The policy
+/// determines whether real DIDs, pseudonymized identifiers, or no
+/// counterparty information appears in the provenance record.
+///
+/// - `Full` — real DIDs are included. Appropriate for contexts where
+///   membership is public or for intra-context provenance.
+/// - `Pseudonymized` — real DIDs are replaced with context-scoped pseudonyms
+///   (§9.10.4). Receiving contexts see stable pseudonyms but cannot correlate
+///   them to real DIDs without the source context's pseudonym derivation key.
+/// - `Redacted` — counterparties list is always empty. Most privacy-preserving.
+///
+/// **Default for cross-context export:** `Redacted`. Contexts that want to
+/// share counterparty information must opt in explicitly.
+///
+/// **Intra-context:** Always `Full` regardless of policy setting. The policy
+/// governs only what is exported across context boundaries.
+///
+/// See spec §7.7.1, §24.3.1, §24.3.5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CounterpartyPolicy {
+    /// Include real DIDs in provenance counterparties.
+    Full,
+    /// Replace real DIDs with context-scoped pseudonyms (§9.10.4).
+    Pseudonymized,
+    /// Set counterparties to an empty list. No identity information exported.
+    Redacted,
+}
+
+impl Default for CounterpartyPolicy {
+    /// Default for cross-context export is `Redacted` (§7.7.1).
+    fn default() -> Self {
+        Self::Redacted
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DataProvenance
 // ---------------------------------------------------------------------------
 

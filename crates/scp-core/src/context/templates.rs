@@ -15,6 +15,8 @@
 //! See ADR-008 in `.docs/adrs/phase-2.md` for the base template specification
 //! and ADR-033 in `.docs/adrs/phase-3.md` for paid templates (§19.10).
 
+use crate::provenance::CounterpartyPolicy;
+
 use super::params::{
     Capability, CeilingPolicy, ContextMode, ContextParams, FieldVisibility, GovernanceModel,
     IncompleteVerificationPolicy, MemoryScope, MetadataVisibilityPolicy, ProjectionPolicy,
@@ -280,6 +282,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             projection_policy: None,
             discoverable: false,
             max_chain_depth: None,
+            counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
@@ -299,6 +302,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             projection_policy: None,
             discoverable: false,
             max_chain_depth: None,
+            counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
@@ -318,6 +322,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             projection_policy: None,
             discoverable: false,
             max_chain_depth: None,
+            counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
@@ -337,6 +342,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             projection_policy: None,
             discoverable: false,
             max_chain_depth: None,
+            counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
@@ -359,6 +365,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             }),
             discoverable: false,
             max_chain_depth: None,
+            counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
@@ -381,6 +388,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             }),
             discoverable: false,
             max_chain_depth: None,
+            counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
@@ -400,6 +408,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             projection_policy: None,
             discoverable: false,
             max_chain_depth: None,
+            counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
@@ -421,6 +430,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             projection_policy: None,
             discoverable: false,
             max_chain_depth: None,
+            counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
@@ -445,6 +455,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             }),
             discoverable: false,
             max_chain_depth: None,
+            counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },
@@ -467,6 +478,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             projection_policy: None,
             discoverable: true,
             max_chain_depth: None,
+            counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         },

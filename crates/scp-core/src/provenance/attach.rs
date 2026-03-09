@@ -9,9 +9,15 @@
 
 use std::time::Duration;
 
-use crate::context::MemoryScope;
+use sha2::{Digest, Sha256};
 
-use super::{ContextId, DID, DataProvenance, DiscoveryMethod, ProvenanceError, SourceType};
+use crate::context::MemoryScope;
+use crate::economy::types::Amount;
+
+use super::{
+    ContextId, CounterpartyPolicy, DID, DataProvenance, DiscoveryMethod, ProvenanceError,
+    SourceType,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -56,6 +62,8 @@ pub const PROTOCOL_HARD_MAX_CHAIN_DEPTH: u8 = 5;
 /// - `data_age` -- Age of the data at the time provenance is being attached.
 /// - `purpose` -- Optional human-readable description of why this data is
 ///   being shared cross-context.
+/// - `counterparty_policy` -- How counterparty DIDs are handled when
+///   provenance crosses context boundaries (§7.7.1, §24.3.1).
 #[derive(Debug, Clone)]
 pub struct SourceContextInfo {
     /// Identifier of the source context.
@@ -72,6 +80,31 @@ pub struct SourceContextInfo {
     pub data_age: Duration,
     /// Optional purpose description for this cross-context data flow.
     pub purpose: Option<String>,
+    /// Counterparty privacy policy (§7.7.1, §24.3.1).
+    ///
+    /// Controls how membership DIDs appear in the provenance record:
+    /// - `Full` — real DIDs included.
+    /// - `Pseudonymized` — replaced with context-scoped pseudonyms.
+    /// - `Redacted` — empty list (default for cross-context export).
+    pub counterparty_policy: CounterpartyPolicy,
+}
+
+// ---------------------------------------------------------------------------
+// PaymentInfo (§24.3.4)
+// ---------------------------------------------------------------------------
+
+/// Economic provenance information for cross-context data flows (§24.3.4).
+///
+/// When a cross-context data flow involves a payment, these fields carry the
+/// economic provenance so receiving contexts can see what data cost to produce.
+#[derive(Debug, Clone, Default)]
+pub struct PaymentInfo {
+    /// Cost of producing this data, if any (§19.6).
+    pub amount: Option<Amount>,
+    /// Payment adapter used (e.g., "lightning", "stripe").
+    pub adapter: Option<String>,
+    /// Receipt ID for verification (32 bytes).
+    pub receipt_id: Option<[u8; 32]>,
 }
 
 // ---------------------------------------------------------------------------
@@ -85,6 +118,14 @@ pub struct SourceContextInfo {
 /// source context state and increments `chain_depth` from any existing
 /// provenance on the data.
 ///
+/// The source context's [`CounterpartyPolicy`] is applied to the counterparties
+/// field (§7.7.1, §24.3.1):
+/// - `Full` — real membership DIDs are included.
+/// - `Pseudonymized` — DIDs are replaced with context-scoped pseudonyms
+///   derived from `pseudonym_key` (which MUST be `Some` when the policy is
+///   `Pseudonymized`; if `None`, falls back to `Redacted`).
+/// - `Redacted` — counterparties is set to an empty list.
+///
 /// # Arguments
 ///
 /// - `source` -- Source context state at the time of data flow.
@@ -92,6 +133,9 @@ pub struct SourceContextInfo {
 /// - `existing_provenance` -- Provenance already attached to the data from a
 ///   previous cross-context hop, if any. When `Some`, chain depth is
 ///   incremented and the chain path is extended.
+/// - `pseudonym_key` -- Optional pseudonym derivation key (§9.10.4). Required
+///   when `source.counterparty_policy` is `Pseudonymized`.
+/// - `payment` -- Optional economic provenance (§24.3.4).
 ///
 /// # Returns
 ///
@@ -109,23 +153,109 @@ pub fn attach_provenance(
     source: &SourceContextInfo,
     _target_context: &ContextId,
     existing_provenance: Option<&DataProvenance>,
+    pseudonym_key: Option<&[u8]>,
+    payment: Option<&PaymentInfo>,
 ) -> DataProvenance {
     let (chain_depth, chain_path) = compute_chain(source, existing_provenance);
+
+    let counterparties = apply_counterparty_policy(
+        &source.members,
+        source.counterparty_policy,
+        &source.context_id,
+        pseudonym_key,
+    );
 
     DataProvenance {
         source_context: source.context_id.clone(),
         source_type: source.source_type,
-        counterparties: source.members.clone(),
+        counterparties,
         purpose: source.purpose.clone(),
         discovery_method: source.discovery_method.clone(),
         age: source.data_age,
         memory_scope: source.memory_scope,
         chain_depth,
         chain_path,
-        payment_amount: None,
-        payment_adapter: None,
-        payment_receipt_id: None,
+        payment_amount: payment.and_then(|p| p.amount),
+        payment_adapter: payment.and_then(|p| p.adapter.clone()),
+        payment_receipt_id: payment.and_then(|p| p.receipt_id),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Counterparty policy application (§7.7.1, §24.3.1)
+// ---------------------------------------------------------------------------
+
+/// Applies the counterparty policy to a list of member DIDs (§7.7.1).
+///
+/// - `Full` — returns the DIDs unchanged.
+/// - `Pseudonymized` — replaces each DID with a context-scoped pseudonym.
+/// - `Redacted` — returns an empty list.
+#[must_use]
+fn apply_counterparty_policy(
+    members: &[DID],
+    policy: CounterpartyPolicy,
+    context_id: &str,
+    pseudonym_key: Option<&[u8]>,
+) -> Vec<DID> {
+    match policy {
+        CounterpartyPolicy::Full => members.to_vec(),
+        CounterpartyPolicy::Pseudonymized => {
+            let Some(key) = pseudonym_key else {
+                // No pseudonym key provided — fall back to redacted for safety.
+                return Vec::new();
+            };
+            members
+                .iter()
+                .map(|did| pseudonymize_did(did, context_id, key))
+                .collect()
+        }
+        CounterpartyPolicy::Redacted => Vec::new(),
+    }
+}
+
+/// Derives a context-scoped pseudonym for a DID (§9.10.4).
+///
+/// `pseudonym = "did:pseudo:" || hex(SHA-256(pseudonym_key || context_id || did_string))`
+///
+/// The pseudonym is deterministic for the same (key, context, DID) triple,
+/// so the same real DID always maps to the same pseudonym within a context.
+/// Without the pseudonym key, the mapping is computationally irreversible.
+#[must_use]
+fn pseudonymize_did(did: &DID, context_id: &str, pseudonym_key: &[u8]) -> DID {
+    let mut hasher = Sha256::new();
+    hasher.update(pseudonym_key);
+    hasher.update(context_id.as_bytes());
+    hasher.update((*did).as_bytes());
+    let hash = hasher.finalize();
+    DID::from(format!("did:pseudo:{}", hex::encode(hash)))
+}
+
+// ---------------------------------------------------------------------------
+// Provenance store counterparty operations (§24.3.5)
+// ---------------------------------------------------------------------------
+
+/// Redacts counterparties from a provenance record (§24.3.5).
+///
+/// Replaces the `counterparties` field with an empty list. This is a
+/// destructive, irreversible operation used when a context's
+/// `counterparty_policy` changes to `Redacted` and existing records must
+/// be retroactively updated.
+pub fn redact_counterparties(provenance: &mut DataProvenance) {
+    provenance.counterparties = Vec::new();
+}
+
+/// Pseudonymizes counterparties in a provenance record (§24.3.5).
+///
+/// Replaces real DIDs with context-scoped pseudonyms derived using the
+/// provided pseudonym derivation key. This is a one-way operation —
+/// the pseudonym key is held only by the source context.
+pub fn pseudonymize_counterparties(provenance: &mut DataProvenance, pseudonym_key: &[u8]) {
+    let context_id = provenance.source_context.clone();
+    provenance.counterparties = provenance
+        .counterparties
+        .iter()
+        .map(|did| pseudonymize_did(did, &context_id, pseudonym_key))
+        .collect();
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +359,9 @@ mod tests {
     use super::*;
 
     /// Creates a basic [`SourceContextInfo`] for testing.
+    ///
+    /// Default `counterparty_policy` is `Full` for test convenience (so
+    /// existing tests that check counterparty contents continue to work).
     fn make_source(context_id: &str, members: Vec<&str>) -> SourceContextInfo {
         SourceContextInfo {
             context_id: context_id.to_string(),
@@ -238,6 +371,7 @@ mod tests {
             discovery_method: DiscoveryMethod::None,
             data_age: Duration::from_secs(60),
             purpose: None,
+            counterparty_policy: CounterpartyPolicy::Full,
         }
     }
 
@@ -272,7 +406,7 @@ mod tests {
         let source = make_source("ctx-source", vec!["did:dht:z6MkAlice"]);
         let target = "ctx-target".to_string();
 
-        let prov = attach_provenance(&source, &target, None);
+        let prov = attach_provenance(&source, &target, None, None, None);
 
         assert_eq!(prov.chain_depth, 0);
     }
@@ -282,7 +416,7 @@ mod tests {
         let source = make_source("ctx-source", vec!["did:dht:z6MkAlice"]);
         let target = "ctx-target".to_string();
 
-        let prov = attach_provenance(&source, &target, None);
+        let prov = attach_provenance(&source, &target, None, None, None);
 
         assert!(prov.chain_path.is_none());
     }
@@ -292,7 +426,7 @@ mod tests {
         let source = make_source("ctx-origin-abc", vec![]);
         let target = "ctx-target".to_string();
 
-        let prov = attach_provenance(&source, &target, None);
+        let prov = attach_provenance(&source, &target, None, None, None);
 
         assert_eq!(prov.source_context, "ctx-origin-abc");
     }
@@ -303,7 +437,7 @@ mod tests {
         source.source_type = SourceType::Ephemeral;
         let target = "ctx-target".to_string();
 
-        let prov = attach_provenance(&source, &target, None);
+        let prov = attach_provenance(&source, &target, None, None, None);
 
         assert_eq!(prov.source_type, SourceType::Ephemeral);
     }
@@ -314,7 +448,7 @@ mod tests {
         source.memory_scope = MemoryScope::Summary;
         let target = "ctx-target".to_string();
 
-        let prov = attach_provenance(&source, &target, None);
+        let prov = attach_provenance(&source, &target, None, None, None);
 
         assert_eq!(prov.memory_scope, MemoryScope::Summary);
     }
@@ -331,7 +465,7 @@ mod tests {
         );
         let target = "ctx-target".to_string();
 
-        let prov = attach_provenance(&source, &target, None);
+        let prov = attach_provenance(&source, &target, None, None, None);
 
         assert_eq!(prov.counterparties.len(), 3);
         assert_eq!(prov.counterparties[0], "did:dht:z6MkAlice");
@@ -345,7 +479,7 @@ mod tests {
         source.discovery_method = DiscoveryMethod::SharedContext("ctx-shared".to_string());
         let target = "ctx-target".to_string();
 
-        let prov = attach_provenance(&source, &target, None);
+        let prov = attach_provenance(&source, &target, None, None, None);
 
         assert_eq!(
             prov.discovery_method,
@@ -359,7 +493,7 @@ mod tests {
         source.data_age = Duration::from_secs(300);
         let target = "ctx-target".to_string();
 
-        let prov = attach_provenance(&source, &target, None);
+        let prov = attach_provenance(&source, &target, None, None, None);
 
         assert_eq!(prov.age, Duration::from_secs(300));
     }
@@ -370,7 +504,7 @@ mod tests {
         source.purpose = Some("recipe sharing".to_string());
         let target = "ctx-target".to_string();
 
-        let prov = attach_provenance(&source, &target, None);
+        let prov = attach_provenance(&source, &target, None, None, None);
 
         assert_eq!(prov.purpose.as_deref(), Some("recipe sharing"));
     }
@@ -380,7 +514,7 @@ mod tests {
         let source = make_source("ctx-src", vec![]);
         let target = "ctx-target".to_string();
 
-        let prov = attach_provenance(&source, &target, None);
+        let prov = attach_provenance(&source, &target, None, None, None);
 
         assert!(prov.purpose.is_none());
     }
@@ -395,7 +529,7 @@ mod tests {
         let target = "ctx-target".to_string();
         let existing = make_provenance_with_chain("ctx-hop-1", 0, None);
 
-        let prov = attach_provenance(&source, &target, Some(&existing));
+        let prov = attach_provenance(&source, &target, Some(&existing), None, None);
 
         assert_eq!(prov.chain_depth, 1);
     }
@@ -407,7 +541,7 @@ mod tests {
         let existing =
             make_provenance_with_chain("ctx-hop-2", 2, Some(vec!["ctx-hop-1", "ctx-hop-2"]));
 
-        let prov = attach_provenance(&source, &target, Some(&existing));
+        let prov = attach_provenance(&source, &target, Some(&existing), None, None);
 
         assert_eq!(prov.chain_depth, 3);
     }
@@ -418,7 +552,7 @@ mod tests {
         let target = "ctx-target".to_string();
         let existing = make_provenance_with_chain("ctx-prev", u8::MAX, None);
 
-        let prov = attach_provenance(&source, &target, Some(&existing));
+        let prov = attach_provenance(&source, &target, Some(&existing), None, None);
 
         assert_eq!(prov.chain_depth, u8::MAX);
     }
@@ -433,7 +567,7 @@ mod tests {
         let target = "ctx-target".to_string();
         let existing = make_provenance_with_chain("ctx-origin", 0, None);
 
-        let prov = attach_provenance(&source, &target, Some(&existing));
+        let prov = attach_provenance(&source, &target, Some(&existing), None, None);
 
         assert!(prov.chain_path.is_some());
         let path = prov.chain_path.unwrap();
@@ -447,7 +581,7 @@ mod tests {
         let target = "ctx-target".to_string();
         let existing = make_provenance_with_chain("ctx-hop-2", 1, Some(vec!["ctx-hop-1"]));
 
-        let prov = attach_provenance(&source, &target, Some(&existing));
+        let prov = attach_provenance(&source, &target, Some(&existing), None, None);
 
         let path = prov.chain_path.as_ref().unwrap();
         assert_eq!(path.len(), 2);
@@ -463,17 +597,17 @@ mod tests {
 
         // First hop: origin -> hop1
         let prov_0 = make_provenance_with_chain("ctx-origin", 0, None);
-        let prov_1 = attach_provenance(&source_1, &target, Some(&prov_0));
+        let prov_1 = attach_provenance(&source_1, &target, Some(&prov_0), None, None);
         assert_eq!(prov_1.chain_depth, 1);
 
         // Second hop: hop1 -> hop2
         let source_2 = make_source("ctx-hop-2", vec!["did:dht:z6MkBob"]);
-        let prov_2 = attach_provenance(&source_2, &target, Some(&prov_1));
+        let prov_2 = attach_provenance(&source_2, &target, Some(&prov_1), None, None);
         assert_eq!(prov_2.chain_depth, 2);
 
         // Third hop: hop2 -> hop3
         let source_3 = make_source("ctx-hop-3", vec!["did:dht:z6MkCharlie"]);
-        let prov_3 = attach_provenance(&source_3, &target, Some(&prov_2));
+        let prov_3 = attach_provenance(&source_3, &target, Some(&prov_2), None, None);
         assert_eq!(prov_3.chain_depth, 3);
 
         let path = prov_3.chain_path.as_ref().unwrap();
@@ -488,7 +622,7 @@ mod tests {
         let source = make_source("ctx-origin", vec!["did:dht:z6MkAlice"]);
         let target = "ctx-target".to_string();
 
-        let prov = attach_provenance(&source, &target, None);
+        let prov = attach_provenance(&source, &target, None, None, None);
 
         assert!(
             prov.chain_path.is_none(),
@@ -505,7 +639,7 @@ mod tests {
         let source = make_source("ctx-empty", vec![]);
         let target = "ctx-target".to_string();
 
-        let prov = attach_provenance(&source, &target, None);
+        let prov = attach_provenance(&source, &target, None, None, None);
 
         assert!(prov.counterparties.is_empty());
     }
@@ -515,7 +649,7 @@ mod tests {
         let source = make_source("ctx-solo", vec!["did:dht:z6MkSolo"]);
         let target = "ctx-target".to_string();
 
-        let prov = attach_provenance(&source, &target, None);
+        let prov = attach_provenance(&source, &target, None, None, None);
 
         assert_eq!(prov.counterparties, vec!["did:dht:z6MkSolo".to_string()]);
     }
@@ -526,7 +660,7 @@ mod tests {
         let target = "ctx-target".to_string();
         let existing = make_provenance_with_chain("ctx-prev", 0, None);
 
-        let prov = attach_provenance(&source, &target, Some(&existing));
+        let prov = attach_provenance(&source, &target, Some(&existing), None, None);
 
         // Counterparties should come from the current source, not from existing provenance
         assert_eq!(prov.counterparties.len(), 2);
@@ -691,7 +825,7 @@ mod tests {
         let source = make_source("ctx-src", vec!["did:dht:z6MkAlice"]);
         let target = "ctx-target".to_string();
 
-        let prov = attach_provenance(&source, &target, None);
+        let prov = attach_provenance(&source, &target, None, None, None);
         let result = check_chain_depth(&prov, DEFAULT_MAX_CHAIN_DEPTH);
 
         assert!(result.is_ok());
@@ -705,7 +839,13 @@ mod tests {
             let ctx_name = format!("ctx-hop-{i}");
             let source = make_source(&ctx_name, vec!["did:dht:z6MkMember"]);
             let target = "ctx-final".to_string();
-            prev = Some(attach_provenance(&source, &target, prev.as_ref()));
+            prev = Some(attach_provenance(
+                &source,
+                &target,
+                prev.as_ref(),
+                None,
+                None,
+            ));
         }
 
         let final_prov = prev.unwrap();
@@ -721,7 +861,13 @@ mod tests {
             let ctx_name = format!("ctx-hop-{i}");
             let source = make_source(&ctx_name, vec!["did:dht:z6MkMember"]);
             let target = "ctx-final".to_string();
-            prev = Some(attach_provenance(&source, &target, prev.as_ref()));
+            prev = Some(attach_provenance(
+                &source,
+                &target,
+                prev.as_ref(),
+                None,
+                None,
+            ));
         }
 
         let final_prov = prev.unwrap();
@@ -730,7 +876,7 @@ mod tests {
         // One more hop pushes past the limit
         let source_extra = make_source("ctx-one-too-many", vec![]);
         let target = "ctx-final".to_string();
-        let over_limit = attach_provenance(&source_extra, &target, Some(&final_prov));
+        let over_limit = attach_provenance(&source_extra, &target, Some(&final_prov), None, None);
 
         assert!(check_chain_depth(&over_limit, DEFAULT_MAX_CHAIN_DEPTH).is_err());
     }
@@ -749,10 +895,11 @@ mod tests {
             discovery_method: DiscoveryMethod::Registry("ctx-reg".to_string()),
             data_age: Duration::from_secs(120),
             purpose: Some("testing".to_string()),
+            counterparty_policy: CounterpartyPolicy::Full,
         };
 
         let target = "ctx-target".to_string();
-        let prov = attach_provenance(&info, &target, None);
+        let prov = attach_provenance(&info, &target, None, None, None);
 
         assert_eq!(prov.source_context, "ctx-full");
         assert_eq!(prov.source_type, SourceType::Summary);
@@ -778,7 +925,7 @@ mod tests {
         let source = make_source("ctx-src", vec!["did:dht:z6MkAlice"]);
         let target = "ctx-target".to_string();
 
-        let prov = attach_provenance(&source, &target, None);
+        let prov = attach_provenance(&source, &target, None, None, None);
         let prov_for_source = prov.clone();
         let prov_for_target = prov;
 
@@ -787,5 +934,205 @@ mod tests {
             prov_for_target.source_context
         );
         assert_eq!(prov_for_source.chain_depth, prov_for_target.chain_depth);
+    }
+
+    // -----------------------------------------------------------------------
+    // CounterpartyPolicy application (§7.7.1, §24.3.1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn counterparty_policy_full_includes_real_dids() {
+        let mut source = make_source("ctx-src", vec!["did:dht:z6MkAlice", "did:dht:z6MkBob"]);
+        source.counterparty_policy = CounterpartyPolicy::Full;
+        let target = "ctx-target".to_string();
+
+        let prov = attach_provenance(&source, &target, None, None, None);
+
+        assert_eq!(prov.counterparties.len(), 2);
+        assert_eq!(prov.counterparties[0], "did:dht:z6MkAlice");
+        assert_eq!(prov.counterparties[1], "did:dht:z6MkBob");
+    }
+
+    #[test]
+    fn counterparty_policy_redacted_produces_empty_list() {
+        let mut source = make_source("ctx-src", vec!["did:dht:z6MkAlice", "did:dht:z6MkBob"]);
+        source.counterparty_policy = CounterpartyPolicy::Redacted;
+        let target = "ctx-target".to_string();
+
+        let prov = attach_provenance(&source, &target, None, None, None);
+
+        assert!(
+            prov.counterparties.is_empty(),
+            "redacted policy must produce empty counterparties"
+        );
+    }
+
+    #[test]
+    fn counterparty_policy_pseudonymized_replaces_dids() {
+        let mut source = make_source("ctx-src", vec!["did:dht:z6MkAlice", "did:dht:z6MkBob"]);
+        source.counterparty_policy = CounterpartyPolicy::Pseudonymized;
+        let target = "ctx-target".to_string();
+        let pseudonym_key = b"test-pseudonym-key-32-bytes!!!!!";
+
+        let prov = attach_provenance(&source, &target, None, Some(pseudonym_key.as_slice()), None);
+
+        assert_eq!(prov.counterparties.len(), 2);
+        // Pseudonyms must be deterministic
+        for cp in &prov.counterparties {
+            assert!(
+                (*cp).starts_with("did:pseudo:"),
+                "pseudonymized DID must start with did:pseudo:"
+            );
+        }
+        // Must differ from original DIDs
+        assert_ne!(prov.counterparties[0], DID::from("did:dht:z6MkAlice"));
+        assert_ne!(prov.counterparties[1], DID::from("did:dht:z6MkBob"));
+    }
+
+    #[test]
+    fn counterparty_policy_pseudonymized_deterministic() {
+        let mut source = make_source("ctx-src", vec!["did:dht:z6MkAlice"]);
+        source.counterparty_policy = CounterpartyPolicy::Pseudonymized;
+        let target = "ctx-target".to_string();
+        let key = b"test-key";
+
+        let prov1 = attach_provenance(&source, &target, None, Some(key.as_slice()), None);
+        let prov2 = attach_provenance(&source, &target, None, Some(key.as_slice()), None);
+
+        assert_eq!(
+            prov1.counterparties, prov2.counterparties,
+            "same inputs must produce same pseudonyms"
+        );
+    }
+
+    #[test]
+    fn counterparty_policy_pseudonymized_no_key_falls_back_to_redacted() {
+        let mut source = make_source("ctx-src", vec!["did:dht:z6MkAlice"]);
+        source.counterparty_policy = CounterpartyPolicy::Pseudonymized;
+        let target = "ctx-target".to_string();
+
+        // No pseudonym key provided — should produce empty list
+        let prov = attach_provenance(&source, &target, None, None, None);
+
+        assert!(
+            prov.counterparties.is_empty(),
+            "pseudonymized without key must fall back to redacted"
+        );
+    }
+
+    #[test]
+    fn counterparty_policy_pseudonymized_differs_by_context() {
+        let key = b"shared-key";
+
+        let mut source_a = make_source("ctx-a", vec!["did:dht:z6MkAlice"]);
+        source_a.counterparty_policy = CounterpartyPolicy::Pseudonymized;
+
+        let mut source_b = make_source("ctx-b", vec!["did:dht:z6MkAlice"]);
+        source_b.counterparty_policy = CounterpartyPolicy::Pseudonymized;
+
+        let target = "ctx-target".to_string();
+
+        let prov_a = attach_provenance(&source_a, &target, None, Some(key.as_slice()), None);
+        let prov_b = attach_provenance(&source_b, &target, None, Some(key.as_slice()), None);
+
+        assert_ne!(
+            prov_a.counterparties[0], prov_b.counterparties[0],
+            "same DID in different contexts must produce different pseudonyms"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Provenance store counterparty operations (§24.3.5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn redact_counterparties_clears_list() {
+        let mut prov = make_provenance_with_chain("ctx-src", 0, None);
+        assert!(!prov.counterparties.is_empty());
+
+        redact_counterparties(&mut prov);
+
+        assert!(prov.counterparties.is_empty());
+    }
+
+    #[test]
+    fn pseudonymize_counterparties_replaces_dids() {
+        let mut prov = make_provenance_with_chain("ctx-src", 0, None);
+        let original_dids = prov.counterparties.clone();
+        let key = b"pseudonym-key";
+
+        pseudonymize_counterparties(&mut prov, key);
+
+        assert_eq!(prov.counterparties.len(), original_dids.len());
+        for (i, cp) in prov.counterparties.iter().enumerate() {
+            assert!((*cp).starts_with("did:pseudo:"));
+            assert_ne!(cp, &original_dids[i]);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Economic provenance (§24.3.4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn attach_provenance_with_payment_info() {
+        let source = make_source("ctx-src", vec!["did:dht:z6MkAlice"]);
+        let target = "ctx-target".to_string();
+        let payment = PaymentInfo {
+            amount: Some(Amount::new(1000)),
+            adapter: Some("lightning".to_string()),
+            receipt_id: Some([0xAA; 32]),
+        };
+
+        let prov = attach_provenance(&source, &target, None, None, Some(&payment));
+
+        assert_eq!(prov.payment_amount, Some(Amount::new(1000)));
+        assert_eq!(prov.payment_adapter.as_deref(), Some("lightning"));
+        assert_eq!(prov.payment_receipt_id, Some([0xAA; 32]));
+    }
+
+    #[test]
+    fn attach_provenance_without_payment_info() {
+        let source = make_source("ctx-src", vec!["did:dht:z6MkAlice"]);
+        let target = "ctx-target".to_string();
+
+        let prov = attach_provenance(&source, &target, None, None, None);
+
+        assert!(prov.payment_amount.is_none());
+        assert!(prov.payment_adapter.is_none());
+        assert!(prov.payment_receipt_id.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // CounterpartyPolicy tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn counterparty_policy_default_is_redacted() {
+        assert_eq!(CounterpartyPolicy::default(), CounterpartyPolicy::Redacted);
+    }
+
+    #[test]
+    fn counterparty_policy_serialization_roundtrip() {
+        let policies = [
+            CounterpartyPolicy::Full,
+            CounterpartyPolicy::Pseudonymized,
+            CounterpartyPolicy::Redacted,
+        ];
+        for policy in &policies {
+            let json = serde_json::to_string(policy).unwrap();
+            let decoded: CounterpartyPolicy = serde_json::from_str(&json).unwrap();
+            assert_eq!(policy, &decoded);
+        }
+    }
+
+    #[test]
+    fn counterparty_policy_variants_distinct() {
+        assert_ne!(CounterpartyPolicy::Full, CounterpartyPolicy::Pseudonymized);
+        assert_ne!(CounterpartyPolicy::Full, CounterpartyPolicy::Redacted);
+        assert_ne!(
+            CounterpartyPolicy::Pseudonymized,
+            CounterpartyPolicy::Redacted
+        );
     }
 }

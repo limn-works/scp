@@ -10286,8 +10286,11 @@ mod tests {
                 target_context: format!("target-{i}"),
                 tool_id: format!("tool-{i}"),
                 rate_limit: None,
+                per_caller_rate_limit: None,
                 approved_by_source: true,
                 approved_by_target: true,
+                outbound_policy: None,
+                inbound_policy: None,
             };
             manager
                 .execute_establish_tool_interface("test-ctx", &iface, pid)
@@ -10301,8 +10304,11 @@ mod tests {
             target_context: "target-overflow".to_owned(),
             tool_id: "tool-overflow".to_owned(),
             rate_limit: None,
+            per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: true,
+            outbound_policy: None,
+            inbound_policy: None,
         };
         let err = manager
             .execute_establish_tool_interface("test-ctx", &overflow, pid)
@@ -11322,8 +11328,11 @@ mod tests {
                     target_context: "other-ctx".into(),
                     tool_id: "tool-a".into(),
                     rate_limit: None,
+                    per_caller_rate_limit: None,
                     approved_by_source: true,
                     approved_by_target: false,
+                    outbound_policy: None,
+                    inbound_policy: None,
                 },
             },
         );

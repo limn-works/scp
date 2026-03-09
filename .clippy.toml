@@ -1,6 +1,6 @@
 cognitive-complexity-threshold = 25
-# The auto-generated test harness for scp-core allocates ~607 KiB on the
-# stack for the TestDescAndFn array (3451 tests). This exceeds the default
+# The auto-generated test harness for scp-core allocates ~700 KiB on the
+# stack for the TestDescAndFn array (~3600 tests). This exceeds the default
 # 512 KiB threshold but is safe — test binaries run on threads with ample
 # stack space. Raising the threshold avoids a false positive on generated code.
-stack-size-threshold = 700000
+stack-size-threshold = 750000

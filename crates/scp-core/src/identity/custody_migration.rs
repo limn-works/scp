@@ -75,7 +75,7 @@ pub struct CustodyMigrationRequest {
     pub new_active_pubkey: Vec<u8>,
     /// The custody type being migrated to.
     pub target_custody_type: CustodyMigrationTarget,
-    /// Unix timestamp (seconds) when the migration was requested.
+    /// Unix timestamp (milliseconds) when the migration was requested.
     pub requested_at: u64,
 }
 
@@ -113,7 +113,7 @@ pub struct CustodyMigrationStatus {
     pub request: CustodyMigrationRequest,
     /// The current step in the migration protocol.
     pub current_step: CustodyMigrationStep,
-    /// Unix timestamp (seconds) when the current step was reached.
+    /// Unix timestamp (milliseconds) when the current step was reached.
     pub step_reached_at: u64,
     /// If the migration failed, a description of the failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -134,12 +134,12 @@ mod tests {
         let req = CustodyMigrationRequest {
             new_active_pubkey: vec![0xAA; 32],
             target_custody_type: CustodyMigrationTarget::Hardware,
-            requested_at: 1_700_000_000,
+            requested_at: 1_700_000_000_000,
         };
 
         assert_eq!(req.new_active_pubkey.len(), 32);
         assert_eq!(req.target_custody_type, CustodyMigrationTarget::Hardware);
-        assert_eq!(req.requested_at, 1_700_000_000);
+        assert_eq!(req.requested_at, 1_700_000_000_000);
     }
 
     #[test]
@@ -147,7 +147,7 @@ mod tests {
         let req = CustodyMigrationRequest {
             new_active_pubkey: vec![0xBB; 32],
             target_custody_type: CustodyMigrationTarget::PlatformManaged,
-            requested_at: 1_700_100_000,
+            requested_at: 1_700_100_000_000,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -202,10 +202,10 @@ mod tests {
             request: CustodyMigrationRequest {
                 new_active_pubkey: vec![0xCC; 32],
                 target_custody_type: CustodyMigrationTarget::Software,
-                requested_at: 1_700_200_000,
+                requested_at: 1_700_200_000_000,
             },
             current_step: CustodyMigrationStep::Rotated,
-            step_reached_at: 1_700_200_100,
+            step_reached_at: 1_700_200_100_000,
             failure_reason: None,
         };
 
@@ -220,10 +220,10 @@ mod tests {
             request: CustodyMigrationRequest {
                 new_active_pubkey: vec![0xDD; 32],
                 target_custody_type: CustodyMigrationTarget::Hardware,
-                requested_at: 1_700_300_000,
+                requested_at: 1_700_300_000_000,
             },
             current_step: CustodyMigrationStep::Authorized,
-            step_reached_at: 1_700_300_050,
+            step_reached_at: 1_700_300_050_000,
             failure_reason: Some("DID document update rejected by relay".to_owned()),
         };
 

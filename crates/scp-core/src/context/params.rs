@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bridge::BridgeMode;
 use crate::economy::EconomicPolicy;
+use crate::provenance::CounterpartyPolicy;
 use crate::trust::RequireParticipation;
 
 pub use super::close::IncompleteVerificationPolicy;
@@ -597,6 +598,19 @@ pub struct ContextParams {
     #[serde(default)]
     pub max_chain_depth: Option<u8>,
 
+    /// Counterparty privacy policy for outbound provenance (§7.7.1, §24.3.1).
+    ///
+    /// Controls how membership DIDs appear in provenance records when data
+    /// crosses this context's boundary:
+    /// - `Full` — real DIDs included (opt-in for public contexts).
+    /// - `Pseudonymized` — context-scoped pseudonyms (§9.10.4).
+    /// - `Redacted` — empty list (default, most privacy-preserving).
+    ///
+    /// Default is `Redacted` per §7.7.1: contexts must opt in to share
+    /// counterparty information.
+    #[serde(default)]
+    pub counterparty_policy: CounterpartyPolicy,
+
     /// Participation admission requirements (spec §7.3.2.1).
     ///
     /// When non-empty, joining members must present [`ParticipationProfile`]
@@ -634,6 +648,7 @@ impl Default for ContextParams {
             projection_policy: None,
             discoverable: false,
             max_chain_depth: None,
+            counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         }
@@ -781,6 +796,7 @@ mod tests {
             projection_policy: None,
             discoverable: false,
             max_chain_depth: None,
+            counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         };
@@ -897,6 +913,7 @@ mod tests {
             projection_policy: None,
             discoverable: false,
             max_chain_depth: None,
+            counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         };
@@ -952,6 +969,7 @@ mod tests {
             projection_policy: None,
             discoverable: false,
             max_chain_depth: None,
+            counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         };
