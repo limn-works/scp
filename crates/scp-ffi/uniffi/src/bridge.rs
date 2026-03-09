@@ -41,6 +41,11 @@ use uuid::Uuid;
 
 use scp_core::context::membership::KeyPackage;
 
+use scp_ffi_common::validate::{
+    validate_capability_uri, validate_did, validate_relay_url, validate_tool_id,
+    validate_tool_name, validate_ucan_token,
+};
+
 use crate::{decrement_handle_count, increment_handle_count, runtime};
 
 /// Tool handler function type: maps JSON input to JSON output (or error string).
@@ -294,7 +299,7 @@ impl KeyCustody for CallbackKeyCustody {
         let type_str = self.provider.custody_type(key.id().to_string());
         match type_str.as_str() {
             "hardware" => CustodyType::Hardware,
-            "software" => CustodyType::Software,
+            "software" | "software_biometric" => CustodyType::Software,
             _ => CustodyType::InMemory,
         }
     }
@@ -350,6 +355,15 @@ pub enum ScpError {
 // ---------------------------------------------------------------------------
 // From<scp-core error types> for ScpError
 // ---------------------------------------------------------------------------
+
+impl From<scp_ffi_common::validate::ValidationError> for ScpError {
+    fn from(e: scp_ffi_common::validate::ValidationError) -> Self {
+        Self::Validation {
+            message: e.message,
+            code: "SCP-VALID-7000".to_owned(),
+        }
+    }
+}
 
 impl From<scp_identity::IdentityError> for ScpError {
     fn from(e: scp_identity::IdentityError) -> Self {
@@ -1857,6 +1871,8 @@ pub async fn context_create(
 ) -> Result<Arc<ContextHandle>, ScpError> {
     runtime()
         .spawn(async move {
+            validate_did(&identity.did)?;
+
             let context_id = format!("ctx-{}", Uuid::new_v4());
 
             // Convert bridge ContextParams to scp-core ContextParams.
@@ -1965,6 +1981,8 @@ pub async fn context_join(
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
+            validate_did(&identity.did)?;
+
             let state = handle.state.lock().await;
 
             if !matches!(*state, ContextState::Active) {
@@ -2214,6 +2232,8 @@ pub async fn context_send(
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
+            validate_did(&identity.did)?;
+
             let state = handle.state.lock().await;
 
             if !matches!(*state, ContextState::Active) {
@@ -2373,6 +2393,8 @@ pub async fn tool_register(
 ) -> Result<String, ScpError> {
     runtime()
         .spawn(async move {
+            validate_tool_name(&definition.name)?;
+
             let state = handle.state.lock().await;
 
             if !matches!(*state, ContextState::Active) {
@@ -2494,6 +2516,12 @@ pub async fn tool_invoke(
 ) -> Result<String, ScpError> {
     runtime()
         .spawn(async move {
+            validate_tool_id(&tool_id)?;
+            validate_did(&identity.did)?;
+            if let Some(ref token) = ucan_token {
+                validate_ucan_token(token)?;
+            }
+
             let state = handle.state.lock().await;
 
             if !matches!(*state, ContextState::Active) {
@@ -3119,6 +3147,7 @@ pub async fn tool_session_close(
 /// protocol mismatch, timeout, authentication failure).
 #[uniffi::export]
 pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager>, ScpError> {
+    validate_relay_url(&relay_url)?;
     if !relay_url.starts_with("wss://") {
         return Err(ScpError::Transport {
             message: format!(
@@ -3197,6 +3226,9 @@ pub async fn ucan_validate(
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
+            validate_ucan_token(&token)?;
+            validate_capability_uri(&capability)?;
+
             use scp_core::crypto::ucan::capability::CapabilityUri;
             use scp_core::crypto::ucan::validate::{
                 DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, parse_ucan, validate_ucan,
@@ -3327,6 +3359,7 @@ pub async fn ucan_mint(
     member_did: String,
     capabilities: Vec<String>,
 ) -> Result<Arc<UcanToken>, ScpError> {
+    validate_did(&member_did)?;
     ucan_mint_impl(handle, member_did, capabilities).await
 }
 

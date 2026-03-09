@@ -137,6 +137,38 @@ struct AppleKeyCustodyTests {
         }
     }
 
+    @Test("publicKey reads from metadata cache without accessing key material")
+    func publicKeyFromMetadataCache() async throws {
+        // Generate a key -- the public key should be cached in metadata.
+        let handle = try await custody.generateKeypair(keyType: "ed25519")
+
+        // Read the public key via the API.
+        let pubKey = try await custody.publicKey(handle)
+        #expect(pubKey.count == 32)
+
+        // Verify the cached public key matches a fresh derivation from
+        // the private key bytes (read directly from Keychain).
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: "scp.key.\(handle)",
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        #expect(status == errSecSuccess)
+        if let privData = result as? Data {
+            let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: privData)
+            #expect(
+                pubKey == signingKey.publicKey.rawRepresentation,
+                "cached public key must match derived public key"
+            )
+        }
+
+        // Cleanup
+        try await custody.destroyKey(handle)
+    }
+
     // MARK: - destroyKey
 
     @Test("destroyKey returns attestation with softwareOnly method")
@@ -286,15 +318,18 @@ struct AppleKeyCustodyTests {
         seedBytes[31] = 1
         let contextId = Data("test".utf8)
 
-        // Store the known seed as an Ed25519 private key in Keychain.
-        let handle = UUID().uuidString
-        try custody.storePrivateKeyBytes(seedBytes, for: handle, keyType: .ed25519)
-
-        // Compute expected pseudonym using the reference algorithm directly:
-        // seed = HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym")
+        // Derive the public key from the seed for metadata caching.
         let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: seedBytes)
         let publicKeyBytes = signingKey.publicKey.rawRepresentation
 
+        // Store the known seed as an Ed25519 private key in Keychain.
+        let handle = UUID().uuidString
+        try custody.storePrivateKeyBytes(
+            seedBytes, for: handle, keyType: .ed25519, publicKeyBytes: publicKeyBytes
+        )
+
+        // Compute expected pseudonym using the reference algorithm directly:
+        // seed = HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym")
         let hmacKey = SymmetricKey(data: publicKeyBytes)
         var hmac = CryptoKit.HMAC<SHA256>(key: hmacKey)
         hmac.update(data: contextId)
@@ -346,6 +381,113 @@ struct AppleKeyCustodyTests {
         try await custody.destroyKey(h1)
         try await custody.destroyKey(h2)
         try await custody.destroyKey(h3)
+    }
+}
+
+// MARK: - BiometricPolicy Tests
+
+@Suite("AppleKeyCustody BiometricPolicy Tests")
+struct AppleKeyCustodyBiometricPolicyTests {
+
+    // MARK: - Default behavior preserved
+
+    @Test("BiometricPolicy.none preserves existing behavior")
+    func biometricNoneMatchesCurrentBehavior() async throws {
+        let custodyDefault = AppleKeyCustody(accessGroup: nil)
+        let custodyExplicit = AppleKeyCustody(accessGroup: nil, biometricPolicy: .none)
+
+        // Both should generate keys identically.
+        let h1 = try await custodyDefault.generateKeypair(keyType: "ed25519")
+        let h2 = try await custodyExplicit.generateKeypair(keyType: "ed25519")
+
+        // Both should sign successfully.
+        let data = Data("test".utf8)
+        let sig1 = try await custodyDefault.sign(h1, data: data)
+        let sig2 = try await custodyExplicit.sign(h2, data: data)
+
+        #expect(sig1.count == 64)
+        #expect(sig2.count == 64)
+
+        // Cleanup
+        try await custodyDefault.destroyKey(h1)
+        try await custodyExplicit.destroyKey(h2)
+    }
+
+    // MARK: - custodyType reflects biometric policy
+
+    @Test("custodyType returns 'software' for BiometricPolicy.none")
+    func custodyTypeNone() async throws {
+        let custodyNone = AppleKeyCustody(accessGroup: nil, biometricPolicy: .none)
+        let handle = try await custodyNone.generateKeypair(keyType: "ed25519")
+        #expect(custodyNone.custodyType(handle) == "software")
+        try await custodyNone.destroyKey(handle)
+    }
+
+    @Test("custodyType returns 'software_biometric' for BiometricPolicy.required")
+    func custodyTypeRequired() async throws {
+        let custodyBio = AppleKeyCustody(accessGroup: nil, biometricPolicy: .required)
+        // custodyType does not access the Keychain -- it reflects the policy.
+        #expect(custodyBio.custodyType("any-handle") == "software_biometric")
+    }
+
+    // MARK: - BiometricPolicy.required creates biometric-gated keys
+
+    /// Verifies that a key stored with `.required` biometric policy uses
+    /// `SecAccessControl` with `.biometryCurrentSet`.
+    ///
+    /// Note: On simulator without enrolled biometrics, the key creation
+    /// succeeds but biometric-gated access will fall back to passcode.
+    /// Full biometric prompt testing requires a device with enrolled
+    /// biometrics -- see ADR-025 Biometric gating for manual testing steps.
+    @Test("BiometricPolicy.required stores key with biometric access control")
+    func biometricRequiredStoresWithAccessControl() async throws {
+        let custodyBio = AppleKeyCustody(accessGroup: nil, biometricPolicy: .required)
+        let handle = try await custodyBio.generateKeypair(keyType: "ed25519")
+
+        // Verify the key exists and has an access control attribute by
+        // querying the Keychain for attributes.
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: "scp.key.\(handle)",
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        #expect(status == errSecSuccess, "key should exist in Keychain")
+
+        if let attrs = result as? [String: Any] {
+            // When SecAccessControl is set, kSecAttrAccessControl is present
+            // in the returned attributes and kSecAttrAccessible is NOT set
+            // (they are mutually exclusive in the Keychain).
+            let hasAccessControl = attrs[kSecAttrAccessControl as String] != nil
+            #expect(
+                hasAccessControl,
+                "biometric key must have kSecAttrAccessControl set"
+            )
+        }
+
+        // Cleanup
+        try await custodyBio.destroyKey(handle)
+    }
+
+    // MARK: - BiometricPolicy enum equality
+
+    @Test("BiometricPolicy raw values")
+    func biometricPolicyRawValues() {
+        #expect(BiometricPolicy.none.rawValue == "none")
+        #expect(BiometricPolicy.required.rawValue == "required")
+        #expect(BiometricPolicy.none != BiometricPolicy.required)
+    }
+
+    // MARK: - biometricPolicy property is accessible
+
+    @Test("biometricPolicy is stored and accessible")
+    func biometricPolicyStored() {
+        let custodyNone = AppleKeyCustody(accessGroup: nil, biometricPolicy: .none)
+        let custodyReq = AppleKeyCustody(accessGroup: nil, biometricPolicy: .required)
+        #expect(custodyNone.biometricPolicy == .none)
+        #expect(custodyReq.biometricPolicy == .required)
     }
 }
 

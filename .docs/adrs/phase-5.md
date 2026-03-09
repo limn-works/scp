@@ -378,6 +378,42 @@ Apple's Keychain, App Attest, and APNs APIs are Objective-C/Swift frameworks (`S
 **APNs opacity (§10.7):**
 Silent push (`content-available: 1`) is the only APNs payload format that satisfies the opacity requirement. Alert notifications (`alert` payload) would include a visible notification with text, exposing context activity to both Apple and potentially the device lock screen. Silent push wakes the app in background with zero user-visible metadata. The SCP engine handles everything after wake.
 
+### Biometric gating
+
+**Amendment (2026-03-08, #392):** `AppleKeyCustody` supports optional biometric authentication (Face ID / Touch ID) gating for key access operations. This is controlled by the `BiometricPolicy` parameter at initialization time.
+
+**Why biometric gating, not Secure Enclave key custody:**
+Issue #392 originally requested Secure Enclave-backed key custody. Analysis confirmed that the Secure Enclave only supports P-256 (NIST P-256 / secp256r1) -- it cannot generate, import, or operate on Ed25519 or X25519 keys. This is a permanent hardware constraint. The current Keychain-backed architecture matches the industry standard used by Signal, WhatsApp, and every other Curve25519-based protocol on Apple platforms: software key storage in Keychain with the Secure Enclave used exclusively for device attestation (P-256).
+
+**The biometric enhancement** adds a second factor: the Keychain protects key material at rest, and biometric authentication gates key access at use time. This is the maximum security achievable for Ed25519/X25519 keys on Apple hardware.
+
+**Policy options:**
+- `BiometricPolicy.none` (default): Keys use `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. No biometric prompt. Background operations work while the device is locked. This is the existing behavior.
+- `BiometricPolicy.required`: Keys are stored with `SecAccessControl` using `.biometryCurrentSet` and `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`. Face ID / Touch ID is required before `sign`, `dhAgree`, or `derivePseudonym` can access key material. `publicKey` and `destroyKey` do not require biometric authentication.
+
+**`.biometryCurrentSet` vs `.biometryAny`:**
+`.biometryCurrentSet` ties key access to the specific set of biometrics enrolled at key creation time. If a new fingerprint is enrolled or Face ID is reset, existing keys become inaccessible -- the Keychain returns `errSecAuthFailed`. This naturally triggers the compromise recovery flow (Section 9.12) since the biometric identity changed. `.biometryAny` would allow newly enrolled biometrics to access existing keys, which weakens the security model.
+
+**Protection class change under biometric policy:**
+When biometric gating is active, the protection class changes from `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` to `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`. This is required because `SecAccessControl` with biometric flags needs the stricter protection class -- background access while locked is incompatible with biometric authentication (the user cannot authenticate while the device is locked). Applications using `.required` must handle this constraint: background SCP operations (relay connections, message processing) will fail while the device is locked.
+
+**Passcode fallback:**
+If the device has no biometric hardware (e.g., older iPads, Mac mini), `.biometryCurrentSet` falls back to device passcode authentication. The key is still gated, but by passcode rather than biometric. This is standard iOS/macOS behavior -- no special handling is needed.
+
+**`custodyType` reporting:**
+`custodyType()` returns `"software"` for `.none` and `"software_biometric"` for `.required`. This allows the protocol engine and remote participants to understand the custody level without exposing implementation details.
+
+**Industry comparison:**
+
+| App | Signing key storage | SE for attestation | Biometric gating |
+|-----|--------------------|--------------------|-----------------|
+| Signal | Keychain (Curve25519) | No (no attestation) | Optional (app lock) |
+| WhatsApp | Keychain (Curve25519) | No (no attestation) | Optional (app lock) |
+| SCP (`.none`) | Keychain (Ed25519/X25519) | Yes (App Attest P-256) | No |
+| SCP (`.required`) | Keychain (Ed25519/X25519) | Yes (App Attest P-256) | Yes (per-operation) |
+
+SCP with `.required` provides the strongest custody model achievable on Apple platforms for Curve25519 keys: Keychain encryption at rest + biometric gate at use time + hardware-backed device attestation via App Attest.
+
 ### Implementation
 
 - **Language:** Swift 6.2+
