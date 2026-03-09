@@ -66,6 +66,32 @@ fn validate_local_part(local: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validates the scope part of an address.
+///
+/// Rules (mirror local-part validation pattern):
+/// - No control characters (< 0x20 or 0x7F).
+/// - No zero-width spaces (U+200B), zero-width joiners (U+200C/U+200D),
+///   or other invisible formatting characters (U+FEFF BOM, U+2060 word joiner).
+fn validate_scope(scope: &str) -> Result<(), String> {
+    for (i, ch) in scope.chars().enumerate() {
+        if ch < '\u{0020}' || ch == '\u{007F}' {
+            return Err(format!(
+                "invalid control character at position {i} in scope"
+            ));
+        }
+        if matches!(
+            ch,
+            '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' | '\u{2060}'
+        ) {
+            return Err(format!(
+                "invalid zero-width/invisible character U+{:04X} at position {i} in scope",
+                ch as u32
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Determines the address type from the scope part.
 ///
 /// - Scope contains `.` => `"DomainHandle"` (e.g., `alice@example.com`)
@@ -127,6 +153,7 @@ pub fn discovery_parse_address(address: String) -> Result<String, JsError> {
     }
 
     validate_local_part(local).map_err(|e| JsError::new(&format!("[SCP-VALID-7103] {e}")))?;
+    validate_scope(scope).map_err(|e| JsError::new(&format!("[SCP-VALID-7104] {e}")))?;
 
     let address_type = classify_scope(scope);
 
@@ -329,5 +356,51 @@ mod tests {
     fn validate_local_part_too_long() {
         let long = "a".repeat(65);
         assert!(validate_local_part(&long).is_err());
+    }
+
+    #[test]
+    fn validate_scope_rejects_control_chars() {
+        // Null byte
+        assert!(validate_scope("scope\x00bad").is_err());
+        // Tab
+        assert!(validate_scope("scope\ttab").is_err());
+        // Newline
+        assert!(validate_scope("scope\nnewline").is_err());
+        // Carriage return
+        assert!(validate_scope("scope\rreturn").is_err());
+        // DEL (0x7F)
+        assert!(validate_scope("scope\x7Fdel").is_err());
+    }
+
+    #[test]
+    fn validate_scope_rejects_zero_width_chars() {
+        // Zero-width space (U+200B)
+        assert!(validate_scope("scope\u{200B}zwsp").is_err());
+        // Zero-width non-joiner (U+200C)
+        assert!(validate_scope("scope\u{200C}zwnj").is_err());
+        // Zero-width joiner (U+200D)
+        assert!(validate_scope("scope\u{200D}zwj").is_err());
+        // BOM (U+FEFF)
+        assert!(validate_scope("\u{FEFF}scope").is_err());
+        // Word joiner (U+2060)
+        assert!(validate_scope("scope\u{2060}wj").is_err());
+    }
+
+    #[test]
+    fn validate_scope_accepts_valid() {
+        assert!(validate_scope("photography").is_ok());
+        assert!(validate_scope("example.com").is_ok());
+        assert!(validate_scope("did:key:z6MkTest").is_ok());
+        assert!(validate_scope("_").is_ok());
+    }
+
+    #[test]
+    fn parse_scope_control_char_fails() {
+        assert!(discovery_parse_address("alice@scope\x00bad".to_owned()).is_err());
+    }
+
+    #[test]
+    fn parse_scope_zero_width_space_fails() {
+        assert!(discovery_parse_address("alice@scope\u{200B}zwsp".to_owned()).is_err());
     }
 }
