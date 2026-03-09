@@ -1442,6 +1442,8 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash const
 | `"SCP-TOOL-REGISTRATION-V1:"` | Tool registration integrity hash | §6.2 |
 | `"SCP-KEY-DESTRUCTION-V1:"` | Key destruction proof | §9.15 |
 | `"SCP-CLAIM-V1:"` | Shadow identity claim validation | §12.3 |
+| `"SCP-RECEIPT-V1:"` | Payment receipt signing | §19.15.5 |
+| `"scp-handle-tool-v1:"` | Handle tool request signing | §22.3.1 |
 
 ### 9.18.3 HPKE Info Strings
 
@@ -1451,7 +1453,6 @@ HPKE `info` strings provide domain separation for key encapsulation operations. 
 |-------------|----------|-------------|----------------|
 | `"scp-sender-key-v1"` | Sender key HPKE encapsulation | `"scp-sender-key-v1" \|\| context_id \|\| sender_did \|\| epoch_BE` | §9.16.2 |
 | `"scp-access-key-v1"` | Access key HPKE encapsulation | `"scp-access-key-v1" \|\| BE32(len(context_id)) \|\| context_id \|\| BE32(len(member_did)) \|\| member_did \|\| epoch_bytes` | §9.17.1 |
-| `"scp-handle-tool-v1:"` | Handle tool request signing | `"scp-handle-tool-v1:" \|\| tool_name \|\| ":" \|\| canonical_json_bytes` | §22.3.1 |
 
 ### 9.18.4 Key and Nonce Sizes
 

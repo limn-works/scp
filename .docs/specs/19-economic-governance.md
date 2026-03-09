@@ -635,8 +635,10 @@ This section tabulates the wire format for all economy protocol types that cross
 
 | Wire Representation | Type | Notes |
 |---------------------|------|-------|
-| JSON | `string` (4 chars) | e.g., `"USD\u0000"`, `"BTC\u0000"`, `"USDC"` |
-| MessagePack | `bin 4` | 4 raw bytes |
+| JSON | `string` (3-4 chars) | e.g., `"USD"`, `"BTC"`, `"USDC"` |
+| MessagePack | `bin 4` | 4 raw bytes, null-padded |
+
+**JSON encoding note:** JSON representations MUST use the trimmed currency string without null-byte padding (e.g., `"USD"`, not `"USD\u0000"`). Null-padding to 4 bytes is applied only in MessagePack/binary encoding. This avoids parser-compatibility issues across implementations, since many JSON parsers reject or mishandle embedded null bytes in strings.
 
 **`Coefficient`** — Newtype wrapping `i64`. Fixed-point with 6 decimal places: `value = raw / 1,000,000`.
 

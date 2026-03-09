@@ -79,7 +79,7 @@ Input:
   value: 1700000000 (Unix timestamp)
 
 Expected bytes:
-  0x0000000065554d80
+  0x000000006553f100
 ```
 
 ### 25.3.4 Optional Absent Field Encoding
@@ -163,13 +163,13 @@ Canonical hash input:
   "SCP-VOTE-V1:"                                           (12 bytes)
   || BE32(19)  || "governance-test-ctx"                     (4 + 19 = 23 bytes)
   || proposal_id                                            (32 bytes, fixed-length)
-  || BE32(18)  || "did:dht:z6MkVoter"                      (4 + 18 = 22 bytes)
+  || BE32(17)  || "did:dht:z6MkVoter"                      (4 + 17 = 21 bytes)
   || 0x01                                                   (1 byte — approve tag)
   || BE64(1700000000)                                       (8 bytes)
 
-Total: 12 + 23 + 32 + 22 + 1 + 8 = 98 bytes
+Total: 12 + 23 + 32 + 21 + 1 + 8 = 97 bytes
 
-Expected: SHA-256 of the 98 bytes. Sign with Ed25519.
+Expected: SHA-256 of the 97 bytes. Sign with Ed25519.
 ```
 
 ## 25.6 Reset Request Signing Vectors (§23.5.2)
@@ -481,14 +481,14 @@ Canonical hash input:
   "SCP-ATTESTATION-V1:"                        (20 bytes)
   || BE32(7)  || "att-001"                      (4 + 7 = 11 bytes)
   || BE16(0x0001)                               (2 bytes — attestation type tag)
-  || BE32(19) || "did:dht:z6MkIssuer"          (4 + 19 = 23 bytes)
-  || BE32(20) || "did:dht:z6MkSubject"         (4 + 20 = 24 bytes)
+  || BE32(18) || "did:dht:z6MkIssuer"          (4 + 18 = 22 bytes)
+  || BE32(19) || "did:dht:z6MkSubject"         (4 + 19 = 23 bytes)
   || BE32(34) || compact_json_bytes             (4 + 34 = 38 bytes)
   || SHA-256(0x00)                              (32 bytes — absent evidence sentinel)
   || BE64(1700000000)                           (8 bytes)
   || BE64(0)                                    (8 bytes — no expiry)
 
-Total: 20 + 11 + 2 + 23 + 24 + 38 + 32 + 8 + 8 = 166 bytes
+Total: 20 + 11 + 2 + 22 + 23 + 38 + 32 + 8 + 8 = 164 bytes
 ```
 
 ## 25.14 Verification Procedure
