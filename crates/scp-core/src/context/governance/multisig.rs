@@ -21,7 +21,7 @@
 //! `approve()`, `reject()`, and `withdraw_vote()` all reject calls after the
 //! voting deadline. This prevents late votes from racing against expiry.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{
     CheckpointAttestationStatus, CosignedCheckpoint, GovernanceAction, GovernanceContext,
@@ -587,6 +587,7 @@ impl GovernanceEngine for ThresholdEngine {
             proposal.approvals.retain(|v| v.voter_did != *voter);
             proposal.rejections.retain(|v| v.voter_did != *voter);
         }
+        self.signers.retain(|d| d != voter);
         // Re-resolve after vote removal.
         let (status, events) = self.resolve_proposal(proposal_id, context.now)?;
         if status.is_terminal() {
@@ -632,10 +633,18 @@ impl GovernanceEngine for ThresholdEngine {
     ) -> Result<CheckpointAttestationStatus, GovernanceError> {
         // Verify all cosignatures are from designated signers and valid
         let mut valid_cosignatures = 0;
+        let mut seen_signers = HashSet::new();
         for cosig in cosignatures {
             if !self.signers.contains(&cosig.signer_did) {
                 return Err(GovernanceError::NotEligible(format!(
                     "Cosigner {} not in signer set",
+                    cosig.signer_did
+                )));
+            }
+
+            if !seen_signers.insert(&cosig.signer_did) {
+                return Err(GovernanceError::NotEligible(format!(
+                    "duplicate cosignature from {}",
                     cosig.signer_did
                 )));
             }

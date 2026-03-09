@@ -25,7 +25,7 @@
 //! without all votes collected, `resolve()` transitions the proposal to
 //! `Expired`, unblocking the context for new proposals.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{
     CheckpointAttestationStatus, CosignedCheckpoint, GovernanceAction, GovernanceContext,
@@ -614,10 +614,18 @@ impl GovernanceEngine for UnanimityEngine {
     ) -> Result<CheckpointAttestationStatus, GovernanceError> {
         // Verify all cosignatures are from required voters and valid
         let mut valid_cosignatures = 0;
+        let mut seen_signers = HashSet::new();
         for cosig in cosignatures {
             if !self.voters.contains(&cosig.signer_did) {
                 return Err(GovernanceError::NotEligible(format!(
                     "Cosigner {} not in voter set",
+                    cosig.signer_did
+                )));
+            }
+
+            if !seen_signers.insert(&cosig.signer_did) {
+                return Err(GovernanceError::NotEligible(format!(
+                    "duplicate cosignature from {}",
                     cosig.signer_did
                 )));
             }

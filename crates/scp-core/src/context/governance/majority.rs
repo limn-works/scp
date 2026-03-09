@@ -19,14 +19,14 @@
 //!
 //! # Timeout
 //!
-//! When `context.now > voting_deadline`:
+//! When `context.now >= voting_deadline`:
 //! - If quorum is not met: `Rejected { InsufficientParticipation }`.
 //! - If quorum is met and `approvals > rejections`: `Approved`.
 //! - If quorum is met and `approvals <= rejections`: `Rejected { MajorityRejected }`.
 //!
 //! See `.docs/adrs/phase-6.md` ADR-031 section 4c for the full specification.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{
     CheckpointAttestationStatus, CosignedCheckpoint, GovernanceAction, GovernanceContext,
@@ -175,7 +175,7 @@ impl MajorityVoteEngine {
         }
 
         // Check deadline.
-        if context.now > proposal.voting_deadline {
+        if context.now >= proposal.voting_deadline {
             return Err(GovernanceError::ProposalNotPending {
                 status: "voting deadline passed".to_owned(),
             });
@@ -268,7 +268,7 @@ impl MajorityVoteEngine {
         }
 
         // Deadline check.
-        if context.now > proposal.voting_deadline {
+        if context.now >= proposal.voting_deadline {
             // Check quorum using integer basis-point arithmetic (ADR-031).
             // participation * 10_000 / eligible gives participation in basis points.
             let participation_bps = participation.saturating_mul(10_000) / eligible;
@@ -409,7 +409,7 @@ impl GovernanceEngine for MajorityVoteEngine {
                 });
             }
 
-            let expired = context.now > proposal.voting_deadline;
+            let expired = context.now >= proposal.voting_deadline;
             if !expired && Self::has_voted(proposal, voter) {
                 return Err(GovernanceError::AlreadyVoted);
             }
@@ -501,7 +501,7 @@ impl GovernanceEngine for MajorityVoteEngine {
                 });
             }
 
-            let expired = context.now > proposal.voting_deadline;
+            let expired = context.now >= proposal.voting_deadline;
             if !expired && Self::has_voted(proposal, voter) {
                 return Err(GovernanceError::AlreadyVoted);
             }
@@ -668,10 +668,18 @@ impl GovernanceEngine for MajorityVoteEngine {
     ) -> Result<CheckpointAttestationStatus, GovernanceError> {
         // Verify all cosignatures are from eligible voters and valid
         let mut valid_cosignatures = 0;
+        let mut seen_signers = HashSet::new();
         for cosig in cosignatures {
             if !self.eligible_voter_dids.contains(&cosig.signer_did) {
                 return Err(GovernanceError::NotEligible(format!(
                     "Cosigner {} not in eligible voter set",
+                    cosig.signer_did
+                )));
+            }
+
+            if !seen_signers.insert(&cosig.signer_did) {
+                return Err(GovernanceError::NotEligible(format!(
+                    "duplicate cosignature from {}",
                     cosig.signer_did
                 )));
             }
