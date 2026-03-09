@@ -43,6 +43,7 @@ use super::attestation::IdentityLinkAttestation;
 ///
 /// Controls who can see the identity's connections (contexts, contacts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum GraphVisibility {
     /// Graph is visible to anyone who resolves the identity's DID.
     Public,
@@ -58,6 +59,7 @@ pub enum GraphVisibility {
 ///
 /// Specifies what portion of the graph is visible to the granted DID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum VisibilityScope {
     /// Full graph — all contexts and contacts.
     Full,
@@ -71,6 +73,7 @@ pub enum VisibilityScope {
 ///
 /// Notifications can be configured globally, per-context, or per-DID.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum NotificationScope {
     /// Global notification preference — applies to all contexts and DIDs
     /// unless overridden by a more specific scope.
@@ -85,6 +88,7 @@ pub enum NotificationScope {
 ///
 /// Controls the verbosity/urgency of notifications for a given scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum NotificationLevel {
     /// All notifications delivered.
     All,
@@ -100,6 +104,7 @@ pub enum NotificationLevel {
 ///
 /// Petnames can be assigned to either DIDs or context IDs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum PetnameTarget {
     /// A DID (person or agent).
     Did(DID),
@@ -121,6 +126,7 @@ pub enum PetnameTarget {
 /// **Serialization:** `MessagePack` (§17) with serde tagging. All timestamps
 /// are Unix milliseconds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum IdentityPrivateStateEvent {
     // -------------------------------------------------------------------
     // Block/Mute events (8)
