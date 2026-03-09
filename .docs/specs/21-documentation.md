@@ -176,14 +176,47 @@ Each example should be:
 
 ## 21.8 P1: Inline Documentation
 
-### scp-core targets
+### 21.8.1 Enforcement
+
+Every public crate MUST enable `#[warn(missing_docs)]` at the crate root (`lib.rs`). This produces compiler warnings for any public item without a doc comment. The long-term target is `#[deny(missing_docs)]` once coverage reaches 100%.
+
+Crates and their enforcement status:
+
+| Crate | `missing_docs` | Current Coverage | Target |
+|---|---|---|---|
+| `scp-core` | `warn` (to add) | ~57% | 100% |
+| `scp-identity` | `warn` (to add) | ~60% | 100% |
+| `scp-transport` | `warn` (to add) | ~45% | 100% |
+| `scp-event-log` | `warn` (to add) | ~55% | 100% |
+| `scp-platform` | `warn` (to add) | ~70% | 100% |
+| `scp-media` | `warn` (to add) | ~40% | 100% |
+| `scp-ffi` | `warn` (to add) | ~30% | 90% |
+| `scp-ffi-napi` | `warn` (to add) | ~25% | 90% |
+| `scp-ffi-uniffi` | `warn` (to add) | ~25% | 90% |
+| `scp-ffi-wasm` | `warn` (to add) | ~30% | 90% |
+| `scp-primitives` | `warn` (to add) | ~80% | 100% |
+| `scp-testing` | `warn` (to add) | ~40% | 90% |
+
+### 21.8.2 Quality Standard
+
+Each public item MUST have:
+
+- **One-line summary** (`///` for items, `//!` for modules). Describes what the item is or does.
+- **Parameter descriptions** for functions with non-obvious parameters. Use `# Arguments` section.
+- **`# Errors`** section for any function returning `Result`, listing all error variants.
+- **`# Panics`** section if the function can panic (even in debug builds).
+- **`# Safety`** section for any `unsafe` code (SCP uses `#![forbid(unsafe_code)]` so this should not apply).
+- **Spec cross-references** where the item implements a specific spec section. Format: `See §N.M in the SCP specification.`
+- **Example usage** for key entry-point functions (identity creation, context operations, messaging, tool invocation). Use `# Examples` with ```` ```rust ```` code blocks that compile under `cargo test --doc`.
+
+### 21.8.3 scp-core Documentation Targets
 
 | Area | Gap | Items | Action |
 |---|---|---|---|
 | Struct fields | Most public fields undocumented | ~180 structs | Add field-level `///` docs |
 | Enum variants | Large enums lack per-variant docs | ~92 enums | Add variant-level `///` docs |
 | Utility functions | Helper functions undocumented | ~228 functions | Add `///` docs with contract |
-| Constants | Magic numbers unexplained | ~70 constants | Add "why this value" docs |
+| Constants | Magic numbers unexplained | ~70 constants | Add "why this value" docs referencing §9.18 |
 
 Priority files (most undocumented items):
 1. `src/context/mod.rs` (40 items)
@@ -192,16 +225,29 @@ Priority files (most undocumented items):
 4. `src/economy/types.rs` (23 items)
 5. `src/discovery/context.rs` (23 items)
 
-### Supporting crate targets
+### 21.8.4 Supporting Crate Targets
 
 | Crate | Gap | Action |
 |---|---|---|
 | scp-mcp | `client.rs`, `stdio.rs`, `sse.rs` missing module docs | Add `//!` headers |
 | scp-node | `http.rs`, `tls.rs`, `well_known.rs` missing module docs | Add `//!` headers |
 
-### FFI crate targets
+### 21.8.5 FFI Crate Targets
 
 All four FFI crates (`scp-ffi`, `napi`, `wasm`, `uniffi`) need README files explaining build process, architecture, and maintenance patterns.
+
+### 21.8.6 Language Binding Documentation
+
+Each language binding MUST have inline documentation equivalent to the Rust source:
+
+| Language | Documentation System | Location | Standard |
+|---|---|---|---|
+| Python | Docstrings (PEP 257) | `bindings/python/scp_sdk/` | Every class and public method has a docstring. |
+| TypeScript | TSDoc comments | `bindings/typescript/src/` | Every exported type and function has `/** */` comments. |
+| Swift | Swift doc comments | `bindings/swift/Sources/` | Every public type and method has `///` comments. |
+| Kotlin | KDoc comments | `bindings/kotlin/` | Every public class and function has `/** */` comments. |
+
+Binding documentation SHOULD reference the corresponding Rust type/function and spec section where applicable.
 
 ## 21.9 P1: Architecture Navigation Guide
 
@@ -217,15 +263,84 @@ Not a replacement for `.docs/architecture.md` — a reading guide for it:
 
 ## 21.10 P1: Generated API Reference
 
-Set up `cargo doc` generation and hosting:
+### 21.10.1 Requirements
 
-1. Ensure all public items have doc comments (see §21.8)
-2. Add `#![doc = include_str!("../README.md")]` to each crate's `lib.rs`
-3. Generate with `cargo doc --workspace --no-deps`
-4. Host on GitHub Pages or similar
-5. For TypeScript: generate with typedoc from WASM/NAPI bindings
-6. For Python: generate from type stubs + docstrings
-7. For Swift: generate with DocC from UniFFI output. DocC requires the compiled `ScpFFI.xcframework` binary target, so it runs as a post-step of the `swift-xcframework` job in `build-matrix.yml` (not in `docs.yml`). The `docs-swift` artifact is uploaded from that workflow.
+1. `cargo doc --workspace --no-deps` MUST produce warning-free output.
+2. CI generates docs on each merge to `main` (`.github/workflows/docs.yml`).
+3. Docs published to GitHub Pages on each release tag.
+4. Cross-crate links resolve correctly in rustdoc output (scp-core -> scp-identity, etc.).
+5. Each language binding has generated API reference alongside Rust docs.
+
+### 21.10.2 Rust (rustdoc)
+
+1. Add `#![doc = include_str!("../README.md")]` to each crate's `lib.rs` so the crate-level doc page shows the README.
+2. Generate with `cargo doc --workspace --no-deps --document-private-items`.
+3. Cross-crate links use `[`item`](crate_name::path::to::item)` syntax.
+4. The `docs.yml` CI workflow already builds rustdoc and uploads as artifact.
+5. On release tags, docs are deployed to GitHub Pages.
+
+### 21.10.3 Python (Sphinx)
+
+1. Ensure all classes and functions in `bindings/python/scp_sdk/` have PEP 257 docstrings.
+2. Generate with Sphinx (autodoc + napoleon) from `bindings/python/docs/`.
+3. Requires `conf.py` in `bindings/python/docs/` — create if missing.
+4. The `docs.yml` CI workflow already has a Python docs job.
+
+### 21.10.4 TypeScript (TypeDoc)
+
+1. Ensure all exported types and functions in `bindings/typescript/src/` have TSDoc comments.
+2. Generate with TypeDoc from `bindings/typescript/`.
+3. Requires `typedoc.json` configuration — create if missing.
+4. The `docs.yml` CI workflow already has a TypeScript docs job.
+5. Note: CI currently uses `npm install` for typedoc — should be updated to use `bun` per project standards.
+
+### 21.10.5 Kotlin (Dokka)
+
+1. Ensure all public classes and functions in `bindings/kotlin/` have KDoc comments.
+2. Generate with Dokka via `./gradlew dokkaHtml`.
+3. Requires Dokka plugin in `build.gradle.kts` — add if missing.
+4. The `docs.yml` CI workflow already has a Kotlin docs job.
+
+### 21.10.6 Swift (DocC)
+
+1. Ensure all public types and methods have `///` Swift doc comments.
+2. Generate with DocC from the compiled `ScpFFI.xcframework` binary target.
+3. DocC generation runs as a post-step of the `swift-xcframework` job in `build-matrix.yml` (not in `docs.yml`), because it requires the compiled framework binary.
+4. The `docs-swift` artifact is uploaded from that workflow.
+
+### 21.10.7 Aggregate Documentation Site
+
+All generated docs are aggregated into a single site deployed to GitHub Pages:
+
+```
+site/
+├── index.html          # Landing page with links to all language docs
+├── docs-rust/          # rustdoc output (scp_core, scp_identity, etc.)
+├── docs-python/        # Sphinx HTML output
+├── docs-typescript/    # TypeDoc HTML output
+├── docs-kotlin/        # Dokka HTML output
+└── docs-swift/         # DocC archive (when available)
+```
+
+The `publish-docs` job in `docs.yml` handles aggregation and deployment.
+
+### 21.10.8 Local Documentation Generation
+
+Developers and agents can generate docs locally:
+
+```bash
+# Rust
+cargo doc --workspace --no-deps --open
+
+# Python (requires sphinx, furo, sphinx-autodoc-typehints)
+cd bindings/python && sphinx-build -b html docs docs/_build/html
+
+# TypeScript (requires typedoc)
+cd bindings/typescript && bun run typedoc
+
+# Kotlin (requires Dokka gradle plugin)
+cd bindings/kotlin && ./gradlew dokkaHtml
+```
 
 ## 21.11 P2: Implementation Guides
 
@@ -345,10 +460,12 @@ This is P2 — the content in `docs/` is the priority. The website is presentati
 
 For agents implementing SCP from the spec (not using the reference implementation):
 
-1. **Protocol compliance checklist** — Every MUST/SHOULD/MAY from the spec, as a checkable list
-2. **Wire format reference** — MessagePack schemas for all envelope types
-3. **Cryptographic requirements** — Exact algorithms, parameters, key sizes, derivation paths
-4. **Test vectors** — Known-good inputs and outputs for crypto operations
-5. **Conformance test suite** — Language-independent test cases that any implementation must pass
+1. **Protocol compliance checklist** — Every MUST/SHOULD/MAY from the spec, as a checkable list.
+2. **Wire format reference** — Field-by-field tables for all types that cross the network. Covered in: §12.12 (bridge), §19.15 (economy), §22.11 (discovery). Envelope types in §9.5.2.
+3. **Cryptographic requirements** — Exact algorithms, parameters, key sizes, derivation paths. Covered in §9.5 (primitives) and §9.18 (constants registry).
+4. **Test vectors** — Known-good inputs and outputs for crypto operations. Covered in §25 (cryptographic test vectors).
+5. **Conformance test suite** — Language-independent test cases that any implementation must pass. Covered in §26 (conformance suite).
 
-This is P2 but important for the protocol's long-term goal of multiple independent implementations.
+This documentation set is now substantially complete as of March 2026. The remaining work is:
+- Generating exact hex outputs for all test vectors by running the reference implementation (§25.15).
+- Creating the protocol compliance checklist (mechanical extraction from spec MUST/SHOULD/MAY statements).
