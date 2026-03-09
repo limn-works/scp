@@ -1628,10 +1628,8 @@ pub fn actions_conflict(
         RevokeReadAccess, RevokeWriteAccess, RotateContentKeys,
     };
 
-    // This function MUST stay in sync with
-    // `sync::conflict_resolution::actions_conflict`. The canonical
-    // conflict matrix is defined here; the sync module re-uses the same
-    // logic for offline-merge conflict detection (ADR-029 / ADR-031).
+    // Canonical conflict matrix. The sync module's `actions_conflict`
+    // delegates here for offline-merge conflict detection (ADR-029 / ADR-031).
 
     match (action_a, action_b) {
         // Competing ChangeRole proposals for the same DID with different roles

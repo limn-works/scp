@@ -255,17 +255,9 @@ pub enum ConflictResolutionError {
 
 /// Checks whether two governance actions are conflicting.
 ///
-/// Two actions conflict if they target the same entity with incompatible
-/// changes. See ADR-031 section 7 for the conflict taxonomy.
-///
-/// # Examples of conflicts
-///
-/// - Two `ChangeRole` actions for the same DID with different target roles.
-/// - Two `ModifyCeiling` actions with different ceiling sets.
-/// - A `RemoveMember` and a `ChangeRole` targeting the same DID.
-/// - Two `RemoveMember` actions targeting the same member (concurrent removal).
-/// - Two `RemoveMember` actions targeting each other's proposers (mutual removal).
-/// - Two `RotateContentKeys` actions (global property mutation).
+/// Delegates to the canonical implementation in
+/// [`crate::context::governance::actions_conflict`]. See ADR-031 section 7
+/// for the conflict taxonomy.
 #[must_use]
 pub fn actions_conflict(
     a: &GovernanceAction,
@@ -273,115 +265,7 @@ pub fn actions_conflict(
     b: &GovernanceAction,
     b_proposer: &DID,
 ) -> bool {
-    match (a, b) {
-        // Two role changes for the same DID with different roles.
-        (
-            GovernanceAction::ChangeRole {
-                did: did_a,
-                new_role: role_a,
-            },
-            GovernanceAction::ChangeRole {
-                did: did_b,
-                new_role: role_b,
-            },
-        ) => did_a == did_b && role_a != role_b,
-
-        // Any two concurrent modifications to the same global context property
-        // conflict — the values may or may not differ, but concurrent
-        // modification is unsafe.
-        (GovernanceAction::ModifyCeiling { .. }, GovernanceAction::ModifyCeiling { .. })
-        | (GovernanceAction::ModifyThreshold { .. }, GovernanceAction::ModifyThreshold { .. })
-        | (
-            GovernanceAction::ModifyPruningPolicy { .. },
-            GovernanceAction::ModifyPruningPolicy { .. },
-        )
-        | (
-            GovernanceAction::ReconfigureGovernance { .. },
-            GovernanceAction::ReconfigureGovernance { .. },
-        )
-        // Concurrent context-wide key rotations conflict (global property mutation).
-        | (
-            GovernanceAction::RotateContentKeys { .. },
-            GovernanceAction::RotateContentKeys { .. },
-        ) => true,
-
-        // Remove + role change for the same DID.
-        (
-            GovernanceAction::RemoveMember {
-                did: remove_did, ..
-            },
-            GovernanceAction::ChangeRole {
-                did: change_did, ..
-            },
-        )
-        | (
-            GovernanceAction::ChangeRole {
-                did: change_did, ..
-            },
-            GovernanceAction::RemoveMember {
-                did: remove_did, ..
-            },
-        ) => remove_did == change_did,
-
-        // Two concurrent removals of the same member conflict (ADR-031 §7:
-        // concurrent modifications to the same membership state).
-        // Also catches mutual removal (each proposer removes the other).
-        (
-            GovernanceAction::RemoveMember { did: did_a, .. },
-            GovernanceAction::RemoveMember { did: did_b, .. },
-        ) => did_a == did_b || (did_a == b_proposer && did_b == a_proposer),
-
-        // Two concurrent revocations of the same type targeting the same DID
-        // conflict (scope may differ, but concurrent revocation is unsafe — ADR-031 §7).
-        (
-            GovernanceAction::RevokeReadAccess { did: did_a, .. },
-            GovernanceAction::RevokeReadAccess { did: did_b, .. },
-        )
-        | (
-            GovernanceAction::RevokeWriteAccess { did: did_a, .. },
-            GovernanceAction::RevokeWriteAccess { did: did_b, .. },
-        ) => did_a == did_b,
-
-        // Revoke and Restore for the same DID conflict (contradictory intent
-        // on the same member's access state).
-        (
-            GovernanceAction::RevokeReadAccess {
-                did: revoke_did, ..
-            },
-            GovernanceAction::RestoreReadAccess { did: restore_did },
-        )
-        | (
-            GovernanceAction::RestoreReadAccess { did: restore_did },
-            GovernanceAction::RevokeReadAccess {
-                did: revoke_did, ..
-            },
-        )
-        | (
-            GovernanceAction::RevokeWriteAccess {
-                did: revoke_did, ..
-            },
-            GovernanceAction::RestoreWriteAccess { did: restore_did },
-        )
-        | (
-            GovernanceAction::RestoreWriteAccess { did: restore_did },
-            GovernanceAction::RevokeWriteAccess {
-                did: revoke_did, ..
-            },
-        ) => revoke_did == restore_did,
-
-        // AddSigner and RemoveSigner for the same DID conflict.
-        (
-            GovernanceAction::AddSigner { did: add_did },
-            GovernanceAction::RemoveSigner { did: remove_did },
-        )
-        | (
-            GovernanceAction::RemoveSigner { did: remove_did },
-            GovernanceAction::AddSigner { did: add_did },
-        ) => add_did == remove_did,
-
-        // All other action pairs are non-conflicting.
-        _ => false,
-    }
+    crate::context::governance::actions_conflict(a, a_proposer, b, b_proposer)
 }
 
 // ---------------------------------------------------------------------------
