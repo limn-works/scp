@@ -218,7 +218,12 @@ public extension Context {
                 code: "SCP-CTX-2002"
             )
         }
-        let inputJson = String(data: input, encoding: .utf8) ?? "{}"
+        guard let inputJson = String(data: input, encoding: .utf8) else {
+            throw ScpError.Tool(
+                message: "Tool input is not valid UTF-8",
+                code: "SCP-TOOL-3001"
+            )
+        }
         let identity = Identity(noPointer: .init())
         let outputJson = try await invokeFn(contextHandle, tool, inputJson, identity)
         return ToolInvocationResult(
@@ -346,7 +351,12 @@ public extension Context {
                 code: "SCP-CTX-2002"
             )
         }
-        let inputJson = String(data: input, encoding: .utf8) ?? "{}"
+        guard let inputJson = String(data: input, encoding: .utf8) else {
+            throw ScpError.Tool(
+                message: "Tool input is not valid UTF-8",
+                code: "SCP-TOOL-3001"
+            )
+        }
         let identity = Identity(noPointer: .init())
         let outputJson = try await invokeCrossContextFn(
             sourceHandle, targetHandle, tool, inputJson, identity, chainDepth
@@ -437,7 +447,12 @@ public extension Context {
                 code: "SCP-CTX-2002"
             )
         }
-        let inputJson = String(data: input, encoding: .utf8) ?? "{}"
+        guard let inputJson = String(data: input, encoding: .utf8) else {
+            throw ScpError.Tool(
+                message: "Tool input is not valid UTF-8",
+                code: "SCP-TOOL-3001"
+            )
+        }
         let identity = Identity(noPointer: .init())
         let outputJson = try await sessionInvokeFn(
             contextHandle, sessionId, inputJson, identity
