@@ -1443,7 +1443,7 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash const
 | `"SCP-KEY-DESTRUCTION-V1:"` | Key destruction proof | §9.15 |
 | `"SCP-CLAIM-V1:"` | Shadow identity claim validation | §12.3 |
 | `"SCP-RECEIPT-V1:"` | Payment receipt signing | §19.15.5 |
-| `"scp-handle-tool-v1:"` | Handle tool request signing | §22.3.1 |
+| `"SCP-HANDLE-TOOL-V1:"` | Handle tool request signing | §22.3.1 |
 
 ### 9.18.3 HPKE Info Strings
 

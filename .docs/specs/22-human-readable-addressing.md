@@ -150,7 +150,7 @@ The `did` parameter in `handle_deregister` is explicit rather than inferred from
 **DID-signature verification scheme.** Handle tool requests use the same DID-authentication mechanism as discovery context reader requests (§6.2.2B). The signature is constructed as follows:
 
 1. **Canonical payload.** The request payload is serialized to canonical JSON (keys sorted lexicographically, no whitespace, no trailing commas). This produces a deterministic byte sequence regardless of JSON serialization library.
-2. **Signed content.** The signed bytes are: `"scp-handle-tool-v1:" || tool_name || ":" || canonical_json_bytes`, where `tool_name` is one of `"handle_register"`, `"handle_lookup"`, `"handle_deregister"`, and `||` denotes byte concatenation. The domain prefix `"scp-handle-tool-v1:"` prevents cross-protocol signature reuse.
+2. **Signed content.** The signed bytes are: `"SCP-HANDLE-TOOL-V1:" || tool_name || ":" || canonical_json_bytes`, where `tool_name` is one of `"handle_register"`, `"handle_lookup"`, `"handle_deregister"`, and `||` denotes byte concatenation. The domain prefix `"SCP-HANDLE-TOOL-V1:"` prevents cross-protocol signature reuse.
 3. **Signature algorithm.** Ed25519 using the requester's `#active` signing key (or `#agent` key if the request is agent-initiated under a valid UCAN delegation).
 4. **Transport.** The signature is carried as an additional field in the tool call request envelope:
    ```
