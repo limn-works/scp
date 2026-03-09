@@ -1,4 +1,8 @@
 // Basic messaging: create identity, create context, send and receive messages.
+//
+// Demonstrates the actual SCP Swift SDK API surface. Identity creation uses
+// the UniFFI `identityCreate` free function, context creation uses
+// `contextCreate`, and the `Context` actor wraps the handle for send/receive.
 
 import Foundation
 import SCP
@@ -6,39 +10,70 @@ import SCP
 @main
 struct BasicMessaging {
     static func main() async throws {
-        // Create two identities
-        let alice = try await Identity.create(custody: "platform")
-        let bob = try await Identity.create(custody: "platform")
-        print("Alice DID: \(alice.did)")
-        print("Bob DID: \(bob.did)")
+        // Create two identities via the UniFFI bridge function
+        let alice = try await identityCreate(custody: "platform")
+        let bob = try await identityCreate(custody: "platform")
+        print("Alice DID: \(alice.did())")
+        print("Bob DID: \(bob.did())")
 
-        // Alice creates a context
-        let ctxAlice = try await Context.create(
-            identity: alice,
-            params: ContextParams(
-                ceiling: ["msg:send", "msg:receive"],
-                ttl: 3600,
-                governance: "single_admin"
-            )
+        // Alice creates a context via the UniFFI bridge function.
+        // ContextParams requires: ceiling, governance, memoryScope, ttlSeconds, promotable
+        let params = ContextParams(
+            ceiling: ["msg:send", "msg:receive"],
+            governance: .singleAdmin,
+            memoryScope: .ephemeral,
+            ttlSeconds: 3600,
+            promotable: false
         )
-        print("Context ID: \(ctxAlice.contextId)")
+        let aliceHandle = try await contextCreate(identity: alice, params: params)
+        print("Context ID: \(aliceHandle.contextId())")
 
-        // Bob joins the context
-        let ctxBob = try await Context.join(identity: bob, contextId: ctxAlice.contextId)
+        // Bob joins the context using the existing handle
+        try await contextJoin(handle: aliceHandle, identity: bob)
 
-        // Alice sends a message
-        try await ctxAlice.send(Data("Hello Bob, this is Alice".utf8))
+        // Send a message via the UniFFI bridge function
+        try await contextSend(
+            handle: aliceHandle,
+            identity: alice,
+            payload: Data("Hello Bob, this is Alice".utf8)
+        )
 
-        // Bob receives it
-        for await msg in ctxBob.messages {
+        // Subscribe to messages via the UniFFI bridge and AsyncStream adapter.
+        // In production, the Context actor wraps this pattern:
+        //   let stream = try await context.messages
+        //   for await msg in stream { ... }
+        //
+        // Here we use the bridge directly for illustration:
+        let (stream, continuation) = AsyncStream<Message>.makeStream()
+        final class Listener: MessageListener, @unchecked Sendable {
+            let continuation: AsyncStream<Message>.Continuation
+            init(_ cont: AsyncStream<Message>.Continuation) {
+                continuation = cont
+            }
+
+            func onMessage(message: Message) {
+                continuation.yield(message)
+            }
+
+            func onError(error _: ScpError) {
+                continuation.finish()
+            }
+
+            func onComplete() {
+                continuation.finish()
+            }
+        }
+        try await contextSubscribe(handle: aliceHandle, listener: Listener(continuation))
+
+        for await msg in stream {
             // swiftlint:disable:next optional_data_string_conversion
-            let text = String(decoding: msg.content, as: UTF8.self)
+            let text = String(decoding: msg.payload, as: UTF8.self)
             print("Bob received from \(msg.senderDid): \(text)")
             break
         }
 
         // Cleanup
-        try await ctxBob.leave()
-        try await ctxAlice.close()
+        try await contextLeave(handle: aliceHandle, identity: bob)
+        try await contextClose(handle: aliceHandle, identity: alice)
     }
 }
