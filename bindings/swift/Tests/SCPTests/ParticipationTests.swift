@@ -46,7 +46,7 @@ struct ParticipationTests {
     func requireParticipationFields() {
         let requirement = RequireParticipation(thresholds: [
             ParticipationThreshold(fact: .messagesSent, minimum: 5),
-            ParticipationThreshold(fact: .toolsInvoked, minimum: 2),
+            ParticipationThreshold(fact: .toolsInvoked, minimum: 2)
         ])
         #expect(requirement.thresholds.count == 2)
     }
@@ -57,11 +57,11 @@ struct ParticipationTests {
     func allThresholdsMet() {
         let requirement = RequireParticipation(thresholds: [
             ParticipationThreshold(fact: .messagesSent, minimum: 5),
-            ParticipationThreshold(fact: .toolsInvoked, minimum: 2),
+            ParticipationThreshold(fact: .toolsInvoked, minimum: 2)
         ])
         let profile: ParticipationProfile = [
             .messagesSent: 10,
-            .toolsInvoked: 3,
+            .toolsInvoked: 3
         ]
 
         let result = verifyParticipationRequirements(
@@ -76,11 +76,11 @@ struct ParticipationTests {
     func oneThresholdNotMet() {
         let requirement = RequireParticipation(thresholds: [
             ParticipationThreshold(fact: .messagesSent, minimum: 5),
-            ParticipationThreshold(fact: .toolsInvoked, minimum: 10),
+            ParticipationThreshold(fact: .toolsInvoked, minimum: 10)
         ])
         let profile: ParticipationProfile = [
             .messagesSent: 10,
-            .toolsInvoked: 3,
+            .toolsInvoked: 3
         ]
 
         let result = verifyParticipationRequirements(
@@ -94,7 +94,7 @@ struct ParticipationTests {
     @Test("verifyParticipationRequirements treats missing profile key as zero")
     func missingProfileKeyIsZero() {
         let requirement = RequireParticipation(thresholds: [
-            ParticipationThreshold(fact: .messagesSent, minimum: 1),
+            ParticipationThreshold(fact: .messagesSent, minimum: 1)
         ])
         let profile: ParticipationProfile = [:]
 
@@ -122,10 +122,10 @@ struct ParticipationTests {
     @Test("verifyParticipationRequirements passes when value equals minimum")
     func exactMinimumPasses() {
         let requirement = RequireParticipation(thresholds: [
-            ParticipationThreshold(fact: .messagesSent, minimum: 5),
+            ParticipationThreshold(fact: .messagesSent, minimum: 5)
         ])
         let profile: ParticipationProfile = [
-            .messagesSent: 5,
+            .messagesSent: 5
         ]
 
         let result = verifyParticipationRequirements(
@@ -139,10 +139,10 @@ struct ParticipationTests {
     @Test("verifyParticipationRequirements fails when value is one below minimum")
     func oneBelowMinimumFails() {
         let requirement = RequireParticipation(thresholds: [
-            ParticipationThreshold(fact: .messagesSent, minimum: 5),
+            ParticipationThreshold(fact: .messagesSent, minimum: 5)
         ])
         let profile: ParticipationProfile = [
-            .messagesSent: 4,
+            .messagesSent: 4
         ]
 
         let result = verifyParticipationRequirements(
@@ -156,7 +156,7 @@ struct ParticipationTests {
     @Test("verifyParticipationRequirements passes with zero minimum and missing key")
     func zeroMinimumWithMissingKey() {
         let requirement = RequireParticipation(thresholds: [
-            ParticipationThreshold(fact: .governanceActions, minimum: 0),
+            ParticipationThreshold(fact: .governanceActions, minimum: 0)
         ])
         let profile: ParticipationProfile = [:]
 
@@ -175,14 +175,14 @@ struct ParticipationTests {
             ParticipationThreshold(fact: .toolsInvoked, minimum: 1),
             ParticipationThreshold(fact: .governanceActions, minimum: 1),
             ParticipationThreshold(fact: .contextsParticipated, minimum: 1),
-            ParticipationThreshold(fact: .attestationsVerified, minimum: 1),
+            ParticipationThreshold(fact: .attestationsVerified, minimum: 1)
         ])
         let profile: ParticipationProfile = [
             .messagesSent: 10,
             .toolsInvoked: 5,
             .governanceActions: 2,
             .contextsParticipated: 3,
-            .attestationsVerified: 1,
+            .attestationsVerified: 1
         ]
 
         let result = verifyParticipationRequirements(
@@ -196,12 +196,12 @@ struct ParticipationTests {
     @Test("verifyParticipationRequirements extra profile keys do not interfere")
     func extraProfileKeysIgnored() {
         let requirement = RequireParticipation(thresholds: [
-            ParticipationThreshold(fact: .messagesSent, minimum: 1),
+            ParticipationThreshold(fact: .messagesSent, minimum: 1)
         ])
         let profile: ParticipationProfile = [
             .messagesSent: 10,
             .toolsInvoked: 5,
-            .governanceActions: 2,
+            .governanceActions: 2
         ]
 
         let result = verifyParticipationRequirements(

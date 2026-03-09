@@ -35,8 +35,7 @@ enum ProvenanceBridge {
 
     /// Default evaluate quality function — delegates to UniFFI
     /// ``evaluateProvenanceQuality``.
-    static let defaultEvaluateQuality: EvaluateQualityFn = {
-        sourceContext, sourceType, contextState, counterparties in
+    static let defaultEvaluateQuality: EvaluateQualityFn = { sourceContext, sourceType, contextState, counterparties in
         try evaluateProvenanceQuality(
             sourceContext: sourceContext,
             sourceType: sourceType,
@@ -47,8 +46,7 @@ enum ProvenanceBridge {
 
     /// Default attach function — delegates to UniFFI
     /// ``provenanceAttach``.
-    static let defaultAttach: AttachFn = {
-        sourceContextId, sourceType, memoryScope, members, targetContextId, existingChainDepth in
+    static let defaultAttach: AttachFn = { sourceContextId, sourceType, memoryScope, members, targetContextId, existingChainDepth in
         try provenanceAttach(
             sourceContextId: sourceContextId,
             sourceType: sourceType,
@@ -61,8 +59,7 @@ enum ProvenanceBridge {
 
     /// Default check chain depth function — delegates to UniFFI
     /// ``provenanceCheckChainDepth``.
-    static let defaultCheckChainDepth: CheckChainDepthFn = {
-        chainDepth, maxDepth in
+    static let defaultCheckChainDepth: CheckChainDepthFn = { chainDepth, maxDepth in
         provenanceCheckChainDepth(chainDepth: chainDepth, maxDepth: maxDepth)
     }
 }

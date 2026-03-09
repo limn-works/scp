@@ -4,18 +4,19 @@ import Testing
 
 // MARK: - Tools Tests
 
-/// Tests for tool definition, invocation, registration, and test vector
-/// verification via the ``Context`` actor's tool extensions.
-///
-/// UniFFI ToolDefinition fields: name, description, inputSchemaJson, outputSchemaJson,
-///     operatorDid, testVectorsJson (String?), implementationHash (Data?)
-/// UniFFI ToolVerificationResult fields: toolId (String), passed (Bool), failures ([String])
-///
-/// These tests validate the Swift ergonomics layer, type shapes, and async
-/// bridging through injectable bridge closures.
-///
-/// See ADR-026 (Swift SDK), `.docs/scaffold/shared.md` conformance testing,
-/// and story SCP-221.
+// Tests for tool definition, invocation, registration, and test vector
+// verification via the ``Context`` actor's tool extensions.
+//
+// UniFFI ToolDefinition fields: name, description, inputSchemaJson, outputSchemaJson,
+//     operatorDid, testVectorsJson (String?), implementationHash (Data?)
+// UniFFI ToolVerificationResult fields: toolId (String), passed (Bool), failures ([String])
+//
+// These tests validate the Swift ergonomics layer, type shapes, and async
+// bridging through injectable bridge closures.
+//
+// See ADR-026 (Swift SDK), `.docs/scaffold/shared.md` conformance testing,
+// and story SCP-221.
+// swiftlint:disable:next type_body_length
 struct ToolsTests {
     // MARK: - Helpers
 
@@ -370,8 +371,7 @@ struct ToolsTests {
         )
 
         var receivedChainDepth: UInt8?
-        let mockInvokeCrossContext: ToolBridge.InvokeCrossContextFn = {
-            _, _, toolId, inputJson, _, chainDepth in
+        let mockInvokeCrossContext: ToolBridge.InvokeCrossContextFn = { _, _, toolId, inputJson, _, chainDepth in
             #expect(toolId == "remote-calc")
             #expect(inputJson == "{\"x\":1}")
             receivedChainDepth = chainDepth

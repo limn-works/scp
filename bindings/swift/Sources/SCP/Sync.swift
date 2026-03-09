@@ -25,15 +25,13 @@ enum SyncBridge {
 
     /// Default classify offline function — delegates to UniFFI
     /// ``syncClassifyOffline``.
-    static let defaultClassifyOffline: ClassifyOfflineFn = {
-        lastRelayContact, now in
+    static let defaultClassifyOffline: ClassifyOfflineFn = { lastRelayContact, now in
         syncClassifyOffline(lastRelayContact: lastRelayContact, now: now)
     }
 
     /// Default classify offline custom function — delegates to UniFFI
     /// ``syncClassifyOfflineCustom``.
-    static let defaultClassifyOfflineCustom: ClassifyOfflineCustomFn = {
-        lastRelayContact, now, tier1ThresholdSecs, tier2ThresholdSecs in
+    static let defaultClassifyOfflineCustom: ClassifyOfflineCustomFn = { lastRelayContact, now, tier1ThresholdSecs, tier2ThresholdSecs in
         syncClassifyOfflineCustom(
             lastRelayContact: lastRelayContact,
             now: now,

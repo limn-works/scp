@@ -1,7 +1,7 @@
-/// MCP integration: expose SCP tools via MCP JSON-RPC server.
+// MCP integration: expose SCP tools via MCP JSON-RPC server.
 
-import SCP
 import Foundation
+import SCP
 
 @main
 struct McpIntegration {

@@ -40,14 +40,16 @@
     /// domains in tests. Every public method dispatches synchronously onto
     /// the queue, so no concurrent access to the `sqlite3` handle is possible.
     private final class InMemoryStorage: @unchecked Sendable {
+        // swiftlint:disable:next identifier_name
         private let db: OpaquePointer
         private let queue = DispatchQueue(label: "dev.limn.scp.test-storage")
 
         init() throws {
             var handle: OpaquePointer?
+            // swiftlint:disable:next identifier_name
             guard sqlite3_open(":memory:", &handle) == SQLITE_OK, let db = handle else {
                 let msg = handle.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "unknown"
-                if let h = handle { sqlite3_close_v2(h) }
+                if let dbHandle = handle { sqlite3_close_v2(dbHandle) }
                 throw StorageError.databaseError("open failed: \(msg)")
             }
             self.db = db
@@ -60,8 +62,8 @@
                 value BLOB NOT NULL
             ) WITHOUT ROWID;
             """
-            let rc = sqlite3_exec(db, sql, nil, nil, &errMsg)
-            if rc != SQLITE_OK {
+            let status = sqlite3_exec(db, sql, nil, nil, &errMsg)
+            if status != SQLITE_OK {
                 let msg = errMsg.map { String(cString: $0) } ?? "unknown"
                 sqlite3_free(errMsg)
                 throw StorageError.databaseError(msg)
@@ -368,10 +370,10 @@
 
             // Concurrently store 10 keys.
             await withThrowingTaskGroup(of: Void.self) { group in
-                for i: UInt32 in 0 ..< 10 {
+                for index: UInt32 in 0 ..< 10 {
                     group.addTask {
-                        let key = "concurrent/\(i)"
-                        var bytes = i.littleEndian
+                        let key = "concurrent/\(index)"
+                        var bytes = index.littleEndian
                         let value = Data(bytes: &bytes, count: MemoryLayout<UInt32>.size)
                         try storage.set(key: key, value: value)
                     }
@@ -383,9 +385,9 @@
             #expect(keys.count == 10)
 
             // Verify each value matches what was stored.
-            for i: UInt32 in 0 ..< 10 {
-                let key = "concurrent/\(i)"
-                var bytes = i.littleEndian
+            for index: UInt32 in 0 ..< 10 {
+                let key = "concurrent/\(index)"
+                var bytes = index.littleEndian
                 let expected = Data(bytes: &bytes, count: MemoryLayout<UInt32>.size)
                 let actual = try storage.get(key: key)
                 #expect(actual == expected, "value mismatch for key \(key)")

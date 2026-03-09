@@ -297,7 +297,7 @@ public final class AppleKeyCustody: Sendable {
     private nonisolated func baseQuery(for handle: String) -> [String: Any] {
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrAccount as String: account(for: handle),
+            kSecAttrAccount as String: account(for: handle)
         ]
         if let group = accessGroup {
             query[kSecAttrAccessGroup as String] = group
@@ -601,8 +601,7 @@ public extension AppleKeyCustody {
         // Read from metadata cache (attributes only -- no biometric prompt).
         if let pubKeyBase64 = metadata.publicKeyBase64,
            let pubKeyData = Data(base64Encoded: pubKeyBase64),
-           pubKeyData.count == 32
-        {
+           pubKeyData.count == 32 {
             return pubKeyData
         }
 

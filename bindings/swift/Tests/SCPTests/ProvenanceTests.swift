@@ -18,8 +18,7 @@ struct ProvenanceTests {
         var receivedContextState: String?
         var receivedCounterparties: [String]?
 
-        let mockEvaluate: ProvenanceBridge.EvaluateQualityFn = {
-            sourceContext, sourceType, contextState, counterparties in
+        let mockEvaluate: ProvenanceBridge.EvaluateQualityFn = { sourceContext, sourceType, contextState, counterparties in
             receivedSourceContext = sourceContext
             receivedSourceType = sourceType
             receivedContextState = contextState
@@ -85,8 +84,7 @@ struct ProvenanceTests {
         var receivedSourceContextId: String?
         var receivedTargetContextId: String?
 
-        let mockAttach: ProvenanceBridge.AttachFn = {
-            sourceContextId, _, _, _, targetContextId, _ in
+        let mockAttach: ProvenanceBridge.AttachFn = { sourceContextId, _, _, _, targetContextId, _ in
             receivedSourceContextId = sourceContextId
             receivedTargetContextId = targetContextId
             return #"{"source_context":"\#(sourceContextId)","target_context":"\#(targetContextId)","chain_depth":0}"#

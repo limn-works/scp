@@ -5,13 +5,13 @@ let package = Package(
     name: "SCP",
     platforms: [
         .iOS(.v17),
-        .macOS(.v14),
+        .macOS(.v14)
     ],
     products: [
-        .library(name: "SCP", targets: ["SCP"]),
+        .library(name: "SCP", targets: ["SCP"])
     ],
     dependencies: [
-        .package(url: "https://github.com/swiftlang/swift-docc-plugin", from: "1.4.3"),
+        .package(url: "https://github.com/swiftlang/swift-docc-plugin", from: "1.4.3")
     ],
     targets: [
         .binaryTarget(
@@ -28,7 +28,7 @@ let package = Package(
                 // `sending` parameter pattern in uniffiTraitInterfaceCallAsync).
                 // Use Swift 5 language mode to downgrade these to warnings until
                 // UniFFI updates its Swift codegen for Swift 6 compatibility.
-                .swiftLanguageMode(.v5),
+                .swiftLanguageMode(.v5)
             ]
         ),
         .testTarget(
@@ -37,8 +37,8 @@ let package = Package(
             path: "Tests/SCPTests",
             swiftSettings: [
                 // Match the SCP target's language mode for consistency.
-                .swiftLanguageMode(.v5),
+                .swiftLanguageMode(.v5)
             ]
-        ),
+        )
     ]
 )

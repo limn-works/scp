@@ -35,8 +35,7 @@ enum DiscoveryBridge {
 
     /// Default create query function — delegates to UniFFI
     /// ``discoveryCreateQuery``.
-    static let defaultCreateQuery: CreateQueryFn = {
-        capabilities, keywords, minHistorySecs in
+    static let defaultCreateQuery: CreateQueryFn = { capabilities, keywords, minHistorySecs in
         try discoveryCreateQuery(
             capabilities: capabilities,
             keywords: keywords,

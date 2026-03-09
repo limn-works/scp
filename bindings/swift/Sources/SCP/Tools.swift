@@ -139,8 +139,7 @@ enum ToolBridge {
     }
 
     /// Default cross-context invoke function — delegates to UniFFI.
-    static let defaultInvokeCrossContext: InvokeCrossContextFn = {
-        sourceHandle, targetHandle, toolId, inputJson, identity, chainDepth in
+    static let defaultInvokeCrossContext: InvokeCrossContextFn = { sourceHandle, targetHandle, toolId, inputJson, identity, chainDepth in
         try await toolInvokeCrossContext(
             sourceHandle: sourceHandle,
             targetHandle: targetHandle,
@@ -152,8 +151,7 @@ enum ToolBridge {
     }
 
     /// Default session create function — delegates to UniFFI.
-    static let defaultSessionCreate: SessionCreateFn = {
-        handle, toolId, sourceContextId, ttlSeconds in
+    static let defaultSessionCreate: SessionCreateFn = { handle, toolId, sourceContextId, ttlSeconds in
         try await toolSessionCreate(
             handle: handle,
             toolId: toolId,
@@ -163,8 +161,7 @@ enum ToolBridge {
     }
 
     /// Default session invoke function — delegates to UniFFI.
-    static let defaultSessionInvoke: SessionInvokeFn = {
-        handle, sessionId, inputJson, identity in
+    static let defaultSessionInvoke: SessionInvokeFn = { handle, sessionId, inputJson, identity in
         try await toolSessionInvoke(
             handle: handle,
             sessionId: sessionId,

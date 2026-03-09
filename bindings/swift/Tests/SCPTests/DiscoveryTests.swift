@@ -55,8 +55,7 @@ struct DiscoveryTests {
         var receivedKeywords: [String]?
         var receivedMinHistory: UInt64?
 
-        let mockCreate: DiscoveryBridge.CreateQueryFn = {
-            capabilities, keywords, minHistorySecs in
+        let mockCreate: DiscoveryBridge.CreateQueryFn = { capabilities, keywords, minHistorySecs in
             receivedCapabilities = capabilities
             receivedKeywords = keywords
             receivedMinHistory = minHistorySecs

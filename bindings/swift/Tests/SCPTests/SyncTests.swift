@@ -81,8 +81,7 @@ struct SyncTests {
         var receivedTier1: UInt64?
         var receivedTier2: UInt64?
 
-        let mockClassifyCustom: SyncBridge.ClassifyOfflineCustomFn = {
-            lastRelayContact, now, tier1Threshold, tier2Threshold in
+        let mockClassifyCustom: SyncBridge.ClassifyOfflineCustomFn = { lastRelayContact, now, tier1Threshold, tier2Threshold in
             receivedTier1 = tier1Threshold
             receivedTier2 = tier2Threshold
             let elapsed = now - lastRelayContact
@@ -106,8 +105,7 @@ struct SyncTests {
 
     @Test("classifyOfflineCustom returns long when exceeding tier2 threshold")
     func classifyOfflineCustomLong() {
-        let mockClassifyCustom: SyncBridge.ClassifyOfflineCustomFn = {
-            lastRelayContact, now, tier1Threshold, tier2Threshold in
+        let mockClassifyCustom: SyncBridge.ClassifyOfflineCustomFn = { lastRelayContact, now, tier1Threshold, tier2Threshold in
             let elapsed = now - lastRelayContact
             if elapsed < tier1Threshold { return "short" }
             if elapsed < tier2Threshold { return "extended" }

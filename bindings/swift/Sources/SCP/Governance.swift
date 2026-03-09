@@ -175,8 +175,7 @@ enum BroadcastBridge {
         try await broadcastSubscribe(handle: handle, subscriberDid: subscriberDid)
     }
 
-    static let defaultUnsubscribe: UnsubscribeFn = {
-        handle, subscriberDid, rotateKeys in
+    static let defaultUnsubscribe: UnsubscribeFn = { handle, subscriberDid, rotateKeys in
         try await broadcastUnsubscribe(
             handle: handle, subscriberDid: subscriberDid, rotateKeys: rotateKeys
         )
@@ -186,15 +185,13 @@ enum BroadcastBridge {
         try await broadcastPublish(handle: handle, authorDid: authorDid, payload: payload)
     }
 
-    static let defaultBlockSubscriber: BlockSubscriberFn = {
-        handle, subscriberDid, blockerDid in
+    static let defaultBlockSubscriber: BlockSubscriberFn = { handle, subscriberDid, blockerDid in
         try await broadcastBlockSubscriber(
             handle: handle, subscriberDid: subscriberDid, blockerDid: blockerDid
         )
     }
 
-    static let defaultHandleKeyRequest: HandleKeyRequestFn = {
-        handle, authorDid, requesterDid in
+    static let defaultHandleKeyRequest: HandleKeyRequestFn = { handle, authorDid, requesterDid in
         try await broadcastHandleKeyRequest(
             handle: handle, authorDid: authorDid, requesterDid: requesterDid
         )

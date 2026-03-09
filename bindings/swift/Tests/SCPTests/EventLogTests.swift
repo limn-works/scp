@@ -176,12 +176,12 @@ struct EventLogTests {
                 timestamp: 1_700_000_001,
                 payloadJson: #"{"content": "test2"}"#,
                 sequence: 2
-            ),
+            )
         ]
 
         let mockQuery: EventLogBridge.QueryFn = { _, filterJson in
-            #expect(filterJson != nil)
-            #expect(filterJson!.contains("after_sequence"))
+            let filter = try #require(filterJson)
+            #expect(filter.contains("after_sequence"))
             return mockEvents
         }
 

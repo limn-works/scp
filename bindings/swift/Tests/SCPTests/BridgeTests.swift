@@ -70,8 +70,7 @@ struct BridgeTests {
         var receivedIsNativeTransport: Bool?
         var receivedShadowStatus: String?
 
-        let mockEvaluate: BridgeConnectorBridge.EvaluateTrustFn = {
-            isBridged, isNativeTransport, shadowStatus in
+        let mockEvaluate: BridgeConnectorBridge.EvaluateTrustFn = { isBridged, isNativeTransport, shadowStatus in
             receivedIsBridged = isBridged
             receivedIsNativeTransport = isNativeTransport
             receivedShadowStatus = shadowStatus

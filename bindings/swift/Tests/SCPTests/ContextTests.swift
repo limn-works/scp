@@ -4,14 +4,15 @@ import Testing
 
 // MARK: - Context Tests
 
-/// Tests for the ``Context`` actor verifying lifecycle state machine, message
-/// streaming, send/receive, leave/close semantics, and bridge delegation.
-///
-/// Uses injected mock bridge functions for testability. The UniFFI bridge
-/// stubs are not exercised here -- Context tests focus on the Swift ergonomics
-/// layer's correct behavior.
-///
-/// See ADR-026 (Swift SDK) and story SCP-102.
+// Tests for the ``Context`` actor verifying lifecycle state machine, message
+// streaming, send/receive, leave/close semantics, and bridge delegation.
+//
+// Uses injected mock bridge functions for testability. The UniFFI bridge
+// stubs are not exercised here -- Context tests focus on the Swift ergonomics
+// layer's correct behavior.
+//
+// See ADR-026 (Swift SDK) and story SCP-102.
+// swiftlint:disable:next type_body_length
 struct ContextTests {
     // MARK: - Mock ContextHandle
 

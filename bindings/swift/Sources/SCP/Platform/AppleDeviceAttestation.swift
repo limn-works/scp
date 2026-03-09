@@ -216,8 +216,7 @@
             // Software-only tokens carry the known prefix; hardware tokens are
             // CBOR-encoded and will not start with this prefix.
             if let string = String(data: token, encoding: .utf8),
-               string.hasPrefix(StorageKey.softwareTokenPrefix)
-            {
+               string.hasPrefix(StorageKey.softwareTokenPrefix) {
                 return true
             }
             // Non-empty non-software bytes are assumed valid for client-side

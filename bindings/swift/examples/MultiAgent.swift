@@ -1,7 +1,7 @@
-/// Multi-agent coordination: multiple agents collaborating in a shared context.
+// Multi-agent coordination: multiple agents collaborating in a shared context.
 
-import SCP
 import Foundation
+import SCP
 
 @main
 struct MultiAgent {
@@ -13,7 +13,8 @@ struct MultiAgent {
 
         var count = 0
         for await msg in ctx.messages {
-            let text = String(data: msg.content, encoding: .utf8)!
+            // swiftlint:disable:next optional_data_string_conversion
+            let text = String(decoding: msg.content, as: UTF8.self)
             let sender = String(msg.senderDid.prefix(16))
             print("[\(name)] Received from \(sender)...: \(text)")
             count += 1

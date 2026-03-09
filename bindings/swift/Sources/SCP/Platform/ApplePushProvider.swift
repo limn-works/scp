@@ -168,8 +168,7 @@
             do {
                 // `withCheckedThrowingContinuation` closure runs synchronously on
                 // the actor's executor — assigning `tokenContinuation` here is safe.
-                let result = try await withCheckedThrowingContinuation {
-                    (continuation: CheckedContinuation<Data, Error>) in
+                let result = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
                     self.tokenContinuation = continuation
                 }
                 timeoutTask.cancel()

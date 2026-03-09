@@ -240,7 +240,7 @@ struct McpTests {
     func mcpClientListToolsRoundtrip() async throws {
         let mockTools = [
             McpToolDefinition(name: "weather", description: "Get weather", inputSchema: "{}"),
-            McpToolDefinition(name: "search", description: nil, inputSchema: "{}"),
+            McpToolDefinition(name: "search", description: nil, inputSchema: "{}")
         ]
 
         let mockListTools: McpBridge.ClientListToolsFn = { _ in
@@ -297,9 +297,9 @@ struct McpTests {
 
     @Test("McpClientHandle tracks initialization state")
     func mcpClientHandleInit() {
-        let uninit = McpClientHandle(initialized: false)
-        let init_ = McpClientHandle(initialized: true)
-        #expect(!uninit.initialized)
-        #expect(init_.initialized)
+        let uninitHandle = McpClientHandle(initialized: false)
+        let initHandle = McpClientHandle(initialized: true)
+        #expect(!uninitHandle.initialized)
+        #expect(initHandle.initialized)
     }
 } // end McpTests

@@ -149,7 +149,7 @@
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrAccount as String: "scp.key.\(handle)",
                 kSecReturnData as String: true,
-                kSecMatchLimit as String: kSecMatchLimitOne,
+                kSecMatchLimit as String: kSecMatchLimitOne
             ]
             var result: AnyObject?
             let status = SecItemCopyMatching(query as CFDictionary, &result)
@@ -366,18 +366,18 @@
 
         @Test("each generateKeypair call returns a unique handle")
         func uniqueHandles() async throws {
-            let h1 = try await custody.generateKeypair(keyType: "ed25519")
-            let h2 = try await custody.generateKeypair(keyType: "x25519")
-            let h3 = try await custody.generateKeypair(keyType: "ed25519")
+            let handle1 = try await custody.generateKeypair(keyType: "ed25519")
+            let handle2 = try await custody.generateKeypair(keyType: "x25519")
+            let handle3 = try await custody.generateKeypair(keyType: "ed25519")
 
-            #expect(h1 != h2)
-            #expect(h2 != h3)
-            #expect(h1 != h3)
+            #expect(handle1 != handle2)
+            #expect(handle2 != handle3)
+            #expect(handle1 != handle3)
 
             // Cleanup
-            try await custody.destroyKey(h1)
-            try await custody.destroyKey(h2)
-            try await custody.destroyKey(h3)
+            try await custody.destroyKey(handle1)
+            try await custody.destroyKey(handle2)
+            try await custody.destroyKey(handle3)
         }
     }
 
@@ -392,20 +392,20 @@
             let custodyExplicit = AppleKeyCustody(accessGroup: nil, biometricPolicy: .none)
 
             // Both should generate keys identically.
-            let h1 = try await custodyDefault.generateKeypair(keyType: "ed25519")
-            let h2 = try await custodyExplicit.generateKeypair(keyType: "ed25519")
+            let handle1 = try await custodyDefault.generateKeypair(keyType: "ed25519")
+            let handle2 = try await custodyExplicit.generateKeypair(keyType: "ed25519")
 
             // Both should sign successfully.
             let data = Data("test".utf8)
-            let sig1 = try await custodyDefault.sign(h1, data: data)
-            let sig2 = try await custodyExplicit.sign(h2, data: data)
+            let sig1 = try await custodyDefault.sign(handle1, data: data)
+            let sig2 = try await custodyExplicit.sign(handle2, data: data)
 
             #expect(sig1.count == 64)
             #expect(sig2.count == 64)
 
             // Cleanup
-            try await custodyDefault.destroyKey(h1)
-            try await custodyExplicit.destroyKey(h2)
+            try await custodyDefault.destroyKey(handle1)
+            try await custodyExplicit.destroyKey(handle2)
         }
 
         // MARK: - custodyType reflects biometric policy
@@ -445,7 +445,7 @@
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrAccount as String: "scp.key.\(handle)",
                 kSecReturnAttributes as String: true,
-                kSecMatchLimit as String: kSecMatchLimitOne,
+                kSecMatchLimit as String: kSecMatchLimitOne
             ]
             var result: AnyObject?
             let status = SecItemCopyMatching(query as CFDictionary, &result)

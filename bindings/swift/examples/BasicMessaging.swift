@@ -1,7 +1,7 @@
-/// Basic messaging: create identity, create context, send and receive messages.
+// Basic messaging: create identity, create context, send and receive messages.
 
-import SCP
 import Foundation
+import SCP
 
 @main
 struct BasicMessaging {
@@ -31,7 +31,8 @@ struct BasicMessaging {
 
         // Bob receives it
         for await msg in ctxBob.messages {
-            let text = String(data: msg.content, encoding: .utf8)!
+            // swiftlint:disable:next optional_data_string_conversion
+            let text = String(decoding: msg.content, as: UTF8.self)
             print("Bob received from \(msg.senderDid): \(text)")
             break
         }

@@ -4,20 +4,21 @@ import Testing
 
 // MARK: - Conformance Tests
 
-/// Cross-language conformance test runner for the Swift SDK.
-///
-/// Loads JSON fixtures from `tests/conformance/` and validates SDK operations
-/// against expected output. Each fixture specifies an operation, input, and
-/// expected result. The runner maps operation strings to Swift SDK function
-/// calls and compares actual output with deep equality (with tolerance for
-/// timestamps and nonces).
-///
-/// When the `tests/conformance/` fixture directory does not yet exist, these
-/// tests validate the conformance runner infrastructure itself by exercising
-/// the operation dispatcher and fixture model with inline test data.
-///
-/// See `.docs/scaffold/shared.md` section "Conformance Testing" and story
-/// SCP-102.
+// Cross-language conformance test runner for the Swift SDK.
+//
+// Loads JSON fixtures from `tests/conformance/` and validates SDK operations
+// against expected output. Each fixture specifies an operation, input, and
+// expected result. The runner maps operation strings to Swift SDK function
+// calls and compares actual output with deep equality (with tolerance for
+// timestamps and nonces).
+//
+// When the `tests/conformance/` fixture directory does not yet exist, these
+// tests validate the conformance runner infrastructure itself by exercising
+// the operation dispatcher and fixture model with inline test data.
+//
+// See `.docs/scaffold/shared.md` section "Conformance Testing" and story
+// SCP-102.
+// swiftlint:disable:next type_body_length
 struct ConformanceTests {
     // MARK: - ConformanceFixture model
 
@@ -34,23 +35,24 @@ struct ConformanceTests {
 
     // MARK: - Operation dispatcher
 
-    /// Maps an operation string to a Swift SDK call and returns a result
-    /// dictionary for comparison against `expected`.
-    ///
-    /// This dispatcher handles the conformance test categories:
-    /// - `identity_create` -> `Identity.create(custody:)` (removed -- Identity is now UniFFI class)
-    /// - `identity_load` -> `Identity.load(did:)` (removed -- Identity is now UniFFI class)
-    /// - `ucan_validate` -> `validate(encoded:contextId:presenterDid:)`
-    /// - `ucan_mint` -> `mint(issuerDid:audienceDid:capabilities:...)`
-    /// - `ucan_revoke` -> `revoke(encoded:revokerDid:)`
-    /// - `transport_connect` -> `connectTransport(config:)`
-    /// - `transport_status` -> `transportStatus()`
-    /// - `event_log_query` -> `EventLog.query(fromSequence:limit:)`
-    /// - `event_log_prove` -> `EventLog.proveInclusion(leafIndex:)`
-    /// - `event_log_verify` -> `EventLog.verifyInclusion(_:)`
-    ///
-    /// Returns a dictionary with result keys, or an "error" key with the
-    /// error code if the operation threw.
+    // Maps an operation string to a Swift SDK call and returns a result
+    // dictionary for comparison against `expected`.
+    //
+    // This dispatcher handles the conformance test categories:
+    // - `identity_create` -> `Identity.create(custody:)` (removed -- Identity is now UniFFI class)
+    // - `identity_load` -> `Identity.load(did:)` (removed -- Identity is now UniFFI class)
+    // - `ucan_validate` -> `validate(encoded:contextId:presenterDid:)`
+    // - `ucan_mint` -> `mint(issuerDid:audienceDid:capabilities:...)`
+    // - `ucan_revoke` -> `revoke(encoded:revokerDid:)`
+    // - `transport_connect` -> `connectTransport(config:)`
+    // - `transport_status` -> `transportStatus()`
+    // - `event_log_query` -> `EventLog.query(fromSequence:limit:)`
+    // - `event_log_prove` -> `EventLog.proveInclusion(leafIndex:)`
+    // - `event_log_verify` -> `EventLog.verifyInclusion(_:)`
+    //
+    // Returns a dictionary with result keys, or an "error" key with the
+    // error code if the operation threw.
+    // swiftlint:disable:next cyclomatic_complexity function_body_length
     private func dispatch(
         operation: String,
         input: [String: String]
@@ -68,7 +70,7 @@ struct ConformanceTests {
                 )
                 return [
                     "is_valid": String(result.isValid),
-                    "failure_reason": result.failureReason ?? "",
+                    "failure_reason": result.failureReason ?? ""
                 ]
             } catch let error as ScpError {
                 return ["error": errorCode(error)]
@@ -87,7 +89,7 @@ struct ConformanceTests {
                 )
                 return [
                     "issuer": token.issuer(),
-                    "audience": token.audience(),
+                    "audience": token.audience()
                 ]
             } catch let error as ScpError {
                 return ["error": errorCode(error)]
@@ -212,7 +214,7 @@ struct ConformanceTests {
         let possiblePaths = [
             "tests/conformance",
             "../../tests/conformance",
-            "../../../../tests/conformance",
+            "../../../../tests/conformance"
         ]
 
         for relativePath in possiblePaths {
@@ -257,7 +259,7 @@ struct ConformanceTests {
             input: [
                 "encoded": "test.token.sig",
                 "context_id": "ctx-1",
-                "presenter_did": "did:dht:z6MkPresenter",
+                "presenter_did": "did:dht:z6MkPresenter"
             ]
         )
         #expect(result["error"] == "SCP-PERM-3001")
@@ -269,7 +271,7 @@ struct ConformanceTests {
             operation: "ucan_mint",
             input: [
                 "issuer_did": "did:dht:z6MkIssuer",
-                "audience_did": "did:dht:z6MkAudience",
+                "audience_did": "did:dht:z6MkAudience"
             ]
         )
         #expect(result["error"] == "SCP-PERM-3002")
@@ -281,7 +283,7 @@ struct ConformanceTests {
             operation: "ucan_revoke",
             input: [
                 "encoded": "test.token.sig",
-                "revoker_did": "did:dht:z6MkRevoker",
+                "revoker_did": "did:dht:z6MkRevoker"
             ]
         )
         #expect(result["error"] == "SCP-PERM-3003")
@@ -380,7 +382,7 @@ struct ConformanceTests {
             input: [
                 "encoded": "test.token.sig",
                 "context_id": "ctx-1",
-                "presenter_did": "did:dht:z6MkPresenter",
+                "presenter_did": "did:dht:z6MkPresenter"
             ],
             expected: ["error": "SCP-PERM-3001"]
         )

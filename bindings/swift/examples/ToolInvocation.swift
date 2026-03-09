@@ -1,7 +1,7 @@
-/// Tool invocation: register a tool with test vectors and invoke it.
+// Tool invocation: register a tool with test vectors and invoke it.
 
-import SCP
 import Foundation
+import SCP
 
 @main
 struct ToolInvocation {

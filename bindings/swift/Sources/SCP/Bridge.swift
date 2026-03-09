@@ -112,8 +112,7 @@ enum BridgeConnectorBridge {
 
     /// Default evaluate trust function — delegates to UniFFI
     /// ``bridgeEvaluateTrust``.
-    static let defaultEvaluateTrust: EvaluateTrustFn = {
-        isBridged, isNativeTransport, shadowStatus in
+    static let defaultEvaluateTrust: EvaluateTrustFn = { isBridged, isNativeTransport, shadowStatus in
         try bridgeEvaluateTrust(
             isBridged: isBridged,
             isNativeTransport: isNativeTransport,

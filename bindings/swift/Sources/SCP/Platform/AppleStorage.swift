@@ -91,7 +91,7 @@
 
         /// SQLite database handle. Opened once during `open()` and used for all
         /// subsequent operations.
-        private let db: OpaquePointer
+        private let db: OpaquePointer // swiftlint:disable:this identifier_name
 
         /// The 32-byte encryption key retrieved (or generated) from Keychain.
         /// Retained for documentation / debugging; the key is applied to SQLite
@@ -117,7 +117,7 @@
         ///
         /// Callers must use ``open()`` which performs the Keychain setup, database
         /// opening, and (on iOS) the file protection step before constructing the actor.
-        private init(db: OpaquePointer, encryptionKey: Data) {
+        private init(db: OpaquePointer, encryptionKey: Data) { // swiftlint:disable:this identifier_name
             self.db = db
             self.encryptionKey = encryptionKey
         }
@@ -154,14 +154,14 @@
                 // access once the device has been unlocked at least once after boot.
                 // NSFileProtectionComplete would block background processing while
                 // the device is locked — unacceptable for relay message processing.
-                let fm = FileManager.default
+                let fileManager = FileManager.default
                 // Only set the attribute if the file already exists; SQLCipher will
                 // create the file on first connection. On creation the attribute must
                 // be set before writes begin, so we create an empty placeholder here.
-                if !fm.fileExists(atPath: dbURL.path) {
-                    fm.createFile(atPath: dbURL.path, contents: nil)
+                if !fileManager.fileExists(atPath: dbURL.path) {
+                    fileManager.createFile(atPath: dbURL.path, contents: nil)
                 }
-                try fm.setAttributes(
+                try fileManager.setAttributes(
                     [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
                     ofItemAtPath: dbURL.path
                 )
@@ -170,6 +170,7 @@
             // Open the SQLite database.
             var dbHandle: OpaquePointer?
             let openResult = sqlite3_open(dbURL.path, &dbHandle)
+            // swiftlint:disable:next identifier_name
             guard openResult == SQLITE_OK, let db = dbHandle else {
                 let msg = dbHandle.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "unknown error"
                 if let handle = dbHandle { sqlite3_close_v2(handle) }
@@ -225,7 +226,7 @@
                 kSecAttrAccount as String: keychainAccount,
                 kSecAttrAccessGroup as String: keychainAccessGroup,
                 kSecReturnData as String: true,
-                kSecMatchLimit as String: kSecMatchLimitOne,
+                kSecMatchLimit as String: kSecMatchLimitOne
             ]
             var result: AnyObject?
             let readStatus = SecItemCopyMatching(readQuery as CFDictionary, &result)
@@ -237,7 +238,7 @@
                     let deleteQuery: [String: Any] = [
                         kSecClass as String: kSecClassGenericPassword,
                         kSecAttrAccount as String: keychainAccount,
-                        kSecAttrAccessGroup as String: keychainAccessGroup,
+                        kSecAttrAccessGroup as String: keychainAccessGroup
                     ]
                     let deleteStatus = SecItemDelete(deleteQuery as CFDictionary)
                     guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
@@ -259,15 +260,15 @@
         /// Called only when no key exists or the existing key is corrupt and deleted.
         private static func generateFreshEncryptionKey() throws -> Data {
             var keyBytes = [UInt8](repeating: 0, count: 32)
-            let rc = SecRandomCopyBytes(kSecRandomDefault, 32, &keyBytes)
-            guard rc == errSecSuccess else { throw StorageError.keychainError(rc) }
+            let randomStatus = SecRandomCopyBytes(kSecRandomDefault, 32, &keyBytes)
+            guard randomStatus == errSecSuccess else { throw StorageError.keychainError(randomStatus) }
             let keyData = Data(keyBytes)
             let addQuery: [String: Any] = [
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrAccount as String: keychainAccount,
                 kSecAttrAccessGroup as String: keychainAccessGroup,
                 kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-                kSecValueData as String: keyData,
+                kSecValueData as String: keyData
             ]
             let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
             guard addStatus == errSecSuccess else { throw StorageError.keychainError(addStatus) }
@@ -425,11 +426,11 @@
         /// Stored in `Application Support` so that it is excluded from iCloud
         /// backup by default (unlike `Documents`).
         static func databaseFileURL() -> URL {
-            let fm = FileManager.default
-            let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            let fileManager = FileManager.default
+            let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             let scpDir = appSupport.appendingPathComponent("dev.limn.scp", isDirectory: true)
             // Create the directory if it does not exist.
-            try? fm.createDirectory(at: scpDir, withIntermediateDirectories: true)
+            try? fileManager.createDirectory(at: scpDir, withIntermediateDirectories: true)
             return scpDir.appendingPathComponent("scp.db")
         }
 
@@ -439,10 +440,10 @@
         }
 
         /// Execute a batch SQL statement (no results expected).
-        private static func execSQL(db: OpaquePointer, sql: String) throws {
+        private static func execSQL(db: OpaquePointer, sql: String) throws { // swiftlint:disable:this identifier_name
             var errMsg: UnsafeMutablePointer<CChar>?
-            let rc = sqlite3_exec(db, sql, nil, nil, &errMsg)
-            if rc != SQLITE_OK {
+            let status = sqlite3_exec(db, sql, nil, nil, &errMsg)
+            if status != SQLITE_OK {
                 let msg = errMsg.map { String(cString: $0) } ?? "unknown error"
                 sqlite3_free(errMsg)
                 throw StorageError.databaseError(msg)
@@ -471,7 +472,8 @@
             // Increment the last non-0xFF byte.
             bytes[bytes.count - 1] += 1
 
-            return String(bytes: bytes, encoding: .utf8) ?? String(decoding: bytes, as: UTF8.self)
+            // swiftlint:disable:next optional_data_string_conversion
+            return String(decoding: bytes, as: UTF8.self)
         }
     }
 
