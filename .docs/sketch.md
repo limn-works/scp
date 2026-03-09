@@ -1658,12 +1658,12 @@ Implementation specifics that require Tier 1/Tier 2 design work:
 - **~~Context templates and lightweight creation.~~** ✅ **Resolved.** .docs/specs/ §5.12 specifies 6 well-known templates (4 encrypted + 2 broadcast), auto-accept policies, invitation bundling, computational profile, standing bilateral contexts. sdk-common.md specifies cross-language SDK surface.
 - **~~Context nesting.~~** ✅ **Resolved.** .docs/specs/ §5.13 specifies parent-child relationships (8 subsections): ceiling inheritance, membership eligibility, creation protocol, parent governance configuration, lifecycle coupling, metadata/legibility, interaction with other mechanisms, depth limits. Cryptographic binding via MLS `group_context` extensions. ADR-008 defines the `ChildContextCreate` capability. Nesting implementation (`nesting.rs`) is deferred to a later phase (see SCP-134 in the PRD).
 - **~~Cross-context provenance chain tracking.~~** ✅ **Resolved.** DataProvenance type includes `chainDepth` (boundary hop count) and `chainPath` (intermediary context IDs). Chain depth limit (default: 3) enforced at protocol level. .docs/specs/ §7.7.1.
-- **Minimum viable agent.** Likely a passthrough that takes human input, wraps it in SCP envelopes, signs, and sends. Reference implementation that's trivially embeddable.
-- **Capability declaration format.** The actual JSON schema for app manifests. Critical surface — this is the interface between "LLMs generate apps" and "SCP provides infrastructure." Must be LLM-parseable.
-- **Offline/local-first.** Disconnection handling, sync, conflict resolution.
-- **Governance interface.** Governance implementations are pluggable — context creators bring their own logic. Remaining question: the minimum viable governance interface (propose, approve, reject) that all models must conform to.
-- **Summary generation protocol.** For summary memory scope: the lifecycle hooks (pre-close summary generation, verification window, key destruction sequence) need specification. How summaries are produced, verified by both parties, and persisted.
-- **Context promotion.** When an ephemeral/TTL context needs to become persistent: is it a new context referencing the old one, or the same context with TTL removed? Architectural decision with security implications.
+- **~~Minimum viable agent.~~** ✅ **Resolved.** MCP server/client translating between model and SCP SDK. See `00-open-questions.md`, §4.4–4.5, §8.5. Tracked at [#364](https://github.com/limn-works/scp/issues/364).
+- **~~Capability declaration format.~~** ✅ **Resolved.** JSON Schema (MCP-compatible) with SCP-specific extensions. §8.4 specifies the contract; §8.5 establishes MCP compatibility. See `00-open-questions.md`.
+- **~~Offline/local-first.~~** ✅ **Resolved.** ADR-029 specifies offline/sync strategy. §23 specifies the full sync protocol. Three-tier recovery (local replay, peer sync, governance-triggered reset).
+- **~~Governance interface.~~** ✅ **Resolved.** ADR-031 specifies multi-admin governance. `GovernanceEngine` trait with `SingleAdmin`, `Threshold`, `Majority`, and `Unanimity` models. 28 governance action types. §5.9 specifies the governance proposal lifecycle.
+- **~~Summary generation protocol.~~** ✅ **Resolved.** §5.11 specifies memory scope enforcement including summary lifecycle: pre-close generation, 300-second verification window, key destruction. Summary format defined by context tools/governance.
+- **~~Context promotion.~~** ✅ **Resolved.** §5.10 specifies `PromotionPolicy` (declared at creation, immutable). Same context with TTL removed. Requires unanimous consent. `PromoteContext` governance action in ADR-031.
 
 ---
 
