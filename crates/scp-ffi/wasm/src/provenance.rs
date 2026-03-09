@@ -147,7 +147,9 @@ fn compute_quality(
             if matches!(source_type, SourceType::Persistent) {
                 3
             } else {
-                u32::from(has_counterparties)
+                // Active context but source type isn't Persistent — inconsistent
+                // state; degrade gracefully (matches scp-core evaluate_quality)
+                1
             }
         }
         ContextState::ClosedWithSummaryVerified => 2,
@@ -393,6 +395,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tier, 2);
+    }
+
+    #[test]
+    fn evaluate_quality_active_ephemeral_always_returns_1() {
+        // Active + non-Persistent always degrades to EphemeralKnownParties (1),
+        // regardless of counterparties — matches scp-core evaluate_quality.
+        let with_parties =
+            evaluate_provenance_quality(Some("Ephemeral".to_owned()), "Active".to_owned(), true)
+                .unwrap();
+        assert_eq!(with_parties, 1);
+
+        let without_parties =
+            evaluate_provenance_quality(Some("Ephemeral".to_owned()), "Active".to_owned(), false)
+                .unwrap();
+        assert_eq!(without_parties, 1);
+    }
+
+    #[test]
+    fn evaluate_quality_active_summary_always_returns_1() {
+        // Active + Summary also degrades to EphemeralKnownParties (1).
+        let tier =
+            evaluate_provenance_quality(Some("Summary".to_owned()), "Active".to_owned(), false)
+                .unwrap();
+        assert_eq!(tier, 1);
     }
 
     #[test]
