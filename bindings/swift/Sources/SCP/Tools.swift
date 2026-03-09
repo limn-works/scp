@@ -189,6 +189,7 @@ public extension Context {
     /// - Parameters:
     ///   - tool: The name of the tool to invoke.
     ///   - input: The tool input as serialized JSON data.
+    ///   - identity: The ``Identity`` of the invoking agent.
     ///   - invokeFn: Bridge function override for testing.
     /// - Returns: A ``ToolInvocationResult`` containing the tool's output and
     ///   provenance metadata.
@@ -204,6 +205,7 @@ public extension Context {
     func invokeTool(
         _ tool: String,
         input: Data,
+        identity: Identity,
         invokeFn: ToolBridge.InvokeFn = ToolBridge.defaultInvoke
     ) async throws -> ToolInvocationResult {
         guard state == .active else {
@@ -224,7 +226,6 @@ public extension Context {
                 code: "SCP-TOOL-3001"
             )
         }
-        let identity = Identity(noPointer: .init())
         let outputJson = try await invokeFn(contextHandle, tool, inputJson, identity)
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
@@ -313,6 +314,7 @@ public extension Context {
     /// - Parameters:
     ///   - tool: The tool ID to invoke in the target context.
     ///   - input: The tool input as serialized JSON data.
+    ///   - identity: The ``Identity`` of the invoking agent.
     ///   - targetContext: The ``Context`` containing the target tool.
     ///   - chainDepth: Current chain depth (0 for direct invocation).
     ///   - invokeCrossContextFn: Bridge function override for testing.
@@ -329,6 +331,7 @@ public extension Context {
     func invokeToolCrossContext(
         _ tool: String,
         input: Data,
+        identity: Identity,
         targetContext: Context,
         chainDepth: UInt8 = 0,
         invokeCrossContextFn: ToolBridge.InvokeCrossContextFn = ToolBridge.defaultInvokeCrossContext
@@ -357,7 +360,6 @@ public extension Context {
                 code: "SCP-TOOL-3001"
             )
         }
-        let identity = Identity(noPointer: .init())
         let outputJson = try await invokeCrossContextFn(
             sourceHandle, targetHandle, tool, inputJson, identity, chainDepth
         )
@@ -420,6 +422,7 @@ public extension Context {
     /// - Parameters:
     ///   - sessionId: The session ID from ``createToolSession``.
     ///   - input: The tool input as serialized JSON data.
+    ///   - identity: The ``Identity`` of the invoking agent.
     ///   - sessionInvokeFn: Bridge function override for testing.
     /// - Returns: A ``ToolInvocationResult`` containing the tool's output.
     /// - Throws: ``ScpError/Tool(message:code:)`` if the session is expired
@@ -433,6 +436,7 @@ public extension Context {
     func invokeToolSession(
         sessionId: String,
         input: Data,
+        identity: Identity,
         sessionInvokeFn: ToolBridge.SessionInvokeFn = ToolBridge.defaultSessionInvoke
     ) async throws -> ToolInvocationResult {
         guard state == .active else {
@@ -453,7 +457,6 @@ public extension Context {
                 code: "SCP-TOOL-3001"
             )
         }
-        let identity = Identity(noPointer: .init())
         let outputJson = try await sessionInvokeFn(
             contextHandle, sessionId, inputJson, identity
         )

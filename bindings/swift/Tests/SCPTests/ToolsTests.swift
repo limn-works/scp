@@ -181,6 +181,7 @@ struct ToolsTests {
         let result = try await context.invokeTool(
             "calculator",
             input: Data("{}".utf8),
+            identity: Identity(noPointer: .init()),
             invokeFn: mockInvoke
         )
         #expect(result.output == Data(#"{"result": 42}"#.utf8))
@@ -193,7 +194,7 @@ struct ToolsTests {
         try await context.close()
 
         do {
-            _ = try await context.invokeTool("calculator", input: Data("{}".utf8))
+            _ = try await context.invokeTool("calculator", input: Data("{}".utf8), identity: Identity(noPointer: .init()))
             Issue.record("Expected invokeTool to throw on closed context")
         } catch let error as ScpError {
             if case let .Context(_, code) = error {
@@ -381,6 +382,7 @@ struct ToolsTests {
         let result = try await sourceContext.invokeToolCrossContext(
             "remote-calc",
             input: Data("{\"x\":1}".utf8),
+            identity: Identity(noPointer: .init()),
             targetContext: targetContext,
             chainDepth: 1,
             invokeCrossContextFn: mockInvokeCrossContext
@@ -400,6 +402,7 @@ struct ToolsTests {
             _ = try await sourceContext.invokeToolCrossContext(
                 "tool",
                 input: Data("{}".utf8),
+                identity: Identity(noPointer: .init()),
                 targetContext: targetContext
             )
             Issue.record("Expected error for closed source context")
@@ -478,6 +481,7 @@ struct ToolsTests {
         let result = try await context.invokeToolSession(
             sessionId: "session-abc-123",
             input: Data("{\"op\":\"add\"}".utf8),
+            identity: Identity(noPointer: .init()),
             sessionInvokeFn: mockSessionInvoke
         )
 
