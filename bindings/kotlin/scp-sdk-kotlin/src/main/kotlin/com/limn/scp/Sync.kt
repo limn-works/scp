@@ -33,9 +33,12 @@ interface SyncBindings {
 /**
  * Default sync policy parameters (§23.6).
  *
- * Exposes the protocol-default thresholds for offline tier classification
- * and conflict resolution. These are compile-time constants matching the
- * Rust `SyncPolicy::default()` values.
+ * **Important:** These are compile-time defaults matching `SyncPolicy::default()` in Rust.
+ * Unlike the Python and TypeScript SDKs, which call bridge functions (`sync_get_policy`)
+ * to obtain runtime-configured values, the UniFFI bridge does not currently expose a
+ * `syncGetPolicy` function. Values returned here will diverge from runtime-configured
+ * policies if the node operator overrides defaults. When a UniFFI `syncGetPolicy` export
+ * is added, `SyncBridge.getPolicy()` should be updated to call it.
  *
  * @property tier1ThresholdSecs Threshold between "short" and "extended" tiers (seconds).
  * @property tier2ThresholdSecs Threshold between "extended" and "long" tiers (seconds).
@@ -88,8 +91,12 @@ class SyncBridge internal constructor(
     /**
      * Returns the default sync policy parameters.
      *
-     * Pure Kotlin operation — no FFI call. Returns the protocol-default
-     * thresholds for offline tier classification.
+     * **Note:** This returns compile-time defaults, not runtime-configured values.
+     * The UniFFI bridge does not yet expose a `syncGetPolicy` function, so this
+     * cannot delegate to the Rust core like the Python and TypeScript SDKs do.
+     * Values may diverge from operator-configured policies at runtime.
+     *
+     * Pure Kotlin operation — no FFI call.
      *
      * @return Default [SyncPolicy] with protocol-standard thresholds.
      */
