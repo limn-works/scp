@@ -512,7 +512,95 @@ The exact byte count depends on the MessagePack encoding of the sub-structures.
 Compute the expected SHA-256 hash using the Rust reference implementation.
 ```
 
-## 25.14 Verification Procedure
+## 25.14 Pseudonymization Vectors (§24.3.5)
+
+Domain: `"SCP-PSEUDONYM-V1:"`
+
+### Vector 27: DID Pseudonymization
+
+`pseudonymize_did` derives a context-scoped pseudonym from a DID, context ID, and a pseudonym key using the canonical hash construction.
+
+```
+Input:
+  pseudonym_key:  0x746573742d70736575646f6e796d2d6b6579 ("test-pseudonym-key", 18 bytes)
+  context_id:     "test-context-01"
+  did:            "did:dht:z6MkTest"
+
+Canonical hash input:
+  "SCP-PSEUDONYM-V1:"                           (17 bytes, no length prefix)
+  || BE32(18)  || "test-pseudonym-key"           (4 + 18 = 22 bytes)
+  || BE32(15)  || "test-context-01"              (4 + 15 = 19 bytes)
+  || BE32(16)  || "did:dht:z6MkTest"            (4 + 16 = 20 bytes)
+
+Total: 17 + 22 + 19 + 20 = 78 bytes
+
+Expected SHA-256:
+  0xa1545542cd8834cc0599f07e5c730dee3005c01097dde63abf906110f1a8e28d
+
+Result: did:pseudo:a1545542cd8834cc0599f07e5c730dee3005c01097dde63abf906110f1a8e28d
+```
+
+The pseudonym is deterministic: the same (key, context, DID) triple always produces the same pseudonym. Different keys or contexts produce unrelated pseudonyms for the same DID.
+
+## 25.15 Tool Interface Offer ID Vectors (§6.2.0.1)
+
+Domain: `"SCP-OFFER-ID-V1:"`
+
+### Vector 28: Tool Interface Offer ID
+
+`compute_offer_id` derives a deterministic 32-byte offer ID from the source context, tool ID, target context, and timestamp.
+
+```
+Input:
+  source_context:  "source-ctx-01"
+  tool_id:         "tool-abc123"
+  target_context:  "target-ctx-02"
+  timestamp:       1700000000
+
+Canonical hash input:
+  "SCP-OFFER-ID-V1:"                            (16 bytes, no length prefix)
+  || BE32(13) || "source-ctx-01"                 (4 + 13 = 17 bytes)
+  || BE32(11) || "tool-abc123"                   (4 + 11 = 15 bytes)
+  || BE32(13) || "target-ctx-02"                 (4 + 13 = 17 bytes)
+  || BE64(1700000000)                            (8 bytes)
+
+Total: 16 + 17 + 15 + 17 + 8 = 73 bytes
+
+Expected SHA-256:
+  0xb9f0cd497bede455c99c995c16eb2a0a2bc013a94cdd744dfd5ddbcd73791d53
+```
+
+## 25.16 Attestation ID Vectors (§3.5.1)
+
+Domain: `"SCP-ATTESTATION-ID-V1:"`
+
+### Vector 29: Attestation ID Computation
+
+`compute_id` derives a deterministic attestation ID from the issuer DID, platform, platform handle, and issuance timestamp. Note: this uses a *different* domain separator from the attestation *signature* construction in §25.13.
+
+```
+Input:
+  issuer:           "did:dht:z6MkIssuer"
+  platform:         "x"
+  platform_handle:  "@alice"
+  issued_at:        1700000000
+
+Canonical hash input:
+  "SCP-ATTESTATION-ID-V1:"                      (22 bytes, no length prefix)
+  || BE32(18)  || "did:dht:z6MkIssuer"          (4 + 18 = 22 bytes)
+  || BE32(1)   || "x"                            (4 + 1 = 5 bytes)
+  || BE32(6)   || "@alice"                       (4 + 6 = 10 bytes)
+  || BE64(1700000000)                            (8 bytes)
+
+Total: 22 + 22 + 5 + 10 + 8 = 67 bytes
+
+Expected SHA-256:
+  0x3b7567f7331372b900e4cf9f764708cebf88df9173cb626e2984fb31ee1bcf4c
+
+Result: "3b7567f7331372b900e4cf9f764708cebf88df9173cb626e2984fb31ee1bcf4c" (hex-encoded)
+```
+
+## 25.17 Verification Procedure
 
 To verify an implementation against these test vectors:
 
@@ -530,7 +618,7 @@ To verify an implementation against these test vectors:
 
 7. **Merkle tree verification.** Construct trees incrementally and verify the root hash matches after each append. Verify inclusion proofs for specific leaves.
 
-## 25.15 Generating Reference Outputs
+## 25.18 Generating Reference Outputs
 
 The Rust reference implementation can generate exact expected outputs for all vectors. Run the test vector generation tool:
 

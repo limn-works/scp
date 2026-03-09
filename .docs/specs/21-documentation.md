@@ -467,5 +467,5 @@ For agents implementing SCP from the spec (not using the reference implementatio
 5. **Conformance test suite** — Language-independent test cases that any implementation must pass. Covered in §26 (conformance suite).
 
 This documentation set is now substantially complete as of March 2026. The remaining work is:
-- Generating exact hex outputs for all test vectors by running the reference implementation (§25.15).
+- Generating exact hex outputs for all test vectors by running the reference implementation (§25.18).
 - Creating the protocol compliance checklist (mechanical extraction from spec MUST/SHOULD/MAY statements).
