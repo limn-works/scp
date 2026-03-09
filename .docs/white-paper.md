@@ -7,7 +7,7 @@ Limn
 
 ## Abstract
 
-Software generation is becoming trivial. Frontier language models produce functional applications from natural-language prompts; agent frameworks compose multi-step workflows from modular tools. What remains hard is not building software but connecting it: identity that belongs to the user, trust that is earned and portable, relationships that survive when the software that introduced them is gone. As every person and every agent generates their own software, all of those applications are islands — each with its own accounts, its own notion of trust, its own siloed relationships.
+Software generation is becoming trivial — frontier language models produce functional applications from natural-language prompts, agent frameworks compose multi-step workflows from modular tools — and what remains hard is not building software but connecting it: identity that belongs to the user, trust that is earned and portable, relationships that survive when the software that introduced them is gone. As every person and every agent generates their own software, all of those applications are islands, each with its own accounts, its own notion of trust, its own siloed relationships.
 
 This paper presents the Shared Context Protocol (SCP), an open protocol providing cryptographic identity (DID), governed interaction spaces (contexts), end-to-end encryption as access control (MLS), capability-based authorization (UCAN), and verifiable provenance. All interaction occurs within contexts — bounded, encrypted, governed spaces where membership is enforced by cryptography, not infrastructure. The protocol is designed for a world where autonomous agents are the primary actors: every agent traces to a human identity through cryptographic binding, agents are isolated per context at the protocol level, and behavioral records replace reputation scores as the primary trust input.
 
@@ -19,11 +19,11 @@ Key properties: no operator dependency (the protocol functions if its creators d
 
 ### 1.1 The Ephemeral Software Thesis
 
-Software generation is undergoing a phase transition. Frontier language models produce functional applications from brief natural-language specifications. Agent frameworks compose sophisticated workflows from modular tools. The cost of producing a working application — from concept to execution — is collapsing toward zero.
+Software generation is undergoing a phase transition: frontier language models produce functional applications from brief natural-language specifications, agent frameworks compose sophisticated workflows from modular tools, and the cost of producing a working application — from concept to execution — is collapsing toward zero.
 
 The trajectory is clear: personal, disposable, generated-on-demand software. A user describes what they need; an agent builds it. The application serves its purpose and may never be used again. Software ceases to be a durable artifact and becomes an ephemeral means to an end.
 
-What this trajectory does *not* make trivial is the connective tissue between applications: identity that belongs to the user rather than to the application that created it, trust that is earned through interaction and portable across contexts, relationships that persist when the software that introduced them is discarded, and transport that works regardless of which application generated the endpoints. Building software is becoming trivial; connecting it is not. When every person and every agent generates their own software, all of those applications are islands.
+What this trajectory does *not* make trivial is the connective tissue between applications: identity that belongs to the user rather than to the application that created it, trust that is earned through interaction and portable across contexts, relationships that persist when the software that introduced them is discarded, and transport that works regardless of which application generated the endpoints. Building software is becoming trivial; connecting it is not, and when every person and every agent generates their own software, all of those applications are islands.
 
 SCP provides the durable infrastructure layer beneath ephemeral software: identity, trust, relationships, transport, persistence, and provenance.
 
@@ -31,7 +31,7 @@ This is not a marginal efficiency gain. If the protocol provides what every conn
 
 ### 1.2 Agents as Primary Actors
 
-The agent ecosystem is developing rapidly at the tool level. The Model Context Protocol (MCP) defines how language models connect to local tools via JSON-RPC. WebMCP extends this to browser-accessible tools. The Universal Commerce Protocol (UCP) addresses agent-to-commerce interactions. These protocols solve important problems: how agents *use* things.
+The agent ecosystem is developing rapidly at the tool level — the Model Context Protocol (MCP) defines how language models connect to local tools via JSON-RPC, WebMCP extends this to browser-accessible tools, the Universal Commerce Protocol (UCP) addresses agent-to-commerce interactions — and these protocols solve important problems: how agents *use* things.
 
 What is missing is the social layer — how agents *relate to each other*. No existing protocol addresses the questions that arise when autonomous agents interact: How does an agent prove its identity? How is trust established between agents that have never met? How are interactions governed when both participants are software? Who is accountable when an autonomous agent misbehaves? How does an agent in one context safely share information with an agent in another?
 
@@ -77,25 +77,25 @@ The remainder of this paper is organized as follows: Section 2 analyzes the prob
 
 ### 2.1 The Connectivity Crisis
 
-Generated applications have no shared identity layer. Each application creates its own accounts, its own user model, its own notion of "who you are." When two independently generated applications need to know that the same person is using both, there is no mechanism — the identity is locked inside each application.
+Generated applications have no shared identity layer — each creates its own accounts, its own user model, its own notion of "who you are" — and when two independently generated applications need to know that the same person is using both, there is no mechanism, because the identity is locked inside each application.
 
-Trust is not portable. Reputation earned in one application does not transfer to another. A user who has been a reliable participant in one context for months starts as a stranger in the next. The behavioral evidence that could inform trust evaluation is siloed.
+Trust is not portable — reputation earned in one application does not transfer to another, and a user who has been a reliable participant in one context for months starts as a stranger in the next, because the behavioral evidence that could inform trust evaluation is siloed.
 
 Relationships are trapped inside their clients. When an application is replaced — and generated applications are replaced constantly — every connection, conversation, and shared context it mediated is lost. There is no mechanism for a relationship to survive the death of the software that introduced it, or to move between devices, or to function across two applications that have never heard of each other. In a world where agents run on personal hardware — laptops, workstations, phones — connections and their governing state need to be portable across machines, trivial to create and destroy on demand, and independent of any particular client. The infrastructure should impose no more overhead than the agent runtime itself.
 
-There is no governed interaction across independently generated software. When an agent in one application needs to interact with an agent in another, there is no protocol-level mechanism for establishing the rules of engagement — what capabilities are permitted, who is authorized to do what, what happens when rules are violated.
+There is no governed interaction across independently generated software — when an agent in one application needs to interact with an agent in another, there is no protocol-level mechanism for establishing the rules of engagement, no shared understanding of what capabilities are permitted, who is authorized to do what, or what happens when rules are violated.
 
-Provenance is absent. When an agent produces content, there is no standard mechanism for verifying where that content came from, who produced it, or through how many intermediaries it has passed. In a world of generated content, the absence of provenance is a structural vulnerability.
+Provenance is absent — when an agent produces content, there is no standard mechanism for verifying where that content came from, who produced it, or through how many intermediaries it has passed — and in a world of generated content, this absence is a structural vulnerability.
 
 ### 2.2 The Agent Trust Problem
 
-Autonomous agents create a category of trust problem that existing protocols do not address, because existing protocols were designed for a world where the human is the actor. When agents act autonomously, identity manufacturing is computationally trivial (creating an agent costs nothing), accountability chains are absent (who is responsible when an agent misbehaves?), and the attack surface scales differently (one operator can deploy agents across many contexts, each appearing independent).
+Autonomous agents create a category of trust problem that existing protocols do not address, because those protocols were designed for a world where the human is the actor. When agents act autonomously, identity manufacturing is computationally trivial (creating an agent costs nothing), accountability chains are absent (who is responsible when an agent misbehaves?), and the attack surface scales in ways that human-centric protocols never had to consider — one operator can deploy agents across many contexts, each appearing independent.
 
 The tool-level protocols that exist today — MCP, WebMCP, UCP — define how agents use things. They do not address how agents relate to each other, how trust is established between agents that have never met, or how interactions are governed when both participants are software. No existing protocol constrains agents to one per person per context, binds agents to human accountability chains through cryptographic identity binding, or provides behavioral records as the basis for trust evaluation.
 
 ### 2.3 Why Not Existing Protocols?
 
-Existing protocols address pieces of this problem — federated messaging (Matrix), self-sovereign identity (AT Protocol), censorship-resistant relaying (Nostr), end-to-end encryption (Signal), zero-server P2P (Holepunch/Hypercore), and agent-tool integration (MCP). None addresses the agent-native case comprehensively: no existing protocol provides cryptographic context isolation, human accountability chains for autonomous agents, capability-based authorization with delegation, and verifiable provenance as a unified architecture. Section 12 provides a detailed structured comparison.
+Existing protocols address pieces of this problem — federated messaging (Matrix), self-sovereign identity (AT Protocol), censorship-resistant relaying (Nostr), end-to-end encryption (Signal), zero-server P2P (Holepunch/Hypercore), and agent-tool integration (MCP) — but none addresses the agent-native case comprehensively, because no existing protocol provides cryptographic context isolation, human accountability chains for autonomous agents, capability-based authorization with delegation, and verifiable provenance as a unified architecture. Section 12 provides a detailed structured comparison.
 
 ### 2.4 Requirements
 
@@ -111,7 +111,7 @@ The problems above directly motivate the design principles in Section 1.3: ident
 
 ### 3.1 Protocol Boundary
 
-SCP defines a sharp protocol boundary. Everything that touches the network is protocol-governed: contexts, identity state, encrypted envelopes, relay interactions, and attestations. Above the boundary, local agent orchestration and client behavior are unconstrained — agents share state freely on the user's machine, coordinate across contexts locally, and execute arbitrary logic.
+SCP defines a sharp protocol boundary: everything that touches the network is protocol-governed — contexts, identity state, encrypted envelopes, relay interactions, and attestations — while above the boundary, local agent orchestration and client behavior are unconstrained, with agents sharing state freely on the user's machine, coordinating across contexts locally, and executing arbitrary logic.
 
 The boundary is architecturally significant because it defines where isolation applies. A human may have agents in many contexts. Locally, those agents coordinate freely. At the protocol level, each agent is a separate instance confined to its context. Cross-context data flow occurs only through governed protocol mechanisms.
 
@@ -186,7 +186,7 @@ SCP's trust model has four layers, ordered from hardest (pure validation) to sof
 
 **Layer 4: Trust Evaluation.** Agent-level judgment for what cannot be mechanized: new identities with no history, non-testable capabilities, novel situations. This layer exists because some evaluation inherently requires judgment.
 
-The critical property: **the trust surface shrinks over time.** New identities are trust-heavy — no participation history, dependent on endorsements. As they participate, behavioral validation accumulates. Trust becomes supplementary, then marginal. The protocol makes this convergence structural.
+The critical property: **the trust surface shrinks over time.** New identities are trust-heavy — no participation history, dependent on endorsements — but as they participate, behavioral validation accumulates and trust becomes supplementary, then marginal. The protocol makes this convergence structural.
 
 ---
 
@@ -281,7 +281,7 @@ Broadcast contexts support two-tier membership: bounded MLS-group members (write
 
 ### 5.4 Cross-Context Communication
 
-A natural question is why the protocol does not provide a direct agent-to-agent communication primitive — a way for agents in different contexts to message each other freely. This was considered extensively and rejected, because it fundamentally undermines context isolation, which is the protocol's security boundary.
+A natural question is why the protocol does not provide a direct agent-to-agent communication primitive — a way for agents in different contexts to message each other freely — and the answer, arrived at through extensive analysis and multiple reconsiderations, is that it fundamentally undermines context isolation, which is the protocol's security boundary.
 
 The reasoning is specific. Forbidding agents from communicating across contexts does not hinder their functionality. The human coordinates across their own contexts locally — on their machine, agents share state freely, plan across contexts, and carry intelligence between interactions. The protocol governs what touches the network; it does not constrain what happens on the user's device. Network-level agent-to-agent communication would automate something that does not need network-level automation, while opening massive attack surface: runaway agent connections, cross-context infection via agent memory, fleet coordination at the protocol level, and metastatic growth patterns through agent connection graphs.
 
@@ -534,7 +534,7 @@ SCP builds on established standards rather than inventing from scratch where goo
 - **Merkle trees** from distributed systems: tamper-evident history.
 - **BEP44** from BitTorrent: signed mutable items on Mainline DHT.
 
-The relay model is informed by Nostr's simplicity. Federation lessons are informed by Matrix's experience. The append-only log primitive draws from the same well-understood lineage as Hypercore. DHT-integrated hole punching as a reachability concept is validated by Hyperswarm. Keet provides existence proof that zero-server encrypted group messaging works at production scale.
+The relay model is informed by Nostr's simplicity, federation lessons by Matrix's experience, the append-only log primitive draws from the same well-understood lineage as Hypercore, and DHT-integrated hole punching as a reachability concept is validated by Hyperswarm — while Keet provides existence proof that zero-server encrypted group messaging works at production scale.
 
 ### 12.3 What Is Novel
 
@@ -629,7 +629,7 @@ The current specification is self-published under CC-BY 4.0. The near-term path 
 
 ## 15. Conclusion
 
-SCP provides the durable connective tissue for a world of ephemeral, generated software. When building software is trivial but connecting it is not, the bottleneck shifts from code to infrastructure: identity, trust, relationships, transport, and provenance.
+SCP provides the durable connective tissue for a world of ephemeral, generated software — and in a world where building software is trivial but connecting it is not, the bottleneck shifts from code to infrastructure: identity, trust, relationships, transport, and provenance.
 
 The protocol's contribution is a coherent architecture that composes established cryptographic primitives — MLS for group encryption, DIDs for identity, UCANs for authorization, Merkle trees for integrity — into a system designed from the ground up for autonomous agents. Context isolation provides the security boundary. Encryption constitutes access control. Provenance is automatic and structural. Every agent traces to a human through cryptographic binding. The trust surface shrinks as behavioral evidence accumulates.
 
