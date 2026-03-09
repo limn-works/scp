@@ -2614,6 +2614,17 @@ impl ContextManager {
             }
         };
 
+        // Emit GovernanceActionExecuted event to the Merkle event log
+        // (ADR-031 §8, PRD SCP-269/SCP-270). Appended after every successful
+        // governance action execution so SDK consumers can observe execution
+        // through the event system.
+        {
+            let context_id_bytes = context_id_to_bytes(context_id);
+            let _ = self
+                .event_log
+                .append_context_event(&context_id_bytes, "GovernanceActionExecuted");
+        }
+
         // Remove the executed proposal from approved_proposals so it no
         // longer participates in conflict detection (ADR-031 §7).  Replay
         // prevention is already handled by `executed_proposals`.
@@ -2644,10 +2655,19 @@ impl ContextManager {
         let pid = proposal.proposal_id;
         match &proposal.action {
             GovernanceAction::BlockAuthor { did, .. } => {
-                let r = self
-                    .block_broadcast_author_internal(context_id, did)
+                // Delegate to RevokeWriteAccess with Full scope (SCP-RG-016,
+                // ADR-038). BlockAuthor is a legacy action; the content access
+                // key layer provides the proper mechanism for revoking write
+                // access. Delegation ensures key rotation and access tracking
+                // are handled consistently.
+                self.execute_revoke_write_access(context_id, did, RevocationScope::Full, pid)
                     .await?;
-                Ok(GovernanceActionResult::AuthorBlocked(r))
+                Ok(GovernanceActionResult::WriteAccessRevoked(
+                    WriteAccessRevokedResult {
+                        did: did.clone(),
+                        scope: RevocationScope::Full,
+                    },
+                ))
             }
             GovernanceAction::RevokeReadAccess { did, scope } => {
                 let r = self
@@ -3501,6 +3521,7 @@ impl ContextManager {
                 GovernanceEvent::DeadlockRecovery { .. } => "GovernanceDeadlockRecovery",
                 GovernanceEvent::ConflictDetected { .. } => "GovernanceConflictDetected",
                 GovernanceEvent::ConflictResolved { .. } => "GovernanceConflictResolved",
+                GovernanceEvent::GovernanceActionExecuted { .. } => "GovernanceActionExecuted",
             };
             let _ = self
                 .event_log
@@ -3520,77 +3541,10 @@ impl ContextManager {
         Ok(status)
     }
 
-    /// Internal implementation of author blocking. Only callable within the
-    /// crate -- external callers must go through [`execute_governance_action`]
-    /// with an approved [`GovernanceProposal`] containing a
-    /// [`GovernanceAction::BlockAuthor`] action.
-    ///
-    /// Removes the author from the broadcast context's author map, destroying
-    /// their sender key. After this call:
-    ///
-    /// - `publish_broadcast()` by this author returns `PermissionDenied`.
-    /// - `handle_broadcast_key_request()` for this author returns `Deny`.
-    /// - Subscribers who cached the author's old key can still decrypt old
-    ///   messages, but no new messages can be sealed.
-    ///
-    /// Emits an `AuthorBlocked` event. See SCP-227 AC4 and spec section 5.14.8.
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-    /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
-    ///   context.
-    async fn block_broadcast_author_internal(
-        &self,
-        context_id: &str,
-        author_did: &DID,
-    ) -> Result<AuthorBlockResult, ContextError> {
-        let context_id_bytes = context_id_to_bytes(context_id);
-
-        // Replay check and executed_proposals tracking are handled by the
-        // outer execute_governance_action wrapper — not duplicated here.
-        let (result, snapshot) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
-            require_active(&ctx.handle)?;
-
-            // Gate: ceiling must include MemberBan (§5.3, ADR-031, #339).
-            // Consistent with revoke_read_access_internal and
-            // restore_read_access_internal which already check this.
-            if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
-                return Err(ContextError::PermissionDenied(
-                    "context ceiling does not include member:ban capability".into(),
-                ));
-            }
-
-            let bc = ctx
-                .broadcast_context
-                .as_mut()
-                .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
-
-            let result = bc.block_author(author_did)?;
-
-            // Take snapshot for persistence before dropping lock.
-            let snapshot = bc.to_snapshot();
-
-            // Emit block event to receive buffer.
-            ctx.receive_buffer.push(ContextEvent::AuthorBlocked {
-                author_did: author_did.clone(),
-            });
-
-            (result, snapshot)
-        };
-
-        // Persist broadcast state for crash recovery.
-        self.persist_broadcast_snapshot(context_id, &snapshot);
-
-        self.event_log
-            .append_context_event(&context_id_bytes, "AuthorBlocked")?;
-
-        Ok(result)
-    }
+    // block_broadcast_author_internal removed (SCP-RG-016, #425).
+    // BlockAuthor now delegates to execute_revoke_write_access with
+    // RevocationScope::Full, which handles key destruction, event emission,
+    // and persistence through the content access key layer (ADR-038).
 
     /// Internal implementation of read access revocation. Only callable within
     /// the crate -- external callers must go through [`execute_governance_action`]
@@ -7728,12 +7682,13 @@ mod tests {
             approved_block_author_proposal(&"did:key:alice".into(), &ctx_id, &"did:key:bob".into());
         let action_result = manager.execute_governance_action(&ctx_id, &proposal).await;
         assert!(action_result.is_ok());
-        let super::GovernanceActionResult::AuthorBlocked(block_result) = action_result.unwrap()
+        let super::GovernanceActionResult::WriteAccessRevoked(revoke_result) =
+            action_result.unwrap()
         else {
-            panic!("expected AuthorBlocked result");
+            panic!("expected WriteAccessRevoked result from BlockAuthor delegation");
         };
-        assert_eq!(block_result.author_did, "did:key:bob");
-        assert_eq!(block_result.final_epoch, 0);
+        assert_eq!(revoke_result.did.0, "did:key:bob");
+        assert_eq!(revoke_result.scope, RevocationScope::Full);
 
         // Alice can still publish (unaffected).
         assert!(
@@ -11411,8 +11366,8 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("member:ban")),
-            "expected PermissionDenied about member:ban, got: {err}"
+            matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("MemberBan")),
+            "expected PermissionDenied about MemberBan, got: {err}"
         );
     }
 

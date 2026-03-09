@@ -1043,6 +1043,23 @@ pub enum GovernanceEvent {
         winner_id: ProposalId,
         loser_id: ProposalId,
     },
+    /// A governance action was successfully executed (ADR-031 §8).
+    ///
+    /// Emitted after every successful governance action execution in
+    /// `execute_governance_action`. Records the proposal ID, the action
+    /// that was executed, the DID of the executor (proposer), and the
+    /// resulting MLS epoch (if applicable). This is the 8th governance
+    /// event type per PRD SCP-269/SCP-270.
+    GovernanceActionExecuted {
+        /// The proposal that was executed.
+        proposal_id: ProposalId,
+        /// The governance action that was executed.
+        action: Box<GovernanceAction>,
+        /// The DID of the executor (proposer of the approved proposal).
+        executor_did: DID,
+        /// The MLS epoch after execution, if applicable.
+        resulting_epoch: Option<u64>,
+    },
 }
 
 // ---------------------------------------------------------------------------
