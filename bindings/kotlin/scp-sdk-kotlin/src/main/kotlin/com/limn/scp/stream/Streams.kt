@@ -35,7 +35,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 interface EventCallback {
     fun onEvent(eventJson: String)
 
-    fun onError(code: String, message: String)
+    fun onError(
+        code: String,
+        message: String,
+    )
 
     fun onComplete()
 }
@@ -134,18 +137,20 @@ class ColdStreamFactory(
         contextId: String,
         filterJson: String,
         pageSize: Int,
-    ): Flow<String> = flow {
-        var offset = 0
-        while (true) {
-            val paginatedFilter = buildPaginatedFilter(filterJson, offset, pageSize)
-            val page = withContext(ioDispatcher) {
-                infraBindings.eventLogQuery(contextId, paginatedFilter)
+    ): Flow<String> =
+        flow {
+            var offset = 0
+            while (true) {
+                val paginatedFilter = buildPaginatedFilter(filterJson, offset, pageSize)
+                val page =
+                    withContext(ioDispatcher) {
+                        infraBindings.eventLogQuery(contextId, paginatedFilter)
+                    }
+                if (page == "[]" || page.isBlank()) break
+                emit(page)
+                offset += pageSize
             }
-            if (page == "[]" || page.isBlank()) break
-            emit(page)
-            offset += pageSize
         }
-    }
 }
 
 /**
@@ -227,38 +232,45 @@ class HotStreamFactory(
     suspend fun contextEvents(
         contextHandle: Long,
         replay: Int = 0,
-    ): SharedFlow<String> = eventMutex.withLock {
-        val existing = activeEventSubscriptions[contextHandle]
-        if (existing != null) return@withLock existing.readOnly
+    ): SharedFlow<String> =
+        eventMutex.withLock {
+            val existing = activeEventSubscriptions[contextHandle]
+            if (existing != null) return@withLock existing.readOnly
 
-        val sharedFlow = MutableSharedFlow<String>(
-            replay = replay,
-            extraBufferCapacity = BUFFER_CAPACITY,
-            onBufferOverflow = BufferOverflow.DROP_OLDEST,
-        )
-        val readOnly = sharedFlow.asSharedFlow()
+            val sharedFlow =
+                MutableSharedFlow<String>(
+                    replay = replay,
+                    extraBufferCapacity = BUFFER_CAPACITY,
+                    onBufferOverflow = BufferOverflow.DROP_OLDEST,
+                )
+            val readOnly = sharedFlow.asSharedFlow()
 
-        val callback = object : EventCallback {
-            override fun onEvent(eventJson: String) {
-                sharedFlow.tryEmit(eventJson)
-            }
+            val callback =
+                object : EventCallback {
+                    override fun onEvent(eventJson: String) {
+                        sharedFlow.tryEmit(eventJson)
+                    }
 
-            override fun onError(code: String, message: String) {
-                sharedFlow.tryEmit("""{"_error":true,"code":"$code","message":"$message"}""")
-            }
+                    override fun onError(
+                        code: String,
+                        message: String,
+                    ) {
+                        sharedFlow.tryEmit("""{"_error":true,"code":"$code","message":"$message"}""")
+                    }
 
-            override fun onComplete() {
-                activeEventSubscriptions.remove(contextHandle)
-            }
+                    override fun onComplete() {
+                        activeEventSubscriptions.remove(contextHandle)
+                    }
+                }
+
+            val subscriptionHandle =
+                withContext(ioDispatcher) {
+                    contextBindings.contextSubscribeEvents(contextHandle, callback)
+                }
+
+            activeEventSubscriptions[contextHandle] = HotStreamState(sharedFlow, readOnly, subscriptionHandle)
+            readOnly
         }
-
-        val subscriptionHandle = withContext(ioDispatcher) {
-            contextBindings.contextSubscribeEvents(contextHandle, callback)
-        }
-
-        activeEventSubscriptions[contextHandle] = HotStreamState(sharedFlow, readOnly, subscriptionHandle)
-        readOnly
-    }
 
     /**
      * Start a hot [SharedFlow] of real-time incoming messages.
@@ -277,38 +289,45 @@ class HotStreamFactory(
     suspend fun incomingMessages(
         contextHandle: Long,
         replay: Int = 0,
-    ): SharedFlow<String> = messageMutex.withLock {
-        val existing = activeMessageSubscriptions[contextHandle]
-        if (existing != null) return@withLock existing.readOnly
+    ): SharedFlow<String> =
+        messageMutex.withLock {
+            val existing = activeMessageSubscriptions[contextHandle]
+            if (existing != null) return@withLock existing.readOnly
 
-        val sharedFlow = MutableSharedFlow<String>(
-            replay = replay,
-            extraBufferCapacity = BUFFER_CAPACITY,
-            onBufferOverflow = BufferOverflow.DROP_OLDEST,
-        )
-        val readOnly = sharedFlow.asSharedFlow()
+            val sharedFlow =
+                MutableSharedFlow<String>(
+                    replay = replay,
+                    extraBufferCapacity = BUFFER_CAPACITY,
+                    onBufferOverflow = BufferOverflow.DROP_OLDEST,
+                )
+            val readOnly = sharedFlow.asSharedFlow()
 
-        val callback = object : MessageCallback {
-            override fun onMessage(messageJson: String) {
-                sharedFlow.tryEmit(messageJson)
-            }
+            val callback =
+                object : MessageCallback {
+                    override fun onMessage(messageJson: String) {
+                        sharedFlow.tryEmit(messageJson)
+                    }
 
-            override fun onError(code: String, message: String) {
-                sharedFlow.tryEmit("""{"_error":true,"code":"$code","message":"$message"}""")
-            }
+                    override fun onError(
+                        code: String,
+                        message: String,
+                    ) {
+                        sharedFlow.tryEmit("""{"_error":true,"code":"$code","message":"$message"}""")
+                    }
 
-            override fun onComplete() {
-                activeMessageSubscriptions.remove(contextHandle)
-            }
+                    override fun onComplete() {
+                        activeMessageSubscriptions.remove(contextHandle)
+                    }
+                }
+
+            val subscriptionHandle =
+                withContext(ioDispatcher) {
+                    contextBindings.contextSubscribe(contextHandle, callback)
+                }
+
+            activeMessageSubscriptions[contextHandle] = HotStreamState(sharedFlow, readOnly, subscriptionHandle)
+            readOnly
         }
-
-        val subscriptionHandle = withContext(ioDispatcher) {
-            contextBindings.contextSubscribe(contextHandle, callback)
-        }
-
-        activeMessageSubscriptions[contextHandle] = HotStreamState(sharedFlow, readOnly, subscriptionHandle)
-        readOnly
-    }
 
     /**
      * Stop receiving context events for the given context handle.
@@ -384,38 +403,44 @@ fun ColdMessageFlow(
     contextBindings: ContextBindings,
     contextHandle: Long,
     ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
-): Flow<String> = callbackFlow {
-    val closed = AtomicBoolean(false)
+): Flow<String> =
+    callbackFlow {
+        val closed = AtomicBoolean(false)
 
-    val callback = object : MessageCallback {
-        override fun onMessage(messageJson: String) {
-            if (closed.get()) return
-            val result = trySend(messageJson)
-            if (result.isFailure && !result.isClosed) {
-                close(BridgeException("Message buffer overflow", "SCP-CTX-2001"))
+        val callback =
+            object : MessageCallback {
+                override fun onMessage(messageJson: String) {
+                    if (closed.get()) return
+                    val result = trySend(messageJson)
+                    if (result.isFailure && !result.isClosed) {
+                        close(BridgeException("Message buffer overflow", "SCP-CTX-2001"))
+                    }
+                }
+
+                override fun onError(
+                    code: String,
+                    message: String,
+                ) {
+                    close(BridgeException(message, code))
+                }
+
+                override fun onComplete() {
+                    close()
+                }
+            }
+
+        val subscriptionHandle =
+            withContext(ioDispatcher) {
+                contextBindings.contextSubscribe(contextHandle, callback)
+            }
+
+        awaitClose {
+            closed.set(true)
+            runBlocking(Dispatchers.IO) {
+                contextBindings.contextUnsubscribe(subscriptionHandle)
             }
         }
-
-        override fun onError(code: String, message: String) {
-            close(BridgeException(message, code))
-        }
-
-        override fun onComplete() {
-            close()
-        }
     }
-
-    val subscriptionHandle = withContext(ioDispatcher) {
-        contextBindings.contextSubscribe(contextHandle, callback)
-    }
-
-    awaitClose {
-        closed.set(true)
-        runBlocking(Dispatchers.IO) {
-            contextBindings.contextUnsubscribe(subscriptionHandle)
-        }
-    }
-}
 
 /**
  * Buffer capacity for hot streams (SharedFlow extraBufferCapacity).
