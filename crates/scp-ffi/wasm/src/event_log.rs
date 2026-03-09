@@ -332,13 +332,23 @@ pub fn event_log_checkpoint(
 
         // Decode the hex merkle root to raw bytes for cross-platform compatibility.
         let merkle_root_bytes: [u8; 32] = {
-            let decoded: Vec<u8> = (0..merkle_root_hex.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&merkle_root_hex[i..i + 2], 16).unwrap_or(0))
-                .collect();
+            let decoded = hex::decode(&merkle_root_hex).map_err(|e| {
+                ScpWasmError::Validation {
+                    message: format!("invalid merkle root hex: {e}"),
+                    code: "SCP-VALID-7000".to_owned(),
+                }
+                .into_js()
+            })?;
+            if decoded.len() != 32 {
+                return Err(ScpWasmError::Validation {
+                    message: format!("merkle root must be 32 bytes, got {}", decoded.len()),
+                    code: "SCP-VALID-7000".to_owned(),
+                }
+                .into_js()
+                .into());
+            }
             let mut arr = [0u8; 32];
-            let copy_len = decoded.len().min(32);
-            arr[..copy_len].copy_from_slice(&decoded[..copy_len]);
+            arr.copy_from_slice(&decoded);
             arr
         };
 
