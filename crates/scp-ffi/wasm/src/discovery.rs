@@ -108,12 +108,12 @@ fn classify_scope(scope: &str) -> &'static str {
 #[wasm_bindgen]
 pub fn discovery_parse_address(address: String) -> Result<String, JsError> {
     if address.is_empty() {
-        return Err(JsError::new("[SCP-DISC-6001] address must not be empty"));
+        return Err(JsError::new("[SCP-VALID-7100] address must not be empty"));
     }
 
     let Some(at_pos) = address.find('@') else {
         return Err(JsError::new(
-            "[SCP-DISC-6002] address must contain '@' separator",
+            "[SCP-VALID-7101] address must contain '@' separator",
         ));
     };
 
@@ -121,10 +121,10 @@ pub fn discovery_parse_address(address: String) -> Result<String, JsError> {
     let scope = &address[at_pos + 1..];
 
     if scope.is_empty() {
-        return Err(JsError::new("[SCP-DISC-6003] scope part must not be empty"));
+        return Err(JsError::new("[SCP-VALID-7102] scope part must not be empty"));
     }
 
-    validate_local_part(local).map_err(|e| JsError::new(&format!("[SCP-DISC-6004] {e}")))?;
+    validate_local_part(local).map_err(|e| JsError::new(&format!("[SCP-VALID-7103] {e}")))?;
 
     let address_type = classify_scope(scope);
 
@@ -192,7 +192,7 @@ pub fn discovery_create_query(
 ) -> Result<String, JsError> {
     if handle.is_none() && context_type.is_none() {
         return Err(JsError::new(
-            "[SCP-DISC-6010] at least one of handle or context_type must be provided",
+            "[SCP-VALID-7110] at least one of handle or context_type must be provided",
         ));
     }
 

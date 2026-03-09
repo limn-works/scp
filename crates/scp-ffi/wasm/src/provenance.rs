@@ -219,7 +219,7 @@ pub fn evaluate_provenance_quality(
 ) -> Result<u32, JsError> {
     let cs = ContextState::from_str(&context_state).ok_or_else(|| {
         JsError::new(&format!(
-            "[SCP-PROV-6100] invalid context_state: '{context_state}'"
+            "[SCP-VALID-7200] invalid context_state: '{context_state}'"
         ))
     })?;
 
@@ -233,7 +233,7 @@ pub fn evaluate_provenance_quality(
     };
 
     let st = SourceType::from_str(&st_str)
-        .ok_or_else(|| JsError::new(&format!("[SCP-PROV-6101] invalid source_type: '{st_str}'")))?;
+        .ok_or_else(|| JsError::new(&format!("[SCP-VALID-7201] invalid source_type: '{st_str}'")))?;
 
     Ok(compute_quality(true, &st, cs, has_counterparties))
 }
@@ -280,29 +280,29 @@ pub fn provenance_attach(
 ) -> Result<String, JsError> {
     if source_context_id.is_empty() {
         return Err(JsError::new(
-            "[SCP-PROV-6110] source_context_id must not be empty",
+            "[SCP-VALID-7210] source_context_id must not be empty",
         ));
     }
     if target_context_id.is_empty() {
         return Err(JsError::new(
-            "[SCP-PROV-6111] target_context_id must not be empty",
+            "[SCP-VALID-7211] target_context_id must not be empty",
         ));
     }
 
     let st = SourceType::from_str(&source_type).ok_or_else(|| {
         JsError::new(&format!(
-            "[SCP-PROV-6112] invalid source_type: '{source_type}'"
+            "[SCP-VALID-7212] invalid source_type: '{source_type}'"
         ))
     })?;
 
     let ms = MemoryScope::from_str(&memory_scope).ok_or_else(|| {
         JsError::new(&format!(
-            "[SCP-PROV-6113] invalid memory_scope: '{memory_scope}'"
+            "[SCP-VALID-7213] invalid memory_scope: '{memory_scope}'"
         ))
     })?;
 
     let counterparties: Vec<String> = serde_json::from_str(&counterparties_json)
-        .map_err(|e| JsError::new(&format!("[SCP-PROV-6114] invalid counterparties JSON: {e}")))?;
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7214] invalid counterparties JSON: {e}")))?;
 
     // Compute chain depth and path
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

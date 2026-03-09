@@ -38,7 +38,7 @@ struct DiscoveryTests {
         let mockParse: DiscoveryBridge.ParseAddressFn = { _ in
             throw ScpError.Validation(
                 message: "malformed address",
-                code: "SCP-DISC-8000"
+                code: "SCP-VALID-7100"
             )
         }
 

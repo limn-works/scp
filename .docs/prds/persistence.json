@@ -884,7 +884,7 @@
         },
         {
           "file": ".docs/adrs/phase-1.md",
-          "section": "## ADR-006: In-Memory Platform Adapter (Testing)"
+          "section": "## ADR-006: Platform Abstraction (In-Memory Testing Adapter)"
         }
       ],
       "details": {

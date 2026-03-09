@@ -65,7 +65,7 @@ struct ProvenanceTests {
         let mockEvaluate: ProvenanceBridge.EvaluateQualityFn = { _, _, _, _ in
             throw ScpError.Validation(
                 message: "invalid source type",
-                code: "SCP-PROV-6101"
+                code: "SCP-VALID-7201"
             )
         }
 
