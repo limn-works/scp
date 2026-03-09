@@ -193,7 +193,7 @@ public actor Context {
         let capturedHandle = handle
         let capturedCloseFn = closeFn
         streamContinuation?.finish()
-        Task {
+        Task.detached {
             try? await capturedCloseFn(capturedHandle)
         }
     }
