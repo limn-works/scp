@@ -165,14 +165,8 @@ struct ConformanceTests {
                 proofType: "inclusion",
                 detailsJson: "{}"
             )
-            do {
-                let valid = try await EventLog.verifyInclusion(proof)
-                return ["is_valid": String(valid)]
-            } catch let error as ScpError {
-                return ["error": errorCode(error)]
-            } catch {
-                return ["error": "unknown"]
-            }
+            let valid = EventLog.verifyInclusion(proof)
+            return ["is_valid": String(valid)]
 
         default:
             return ["error": "unsupported_operation"]

@@ -264,8 +264,8 @@ struct EventLogTests {
         let validProof = Proof(verified: true, proofType: "inclusion", detailsJson: "{}")
         let invalidProof = Proof(verified: false, proofType: "inclusion", detailsJson: "{}")
 
-        let validResult = try await EventLog.verifyInclusion(validProof)
-        let invalidResult = try await EventLog.verifyInclusion(invalidProof)
+        let validResult = EventLog.verifyInclusion(validProof)
+        let invalidResult = EventLog.verifyInclusion(invalidProof)
 
         #expect(validResult == true)
         #expect(invalidResult == false)

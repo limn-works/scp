@@ -194,7 +194,7 @@ public nonisolated struct EventLog: Sendable {
     ///
     /// - Parameter proof: The proof to verify.
     /// - Returns: `true` if the proof is valid.
-    public static func verifyInclusion(_ proof: Proof) async throws -> Bool {
-        return proof.verified
+    public static func verifyInclusion(_ proof: Proof) -> Bool {
+        proof.verified
     }
 }
