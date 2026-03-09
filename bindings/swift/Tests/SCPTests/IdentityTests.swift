@@ -128,4 +128,147 @@ struct IdentityTests {
         #expect(identity.did() == "")
         #expect(identity.custodyType() == "")
     }
+
+    // MARK: - Device Attestation
+
+    @Test("identityAttestDevice calls bridge and returns token")
+    func identityAttestDeviceRoundtrip() async throws {
+        let identity = MockIdentity(did: "did:dht:z6MkAttest", custodyType: "in_memory")
+
+        var receivedIdentity: Identity?
+        let mockAttest: IdentityBridge.AttestDeviceFn = { identity in
+            receivedIdentity = identity
+            return "dGVzdC1hdHRlc3RhdGlvbi10b2tlbg=="
+        }
+
+        let token = try await identityAttestDevice(identity, attestDeviceFn: mockAttest)
+        #expect(token == "dGVzdC1hdHRlc3RhdGlvbi10b2tlbg==")
+        #expect(receivedIdentity?.did() == "did:dht:z6MkAttest")
+    }
+
+    @Test("identityAttestDevice propagates bridge errors")
+    func identityAttestDevicePropagatesBridgeErrors() async throws {
+        let identity = MockIdentity(did: "did:dht:z6MkFail", custodyType: "external")
+
+        let mockAttest: IdentityBridge.AttestDeviceFn = { _ in
+            throw ScpError.Identity(
+                message: "device attestation requires retained identity state",
+                code: "SCP-IDENT-1007"
+            )
+        }
+
+        do {
+            _ = try await identityAttestDevice(identity, attestDeviceFn: mockAttest)
+            Issue.record("Expected identityAttestDevice to throw")
+        } catch let error as ScpError {
+            if case let .Identity(message, code) = error {
+                #expect(code == "SCP-IDENT-1007")
+                #expect(message.contains("retained identity state"))
+            } else {
+                Issue.record("Expected ScpError.Identity, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    @Test("identityAttestDevice default throws descriptive error")
+    func identityAttestDeviceDefaultThrows() async throws {
+        let identity = MockIdentity(did: "did:dht:z6MkDefault", custodyType: "in_memory")
+
+        do {
+            _ = try await identityAttestDevice(identity)
+            Issue.record("Expected default to throw")
+        } catch let error as ScpError {
+            if case let .Identity(message, code) = error {
+                #expect(code == "SCP-IDENT-1010")
+                #expect(message.contains("not yet available"))
+            } else {
+                Issue.record("Expected ScpError.Identity, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    @Test("identityVerifyDeviceAttestation calls bridge and returns result")
+    func identityVerifyDeviceAttestationRoundtrip() async throws {
+        var receivedDid: String?
+        var receivedToken: String?
+        let mockVerify: IdentityBridge.VerifyDeviceAttestationFn = { did, tokenBase64 in
+            receivedDid = did
+            receivedToken = tokenBase64
+            return true
+        }
+
+        let result = try await identityVerifyDeviceAttestation(
+            did: "did:dht:z6MkVerify",
+            tokenBase64: "dGVzdA==",
+            verifyDeviceAttestationFn: mockVerify
+        )
+        #expect(result == true)
+        #expect(receivedDid == "did:dht:z6MkVerify")
+        #expect(receivedToken == "dGVzdA==")
+    }
+
+    @Test("identityVerifyDeviceAttestation returns false for invalid token")
+    func identityVerifyDeviceAttestationReturnsFalse() async throws {
+        let mockVerify: IdentityBridge.VerifyDeviceAttestationFn = { _, _ in
+            false
+        }
+
+        let result = try await identityVerifyDeviceAttestation(
+            did: "did:dht:z6MkVerify",
+            tokenBase64: "aW52YWxpZA==",
+            verifyDeviceAttestationFn: mockVerify
+        )
+        #expect(result == false)
+    }
+
+    @Test("identityVerifyDeviceAttestation propagates bridge errors")
+    func identityVerifyDeviceAttestationPropagatesBridgeErrors() async throws {
+        let mockVerify: IdentityBridge.VerifyDeviceAttestationFn = { _, _ in
+            throw ScpError.Identity(
+                message: "invalid base64 attestation token",
+                code: "SCP-IDENT-1011"
+            )
+        }
+
+        do {
+            _ = try await identityVerifyDeviceAttestation(
+                did: "did:dht:z6MkVerify",
+                tokenBase64: "not-base64",
+                verifyDeviceAttestationFn: mockVerify
+            )
+            Issue.record("Expected error to propagate")
+        } catch let error as ScpError {
+            if case let .Identity(_, code) = error {
+                #expect(code == "SCP-IDENT-1011")
+            } else {
+                Issue.record("Expected ScpError.Identity, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    @Test("identityVerifyDeviceAttestation default throws descriptive error")
+    func identityVerifyDeviceAttestationDefaultThrows() async throws {
+        do {
+            _ = try await identityVerifyDeviceAttestation(
+                did: "did:dht:z6MkDefault",
+                tokenBase64: "dGVzdA=="
+            )
+            Issue.record("Expected default to throw")
+        } catch let error as ScpError {
+            if case let .Identity(message, code) = error {
+                #expect(code == "SCP-IDENT-1012")
+                #expect(message.contains("not yet available"))
+            } else {
+                Issue.record("Expected ScpError.Identity, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
 } // end IdentityTests

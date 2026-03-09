@@ -66,6 +66,129 @@ public enum MemberRole: String, Sendable {
     }
 }
 
+// MARK: - ContextLifecycleBridge
+
+/// Namespace for UniFFI bridge function references used by context lifecycle
+/// operations beyond basic create/join/leave/close (drain events, TTL, export/import).
+enum ContextLifecycleBridge {
+    /// Drain pending events from a context.
+    typealias DrainEventsFn = @Sendable (
+        _ handle: ContextHandle
+    ) async throws -> [String]
+
+    /// Handle TTL expiry for a context.
+    typealias HandleTtlExpiryFn = @Sendable (
+        _ handle: ContextHandle
+    ) async throws -> Void
+
+    /// Propose a TTL extension with member consent.
+    typealias ProposeTtlExtensionFn = @Sendable (
+        _ handle: ContextHandle,
+        _ memberDid: String,
+        _ proposedSeconds: UInt64
+    ) async throws -> Bool
+
+    /// Reset the TTL timer after unanimous extension.
+    typealias ResetTtlTimerFn = @Sendable (
+        _ handle: ContextHandle,
+        _ newSeconds: UInt64
+    ) async throws -> Void
+
+    /// Export a context's full state as serialized bytes.
+    typealias ExportFn = @Sendable (
+        _ handle: ContextHandle
+    ) async throws -> Data
+
+    /// Import a context from serialized bytes.
+    typealias ImportFn = @Sendable (
+        _ data: Data
+    ) async throws -> String
+
+    /// Register a DID as locally controlled.
+    typealias RegisterLocalDidFn = @Sendable (
+        _ did: String
+    ) async throws -> Void
+
+    /// Check if a DID is registered as locally controlled.
+    typealias IsLocalDidFn = @Sendable (
+        _ did: String
+    ) async throws -> Bool
+
+    /// Verify participation requirements via the UniFFI bridge.
+    typealias VerifyParticipationRequirementsFn = @Sendable (
+        _ profileJson: String,
+        _ requirementsJson: String
+    ) throws -> Bool
+
+    static let defaultDrainEvents: DrainEventsFn = { handle in
+        await contextDrainEvents(handle: handle)
+    }
+
+    static let defaultHandleTtlExpiry: HandleTtlExpiryFn = { handle in
+        try await contextHandleTtlExpiry(handle: handle)
+    }
+
+    static let defaultProposeTtlExtension: ProposeTtlExtensionFn = { handle, memberDid, proposedSeconds in
+        try await contextProposeTtlExtension(
+            handle: handle, memberDid: memberDid, proposedSeconds: proposedSeconds
+        )
+    }
+
+    static let defaultResetTtlTimer: ResetTtlTimerFn = { handle, newSeconds in
+        await contextResetTtlTimer(handle: handle, newSeconds: newSeconds)
+    }
+
+    /// Default export function.
+    ///
+    /// ``contextExport`` is not yet available in the UniFFI-generated bindings
+    /// (ScpBindings.swift). The default throws a descriptive error. Inject a
+    /// real closure in production once the UniFFI bridge is regenerated, or
+    /// in tests via the injectable parameter.
+    static let defaultExport: ExportFn = { _ in
+        throw ScpError.Context(
+            message: "contextExport is not yet available in the UniFFI-generated bindings. "
+                + "Regenerate ScpBindings.swift or inject a bridge function.",
+            code: "SCP-CTX-2030"
+        )
+    }
+
+    /// Default import function.
+    ///
+    /// ``contextImport`` is not yet available in the UniFFI-generated bindings
+    /// (ScpBindings.swift). The default throws a descriptive error.
+    static let defaultImport: ImportFn = { _ in
+        throw ScpError.Context(
+            message: "contextImport is not yet available in the UniFFI-generated bindings. "
+                + "Regenerate ScpBindings.swift or inject a bridge function.",
+            code: "SCP-CTX-2032"
+        )
+    }
+
+    static let defaultRegisterLocalDid: RegisterLocalDidFn = { did in
+        await registerLocalDid(did: did)
+    }
+
+    static let defaultIsLocalDid: IsLocalDidFn = { did in
+        await isLocalDid(did: did)
+    }
+
+    /// Default verify participation requirements function.
+    ///
+    /// ``verifyParticipationRequirements`` is not yet available in the
+    /// UniFFI-generated bindings (ScpBindings.swift). The default throws
+    /// a descriptive error. Use the pure-Swift
+    /// ``verifyParticipationRequirements(requirement:profile:)`` in
+    /// Trust.swift for local verification.
+    static let defaultVerifyParticipationRequirements: VerifyParticipationRequirementsFn = { _, _ in
+        throw ScpError.Validation(
+            message: "verifyParticipationRequirements is not yet available in the UniFFI-generated "
+                + "bindings. Use the pure-Swift verifyParticipationRequirements(requirement:profile:) "
+                + "or regenerate ScpBindings.swift.",
+            code: "SCP-VALID-7030"
+        )
+    }
+}
+
 // MARK: - GovernanceBridge
 
 /// Namespace for UniFFI bridge function references used by governance operations.
@@ -527,4 +650,238 @@ public extension Context {
         }
         return try await admissionFn(contextHandle)
     }
+}
+
+// MARK: - Context Lifecycle Extensions
+
+public extension Context {
+    /// Drains all pending events from this context.
+    ///
+    /// Returns event descriptions as strings. The events are consumed (removed
+    /// from the internal queue) by this call.
+    ///
+    /// - Parameter drainEventsFn: Bridge function override for testing.
+    /// - Returns: An array of event description strings.
+    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active.
+    func drainEvents(
+        drainEventsFn: ContextLifecycleBridge.DrainEventsFn =
+            ContextLifecycleBridge.defaultDrainEvents
+    ) async throws -> [String] {
+        guard state == .active else {
+            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        return try await drainEventsFn(contextHandle)
+    }
+
+    /// Handles TTL expiry for this context.
+    ///
+    /// Transitions the context from active to expired, destroying keys per
+    /// the context's memory scope policy.
+    ///
+    /// - Parameter handleTtlExpiryFn: Bridge function override for testing.
+    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active.
+    func handleTtlExpiry(
+        handleTtlExpiryFn: ContextLifecycleBridge.HandleTtlExpiryFn =
+            ContextLifecycleBridge.defaultHandleTtlExpiry
+    ) async throws {
+        guard state == .active else {
+            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        try await handleTtlExpiryFn(contextHandle)
+        state = .expired
+    }
+
+    /// Proposes a TTL extension for this context.
+    ///
+    /// Records consent from the given member for the proposed extension
+    /// duration. Returns `true` when all members have consented (unanimous
+    /// approval).
+    ///
+    /// - Parameters:
+    ///   - memberDid: The DID of the member consenting to the extension.
+    ///   - proposedSeconds: The proposed TTL extension duration in seconds.
+    ///   - proposeTtlExtensionFn: Bridge function override for testing.
+    /// - Returns: `true` if all members have consented, `false` otherwise.
+    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not
+    ///   active or the member is not found.
+    func proposeTtlExtension(
+        memberDid: String,
+        proposedSeconds: UInt64,
+        proposeTtlExtensionFn: ContextLifecycleBridge.ProposeTtlExtensionFn =
+            ContextLifecycleBridge.defaultProposeTtlExtension
+    ) async throws -> Bool {
+        guard state == .active else {
+            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        return try await proposeTtlExtensionFn(contextHandle, memberDid, proposedSeconds)
+    }
+
+    /// Resets the TTL timer after a successful unanimous extension.
+    ///
+    /// Cancels the old timer and spawns a new one with the given duration.
+    /// Call this after ``proposeTtlExtension(memberDid:proposedSeconds:proposeTtlExtensionFn:)``
+    /// returns `true`.
+    ///
+    /// - Parameters:
+    ///   - newSeconds: The new TTL duration in seconds.
+    ///   - resetTtlTimerFn: Bridge function override for testing.
+    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active.
+    func resetTtlTimer(
+        newSeconds: UInt64,
+        resetTtlTimerFn: ContextLifecycleBridge.ResetTtlTimerFn =
+            ContextLifecycleBridge.defaultResetTtlTimer
+    ) async throws {
+        guard state == .active else {
+            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        try await resetTtlTimerFn(contextHandle, newSeconds)
+    }
+
+    /// Exports this context's full state as serialized bytes.
+    ///
+    /// Returns the serialized bytes of a `StoredValue<ContextExport>` envelope
+    /// (spec section 17.5), suitable for backup, migration, or transfer to
+    /// another node.
+    ///
+    /// - Parameter exportFn: Bridge function override for testing.
+    /// - Returns: The serialized context state as `Data`.
+    /// - Throws: ``ScpError/Context(message:code:)`` if export fails.
+    func exportContext(
+        exportFn: ContextLifecycleBridge.ExportFn = ContextLifecycleBridge.defaultExport
+    ) async throws -> Data {
+        guard state == .active else {
+            throw ScpError.Context(message: "Context is not active", code: "SCP-CTX-2001")
+        }
+        guard let contextHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "Context handle is not a UniFFI ContextHandle",
+                code: "SCP-CTX-2002"
+            )
+        }
+        return try await exportFn(contextHandle)
+    }
+}
+
+// MARK: - Context Import (free function)
+
+/// Imports a context from serialized bytes.
+///
+/// The bytes must be a `StoredValue<ContextExport>` envelope (spec section
+/// 17.5), as produced by ``Context/exportContext(exportFn:)``.
+///
+/// - Parameters:
+///   - data: The serialized context state.
+///   - importFn: Bridge function override for testing.
+/// - Returns: The context ID of the imported context.
+/// - Throws: ``ScpError/Context(message:code:)`` if deserialization,
+///   validation, or import fails.
+///
+/// ## Provenance
+///
+/// - Spec section 17.5
+public func importContext(
+    data: Data,
+    importFn: ContextLifecycleBridge.ImportFn = ContextLifecycleBridge.defaultImport
+) async throws -> String {
+    try await importFn(data)
+}
+
+// MARK: - Local DID Management
+
+/// Registers a DID as locally controlled by this node/SDK.
+///
+/// Used for defense-in-depth validation in broadcast key request handling.
+///
+/// - Parameters:
+///   - did: The DID string to register as local.
+///   - registerLocalDidFn: Bridge function override for testing.
+///
+/// ## Provenance
+///
+/// - Spec section 5.14 (Broadcast)
+public func registerLocalDid(
+    did: String,
+    registerLocalDidFn: ContextLifecycleBridge.RegisterLocalDidFn =
+        ContextLifecycleBridge.defaultRegisterLocalDid
+) async throws {
+    try await registerLocalDidFn(did)
+}
+
+/// Checks whether a DID is registered as locally controlled.
+///
+/// - Parameters:
+///   - did: The DID string to check.
+///   - isLocalDidFn: Bridge function override for testing.
+/// - Returns: `true` if the DID is locally registered, `false` otherwise.
+///
+/// ## Provenance
+///
+/// - Spec section 5.14 (Broadcast)
+public func isLocalDid(
+    did: String,
+    isLocalDidFn: ContextLifecycleBridge.IsLocalDidFn =
+        ContextLifecycleBridge.defaultIsLocalDid
+) async throws -> Bool {
+    try await isLocalDidFn(did)
+}
+
+// MARK: - Participation Requirements (Bridge)
+
+/// Verifies participation profiles against admission requirements via the
+/// UniFFI bridge.
+///
+/// Both inputs are JSON strings:
+/// - `profileJson`: JSON array of participation profile objects.
+/// - `requirementsJson`: JSON array of participation requirement objects.
+///
+/// Uses the current system time for freshness checks. Returns `true` if all
+/// requirements are satisfied.
+///
+/// For a pure-Swift version that uses typed ``RequireParticipation`` and
+/// ``ParticipationProfile`` inputs, see
+/// ``verifyParticipationRequirements(requirement:profile:)`` in Trust.swift.
+///
+/// - Parameters:
+///   - profileJson: JSON string of participation profiles.
+///   - requirementsJson: JSON string of participation requirements.
+///   - verifyFn: Bridge function override for testing.
+/// - Returns: `true` if all requirements are satisfied.
+/// - Throws: ``ScpError/Validation(message:code:)`` if JSON parsing fails
+///   or a requirement is not met.
+///
+/// ## Provenance
+///
+/// - Spec section 23.7 (Participation Requirements)
+/// - ADR-017 Layer 2
+public func verifyParticipationRequirementsBridge(
+    profileJson: String,
+    requirementsJson: String,
+    verifyFn: ContextLifecycleBridge.VerifyParticipationRequirementsFn =
+        ContextLifecycleBridge.defaultVerifyParticipationRequirements
+) throws -> Bool {
+    try verifyFn(profileJson, requirementsJson)
 }

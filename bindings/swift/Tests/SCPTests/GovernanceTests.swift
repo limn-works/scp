@@ -875,4 +875,305 @@ struct GovernanceTests {
             Issue.record("Expected ScpError, got \(type(of: error))")
         }
     }
+
+    // MARK: - Context Lifecycle Extension tests
+
+    @Test("drainEvents calls bridge and returns event list")
+    func drainEventsRoundtrip() async throws {
+        let context = makeActiveContext()
+
+        let mockDrain: ContextLifecycleBridge.DrainEventsFn = { _ in
+            ["MemberJoined(did:dht:z6MkAlice)", "MessageSent(payload_len=42)"]
+        }
+
+        let events = try await context.drainEvents(drainEventsFn: mockDrain)
+        #expect(events.count == 2)
+        #expect(events[0].contains("MemberJoined"))
+        #expect(events[1].contains("MessageSent"))
+    }
+
+    @Test("drainEvents returns empty array when no events")
+    func drainEventsEmpty() async throws {
+        let context = makeActiveContext()
+
+        let mockDrain: ContextLifecycleBridge.DrainEventsFn = { _ in [] }
+
+        let events = try await context.drainEvents(drainEventsFn: mockDrain)
+        #expect(events.isEmpty)
+    }
+
+    @Test("drainEvents throws SCP-CTX-2001 when context is closed")
+    func drainEventsThrowsWhenClosed() async throws {
+        let context = try await makeClosedContext()
+
+        do {
+            _ = try await context.drainEvents()
+            Issue.record("Expected drainEvents to throw on closed context")
+        } catch let error as ScpError {
+            if case let .Context(_, code) = error {
+                #expect(code == "SCP-CTX-2001")
+            } else {
+                Issue.record("Expected ScpError.Context, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    @Test("handleTtlExpiry calls bridge and transitions state to expired")
+    func handleTtlExpiryRoundtrip() async throws {
+        let context = makeActiveContext()
+
+        var called = false
+        let mockExpiry: ContextLifecycleBridge.HandleTtlExpiryFn = { _ in
+            called = true
+        }
+
+        try await context.handleTtlExpiry(handleTtlExpiryFn: mockExpiry)
+        #expect(called)
+        #expect(context.state == .expired)
+    }
+
+    @Test("handleTtlExpiry throws SCP-CTX-2001 when context is closed")
+    func handleTtlExpiryThrowsWhenClosed() async throws {
+        let context = try await makeClosedContext()
+
+        do {
+            try await context.handleTtlExpiry()
+            Issue.record("Expected handleTtlExpiry to throw on closed context")
+        } catch let error as ScpError {
+            if case let .Context(_, code) = error {
+                #expect(code == "SCP-CTX-2001")
+            } else {
+                Issue.record("Expected ScpError.Context, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    @Test("proposeTtlExtension calls bridge with member DID and duration")
+    func proposeTtlExtensionRoundtrip() async throws {
+        let context = makeActiveContext()
+
+        var receivedDid: String?
+        var receivedSeconds: UInt64?
+        let mockPropose: ContextLifecycleBridge.ProposeTtlExtensionFn = { _, did, seconds in
+            receivedDid = did
+            receivedSeconds = seconds
+            return true
+        }
+
+        let unanimous = try await context.proposeTtlExtension(
+            memberDid: "did:dht:z6MkAlice",
+            proposedSeconds: 3600,
+            proposeTtlExtensionFn: mockPropose
+        )
+        #expect(unanimous == true)
+        #expect(receivedDid == "did:dht:z6MkAlice")
+        #expect(receivedSeconds == 3600)
+    }
+
+    @Test("proposeTtlExtension returns false when not unanimous")
+    func proposeTtlExtensionNotUnanimous() async throws {
+        let context = makeActiveContext()
+
+        let mockPropose: ContextLifecycleBridge.ProposeTtlExtensionFn = { _, _, _ in false }
+
+        let result = try await context.proposeTtlExtension(
+            memberDid: "did:dht:z6MkBob",
+            proposedSeconds: 7200,
+            proposeTtlExtensionFn: mockPropose
+        )
+        #expect(result == false)
+    }
+
+    @Test("proposeTtlExtension throws SCP-CTX-2001 when context is closed")
+    func proposeTtlExtensionThrowsWhenClosed() async throws {
+        let context = try await makeClosedContext()
+
+        do {
+            _ = try await context.proposeTtlExtension(
+                memberDid: "did:dht:z6MkAlice",
+                proposedSeconds: 3600
+            )
+            Issue.record("Expected proposeTtlExtension to throw on closed context")
+        } catch let error as ScpError {
+            if case let .Context(_, code) = error {
+                #expect(code == "SCP-CTX-2001")
+            } else {
+                Issue.record("Expected ScpError.Context, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    @Test("resetTtlTimer calls bridge with new duration")
+    func resetTtlTimerRoundtrip() async throws {
+        let context = makeActiveContext()
+
+        var receivedSeconds: UInt64?
+        let mockReset: ContextLifecycleBridge.ResetTtlTimerFn = { _, seconds in
+            receivedSeconds = seconds
+        }
+
+        try await context.resetTtlTimer(newSeconds: 7200, resetTtlTimerFn: mockReset)
+        #expect(receivedSeconds == 7200)
+    }
+
+    @Test("resetTtlTimer throws SCP-CTX-2001 when context is closed")
+    func resetTtlTimerThrowsWhenClosed() async throws {
+        let context = try await makeClosedContext()
+
+        do {
+            try await context.resetTtlTimer(newSeconds: 3600)
+            Issue.record("Expected resetTtlTimer to throw on closed context")
+        } catch let error as ScpError {
+            if case let .Context(_, code) = error {
+                #expect(code == "SCP-CTX-2001")
+            } else {
+                Issue.record("Expected ScpError.Context, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    @Test("exportContext calls bridge and returns data")
+    func exportContextRoundtrip() async throws {
+        let context = makeActiveContext()
+
+        let mockExport: ContextLifecycleBridge.ExportFn = { _ in
+            Data("exported-context-data".utf8)
+        }
+
+        let data = try await context.exportContext(exportFn: mockExport)
+        #expect(String(data: data, encoding: .utf8) == "exported-context-data")
+    }
+
+    @Test("exportContext throws SCP-CTX-2001 when context is closed")
+    func exportContextThrowsWhenClosed() async throws {
+        let context = try await makeClosedContext()
+
+        do {
+            _ = try await context.exportContext()
+            Issue.record("Expected exportContext to throw on closed context")
+        } catch let error as ScpError {
+            if case let .Context(_, code) = error {
+                // SCP-CTX-2001 (not active) or SCP-CTX-2030 (default stub)
+                #expect(code == "SCP-CTX-2001")
+            } else {
+                Issue.record("Expected ScpError.Context, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    @Test("importContext calls bridge and returns context ID")
+    func importContextRoundtrip() async throws {
+        let mockImport: ContextLifecycleBridge.ImportFn = { _ in
+            "ctx-imported-123"
+        }
+
+        let contextId = try await importContext(
+            data: Data("serialized".utf8),
+            importFn: mockImport
+        )
+        #expect(contextId == "ctx-imported-123")
+    }
+
+    @Test("importContext default throws descriptive error")
+    func importContextDefaultThrows() async throws {
+        do {
+            _ = try await importContext(data: Data("invalid".utf8))
+            Issue.record("Expected default to throw")
+        } catch let error as ScpError {
+            if case let .Context(message, code) = error {
+                #expect(code == "SCP-CTX-2032")
+                #expect(message.contains("not yet available"))
+            } else {
+                Issue.record("Expected ScpError.Context, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    // MARK: - Local DID Management tests
+
+    @Test("registerLocalDid calls bridge with DID")
+    func registerLocalDidRoundtrip() async throws {
+        var receivedDid: String?
+        let mockRegister: ContextLifecycleBridge.RegisterLocalDidFn = { did in
+            receivedDid = did
+        }
+
+        try await registerLocalDid(did: "did:dht:z6MkLocal", registerLocalDidFn: mockRegister)
+        #expect(receivedDid == "did:dht:z6MkLocal")
+    }
+
+    @Test("isLocalDid calls bridge and returns result")
+    func isLocalDidRoundtrip() async throws {
+        var receivedDid: String?
+        let mockIsLocal: ContextLifecycleBridge.IsLocalDidFn = { did in
+            receivedDid = did
+            return true
+        }
+
+        let result = try await isLocalDid(did: "did:dht:z6MkLocal", isLocalDidFn: mockIsLocal)
+        #expect(result == true)
+        #expect(receivedDid == "did:dht:z6MkLocal")
+    }
+
+    @Test("isLocalDid returns false for unregistered DID")
+    func isLocalDidReturnsFalse() async throws {
+        let mockIsLocal: ContextLifecycleBridge.IsLocalDidFn = { _ in false }
+
+        let result = try await isLocalDid(did: "did:dht:z6MkUnknown", isLocalDidFn: mockIsLocal)
+        #expect(result == false)
+    }
+
+    // MARK: - Participation Requirements Bridge tests
+
+    @Test("verifyParticipationRequirementsBridge calls bridge with JSON")
+    func verifyParticipationRequirementsBridgeRoundtrip() throws {
+        var receivedProfile: String?
+        var receivedRequirements: String?
+        let mockVerify: ContextLifecycleBridge.VerifyParticipationRequirementsFn = { profile, requirements in
+            receivedProfile = profile
+            receivedRequirements = requirements
+            return true
+        }
+
+        let result = try verifyParticipationRequirementsBridge(
+            profileJson: "[{}]",
+            requirementsJson: "[{}]",
+            verifyFn: mockVerify
+        )
+        #expect(result == true)
+        #expect(receivedProfile == "[{}]")
+        #expect(receivedRequirements == "[{}]")
+    }
+
+    @Test("verifyParticipationRequirementsBridge default throws descriptive error")
+    func verifyParticipationRequirementsBridgeDefaultThrows() throws {
+        do {
+            _ = try verifyParticipationRequirementsBridge(
+                profileJson: "[]",
+                requirementsJson: "[]"
+            )
+            Issue.record("Expected default to throw")
+        } catch let error as ScpError {
+            if case let .Validation(message, code) = error {
+                #expect(code == "SCP-VALID-7030")
+                #expect(message.contains("not yet available"))
+            } else {
+                Issue.record("Expected ScpError.Validation, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
 } // end GovernanceTests

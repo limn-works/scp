@@ -84,6 +84,45 @@ enum IdentityBridge {
     static let defaultRotateAgentKey: RotateAgentKeyFn = { identity in
         try await identity.rotateAgentKey()
     }
+
+    /// Generate a device attestation token for an identity.
+    typealias AttestDeviceFn = @Sendable (
+        _ identity: Identity
+    ) async throws -> String
+
+    /// Verify a device attestation token.
+    typealias VerifyDeviceAttestationFn = @Sendable (
+        _ did: String,
+        _ tokenBase64: String
+    ) async throws -> Bool
+
+    /// Default attest device function.
+    ///
+    /// ``identityAttestDevice`` is not yet available in the UniFFI-generated
+    /// bindings (ScpBindings.swift). The default throws a descriptive error.
+    /// Inject a real closure in production once the UniFFI bridge is
+    /// regenerated, or in tests via the injectable parameter.
+    static let defaultAttestDevice: AttestDeviceFn = { _ in
+        throw ScpError.Identity(
+            message: "identityAttestDevice is not yet available in the UniFFI-generated "
+                + "bindings. Regenerate ScpBindings.swift or inject a bridge function.",
+            code: "SCP-IDENT-1010"
+        )
+    }
+
+    /// Default verify device attestation function.
+    ///
+    /// ``identityVerifyDeviceAttestation`` is not yet available in the
+    /// UniFFI-generated bindings (ScpBindings.swift). The default throws
+    /// a descriptive error.
+    static let defaultVerifyDeviceAttestation: VerifyDeviceAttestationFn = { _, _ in
+        throw ScpError.Identity(
+            message: "identityVerifyDeviceAttestation is not yet available in the "
+                + "UniFFI-generated bindings. Regenerate ScpBindings.swift or inject "
+                + "a bridge function.",
+            code: "SCP-IDENT-1012"
+        )
+    }
 }
 
 // MARK: - Public API
@@ -195,4 +234,54 @@ public func rotateAgentKeyForIdentity(
     rotateAgentKeyFn: IdentityBridge.RotateAgentKeyFn = IdentityBridge.defaultRotateAgentKey
 ) async throws -> Identity {
     try await rotateAgentKeyFn(identity)
+}
+
+/// Generates a device attestation token for an identity.
+///
+/// Uses the platform's device attestation mechanism to produce a token
+/// proving the identity is bound to a physical device. The token is
+/// base64-encoded for transport.
+///
+/// - Parameters:
+///   - identity: The identity to attest. Must have been created via
+///     ``identityCreate`` (not ``identityLoad``).
+///   - attestDeviceFn: Bridge function override for testing.
+/// - Returns: A base64-encoded attestation token string.
+/// - Throws: ``ScpError`` if the identity was externally loaded or
+///   attestation generation fails.
+///
+/// ## Provenance
+///
+/// - Spec section 9.3 (Sybil Resistance and Identity Uniqueness)
+public func identityAttestDevice(
+    _ identity: Identity,
+    attestDeviceFn: IdentityBridge.AttestDeviceFn = IdentityBridge.defaultAttestDevice
+) async throws -> String {
+    try await attestDeviceFn(identity)
+}
+
+/// Verifies a device attestation token.
+///
+/// Checks that the base64-encoded attestation token is valid. The DID
+/// parameter is provided for API consistency (future use for binding
+/// verification).
+///
+/// - Parameters:
+///   - did: The DID string associated with the attestation.
+///   - tokenBase64: The base64-encoded attestation token to verify.
+///   - verifyDeviceAttestationFn: Bridge function override for testing.
+/// - Returns: `true` if the token is valid, `false` otherwise.
+/// - Throws: ``ScpError`` if base64 decoding fails or verification
+///   encounters an error.
+///
+/// ## Provenance
+///
+/// - Spec section 9.3 (Sybil Resistance and Identity Uniqueness)
+public func identityVerifyDeviceAttestation(
+    did: String,
+    tokenBase64: String,
+    verifyDeviceAttestationFn: IdentityBridge.VerifyDeviceAttestationFn =
+        IdentityBridge.defaultVerifyDeviceAttestation
+) async throws -> Bool {
+    try await verifyDeviceAttestationFn(did, tokenBase64)
 }
