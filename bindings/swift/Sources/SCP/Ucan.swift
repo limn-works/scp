@@ -98,6 +98,29 @@ enum UcanBridge {
     static let defaultRevoke: RevokeFn = { handle, token in
         try await ucanRevoke(handle: handle, token: token)
     }
+
+    /// Delegate a UCAN token. Maps to ``ucanDelegate`` in ScpBindings.
+    typealias DelegateFn = @Sendable (
+        _ handle: ContextHandle,
+        _ delegatorDid: String,
+        _ delegateeDid: String,
+        _ parentToken: String,
+        _ capabilities: [String]
+    ) async throws -> UcanToken
+
+    /// Default delegate function.
+    ///
+    /// ``ucanDelegate`` is not yet available in the UniFFI-generated bindings
+    /// (ScpBindings.swift). The default throws a descriptive error. Inject a
+    /// real closure in production once the UniFFI bridge is regenerated, or in
+    /// tests via the injectable parameter.
+    static let defaultDelegate: DelegateFn = { _, _, _, _, _ in
+        throw ScpError.Permission(
+            message: "ucanDelegate is not yet available in the UniFFI-generated "
+                + "bindings. Regenerate ScpBindings.swift or inject a bridge function.",
+            code: "SCP-PERM-3010"
+        )
+    }
 }
 
 // MARK: - UCAN Public API
@@ -179,6 +202,38 @@ public func revokeUcanToken(
     revokeFn: UcanBridge.RevokeFn = UcanBridge.defaultRevoke
 ) async throws {
     try await revokeFn(handle, token)
+}
+
+/// Delegates a UCAN token to another entity.
+///
+/// Creates a new UCAN token derived from a parent token with attenuated
+/// capabilities. The delegator must be the audience of the parent token.
+/// Delegated capabilities must be a subset of the parent's capabilities.
+///
+/// - Parameters:
+///   - handle: The ``ContextHandle`` for the context.
+///   - delegatorDid: The DID of the entity delegating (must match parent
+///     token's audience).
+///   - delegateeDid: The DID of the entity receiving the delegation.
+///   - parentToken: The encoded parent UCAN token (JWT format).
+///   - capabilities: Capability URI strings to delegate (subset of parent's).
+///   - delegateFn: Bridge function override for testing.
+/// - Returns: A ``UcanToken`` with the delegated token's metadata.
+/// - Throws: ``ScpError/Permission(message:code:)`` if delegation fails.
+///
+/// ## Provenance
+///
+/// - ADR-016 (UCAN) in `.docs/adrs/phase-3.md`, criterion 4
+/// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
+public func delegateUcanToken(
+    handle: ContextHandle,
+    delegatorDid: String,
+    delegateeDid: String,
+    parentToken: String,
+    capabilities: [String],
+    delegateFn: UcanBridge.DelegateFn = UcanBridge.defaultDelegate
+) async throws -> UcanToken {
+    try await delegateFn(handle, delegatorDid, delegateeDid, parentToken, capabilities)
 }
 
 // MARK: - Legacy API (backward compatibility)

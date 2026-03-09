@@ -549,4 +549,45 @@ struct ContextTests {
         let result = await task.value
         #expect(result == .active)
     }
+    // MARK: - Join context tests
+
+    @Test("joinContext calls bridge with handle and identity")
+    func joinContextRoundtrip() async throws {
+        let handle = ContextHandle(noPointer: .init())
+        let identity = Identity(noPointer: .init())
+        var joinCalled = false
+
+        let mockJoin: ContextBridge.JoinFn = { _, _ in
+            joinCalled = true
+        }
+
+        try await joinContext(handle: handle, identity: identity, joinFn: mockJoin)
+        #expect(joinCalled)
+    }
+
+    @Test("joinContext propagates bridge errors")
+    func joinContextPropagatesErrors() async throws {
+        let handle = ContextHandle(noPointer: .init())
+        let identity = Identity(noPointer: .init())
+
+        let mockJoin: ContextBridge.JoinFn = { _, _ in
+            throw ScpError.Context(
+                message: "cannot join context in Closed state",
+                code: "SCP-CTX-2013"
+            )
+        }
+
+        do {
+            try await joinContext(handle: handle, identity: identity, joinFn: mockJoin)
+            Issue.record("Expected joinContext to throw")
+        } catch let error as ScpError {
+            if case let .Context(_, code) = error {
+                #expect(code == "SCP-CTX-2013")
+            } else {
+                Issue.record("Expected ScpError.Context, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
 } // end ContextTests

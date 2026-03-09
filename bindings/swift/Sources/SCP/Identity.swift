@@ -30,6 +30,39 @@ import Foundation
 ///
 /// See ADR-039 (Agent Key Binding) and spec section 9.
 enum IdentityBridge {
+    /// Create a new identity with the specified custody method.
+    typealias CreateFn = @Sendable (
+        _ custody: String
+    ) async throws -> Identity
+
+    /// Load an existing identity by DID.
+    typealias LoadFn = @Sendable (
+        _ did: String
+    ) async throws -> Identity
+
+    /// Resolve a DID to its document.
+    typealias ResolveFn = @Sendable (
+        _ did: String
+    ) async throws -> DidDocument
+
+    /// Default create function — delegates to UniFFI
+    /// ``identityCreate(custody:)``.
+    static let defaultCreate: CreateFn = { custody in
+        try await identityCreate(custody: custody)
+    }
+
+    /// Default load function — delegates to UniFFI
+    /// ``identityLoad(did:)``.
+    static let defaultLoad: LoadFn = { did in
+        try await identityLoad(did: did)
+    }
+
+    /// Default resolve function — delegates to UniFFI
+    /// ``identityResolve(did:)``.
+    static let defaultResolve: ResolveFn = { did in
+        try await identityResolve(did: did)
+    }
+
     /// Check whether an identity has an agent signing key.
     typealias HasAgentKeyFn = @Sendable (
         _ identity: Identity
@@ -96,32 +129,16 @@ enum IdentityBridge {
         _ tokenBase64: String
     ) async throws -> Bool
 
-    /// Default attest device function.
-    ///
-    /// ``identityAttestDevice`` is not yet available in the UniFFI-generated
-    /// bindings (ScpBindings.swift). The default throws a descriptive error.
-    /// Inject a real closure in production once the UniFFI bridge is
-    /// regenerated, or in tests via the injectable parameter.
-    static let defaultAttestDevice: AttestDeviceFn = { _ in
-        throw ScpError.Identity(
-            message: "identityAttestDevice is not yet available in the UniFFI-generated "
-                + "bindings. Regenerate ScpBindings.swift or inject a bridge function.",
-            code: "SCP-IDENT-1010"
-        )
+    /// Default attest device function — delegates to UniFFI
+    /// ``identityAttestDevice(identity:)``.
+    static let defaultAttestDevice: AttestDeviceFn = { identity in
+        try await identityAttestDevice(identity: identity)
     }
 
-    /// Default verify device attestation function.
-    ///
-    /// ``identityVerifyDeviceAttestation`` is not yet available in the
-    /// UniFFI-generated bindings (ScpBindings.swift). The default throws
-    /// a descriptive error.
-    static let defaultVerifyDeviceAttestation: VerifyDeviceAttestationFn = { _, _ in
-        throw ScpError.Identity(
-            message: "identityVerifyDeviceAttestation is not yet available in the "
-                + "UniFFI-generated bindings. Regenerate ScpBindings.swift or inject "
-                + "a bridge function.",
-            code: "SCP-IDENT-1012"
-        )
+    /// Default verify device attestation function — delegates to UniFFI
+    /// ``identityVerifyDeviceAttestation(did:tokenBase64:)``.
+    static let defaultVerifyDeviceAttestation: VerifyDeviceAttestationFn = { did, tokenBase64 in
+        try await identityVerifyDeviceAttestation(did: did, tokenBase64: tokenBase64)
     }
 }
 
@@ -284,4 +301,78 @@ public func identityVerifyDeviceAttestation(
         IdentityBridge.defaultVerifyDeviceAttestation
 ) async throws -> Bool {
     try await verifyDeviceAttestationFn(did, tokenBase64)
+}
+
+/// Creates a new SCP identity with the specified custody method.
+///
+/// Delegates to the UniFFI ``identityCreate(custody:)`` bridge function.
+/// The custody method determines where private key material is stored:
+///
+/// - `"in_memory"` — Heap memory (dev/test only). Requires the
+///   `allow_in_memory_custody` feature.
+/// - `"platform"` — Secure Enclave (iOS) or Android Keystore (Android).
+///   Requires ``identityCreateWithCustody`` with a platform provider.
+///
+/// - Parameters:
+///   - custody: The custody method string (`"in_memory"` or `"platform"`).
+///   - createFn: Bridge function override for testing.
+/// - Returns: A new ``Identity`` instance.
+/// - Throws: ``ScpError/Identity(message:code:)`` if creation fails.
+///
+/// ## Provenance
+///
+/// - ADR-006 (Platform Abstraction)
+/// - Spec section 9 (Identity)
+public func createIdentity(
+    custody: String,
+    createFn: IdentityBridge.CreateFn = IdentityBridge.defaultCreate
+) async throws -> Identity {
+    try await createFn(custody)
+}
+
+/// Loads an existing SCP identity from storage by its DID.
+///
+/// Delegates to the UniFFI ``identityLoad(did:)`` bridge function.
+/// The returned identity is a DID-string-only handle without local key
+/// material. Key operations require a custody provider to be wired.
+///
+/// - Parameters:
+///   - did: The DID string to load (e.g., `"did:dht:z6Mk..."`).
+///   - loadFn: Bridge function override for testing.
+/// - Returns: An ``Identity`` handle for the loaded DID.
+/// - Throws: ``ScpError/Identity(message:code:)`` if the DID format is
+///   unsupported or the identity cannot be loaded.
+///
+/// ## Provenance
+///
+/// - ADR-006 (Platform Abstraction)
+/// - Spec section 9 (Identity)
+public func loadIdentity(
+    did: String,
+    loadFn: IdentityBridge.LoadFn = IdentityBridge.defaultLoad
+) async throws -> Identity {
+    try await loadFn(did)
+}
+
+/// Resolves a DID to its document.
+///
+/// Delegates to the UniFFI ``identityResolve(did:)`` bridge function.
+/// Performs DHT resolution and returns the document fields.
+///
+/// - Parameters:
+///   - did: The DID string to resolve (e.g., `"did:dht:z6Mk..."`).
+///   - resolveFn: Bridge function override for testing.
+/// - Returns: A ``DidDocument`` with the resolved document fields.
+/// - Throws: ``ScpError/Identity(message:code:)`` if the DID cannot be
+///   resolved (not found on DHT, invalid format, verification failure).
+///
+/// ## Provenance
+///
+/// - ADR-002 (DID)
+/// - Spec section 3 (Identity)
+public func resolveIdentity(
+    did: String,
+    resolveFn: IdentityBridge.ResolveFn = IdentityBridge.defaultResolve
+) async throws -> DidDocument {
+    try await resolveFn(did)
 }

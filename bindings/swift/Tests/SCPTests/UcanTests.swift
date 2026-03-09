@@ -295,4 +295,104 @@ struct UcanTests {
 
         #expect(revoked)
     }
+    // MARK: - Delegate via injectable bridge (async roundtrip)
+
+    @Test("delegateUcanToken calls bridge and returns delegated token")
+    func delegateRoundtrip() async throws {
+        let handle = ContextHandle(noPointer: .init())
+        let mockToken = MockUcanToken(
+            issuer: "did:dht:z6MkDelegator",
+            audience: "did:dht:z6MkDelegatee",
+            expiry: 1_700_090_000,
+            tokenId: "delegated-token-001",
+            capabilities: ["scp:ctx:abc/messages:read"]
+        )
+
+        var receivedDelegatorDid: String?
+        var receivedDelegateeDid: String?
+        var receivedParentToken: String?
+        var receivedCapabilities: [String]?
+
+        let mockDelegate: UcanBridge.DelegateFn = { _, delegatorDid, delegateeDid, parentToken, capabilities in
+            receivedDelegatorDid = delegatorDid
+            receivedDelegateeDid = delegateeDid
+            receivedParentToken = parentToken
+            receivedCapabilities = capabilities
+            return mockToken
+        }
+
+        let result = try await delegateUcanToken(
+            handle: handle,
+            delegatorDid: "did:dht:z6MkDelegator",
+            delegateeDid: "did:dht:z6MkDelegatee",
+            parentToken: "eyJhbGciOiJFZERTQSJ9.parent.sig",
+            capabilities: ["scp:ctx:abc/messages:read"],
+            delegateFn: mockDelegate
+        )
+
+        #expect(result.tokenId() == "delegated-token-001")
+        #expect(result.issuer() == "did:dht:z6MkDelegator")
+        #expect(result.audience() == "did:dht:z6MkDelegatee")
+        #expect(receivedDelegatorDid == "did:dht:z6MkDelegator")
+        #expect(receivedDelegateeDid == "did:dht:z6MkDelegatee")
+        #expect(receivedParentToken == "eyJhbGciOiJFZERTQSJ9.parent.sig")
+        #expect(receivedCapabilities == ["scp:ctx:abc/messages:read"])
+    }
+
+    @Test("delegateUcanToken propagates bridge errors")
+    func delegatePropagatesErrors() async throws {
+        let handle = ContextHandle(noPointer: .init())
+
+        let mockDelegate: UcanBridge.DelegateFn = { _, _, _, _, _ in
+            throw ScpError.Permission(
+                message: "capabilities wider than parent",
+                code: "SCP-PERM-3004"
+            )
+        }
+
+        do {
+            _ = try await delegateUcanToken(
+                handle: handle,
+                delegatorDid: "did:dht:z6MkDelegator",
+                delegateeDid: "did:dht:z6MkDelegatee",
+                parentToken: "eyJhbGciOiJFZERTQSJ9.parent.sig",
+                capabilities: ["scp:ctx:*/admin:*"],
+                delegateFn: mockDelegate
+            )
+            Issue.record("Expected delegateUcanToken to throw")
+        } catch let error as ScpError {
+            if case let .Permission(_, code) = error {
+                #expect(code == "SCP-PERM-3004")
+            } else {
+                Issue.record("Expected ScpError.Permission, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    @Test("delegateUcanToken default throws descriptive error")
+    func delegateDefaultThrows() async throws {
+        let handle = ContextHandle(noPointer: .init())
+
+        do {
+            _ = try await delegateUcanToken(
+                handle: handle,
+                delegatorDid: "did:dht:z6MkDelegator",
+                delegateeDid: "did:dht:z6MkDelegatee",
+                parentToken: "eyJhbGciOiJFZERTQSJ9.parent.sig",
+                capabilities: ["scp:ctx:abc/messages:read"]
+            )
+            Issue.record("Expected default to throw")
+        } catch let error as ScpError {
+            if case let .Permission(message, code) = error {
+                #expect(code == "SCP-PERM-3010")
+                #expect(message.contains("not yet available"))
+            } else {
+                Issue.record("Expected ScpError.Permission, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
 } // end UcanTests

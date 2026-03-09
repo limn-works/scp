@@ -271,4 +271,130 @@ struct IdentityTests {
             Issue.record("Expected ScpError, got \(type(of: error))")
         }
     }
+    // MARK: - Create Identity
+
+    @Test("createIdentity calls bridge and returns identity")
+    func createIdentityRoundtrip() async throws {
+        let mockIdentity = MockIdentity(did: "did:dht:z6MkCreated", custodyType: "in_memory")
+        var receivedCustody: String?
+
+        let mockCreate: IdentityBridge.CreateFn = { custody in
+            receivedCustody = custody
+            return mockIdentity
+        }
+
+        let result = try await createIdentity(custody: "in_memory", createFn: mockCreate)
+        #expect(result.did() == "did:dht:z6MkCreated")
+        #expect(receivedCustody == "in_memory")
+    }
+
+    @Test("createIdentity propagates bridge errors")
+    func createIdentityPropagatesErrors() async throws {
+        let mockCreate: IdentityBridge.CreateFn = { _ in
+            throw ScpError.Identity(
+                message: "in_memory custody not available",
+                code: "SCP-IDENT-1008"
+            )
+        }
+
+        do {
+            _ = try await createIdentity(custody: "in_memory", createFn: mockCreate)
+            Issue.record("Expected createIdentity to throw")
+        } catch let error as ScpError {
+            if case let .Identity(_, code) = error {
+                #expect(code == "SCP-IDENT-1008")
+            } else {
+                Issue.record("Expected ScpError.Identity, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    // MARK: - Load Identity
+
+    @Test("loadIdentity calls bridge and returns identity")
+    func loadIdentityRoundtrip() async throws {
+        let mockIdentity = MockIdentity(did: "did:dht:z6MkLoaded", custodyType: "external")
+        var receivedDid: String?
+
+        let mockLoad: IdentityBridge.LoadFn = { did in
+            receivedDid = did
+            return mockIdentity
+        }
+
+        let result = try await loadIdentity(did: "did:dht:z6MkLoaded", loadFn: mockLoad)
+        #expect(result.did() == "did:dht:z6MkLoaded")
+        #expect(receivedDid == "did:dht:z6MkLoaded")
+    }
+
+    @Test("loadIdentity propagates bridge errors for unsupported DID method")
+    func loadIdentityPropagatesErrors() async throws {
+        let mockLoad: IdentityBridge.LoadFn = { _ in
+            throw ScpError.Identity(
+                message: "unsupported DID method",
+                code: "SCP-IDENT-1004"
+            )
+        }
+
+        do {
+            _ = try await loadIdentity(did: "did:web:example.com", loadFn: mockLoad)
+            Issue.record("Expected loadIdentity to throw")
+        } catch let error as ScpError {
+            if case let .Identity(_, code) = error {
+                #expect(code == "SCP-IDENT-1004")
+            } else {
+                Issue.record("Expected ScpError.Identity, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    // MARK: - Resolve Identity
+
+    @Test("resolveIdentity calls bridge and returns DidDocument")
+    func resolveIdentityRoundtrip() async throws {
+        var receivedDid: String?
+
+        let mockResolve: IdentityBridge.ResolveFn = { did in
+            receivedDid = did
+            return DidDocument(
+                id: did,
+                authentication: ["#0"],
+                assertionMethods: ["#active"],
+                alsoKnownAs: [],
+                serviceEndpoints: ["https://relay.example.com"]
+            )
+        }
+
+        let doc = try await resolveIdentity(did: "did:dht:z6MkResolved", resolveFn: mockResolve)
+        #expect(doc.id == "did:dht:z6MkResolved")
+        #expect(doc.authentication == ["#0"])
+        #expect(doc.serviceEndpoints.count == 1)
+        #expect(receivedDid == "did:dht:z6MkResolved")
+    }
+
+    @Test("resolveIdentity propagates bridge errors")
+    func resolveIdentityPropagatesErrors() async throws {
+        let mockResolve: IdentityBridge.ResolveFn = { _ in
+            throw ScpError.Identity(
+                message: "DID not found on DHT",
+                code: "SCP-IDENT-1006"
+            )
+        }
+
+        do {
+            _ = try await resolveIdentity(did: "did:dht:z6MkUnknown", resolveFn: mockResolve)
+            Issue.record("Expected resolveIdentity to throw")
+        } catch let error as ScpError {
+            if case let .Identity(_, code) = error {
+                #expect(code == "SCP-IDENT-1006")
+            } else {
+                Issue.record("Expected ScpError.Identity, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
 } // end IdentityTests

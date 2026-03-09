@@ -115,6 +115,27 @@ enum EventLogBridge {
     static let defaultVerify: VerifyFn = { handle, claimJson in
         try await eventLogVerify(handle: handle, claimJson: claimJson)
     }
+
+    /// Generate a signed consistency checkpoint. Maps to ``eventLogCheckpoint``.
+    typealias CheckpointFn = @Sendable (
+        _ handle: ContextHandle,
+        _ identity: Identity,
+        _ epoch: UInt64
+    ) async throws -> Checkpoint
+
+    /// Default checkpoint function.
+    ///
+    /// ``eventLogCheckpoint`` is not yet available in the UniFFI-generated
+    /// bindings (ScpBindings.swift). The default throws a descriptive error.
+    /// Inject a real closure in production once the UniFFI bridge is
+    /// regenerated, or in tests via the injectable parameter.
+    static let defaultCheckpoint: CheckpointFn = { _, _, _ in
+        throw ScpError.Context(
+            message: "eventLogCheckpoint is not yet available in the UniFFI-generated "
+                + "bindings. Regenerate ScpBindings.swift or inject a bridge function.",
+            code: "SCP-CTX-2032"
+        )
+    }
 }
 
 // MARK: - EventLog
@@ -197,4 +218,37 @@ public nonisolated struct EventLog: Sendable {
     public static func verifyInclusion(_ proof: Proof) -> Bool {
         proof.verified
     }
+}
+
+// MARK: - Event Log Checkpoint (free function)
+
+/// Generates a signed consistency checkpoint for equivocation detection.
+///
+/// Members periodically exchange signed Merkle roots. If two members have
+/// different roots for the same event count, the relay is equivocating
+/// (showing different histories to different members).
+///
+/// Delegates to the UniFFI ``eventLogCheckpoint`` bridge function.
+///
+/// - Parameters:
+///   - handle: The ``ContextHandle`` for the context whose event log to
+///     checkpoint.
+///   - identity: The ``Identity`` generating the checkpoint (used for signing).
+///   - epoch: The current MLS epoch (pass 0 for broadcast contexts).
+///   - checkpointFn: Bridge function override for testing.
+/// - Returns: A ``Checkpoint`` containing the signed checkpoint data.
+/// - Throws: ``ScpError/Context(message:code:)`` if the context is not found.
+///   ``ScpError/Permission(message:code:)`` if key custody is not available.
+///
+/// ## Provenance
+///
+/// - ADR-011 (Event Log) acceptance criterion 8 in `.docs/adrs/phase-2.md`
+/// - ADR-030 (Pruning/Checkpointing)
+public func generateEventLogCheckpoint(
+    handle: ContextHandle,
+    identity: Identity,
+    epoch: UInt64,
+    checkpointFn: EventLogBridge.CheckpointFn = EventLogBridge.defaultCheckpoint
+) async throws -> Checkpoint {
+    try await checkpointFn(handle, identity, epoch)
 }

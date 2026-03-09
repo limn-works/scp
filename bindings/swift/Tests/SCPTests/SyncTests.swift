@@ -122,4 +122,68 @@ struct SyncTests {
 
         #expect(tier == "long")
     }
+
+    // MARK: - getSyncPolicy via injectable bridge (roundtrip)
+
+    @Test("getSyncPolicy calls bridge and returns policy JSON")
+    func getSyncPolicyRoundtrip() async throws {
+        var receivedContextId: String?
+
+        let mockGetPolicy: SyncBridge.GetPolicyFn = { contextId in
+            receivedContextId = contextId
+            return #"{"tier1_threshold_secs":14400,"tier2_threshold_secs":604800}"#
+        }
+
+        let result = try await getSyncPolicy(
+            contextId: "ctx-sync-001",
+            getPolicyFn: mockGetPolicy
+        )
+
+        #expect(result.contains("tier1_threshold_secs"))
+        #expect(result.contains("14400"))
+        #expect(receivedContextId == "ctx-sync-001")
+    }
+
+    @Test("getSyncPolicy propagates bridge errors")
+    func getSyncPolicyPropagatesErrors() async throws {
+        let mockGetPolicy: SyncBridge.GetPolicyFn = { _ in
+            throw ScpError.Context(
+                message: "context not found",
+                code: "SCP-CTX-2041"
+            )
+        }
+
+        do {
+            _ = try await getSyncPolicy(
+                contextId: "ctx-nonexistent",
+                getPolicyFn: mockGetPolicy
+            )
+            Issue.record("Expected getSyncPolicy to throw")
+        } catch let error as ScpError {
+            if case let .Context(_, code) = error {
+                #expect(code == "SCP-CTX-2041")
+            } else {
+                Issue.record("Expected ScpError.Context, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    @Test("getSyncPolicy default throws descriptive error")
+    func getSyncPolicyDefaultThrows() async throws {
+        do {
+            _ = try await getSyncPolicy(contextId: "ctx-default")
+            Issue.record("Expected default to throw")
+        } catch let error as ScpError {
+            if case let .Context(message, code) = error {
+                #expect(code == "SCP-CTX-2040")
+                #expect(message.contains("not yet available"))
+            } else {
+                Issue.record("Expected ScpError.Context, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
 } // end SyncTests

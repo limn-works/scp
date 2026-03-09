@@ -270,4 +270,96 @@ struct EventLogTests {
         #expect(validResult == true)
         #expect(invalidResult == false)
     }
+    // MARK: - Checkpoint generation via injectable bridge (async roundtrip)
+
+    @Test("generateEventLogCheckpoint calls bridge and returns checkpoint")
+    func checkpointRoundtrip() async throws {
+        let handle = ContextHandle(noPointer: .init())
+        let identity = Identity(noPointer: .init())
+
+        var receivedEpoch: UInt64?
+
+        let mockCheckpoint: EventLogBridge.CheckpointFn = { _, _, epoch in
+            receivedEpoch = epoch
+            return Checkpoint(
+                contextId: "ctx-checkpoint",
+                senderDid: "did:dht:z6MkSender",
+                eventCount: 50,
+                merkleRoot: Data(repeating: 0xAB, count: 32),
+                epoch: epoch,
+                timestamp: 1_700_000_000,
+                signature: Data(repeating: 0xCD, count: 64)
+            )
+        }
+
+        let checkpoint = try await generateEventLogCheckpoint(
+            handle: handle,
+            identity: identity,
+            epoch: 7,
+            checkpointFn: mockCheckpoint
+        )
+
+        #expect(checkpoint.contextId == "ctx-checkpoint")
+        #expect(checkpoint.senderDid == "did:dht:z6MkSender")
+        #expect(checkpoint.eventCount == 50)
+        #expect(checkpoint.epoch == 7)
+        #expect(checkpoint.merkleRoot.count == 32)
+        #expect(checkpoint.signature.count == 64)
+        #expect(receivedEpoch == 7)
+    }
+
+    @Test("generateEventLogCheckpoint propagates bridge errors")
+    func checkpointPropagatesErrors() async throws {
+        let handle = ContextHandle(noPointer: .init())
+        let identity = Identity(noPointer: .init())
+
+        let mockCheckpoint: EventLogBridge.CheckpointFn = { _, _, _ in
+            throw ScpError.Permission(
+                message: "event log checkpoint requires key custody",
+                code: "SCP-PERM-3008"
+            )
+        }
+
+        do {
+            _ = try await generateEventLogCheckpoint(
+                handle: handle,
+                identity: identity,
+                epoch: 0,
+                checkpointFn: mockCheckpoint
+            )
+            Issue.record("Expected generateEventLogCheckpoint to throw")
+        } catch let error as ScpError {
+            if case let .Permission(_, code) = error {
+                #expect(code == "SCP-PERM-3008")
+            } else {
+                Issue.record("Expected ScpError.Permission, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    @Test("generateEventLogCheckpoint default throws descriptive error")
+    func checkpointDefaultThrows() async throws {
+        let handle = ContextHandle(noPointer: .init())
+        let identity = Identity(noPointer: .init())
+
+        do {
+            _ = try await generateEventLogCheckpoint(
+                handle: handle,
+                identity: identity,
+                epoch: 0
+            )
+            Issue.record("Expected default to throw")
+        } catch let error as ScpError {
+            if case let .Context(message, code) = error {
+                #expect(code == "SCP-CTX-2032")
+                #expect(message.contains("not yet available"))
+            } else {
+                Issue.record("Expected ScpError.Context, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
 } // end EventLogTests

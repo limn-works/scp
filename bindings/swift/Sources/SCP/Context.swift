@@ -42,6 +42,17 @@ enum ContextBridge {
     typealias CloseFn = @Sendable (
         _ handle: any ContextHandleProtocol
     ) async throws -> Void
+
+    /// The closure type for joining an existing context. Injected for testability.
+    typealias JoinFn = @Sendable (
+        _ handle: ContextHandle,
+        _ identity: Identity
+    ) async throws -> Void
+
+    /// Default join function — delegates to UniFFI ``contextJoin``.
+    static let defaultJoin: JoinFn = { handle, identity in
+        try await contextJoin(handle: handle, identity: identity)
+    }
 }
 
 // MARK: - MessageListenerAdapter
@@ -342,4 +353,31 @@ public actor Context {
         streamContinuation?.finish()
         streamContinuation = nil
     }
+}
+
+// MARK: - Context Join (free function)
+
+/// Joins an existing SCP context.
+///
+/// Delegates to the UniFFI ``contextJoin`` bridge function. The identity
+/// provides the key package for MLS group admission.
+///
+/// - Parameters:
+///   - handle: The ``ContextHandle`` for the context to join.
+///   - identity: The ``Identity`` joining the context.
+///   - joinFn: Bridge function override for testing.
+/// - Throws: ``ScpError/Context(message:code:)`` if the context is not
+///   in active state or the join operation fails.
+///
+/// ## Provenance
+///
+/// - ADR-021 (UniFFI Bridge)
+/// - ADR-026 (Swift SDK)
+/// - Spec section 5 (Context Lifecycle)
+public func joinContext(
+    handle: ContextHandle,
+    identity: Identity,
+    joinFn: ContextBridge.JoinFn = ContextBridge.defaultJoin
+) async throws {
+    try await joinFn(handle, identity)
 }
