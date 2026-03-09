@@ -9,6 +9,8 @@ use js_sys::Promise;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
+use scp_ffi_common::validate::{validate_did, validate_tool_id, validate_tool_name, validate_ucan_token};
+
 use crate::context::WasmContextHandle;
 use crate::error::ScpWasmError;
 use crate::manager::with_manager;
@@ -82,6 +84,8 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
                 .into_js()
             })?
             .to_owned();
+
+        validate_tool_name(&name).map_err(|e| ScpWasmError::from(e).into_js())?;
 
         let description = def["description"].as_str().unwrap_or("").to_owned();
 
@@ -172,6 +176,23 @@ pub fn tool_invoke(
     identity_did: String,
     ucan_token: Option<String>,
 ) -> Promise {
+    if let Err(e) = validate_tool_id(&tool_id) {
+        return future_to_promise(async move {
+            Err(ScpWasmError::from(e).into_js().into())
+        });
+    }
+    if let Err(e) = validate_did(&identity_did) {
+        return future_to_promise(async move {
+            Err(ScpWasmError::from(e).into_js().into())
+        });
+    }
+    if let Some(ref token) = ucan_token
+        && let Err(e) = validate_ucan_token(token)
+    {
+        return future_to_promise(async move {
+            Err(ScpWasmError::from(e).into_js().into())
+        });
+    }
     let context_id = context.context_id();
     future_to_promise(async move {
         // UCAN authorization: validate the token via the WASM-local
@@ -396,8 +417,7 @@ pub fn tool_session_invoke(
         .map_err(|e| {
             ScpWasmError::Permission {
                 message: format!(
-                    "UCAN authorization failed for tool '{}': {e}",
-                    tool_id_for_ucan
+                    "UCAN authorization failed for tool '{tool_id_for_ucan}': {e}",
                 ),
                 code: "SCP-PERM-3000".to_owned(),
             }

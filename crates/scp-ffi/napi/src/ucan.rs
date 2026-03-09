@@ -30,6 +30,7 @@ use std::collections::HashMap;
 
 use napi_derive::napi;
 use scp_core::crypto::ucan::mint::{MintParams, mint_ucan};
+use scp_ffi_common::validate::{validate_capability_uri, validate_did, validate_ucan_token};
 
 use scp_core::crypto::ucan::UcanError as CoreUcanError;
 
@@ -193,6 +194,9 @@ pub async fn ucan_validate(
     presenting_agent_did: Option<String>,
     proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<()> {
+    validate_ucan_token(&token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_capability_uri(&capability).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
     // Ensure the context's persistent runtime state (RevocationList, NonceTracker)
     // is registered. Uses the same registry as event_log and ucan_revoke.
     crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
@@ -293,6 +297,8 @@ pub async fn ucan_mint(
     member_did: String,
     capabilities: Vec<String>,
 ) -> napi::Result<NapiUcanToken> {
+    validate_did(&member_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
     // In-memory custody is only available when `allow_in_memory_custody` is enabled.
     #[cfg(not(feature = "allow_in_memory_custody"))]
     {
@@ -403,13 +409,13 @@ pub async fn ucan_mint(
 pub async fn ucan_revoke(handle: &NapiContextHandle, token: String) -> napi::Result<()> {
     crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
 
-    // Parse the token to extract its payload for CID computation.
-    let parsed = parse_ucan(&token).map_err(ScpNapiError::from)?;
+    // Validate the token is a well-formed UCAN before revoking.
+    let _parsed = parse_ucan(&token).map_err(ScpNapiError::from)?;
 
     let context_id = handle.context_id();
     crate::runtime::with_context(&context_id, |rt| {
-        // Compute the content-hash CID matching scp-core's format.
-        let token_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(&parsed.payload);
+        // Compute the content-hash CID matching scp-core's format (SHA-256 of raw JWT).
+        let token_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(&token);
         rt.revocation_list.revoke(token_cid);
         Ok(())
     })

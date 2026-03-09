@@ -9,6 +9,7 @@
 //! See ADR-022 in `.docs/adrs/phase-4.md`.
 
 use napi_derive::napi;
+use scp_ffi_common::validate::{validate_did, validate_tool_id, validate_tool_name, validate_ucan_token};
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
@@ -124,6 +125,8 @@ pub async fn tool_register(
     handle: &NapiContextHandle,
     definition: NapiToolDefinition,
 ) -> napi::Result<String> {
+    validate_tool_name(&definition.name).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
     let state_str = handle.state()?;
     if state_str != "active" {
         return Err(ScpNapiError::Tool {
@@ -235,6 +238,10 @@ pub async fn tool_invoke(
     ucan_token: String,
     proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<String> {
+    validate_tool_id(&tool_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_ucan_token(&ucan_token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
     let state_str = handle.state()?;
     if state_str != "active" {
         return Err(ScpNapiError::Tool {
@@ -425,6 +432,7 @@ pub async fn tool_verify(
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+#[allow(clippy::too_many_arguments)] // FFI boundary: napi-rs requires explicit params
 pub async fn tool_invoke_cross_context(
     source_handle: &NapiContextHandle,
     target_handle: &NapiContextHandle,

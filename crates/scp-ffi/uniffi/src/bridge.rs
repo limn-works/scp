@@ -2754,6 +2754,7 @@ pub async fn tool_verify(
 /// revoked, or lacks the required tool invocation capability.
 /// Returns `ScpError::Tool` if chain depth exceeded or contexts not active.
 #[uniffi::export]
+#[allow(clippy::too_many_arguments)] // FFI boundary: UniFFI requires explicit params
 pub async fn tool_invoke_cross_context(
     source_handle: Arc<ContextHandle>,
     target_handle: Arc<ContextHandle>,

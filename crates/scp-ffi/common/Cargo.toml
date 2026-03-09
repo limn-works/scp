@@ -1,23 +1,27 @@
 [package]
 name = "scp-ffi-common"
 version = "0.1.0"
-description = "Shared bridge adapter types for SCP FFI bridges (PyO3, napi-rs, UniFFI)"
+description = "Shared bridge adapter types for SCP FFI bridges (PyO3, napi-rs, UniFFI, WASM)"
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
 
 [features]
+default = ["resolvers"]
+# Full resolver implementations (BridgeDidResolver, IdentityBackedDidResolver, etc.).
+# Requires scp-core, scp-identity, tokio. Disable for WASM (which only needs validate).
+resolvers = ["dep:scp-core", "dep:scp-identity", "dep:hex", "dep:z-base-32", "dep:tokio", "dep:tracing"]
 # Enables the did:key:{hex} DID format in BridgeDidResolver. This is a
 # non-standard test convenience — production builds must resolve via did:dht:z.
-testing = []
+testing = ["resolvers"]
 
 [dependencies]
-scp-core = { path = "../../scp-core" }
-scp-identity = { path = "../../scp-identity" }
-hex = { workspace = true }
-z-base-32 = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
+scp-core = { path = "../../scp-core", optional = true }
+scp-identity = { path = "../../scp-identity", optional = true }
+hex = { workspace = true, optional = true }
+z-base-32 = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 scp-platform = { path = "../../scp-platform", features = ["testing"] }

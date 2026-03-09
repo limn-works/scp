@@ -10,6 +10,8 @@ use js_sys::Promise;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
+use scp_ffi_common::validate::validate_did;
+
 use crate::error::ScpWasmError;
 use crate::manager::{WasmGovernanceAction, with_manager};
 
@@ -201,6 +203,11 @@ impl WasmMessage {
 /// `WasmContextHandle` with all §5.7 metadata fields populated.
 #[wasm_bindgen]
 pub fn context_create(identity_did: String, params_json: String) -> Promise {
+    if let Err(e) = validate_did(&identity_did) {
+        return future_to_promise(async move {
+            Err(ScpWasmError::from(e).into_js().into())
+        });
+    }
     future_to_promise(async move {
         let params: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
             ScpWasmError::Validation {
@@ -236,6 +243,11 @@ pub fn context_create(identity_did: String, params_json: String) -> Promise {
 /// Delegates to `WasmContextManager::join_context`.
 #[wasm_bindgen]
 pub fn context_join(handle: &WasmContextHandle, identity_did: String) -> Promise {
+    if let Err(e) = validate_did(&identity_did) {
+        return future_to_promise(async move {
+            Err(ScpWasmError::from(e).into_js().into())
+        });
+    }
     let context_id = handle.context_id();
 
     future_to_promise(async move {
@@ -291,6 +303,11 @@ pub fn context_send(
     identity_did: String,
     payload_base64: String,
 ) -> Promise {
+    if let Err(e) = validate_did(&identity_did) {
+        return future_to_promise(async move {
+            Err(ScpWasmError::from(e).into_js().into())
+        });
+    }
     let context_id = handle.context_id();
 
     future_to_promise(async move {

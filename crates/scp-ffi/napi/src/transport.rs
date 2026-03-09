@@ -16,6 +16,7 @@
 //! See ADR-022 and ADR-005 (Transport Abstraction) in `.docs/adrs/`.
 
 use napi_derive::napi;
+use scp_ffi_common::validate::validate_relay_url;
 
 use crate::error::ScpNapiError;
 use crate::{decrement_handle_count, increment_handle_count};
@@ -127,6 +128,8 @@ impl Drop for NapiTransportManager {
 ///   protocol mismatch, timeout, authentication failure) in the full runtime.
 #[napi]
 pub async fn transport_connect(relay_url: String) -> napi::Result<NapiTransportManager> {
+    validate_relay_url(&relay_url).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
     if !relay_url.starts_with("wss://") {
         return Err(ScpNapiError::Validation {
             message: format!(

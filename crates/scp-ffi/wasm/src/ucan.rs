@@ -19,6 +19,8 @@ use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
+use scp_ffi_common::validate::{validate_capability_uri, validate_did, validate_ucan_token};
+
 use crate::context::WasmContextHandle;
 use crate::error::ScpWasmError;
 use crate::manager::with_manager;
@@ -668,6 +670,21 @@ pub fn ucan_validate(
     expected_aud_did: String,
     proof_tokens_json: Option<String>,
 ) -> Promise {
+    if let Err(e) = validate_ucan_token(&token) {
+        return future_to_promise(async move {
+            Err(ScpWasmError::from(e).into_js().into())
+        });
+    }
+    if let Err(e) = validate_capability_uri(&capability) {
+        return future_to_promise(async move {
+            Err(ScpWasmError::from(e).into_js().into())
+        });
+    }
+    if let Err(e) = validate_did(&expected_aud_did) {
+        return future_to_promise(async move {
+            Err(ScpWasmError::from(e).into_js().into())
+        });
+    }
     let context_id = context.context_id();
 
     future_to_promise(async move {
@@ -738,6 +755,11 @@ pub fn ucan_mint(
     member_did: String,
     capabilities_json: String,
 ) -> Promise {
+    if let Err(e) = validate_did(&member_did) {
+        return future_to_promise(async move {
+            Err(ScpWasmError::from(e).into_js().into())
+        });
+    }
     let context_id = context.context_id();
     future_to_promise(async move {
         let caps: serde_json::Value = serde_json::from_str(&capabilities_json).map_err(|e| {

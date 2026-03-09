@@ -376,6 +376,15 @@ impl From<serde_json::Error> for ScpNapiError {
     }
 }
 
+impl From<scp_ffi_common::validate::ValidationError> for ScpNapiError {
+    fn from(e: scp_ffi_common::validate::ValidationError) -> Self {
+        Self::Validation {
+            message: e.message,
+            code: "SCP-VALID-7000".to_owned(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

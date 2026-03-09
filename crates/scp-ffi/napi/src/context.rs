@@ -21,6 +21,8 @@ use uuid::Uuid;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::traits::KeyCustody;
 
+use scp_ffi_common::validate::validate_did;
+
 use crate::error::ScpNapiError;
 use crate::identity::NapiIdentity;
 #[cfg(feature = "allow_in_memory_custody")]
@@ -282,6 +284,8 @@ pub async fn context_create(
     identity: &NapiIdentity,
     params_json: String,
 ) -> napi::Result<NapiContextHandle> {
+    validate_did(&identity.inner.did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
     let params: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!(
@@ -414,6 +418,8 @@ pub async fn context_create(
 #[napi]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_join(handle: &NapiContextHandle, identity_did: String) -> napi::Result<()> {
+    validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
     if state_str != "active" {
         return Err(ScpNapiError::Context {
@@ -531,6 +537,8 @@ pub async fn context_send(
     identity_did: String,
     payload: Vec<u8>,
 ) -> napi::Result<()> {
+    validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
     if state_str != "active" {
         return Err(ScpNapiError::Context {

@@ -154,6 +154,15 @@ impl ScpWasmError {
 // From implementations for ergonomic conversion
 // ---------------------------------------------------------------------------
 
+impl From<scp_ffi_common::validate::ValidationError> for ScpWasmError {
+    fn from(e: scp_ffi_common::validate::ValidationError) -> Self {
+        Self::Validation {
+            message: e.message,
+            code: "SCP-VALID-7000".to_owned(),
+        }
+    }
+}
+
 impl From<serde_json::Error> for ScpWasmError {
     fn from(e: serde_json::Error) -> Self {
         Self::Validation {
