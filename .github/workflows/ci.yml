@@ -276,7 +276,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.swift == 'true'
     name: Swift / lint + format
-    runs-on: macos-15
+    runs-on: macos-latest
     defaults:
       run:
         working-directory: bindings/swift
@@ -291,7 +291,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.swift == 'true'
     name: Swift / build + test
-    runs-on: macos-15
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: swift-actions/setup-swift@v2
