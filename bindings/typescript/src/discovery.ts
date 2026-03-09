@@ -95,14 +95,16 @@ export async function normalizeAddress(address: string): Promise<string> {
  * Discovers contexts from a DID string or `scp://` URI.
  *
  * @param query - A DID string or `scp://` URI.
- * @returns JSON string with discovery results.
+ * @returns Parsed discovery results.
  * @throws {ContextError} If discovery fails.
  * @throws {ValidationError} If the query is neither a DID nor an `scp://` URI.
  */
-export async function discoverContexts(query: string): Promise<string> {
+export async function discoverContexts(query: string): Promise<DiscoveryResult[]> {
   try {
     const bridge = await getBridge();
-    return await bridge.contextDiscover(query);
+    const raw = await bridge.contextDiscover(query);
+    const results: DiscoveryResult[] = JSON.parse(raw);
+    return results;
   } catch (error) {
     throw mapBridgeError(error);
   }
