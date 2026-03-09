@@ -49,6 +49,20 @@ interface DiscoveryBindings {
      * @return Normalized address string.
      */
     fun discoveryNormalizeAddress(address: String): String
+
+    /**
+     * Discovers contexts from a DID string or `scp://` URI.
+     *
+     * Detects whether the query is a DID or an `scp://` URI and delegates
+     * to the appropriate core discovery function.
+     *
+     * @param query A DID string (e.g., `"did:dht:z6Mk..."`) or an `scp://` URI.
+     * @return JSON string with an array of discovery results, each containing
+     *   `context_id`, `relay_urls`, `publisher_did`, `discovery_source`,
+     *   `mode`, and `metadata_summary`.
+     * @throws BridgeException if DID resolution or URI parsing fails.
+     */
+    fun contextDiscover(query: String): String
 }
 
 /**
@@ -100,4 +114,16 @@ class DiscoveryBridge internal constructor(
      */
     suspend fun normalizeAddress(address: String): String =
         bridge.ffiCall { bindings.discoveryNormalizeAddress(address) }
+
+    /**
+     * Discovers contexts from a DID string or `scp://` URI.
+     *
+     * Detects whether the query is a DID or an `scp://` URI and delegates
+     * to the appropriate core discovery function.
+     *
+     * @param query A DID string (e.g., `"did:dht:z6Mk..."`) or an `scp://` URI.
+     * @return JSON string with an array of discovery results.
+     */
+    suspend fun discover(query: String): String =
+        bridge.ffiCall { bindings.contextDiscover(query) }
 }
