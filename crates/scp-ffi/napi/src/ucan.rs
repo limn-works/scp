@@ -493,27 +493,30 @@ pub async fn ucan_delegate(
         }
 
         // Build attenuated capabilities from the capability URI strings.
+        // Use CapabilityUri::from_str for validated parsing instead of ad-hoc
+        // string splitting.
         let attenuations: Vec<Attenuation> = capabilities
             .iter()
             .map(|cap| {
-                let cap_uri = if cap.starts_with("scp:ctx:") {
+                let cap_uri_str = if cap.starts_with("scp:ctx:") {
                     cap.clone()
                 } else {
                     format!("scp:ctx:{context_id}/{cap}")
                 };
-                let action = cap_uri.rsplit_once('/').map_or_else(
-                    || cap.clone(),
-                    |(_, a)| {
-                        a.split_once(':')
-                            .map_or_else(|| a.to_owned(), |(_, act)| act.to_owned())
-                    },
-                );
-                Attenuation {
-                    with: cap_uri,
-                    can: action,
-                }
+                let parsed: CapabilityUri =
+                    cap_uri_str
+                        .parse()
+                        .map_err(|e: CoreUcanError| ScpNapiError::Permission {
+                            message: format!("invalid capability URI '{cap_uri_str}': {e}"),
+                            code: "SCP-PERM-3023".to_owned(),
+                        })?;
+                Ok(Attenuation {
+                    with: cap_uri_str,
+                    can: parsed.action().to_owned(),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, ScpNapiError>>()
+            .map_err(napi::Error::from)?;
 
         // Get ceiling from the context handle for delegation-time enforcement (#339).
         let ceiling_strings: std::collections::HashSet<String> =
