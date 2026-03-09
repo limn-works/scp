@@ -11,7 +11,7 @@
  * See ADR-022 in `.docs/adrs/phase-4.md`.
  */
 
-import { TransportError } from "../errors.js";
+import { ScpError, TransportError } from "../errors.js";
 import type {
   BroadcastAdmissionPolicy,
   Checkpoint,
@@ -317,10 +317,10 @@ export function createWasmBridge(): Bridge {
     },
 
     async identityRotateKey(_handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
-      throw new TransportError(
+      throw new ScpError(
         "Key rotation in the browser requires WebCrypto orchestration -- " +
           "this operation is not yet supported in the WASM bridge",
-        "SCP-TRANS-5004",
+        "SCP-IDENT-1010",
       );
     },
 
@@ -388,39 +388,27 @@ export function createWasmBridge(): Bridge {
 
     // Membership queries -- not yet available in WASM bridge (ADR-034 constraints)
     async contextMemberCount(_handle: BridgeContextHandle): Promise<number | null> {
-      throw new TransportError(
-        "Membership queries are not available in the WASM bridge",
-        "SCP-CTX-2030",
-      );
+      throw new ScpError("Membership queries are not available in the WASM bridge", "SCP-CTX-2030");
     },
 
     async contextIsMember(_handle: BridgeContextHandle, _did: string): Promise<boolean> {
-      throw new TransportError(
-        "Membership queries are not available in the WASM bridge",
-        "SCP-CTX-2030",
-      );
+      throw new ScpError("Membership queries are not available in the WASM bridge", "SCP-CTX-2030");
     },
 
     async contextMemberDids(_handle: BridgeContextHandle): Promise<readonly string[]> {
-      throw new TransportError(
-        "Membership queries are not available in the WASM bridge",
-        "SCP-CTX-2030",
-      );
+      throw new ScpError("Membership queries are not available in the WASM bridge", "SCP-CTX-2030");
     },
 
     async contextMemberRole(
       _handle: BridgeContextHandle,
       _did: string,
     ): Promise<MemberRole | null> {
-      throw new TransportError(
-        "Membership queries are not available in the WASM bridge",
-        "SCP-CTX-2030",
-      );
+      throw new ScpError("Membership queries are not available in the WASM bridge", "SCP-CTX-2030");
     },
 
     // Broadcast operations -- not yet available in WASM bridge (ADR-034 constraints)
     async broadcastSubscribe(_handle: BridgeContextHandle, _subscriberDid: string): Promise<void> {
-      throw new TransportError(
+      throw new ScpError(
         "Broadcast operations are not available in the WASM bridge",
         "SCP-CTX-2030",
       );
@@ -431,7 +419,7 @@ export function createWasmBridge(): Bridge {
       _subscriberDid: string,
       _rotateKeys?: boolean,
     ): Promise<void> {
-      throw new TransportError(
+      throw new ScpError(
         "Broadcast operations are not available in the WASM bridge",
         "SCP-CTX-2030",
       );
@@ -442,7 +430,7 @@ export function createWasmBridge(): Bridge {
       _authorDid: string,
       _payload: Uint8Array,
     ): Promise<void> {
-      throw new TransportError(
+      throw new ScpError(
         "Broadcast operations are not available in the WASM bridge",
         "SCP-CTX-2030",
       );
@@ -453,7 +441,7 @@ export function createWasmBridge(): Bridge {
       _subscriberDid: string,
       _blockerDid: string,
     ): Promise<void> {
-      throw new TransportError(
+      throw new ScpError(
         "Broadcast operations are not available in the WASM bridge",
         "SCP-CTX-2030",
       );
@@ -464,21 +452,21 @@ export function createWasmBridge(): Bridge {
       _authorDid: string,
       _requesterDid: string,
     ): Promise<string> {
-      throw new TransportError(
+      throw new ScpError(
         "Broadcast operations are not available in the WASM bridge",
         "SCP-CTX-2030",
       );
     },
 
     async broadcastSubscriberCount(_handle: BridgeContextHandle): Promise<number | null> {
-      throw new TransportError(
+      throw new ScpError(
         "Broadcast operations are not available in the WASM bridge",
         "SCP-CTX-2030",
       );
     },
 
     async broadcastIsSubscriber(_handle: BridgeContextHandle, _did: string): Promise<boolean> {
-      throw new TransportError(
+      throw new ScpError(
         "Broadcast operations are not available in the WASM bridge",
         "SCP-CTX-2030",
       );
@@ -487,7 +475,7 @@ export function createWasmBridge(): Bridge {
     async broadcastAdmission(
       _handle: BridgeContextHandle,
     ): Promise<BroadcastAdmissionPolicy | null> {
-      throw new TransportError(
+      throw new ScpError(
         "Broadcast operations are not available in the WASM bridge",
         "SCP-CTX-2030",
       );
@@ -498,7 +486,7 @@ export function createWasmBridge(): Bridge {
       _handle: BridgeContextHandle,
       _proposalJson: string,
     ): Promise<string> {
-      throw new TransportError(
+      throw new ScpError(
         "Governance operations are not available in the WASM bridge",
         "SCP-CTX-2030",
       );
@@ -636,7 +624,7 @@ export function createWasmBridge(): Bridge {
       // exposed via a dedicated WASM export yet. Return a minimal checkpoint
       // from available data. The WASM bridge stores the Merkle tree internally;
       // the root is accessible via event_log_verify with a known leaf.
-      throw new TransportError(
+      throw new ScpError(
         "Event log checkpoint in the WASM bridge requires a dedicated export",
         "SCP-CTX-2027",
       );
