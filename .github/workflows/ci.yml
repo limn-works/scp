@@ -283,6 +283,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install SwiftLint and SwiftFormat
+        # HOMEBREW_NO_AUTO_UPDATE prevents brew from auto-upgrading
+        # formulae between CI runs, reducing version drift risk.
+        # Known-good versions: swiftlint 0.63.2, swiftformat 0.60.1.
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
         run: brew install swiftlint swiftformat
       - run: swiftlint lint --strict
       - run: swiftformat --lint Sources/ Tests/
