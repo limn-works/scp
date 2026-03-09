@@ -398,7 +398,17 @@ impl ContextCryptoProvider for NapiBridgeCryptoProvider {
         _context_id: &[u8; 32],
         _sender_did: &str,
         payload: &[u8],
+        _epoch: u64,
+        _sequence: u64,
     ) -> Result<Vec<u8>, ContextError> {
+        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+        WARN_ONCE.call_once(|| {
+            tracing::warn!(
+                "NapiBridgeCryptoProvider::encrypt_message is a no-op — \
+                 messages are sent in plaintext. Wire a production crypto \
+                 provider for real MLS/sender-key encryption."
+            );
+        });
         // Return payload as-is; real encryption is layered above the bridge.
         Ok(payload.to_vec())
     }

@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use dashmap::DashMap;
 use napi_derive::napi;
+use scp_mcp::allowlist;
 use scp_mcp::client::{McpClient, McpTransport};
 use scp_mcp::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
 use scp_mcp::server::ContextProvider;
@@ -191,17 +192,21 @@ struct StdioTransportInner {
 
 impl StdioMcpTransport {
     fn spawn(command: &[String]) -> Result<Self, String> {
-        if command.is_empty() {
-            return Err("command must be non-empty".to_owned());
-        }
+        let (cmd, args) = command
+            .split_first()
+            .ok_or("command list is empty".to_owned())?;
 
-        let mut child = Command::new(&command[0])
-            .args(&command[1..])
+        // Validate the command against the stdio allowlist (defense-in-depth).
+        // Uses the validated basename for Command::new to prevent path bypass.
+        let basename = allowlist::validate_command(cmd).map_err(|e| e.to_string())?;
+
+        let mut child = Command::new(&basename)
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .map_err(|e| format!("failed to spawn subprocess '{}': {e}", command[0]))?;
+            .map_err(|e| format!("failed to spawn '{basename}': {e}"))?;
 
         let stdin = child.stdin.take().ok_or("failed to capture child stdin")?;
         let stdout = child
@@ -331,6 +336,14 @@ impl ContextProvider for McpNapiBridgeProvider {
     }
 
     fn agent_role(&self, _context_id: &str) -> Option<String> {
+        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+        WARN_ONCE.call_once(|| {
+            tracing::warn!(
+                "McpNapiBridgeProvider::agent_role always returns \"admin\" — \
+                 wire a production ContextProvider that resolves real roles \
+                 from ContextManager before exposing MCP in production."
+            );
+        });
         Some("admin".to_owned())
     }
 
@@ -343,6 +356,14 @@ impl ContextProvider for McpNapiBridgeProvider {
     }
 
     fn validate_capability(&self, _context_id: &str, _tool_name: &str) -> Result<(), String> {
+        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+        WARN_ONCE.call_once(|| {
+            tracing::warn!(
+                "McpNapiBridgeProvider::validate_capability always succeeds — \
+                 wire a production ContextProvider that checks UCAN capabilities \
+                 against the context's role state before exposing MCP in production."
+            );
+        });
         Ok(())
     }
 
@@ -726,5 +747,115 @@ pub async fn mcp_client_invoke(
         // u64 timestamps must be cast to f64 — safe up to 2^53 (year 287396).
         #[allow(clippy::cast_precision_loss)]
         timestamp: result.provenance.timestamp as f64,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Stdio allowlist error mapping
+// ---------------------------------------------------------------------------
+
+/// Maps [`AllowlistError`] to the appropriate [`ScpNapiError`] variant.
+///
+/// Input-validation errors map to `Validation`. Runtime/policy errors
+/// map to `Transport`. Exhaustive match ensures new variants produce
+/// a compile error instead of silently falling through.
+#[allow(clippy::needless_pass_by_value)]
+fn allowlist_err(e: allowlist::AllowlistError) -> ScpNapiError {
+    use scp_mcp::allowlist::AllowlistError;
+    let msg = e.to_string();
+    match e {
+        AllowlistError::EmptyEntry
+        | AllowlistError::PathInEntry(_)
+        | AllowlistError::NulInEntry(_)
+        | AllowlistError::ControlCharInEntry(_)
+        | AllowlistError::PathInCommand(_)
+        | AllowlistError::InvalidCommand(_) => ScpNapiError::Validation {
+            message: msg,
+            code: "SCP-VALID-7030".to_owned(),
+        },
+        AllowlistError::NotAllowed { .. } | AllowlistError::LockPoisoned => {
+            ScpNapiError::Transport {
+                message: msg,
+                code: "SCP-TRANS-5030".to_owned(),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stdio allowlist configuration (NAPI)
+// ---------------------------------------------------------------------------
+
+/// Snapshot of the current stdio allowlist state.
+#[napi(object)]
+pub struct NapiAllowlistState {
+    /// Sorted list of allowed binary basenames.
+    pub allowed: Vec<String>,
+    /// Whether the allowlist is bypassed entirely (unrestricted mode).
+    pub unrestricted: bool,
+}
+
+/// Configures the MCP stdio subprocess allowlist.
+///
+/// By default, only well-known MCP server launchers are permitted (e.g.
+/// `uvx`, `npx`, `node`, `python3`). Use this function to extend the list.
+///
+/// # Arguments
+///
+/// * `additional_binaries` -- Binary basenames to add to the default allowlist.
+///
+/// # Errors
+///
+/// Throws if any entry is invalid (contains a path, NUL byte, or is empty).
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn mcp_configure_stdio_allowlist(additional_binaries: Vec<String>) -> napi::Result<()> {
+    allowlist::configure(&additional_binaries).map_err(|e| napi::Error::from(allowlist_err(e)))?;
+    Ok(())
+}
+
+/// Disable the stdio allowlist entirely (unrestricted mode).
+///
+/// After calling this, **any** binary name may be spawned as a subprocess.
+/// Only use when the command source is fully trusted.
+///
+/// # Errors
+///
+/// Throws if the allowlist lock is poisoned.
+#[napi]
+pub fn mcp_disable_stdio_allowlist() -> napi::Result<()> {
+    allowlist::disable_enforcement().map_err(|e| napi::Error::from(allowlist_err(e)))?;
+    Ok(())
+}
+
+/// Reset the stdio allowlist to its default state.
+///
+/// Restores the default binaries, removes any additions, and re-enables
+/// enforcement (clears unrestricted mode).
+///
+/// # Errors
+///
+/// Throws if the allowlist lock is poisoned.
+#[napi]
+pub fn mcp_reset_stdio_allowlist() -> napi::Result<()> {
+    allowlist::reset().map_err(|e| napi::Error::from(allowlist_err(e)))?;
+    Ok(())
+}
+
+/// Return the current stdio allowlist state.
+///
+/// Returns an object with:
+/// - `allowed`: sorted list of allowed binary names
+/// - `unrestricted`: boolean indicating whether the allowlist is bypassed
+///
+/// # Errors
+///
+/// Throws if the allowlist lock is poisoned.
+#[napi]
+pub fn mcp_get_stdio_allowlist() -> napi::Result<NapiAllowlistState> {
+    let state = allowlist::get_state().map_err(|e| napi::Error::from(allowlist_err(e)))?;
+    Ok(NapiAllowlistState {
+        allowed: state.allowed,
+        unrestricted: state.unrestricted,
     })
 }
