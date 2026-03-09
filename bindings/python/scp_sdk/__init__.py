@@ -18,7 +18,17 @@ See ``.docs/adrs/phase-3.md`` ADR-014 for the full SDK design.
 
 from __future__ import annotations
 
+from scp_sdk.bridge import (
+    create_shadow,
+)
+from scp_sdk.bridge import (
+    evaluate_trust as bridge_evaluate_trust,
+)
+from scp_sdk.bridge import (
+    register as bridge_register,
+)
 from scp_sdk.context import Context, Membership
+from scp_sdk.discovery import create_query, discover, normalize_address, parse_address
 from scp_sdk.errors import (
     BRIDGE_ERROR_MAP,
     ContextError,
@@ -47,7 +57,14 @@ from scp_sdk.mcp import (
     reset_stdio_allowlist,
     serve_mcp,
 )
-from scp_sdk.sync import run_sync
+from scp_sdk.provenance import (
+    attach as provenance_attach,
+)
+from scp_sdk.provenance import (
+    check_chain_depth,
+    evaluate_provenance_quality,
+)
+from scp_sdk.sync import classify_offline, get_policy, run_sync
 from scp_sdk.tools import TestVector, ToolDefinition
 from scp_sdk.transport import TransportConfig, TransportStatus, connect_relay, relay_status
 from scp_sdk.trust import (
@@ -56,8 +73,13 @@ from scp_sdk.trust import (
     CapabilityValidation,
     ChallengeResult,
     Endorsement,
+    ParticipationFact,
+    ParticipationProfile,
+    ParticipationThreshold,
+    RequireParticipation,
     TrustEvaluation,
     evaluate_trust,
+    verify_participation_requirements,
 )
 from scp_sdk.types import (
     Capability,
@@ -103,10 +125,14 @@ __all__ = [
     "Membership",
     "MemoryScope",
     "Message",
+    "ParticipationFact",
+    "ParticipationProfile",
+    "ParticipationThreshold",
     "PromotionPolicy",
     "Proof",
     "Provenance",
     "ProvenanceQuality",
+    "RequireParticipation",
     "ScpError",
     "SourceType",
     "TestVector",
@@ -120,13 +146,25 @@ __all__ = [
     "UcanToken",
     "ValidationError",
     "__version__",
+    "bridge_evaluate_trust",
+    "bridge_register",
+    "check_chain_depth",
+    "classify_offline",
     "configure_stdio_allowlist",
     "connect_relay",
+    "create_query",
+    "create_shadow",
     "delegate",
     "disable_stdio_allowlist",
+    "discover",
+    "evaluate_provenance_quality",
     "evaluate_trust",
+    "get_policy",
     "get_stdio_allowlist",
     "mint",
+    "normalize_address",
+    "parse_address",
+    "provenance_attach",
     "register_tool_handler",
     "registry_cleanup",
     "registry_stats",
@@ -136,4 +174,5 @@ __all__ = [
     "run_sync",
     "serve_mcp",
     "validate",
+    "verify_participation_requirements",
 ]

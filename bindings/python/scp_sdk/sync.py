@@ -73,6 +73,62 @@ def run_sync(coro: Coroutine[Any, Any, _T]) -> _T:
     return future.result()
 
 
+# ---------------------------------------------------------------------------
+# Sync/offline operations (ADR-029)
+# ---------------------------------------------------------------------------
+
+
+def _bridge() -> Any:
+    """Return the ``_scp_core`` extension module, imported lazily."""
+    try:
+        import _scp_core  # type: ignore[import-not-found]
+
+        return _scp_core
+    except ImportError as exc:
+        from scp_sdk.errors import ScpError
+
+        raise ScpError(
+            "The _scp_core extension module is not installed. "
+            "Install scp-sdk with: pip install scp-sdk",
+            code="SCP-UNKNOWN-0001",
+        ) from exc
+
+
+def classify_offline(last_relay_contact: int, now: int) -> str:
+    """Classify an offline duration into the appropriate recovery tier.
+
+    Uses the default sync policy thresholds:
+
+    - Tier 1 (Short): < 4 hours.
+    - Tier 2 (Extended): 4 hours to 7 days.
+    - Tier 3 (Long): > 7 days.
+
+    Args:
+        last_relay_contact: Unix timestamp (seconds) of last relay contact.
+        now: Current Unix timestamp (seconds).
+
+    Returns:
+        ``"short"``, ``"extended"``, or ``"long"``.
+    """
+    bridge = _bridge()
+    return bridge.sync_classify_offline(last_relay_contact, now)
+
+
+def get_policy() -> dict[str, Any]:
+    """Return the default sync policy parameters.
+
+    Returns:
+        A dict with ``tier_1_threshold_secs``, ``tier_2_threshold_secs``,
+        ``gap_timeout_secs``, ``reorder_buffer_capacity``,
+        ``max_sequential_commits``, ``commit_process_timeout_secs``,
+        ``sender_key_timeout_secs``, ``reconnection_dedup_window_secs``.
+    """
+    bridge = _bridge()
+    return dict(bridge.sync_get_policy())
+
+
 __all__ = [
+    "classify_offline",
+    "get_policy",
     "run_sync",
 ]

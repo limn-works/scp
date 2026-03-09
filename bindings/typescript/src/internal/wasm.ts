@@ -116,6 +116,74 @@ interface WasmModule {
     encoded: string;
   }>;
   ucan_revoke: (handle: BridgeContextHandle, token: string) => Promise<void>;
+  // Bridge Connector
+  bridge_register: (
+    contextId: string,
+    operatorDid: string,
+    platform: string,
+    mode: string,
+  ) => ReturnType<Bridge["bridgeRegister"]>;
+  bridge_evaluate_trust: (
+    isBridged: boolean,
+    isNativeTransport: boolean,
+    shadowStatus: string,
+  ) => number;
+  bridge_create_shadow: (
+    bridgeId: string,
+    platformHandle: string,
+    bridgeMode: string,
+    contextId: string,
+  ) => ReturnType<Bridge["bridgeCreateShadow"]>;
+  // Discovery
+  discovery_parse_address: (address: string) => string;
+  discovery_create_query: (
+    capabilitiesJson: string | undefined,
+    keywordsJson: string | undefined,
+    minHistorySecs: number | undefined,
+  ) => string;
+  discovery_normalize_address: (address: string) => string;
+  context_discover: (query: string) => Promise<string>;
+  // Provenance
+  evaluate_provenance_quality: (
+    sourceContext: string | undefined,
+    sourceType: string,
+    contextState: string,
+    counterpartiesJson: string | undefined,
+  ) => number;
+  provenance_attach: (
+    sourceContextId: string,
+    sourceType: string,
+    memoryScope: string,
+    membersJson: string,
+    targetContextId: string,
+    existingChainDepth: number | undefined,
+  ) => string;
+  provenance_check_chain_depth: (chainDepth: number, maxDepth: number | undefined) => boolean;
+  // Sync
+  sync_classify_offline: (lastRelayContact: number, now: number) => string;
+  sync_get_policy: () => ReturnType<Bridge["syncGetPolicy"]>;
+  // Identity Advanced
+  identity_create_with_agent_key: (
+    custody: string,
+  ) => Promise<{ did: string; custodyType: string }>;
+  identity_add_agent_key: (identity: { did: string; custodyType: string }) => {
+    did: string;
+    custodyType: string;
+  };
+  identity_rotate_agent_key: (identity: { did: string; custodyType: string }) => {
+    did: string;
+    custodyType: string;
+  };
+  identity_remove_agent_key: (identity: { did: string; custodyType: string }) => {
+    did: string;
+    custodyType: string;
+  };
+  identity_migrate: (identity: {
+    did: string;
+    custodyType: string;
+  }) => Promise<{ did: string; custodyType: string }>;
+  identity_attest_device: (did: string) => Promise<string>;
+  identity_verify_device_attestation: (did: string, tokenBase64: string) => Promise<boolean>;
 }
 
 // ---------------------------------------------------------------------------
@@ -452,6 +520,153 @@ export function createWasmBridge(): Bridge {
         "Event log checkpoint in the WASM bridge requires a dedicated export",
         "SCP-CTX-2027",
       );
+    },
+
+    // Bridge Connector
+    bridgeRegister(contextId: string, operatorDid: string, platform: string, mode: string) {
+      const wasm = getWasm();
+      return wasm.bridge_register(contextId, operatorDid, platform, mode);
+    },
+
+    bridgeEvaluateTrust(isBridged: boolean, isNativeTransport: boolean, shadowStatus: string) {
+      const wasm = getWasm();
+      return wasm.bridge_evaluate_trust(isBridged, isNativeTransport, shadowStatus);
+    },
+
+    bridgeCreateShadow(
+      bridgeId: string,
+      platformHandle: string,
+      bridgeMode: string,
+      contextId: string | undefined,
+    ) {
+      const wasm = getWasm();
+      return wasm.bridge_create_shadow(
+        bridgeId,
+        platformHandle,
+        bridgeMode,
+        contextId ?? "ctx-shadow",
+      );
+    },
+
+    // Discovery
+    discoveryParseAddress(address: string) {
+      const wasm = getWasm();
+      return wasm.discovery_parse_address(address);
+    },
+
+    discoveryCreateQuery(
+      capabilities: string[] | undefined,
+      keywords: string[] | undefined,
+      minHistorySecs: number | undefined,
+    ) {
+      const wasm = getWasm();
+      return wasm.discovery_create_query(
+        capabilities ? JSON.stringify(capabilities) : undefined,
+        keywords ? JSON.stringify(keywords) : undefined,
+        minHistorySecs,
+      );
+    },
+
+    discoveryNormalizeAddress(address: string) {
+      const wasm = getWasm();
+      return wasm.discovery_normalize_address(address);
+    },
+
+    async contextDiscover(query: string): Promise<string> {
+      const wasm = getWasm();
+      return await wasm.context_discover(query);
+    },
+
+    // Provenance
+    async evaluateProvenanceQuality(
+      sourceContext: string | undefined,
+      sourceType: string,
+      contextState: string,
+      counterparties: string[] | undefined,
+    ): Promise<number> {
+      const wasm = getWasm();
+      return wasm.evaluate_provenance_quality(
+        sourceContext,
+        sourceType,
+        contextState,
+        counterparties ? JSON.stringify(counterparties) : undefined,
+      );
+    },
+
+    provenanceAttach(
+      sourceContextId: string,
+      sourceType: string,
+      memoryScope: string,
+      members: string[],
+      targetContextId: string,
+      existingChainDepth: number | undefined,
+    ) {
+      const wasm = getWasm();
+      return wasm.provenance_attach(
+        sourceContextId,
+        sourceType,
+        memoryScope,
+        JSON.stringify(members),
+        targetContextId,
+        existingChainDepth,
+      );
+    },
+
+    provenanceCheckChainDepth(chainDepth: number, maxDepth: number | undefined) {
+      const wasm = getWasm();
+      return wasm.provenance_check_chain_depth(chainDepth, maxDepth);
+    },
+
+    // Sync
+    syncClassifyOffline(lastRelayContact: number, now: number) {
+      const wasm = getWasm();
+      return wasm.sync_classify_offline(lastRelayContact, now);
+    },
+
+    syncGetPolicy() {
+      const wasm = getWasm();
+      return wasm.sync_get_policy();
+    },
+
+    // Identity Advanced
+    async identityCreateWithAgentKey(custody: string): Promise<BridgeIdentityHandle> {
+      const wasm = getWasm();
+      const handle = await wasm.identity_create_with_agent_key(custody);
+      return { did: handle.did, custodyType: handle.custodyType };
+    },
+
+    async identityAddAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      const wasm = getWasm();
+      const updated = wasm.identity_add_agent_key(handle);
+      return { did: updated.did, custodyType: updated.custodyType };
+    },
+
+    async identityRotateAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      const wasm = getWasm();
+      const updated = wasm.identity_rotate_agent_key(handle);
+      return { did: updated.did, custodyType: updated.custodyType };
+    },
+
+    async identityRemoveAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      const wasm = getWasm();
+      const updated = wasm.identity_remove_agent_key(handle);
+      return { did: updated.did, custodyType: updated.custodyType };
+    },
+
+    async identityMigrate(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      const wasm = getWasm();
+      const updated = await wasm.identity_migrate(handle);
+      return { did: updated.did, custodyType: updated.custodyType };
+    },
+
+    async identityAttestDevice(did: string): Promise<string> {
+      const wasm = getWasm();
+      return await wasm.identity_attest_device(did);
+    },
+
+    async identityVerifyDeviceAttestation(did: string, tokenBase64: string): Promise<boolean> {
+      const wasm = getWasm();
+      return await wasm.identity_verify_device_attestation(did, tokenBase64);
     },
 
     // Lifecycle

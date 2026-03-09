@@ -186,6 +186,128 @@ class Identity:
 
     # -- Async instance methods ----------------------------------------------
 
+    @classmethod
+    async def create_with_agent_key(cls, custody: str = "platform") -> Identity:
+        """Create a new SCP identity with an agent signing key (ADR-039).
+
+        Creates a DID identity with both the standard signing key and an
+        ``#agent`` verification method in the DID document.
+
+        Args:
+            custody: Key custody type (``"platform"`` or ``"in_memory"``).
+
+        Returns:
+            A new :class:`Identity` instance with an agent key.
+
+        Raises:
+            scp_sdk.IdentityError: If key generation or DID creation fails.
+        """
+        import _scp_core
+
+        handle = _scp_core.py_identity_create_with_agent_key(custody)
+        return cls(handle)
+
+    async def add_agent_key(self) -> Identity:
+        """Add an agent signing key to this identity (ADR-039).
+
+        Generates a new Ed25519 keypair for the ``#agent`` verification
+        method, updates the DID document, and publishes to the DHT.
+
+        Returns:
+            A new :class:`Identity` with the agent key added.
+
+        Raises:
+            scp_sdk.IdentityError: If the identity already has an agent key
+                or key generation fails.
+        """
+        import _scp_core
+
+        handle = _scp_core.py_identity_add_agent_key(self._handle)
+        return Identity(handle)
+
+    async def rotate_agent_key(self) -> Identity:
+        """Rotate the agent signing key for this identity (ADR-039).
+
+        Generates a new Ed25519 keypair, retires the old ``#agent`` key,
+        and installs the new key as ``#agent``.
+
+        Returns:
+            A new :class:`Identity` with the rotated agent key.
+
+        Raises:
+            scp_sdk.IdentityError: If the identity has no agent key or
+                key generation fails.
+        """
+        import _scp_core
+
+        handle = _scp_core.py_identity_rotate_agent_key(self._handle)
+        return Identity(handle)
+
+    async def remove_agent_key(self) -> Identity:
+        """Remove the agent signing key from this identity (ADR-039).
+
+        Removes the ``#agent`` verification method from the DID document
+        and publishes the update.
+
+        Returns:
+            A new :class:`Identity` with the agent key removed.
+
+        Raises:
+            scp_sdk.IdentityError: If the identity has no agent key.
+        """
+        import _scp_core
+
+        handle = _scp_core.py_identity_remove_agent_key(self._handle)
+        return Identity(handle)
+
+    async def migrate(self) -> Identity:
+        """Migrate this identity to a new DID (Layer 2 rotation).
+
+        Creates a new DID using the pre-rotation key as the new
+        Identity Key. The old DID document is updated with an
+        ``alsoKnownAs`` pointing to the new DID.
+
+        Returns:
+            A new :class:`Identity` with the new DID string.
+
+        Raises:
+            scp_sdk.IdentityError: If the identity is not in the
+                registry or migration fails.
+        """
+        import _scp_core
+
+        handle = _scp_core.py_identity_migrate(self._handle)
+        return Identity(handle)
+
+    async def attest_device(self) -> str:
+        """Generate a device attestation token for this identity.
+
+        Returns:
+            The attestation token as a base64-encoded string.
+
+        Raises:
+            scp_sdk.IdentityError: If attestation generation fails.
+        """
+        import _scp_core
+
+        return _scp_core.py_identity_attest_device(self.did)
+
+    async def verify_device_attestation(self, token_base64: str) -> bool:
+        """Verify a device attestation token.
+
+        Args:
+            token_base64: The base64-encoded attestation token to verify.
+
+        Returns:
+            ``True`` if the token is valid, ``False`` otherwise.
+
+        Raises:
+            scp_sdk.IdentityError: If verification fails.
+        """
+        import _scp_core
+
+        return _scp_core.py_identity_verify_device_attestation(self.did, token_base64)
+
     async def rotate_key(self) -> Identity:
         """Rotate this identity's active signing key.
 

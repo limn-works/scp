@@ -51,7 +51,7 @@ export { defineToolDefinition } from "./tools.js";
 // Trust
 // ---------------------------------------------------------------------------
 
-export { evaluateTrust } from "./trust.js";
+export { evaluateTrust, verifyParticipationRequirements } from "./trust.js";
 
 // ---------------------------------------------------------------------------
 // Event Log
@@ -77,6 +77,38 @@ export { delegateUcan, mintUcan, revokeUcan, validateUcan } from "./ucan.js";
 
 export type { McpClient, McpServer } from "./mcp.js";
 export { connectMcp, connectMcpStdio, serveMcp } from "./mcp.js";
+
+// ---------------------------------------------------------------------------
+// Bridge Connector
+// ---------------------------------------------------------------------------
+
+export type { BridgeRegistration, ShadowIdentity } from "./bridge.js";
+export { bridgeCreateShadow, bridgeEvaluateTrust, bridgeRegister } from "./bridge.js";
+
+// ---------------------------------------------------------------------------
+// Discovery
+// ---------------------------------------------------------------------------
+
+export type { DiscoveryResult, ParsedAddress } from "./discovery.js";
+export { createQuery, discoverContexts, normalizeAddress, parseAddress } from "./discovery.js";
+
+// ---------------------------------------------------------------------------
+// Provenance
+// ---------------------------------------------------------------------------
+
+export type { ProvenanceRecord } from "./provenance.js";
+export {
+  evaluateProvenanceQuality,
+  provenanceAttach,
+  provenanceCheckChainDepth,
+} from "./provenance.js";
+
+// ---------------------------------------------------------------------------
+// Sync
+// ---------------------------------------------------------------------------
+
+export type { SyncPolicy } from "./sync.js";
+export { classifyOffline, getSyncPolicy } from "./sync.js";
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -115,8 +147,12 @@ export type {
   McpClientConfig,
   McpServerConfig,
   Message,
+  ParticipationFact,
+  ParticipationProfile,
+  ParticipationThreshold,
   Proof,
   Provenance,
+  RequireParticipation,
   TestVector,
   ToolDefinition,
   ToolVerificationResult,

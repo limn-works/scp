@@ -12,7 +12,13 @@
 import type { Context } from "./context.js";
 import { mapBridgeError } from "./errors.js";
 import { getBridge } from "./internal/bridge.js";
-import type { AttestationSummary, BehavioralRecord, TrustEvaluation } from "./types.js";
+import type {
+  AttestationSummary,
+  BehavioralRecord,
+  ParticipationProfile,
+  RequireParticipation,
+  TrustEvaluation,
+} from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Trust evaluation
@@ -77,4 +83,43 @@ export async function evaluateTrust(ctx: Context, subjectDid: string): Promise<T
   } catch (error) {
     throw mapBridgeError(error);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Participation verification (spec section 9.3, SCP-BA-004)
+// ---------------------------------------------------------------------------
+
+/**
+ * Verifies whether a participant meets participation requirements.
+ *
+ * Evaluates the participant's profile against the requirement's thresholds.
+ * This is a pure function — no bridge call needed.
+ *
+ * @param requirement - The participation requirement to verify against.
+ * @param profile - The participant's participation profile.
+ * @returns `true` if requirements are met, `false` otherwise.
+ */
+export function verifyParticipationRequirements(
+  requirement: RequireParticipation,
+  profile: ParticipationProfile,
+): boolean {
+  if (requirement.thresholds.length === 0) {
+    return true;
+  }
+
+  const results: boolean[] = [];
+  for (const threshold of requirement.thresholds) {
+    const matchingFacts = profile.facts.filter((f) => f.factType === threshold.factType);
+    if (matchingFacts.length === 0) {
+      results.push(false);
+      continue;
+    }
+
+    const totalValue = matchingFacts.reduce((sum, f) => sum + f.value, 0);
+    const meetsMin = totalValue >= threshold.minimum;
+    const meetsMax = threshold.maximum === undefined || totalValue <= threshold.maximum;
+    results.push(meetsMin && meetsMax);
+  }
+
+  return requirement.requireAll ? results.every(Boolean) : results.some(Boolean);
 }
