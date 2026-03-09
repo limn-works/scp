@@ -120,16 +120,16 @@ SCP defines a sharp protocol boundary. Everything that touches the network is pr
 The boundary is architecturally significant because it defines where isolation applies. A human may have agents in many contexts. Locally, those agents coordinate freely. At the protocol level, each agent is a separate instance confined to its context. Cross-context data flow occurs only through governed protocol mechanisms.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    LOCAL (User's Machine)                     │
-│                                                               │
-│  Agent·A    Agent·B    Agent·C    Agent·D                    │
-│     │          │          │          │                        │
-│  ┌──┴──────────┴──────────┴──────────┴──┐                    │
-│  │     Local Agent Orchestration         │                    │
-│  │     (Unconstrained by protocol)       │                    │
-│  └──┬──────────┬──────────┬──────────┬──┘                    │
-└─────┼──────────┼──────────┼──────────┼────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                   LOCAL (User's Machine)                  │
+│                                                          │
+│  Agent·A    Agent·B    Agent·C    Agent·D                │
+│     │          │          │          │                    │
+│  ┌──┴──────────┴──────────┴──────────┴──┐                │
+│  │     Local Agent Orchestration         │                │
+│  │     (Unconstrained by protocol)       │                │
+│  └──┬──────────┬──────────┬──────────┬──┘                │
+└─────┼──────────┼──────────┼──────────┼───────────────────┘
 ══════╪══════════╪══════════╪══════════╪══════ PROTOCOL BOUNDARY
       │          │          │          │
   Context A  Context B  Context C  Context D
