@@ -605,6 +605,349 @@ Mitigations:
 - **No query logging mandate.** The protocol does not require discovery contexts to log queries. Writers process lookups but are not mandated to record them beyond what the event log requires (registrations are logged; reads are not).
 - **Privacy-preserving lookup is a future direction.** Techniques like private information retrieval (PIR) or oblivious queries could be layered onto the discovery context tool interface without protocol changes — the tool schema is compatible. This is acknowledged as unspecified and not blocking for initial implementation.
 
-## 22.11 Phase Integration
+## 22.11 Wire Format Tables
+
+This section tabulates the wire format for all discovery and addressing types that cross the network. All types use serde serialization (JSON for tool call payloads, MessagePack for MLS application messages). An independent implementer MUST implement these types with exactly the field names, types, and semantics shown below.
+
+### 22.11.1 Agent Registration and Search
+
+These types are the tool call schemas for the standard discovery context tools defined in §6.2.2B.
+
+**`AgentSearchParams`** — Input for `agent_search` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `capability_filter` | `Vec<String>` | No | Filter by capability URIs (§9.18.13). Logical AND — all must match. |
+| `keywords` | `Vec<String>` | No | Free-text keyword search. Logical OR — any may match. |
+| `limit` | `u32` | No | Maximum results to return. Default: 100. |
+
+**`AgentSearchResult`** — Output from `agent_search` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `entries` | `Vec<RegistrationEntry>` | Yes | Matching agent entries. |
+| `total_matches` | `u64` | Yes | Total matches (may exceed returned entries if `limit` applied). |
+
+**`AgentRegisterParams`** — Input for `agent_register` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `did` | `String` (DID) | Yes | The agent's DID to register. |
+| `capabilities` | `Vec<String>` | Yes | Capability URIs the agent supports. |
+| `metadata` | `Map<String, Value>` | Yes | Arbitrary metadata (description, tags, etc.). May be empty. |
+
+**`AgentRegisterResult`** — Output from `agent_register` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `registered` | `bool` | Yes | `true` if registration succeeded. |
+| `entry_id` | `String` | Yes | Unique identifier for the registration entry. |
+
+**`AgentDeregisterParams`** — Input for `agent_deregister` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `did` | `String` (DID) | Yes | DID to deregister. Must match the authenticated requester. |
+
+**`AgentDeregisterResult`** — Output from `agent_deregister` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `removed` | `bool` | Yes | `true` if the entry was found and removed. |
+
+**`RegistrationEntry`** — A single agent registration record.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `did` | `String` (DID) | Yes | The registered agent's DID. |
+| `capabilities` | `Vec<String>` | Yes | Capability URIs. |
+| `metadata` | `Map<String, Value>` | Yes | Registration metadata. |
+| `entry_id` | `String` | Yes | Unique entry identifier. |
+| `registered_at` | `u64` | Yes | Unix timestamp (seconds) of registration. |
+
+**`RegistrationEvent`** — Tagged enum for registration lifecycle events (event log entries).
+
+| Variant | Tag | Fields | Semantics |
+|---------|-----|--------|-----------|
+| `Registered` | `"registered"` | `did: String`, `capabilities: Vec<String>`, `metadata: Map`, `entry_id: String`, `timestamp: u64` | New registration. |
+| `Updated` | `"updated"` | `did: String`, `capabilities: Vec<String>`, `metadata: Map`, `entry_id: String`, `timestamp: u64` | Updated existing registration. |
+| `Deregistered` | `"deregistered"` | `did: String`, `entry_id: String`, `timestamp: u64` | Removed registration. |
+
+**`MembershipTier`** — Enum for discovery context membership levels.
+
+| Variant | Serde Tag | Semantics |
+|---------|-----------|-----------|
+| `Writer` | `"writer"` | MLS group member. Can process registrations and writes. |
+| `Reader` | `"reader"` | DID-authenticated. Can query but not modify. Unbounded membership. |
+
+### 22.11.2 Handle Registration and Lookup
+
+**`HandleRegisterParams`** — Input for `handle_register` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `handle` | `String` | Yes | The local-part to register. Must match `[a-z0-9._-]`, max 64 chars (§9.18.13). |
+| `target` | `HandleTarget` | Yes | What the handle resolves to. |
+| `metadata` | `HandleMetadata` | No | Optional descriptive metadata. |
+
+**`HandleRegisterResult`** — Output from `handle_register` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `status` | `HandleRegisterStatus` | Yes | Registration outcome. |
+| `entry_id` | `String` | No | Present when `status` = `Registered`. Unique entry ID. |
+
+**`HandleRegisterStatus`** — Enum for registration outcomes.
+
+| Variant | Serde Tag | Semantics |
+|---------|-----------|-----------|
+| `Registered` | `"registered"` | Handle registered successfully. |
+| `Conflict` | `"conflict"` | Another DID already holds this handle. |
+| `OwnershipMismatch` | `"ownership_mismatch"` | Requester DID does not match handle owner. |
+
+**`HandleMetadata`** — Optional descriptive metadata for handles.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `description` | `String` | No | Human-readable description. |
+| `tags` | `Vec<String>` | No | Categorization tags. |
+
+**`HandleLookupParams`** — Input for `handle_lookup` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `handle` | `String` | Yes | The local-part to look up. |
+| `type_filter` | `HandleTypeFilter` | No | Restrict results to identity or context handles. |
+
+**`HandleLookupResult`** — Output from `handle_lookup` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `results` | `Vec<HandleEntry>` | Yes | Matching handle entries. |
+
+**`HandleTypeFilter`** — Enum for filtering handle lookup results.
+
+| Variant | Serde Tag | Semantics |
+|---------|-----------|-----------|
+| `Identity` | `"identity"` | Only return identity handles. |
+| `Context` | `"context"` | Only return context handles. |
+
+**`HandleEntry`** — A resolved handle record.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `handle` | `String` | Yes | The local-part. |
+| `target` | `HandleTarget` | Yes | What the handle points to. |
+| `owner_did` | `String` (DID) | Yes | DID of the handle owner. |
+| `registered_at` | `u64` | Yes | Unix timestamp (seconds). |
+| `metadata` | `HandleMetadata` | Yes | Descriptive metadata. May have all fields absent. |
+| `entry_id` | `String` | Yes | Unique entry identifier. |
+
+**`HandleDeregisterParams`** — Input for `handle_deregister` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `handle` | `String` | Yes | The local-part to deregister. |
+| `did` | `String` (DID) | Yes | Must match the handle owner. |
+
+**`HandleDeregisterResult`** — Output from `handle_deregister` tool.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `removed` | `bool` | Yes | `true` if the handle was found and removed. |
+
+**`HandleTarget`** — Tagged enum for what a handle resolves to.
+
+| Variant | Tag | Fields | Semantics |
+|---------|-----|--------|-----------|
+| `Identity` | `"identity"` | `did: String` | Handle points to a DID. |
+| `Context` | `"context"` | `context_id: String`, `relay_urls: Vec<String>` | Handle points to a context. |
+
+### 22.11.3 Address Resolution
+
+**`AddressType`** — Enum for address categories.
+
+| Variant | Serde Tag | Semantics |
+|---------|-----------|-----------|
+| `Identity` | `"identity"` | Address resolves to a DID. |
+| `Context` | `"context"` | Address resolves to a context ID + relay URLs. |
+
+**`AddressResolution`** — Tagged enum for resolution results.
+
+| Variant | Tag | Fields | Semantics |
+|---------|-----|--------|-----------|
+| `Identity` | `"identity"` | `did: String`, `trust_level: TrustLevel`, `resolution_path: ResolutionPath` | Resolved to a DID. |
+| `Context` | `"context"` | `context_id: String`, `relay_urls: Vec<String>`, `mode: String`, `trust_level: TrustLevel`, `resolution_path: ResolutionPath` | Resolved to a context. `mode` is `"encrypted"` or `"broadcast"`. |
+
+**`TrustLevel`** — Tagged enum indicating binding strength. Not strictly ordered (§22.7).
+
+| Variant | Tag | Fields | Semantics |
+|---------|-----|--------|-----------|
+| `DirectExchange` | `"direct_exchange"` | — | DID exchanged out-of-band and verified. Highest personal trust. |
+| `LocalPetname` | `"local_petname"` | — | User-assigned name. Maximum personal trust, zero shareability. |
+| `MultiLayerCorroborated` | `"multi_layer_corroborated"` | `sources: Vec<ResolutionPath>` | Multiple independent resolution paths agree. |
+| `DomainVerified` | `"domain_verified"` | — | Resolved via `.well-known/scp`. HTTPS-dependent. |
+| `AttestationVerified` | `"attestation_verified"` | — | Resolved via identity attestation. Platform-dependent. |
+| `DiscoveryContextVerified` | `"discovery_context_verified"` | — | Resolved via discovery context handle. Community-governed. |
+
+**`ResolutionPath`** — Provenance for the resolution itself.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `layer` | `ResolutionLayer` | Yes | Which resolution layer found the result. |
+| `source` | `String` | Yes | Discovery context name, domain, or platform. |
+| `source_id` | `String` | No | Discovery context ID (hex) when `layer` = `DiscoveryContext`. |
+| `resolved_at` | `u64` | Yes | Unix timestamp (seconds) of resolution. |
+
+**`ResolutionLayer`** — Enum for resolution path layers.
+
+| Variant | Serde Tag | Semantics |
+|---------|-----------|-----------|
+| `Petname` | `"petname"` | Local petname store. |
+| `DiscoveryContext` | `"discovery_context"` | Discovery context handle lookup. |
+| `Attestation` | `"attestation"` | Attestation-backed reverse lookup. |
+| `Domain` | `"domain"` | `.well-known/scp` domain handle. |
+| `MultiLayerCorroborated` | `"multi_layer_corroborated"` | Multiple layers agreed. |
+
+**`ParsedAddress`** — Tagged enum for parsed human-readable addresses.
+
+| Variant | Tag | Fields | Semantics |
+|---------|-----|--------|-----------|
+| `DiscoveryHandle` | `"discovery_handle"` | `local_part: String`, `scope: String` | `alice@cooking-community` — scope has no `.` |
+| `DomainHandle` | `"domain_handle"` | `local_part: String`, `domain: String` | `alice@example.com` — scope contains `.` |
+| `AttestationHandle` | `"attestation_handle"` | `handle: String`, `platform: String` | `@alice:x` — leading `@`, optional `:platform` |
+| `Unscoped` | `"unscoped"` | `name: String` | `alice` — bare name, search all layers |
+
+### 22.11.4 Push Notifications
+
+**`PushPlatform`** — Enum for push notification platforms. Tag bytes are used in the signature construction.
+
+| Variant | Serde Tag | Tag Byte | Semantics |
+|---------|-----------|----------|-----------|
+| `Apns` | `"apns"` | `0x01` | Apple Push Notification Service. |
+| `Fcm` | `"fcm"` | `0x02` | Firebase Cloud Messaging. |
+| `WebPush` | `"web_push"` | `0x03` | Web Push API (RFC 8030). |
+
+**`PushRegistration`** — Registers a device for push notifications.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `did` | `String` (DID) | Yes | Registrant's DID. |
+| `platform` | `PushPlatform` | Yes | Target push platform. |
+| `token` | `Vec<u8>` (serde_bytes) | Yes | Platform-specific device token. |
+| `contexts` | `Vec<String>` | Yes | Context IDs to receive notifications for. |
+| `timestamp` | `u64` | Yes | Unix timestamp (seconds). |
+| `signature` | `Vec<u8>` (64 bytes) | Yes | Ed25519 signature over: `did \|\| platform_tag(1 byte) \|\| token \|\| contexts \|\| timestamp`. |
+
+**`PushDeregistration`** — Removes push notification registration.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `did` | `String` (DID) | Yes | Registrant's DID. |
+| `platform` | `PushPlatform` | Yes | Platform to deregister from. |
+| `timestamp` | `u64` | Yes | Unix timestamp (seconds). |
+| `signature` | `Vec<u8>` (64 bytes) | Yes | Ed25519 signature over: `did \|\| platform_tag(1 byte) \|\| timestamp`. |
+
+### 22.11.5 Petname Events (Identity Private State)
+
+These events are appended to the identity private state event log (§3.7). They are encrypted to the identity's own keys and synced across devices.
+
+**`PetnameEvent`** — Tagged enum for petname lifecycle.
+
+| Variant | Tag | Fields | Semantics |
+|---------|-----|--------|-----------|
+| `SetPetname` | `"set_petname"` | `did: String`, `name: String` | Assign a local name to a DID. |
+| `RemovePetname` | `"remove_petname"` | `did: String` | Remove a DID's local name. |
+| `SetContextPetname` | `"set_context_petname"` | `context_id: String`, `name: String` | Assign a local name to a context. |
+| `RemoveContextPetname` | `"remove_context_petname"` | `context_id: String` | Remove a context's local name. |
+
+### 22.11.6 Capability and Context Discovery
+
+**`CapabilityEntry`** — A resolved DID's capabilities.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `did` | `String` (DID) | Yes | The capability holder's DID. |
+| `capabilities` | `Vec<String>` | Yes | Capability URIs from DID document `SCPCapabilities` service. |
+| `service_endpoints` | `Vec<String>` | Yes | Service endpoint URLs from DID document. |
+| `resolved_at` | `u64` | Yes | Unix timestamp (seconds) of DID document resolution. |
+
+**`ContextDiscoveryResult`** — A discovered broadcast context.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `context_id` | `String` | Yes | Hex-encoded context ID. |
+| `relay_urls` | `Vec<String>` | Yes | Relay URLs serving this context. |
+| `publisher_did` | `String` (DID) | Yes | DID that published the context. |
+| `discovery_source` | `ContextDiscoverySource` | Yes | How the context was discovered. |
+| `mode` | `String` | Yes | Context mode: `"broadcast"`. |
+| `metadata_summary` | `Map<String, Value>` | Yes | Subset of context metadata visible pre-join. |
+
+**`ContextDiscoverySource`** — Tagged enum for how a context was discovered.
+
+| Variant | Tag | Fields | Semantics |
+|---------|-----|--------|-----------|
+| `DhtDidDocument` | `"dht_did_document"` | — | Found via `SCPBroadcastContext` service in publisher's DID doc. |
+| `WellKnown` | `"well_known"` | — | Found via `.well-known/scp` on a domain. |
+| `DiscoveryContext` | `"discovery_context"` | `context_id: String` | Found via search in a discovery context. |
+| `ContextUri` | `"context_uri"` | — | Found via `scp://` URI. |
+
+**`BootstrapConfig`** — Client bootstrap discovery configuration.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `default_context_ids` | `Vec<String>` | Yes | SDK default discovery context IDs. |
+| `auto_query_on_identity_creation` | `bool` | Yes | Whether to auto-query discovery contexts on first identity creation. |
+| `custom_context_ids` | `Vec<String>` | Yes | User-added discovery context IDs. May be empty. |
+| `fallback_to_did_resolution` | `bool` | Yes | Whether to fall back to DID document capability resolution. |
+
+**`DiscoveryQuery`** — Parameters for multi-source discovery search.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `capability_filter` | `Vec<String>` | No | Filter by capability URIs. Logical AND. |
+| `keywords` | `Vec<String>` | No | Free-text keywords. Logical OR. |
+| `min_history` | `u64` | No | Minimum participation history (seconds) required. |
+
+**`DiscoveryResult`** — Aggregated discovery search results.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `entries` | `Vec<DiscoveryResultEntry>` | Yes | Matching entries across all queried sources. |
+| `sources` | `Vec<String>` | Yes | Discovery context IDs that were queried. |
+
+**`DiscoveryResultEntry`** — A single discovery result.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `did` | `String` (DID) | Yes | The discovered agent's DID. |
+| `capabilities` | `Vec<String>` | Yes | Capability URIs. |
+| `participation_summary` | `Map<String, Value>` | Yes | Participation profile summary. |
+| `provenance` | `DataProvenance` | Yes | Provenance metadata (§24). |
+| `relevance_score` | `f64` | Yes | Relevance score (0.0 to 1.0). |
+
+### 22.11.7 Standard Tool Names
+
+The following tool names are normative — independent implementations MUST use exactly these names for interoperability:
+
+| Tool Name | Direction | Spec Reference |
+|-----------|-----------|----------------|
+| `agent_search` | Reader (DID-authenticated query) | §6.2.2B |
+| `agent_register` | Writer (MLS member write) | §6.2.2B |
+| `agent_deregister` | Writer (MLS member write) | §6.2.2B |
+| `handle_register` | Writer (MLS member write) | §22.3.1 |
+| `handle_lookup` | Reader (DID-authenticated query) | §22.3.1 |
+| `handle_deregister` | Writer (MLS member write) | §22.3.1 |
+| `attestation_lookup` | Reader (DID-authenticated query) | §22.5.1 |
+
+### 22.11.8 DID Document Service Types
+
+| Service Type | Semantics | Spec Reference |
+|--------------|-----------|----------------|
+| `SCPCapabilities` | Agent capability URIs | §6.2.2A |
+| `SCPBroadcastContext` | Broadcast context advertisement | §5.14 |
+| `SCPRelay` | Relay endpoint URL | §18.3 |
+
+## 22.12 Phase Integration
 
 Phase assignments for addressing components are tracked in `.docs/architecture.md` alongside all other build phase allocations. Summary: address format types, petname storage, `.well-known/scp` handles extension, and URI handle parameter land in Phase 2 (extending existing types, no external dependencies). Discovery context handle tools, attestation lookup, `AddressResolver`, and the handle-registry template land in Phase 3 (dependent on discovery context and attestation infrastructure).

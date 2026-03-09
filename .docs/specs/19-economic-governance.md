@@ -617,3 +617,208 @@ Community payment adapters (x402, Lightning, SPL, Stripe) are **Phase 4+** — e
 7. **Payment data inside encrypted envelope — relays never see payment metadata** for context-level economics. Relay-level payments are visible to the relay (necessary for relay to verify) but not to other relays or contexts.
 8. **Free relays MUST always exist in bootstrap list.** The SDK's fallback relay list (§18.5) MUST include free relays. This is a protocol invariant that prevents economic gatekeeping of basic protocol operation.
 9. **Auto-accept never applies to paid contexts.** No auto-accept policy configuration (§5.12.2) can override this. Agents never silently incur costs.
+
+## 19.15 Wire Format Tables
+
+This section tabulates the wire format for all economy protocol types that cross the network. All types use serde serialization (JSON for tool call payloads, MessagePack for MLS application messages and event log entries). An independent implementer MUST implement these types with exactly the field names, types, and semantics shown below.
+
+### 19.15.1 Core Value Types
+
+**`Amount`** — Newtype wrapping `u64`. Represents the smallest currency unit (e.g., cents for USD, satoshis for BTC). No floating-point anywhere in the economy protocol.
+
+| Wire Representation | Type | Notes |
+|---------------------|------|-------|
+| JSON | `number` (unsigned integer) | e.g., `1500` = 15.00 USD |
+| MessagePack | `uint 64` | Network byte order |
+
+**`CurrencyCode`** — Newtype wrapping `[u8; 4]`. ISO 4217 currency code, null-padded to 4 bytes.
+
+| Wire Representation | Type | Notes |
+|---------------------|------|-------|
+| JSON | `string` (4 chars) | e.g., `"USD\u0000"`, `"BTC\u0000"`, `"USDC"` |
+| MessagePack | `bin 4` | 4 raw bytes |
+
+**`Coefficient`** — Newtype wrapping `i64`. Fixed-point with 6 decimal places: `value = raw / 1,000,000`.
+
+| Wire Representation | Type | Notes |
+|---------------------|------|-------|
+| JSON | `number` (signed integer) | e.g., `1500000` = 1.5 |
+| MessagePack | `int 64` | Signed |
+
+### 19.15.2 Cost Structure
+
+**`SubscriptionPeriod`** — Tagged enum for subscription billing periods.
+
+| Variant | Serde Tag | Fields | Semantics |
+|---------|-----------|--------|-----------|
+| `Daily` | `"daily"` | — | Billed daily. |
+| `Weekly` | `"weekly"` | — | Billed weekly. |
+| `Monthly` | `"monthly"` | — | Billed monthly. |
+| `Custom` | `"custom"` | `seconds: u64` | Custom period in seconds. |
+
+**`SubscriptionCost`** — Cost definition for recurring subscriptions.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `amount` | `Amount` (u64) | Yes | Cost per period in smallest currency unit. |
+| `period` | `SubscriptionPeriod` | Yes | Billing period. |
+| `currency` | `CurrencyCode` ([u8; 4]) | Yes | Payment currency. |
+
+**`CostSchedule`** — Per-action cost table for a context.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `currency` | `CurrencyCode` ([u8; 4]) | Yes | Currency for all costs in this schedule. |
+| `per_message` | `Amount` (u64) | No | Cost per message sent. |
+| `per_tool_invoke` | `Amount` (u64) | No | Cost per tool invocation. |
+| `per_join` | `Amount` (u64) | No | One-time cost to join the context. |
+| `per_period` | `SubscriptionCost` | No | Recurring subscription cost. |
+| `per_byte_stored` | `Amount` (u64) | No | Cost per byte of stored data. |
+
+**`PaidActionType`** — Enum for billable action categories.
+
+| Variant | Serde Tag | Semantics |
+|---------|-----------|-----------|
+| `MessageSend` | `"message_send"` | Sending a message. |
+| `ToolInvoke` | `"tool_invoke"` | Invoking a tool. |
+| `ContextJoin` | `"context_join"` | Joining a context. |
+| `SubscriptionPeriod` | `"subscription_period"` | Recurring subscription payment. |
+| `ByteStored` | `"byte_stored"` | Data storage. |
+
+### 19.15.3 Dynamic Pricing
+
+**`PricingMetric`** — Observable metrics for dynamic pricing formulas.
+
+| Variant | Serde Tag | Measurement Semantics |
+|---------|-----------|----------------------|
+| `ContextMessageRate` | `"context_message_rate"` | Messages per second in the context (sliding window). |
+| `MemberCount` | `"member_count"` | Current context member count. |
+| `RelayQueueDepth` | `"relay_queue_depth"` | Pending messages in relay queue. |
+| `TimeOfDay` | `"time_of_day"` | Current hour (0-23) in UTC. |
+| `SenderVelocity` | `"sender_velocity"` | Messages per minute from the specific sender. |
+| `StorageUsage` | `"storage_usage"` | Bytes currently stored for the context. |
+
+**`PricingVariable`** — Tagged enum for pricing formula components.
+
+| Variant | Tag | Fields | Semantics |
+|---------|-----|--------|-----------|
+| `Linear` | `"linear"` | `metric: PricingMetric`, `coefficient: Coefficient` | `cost += coefficient * metric / 1,000,000`. |
+| `Step` | `"step"` | `metric: PricingMetric`, `thresholds: Vec<(u64, Amount)>` | Add `Amount` when `metric >= threshold`. Each threshold is `[metric_value, amount]`. |
+
+**`PricingFormula`** — Complete dynamic pricing specification.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `base_cost` | `Amount` (u64) | Yes | Fixed cost before variable adjustments. |
+| `variables` | `Vec<PricingVariable>` | Yes | Variable cost components. May be empty. |
+| `cap` | `Amount` (u64) | No | Maximum total cost after all adjustments. |
+| `floor` | `Amount` (u64) | No | Minimum total cost after all adjustments. |
+
+### 19.15.4 Economic Policy
+
+**`EconomicPolicy`** — Context-level economic configuration. Part of context metadata (§5.7).
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `locked` | `bool` | Yes | If `true`, economic policy cannot be changed by governance. |
+| `cost_schedule` | `CostSchedule` | Yes | Per-action cost table. |
+| `payment_adapters` | `Vec<String>` | Yes | Accepted payment adapter IDs. |
+| `pricing_formula` | `PricingFormula` | No | Dynamic pricing. If absent, `cost_schedule` alone determines costs. |
+| `payee` | `String` (DID) | Yes | DID that receives payments. |
+
+### 19.15.5 Payment Authorization and Receipt
+
+**`PaymentMetadata`** — Metadata for a payment request.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `action_type` | `PaidActionType` | Yes | What action this payment authorizes. |
+| `context_id` | `String` | No | Context ID if the action is context-scoped. |
+| `idempotency_key` | `[u8; 16]` | Yes | CSPRNG, prevents duplicate payments. |
+
+**`PaymentAuthorization`** — Authorization from payer to proceed with payment.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `auth_id` | `[u8; 32]` | Yes | Unique authorization identifier. |
+| `payer` | `String` (DID) | Yes | DID authorizing the payment. |
+| `payee` | `String` (DID) | Yes | DID receiving the payment. |
+| `amount` | `Amount` (u64) | Yes | Authorized amount. |
+| `currency` | `CurrencyCode` ([u8; 4]) | Yes | Currency. |
+| `adapter_id` | `String` | Yes | Payment adapter handling the transaction. |
+| `created_at` | `u64` | Yes | Unix timestamp (seconds). |
+| `expires_at` | `u64` | Yes | Authorization expiry. Payment must be captured before this. |
+| `adapter_state` | `Vec<u8>` (serde_bytes) | Yes | Adapter-specific opaque state. |
+
+**`PaymentReceipt`** — Proof of completed payment. Recorded in context event log.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `receipt_id` | `[u8; 32]` | Yes | Unique receipt identifier. |
+| `payer` | `String` (DID) | Yes | DID that paid. |
+| `payee` | `String` (DID) | Yes | DID that received payment. |
+| `amount` | `Amount` (u64) | Yes | Amount paid. |
+| `currency` | `CurrencyCode` ([u8; 4]) | Yes | Currency. |
+| `action_type` | `PaidActionType` | Yes | What action was paid for. |
+| `context_id` | `String` | No | Context if action is context-scoped. |
+| `adapter_id` | `String` | Yes | Payment adapter used. |
+| `adapter_proof` | `Vec<u8>` (serde_bytes) | Yes | Adapter-specific payment proof. |
+| `timestamp` | `u64` | Yes | Unix timestamp (seconds) of payment. |
+| `signature` | `Vec<u8>` (64 bytes) | Yes | Ed25519 signature by payee over canonical receipt fields (§9.5.1). |
+
+**Receipt Signature Construction.** The receipt signature covers: `SHA-256("SCP-RECEIPT-V1:" || receipt_id || len(payer) || payer || len(payee) || payee || amount_BE || currency || action_type_tag || len(context_id) || context_id || len(adapter_id) || adapter_id || timestamp_BE)`. When `context_id` is absent, the sentinel `SHA-256(0x00)` (32 bytes) is used per §9.5.1.
+
+**`AdapterCapabilities`** — Advertised capabilities of a payment adapter.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `supported_currencies` | `Vec<CurrencyCode>` | Yes | Currencies this adapter handles. |
+| `supports_streaming` | `bool` | Yes | Whether streaming payments are supported. |
+| `supports_batch_auth` | `bool` | Yes | Whether batch authorization is supported. |
+| `supports_single_step` | `bool` | Yes | Whether auth+capture can be one step. |
+| `min_amount` | `Amount` (u64) | No | Minimum payment amount. |
+| `max_amount` | `Amount` (u64) | No | Maximum payment amount. |
+| `typical_settlement_ms` | `u64` | Yes | Typical settlement time in milliseconds. |
+| `requires_facilitator` | `bool` | Yes | Whether a third-party facilitator is needed. |
+
+**`VerificationResult`** — Result of verifying a payment receipt.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `valid` | `bool` | Yes | Whether the receipt verified successfully. |
+| `adapter_id` | `String` | Yes | Adapter that performed verification. |
+| `verified_amount` | `Amount` (u64) | Yes | Amount confirmed by the adapter. |
+| `verified_currency` | `CurrencyCode` ([u8; 4]) | Yes | Currency confirmed. |
+| `verification_timestamp` | `u64` | Yes | Unix timestamp (seconds) of verification. |
+
+**`RefundConfirmation`** — Confirmation of a payment refund.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `refund_id` | `[u8; 32]` | Yes | Unique refund identifier. |
+| `original_receipt_id` | `[u8; 32]` | Yes | Receipt being refunded. |
+| `refunded_amount` | `Amount` (u64) | Yes | Amount refunded. |
+| `currency` | `CurrencyCode` ([u8; 4]) | Yes | Currency. |
+| `adapter_proof` | `Vec<u8>` (serde_bytes) | Yes | Adapter-specific refund proof. |
+
+**`PaymentError`** — Tagged enum for payment failure reasons.
+
+| Variant | Tag | Fields | Semantics |
+|---------|-----|--------|-----------|
+| `InsufficientBalance` | `"insufficient_balance"` | `available: Amount`, `requested: Amount` | Payer lacks funds. |
+| `UnsupportedCurrency` | `"unsupported_currency"` | `currency: CurrencyCode` | Adapter does not handle this currency. |
+| `AuthorizationExpired` | `"authorization_expired"` | `auth_id: [u8; 32]`, `expired_at: u64` | Authorization timed out. |
+| `AdapterUnavailable` | `"adapter_unavailable"` | `adapter_id: String` | Payment adapter is unreachable. |
+| `DuplicatePayment` | `"duplicate_payment"` | `idempotency_key: [u8; 16]` | Payment already processed for this key. |
+
+### 19.15.6 Spending Capability (UCAN Extension)
+
+The spending UCAN `att` (attenuation) resource uses the capability URI format `scp:capability:spend/v1`. Spending delegation is constrained by the following fields in the UCAN `fct` (facts) section:
+
+| Fact Key | Type | Semantics |
+|----------|------|-----------|
+| `max_amount` | `u64` | Maximum amount per transaction. |
+| `currency` | `String` (4 chars) | Allowed currency code. |
+| `context_id` | `String` | If present, spending restricted to this context. |
+| `action_types` | `Vec<String>` | If present, restrict to these `PaidActionType` variants. |
+| `expires_at` | `u64` | Absolute expiry (in addition to UCAN `exp`). |

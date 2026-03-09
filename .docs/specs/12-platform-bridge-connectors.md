@@ -842,3 +842,208 @@ Approximately 80% of major platforms use OAuth 2.0 for third-party authorization
 Self-hosted bridges (§12.7) eliminate third-party trust for credential custody. The operator runs the bridge software on their own infrastructure, and credentials never leave their machine. The credential lifecycle is identical to managed bridges — the same five phases, the same encryption requirements, the same revocation behavior. The protocol treats self-hosted and managed bridges identically.
 
 The security benefit of self-hosting is operational, not protocol-level: the credential material exists on infrastructure the operator controls, rather than on a third-party service. The protocol's role is to ensure that regardless of hosting model, the credential lifecycle is consistent and the revocation guarantees are honored.
+
+## 12.12 Wire Format Tables
+
+This section tabulates the wire format for all bridge protocol types that cross the network. All types use serde serialization (JSON for tool call payloads, MessagePack for MLS application messages and event log entries). An independent implementer MUST implement these types with exactly the field names, types, and semantics shown below. All constants referenced here are defined in §9.18.
+
+### 12.12.1 Core Bridge Entities
+
+**`BridgeMode`** — Enum for bridge operating modes (§12.4).
+
+| Variant | Serde Tag | Semantics |
+|---------|-----------|-----------|
+| `Relay` | `"relay"` | Bridge relays messages without platform interaction. Read-only ingestion. |
+| `Puppet` | `"puppet"` | Bridge controls a platform account. Bidirectional but synthetic. |
+| `Api` | `"api"` | Bridge uses official platform API. Bidirectional with rate limits. |
+| `Cooperative` | `"cooperative"` | Platform natively supports SCP. Full fidelity. |
+
+**`BridgeStatus`** — Enum for bridge lifecycle states.
+
+| Variant | Serde Tag | Semantics |
+|---------|-----------|-----------|
+| `Active` | `"active"` | Bridge is operational. |
+| `Suspended` | `"suspended"` | Bridge is temporarily suspended by governance. |
+| `Revoked` | `"revoked"` | Bridge is permanently revoked. |
+
+**`BridgeConnector`** — A registered bridge connector entity.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `bridge_id` | `String` | Yes | Unique bridge identifier. |
+| `operator_did` | `String` (DID) | Yes | DID of the human operator. |
+| `platform` | `String` | Yes | Target platform name (e.g., `"slack"`, `"discord"`). |
+| `mode` | `BridgeMode` | Yes | Operating mode. |
+| `status` | `BridgeStatus` | Yes | Current lifecycle state. |
+| `registration_context` | `String` | Yes | Context ID where the bridge is registered. |
+| `registered_at` | `u64` | Yes | Unix timestamp (seconds). |
+
+### 12.12.2 Bridge Registration
+
+**`BridgeRegistrationRequest`** — Request to register a bridge with a context.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `bridge_id` | `String` | Yes | Proposed bridge identifier. |
+| `operator_did` | `String` (DID) | Yes | Operator's DID. |
+| `platform` | `String` | Yes | Target platform. |
+| `mode` | `BridgeMode` | Yes | Requested operating mode. |
+| `context_id` | `String` | Yes | Context to register with. |
+| `requested_at` | `u64` | Yes | Unix timestamp (seconds). |
+| `self_hosted` | `bool` | Yes | Whether the operator runs bridge infrastructure. |
+
+**`RegistrationDecision`** — Governance decision on bridge registration.
+
+| Variant | Serde Tag | Fields | Semantics |
+|---------|-----------|--------|-----------|
+| `Approved` | `"approved"` | — | Registration accepted. |
+| `Rejected` | `"rejected"` | `reason: String` | Registration denied with explanation. |
+
+**`BridgeRegistrationAction`** — Tagged enum for registration lifecycle actions.
+
+| Variant | Tag | Fields | Semantics |
+|---------|-----|--------|-----------|
+| `Requested` | `"requested"` | — | Registration submitted. |
+| `Approved` | `"approved"` | — | Governance approved the registration. |
+| `Rejected` | `"rejected"` | `reason: String` | Governance rejected with reason. |
+| `Revoked` | `"revoked"` | — | Governance revoked an active bridge. |
+
+**`BridgeRegistrationEvent`** — Event log entry for bridge registration lifecycle.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `action` | `BridgeRegistrationAction` | Yes | The lifecycle action. |
+| `bridge_id` | `String` | Yes | Bridge identifier. |
+| `operator_did` | `String` (DID) | Yes | Bridge operator's DID. |
+| `governance_did` | `String` (DID) | Yes | DID of the governance actor who made the decision. |
+| `context_id` | `String` | Yes | Context ID. |
+| `timestamp` | `u64` | Yes | Unix timestamp (seconds). |
+
+### 12.12.3 Shadow Identity Management
+
+**`ShadowProvenanceStatus`** — Enum for shadow identity provenance state.
+
+| Variant | Serde Tag | Semantics |
+|---------|-----------|-----------|
+| `Shadow` | `"shadow"` | Unclaimed. Attributed to bridge operator. |
+| `Claimed` | `"claimed"` | Claimed by a verified DID via attestation proof. |
+
+**`ShadowIdentity`** — A shadow identity representing a non-SCP platform user.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `shadow_id` | `String` | Yes | Unique shadow identifier. |
+| `platform_handle` | `String` | Yes | User's handle on the external platform. |
+| `bridge_id` | `String` | Yes | Bridge that created this shadow. |
+| `attributed_role` | `String` | Yes | Role within the context (e.g., `"reader"`). |
+| `provenance_status` | `ShadowProvenanceStatus` | Yes | Whether claimed by a verified DID. |
+| `created_at` | `u64` | Yes | Unix timestamp (seconds). |
+
+**`ShadowCreationEvent`** — Event log entry for shadow identity creation.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `shadow_id` | `String` | Yes | Shadow identifier. |
+| `platform_handle` | `String` | Yes | External platform handle. |
+| `bridge_id` | `String` | Yes | Creating bridge. |
+| `bridge_mode` | `BridgeMode` | Yes | Bridge operating mode at creation time. |
+| `initial_role` | `String` | Yes | Initial context role. |
+| `context_id` | `String` | Yes | Context ID. |
+| `timestamp` | `u64` | Yes | Unix timestamp (seconds). |
+
+**`ShadowRoleUpgradeEvent`** — Event log entry for shadow role changes.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `shadow_id` | `String` | Yes | Shadow identifier. |
+| `previous_role` | `String` | Yes | Role before upgrade. |
+| `new_role` | `String` | Yes | Role after upgrade. |
+| `governance_did` | `String` (DID) | Yes | DID authorizing the change. |
+| `context_id` | `String` | Yes | Context ID. |
+| `timestamp` | `u64` | Yes | Unix timestamp (seconds). |
+
+**`GovernanceAction`** — A governance action associated with shadow management.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `governance_did` | `String` (DID) | Yes | DID of the governance actor. |
+| `context_id` | `String` | Yes | Context ID. |
+| `timestamp` | `u64` | Yes | Unix timestamp (seconds). |
+| `justification` | `String` | Yes | Reason for the action. |
+
+### 12.12.4 Shadow Claiming
+
+**`ClaimRequest`** — Request to claim a shadow identity.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `shadow_id` | `String` | Yes | Shadow to claim. |
+| `claimant_did` | `String` (DID) | Yes | DID of the claimant. |
+| `attestation_proof` | `Vec<u8>` (serde_bytes) | Yes | Cryptographic proof binding the platform identity to the DID (§3.5). |
+| `requested_at` | `u64` | Yes | Unix timestamp (seconds). |
+
+**`ShadowClaimEvent`** — Event log entry for a successful claim.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `shadow_id` | `String` | Yes | Claimed shadow. |
+| `claimant_did` | `String` (DID) | Yes | DID that claimed the shadow. |
+| `claimed_at` | `u64` | Yes | Unix timestamp (seconds). |
+| `context_id` | `String` | Yes | Context ID. |
+
+### 12.12.5 Bridge Provenance
+
+**`BridgeTrustLevel`** — Enum for bridge trust ordering (lowest to highest).
+
+| Variant | Serde Tag | Numeric Order | Semantics |
+|---------|-----------|---------------|-----------|
+| `ShadowBridged` | `"shadow_bridged"` | 0 | Content from unclaimed shadow identity. Lowest trust. |
+| `ClaimedBridged` | `"claimed_bridged"` | 1 | Content from claimed (DID-verified) shadow. |
+| `NativeBridged` | `"native_bridged"` | 2 | Content from native SCP member via bridge transport. |
+| `NativeNative` | `"native_native"` | 3 | Content from native SCP member via native transport. Highest trust. |
+
+**`BridgeProvenance`** — Extended provenance for bridged content (extends `DataProvenance` §24).
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `base` | `DataProvenance` | Yes | Standard provenance fields. |
+| `originating_platform` | `String` | Yes | Platform name (e.g., `"slack"`). |
+| `bridge_connector_id` | `String` | Yes | Bridge that relayed the content. |
+| `operator_did` | `String` (DID) | Yes | Bridge operator's DID. |
+| `bridge_mode` | `BridgeMode` | Yes | Operating mode of the bridge. |
+| `shadow_status` | `ShadowProvenanceStatus` | Yes | Whether the original sender is a shadow or claimed. |
+
+### 12.12.6 Bridge Message Envelope
+
+**`SenderKeyEnvelope`** — Envelope for bridged messages using sender key encryption.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `sender_did` | `String` | Yes | DID of the message sender (bridge operator for shadow senders). |
+| `encryption_type` | `String` | Yes | `"sender_key"` or `"mls"`. |
+| `ciphertext` | `Vec<u8>` (serde_bytes) | Yes | Encrypted message payload. |
+| `bridge_provenance` | `BridgeProvenance` | Yes | Provenance metadata. |
+| `platform_message_id` | `String` | No | Original message ID on the external platform. |
+| `platform_timestamp` | `u64` | No | Original timestamp on the external platform. |
+
+### 12.12.7 Bridge Credentials
+
+**`CredentialType`** — Enum for credential categories.
+
+| Variant | Serde Tag | Semantics |
+|---------|-----------|-----------|
+| `OAuthAccessToken` | `"oauth_access_token"` | OAuth 2.0 access token. |
+| `OAuthRefreshToken` | `"oauth_refresh_token"` | OAuth 2.0 refresh token. |
+| `ApiKey` | `"api_key"` | Platform API key. |
+| `WebhookSecret` | `"webhook_secret"` | Webhook signing secret. |
+| `Custom` | `"custom"` | Custom credential type. Carries `type_name: String`. |
+
+**`BridgeCredential`** — Encrypted credential storage record.
+
+| Field | Type | Required | Semantics |
+|-------|------|----------|-----------|
+| `encrypted_data` | `Vec<u8>` (serde_bytes) | Yes | Format: `[12-byte AES-GCM nonce][ciphertext + 16-byte tag]`. Encrypted with bridge operator's key. |
+| `credential_type` | `CredentialType` | Yes | What kind of credential this is. |
+| `created_at` | `u64` | Yes | Unix timestamp (seconds). |
+| `expires_at` | `u64` | No | Expiry timestamp. Absent for non-expiring credentials. |
+| `bridge_id` | `String` | Yes | Bridge this credential belongs to. |
