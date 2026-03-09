@@ -33,6 +33,7 @@ jobs:
       python: ${{ steps.filter.outputs.python }}
       typescript: ${{ steps.filter.outputs.typescript }}
       kotlin: ${{ steps.filter.outputs.kotlin }}
+      swift: ${{ steps.filter.outputs.swift }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -50,6 +51,9 @@ jobs:
               - 'bindings/typescript/**'
             kotlin:
               - 'bindings/kotlin/**'
+            swift:
+              - 'bindings/swift/**'
+              - 'crates/scp-ffi/uniffi/**'
 
   # ── Error codes ───────────────────────────────────────────────────
   error-codes:
@@ -266,3 +270,36 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy -p scp-ffi-wasm --target wasm32-unknown-unknown -- -D warnings
+
+  # ── Swift ──────────────────────────────────────────────────────────
+  swift-lint:
+    needs: changes
+    if: needs.changes.outputs.swift == 'true'
+    name: Swift / swiftlint
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: bindings/swift
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install SwiftLint
+        run: brew install swiftlint
+      - run: swiftlint lint --strict
+
+  swift-build-test:
+    needs: changes
+    if: needs.changes.outputs.swift == 'true'
+    name: Swift / build + test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build XCFramework (dev mode — macOS arm64 only)
+        run: bindings/swift/build-xcframework.sh --dev
+      - name: Build Swift package
+        working-directory: bindings/swift
+        run: swift build
+      - name: Run Swift tests
+        working-directory: bindings/swift
+        run: swift test
