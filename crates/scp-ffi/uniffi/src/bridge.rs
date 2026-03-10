@@ -2778,7 +2778,10 @@ pub async fn tool_invoke(
             })?;
 
             let input_value: serde_json::Value =
-                serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
+                serde_json::from_str(&input_json).map_err(|e| ScpError::Tool {
+                    message: format!("invalid input JSON: {e}"),
+                    code: "SCP-TOOL-6002".to_owned(),
+                })?;
             scp_core::context::tools::validate_value_against_schema(
                 &input_value,
                 &registration.schema.input_schema,
@@ -3040,7 +3043,10 @@ pub async fn tool_invoke_cross_context(
             )?;
 
             let input_value: serde_json::Value =
-                serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
+                serde_json::from_str(&input_json).map_err(|e| ScpError::Tool {
+                    message: format!("invalid input JSON: {e}"),
+                    code: "SCP-TOOL-6002".to_owned(),
+                })?;
 
             let registry = target_handle.tool_registry.lock().await;
             let registration = registry.get(&tool_id).ok_or_else(|| ScpError::Tool {
@@ -3266,7 +3272,10 @@ pub async fn tool_session_invoke(
             drop(store);
 
             let input_value: serde_json::Value =
-                serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
+                serde_json::from_str(&input_json).map_err(|e| ScpError::Tool {
+                    message: format!("invalid input JSON: {e}"),
+                    code: "SCP-TOOL-6002".to_owned(),
+                })?;
 
             // Validate input against tool's input schema if tool is registered.
             let registry = handle.tool_registry.lock().await;
