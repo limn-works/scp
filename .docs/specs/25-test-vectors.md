@@ -420,7 +420,7 @@ Domain: `"SCP-PROPOSAL-V1:"`
 Input:
   context_id:   "gov-proposal-context"
   proposer_did: "did:dht:z6MkProposer"
-  action_bytes: MessagePack serialization of GovernanceAction (variable length)
+  action_bytes: canonical JSON serialization of GovernanceAction (variable length)
                 Example: 0xdeadbeef01020304 (8 bytes, placeholder)
   timestamp:    1700000000
 
@@ -435,10 +435,13 @@ Total: 17 + 24 + 24 + 12 + 8 = 85 bytes
 
 Proposal ID: SHA-256 of the above 85 bytes.
 
-Note: action_bytes is the raw MessagePack serialization of the GovernanceAction
-enum (not a pre-hash). Field order matches code: context_id, proposer_did,
-action_bytes, timestamp. The action_bytes placeholder above should be replaced
-with actual MessagePack output when generating §25.18 hex outputs.
+Note: action_bytes is the canonical JSON serialization of the GovernanceAction
+enum (compact, no whitespace — equivalent to serde_json::to_vec in Rust or
+json.dumps(separators=(',', ':')) in Python). JSON is used rather than
+MessagePack for cross-implementation determinism (see §9.5.2). Field order
+matches code: context_id, proposer_did, action_bytes, timestamp. The
+action_bytes placeholder above should be replaced with actual JSON output
+when generating §25.18 hex outputs.
 ```
 
 ## 25.12 HPKE Key Distribution Vectors
