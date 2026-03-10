@@ -928,6 +928,91 @@ pub fn identity_rotate_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
     })
 }
 
+/// Rotates the main signing key for an identity.
+///
+/// Generates a new Ed25519 keypair, derives a new `did:dht` DID from the
+/// new public key, updates the identity registry, and returns a new
+/// `WasmIdentity`. The old DID is stored in the migration links so
+/// `identity_resolve` can include it in `alsoKnownAs`.
+///
+/// # Errors
+///
+/// Returns `[SCP-IDENT-1010]` if key generation fails.
+#[wasm_bindgen]
+pub fn identity_rotate_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsError> {
+    let old_did = identity.did.clone();
+    let custody = identity.custody_type.clone();
+
+    // Generate a new Ed25519 signing key.
+    let new_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let new_pub = new_key.verifying_key();
+    let pub_bytes = new_pub.to_bytes();
+    let new_did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
+
+    // Copy the agent key from the old identity if it exists.
+    let agent_key_bytes = IDENTITY_REGISTRY.with(|reg| {
+        reg.borrow()
+            .get(&old_did)
+            .and_then(|entry| entry.agent_signing_key_bytes.clone())
+    });
+
+    // Register the new identity in the registry.
+    IDENTITY_REGISTRY.with(|reg| {
+        let mut map = reg.borrow_mut();
+
+        // Remove the old identity first (key material is zeroized on drop).
+        map.remove(&old_did);
+
+        // Capacity check (matching identity_migrate pattern).
+        if !map.contains_key(&new_did) && map.len() >= WASM_IDENTITY_REGISTRY_CAP {
+            return Err(ScpWasmError::Validation {
+                message: format!(
+                    "identity registry has reached capacity ({WASM_IDENTITY_REGISTRY_CAP}) \
+                     — cannot create additional identities"
+                ),
+                code: "SCP-VALID-7400".to_owned(),
+            }
+            .into_js());
+        }
+
+        map.insert(
+            new_did.clone(),
+            IdentityEntry {
+                signing_key_bytes: zeroize::Zeroizing::new(new_key.to_bytes()),
+                public_key_bytes: pub_bytes,
+                custody_type: custody.clone(),
+                agent_signing_key_bytes: agent_key_bytes,
+            },
+        );
+
+        Ok(())
+    })?;
+
+    // Record the migration link (with capacity check).
+    MIGRATION_LINKS.with(|links| {
+        let mut map = links.borrow_mut();
+        if !map.contains_key(&new_did) && map.len() >= WASM_MIGRATION_LINKS_CAP {
+            return Err(ScpWasmError::Validation {
+                message: format!(
+                    "migration links registry has reached capacity \
+                     ({WASM_MIGRATION_LINKS_CAP}) — cannot store additional migration links"
+                ),
+                code: "SCP-VALID-7401".to_owned(),
+            }
+            .into_js());
+        }
+        map.insert(new_did.clone(), old_did);
+        Ok(())
+    })?;
+
+    Ok(WasmIdentity {
+        did: new_did,
+        custody_type: custody,
+        has_agent_key: identity.has_agent_key,
+        agent_public_key_multibase: identity.agent_public_key_multibase.clone(),
+    })
+}
+
 /// Removes the agent signing key from an identity (ADR-039).
 ///
 /// # Errors

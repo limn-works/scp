@@ -1995,6 +1995,85 @@ impl WasmContextManager {
         Ok(())
     }
 
+    /// Returns the number of subscribers in a broadcast context.
+    ///
+    /// Returns `None` if the context is not a broadcast context.
+    #[must_use]
+    pub fn broadcast_subscriber_count(&self, context_id: &str) -> Option<usize> {
+        self.contexts
+            .get(context_id)
+            .and_then(|ctx| ctx.broadcast.as_ref().map(|bc| bc.subscribers.len()))
+    }
+
+    /// Returns `true` if the given DID is a subscriber in a broadcast context.
+    #[must_use]
+    pub fn is_broadcast_subscriber(&self, context_id: &str, did: &str) -> bool {
+        self.contexts
+            .get(context_id)
+            .and_then(|ctx| {
+                ctx.broadcast
+                    .as_ref()
+                    .map(|bc| bc.subscribers.contains(did))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Returns the admission policy string for a broadcast context.
+    ///
+    /// Returns `None` if the context is not a broadcast context.
+    #[must_use]
+    pub fn broadcast_admission(&self, context_id: &str) -> Option<String> {
+        self.contexts
+            .get(context_id)
+            .and_then(|ctx| ctx.broadcast.as_ref().map(|bc| bc.admission.clone()))
+    }
+
+    /// Handles a broadcast key request.
+    ///
+    /// Validates that the requester is a non-blocked subscriber (or author) and
+    /// returns a grant/deny decision. In the WASM bridge, key material is managed
+    /// by `WebCrypto` — the grant decision carries no actual key bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not active or not a broadcast context.
+    pub fn handle_broadcast_key_request(
+        &self,
+        context_id: &str,
+        author_did: &str,
+        requester_did: &str,
+    ) -> Result<String, ScpWasmError> {
+        // Use a uniform deny reason to prevent information leakage (§5.14.8).
+        const DENY_REASON: &str = "key request denied";
+
+        let ctx = self.contexts.get(context_id).ok_or_else(|| ScpWasmError::Context {
+            message: format!("context not registered: {context_id}"),
+            code: "SCP-CTX-2001".to_owned(),
+        })?;
+
+        let bc = ctx.broadcast.as_ref().ok_or_else(|| ScpWasmError::Context {
+            message: "not a broadcast context".to_owned(),
+            code: "SCP-CTX-2001".to_owned(),
+        })?;
+
+        // Author must be a known author.
+        if !bc.authors.contains(author_did) {
+            return Ok(serde_json::json!({ "decision": "deny", "reason": DENY_REASON }).to_string());
+        }
+
+        // Requester must not be blocked.
+        if bc.blocked_subscribers.contains(requester_did) {
+            return Ok(serde_json::json!({ "decision": "deny", "reason": DENY_REASON }).to_string());
+        }
+
+        // Requester must be a subscriber or author.
+        if !bc.subscribers.contains(requester_did) && !bc.authors.contains(requester_did) {
+            return Ok(serde_json::json!({ "decision": "deny", "reason": DENY_REASON }).to_string());
+        }
+
+        Ok(serde_json::json!({ "decision": "grant" }).to_string())
+    }
+
     // -----------------------------------------------------------------------
     // TTL operations
     // -----------------------------------------------------------------------

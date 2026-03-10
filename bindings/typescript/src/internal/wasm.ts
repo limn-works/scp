@@ -12,7 +12,7 @@
  */
 
 import type { BridgeMode, ShadowStatus } from "../bridge";
-import { ScpError, TransportError } from "../errors";
+import { TransportError } from "../errors";
 import type {
   BroadcastAdmissionPolicy,
   Checkpoint,
@@ -201,6 +201,19 @@ interface WasmModule {
     payloadBase64: string,
   ) => Promise<void>;
   broadcast_block: (handle: BridgeContextHandle, subscriberDid: string) => Promise<void>;
+  broadcast_subscriber_count: (handle: BridgeContextHandle) => number | null;
+  broadcast_is_subscriber: (handle: BridgeContextHandle, did: string) => boolean;
+  broadcast_admission: (handle: BridgeContextHandle) => string | null;
+  broadcast_handle_key_request: (
+    handle: BridgeContextHandle,
+    authorDid: string,
+    requesterDid: string,
+  ) => Promise<string>;
+  // Identity key rotation
+  identity_rotate_key: (identity: { did: string; custodyType: string }) => {
+    did: string;
+    custodyType: string;
+  };
   // Governance
   context_execute_governance: (
     handle: BridgeContextHandle,
@@ -367,12 +380,13 @@ export function createWasmBridge(): Bridge {
       };
     },
 
-    async identityRotateKey(_handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
-      throw new ScpError(
-        "Key rotation in the browser requires WebCrypto orchestration -- " +
-          "this operation is not yet supported in the WASM bridge",
-        "SCP-IDENT-1010",
-      );
+    async identityRotateKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      const wasm = getWasm();
+      const result = wasm.identity_rotate_key({
+        did: handle.did,
+        custodyType: handle.custodyType,
+      });
+      return { did: result.did, custodyType: result.custodyType };
     },
 
     // Context
@@ -498,37 +512,32 @@ export function createWasmBridge(): Bridge {
     },
 
     async broadcastHandleKeyRequest(
-      _handle: BridgeContextHandle,
-      _authorDid: string,
-      _requesterDid: string,
+      handle: BridgeContextHandle,
+      authorDid: string,
+      requesterDid: string,
     ): Promise<string> {
-      throw new ScpError(
-        "Broadcast key request handling is not available in the WASM bridge",
-        "SCP-CTX-2030",
-      );
+      const wasm = getWasm();
+      return await wasm.broadcast_handle_key_request(handle, authorDid, requesterDid);
     },
 
-    async broadcastSubscriberCount(_handle: BridgeContextHandle): Promise<number | null> {
-      throw new ScpError(
-        "Broadcast subscriber count is not available in the WASM bridge",
-        "SCP-CTX-2030",
-      );
+    async broadcastSubscriberCount(handle: BridgeContextHandle): Promise<number | null> {
+      const wasm = getWasm();
+      const count = wasm.broadcast_subscriber_count(handle);
+      return count ?? null;
     },
 
-    async broadcastIsSubscriber(_handle: BridgeContextHandle, _did: string): Promise<boolean> {
-      throw new ScpError(
-        "Broadcast subscriber check is not available in the WASM bridge",
-        "SCP-CTX-2030",
-      );
+    async broadcastIsSubscriber(handle: BridgeContextHandle, did: string): Promise<boolean> {
+      const wasm = getWasm();
+      return wasm.broadcast_is_subscriber(handle, did);
     },
 
     async broadcastAdmission(
-      _handle: BridgeContextHandle,
+      handle: BridgeContextHandle,
     ): Promise<BroadcastAdmissionPolicy | null> {
-      throw new ScpError(
-        "Broadcast admission policy is not available in the WASM bridge",
-        "SCP-CTX-2030",
-      );
+      const wasm = getWasm();
+      const admission = wasm.broadcast_admission(handle);
+      if (admission == null) return null;
+      return admission as BroadcastAdmissionPolicy;
     },
 
     // Governance — delegate to WASM runtime

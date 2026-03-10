@@ -542,6 +542,61 @@ pub fn broadcast_block(handle: &WasmContextHandle, subscriber_did: String) -> Pr
     })
 }
 
+/// Returns the number of subscribers in a broadcast context.
+///
+/// Returns `null` if the context is not a broadcast context.
+#[wasm_bindgen]
+pub fn broadcast_subscriber_count(handle: &WasmContextHandle) -> Option<u32> {
+    let context_id = handle.context_id();
+    with_manager(|mgr| {
+        Ok(mgr
+            .broadcast_subscriber_count(&context_id)
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX)))
+    })
+    .ok()
+    .flatten()
+}
+
+/// Returns `true` if the given DID is a subscriber in a broadcast context.
+#[wasm_bindgen]
+pub fn broadcast_is_subscriber(handle: &WasmContextHandle, did: String) -> bool {
+    let context_id = handle.context_id();
+    with_manager(|mgr| Ok(mgr.is_broadcast_subscriber(&context_id, &did)))
+        .unwrap_or(false)
+}
+
+/// Returns the admission policy for a broadcast context as a JSON string.
+///
+/// Returns `null` if the context is not a broadcast context.
+#[wasm_bindgen]
+pub fn broadcast_admission(handle: &WasmContextHandle) -> Option<String> {
+    let context_id = handle.context_id();
+    with_manager(|mgr| Ok(mgr.broadcast_admission(&context_id)))
+        .ok()
+        .flatten()
+}
+
+/// Handles a broadcast key request and returns a grant/deny decision as JSON.
+///
+/// Returns a JSON string: `{"decision": "grant"}` or `{"decision": "deny", "reason": "..."}`.
+#[wasm_bindgen]
+pub fn broadcast_handle_key_request(
+    handle: &WasmContextHandle,
+    author_did: String,
+    requester_did: String,
+) -> Promise {
+    let context_id = handle.context_id();
+
+    future_to_promise(async move {
+        let result = with_manager(|mgr| {
+            mgr.handle_broadcast_key_request(&context_id, &author_did, &requester_did)
+        })
+        .map_err(ScpWasmError::into_js)?;
+
+        Ok(JsValue::from_str(&result))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Context export/import bridge functions (#424)
 // ---------------------------------------------------------------------------
