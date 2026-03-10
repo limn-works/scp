@@ -155,9 +155,11 @@ pub fn bridge_register(
         })
     })?;
 
-    let governance_did: scp_identity::DID = operator_did.clone().into();
+    // The approver must differ from the operator (governance rule).
+    let approver_did: scp_identity::DID =
+        format!("{operator_did}:approver").into();
     let (connector, _approval_event) =
-        approve_registration(&mut registry, &bridge_id, &governance_did, 0).map_err(|e| {
+        approve_registration(&mut registry, &bridge_id, &approver_did, 0).map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: format!("bridge approval failed: {e}"),
                 code: "SCP-VALID-7013".to_owned(),
