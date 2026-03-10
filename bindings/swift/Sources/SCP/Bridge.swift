@@ -74,10 +74,10 @@ public enum BridgeConnectorBridge {
 /// Evaluates the trust level for an action based on bridge provenance.
 ///
 /// Returns an integer (0-3) representing the trust tier:
-/// - 0: Native-native (highest trust)
-/// - 1: Native-bridged
-/// - 2: Claimed-bridged
-/// - 3: Shadow-bridged (lowest trust)
+/// - 0: Shadow-bridged (lowest trust)
+/// - 1: Claimed-bridged
+/// - 2: Native-bridged
+/// - 3: Native-native (highest trust)
 ///
 /// - Parameters:
 ///   - isBridged: Whether the action originates from a bridge.
