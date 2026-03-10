@@ -4,84 +4,105 @@
 
 An agent with no prior context should be able to visit the SCP repository, understand the protocol, build the project, use the SDK in any target language, run tests, and implement features or write a conforming implementation — without human guidance.
 
-## 21.2 Current State as of 27 Feb 2026 2PM EST
+## 21.2 Current State as of 9 Mar 2026
 
-### Strong
-- Protocol specification: 95% complete (21 spec files, 6,700+ lines)
-- ADRs: 6 phase documents covering all architectural decisions
-- Module-level code documentation: 100% of Rust files have `//!` headers
-- Trait contracts: ~100% documented with invariants and error conditions
-- Standards: 8 languages, error hierarchy, async patterns, CI tiers
+### Done
+
+| # | Category | Artifact | Notes |
+|---|----------|----------|-------|
+| 1 | Protocol specification | 27 spec files, ~15,900 lines | §01–§26 covering all protocol areas |
+| 2 | ADRs | 6 phase documents, ADR-001–ADR-039 | All architectural decisions recorded |
+| 3 | Module-level Rust docs | 100% of Rust files have `//!` headers | All crates |
+| 4 | Trait contracts | ~100% documented | Invariants and error conditions |
+| 5 | Standards | `.docs/standards/` | 8 languages, error hierarchy, async patterns, CI tiers |
+| 6 | SDK binding READMEs | `bindings/{python,typescript,swift,kotlin}/README.md` | Install, quickstart, platform notes |
+| 7 | Architecture guide | `docs/guides/architecture.md` | Reading guide with entry points |
+| 8 | Transport adapter guide | `docs/guides/transport-adapters.md` | Trait requirements, step-by-step, conformance |
+| 9 | Wire format tables | §9.5.2, §12.12, §19.15, §22.11, §23.16 | Signed structures, bridge, economy, discovery, sync |
+| 10 | Protocol constants registry | §9.18 (16 subsections, ~100 constants) | Domain separators, key derivation labels, sizes, timeouts |
+| 11 | Cryptographic test vectors | §25 (18 subsections) | All crypto operations; hex outputs pending (§25.18) |
+| 12 | Conformance suite spec | §26 | Language-independent test case definitions |
+| 13 | GovernanceAction table | §9.5.2 | All 28 variants with signed structure fields |
+| 14 | ContextParams table | §9.5.2 | All 17 fields tabulated |
+| 15 | Domain separators | §9.18.2 | 30 separators registered, code-verified |
+| 16 | Key derivation labels | §9.18.3 | HPKE info, HKDF salt/info, HMAC domains, MLS exporter |
+| 17 | Provenance system | §24 | Full specification with chain depth limits |
+| 18 | README.md | Root | Protocol overview, capabilities, architecture |
+| 19 | LICENSING.md | Root | License structure and FAQ |
+| 20 | CI workflows | `.github/workflows/` | Build matrix, docs, release, security scanning |
+| 21 | Getting started guide | `GETTING-STARTED.md` | Prerequisites, setup, build, test, project structure |
+| 22 | Testing guide | `TESTING.md` | Per-language commands, feature flags, lint, conformance, CI matrix |
+| 23 | Contributing guide | `CONTRIBUTING.md` | Workflow, commits, code style, artifact flow, PRD process |
 
 ### Gaps
 
 | Category | Current | Target | Priority |
 |---|---|---|---|
-| Getting started | None | Build guide, environment setup | P0 |
-| SDK binding READMEs | None | README per language with install + quickstart | P0 |
+| ~~Getting started guide~~ | ~~None~~ | ~~`GETTING-STARTED.md`~~ | Done |
+| ~~Testing guide~~ | ~~Commands in standards only~~ | ~~`TESTING.md`~~ | Done |
+| ~~Contributing guide~~ | ~~None~~ | ~~`CONTRIBUTING.md`~~ | Done |
 | Example applications | Pseudocode only | Runnable examples per language | P0 |
-| Testing guide | Commands in standards only | Standalone how-to | P0 |
+| FFI crate READMEs | None | `crates/scp-ffi/{src,napi,wasm,uniffi}/README.md` | P1 |
 | Inline doc coverage | 57% (scp-core) | 90%+ | P1 |
-| Architecture navigation | Dense 1,054-line doc | Reading guide with entry points | P1 |
-| Generated API reference | None | Hosted rustdoc, typedoc, etc. | P1 |
-| CI workflow | Placeholder | Working GitHub Actions | P1 |
-| Integration guides | None | "Add SCP to existing app" | P2 |
-| Transport adapter guide | None | "Implement a new transport" | P2 |
-| Relay operator guide | None | "Run and monitor a relay" | P2 |
-| Conformance testing guide | Spec only | Working macro examples | P2 |
+| Generated API reference | None | Hosted rustdoc, typedoc, Dokka, DocC | P1 |
+| Remaining guides | 2 of 5 | Storage backends, relay ops, conformance testing | P2 |
+| Test vector hex outputs | Spec complete, outputs pending | Run reference impl to generate §25.18 | P2 |
+| Protocol compliance checklist | None | Extracted MUST/SHOULD/MAY from all specs | P2 |
+| Scaffolds & templates | None | Clonable project setups per §21.12 | P2 |
 
 ## 21.3 Documentation Architecture
 
 ```
-README.md                        # What SCP is, capabilities, architecture, license
-LICENSING.md                     # License structure and FAQ
-GETTING-STARTED.md               # Clone → build → run in 15 minutes
-CONTRIBUTING.md                  # Branch naming, commits, testing, PR process, CLA
-TESTING.md                       # How to run tests, write tests, debug failures
+README.md                      ✓ What SCP is, capabilities, architecture, license
+LICENSING.md                   ✓ License structure and FAQ
+GETTING-STARTED.md             ✓ Prerequisites, setup, build, test, project structure
+CONTRIBUTING.md                ✓ Workflow, commits, code style, artifact flow, PRD process
+TESTING.md                     ✓ Per-language commands, feature flags, lint, conformance, CI matrix
 
-docs/                            # Published documentation (agent-facing)
+docs/                            Published documentation (agent-facing)
 ├── guides/
-│   ├── architecture.md          # Reading guide: where to start, what to focus on
-│   ├── sdk-quickstart.md        # Unified quickstart (all languages)
-│   ├── transport-adapters.md    # How to implement a new transport adapter
-│   ├── storage-backends.md      # How to implement a new storage backend
-│   ├── relay-operations.md      # How to run, monitor, and upgrade a relay
-│   └── conformance-testing.md   # How to use conformance macros
+│   ├── architecture.md        ✓ Reading guide: where to start, what to focus on
+│   ├── sdk-quickstart.md        Unified quickstart (all languages)
+│   ├── transport-adapters.md  ✓ How to implement a new transport adapter
+│   ├── storage-backends.md      How to implement a new storage backend
+│   ├── relay-operations.md      How to run, monitor, and upgrade a relay
+│   └── conformance-testing.md   How to use conformance macros
 ├── examples/
-│   ├── python/                  # Working Python examples
-│   ├── typescript/              # Working TypeScript examples
-│   ├── swift/                   # Working Swift examples
-│   └── rust/                    # Working Rust examples
-└── api/                         # Generated API reference (rustdoc output, etc.)
+│   ├── python/                  Working Python examples
+│   ├── typescript/              Working TypeScript examples
+│   ├── swift/                   Working Swift examples
+│   └── rust/                    Working Rust examples
+└── api/                         Generated API reference (rustdoc output, etc.)
 
-scaffolds/                       # Clonable barebones project setups
-├── rust-client/                 # Minimal Rust binary using scp-core
-├── python-agent/                # Python agent skeleton with async runtime
-├── typescript-web/              # Browser app with WASM binding
-├── typescript-node/             # Node.js agent with NAPI binding
-├── swift-ios/                   # iOS app with Keychain custody
-├── swift-macos/                 # macOS app with Secure Enclave custody
-├── kotlin-android/              # Android app with Keystore custody
-└── relay/                       # Minimal relay with scp-node, TLS, monitoring
+scaffolds/                       Clonable barebones project setups
+├── rust-client/                 Minimal Rust binary using scp-core
+├── python-agent/                Python agent skeleton with async runtime
+├── typescript-web/              Browser app with WASM binding
+├── typescript-node/             Node.js agent with NAPI binding
+├── swift-ios/                   iOS app with Keychain custody
+├── swift-macos/                 macOS app with Secure Enclave custody
+├── kotlin-android/              Android app with Keystore custody
+└── relay/                       Minimal relay with scp-node, TLS, monitoring
 
-templates/                       # Clonable working applications for common use cases
-├── chat/                        # Two-party encrypted chat (CLI + web)
-├── agent-tool-provider/         # Agent exposing tools via SCP context + MCP
-├── collaborative-workspace/     # Multi-party context with roles and tools
-├── personal-relay/              # Self-hosted relay with auto-TLS
-├── broadcast-feed/              # Broadcast context with subscriber management
-└── cross-context-bridge/        # Tool interface bridging two contexts
+templates/                       Clonable working applications for common use cases
+├── chat/                        Two-party encrypted chat (CLI + web)
+├── agent-tool-provider/         Agent exposing tools via SCP context + MCP
+├── collaborative-workspace/     Multi-party context with roles and tools
+├── personal-relay/              Self-hosted relay with auto-TLS
+├── broadcast-feed/              Broadcast context with subscriber management
+└── cross-context-bridge/        Tool interface bridging two contexts
 
-bindings/python/README.md        # Python SDK: install, quickstart, platform notes
-bindings/swift/README.md         # Swift SDK: install, quickstart, platform notes
-bindings/typescript/README.md    # TypeScript SDK: install, quickstart, platform notes (when created)
+bindings/python/README.md      ✓ Python SDK: install, quickstart, platform notes
+bindings/swift/README.md       ✓ Swift SDK: install, quickstart, platform notes
+bindings/typescript/README.md  ✓ TypeScript SDK: install, quickstart, platform notes
+bindings/kotlin/README.md      ✓ Kotlin SDK: install, quickstart, platform notes
 
-crates/scp-ffi/README.md         # PyO3 bridge: build, architecture, for maintainers
-crates/scp-ffi/napi/README.md    # NAPI bridge: build, native addon compilation
-crates/scp-ffi/wasm/README.md    # WASM bridge: build, JS callback injection
-crates/scp-ffi/uniffi/README.md  # UniFFI bridge: build, XCFramework generation
+crates/scp-ffi/README.md        PyO3 bridge: build, architecture, for maintainers
+crates/scp-ffi/napi/README.md    NAPI bridge: build, native addon compilation
+crates/scp-ffi/wasm/README.md    WASM bridge: build, JS callback injection
+crates/scp-ffi/uniffi/README.md  UniFFI bridge: build, XCFramework generation
 
-.docs/                           # Internal project knowledge (unchanged)
+.docs/                         ✓ Internal project knowledge (27 specs, ADRs, standards)
 ```
 
 ### Separation of concerns
@@ -456,16 +477,49 @@ For public-facing documentation, a static site generated from `docs/`:
 
 This is P2 — the content in `docs/` is the priority. The website is presentation.
 
-## 21.13 Compliance Documentation (Agent-Optimized)
+## 21.14 Compliance Documentation (Agent-Optimized)
 
 For agents implementing SCP from the spec (not using the reference implementation):
 
 1. **Protocol compliance checklist** — Every MUST/SHOULD/MAY from the spec, as a checkable list.
-2. **Wire format reference** — Field-by-field tables for all types that cross the network. Covered in: §12.12 (bridge), §19.15 (economy), §22.11 (discovery). Envelope types in §9.5.2.
-3. **Cryptographic requirements** — Exact algorithms, parameters, key sizes, derivation paths. Covered in §9.5 (primitives) and §9.18 (constants registry).
+2. **Wire format reference** — Field-by-field tables for all types that cross the network. Covered in: §12.12 (bridge), §19.15 (economy), §22.11 (discovery). Envelope types in §9.5.2. Sync in §23.16.
+3. **Cryptographic requirements** — Exact algorithms, parameters, key sizes, derivation paths. Covered in §9.5 (primitives) and §9.18 (constants registry, 16 subsections, ~100 constants).
 4. **Test vectors** — Known-good inputs and outputs for crypto operations. Covered in §25 (cryptographic test vectors).
 5. **Conformance test suite** — Language-independent test cases that any implementation must pass. Covered in §26 (conformance suite).
 
 This documentation set is now substantially complete as of March 2026. The remaining work is:
 - Generating exact hex outputs for all test vectors by running the reference implementation (§25.18).
 - Creating the protocol compliance checklist (mechanical extraction from spec MUST/SHOULD/MAY statements).
+
+## 21.15 Protocol Spec as Standalone Specification
+
+**Completeness criterion:** an independent team should be able to implement a conforming SCP stack from `.docs/specs/` alone, without reading the Rust reference implementation source code.
+
+This requires that every protocol-level behavior is specified with enough precision for interoperable implementation:
+
+| Area | Spec Coverage | Status |
+|------|---------------|--------|
+| Identity (DID, keys, migration) | §3, §9.5, §9.11, §9.12 | Complete |
+| Contexts (creation, lifecycle, params) | §5 | Complete |
+| Cross-context communication | §6 | Complete |
+| Trust and capabilities (UCAN, attestations) | §7, §9.8 | Complete |
+| Cryptographic constructions | §9.5.1 (canonical hash), §9.5.2 (signed structures) | Complete |
+| Envelope wire formats | §9.5.2 (inner/outer/broadcast), §9.10 (padding/chunking) | Complete |
+| Sender key layer | §9.16 | Complete |
+| Access key layer (content access control) | §9.17 | Complete |
+| MLS group management | §9.7 | Complete |
+| Protocol constants | §9.18 (16 subsections, ~100 constants) | Complete |
+| Relay wire protocol | §10.5 | Complete |
+| Bridge connectors | §12 | Complete |
+| Governance | §5.6, §9.5.2 (28 GovernanceAction variants) | Complete |
+| Sync and offline recovery | §23, §23.16 (wire formats) | Complete |
+| Discovery and addressing | §22, §22.11 (wire formats) | Complete |
+| Economy | §19, §19.15 (wire formats) | Complete |
+| Provenance | §24 | Complete |
+| Test vectors | §25 | Spec complete; hex outputs pending (§25.18) |
+| Conformance suite | §26 | Complete |
+| Versioning and evolution | §13 | Complete |
+
+**Remaining gaps for full standalone implementability:**
+1. Test vector hex outputs — §25.18 requires running the reference implementation to generate known-good byte sequences for each cryptographic operation.
+2. Protocol compliance checklist — mechanical extraction of all MUST/SHOULD/MAY requirements into a checkable format.

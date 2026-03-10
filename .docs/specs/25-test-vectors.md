@@ -157,23 +157,25 @@ Domain: `"SCP-VOTE-V1:"`
 
 ```
 Input:
-  context_id:   "governance-test-ctx"
   proposal_id:  0x0102030405060708091011121314151617181920212223242526272829303132
   voter_did:    "did:dht:z6MkVoter"
-  vote_value:   "approve" (tag: 0x01)
+  vote_type:    VoteType::Approve (JSON: "Approve", 9 bytes with quotes)
   timestamp:    1700000000
 
-Canonical hash input:
+Canonical hash input (per §9.5.2 SignedVote):
   "SCP-VOTE-V1:"                                           (12 bytes)
-  || BE32(19)  || "governance-test-ctx"                     (4 + 19 = 23 bytes)
   || proposal_id                                            (32 bytes, fixed-length)
   || BE32(17)  || "did:dht:z6MkVoter"                      (4 + 17 = 21 bytes)
-  || 0x01                                                   (1 byte — approve tag)
+  || BE32(9)   || "\"Approve\""                             (4 + 9 = 13 bytes, JSON)
   || BE64(1700000000)                                       (8 bytes)
 
-Total: 12 + 23 + 32 + 21 + 1 + 8 = 97 bytes
+Total: 12 + 32 + 21 + 13 + 8 = 86 bytes
 
-Expected: SHA-256 of the 97 bytes. Sign with Ed25519.
+Expected: SHA-256 of the 86 bytes. Sign with Ed25519.
+
+Note: vote_type is serialized as compact JSON via serde_json (no whitespace).
+VoteType::Approve → "\"Approve\"" (9 bytes). VoteType::Reject → "\"Reject\"" (8 bytes).
+context_id is NOT included — the vote is bound to a context via the proposal_id hash.
 ```
 
 ## 25.6 Reset Request Signing Vectors (§23.5.2)
@@ -184,19 +186,23 @@ Domain: `"SCP-RESET-REQUEST-V1:"`
 
 ```
 Input:
-  context_id:     "sync-test-context"
-  requester_did:  "did:dht:z6MkSync"
-  nonce:          0x0102030405060708091011121314151617181920212223242526272829303132 (32 bytes)
-  timestamp:      1700000000
+  context_id:       "sync-test-context"
+  member_did:       "did:dht:z6MkSync"
+  last_known_epoch: 42
+  reason:           "offline" (ResetReason::Offline → Display string)
+  nonce:            0x0102030405060708091011121314151617 (16 bytes)
+  timestamp:        1700000000
 
-Canonical hash input:
+Canonical hash input (per §23.5.2, field order from code):
   "SCP-RESET-REQUEST-V1:"                     (21 bytes)
   || BE32(17) || "sync-test-context"           (4 + 17 = 21 bytes)
   || BE32(16) || "did:dht:z6MkSync"           (4 + 16 = 20 bytes)
-  || nonce                                     (32 bytes, fixed-length)
+  || BE64(42)                                  (8 bytes — last_known_epoch)
+  || BE32(7)  || "offline"                     (4 + 7 = 11 bytes — reason)
+  || nonce                                     (16 bytes, fixed-length, no length prefix)
   || BE64(1700000000)                          (8 bytes)
 
-Total: 21 + 21 + 20 + 32 + 8 = 102 bytes
+Total: 21 + 21 + 20 + 8 + 11 + 16 + 8 = 105 bytes
 
 Expected: SHA-256 of 102 bytes. Sign with Ed25519.
 ```
@@ -413,20 +419,26 @@ Domain: `"SCP-PROPOSAL-V1:"`
 ```
 Input:
   context_id:   "gov-proposal-context"
-  action_hash:  SHA-256 of serialized governance action (32 bytes)
   proposer_did: "did:dht:z6MkProposer"
+  action_bytes: MessagePack serialization of GovernanceAction (variable length)
+                Example: 0xdeadbeef01020304 (8 bytes, placeholder)
   timestamp:    1700000000
 
-Canonical hash input:
+Canonical hash input (per §9.5.2 GovernanceProposal ID):
   "SCP-PROPOSAL-V1:"                           (17 bytes)
   || BE32(20) || "gov-proposal-context"         (4 + 20 = 24 bytes)
-  || action_hash                                (32 bytes, fixed-length)
   || BE32(20) || "did:dht:z6MkProposer"        (4 + 20 = 24 bytes)
+  || BE32(8)  || action_bytes                   (4 + 8 = 12 bytes, length-prefixed)
   || BE64(1700000000)                           (8 bytes)
 
-Total: 17 + 24 + 32 + 24 + 8 = 105 bytes
+Total: 17 + 24 + 24 + 12 + 8 = 85 bytes
 
-Proposal ID: SHA-256 of the above 105 bytes.
+Proposal ID: SHA-256 of the above 85 bytes.
+
+Note: action_bytes is the raw MessagePack serialization of the GovernanceAction
+enum (not a pre-hash). Field order matches code: context_id, proposer_did,
+action_bytes, timestamp. The action_bytes placeholder above should be replaced
+with actual MessagePack output when generating §25.18 hex outputs.
 ```
 
 ## 25.12 HPKE Key Distribution Vectors

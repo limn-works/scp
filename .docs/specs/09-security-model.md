@@ -394,6 +394,28 @@ Note: the `claim` field uses compact JSON with no whitespace (equivalent to Pyth
 | 4 | `wrapping_pubkey` | 32 bytes (X25519 public key) |
 | 5 | `nonce` | 16 bytes (random, unique per request) |
 
+**GovernanceProposal ID** — domain: `"SCP-PROPOSAL-V1:"` (hash, not signature)
+
+| Order | Field | Encoding |
+|-------|-------|----------|
+| 1 | `context_id` | 4-byte BE length + UTF-8 bytes |
+| 2 | `proposer_did` | 4-byte BE length + UTF-8 bytes |
+| 3 | `action_bytes` | 4-byte BE length + MessagePack serialization of `GovernanceAction` |
+| 4 | `timestamp` | 8-byte BE u64 |
+
+Note: The `ProposalId` is the SHA-256 output (32 bytes). It is deterministic for identical inputs and collision-resistant across contexts. The `action_bytes` field uses MessagePack serialization of the `GovernanceAction` enum (externally tagged, serde named fields).
+
+**SignedVote** — domain: `"SCP-VOTE-V1:"`
+
+| Order | Field | Encoding |
+|-------|-------|----------|
+| 1 | `proposal_id` | 32 bytes (fixed-size, the `ProposalId` hash) |
+| 2 | `voter_did` | 4-byte BE length + UTF-8 bytes |
+| 3 | `vote_type` | 4-byte BE length + JSON serialization of `VoteType` (compact, no whitespace) |
+| 4 | `timestamp` | 8-byte BE u64 |
+
+Note: The Ed25519 signature is over `SHA-256("SCP-VOTE-V1:" || fields)`. The `proposal_id` binds the vote to a specific proposal, preventing cross-proposal replay. `VoteType` is serialized as compact JSON (equivalent to `json.dumps(separators=(',', ':'))` in Python).
+
 **UCAN signing:** EdDSA (Ed25519) per UCAN specification. The nonce field (`nnc`) is mandatory and must be unique per token issuance. This prevents UCAN token replay. UCAN token expiry (`exp`) MUST NOT exceed 24 hours (matching the nonce deduplication cache window in §9.8.2). Tokens with longer expiry could be replayed after nonce cache eviction. **UCAN revocation** is per-context via `RevocationList` — an append-only map of token CIDs to revocation states (Active, RevocationPending, Revoked). Revocations are distributed as MLS application messages to all context members. Revocation check is step 10 of the 11-step validation pipeline (ADR-016) and is performed on every capability exercise. The system is **fail-closed**: tokens in `RevocationPending` state (revocation initiated but not yet confirmed via MLS) are denied. See ADR-016 criterion 7 and `scp-core/crypto/ucan/revoke.rs` for the full specification.
 
 **UCAN CID computation.** UCAN tokens are identified by Content Identifiers (CIDs) in the `RevocationList` and in delegation chain `prf` references. CID computation MUST use the following parameters:
@@ -1153,18 +1175,18 @@ This suite matches the MLS ciphersuite (§9.5) and the DID-to-DID HPKE suite, mi
 **`info` parameter (domain separation):**
 
 ```
-info = "scp-sender-key-v1" || BE32(len(context_id)) || context_id || BE32(len(sender_did)) || sender_did || epoch_bytes
+info = "scp-sender-key-v1" || context_id || sender_did || epoch_bytes
 ```
 
-Where `context_id` and `sender_did` are UTF-8 bytes with 4-byte big-endian length prefixes (preventing boundary-shift collisions between variable-length fields) and `epoch_bytes` is the 8-byte big-endian encoding of the sender key epoch. The `info` string binds the HPKE encryption to a specific context, sender, and epoch. Using a different `info` on open produces a different derived key, causing AEAD decryption to fail.
+Where `context_id` and `sender_did` are UTF-8 bytes (no length prefix — the `info` string is not parsed, only compared) and `epoch_bytes` is the 8-byte big-endian encoding of the sender key epoch. The `info` string binds the HPKE encryption to a specific context, sender, and epoch. Using a different `info` on open produces a different derived key, causing AEAD decryption to fail.
 
 **`aad` parameter (additional authenticated data):**
 
 ```
-aad = BE32(len(context_id)) || context_id || BE32(len(sender_did)) || sender_did || epoch_bytes
+aad = context_id || sender_did || epoch_bytes
 ```
 
-Where fields use the same length-prefixed encoding as `info` (without the domain separator prefix). The AAD binds the ciphertext to the context and sender, preventing cross-context and cross-sender key substitution attacks. Tampering with any field in the wire format causes AEAD verification to fail.
+Where fields use the same encoding as `info` (without the domain separator prefix). The AAD binds the ciphertext to the context and sender, preventing cross-context and cross-sender key substitution attacks. Tampering with any field in the wire format causes AEAD verification to fail.
 
 **Nonce:** The AEAD nonce is managed internally by the HPKE context (RFC 9180 §5.2 `ComputeNonce`). Implementations MUST NOT generate or supply an external nonce — HPKE derives it from the key schedule. Since each `SenderKeyResponse` creates a fresh HPKE context (fresh ephemeral keypair), the internal sequence counter starts at 0 and only one `Seal`/`Open` call is made per context.
 
@@ -1433,8 +1455,8 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash const
 | `"SCP-PARTICIPATION-PROFILE-V1:"` | ParticipationProfile canonical hash | §9.5.2 |
 | `"SCP-BLOCK-NOTIFICATION-V1:"` | BlockNotification signing | §9.5.2 |
 | `"SCP-ACCESS-KEY-REQUEST-V1:"` | AccessKeyRequest signing | §9.5.2 |
-| `"SCP-VOTE-V1:"` | Governance vote signing | §6.4 |
-| `"SCP-PROPOSAL-V1:"` | Governance proposal ID computation | §6.4 |
+| `"SCP-VOTE-V1:"` | Governance vote signing | §9.5.2 |
+| `"SCP-PROPOSAL-V1:"` | Governance proposal ID computation | §9.5.2 |
 | `"SCP-MIGRATION-V1:"` | DID migration proof | §9.12 |
 | `"SCP-RESET-REQUEST-V1:"` | Sync reset request signing | §23.5.2 |
 | `"SCP-KEY-CONTINUITY-V1:"` | Key continuity fingerprint hash | §9.11 |
@@ -1447,24 +1469,47 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash const
 | `"SCP-CLAIM-V1:"` | Shadow identity claim validation | §12.3 |
 | `"SCP-RECEIPT-V1:"` | Payment receipt signing | §19.15.5 |
 | `"SCP-HANDLE-TOOL-V1:"` | Handle tool request signing | §22.3.1 |
-| `"SCP-CHUNK-V1:"` | Chunk envelope message ID derivation | §9.5.3 |
-| `"SCP-ATTESTATION-ID-V1:"` | Identity attestation ID computation | §3.5 |
-| `"SCP-IDENTITY-LINK-ATTESTATION-V1:"` | Identity link attestation canonical hash for signing | §3.5 |
-| `"SCP-PSEUDONYM-V1:"` | Context-scoped pseudonym derivation | §9.10.4 |
-| `"SCP-OFFER-ID-V1:"` | Tool interface offer ID computation | §6.2 |
-| `"SCP-PRIVATE-LOG-V1:"` | Private state event hash chain | §3.4 |
-| `"SCP-CHALLENGE-REQ-V1:"` | Challenge request canonical bytes for signing | §10.5 |
-| `"SCP-CHALLENGE-RESP-V1:"` | Challenge response canonical bytes for signing | §10.5 |
-| `"SCP-CHALLENGE-VERIFY-V1:"` | Challenge verification canonical bytes for signing | §10.5 |
+| `"SCP-CHALLENGE-REQ-V1:"` | Trust challenge request signing | §7.4 |
+| `"SCP-CHALLENGE-RESP-V1:"` | Trust challenge response signing | §7.4 |
+| `"SCP-CHALLENGE-VERIFY-V1:"` | Trust challenge verification signing | §7.4 |
+| `"SCP-BRIDGE-REGISTER-V1:"` | Bridge relay registration signing | §12 |
+| `"SCP-PRIVATE-LOG-V1:"` | Private state event hash chain | §3.7 |
+| `"SCP-PUSH-REGISTER-V1:"` | Push notification registration signing | §22.11.4 |
+| `"SCP-PUSH-DEREGISTER-V1:"` | Push notification deregistration signing | §22.11.4 |
+| `"SCP-CHUNK-MSG-ID-V1:"` | Chunked message ID derivation | §9.10.3 |
 
-### 9.18.3 HPKE Info Strings
+### 9.18.3 Key Derivation and HPKE Labels
 
-HPKE `info` strings provide domain separation for key encapsulation operations. Each key distribution protocol uses a distinct prefix to prevent cross-protocol key confusion.
+This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strings, and MLS exporter labels. Each label provides domain separation for a specific key derivation or encapsulation protocol.
+
+**HPKE info prefixes** — used in `info` parameter of RFC 9180 HPKE encapsulation:
 
 | Info Prefix | Used For | Full Format | Spec Reference |
 |-------------|----------|-------------|----------------|
 | `"scp-sender-key-v1"` | Sender key HPKE encapsulation | `"scp-sender-key-v1" \|\| BE32(len(context_id)) \|\| context_id \|\| BE32(len(sender_did)) \|\| sender_did \|\| epoch_BE` | §9.16.2 |
 | `"scp-access-key-v1"` | Access key HPKE encapsulation | `"scp-access-key-v1" \|\| BE32(len(context_id)) \|\| context_id \|\| BE32(len(member_did)) \|\| member_did \|\| epoch_bytes` | §9.17.1 |
+
+**HKDF labels** — used in HKDF-SHA-256 `salt` or `info` parameters:
+
+| Label | Type | Used For | Spec Reference |
+|-------|------|----------|----------------|
+| `"scp-private-state-salt-v1"` | HKDF salt domain | Private state routing ID derivation — actual salt is `SHA-256("scp-private-state-salt-v1")` | §3.7 |
+| `"scp-private-state-v1"` | HKDF info prefix | Private state routing ID derivation — full info is `"scp-private-state-v1" \|\| did_string` | §3.7 |
+| `"scp-bridge-credential-v1"` | HKDF info | Bridge credential encryption key derivation | §12 |
+| `"scp-participation-statement-v1"` | HKDF info | Context-specific participation signing key derivation | §7.3 |
+
+**HMAC domain separators** — used in HMAC-SHA-256 for pseudonym key derivation:
+
+| Label | Used For | Construction | Spec Reference |
+|-------|----------|--------------|----------------|
+| `"scp-pseudonym"` | Pseudonym v1 (non-rotatable, epoch 0) | `HMAC-SHA-256(identity_key_material, context_id \|\| "scp-pseudonym")` | §9.2 |
+| `"scp-pseudonym-v2"` | Pseudonym v2 (rotatable, epoch > 0) | `HMAC-SHA-256(identity_key_material, context_id \|\| epoch_BE \|\| "scp-pseudonym-v2")` | §9.2 |
+
+**MLS exporter labels** — used in RFC 9420 `MLS-Exporter` for key export:
+
+| Label | Used For | Spec Reference |
+|-------|----------|----------------|
+| `"scp-media-key-v1"` | DTLS-SRTP media key derivation from MLS group state | §10.9.1 |
 
 ### 9.18.4 Key and Nonce Sizes
 
@@ -1476,6 +1521,8 @@ HPKE `info` strings provide domain separation for key encapsulation operations. 
 | AES-GCM nonce size | 12 bytes | For sender key and access key AEAD | §9.16, §9.17 |
 | Sender key size | 32 bytes | AES-256-GCM key | §9.16 |
 | Access key size | 32 bytes | AES-256 wrapping key | §9.17 |
+| AES-KW IV | `[0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6]` | RFC 3394 Initial Value for AES Key Wrap | §9.17 |
+| AES-KW semiblocks | 4 | Number of 64-bit semiblocks in 256-bit key | §9.17 |
 
 ### 9.18.5 Envelope and Padding
 
@@ -1484,6 +1531,10 @@ HPKE `info` strings provide domain separation for key encapsulation operations. 
 | Padding bucket sizes | `[256, 1024, 4096, 16384, 65536, 262144]` | Payloads padded to next bucket boundary | §9.10 |
 | Max chunk payload size | 262140 bytes | Largest bucket (262144) minus 4-byte length suffix | §9.10 |
 | Length suffix size | 4 bytes | BE u32, appended before padding | §9.10 |
+| Max total chunks | 262,144 | Maximum chunks per chunked message (~64 GB theoretical max) | §9.10 |
+| Max bounded binary field | 524,288 bytes (512 KiB) | OOM-prevention limit for binary fields on deserialization | §9.5 |
+| Max outer envelope wire size | 589,824 bytes (576 KiB) | `MAX_BOUNDED_BINARY + 65,536` — checked before deserialization | §9.5 |
+| Max bounded string field | 1,024 bytes | OOM-prevention limit for string identifier fields | §9.5 |
 
 ### 9.18.6 Context and Governance
 
@@ -1498,6 +1549,10 @@ HPKE `info` strings provide domain separation for key encapsulation operations. 
 | Tool lifecycle default timeout | 30,000ms (30s) | Default tool invocation timeout | §6.2 |
 | Tool lifecycle max timeout | 300,000ms (5 min) | Hard protocol maximum for tool invocation timeout | §6.2 |
 | Min active voters for fallback | 2 | Minimum voters for governance timeout fallback | §6.4 |
+| Max threshold signers | 64 | Maximum co-signers for multi-sig governance actions | §5.6 |
+| Max role name length | 64 bytes | Maximum length of custom role names | §5.6 |
+| Default provenance chain depth | 3 hops | Default max cross-context provenance chain depth | §24.4 |
+| Protocol hard max chain depth | 5 hops | Absolute maximum — no context may exceed this | §24.4 |
 
 ### 9.18.7 MLS and UCAN
 
@@ -1513,6 +1568,10 @@ HPKE `info` strings provide domain separation for key encapsulation operations. 
 | CID hash algorithm | SHA-256 (multihash `0x12`) | 32-byte digest | §9.5 |
 | CID content codec | DAG-CBOR (`0x71`) | Canonical CBOR encoding | §9.5 |
 | CID multibase encoding | base32lower (prefix `b`) | For display; raw bytes on wire | §9.5 |
+| MLS extension type: `scp_wrapping_key` | `0xFF01` | RFC 9420 §17.3 private-use range; carries X25519 sender key wrapping public key | §9.16 |
+| UCAN max delegation chain depth | 32 | Maximum depth of UCAN delegation chains | §9.8.2 |
+| UCAN nonce cache max capacity | 100,000 | Maximum nonces tracked for deduplication | §9.8.2 |
+| UCAN nonce min retention | 86,400s (24h) | Minimum time nonces are retained before garbage collection | §9.8.2 |
 
 ### 9.18.8 Sender Key Protocol
 
@@ -1520,6 +1579,12 @@ HPKE `info` strings provide domain separation for key encapsulation operations. 
 |----------|-------|-------|----------------|
 | Sender key grace period | 30s | Window for accepting messages with pre-rotation keys | §9.16 |
 | Sender key timeout | 60s | Timeout for sender key request/response exchange | §9.16.2 |
+| Sender key nonce expiry | 300s (5 min) | Validity window for sender key request nonces | §9.16.2 |
+| Sender key request freshness | 300s (5 min) | Request freshness window (synchronized with nonce expiry) | §9.16.2 |
+| Block notification freshness | 30,000ms (30s) | Maximum age for block notification messages | §9.16.4 |
+| Sender key nonce dedup capacity | 10,000 | Maximum nonces tracked for sender key replay prevention | §9.16.2 |
+| Access key request freshness | 30s | Freshness window for access key request messages | §9.17.1 |
+| Broadcast replay max authors | 10,000 | Maximum unique senders tracked in broadcast replay detector | §9.16.5 |
 
 ### 9.18.9 Sync and Offline Recovery
 
@@ -1536,6 +1601,9 @@ HPKE `info` strings provide domain separation for key encapsulation operations. 
 | Max epoch drift (Tier 3) | 1,000 epochs | Maximum epoch gap before requiring full reset | §23.5 |
 | Reset request nonce cache | 10,000 entries | Anti-replay cache for reset request nonces | §23.5 |
 | Max inflight reset queue | 500 | Maximum concurrent pending reset requests | §23.5 |
+| Reorder buffer capacity | 100 | Capacity of message reorder buffer for out-of-order delivery | §23 |
+| Reset request freshness | 30s | Freshness window for Tier 3 reset request signatures | §23.5 |
+| Reset request nonce TTL | 60s | TTL for Tier 3 reset request nonces in anti-replay cache | §23.5 |
 
 ### 9.18.10 Event Log
 
@@ -1562,6 +1630,7 @@ HPKE `info` strings provide domain separation for key encapsulation operations. 
 | Max reconnect attempts | 6 | Maximum consecutive reconnection attempts | §10.5 |
 | Reconnect overlap | 5s | Overlap window during relay reconnection for gap-filling | §10.5 |
 | Relay timestamp deviation threshold | 60s | Maximum acceptable clock skew between client and relay | §10.5 |
+| Max blob size | 262,144 bytes (256 KiB) | Maximum blob payload size on relay (matches largest padding bucket) | §10.5 |
 
 ### 9.18.12 Bridge
 
@@ -1584,3 +1653,27 @@ HPKE `info` strings provide domain separation for key encapsulation operations. 
 | Push platform tag: APNS | `0x01` | Platform tag byte for Apple Push Notification Service | §10.7.1 |
 | Push platform tag: FCM | `0x02` | Platform tag byte for Firebase Cloud Messaging | §10.7.1 |
 | Push platform tag: WebPush | `0x03` | Platform tag byte for Web Push API | §10.7.1 |
+
+### 9.18.14 Version Constants
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| SCP protocol version | `0x0100` (u16) | SCP/1.0, encoded as `(major << 8) \| minor`; first field in all envelope types | §9.5 |
+| Inner envelope version | `1` (u8) | Inner envelope format version | §9.5 |
+
+### 9.18.15 Timestamp and Message Validation
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Default clock skew tolerance | 300,000ms (5 min) | Maximum acceptable clock skew for envelope timestamp validation | §9.5 |
+| Default max message age | 604,800,000ms (7d) | Messages older than this are rejected regardless of clock skew | §9.5 |
+
+### 9.18.16 Membership and Buffers
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Default receive buffer capacity | 1,000 events | Default in-memory event receive buffer per membership | §5.6 |
+| Min receive buffer capacity | 100 events | Minimum configurable buffer capacity | §5.6 |
+| Max receive buffer capacity | 10,000 events | Maximum configurable buffer capacity | §5.6 |
+| Default key package min buffer | 10 | Minimum MLS key packages to keep available | §9.7 |
+| Key package replenish threshold | 5 | Trigger replenishment when buffer drops below this | §9.7 |
