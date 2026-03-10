@@ -103,7 +103,16 @@ export async function discoverContexts(query: string): Promise<DiscoveryResult[]
   try {
     const bridge = await getBridge();
     const raw = await bridge.contextDiscover(query);
-    const results: DiscoveryResult[] = JSON.parse(raw);
+    const parsed: Array<Record<string, unknown>> = JSON.parse(raw);
+    // NAPI Rust returns snake_case keys; map to the camelCase DiscoveryResult interface.
+    const results: DiscoveryResult[] = parsed.map((item) => ({
+      contextId: (item.context_id ?? item.contextId) as string,
+      relayUrls: (item.relay_urls ?? item.relayUrls) as readonly string[],
+      publisherDid: (item.publisher_did ?? item.publisherDid) as string,
+      discoverySource: (item.discovery_source ?? item.discoverySource) as string,
+      mode: (item.mode ?? null) as string | null,
+      metadataSummary: (item.metadata_summary ?? item.metadataSummary ?? null) as string | null,
+    }));
     return results;
   } catch (error) {
     throw mapBridgeError(error);
