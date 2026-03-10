@@ -619,7 +619,7 @@ Template: "scp:template/coordination"
   metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, tool_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/group-discussion"
-  ceiling:     [messagesRead, messagesWrite, memberInvite, memberBan]
+  ceiling:     [messagesRead, messagesWrite, memberInvite, roleAssign, memberBan]
   roles:       [admin, member, observer]
   governance:  single-admin
   memory_scope: full

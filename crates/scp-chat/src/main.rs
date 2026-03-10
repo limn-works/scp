@@ -65,6 +65,8 @@ const MAX_HISTORY: usize = 200;
 const STORAGE_KEY_MEMBER_METADATA: &str = "chat/member_metadata";
 /// Storage key prefix for persisted chat messages.
 const STORAGE_KEY_MESSAGES: &str = "chat/messages";
+/// Storage key for persisted identity (DID, key handles, document).
+const STORAGE_KEY_IDENTITY: &str = "chat/identity";
 
 type ChatDidDht = DidDht<scp_identity::InMemoryDhtClient, scp_identity::cache::SystemClock>;
 
@@ -110,18 +112,82 @@ fn noop_key_resolver() -> scp_core::context::governance::KeyResolver {
 // Data directory helpers
 // ---------------------------------------------------------------------------
 
+/// Returns the data directory, local to the binary's working directory.
 fn data_dir() -> PathBuf {
-    dirs::home_dir()
-        .expect("could not determine home directory")
-        .join(".scp-chat")
+    PathBuf::from("scp-chat-data")
 }
 
 fn ensure_data_dir() -> PathBuf {
     let dir = data_dir();
     if !dir.exists() {
-        std::fs::create_dir_all(&dir).expect("failed to create ~/.scp-chat/");
+        std::fs::create_dir_all(&dir).expect("failed to create scp-chat-data/");
     }
     dir
+}
+
+// ---------------------------------------------------------------------------
+// Identity persistence
+// ---------------------------------------------------------------------------
+
+/// Serializable snapshot of [`ScpIdentity`] + [`DidDocument`] for persistence
+/// across restarts. Key handles are opaque u64 indices into the
+/// `FileKeyCustody` keyring — they remain valid as long as the keyring file
+/// doesn't change.
+#[derive(Serialize, Deserialize)]
+struct PersistedIdentity {
+    identity_key: u64,
+    active_signing_key: u64,
+    agent_signing_key: Option<u64>,
+    pre_rotation_commitment: [u8; 32],
+    did: String,
+    document: scp_identity::DidDocument,
+}
+
+impl PersistedIdentity {
+    fn from_identity(id: &scp_identity::ScpIdentity, doc: &scp_identity::DidDocument) -> Self {
+        Self {
+            identity_key: id.identity_key.id(),
+            active_signing_key: id.active_signing_key.id(),
+            agent_signing_key: id.agent_signing_key.map(|k| k.id()),
+            pre_rotation_commitment: id.pre_rotation_commitment,
+            did: id.did.clone(),
+            document: doc.clone(),
+        }
+    }
+
+    fn into_identity(self) -> (scp_identity::ScpIdentity, scp_identity::DidDocument) {
+        use scp_platform::traits::KeyHandle;
+        let identity = scp_identity::ScpIdentity {
+            identity_key: KeyHandle::new(self.identity_key),
+            active_signing_key: KeyHandle::new(self.active_signing_key),
+            agent_signing_key: self.agent_signing_key.map(KeyHandle::new),
+            pre_rotation_commitment: self.pre_rotation_commitment,
+            did: self.did,
+        };
+        (identity, self.document)
+    }
+}
+
+async fn load_persisted_identity(
+    storage: &FilesystemStorage,
+) -> Option<(scp_identity::ScpIdentity, scp_identity::DidDocument)> {
+    let data = storage.retrieve(STORAGE_KEY_IDENTITY).await.ok()??;
+    serde_json::from_slice::<PersistedIdentity>(&data)
+        .ok()
+        .map(PersistedIdentity::into_identity)
+}
+
+async fn save_persisted_identity(
+    storage: &FilesystemStorage,
+    identity: &scp_identity::ScpIdentity,
+    document: &scp_identity::DidDocument,
+) {
+    let persisted = PersistedIdentity::from_identity(identity, document);
+    let json = serde_json::to_vec(&persisted).expect("serialize identity");
+    storage
+        .store(STORAGE_KEY_IDENTITY, &json)
+        .await
+        .expect("failed to persist identity");
 }
 
 // ---------------------------------------------------------------------------
@@ -425,7 +491,11 @@ fn truncate_did(did: &str) -> String {
 // Self-signed TLS provider
 // ---------------------------------------------------------------------------
 
-struct SelfSignedTls(String);
+/// Self-signed TLS provider that generates a cert with multiple Subject
+/// Alternative Names (SANs). Covers LAN IP, public IP (if UPnP mapped),
+/// localhost, and 127.0.0.1 so devices connecting via any address get a
+/// valid cert (after accepting the self-signed warning).
+struct SelfSignedTls(Vec<String>);
 
 impl TlsProvider for SelfSignedTls {
     fn provision(
@@ -438,8 +508,20 @@ impl TlsProvider for SelfSignedTls {
                 + '_,
         >,
     > {
-        let domain = self.0.clone();
-        Box::pin(async move { scp_node::tls::generate_self_signed(&domain) })
+        let sans = self.0.clone();
+        Box::pin(async move {
+            let params = rcgen::CertificateParams::new(sans)
+                .map_err(|e| scp_node::tls::TlsError::Certificate(e.to_string()))?;
+            let key_pair = rcgen::KeyPair::generate()
+                .map_err(|e| scp_node::tls::TlsError::Certificate(e.to_string()))?;
+            let cert = params
+                .self_signed(&key_pair)
+                .map_err(|e| scp_node::tls::TlsError::Certificate(e.to_string()))?;
+            Ok(scp_node::tls::CertificateData {
+                certificate_chain_pem: cert.pem(),
+                private_key_pem: zeroize::Zeroizing::new(key_pair.serialize_pem()),
+            })
+        })
     }
 }
 
@@ -472,40 +554,72 @@ async fn main() {
     let protocol_store = Arc::new(ProtocolStore::new(manager_storage));
 
     // --- Identity ---
-    // FileKeyCustody handles create-or-reuse internally: same keys on disk
-    // produce the same DID every time, so no separate identity.json is needed.
+    // On restart, load persisted identity (DID + key handles + document) from
+    // storage. Key handles index into the FileKeyCustody keyring which is
+    // persisted in keys.enc. On first run, create a new identity and persist it.
     let keys_path = dir.join("keys.enc");
-    let is_existing = keys_path.exists();
 
-    let dht_client = Arc::new(scp_identity::InMemoryDhtClient::new());
-    let cache = Arc::new(scp_identity::DidCache::new());
-
-    let upnp = Arc::new(scp_transport::nat::UpnpPortMapper::new());
-    println!("{DIM}  UPnP: attempting port mapping...{RESET}");
-
-    // Always use generate_identity_with: FileKeyCustody opens existing keys
-    // on restart, so the builder derives the same DID from the same keys.
     let custody = Arc::new(
         FileKeyCustody::new(&keys_path, PASSPHRASE)
             .expect("failed to open/create key file (wrong passphrase?)"),
     );
 
+    let dht_client = Arc::new(scp_identity::InMemoryDhtClient::new());
+    let cache = Arc::new(scp_identity::DidCache::new());
     let sign_fn = ChatDidDht::make_sign_fn(Arc::clone(&custody));
     let did_method = Arc::new(ChatDidDht::with_client_and_signer(
         dht_client, cache, sign_fn,
     ));
 
-    // We need a separate FilesystemStorage for the node builder (it takes
-    // ownership). The node's internal ProtocolStore and our direct storage
-    // share the same directory, but use different key namespaces ("chat/*"
-    // for us, protocol namespaces for the node).
+    let upnp = Arc::new(scp_transport::nat::UpnpPortMapper::new());
+    println!("{DIM}  UPnP: attempting port mapping...{RESET}");
+
+    // UPnP for HTTP port — do this early so we know the public IP for the TLS
+    // cert SANs. The relay port mapping is handled by port_mapper() in build().
+    let upnp_http = scp_transport::nat::UpnpPortMapper::new();
+    let public_addr = match upnp_http.map_port(PORT).await {
+        Ok(result) => {
+            println!(
+                "{DIM}  UPnP: HTTP port {PORT} mapped to {}{RESET}",
+                result.external_addr
+            );
+            Some(result.external_addr)
+        }
+        Err(e) => {
+            println!("{DIM}  UPnP: HTTP port mapping failed ({e}){RESET}");
+            None
+        }
+    };
+
+    // Build TLS cert with SANs for all reachable addresses.
+    let mut sans = vec![host_ip.clone(), "localhost".to_owned(), "127.0.0.1".to_owned()];
+    if let Some(addr) = &public_addr {
+        sans.push(addr.ip().to_string());
+    }
+    println!("{DIM}  TLS SANs: {}{RESET}", sans.join(", "));
+
+    // Load or create identity. On restart, the persisted identity has the same
+    // key handles as last time — FileKeyCustody reloads the same keyring.
+    let (identity, document, is_existing) =
+        if let Some((id, doc)) = load_persisted_identity(&fs_storage).await {
+            (id, doc, true)
+        } else {
+            let (id, doc) = did_method
+                .create(custody.as_ref())
+                .await
+                .expect("failed to create identity");
+            save_persisted_identity(&fs_storage, &id, &doc).await;
+            (id, doc, false)
+        };
+
+    // Build the node with the explicit identity (never re-generates).
     let node_storage =
         FilesystemStorage::new(&storage_dir).expect("failed to create node storage dir");
 
     let node = ApplicationNodeBuilder::new()
         .no_domain()
-        .tls_provider(Arc::new(SelfSignedTls(host_ip.clone())))
-        .generate_identity_with(custody, did_method)
+        .tls_provider(Arc::new(SelfSignedTls(sans)))
+        .identity(identity, document, did_method)
         .storage(node_storage)
         .port_mapper(upnp)
         .blob_storage(BlobStorageBackend::in_memory())
@@ -531,22 +645,6 @@ async fn main() {
     let relay_addr = node.relay().bound_addr();
     let bridge_token = node.bridge_token_hex();
     let host_name = "Host".to_owned();
-
-    // UPnP for HTTP port.
-    let upnp_http = scp_transport::nat::UpnpPortMapper::new();
-    let public_addr = match upnp_http.map_port(PORT).await {
-        Ok(result) => {
-            println!(
-                "{DIM}  UPnP: HTTP port {PORT} mapped to {}{RESET}",
-                result.external_addr
-            );
-            Some(result.external_addr)
-        }
-        Err(e) => {
-            println!("{DIM}  UPnP: HTTP port mapping failed ({e}){RESET}");
-            None
-        }
-    };
 
     // Renew UPnP mapping every 30 minutes (lease is 1 hour, renew at 50%).
     if public_addr.is_some() {
@@ -583,26 +681,14 @@ async fn main() {
 
     // Try to restore the context from persisted state. If no persisted context
     // exists (first run), create a new one.
+    // NOTE: MlsCryptoProvider is in-memory (#645) — after restart, the MLS
+    // group is gone and join_context/send_message crypto ops fail. This is an
+    // SDK bug, not an app-level concern.
     let handle = match manager.restore_all_contexts().await {
         Ok(restored) if restored.contains(&CTX_ID.to_owned()) => {
-            // Context restored from persistence. Verify host is a member.
             let member_count = manager.member_count(CTX_ID).await.unwrap_or(0);
             println!("  {GREEN}Restored context:{RESET} {member_count} members");
 
-            // Ensure host is in the context (in case identity changed).
-            if !manager.is_member(CTX_ID, &host_did).await {
-                let handle = ContextHandle::new(CTX_ID.to_owned(), ContextParams::default());
-                let _ = handle
-                    .transition_to(&scp_core::context::ContextState::Active)
-                    .await;
-                let kp = KeyPackage::mock(DID(host_did.clone()));
-                manager
-                    .join_context(&handle, kp)
-                    .await
-                    .expect("failed to add host to restored context");
-            }
-
-            // Create a handle for subsequent operations.
             let handle = ContextHandle::new(CTX_ID.to_owned(), ContextParams::default());
             let _ = handle
                 .transition_to(&scp_core::context::ContextState::Active)
@@ -610,7 +696,6 @@ async fn main() {
             handle
         }
         _ => {
-            // First run or no persisted context: create a new one.
             let handle = manager
                 .create_context(
                     CTX_ID.to_owned(),
@@ -711,10 +796,14 @@ async fn main() {
     let shutdown = async move {
         tokio::signal::ctrl_c().await.ok();
         println!("\n{DIM}Shutting down...{RESET}");
-        // Persist app-level member metadata. Protocol-level membership is
-        // auto-persisted by the ContextManager's persistence provider.
         room_shutdown.persist_metadata().await;
-        println!("{DIM}Room state saved.{RESET}");
+        println!("{DIM}State saved.{RESET}");
+        // Hard deadline: if serve()'s drain hangs on STUN/relay, force exit.
+        tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            println!("{DIM}Shutdown complete.{RESET}");
+            std::process::exit(0);
+        });
     };
 
     if let Err(e) = node.serve(app, shutdown).await {
@@ -726,8 +815,14 @@ async fn main() {
 // HTTP handlers
 // ---------------------------------------------------------------------------
 
-async fn serve_web_ui() -> Html<&'static str> {
-    Html(include_str!("chat.html"))
+async fn serve_web_ui() -> impl IntoResponse {
+    // Read from disk so frontend changes take effect without rebuilding.
+    // Falls back to the compile-time embedded copy if the file is missing
+    // (e.g. running the binary outside the source tree).
+    match tokio::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/chat.html")).await {
+        Ok(html) => Html(html).into_response(),
+        Err(_) => Html(include_str!("chat.html")).into_response(),
+    }
 }
 
 async fn handle_join(

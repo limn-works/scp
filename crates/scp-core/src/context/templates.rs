@@ -99,6 +99,8 @@ const CAP_TOOL_REGISTER: &str = "tool:register";
 const CAP_MEMBER_INVITE: &str = "member:invite";
 /// Standard capability name for banning members from a context.
 const CAP_MEMBER_BAN: &str = "member:ban";
+/// Standard capability name for assigning roles to members.
+const CAP_ROLE_ASSIGN: &str = "role:assign";
 
 // ---------------------------------------------------------------------------
 // Template definitions
@@ -174,12 +176,17 @@ fn messaging_tools_ban_ceiling() -> Vec<Capability> {
 }
 
 /// Returns the messaging + invite + ban ceiling: messaging + `member:invite`
-/// + `member:ban`.
+/// + `role:assign` + `member:ban`.
+///
+/// `role:assign` is included because `member:invite` is useless without it —
+/// `join_context` assigns a role to the new member, which requires the inviter
+/// to hold `RoleAssign`.
 fn messaging_invite_ban_ceiling() -> Vec<Capability> {
     vec![
         Capability::new(CAP_MESSAGES_READ),
         Capability::new(CAP_MESSAGES_WRITE),
         Capability::new(CAP_MEMBER_INVITE),
+        Capability::new(CAP_ROLE_ASSIGN),
         Capability::new(CAP_MEMBER_BAN),
     ]
 }
@@ -256,7 +263,7 @@ const fn member_count_hidden_visibility() -> MetadataVisibilityPolicy {
 /// | `BilateralEphemeral` | Encrypted | messages + ban | Yes | private | None | Required | None |
 /// | `BilateralPersistent` | Encrypted | messages + ban | Yes | private | None | Forbidden | None |
 /// | `Coordination` | Encrypted | messages + invoke + ban | Yes | private | None | Required | None |
-/// | `GroupDiscussion` | Encrypted | messages + invite + ban | Yes | group | None | Optional | None |
+/// | `GroupDiscussion` | Encrypted | messages + invite + role_assign + ban | Yes | group | None | Optional | None |
 /// | `PublicBroadcast` | Broadcast | messages + tools | No | default | Public | Optional | None |
 /// | `GatedBroadcast` | Broadcast | messages + tools | No | member_count_hidden | Gated | Optional | None |
 /// | `ToolInterfaceTemplate` | Encrypted | messages + tools + ban | Yes | default | None | Optional | None |
@@ -907,7 +914,7 @@ mod tests {
     fn group_discussion_params_have_correct_fields() {
         let params = template_params(&TemplateId::GroupDiscussion);
         assert_eq!(params.mode, ContextMode::Encrypted);
-        assert_eq!(params.ceiling.len(), 4);
+        assert_eq!(params.ceiling.len(), 5);
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MESSAGES_READ));
         assert!(
             params
@@ -916,6 +923,7 @@ mod tests {
                 .any(|c| c.name() == CAP_MESSAGES_WRITE)
         );
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MEMBER_INVITE));
+        assert!(params.ceiling.iter().any(|c| c.name() == CAP_ROLE_ASSIGN));
         assert!(params.ceiling.iter().any(|c| c.name() == CAP_MEMBER_BAN));
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::Promotable);
@@ -1446,7 +1454,7 @@ mod tests {
     fn from_template_group_discussion_produces_valid_params() {
         let params = ContextParams::from_template(TemplateId::GroupDiscussion);
         assert_eq!(params.mode, ContextMode::Encrypted);
-        assert_eq!(params.ceiling.len(), 4);
+        assert_eq!(params.ceiling.len(), 5);
         assert_eq!(params.promotion_policy, PromotionPolicy::Promotable);
         assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.template_id, Some(TemplateId::GroupDiscussion));
