@@ -2868,8 +2868,9 @@ fn validate_tool_ucan_uniffi(
 
     crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
         let production_resolver = crate::runtime::did_resolver();
-        let did_resolver =
-            scp_ffi_common::DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
+        let did_resolver = scp_ffi_common::DispatchDidResolver::new(
+            production_resolver.map(std::convert::AsRef::as_ref),
+        );
         let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
             revocation_list: &ucan_state.revocation_list,
         };
@@ -3505,8 +3506,9 @@ pub async fn ucan_validate(
             let validation_result =
                 crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
                     let production_resolver = crate::runtime::did_resolver();
-        let did_resolver =
-            scp_ffi_common::DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
+                    let did_resolver = scp_ffi_common::DispatchDidResolver::new(
+                        production_resolver.map(std::convert::AsRef::as_ref),
+                    );
                     let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
                         revocation_list: &ucan_state.revocation_list,
                     };
