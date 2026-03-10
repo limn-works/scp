@@ -67,7 +67,7 @@ struct ConformanceTests {
             let mockValidate: UcanBridge.ValidateFn = { _, _, _, _, _ in
                 throw ScpError.Validation(
                     message: "Conformance stub: no real Rust runtime",
-                    code: "SCP-VALID-9999"
+                    code: "SCP-VALID-7999"
                 )
             }
             do {
@@ -95,7 +95,7 @@ struct ConformanceTests {
             let mockMint: UcanBridge.MintFn = { _, _, _ in
                 throw ScpError.Validation(
                     message: "Conformance stub: no real Rust runtime",
-                    code: "SCP-VALID-9999"
+                    code: "SCP-VALID-7999"
                 )
             }
             do {
@@ -123,7 +123,7 @@ struct ConformanceTests {
             let mockRevoke: UcanBridge.RevokeFn = { _, _ in
                 throw ScpError.Validation(
                     message: "Conformance stub: no real Rust runtime",
-                    code: "SCP-VALID-9999"
+                    code: "SCP-VALID-7999"
                 )
             }
             do {
@@ -146,7 +146,7 @@ struct ConformanceTests {
             let mockConnect: TransportBridge.ConnectFn = { _ in
                 throw ScpError.Transport(
                     message: "Conformance stub: no real Rust runtime",
-                    code: "SCP-TRANS-9999"
+                    code: "SCP-TRANS-5999"
                 )
             }
             do {
@@ -162,7 +162,7 @@ struct ConformanceTests {
             let mockStatus: TransportBridge.StatusFn = { _ in
                 throw ScpError.Transport(
                     message: "Conformance stub: no real Rust runtime",
-                    code: "SCP-TRANS-9999"
+                    code: "SCP-TRANS-5999"
                 )
             }
             do {
@@ -315,8 +315,8 @@ struct ConformanceTests {
                 "audience_did": "did:dht:z6MkAudience"
             ]
         )
-        // Mock bridge throws SCP-VALID-9999 (no real Rust runtime)
-        #expect(result["error"] == "SCP-VALID-9999")
+        // Mock bridge throws SCP-VALID-7999 (no real Rust runtime)
+        #expect(result["error"] == "SCP-VALID-7999")
     }
 
     @Test("Conformance runner dispatches ucan_revoke operation")
@@ -328,8 +328,8 @@ struct ConformanceTests {
                 "revoker_did": "did:dht:z6MkRevoker"
             ]
         )
-        // Mock bridge throws SCP-VALID-9999 (no real Rust runtime)
-        #expect(result["error"] == "SCP-VALID-9999")
+        // Mock bridge throws SCP-VALID-7999 (no real Rust runtime)
+        #expect(result["error"] == "SCP-VALID-7999")
     }
 
     @Test("Conformance runner dispatches transport_connect operation")
@@ -338,8 +338,8 @@ struct ConformanceTests {
             operation: "transport_connect",
             input: ["relay_url": "wss://relay.test/scp/v1"]
         )
-        // Mock bridge throws SCP-TRANS-9999 (no real Rust runtime)
-        #expect(result["error"] == "SCP-TRANS-9999")
+        // Mock bridge throws SCP-TRANS-5999 (no real Rust runtime)
+        #expect(result["error"] == "SCP-TRANS-5999")
     }
 
     @Test("Conformance runner dispatches transport_status operation")
@@ -348,8 +348,8 @@ struct ConformanceTests {
             operation: "transport_status",
             input: [:]
         )
-        // Mock bridge throws SCP-TRANS-9999 (no real Rust runtime)
-        #expect(result["error"] == "SCP-TRANS-9999")
+        // Mock bridge throws SCP-TRANS-5999 (no real Rust runtime)
+        #expect(result["error"] == "SCP-TRANS-5999")
     }
 
     @Test("Conformance runner dispatches event_log_query operation")

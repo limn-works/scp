@@ -427,6 +427,33 @@
 
         // MARK: - BiometricPolicy.required creates biometric-gated keys
 
+        /// Whether the Keychain supports biometric-protected items in this
+        /// environment. CLI test runners and CI lack the entitlement
+        /// (`errSecMissingEntitlement` / `-34018`).
+        private static var biometricKeychainAvailable: Bool = {
+            guard let access = SecAccessControlCreateWithFlags(
+                nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+                .biometryCurrentSet, nil
+            ) else { return false }
+            let tag = "scp.test.biometric-probe"
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrAccount as String: tag,
+                kSecValueData as String: Data([0x42]),
+                kSecAttrAccessControl as String: access
+            ]
+            let status = SecItemAdd(query as CFDictionary, nil)
+            if status == errSecSuccess {
+                SecItemDelete(
+                    [kSecClass as String: kSecClassGenericPassword,
+                     kSecAttrAccount as String: tag] as CFDictionary
+                )
+                return true
+            }
+            // -34018 = errSecMissingEntitlement
+            return status != -34018
+        }()
+
         /// Verifies that a key stored with `.required` biometric policy uses
         /// `SecAccessControl` with `.biometryCurrentSet`.
         ///
@@ -434,7 +461,10 @@
         /// succeeds but biometric-gated access will fall back to passcode.
         /// Full biometric prompt testing requires a device with enrolled
         /// biometrics -- see ADR-025 Biometric gating for manual testing steps.
-        @Test("BiometricPolicy.required stores key with biometric access control")
+        @Test(
+            "BiometricPolicy.required stores key with biometric access control",
+            .enabled(if: biometricKeychainAvailable, "Requires Keychain biometric entitlements")
+        )
         func biometricRequiredStoresWithAccessControl() async throws {
             let custodyBio = AppleKeyCustody(accessGroup: nil, biometricPolicy: .required)
             let handle = try await custodyBio.generateKeypair(keyType: "ed25519")
