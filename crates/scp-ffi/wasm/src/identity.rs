@@ -116,7 +116,7 @@ const EXPORT_HMAC_DOMAIN: &[u8] = b"scp-context-export-integrity-v1";
 /// Returns the hex-encoded HMAC tag, or an error if the DID is not in the
 /// identity registry.
 ///
-/// The HMAC key is derived via HKDF-SHA256(ikm=signing_key, salt=[], info=EXPORT_HMAC_DOMAIN)
+/// The HMAC key is derived via `HKDF-SHA256(ikm=signing_key, salt=[], info=EXPORT_HMAC_DOMAIN)`
 /// to ensure domain separation from the signing key's primary use (Ed25519
 /// signatures).
 pub(crate) fn compute_export_hmac(did: &str, data: &[u8]) -> Result<String, ScpWasmError> {
@@ -124,12 +124,11 @@ pub(crate) fn compute_export_hmac(did: &str, data: &[u8]) -> Result<String, ScpW
     use sha2::Sha256;
 
     let hmac_key = derive_export_hmac_key(did)?;
-    let mut mac = Hmac::<Sha256>::new_from_slice(hmac_key.as_ref()).map_err(|e| {
-        ScpWasmError::Identity {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(hmac_key.as_ref()).map_err(|e| ScpWasmError::Identity {
             message: format!("HMAC key init failed: {e}"),
             code: "SCP-CTX-2020".to_owned(),
-        }
-    })?;
+        })?;
     mac.update(data);
     let result = mac.finalize();
     Ok(hex::encode(result.into_bytes()))
@@ -155,7 +154,7 @@ pub(crate) fn verify_export_hmac(
 
     let hmac_key = derive_export_hmac_key(did)?;
     let mut mac =
-        Hmac::<Sha256>::new_from_slice(&hmac_key).map_err(|e| ScpWasmError::Identity {
+        Hmac::<Sha256>::new_from_slice(hmac_key.as_ref()).map_err(|e| ScpWasmError::Identity {
             message: format!("HMAC key init failed: {e}"),
             code: "SCP-CTX-2020".to_owned(),
         })?;
@@ -172,8 +171,6 @@ pub(crate) fn verify_export_hmac(
 ///
 /// The derived key is wrapped in `Zeroizing` to ensure it is zeroed on drop.
 fn derive_export_hmac_key(did: &str) -> Result<zeroize::Zeroizing<[u8; 32]>, ScpWasmError> {
-    use sha2::Sha256;
-
     IDENTITY_REGISTRY.with(|reg| {
         let map = reg.borrow();
         let entry = map.get(did).ok_or_else(|| ScpWasmError::Identity {
@@ -181,10 +178,20 @@ fn derive_export_hmac_key(did: &str) -> Result<zeroize::Zeroizing<[u8; 32]>, Scp
             code: "SCP-CTX-2020".to_owned(),
         })?;
 
-        // HKDF-SHA256: extract(salt=[], ikm=signing_key) then expand(info=EXPORT_HMAC_DOMAIN, len=32)
-        // Using the standard HKDF construction with hmac crate.
-        let prk = hkdf_extract_sha256(&[], &entry.signing_key_bytes);
-        let okm = hkdf_expand_sha256(&prk, EXPORT_HMAC_DOMAIN, 32);
+        // HKDF-SHA256: extract(salt=[], ikm=signing_key) then
+        // expand(info=EXPORT_HMAC_DOMAIN, len=32).
+        let prk = hkdf_extract_sha256(&[], entry.signing_key_bytes.as_ref()).map_err(|e| {
+            ScpWasmError::Identity {
+                message: format!("HKDF extract failed: {e}"),
+                code: "SCP-CTX-2020".to_owned(),
+            }
+        })?;
+        let okm = hkdf_expand_sha256(&prk, EXPORT_HMAC_DOMAIN, 32).map_err(|e| {
+            ScpWasmError::Identity {
+                message: format!("HKDF expand failed: {e}"),
+                code: "SCP-CTX-2020".to_owned(),
+            }
+        })?;
         let mut key = [0u8; 32];
         key.copy_from_slice(&okm);
         Ok(zeroize::Zeroizing::new(key))
@@ -192,31 +199,40 @@ fn derive_export_hmac_key(did: &str) -> Result<zeroize::Zeroizing<[u8; 32]>, Scp
 }
 
 /// HKDF-Extract (RFC 5869) using HMAC-SHA256.
-fn hkdf_extract_sha256(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
+///
+/// # Errors
+///
+/// Returns an error string if HMAC initialization fails (should not happen
+/// since HMAC-SHA256 accepts any key length, but we avoid `expect`/`unwrap`).
+fn hkdf_extract_sha256(salt: &[u8], ikm: &[u8]) -> Result<[u8; 32], String> {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
-    let salt = if salt.is_empty() { &[0u8; 32] } else { salt };
-    let mut mac = Hmac::<Sha256>::new_from_slice(salt).expect("HMAC-SHA256 accepts any key length");
+    let effective_salt: &[u8] = if salt.is_empty() { &[0u8; 32] } else { salt };
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(effective_salt).map_err(|e| format!("HMAC init: {e}"))?;
     mac.update(ikm);
-    mac.finalize().into_bytes().into()
+    Ok(mac.finalize().into_bytes().into())
 }
 
 /// HKDF-Expand (RFC 5869) using HMAC-SHA256.
 ///
 /// `length` must be <= 255 * 32 = 8160 bytes.
-fn hkdf_expand_sha256(prk: &[u8; 32], info: &[u8], length: usize) -> Vec<u8> {
+///
+/// # Errors
+///
+/// Returns an error string if HMAC initialization fails.
+fn hkdf_expand_sha256(prk: &[u8; 32], info: &[u8], length: usize) -> Result<Vec<u8>, String> {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
     let hash_len = 32;
-    let n = (length + hash_len - 1) / hash_len;
+    let n = length.div_ceil(hash_len);
     let mut okm = Vec::with_capacity(n * hash_len);
     let mut t = Vec::new();
 
     for i in 1..=n {
-        let mut mac =
-            Hmac::<Sha256>::new_from_slice(prk).expect("HMAC-SHA256 accepts any key length");
+        let mut mac = Hmac::<Sha256>::new_from_slice(prk).map_err(|e| format!("HMAC init: {e}"))?;
         mac.update(&t);
         mac.update(info);
         #[allow(clippy::cast_possible_truncation)]
@@ -226,7 +242,7 @@ fn hkdf_expand_sha256(prk: &[u8; 32], info: &[u8], length: usize) -> Vec<u8> {
     }
 
     okm.truncate(length);
-    okm
+    Ok(okm)
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,7 +1118,6 @@ pub fn identity_attest_device(did: String) -> Promise {
 #[wasm_bindgen]
 pub fn identity_verify_device_attestation(did: String, token_base64: String) -> Promise {
     use base64::Engine;
-    use ed25519_dalek::Verifier;
 
     future_to_promise(async move {
         let token_bytes = base64::engine::general_purpose::STANDARD

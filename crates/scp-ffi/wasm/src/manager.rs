@@ -1376,10 +1376,15 @@ impl WasmContextManager {
     /// stale/future, or was already seen.
     pub fn ucan_record_nonce(&mut self, context_id: &str, nonce: &str) -> Result<(), ScpWasmError> {
         // 1. Validate nonce format: {unix_millis}-{32_hex_chars}
-        let (ts_part, hex_part) = nonce.split_once('-').ok_or_else(|| ScpWasmError::Permission {
-            message: format!("nonce format invalid: missing '-' separator in nonce: {nonce}"),
-            code: "SCP-PERM-3000".to_owned(),
-        })?;
+        let (ts_part, hex_part) =
+            nonce
+                .split_once('-')
+                .ok_or_else(|| ScpWasmError::Permission {
+                    message: format!(
+                        "nonce format invalid: missing '-' separator in nonce: {nonce}"
+                    ),
+                    code: "SCP-PERM-3000".to_owned(),
+                })?;
 
         let nonce_millis: f64 = ts_part.parse().map_err(|_| ScpWasmError::Permission {
             message: format!("nonce format invalid: non-numeric timestamp in nonce: {ts_part}"),
@@ -2183,6 +2188,19 @@ impl WasmContextManager {
             seen_nonces: ctx.seen_nonces.keys().cloned().collect(),
         };
 
+        // Serialize snapshot to canonical JSON for HMAC computation.
+        // The HMAC is computed over this stable serialization — NOT the full
+        // envelope — to avoid a circular dependency (envelope contains the MAC).
+        let snapshot_json = serde_json::to_vec(&snapshot).map_err(|e| ScpWasmError::Context {
+            message: format!("export snapshot serialization failed: {e}"),
+            code: "SCP-CTX-2030".to_owned(),
+        })?;
+
+        // Compute HMAC-SHA256 over the snapshot JSON using the creator's
+        // signing key (via HKDF domain separation). The creator DID is in the
+        // snapshot — look up their identity in the registry.
+        let integrity_mac = crate::identity::compute_export_hmac(&ctx.creator_did, &snapshot_json)?;
+
         let now_ms = crate::time::now_ms();
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let exported_at = (now_ms / 1000.0) as u64;
@@ -2191,6 +2209,7 @@ impl WasmContextManager {
             version: WASM_EXPORT_VERSION,
             exported_at,
             exporter_did: exporter_did.to_owned(),
+            integrity_mac,
             snapshot,
         };
 
@@ -2200,20 +2219,14 @@ impl WasmContextManager {
         })
     }
 
-    /// Imports a context from serialized JSON bytes produced by [`export_context`].
+    /// Deserializes and verifies a context export envelope.
     ///
-    /// Deserializes the envelope, validates the version, and reconstructs
-    /// the context state in the manager.
-    ///
-    /// # Returns
-    ///
-    /// The context ID of the imported context.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if deserialization fails, version is incompatible,
-    /// or the context already exists.
-    pub fn import_context(&mut self, data: &[u8]) -> Result<String, ScpWasmError> {
+    /// Performs version check and HMAC integrity verification before returning
+    /// the parsed envelope. Extracted to keep `import_context` within the line
+    /// limit.
+    fn deserialize_and_verify_envelope(
+        data: &[u8],
+    ) -> Result<WasmContextExportEnvelope, ScpWasmError> {
         let envelope: WasmContextExportEnvelope =
             serde_json::from_slice(data).map_err(|e| ScpWasmError::Context {
                 message: format!("invalid export data: {e}"),
@@ -2229,6 +2242,49 @@ impl WasmContextManager {
                 code: "SCP-CTX-2032".to_owned(),
             });
         }
+
+        // Re-serialize the snapshot to canonical JSON and verify the HMAC tag
+        // using the creator's signing key. This MUST happen before any state
+        // reconstruction to prevent an attacker from crafting payloads that
+        // grant them admin of a context.
+        let snapshot_json =
+            serde_json::to_vec(&envelope.snapshot).map_err(|e| ScpWasmError::Context {
+                message: format!("snapshot re-serialization failed: {e}"),
+                code: "SCP-CTX-2032".to_owned(),
+            })?;
+
+        if envelope.integrity_mac.is_empty() {
+            return Err(ScpWasmError::Context {
+                message: "export integrity_mac is missing — refusing to import unsigned export"
+                    .to_owned(),
+                code: "SCP-CTX-2020".to_owned(),
+            });
+        }
+
+        crate::identity::verify_export_hmac(
+            &envelope.snapshot.creator_did,
+            &snapshot_json,
+            &envelope.integrity_mac,
+        )?;
+
+        Ok(envelope)
+    }
+
+    /// Imports a context from serialized JSON bytes produced by [`export_context`].
+    ///
+    /// Deserializes the envelope, validates the version and integrity MAC,
+    /// then reconstructs the context state in the manager.
+    ///
+    /// # Returns
+    ///
+    /// The context ID of the imported context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deserialization fails, version is incompatible,
+    /// the integrity MAC is missing/invalid, or the context already exists.
+    pub fn import_context(&mut self, data: &[u8]) -> Result<String, ScpWasmError> {
+        let envelope = Self::deserialize_and_verify_envelope(data)?;
 
         let snap = &envelope.snapshot;
         let context_id = snap.context_id.clone();
@@ -2363,8 +2419,8 @@ struct WasmContextExportEnvelope {
     /// DID of the identity that performed the export.
     exporter_did: String,
     /// HMAC-SHA256 tag (hex-encoded) over the canonical JSON serialization of
-    /// the `snapshot` field. Keyed by HKDF(creator_signing_key,
-    /// info="scp-context-export-integrity-v1"). Verified on import to prevent
+    /// the `snapshot` field. Keyed by `HKDF(creator_signing_key,
+    /// info="scp-context-export-integrity-v1")`. Verified on import to prevent
     /// tampering with membership, roles, or governance state.
     integrity_mac: String,
     /// The context state snapshot.
