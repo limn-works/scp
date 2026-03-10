@@ -105,6 +105,7 @@ pub(crate) fn runtime() -> PyResult<&'static tokio::runtime::Runtime> {
 ///
 /// Returns `PyRuntimeError` if tokio runtime construction fails, which
 /// prevents undefined behavior from panicking across the FFI boundary.
+#[doc(hidden)]
 pub fn init_runtime() -> PyResult<()> {
     // If already initialized, return immediately.
     if RUNTIME.get().is_some() {
