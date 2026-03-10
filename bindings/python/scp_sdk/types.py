@@ -177,6 +177,8 @@ class MemberRole(enum.Enum):
 
     #: Context administrator with full governance capabilities.
     ADMIN = "Admin"
+    #: Moderator with messaging, moderation, and governance proposal capabilities.
+    MODERATOR = "Moderator"
     #: Regular participant with standard capabilities.
     MEMBER = "Member"
     #: Read-only observer with no write capabilities.

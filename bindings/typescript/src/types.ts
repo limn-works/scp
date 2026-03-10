@@ -44,7 +44,7 @@ export interface ContextParams {
  *
  * Mirrors `scp_core::context::roles::Role`.
  */
-export type MemberRole = "Admin" | "Member" | "Observer" | "Custom";
+export type MemberRole = "Admin" | "Moderator" | "Member" | "Observer" | "Custom";
 
 // ---------------------------------------------------------------------------
 // Broadcast
