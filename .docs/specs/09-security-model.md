@@ -1153,18 +1153,18 @@ This suite matches the MLS ciphersuite (§9.5) and the DID-to-DID HPKE suite, mi
 **`info` parameter (domain separation):**
 
 ```
-info = "scp-sender-key-v1" || context_id || sender_did || epoch_bytes
+info = "scp-sender-key-v1" || BE32(len(context_id)) || context_id || BE32(len(sender_did)) || sender_did || epoch_bytes
 ```
 
-Where `context_id` and `sender_did` are UTF-8 bytes (no length prefix — the `info` string is not parsed, only compared) and `epoch_bytes` is the 8-byte big-endian encoding of the sender key epoch. The `info` string binds the HPKE encryption to a specific context, sender, and epoch. Using a different `info` on open produces a different derived key, causing AEAD decryption to fail.
+Where `context_id` and `sender_did` are UTF-8 bytes with 4-byte big-endian length prefixes (preventing boundary-shift collisions between variable-length fields) and `epoch_bytes` is the 8-byte big-endian encoding of the sender key epoch. The `info` string binds the HPKE encryption to a specific context, sender, and epoch. Using a different `info` on open produces a different derived key, causing AEAD decryption to fail.
 
 **`aad` parameter (additional authenticated data):**
 
 ```
-aad = context_id || sender_did || epoch_bytes
+aad = BE32(len(context_id)) || context_id || BE32(len(sender_did)) || sender_did || epoch_bytes
 ```
 
-Where fields use the same encoding as `info` (without the domain separator prefix). The AAD binds the ciphertext to the context and sender, preventing cross-context and cross-sender key substitution attacks. Tampering with any field in the wire format causes AEAD verification to fail.
+Where fields use the same length-prefixed encoding as `info` (without the domain separator prefix). The AAD binds the ciphertext to the context and sender, preventing cross-context and cross-sender key substitution attacks. Tampering with any field in the wire format causes AEAD verification to fail.
 
 **Nonce:** The AEAD nonce is managed internally by the HPKE context (RFC 9180 §5.2 `ComputeNonce`). Implementations MUST NOT generate or supply an external nonce — HPKE derives it from the key schedule. Since each `SenderKeyResponse` creates a fresh HPKE context (fresh ephemeral keypair), the internal sequence counter starts at 0 and only one `Seal`/`Open` call is made per context.
 
@@ -1447,6 +1447,15 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash const
 | `"SCP-CLAIM-V1:"` | Shadow identity claim validation | §12.3 |
 | `"SCP-RECEIPT-V1:"` | Payment receipt signing | §19.15.5 |
 | `"SCP-HANDLE-TOOL-V1:"` | Handle tool request signing | §22.3.1 |
+| `"SCP-CHUNK-V1:"` | Chunk envelope message ID derivation | §9.5.3 |
+| `"SCP-ATTESTATION-ID-V1:"` | Identity attestation ID computation | §3.5 |
+| `"SCP-IDENTITY-LINK-ATTESTATION-V1:"` | Identity link attestation canonical hash for signing | §3.5 |
+| `"SCP-PSEUDONYM-V1:"` | Context-scoped pseudonym derivation | §9.10.4 |
+| `"SCP-OFFER-ID-V1:"` | Tool interface offer ID computation | §6.2 |
+| `"SCP-PRIVATE-LOG-V1:"` | Private state event hash chain | §3.4 |
+| `"SCP-CHALLENGE-REQ-V1:"` | Challenge request canonical bytes for signing | §10.5 |
+| `"SCP-CHALLENGE-RESP-V1:"` | Challenge response canonical bytes for signing | §10.5 |
+| `"SCP-CHALLENGE-VERIFY-V1:"` | Challenge verification canonical bytes for signing | §10.5 |
 
 ### 9.18.3 HPKE Info Strings
 
@@ -1454,7 +1463,7 @@ HPKE `info` strings provide domain separation for key encapsulation operations. 
 
 | Info Prefix | Used For | Full Format | Spec Reference |
 |-------------|----------|-------------|----------------|
-| `"scp-sender-key-v1"` | Sender key HPKE encapsulation | `"scp-sender-key-v1" \|\| context_id \|\| sender_did \|\| epoch_BE` | §9.16.2 |
+| `"scp-sender-key-v1"` | Sender key HPKE encapsulation | `"scp-sender-key-v1" \|\| BE32(len(context_id)) \|\| context_id \|\| BE32(len(sender_did)) \|\| sender_did \|\| epoch_BE` | §9.16.2 |
 | `"scp-access-key-v1"` | Access key HPKE encapsulation | `"scp-access-key-v1" \|\| BE32(len(context_id)) \|\| context_id \|\| BE32(len(member_did)) \|\| member_did \|\| epoch_bytes` | §9.17.1 |
 
 ### 9.18.4 Key and Nonce Sizes
