@@ -12,7 +12,7 @@
 //!
 //! See GitHub issue #81.
 
-use ed25519_dalek::Verifier;
+
 
 /// Verifies an Ed25519 signature against a public key and message bytes.
 ///

@@ -693,7 +693,7 @@ pub fn verify_participation_requirements(
 fn verify_statement_signature(
     statement: &ParticipationProfile,
 ) -> Result<(), ParticipationAdmissionError> {
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use ed25519_dalek::{Signature, VerifyingKey};
 
     let verifying_key = VerifyingKey::from_bytes(&statement.signer_public_key).map_err(|e| {
         ParticipationAdmissionError::InvalidSignature {
