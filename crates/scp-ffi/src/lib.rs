@@ -53,6 +53,7 @@ use std::time::Duration;
 use pyo3::prelude::*;
 
 pub mod bridge_adapters;
+pub mod bridge_connector;
 pub mod custody;
 pub mod discovery;
 pub mod error;
@@ -61,6 +62,7 @@ pub mod identity;
 pub mod mcp;
 pub mod provenance;
 pub mod runtime;
+pub mod sync;
 pub mod tools;
 pub mod transport;
 pub mod trust;
@@ -186,23 +188,24 @@ fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Step 1: Initialize the tokio runtime.
     init_runtime()?;
 
-    // Step 2: Register atexit handler for graceful shutdown.
+    // Step 2: Register exception class hierarchy.
+    error::register_exceptions(m)?;
+
+    // Step 3: Register identity bridge classes and functions.
+    identity::register_identity(m)?;
+
+    // Step 4: Register bridge functions.
+    m.add_function(wrap_pyfunction!(runtime_is_initialized, m)?)?;
+    m.add_function(wrap_pyfunction!(version, m)?)?;
+    m.add_function(wrap_pyfunction!(shutdown_runtime, m)?)?;
+
+    // Step 5: Register atexit handler for graceful shutdown.
+    // Must come AFTER shutdown_runtime is added to the module (step 4).
     // Python cleanup (GC, __del__, atexit handlers) completes BEFORE Rust
     // module finalization, so this ordering is safe.
     let atexit = py.import("atexit")?;
     let shutdown_fn = m.getattr("shutdown_runtime")?;
     atexit.call_method1("register", (shutdown_fn,))?;
-
-    // Step 3: Register exception class hierarchy.
-    error::register_exceptions(m)?;
-
-    // Step 4: Register identity bridge classes and functions.
-    identity::register_identity(m)?;
-
-    // Step 5: Register bridge functions.
-    m.add_function(wrap_pyfunction!(runtime_is_initialized, m)?)?;
-    m.add_function(wrap_pyfunction!(version, m)?)?;
-    m.add_function(wrap_pyfunction!(shutdown_runtime, m)?)?;
 
     // Step 6: Register domain bridge modules.
     context::register_context(m)?;
@@ -214,6 +217,8 @@ fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     provenance::register_provenance(m)?;
     mcp::register_mcp(m)?;
     trust::register_trust(m)?;
+    bridge_connector::register_bridge_connector(m)?;
+    sync::register_sync(m)?;
 
     Ok(())
 }

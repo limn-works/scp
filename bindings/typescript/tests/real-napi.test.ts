@@ -1,0 +1,848 @@
+/**
+ * Real NAPI bridge E2E tests for the SCP TypeScript SDK (Phase D5).
+ *
+ * These tests exercise the actual napi-rs native addon compiled from
+ * `crates/scp-ffi/napi/`. They verify that the TypeScript SDK classes
+ * correctly delegate through the real FFI bridge to scp-core Rust code.
+ *
+ * Prerequisites:
+ * - The NAPI bridge must be compiled with `allow_in_memory_custody` feature.
+ * - The platform-specific `@scp/sdk-napi-*` package must be loadable.
+ *
+ * If the native addon is not available, all tests are skipped gracefully.
+ */
+
+import { afterAll, describe, expect, test } from "bun:test";
+
+// ---------------------------------------------------------------------------
+// Guard: skip all tests if the native NAPI binding is unavailable.
+// ---------------------------------------------------------------------------
+
+let bridge: Awaited<ReturnType<typeof import("../src/internal/bridge").getBridge>> | null = null;
+let skipReason = "";
+
+try {
+  // Attempt to load the native bridge synchronously to detect availability.
+  const { createNativeBridge } = await import("../src/internal/native.js");
+  bridge = createNativeBridge();
+} catch (e: unknown) {
+  const msg = e instanceof Error ? e.message : String(e);
+  skipReason = `Native NAPI bridge not available: ${msg}`;
+}
+
+// When the bridge is unavailable, define a single test that reports the skip.
+if (bridge === null) {
+  describe("Real NAPI bridge E2E (SKIPPED)", () => {
+    test.skip(`all tests skipped: ${skipReason}`, () => {});
+  });
+} else {
+  // Capture the bridge in a const for type narrowing.
+  const napi = bridge;
+
+  // ---------------------------------------------------------------------------
+  // Lifecycle hooks
+  // ---------------------------------------------------------------------------
+
+  afterAll(() => {
+    napi.shutdown(1);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 1. Identity creation and lifecycle
+  // ---------------------------------------------------------------------------
+
+  describe("Identity (real NAPI)", () => {
+    test("creates an in-memory identity with a valid did:dht DID", async () => {
+      const handle = await napi.identityCreate("in_memory");
+      expect(handle.did).toMatch(/^did:dht:/);
+      expect(handle.custodyType).toBe("in_memory");
+    });
+
+    test("creates two identities with distinct DIDs", async () => {
+      const a = await napi.identityCreate("in_memory");
+      const b = await napi.identityCreate("in_memory");
+      expect(a.did).not.toBe(b.did);
+    });
+
+    test("loads an identity by DID", async () => {
+      const created = await napi.identityCreate("in_memory");
+      const loaded = await napi.identityLoad(created.did);
+      expect(loaded.did).toBe(created.did);
+    });
+
+    test("resolves a DID to a DID document", async () => {
+      const handle = await napi.identityCreate("in_memory");
+      const doc = await napi.identityResolve(handle.did);
+      expect(doc.id).toBe(handle.did);
+      // The document should have at least one authentication method.
+      expect(doc.authentication.length).toBeGreaterThanOrEqual(1);
+    });
+
+    test("rotates an identity key and preserves the DID", async () => {
+      const handle = await napi.identityCreate("in_memory");
+      const rotated = await napi.identityRotateKey(handle);
+      expect(rotated.did).toBe(handle.did);
+    });
+
+    test("creates an identity with an agent key (ADR-039)", async () => {
+      const handle = await napi.identityCreateWithAgentKey("in_memory");
+      expect(handle.did).toMatch(/^did:dht:/);
+    });
+
+    test("adds an agent key to an existing identity", async () => {
+      const handle = await napi.identityCreate("in_memory");
+      const withAgent = await napi.identityAddAgentKey(handle);
+      expect(withAgent.did).toBe(handle.did);
+    });
+
+    test("rotates an agent key", async () => {
+      const handle = await napi.identityCreateWithAgentKey("in_memory");
+      const rotated = await napi.identityRotateAgentKey(handle);
+      expect(rotated.did).toBe(handle.did);
+    });
+
+    test("removes an agent key", async () => {
+      const handle = await napi.identityCreateWithAgentKey("in_memory");
+      const removed = await napi.identityRemoveAgentKey(handle);
+      expect(removed.did).toBe(handle.did);
+    });
+
+    test("migrates an identity to a new DID", async () => {
+      const handle = await napi.identityCreate("in_memory");
+      const migrated = await napi.identityMigrate(handle);
+      // Migration creates a new DID.
+      expect(migrated.did).toMatch(/^did:dht:/);
+      expect(migrated.did).not.toBe(handle.did);
+    });
+
+    test("generates and verifies a device attestation", async () => {
+      const handle = await napi.identityCreate("in_memory");
+      const token = await napi.identityAttestDevice(handle.did);
+      expect(typeof token).toBe("string");
+      expect(token.length).toBeGreaterThan(0);
+
+      const valid = await napi.identityVerifyDeviceAttestation(handle.did, token);
+      expect(valid).toBe(true);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 2. Context lifecycle
+  // ---------------------------------------------------------------------------
+
+  describe("Context lifecycle (real NAPI)", () => {
+    test("creates a context and returns a context ID", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read", "messages:write"],
+          memoryScope: "ephemeral",
+        }),
+      );
+      expect(ctx.contextId).toBeTruthy();
+      expect(typeof ctx.contextId).toBe("string");
+    });
+
+    test("a second identity can join the context", async () => {
+      const creator = await napi.identityCreate("in_memory");
+      const joiner = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(creator, JSON.stringify({ ceiling: ["messages:read"] }));
+      // Should not throw.
+      await napi.contextJoin(ctx, joiner.did);
+    });
+
+    test("sends a message without error", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
+      );
+      const payload = new TextEncoder().encode("hello from NAPI");
+      // Should not throw.
+      await napi.contextSend(ctx, identity.did, payload);
+    });
+
+    test("leaves a context without error", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["messages:read"] }),
+      );
+      await napi.contextLeave(ctx, identity.did);
+    });
+
+    test("closes a context without error", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["messages:read"] }),
+      );
+      await napi.contextClose(ctx, identity.did);
+    });
+
+    test("creates a context with broadcast mode", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read"],
+          mode: "Broadcast",
+        }),
+      );
+      expect(ctx.contextId).toBeTruthy();
+    });
+
+    test("creates a context with governance and TTL", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read"],
+          governance: "threshold",
+          ttlSeconds: 3600,
+          memoryScope: "full",
+          ceilingPolicy: "governed",
+        }),
+      );
+      expect(ctx.contextId).toBeTruthy();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 3. Membership queries
+  // ---------------------------------------------------------------------------
+
+  describe("Membership (real NAPI)", () => {
+    test("member count after creation is 1", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["messages:read"] }),
+      );
+      const count = await napi.contextMemberCount(ctx);
+      expect(count).toBe(1);
+    });
+
+    test("creator is a member", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["messages:read"] }),
+      );
+      const isMember = await napi.contextIsMember(ctx, identity.did);
+      expect(isMember).toBe(true);
+    });
+
+    test("non-member is not a member", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const other = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["messages:read"] }),
+      );
+      const isMember = await napi.contextIsMember(ctx, other.did);
+      expect(isMember).toBe(false);
+    });
+
+    test("member DIDs includes the creator", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["messages:read"] }),
+      );
+      const dids = await napi.contextMemberDids(ctx);
+      expect(dids).toContain(identity.did);
+    });
+
+    test("member count increases after join", async () => {
+      const creator = await napi.identityCreate("in_memory");
+      const joiner = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(creator, JSON.stringify({ ceiling: ["messages:read"] }));
+      await napi.contextJoin(ctx, joiner.did);
+      const count = await napi.contextMemberCount(ctx);
+      expect(count).toBe(2);
+    });
+
+    test("creator role is Admin", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["messages:read"] }),
+      );
+      const role = await napi.contextMemberRole(ctx, identity.did);
+      expect(role).toBe("Admin");
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 4. Tools
+  // ---------------------------------------------------------------------------
+
+  describe("Tools (real NAPI)", () => {
+    test("registers a tool and returns a tool ID", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["tools:register"] }),
+      );
+      const toolId = await napi.toolRegister(ctx, {
+        name: "echo",
+        description: "Echoes input",
+        inputSchema: { type: "object" },
+        outputSchema: { type: "object" },
+        operator: identity.did,
+      });
+      expect(typeof toolId).toBe("string");
+      expect(toolId.length).toBeGreaterThan(0);
+    });
+
+    test("invokes a registered tool", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["tools:register", "tools:invoke"] }),
+      );
+      const toolId = await napi.toolRegister(ctx, {
+        name: "test-tool",
+        description: "A test tool",
+        inputSchema: { type: "object" },
+        outputSchema: { type: "object" },
+        operator: identity.did,
+      });
+      const resultJson = await napi.toolInvoke(
+        ctx,
+        toolId,
+        JSON.stringify({ x: 42 }),
+        identity.did,
+      );
+      expect(typeof resultJson).toBe("string");
+      // The result should be valid JSON.
+      const parsed = JSON.parse(resultJson);
+      expect(parsed).toBeTruthy();
+    });
+
+    test("verifies a tool and returns a verification result", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["tools:register"] }),
+      );
+      const toolId = await napi.toolRegister(ctx, {
+        name: "verify-me",
+        description: "Tool for verification",
+        inputSchema: { type: "object" },
+        outputSchema: { type: "object" },
+        operator: identity.did,
+      });
+      const result = await napi.toolVerify(ctx, toolId);
+      expect(typeof result.passed).toBe("boolean");
+      expect(Array.isArray(result.failures)).toBe(true);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 5. UCAN lifecycle
+  // ---------------------------------------------------------------------------
+
+  describe("UCAN (real NAPI)", () => {
+    test("mints a UCAN token with capabilities", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        admin,
+        JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
+      );
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      expect(token.id).toBeTruthy();
+      expect(token.encoded).toBeTruthy();
+      expect(token.issuer).toBeTruthy();
+      expect(token.audience).toBe(member.did);
+      expect(token.capabilities).toContain("messages:read");
+    });
+
+    test("validates a minted token for a granted capability", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      // Should not throw.
+      await napi.ucanValidate(ctx, token.encoded, "messages:read");
+    });
+
+    test("rejects validation for an ungranted capability", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      await expect(napi.ucanValidate(ctx, token.encoded, "messages:write")).rejects.toThrow();
+    });
+
+    test("revokes a token", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      // Revocation should not throw.
+      await napi.ucanRevoke(ctx, token.encoded);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 6. Event log
+  // ---------------------------------------------------------------------------
+
+  describe("Event log (real NAPI)", () => {
+    test("queries events after context creation", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["messages:read"] }),
+      );
+      const events = await napi.eventLogQuery(ctx, undefined);
+      // At minimum, a ContextCreated event should exist.
+      expect(events.length).toBeGreaterThanOrEqual(1);
+      expect(events[0].eventType).toBeTruthy();
+      expect(events[0].actorDid).toBeTruthy();
+      expect(typeof events[0].sequence).toBe("number");
+    });
+
+    test("queries events with a filter", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
+      );
+      await napi.contextSend(ctx, identity.did, new TextEncoder().encode("msg"));
+
+      const events = await napi.eventLogQuery(ctx, JSON.stringify({ eventType: "MessageSent" }));
+      // The filter is JSON-serialized, so the bridge should accept it.
+      expect(Array.isArray(events)).toBe(true);
+    });
+
+    test("verifies an inclusion proof", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["messages:read"] }),
+      );
+
+      const claim = JSON.stringify({ type: "inclusion", leafIndex: 0 });
+      const proof = await napi.eventLogVerify(ctx, claim);
+      expect(typeof proof.verified).toBe("boolean");
+      expect(typeof proof.proofType).toBe("string");
+    });
+
+    test("creates a checkpoint", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["messages:read"] }),
+      );
+
+      const checkpoint = await napi.eventLogCheckpoint(ctx);
+      expect(checkpoint.root).toBeTruthy();
+      expect(typeof checkpoint.eventCount).toBe("number");
+      expect(typeof checkpoint.timestamp).toBe("number");
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 7. Discovery
+  // ---------------------------------------------------------------------------
+
+  describe("Discovery (real NAPI)", () => {
+    test("parses a discovery handle address", () => {
+      const result = napi.discoveryParseAddress("alice@cooking-community");
+      const parsed = JSON.parse(result);
+      expect(parsed.type).toBe("discovery_handle");
+      expect(parsed.local_part).toBe("alice");
+    });
+
+    test("parses a domain handle address", () => {
+      const result = napi.discoveryParseAddress("alice@example.com");
+      const parsed = JSON.parse(result);
+      expect(parsed.type).toBe("domain_handle");
+      expect(parsed.local_part).toBe("alice");
+      expect(parsed.domain).toBe("example.com");
+    });
+
+    test("creates a discovery query with capabilities", () => {
+      const result = napi.discoveryCreateQuery(["code_review"], undefined, undefined);
+      expect(typeof result).toBe("string");
+      const parsed = JSON.parse(result);
+      expect(parsed.capability_filter).toContain("code_review");
+    });
+
+    test("creates a discovery query with keywords", () => {
+      const result = napi.discoveryCreateQuery(undefined, ["rust", "security"], undefined);
+      const parsed = JSON.parse(result);
+      expect(parsed.keywords).toContain("rust");
+      expect(parsed.keywords).toContain("security");
+    });
+
+    test("creates an empty discovery query", () => {
+      const result = napi.discoveryCreateQuery(undefined, undefined, undefined);
+      expect(typeof result).toBe("string");
+      // Should be valid JSON.
+      JSON.parse(result);
+    });
+
+    test("normalizes an address (lowercases and trims)", () => {
+      const result = napi.discoveryNormalizeAddress("  ALICE@Cooking  ");
+      expect(result).toBe("alice@cooking");
+    });
+
+    test("discovers contexts from an scp:// URI", async () => {
+      const uri =
+        "scp://context/deadbeef?relay=wss%3A%2F%2Frelay.example.com%2Fscp%2Fv1&mode=broadcast";
+      const raw = await napi.contextDiscover(uri);
+      const results = JSON.parse(raw);
+      expect(Array.isArray(results)).toBe(true);
+      expect(results.length).toBe(1);
+      expect(results[0].context_id).toBe("deadbeef");
+      expect(results[0].discovery_source).toBe("context_uri");
+    });
+
+    test("rejects discovery with an invalid query", async () => {
+      await expect(napi.contextDiscover("not-a-did-or-uri")).rejects.toThrow();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 8. Provenance
+  // ---------------------------------------------------------------------------
+
+  describe("Provenance (real NAPI)", () => {
+    test("evaluates provenance quality for an active persistent context", async () => {
+      const quality = await napi.evaluateProvenanceQuality(
+        "ctx-source-123",
+        "persistent",
+        "active",
+        ["did:dht:z6MkTestCounterparty"],
+      );
+      expect(typeof quality).toBe("number");
+      expect(quality).toBeGreaterThanOrEqual(0);
+      expect(quality).toBeLessThanOrEqual(3);
+    });
+
+    test("evaluates provenance quality without a source context", async () => {
+      const quality = await napi.evaluateProvenanceQuality(
+        undefined,
+        "ephemeral",
+        "unknown",
+        undefined,
+      );
+      expect(typeof quality).toBe("number");
+    });
+
+    test("attaches provenance metadata at a cross-context boundary", () => {
+      const raw = napi.provenanceAttach(
+        "ctx-source",
+        "persistent",
+        "full",
+        ["did:dht:z6MkMember1"],
+        "ctx-target",
+        undefined,
+      );
+      const record = JSON.parse(raw);
+      expect(record.source_context).toBe("ctx-source");
+      expect(record.chain_depth).toBe(1);
+      expect(Array.isArray(record.counterparties)).toBe(true);
+    });
+
+    test("attaches provenance with existing chain depth", () => {
+      const raw = napi.provenanceAttach(
+        "ctx-source",
+        "persistent",
+        "full",
+        ["did:dht:z6MkMember1"],
+        "ctx-target",
+        2,
+      );
+      const record = JSON.parse(raw);
+      // Chain depth should be existing + 1 = 3.
+      expect(record.chain_depth).toBe(3);
+    });
+
+    test("checks chain depth within default limit (3)", () => {
+      expect(napi.provenanceCheckChainDepth(0, undefined)).toBe(true);
+      expect(napi.provenanceCheckChainDepth(3, undefined)).toBe(true);
+      expect(napi.provenanceCheckChainDepth(4, undefined)).toBe(false);
+    });
+
+    test("checks chain depth with custom limit", () => {
+      expect(napi.provenanceCheckChainDepth(1, 1)).toBe(true);
+      expect(napi.provenanceCheckChainDepth(2, 1)).toBe(false);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 9. Bridge trust evaluation
+  // ---------------------------------------------------------------------------
+
+  describe("Bridge trust (real NAPI)", () => {
+    test("evaluates trust for native non-bridged action (highest tier)", () => {
+      const tier = napi.bridgeEvaluateTrust(false, true, "shadow");
+      expect(typeof tier).toBe("number");
+      // Native + non-bridged should be highest trust.
+      expect(tier).toBe(3);
+    });
+
+    test("evaluates trust for shadow bridged action (lowest tier)", () => {
+      const tier = napi.bridgeEvaluateTrust(true, false, "shadow");
+      expect(typeof tier).toBe("number");
+      expect(tier).toBeLessThan(3);
+    });
+
+    test("evaluates trust for claimed bridged action", () => {
+      const tier = napi.bridgeEvaluateTrust(true, false, "claimed");
+      expect(typeof tier).toBe("number");
+      // Claimed should be higher trust than shadow when bridged.
+      const shadowTier = napi.bridgeEvaluateTrust(true, false, "shadow");
+      expect(tier).toBeGreaterThanOrEqual(shadowTier);
+    });
+
+    test("registers a bridge connector", () => {
+      const reg = napi.bridgeRegister("ctx-bridge-test", "did:key:operator", "discord", "relay");
+      expect(reg.bridge_id).toBeTruthy();
+      expect(reg.operator_did).toBe("did:key:operator");
+      expect(reg.platform).toBe("discord");
+      expect(reg.mode).toBe("relay");
+      expect(reg.status).toBe("active");
+      expect(reg.context_id).toBe("ctx-bridge-test");
+    });
+
+    test("creates a shadow identity", () => {
+      const shadow = napi.bridgeCreateShadow("bridge-1", "@discorduser", "relay", "ctx-shadow");
+      expect(shadow.shadow_id).toBeTruthy();
+      expect(shadow.platform_handle).toBe("@discorduser");
+      expect(shadow.bridge_id).toBe("bridge-1");
+      expect(shadow.attributed_role).toBe("observer");
+      // Provenance status should be "Shadow" (Debug format from Rust).
+      expect(shadow.provenance_status).toBeTruthy();
+    });
+
+    test("registers bridges with all four modes", () => {
+      for (const mode of ["relay", "puppet", "api", "cooperative"]) {
+        const reg = napi.bridgeRegister(`ctx-${mode}`, "did:key:op", "slack", mode);
+        expect(reg.status).toBe("active");
+      }
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 10. Sync / offline classification
+  // ---------------------------------------------------------------------------
+
+  describe("Sync classification (real NAPI)", () => {
+    test("classifies a short offline duration", () => {
+      const now = 1_000_000;
+      const lastContact = now - 3600; // 1 hour ago
+      const result = napi.syncClassifyOffline(lastContact, now);
+      expect(result).toBe("short");
+    });
+
+    test("classifies an extended offline duration", () => {
+      const now = 1_000_000;
+      const lastContact = now - 100_000; // ~27 hours ago
+      const result = napi.syncClassifyOffline(lastContact, now);
+      expect(result).toBe("extended");
+    });
+
+    test("classifies a long offline duration", () => {
+      const now = 2_000_000;
+      const lastContact = 1_000_000; // 1,000,000 seconds ago (~11 days)
+      const result = napi.syncClassifyOffline(lastContact, now);
+      expect(result).toBe("long");
+    });
+
+    test("returns default sync policy with expected fields", () => {
+      const policy = napi.syncGetPolicy();
+      expect(policy.tier_1_threshold_secs).toBe(14_400); // 4 hours
+      expect(policy.tier_2_threshold_secs).toBe(604_800); // 7 days
+      expect(policy.gap_timeout_secs).toBeGreaterThan(0);
+      expect(policy.reorder_buffer_capacity).toBeGreaterThan(0);
+      expect(policy.max_sequential_commits).toBeGreaterThan(0);
+      expect(policy.commit_process_timeout_secs).toBeGreaterThan(0);
+      expect(policy.sender_key_timeout_secs).toBeGreaterThan(0);
+      expect(policy.reconnection_dedup_window_secs).toBeGreaterThan(0);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 11. Version and lifecycle
+  // ---------------------------------------------------------------------------
+
+  describe("Lifecycle (real NAPI)", () => {
+    test("version returns a non-empty string", () => {
+      const v = napi.version();
+      expect(typeof v).toBe("string");
+      expect(v.length).toBeGreaterThan(0);
+    });
+
+    test("shutdown with 0 timeout returns immediately", () => {
+      // Should not hang.
+      napi.shutdown(0);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 12. End-to-end scenario: full context lifecycle
+  // ---------------------------------------------------------------------------
+
+  describe("E2E context lifecycle (real NAPI)", () => {
+    test("create -> join -> send -> membership check -> leave -> close", async () => {
+      // Create identities.
+      const alice = await napi.identityCreate("in_memory");
+      const bob = await napi.identityCreate("in_memory");
+
+      // Create context.
+      const ctx = await napi.contextCreate(
+        alice,
+        JSON.stringify({
+          ceiling: ["messages:read", "messages:write"],
+          memoryScope: "ephemeral",
+          governance: "single_admin",
+        }),
+      );
+
+      // Verify initial state.
+      expect(await napi.contextMemberCount(ctx)).toBe(1);
+      expect(await napi.contextIsMember(ctx, alice.did)).toBe(true);
+      expect(await napi.contextIsMember(ctx, bob.did)).toBe(false);
+
+      // Bob joins.
+      await napi.contextJoin(ctx, bob.did);
+      expect(await napi.contextMemberCount(ctx)).toBe(2);
+      expect(await napi.contextIsMember(ctx, bob.did)).toBe(true);
+
+      // Alice sends a message.
+      await napi.contextSend(ctx, alice.did, new TextEncoder().encode("hello bob"));
+
+      // Verify event log has entries.
+      const events = await napi.eventLogQuery(ctx, undefined);
+      expect(events.length).toBeGreaterThanOrEqual(1);
+
+      // Checkpoint the event log.
+      const checkpoint = await napi.eventLogCheckpoint(ctx);
+      expect(checkpoint.eventCount).toBeGreaterThanOrEqual(1);
+
+      // Bob leaves.
+      await napi.contextLeave(ctx, bob.did);
+
+      // Alice closes.
+      await napi.contextClose(ctx, alice.did);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 13. E2E: UCAN mint -> validate -> revoke
+  // ---------------------------------------------------------------------------
+
+  describe("E2E UCAN lifecycle (real NAPI)", () => {
+    test("mint -> validate -> revoke -> validation fails", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        admin,
+        JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
+      );
+
+      // Mint.
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read", "messages:write"]);
+      expect(token.capabilities.length).toBe(2);
+
+      // Validate both capabilities.
+      await napi.ucanValidate(ctx, token.encoded, "messages:read");
+      await napi.ucanValidate(ctx, token.encoded, "messages:write");
+
+      // Revoke.
+      await napi.ucanRevoke(ctx, token.encoded);
+
+      // Validation should now fail.
+      await expect(napi.ucanValidate(ctx, token.encoded, "messages:read")).rejects.toThrow();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 14. E2E: Tools register + invoke + verify
+  // ---------------------------------------------------------------------------
+
+  describe("E2E tool lifecycle (real NAPI)", () => {
+    test("register -> invoke -> verify", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["tools:register", "tools:invoke"],
+        }),
+      );
+
+      // Register.
+      const toolId = await napi.toolRegister(ctx, {
+        name: "e2e-tool",
+        description: "End-to-end test tool",
+        inputSchema: {
+          type: "object",
+          properties: { value: { type: "number" } },
+        },
+        outputSchema: {
+          type: "object",
+          properties: { doubled: { type: "number" } },
+        },
+        operator: identity.did,
+      });
+      expect(toolId).toBeTruthy();
+
+      // Invoke.
+      const resultJson = await napi.toolInvoke(
+        ctx,
+        toolId,
+        JSON.stringify({ value: 21 }),
+        identity.did,
+      );
+      expect(typeof resultJson).toBe("string");
+      const result = JSON.parse(resultJson);
+      expect(result).toBeTruthy();
+
+      // Verify.
+      const verification = await napi.toolVerify(ctx, toolId);
+      expect(typeof verification.passed).toBe("boolean");
+      expect(Array.isArray(verification.failures)).toBe(true);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 15. Cross-cutting: provenance + discovery in sequence
+  // ---------------------------------------------------------------------------
+
+  describe("Cross-cutting provenance and discovery (real NAPI)", () => {
+    test("provenance attach -> chain depth check -> discovery query", () => {
+      // Attach provenance.
+      const provRaw = napi.provenanceAttach(
+        "ctx-origin",
+        "persistent",
+        "full",
+        ["did:dht:z6MkA", "did:dht:z6MkB"],
+        "ctx-destination",
+        undefined,
+      );
+      const prov = JSON.parse(provRaw);
+      expect(prov.chain_depth).toBe(1);
+
+      // Check the chain depth is within limit.
+      expect(napi.provenanceCheckChainDepth(prov.chain_depth, undefined)).toBe(true);
+
+      // Create a discovery query for the destination context.
+      const queryJson = napi.discoveryCreateQuery(["messages:read"], ["collaboration"], 3600);
+      const query = JSON.parse(queryJson);
+      expect(query.capability_filter).toContain("messages:read");
+      expect(query.keywords).toContain("collaboration");
+    });
+  });
+}
