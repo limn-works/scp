@@ -62,24 +62,24 @@ public nonisolated struct TransportConfig: Sendable {
 /// injected for testability; defaults call through to ScpBindings.
 ///
 /// See ADR-026 for the flat delegation pattern and ADR-005 for transport spec.
-enum TransportBridge {
+public enum TransportBridge {
     /// Connect to a relay. Maps to ``transportConnect`` in ScpBindings.
-    typealias ConnectFn = @Sendable (
+    public typealias ConnectFn = @Sendable (
         _ relayUrl: String
     ) async throws -> TransportManager
 
     /// Query transport status. Maps to ``transportStatus`` in ScpBindings.
-    typealias StatusFn = @Sendable (
+    public typealias StatusFn = @Sendable (
         _ manager: TransportManager
     ) async throws -> TransportStatus
 
     /// Default connect function that delegates to the UniFFI-generated binding.
-    static let defaultConnect: ConnectFn = { relayUrl in
+    public static let defaultConnect: ConnectFn = { relayUrl in
         try await transportConnect(relayUrl: relayUrl)
     }
 
     /// Default status function that delegates to the UniFFI-generated binding.
-    static let defaultStatus: StatusFn = { manager in
+    public static let defaultStatus: StatusFn = { manager in
         try await transportStatus(manager: manager)
     }
 }

@@ -31,137 +31,137 @@ import Foundation
 /// ScpBindings.
 ///
 /// See ADR-039 (Agent Key Binding) and spec section 9.
-enum IdentityBridge {
+public enum IdentityBridge {
     /// Create a new identity with the specified custody method.
-    typealias CreateFn = @Sendable (
+    public typealias CreateFn = @Sendable (
         _ custody: String
     ) async throws -> Identity
 
     /// Load an existing identity by DID.
-    typealias LoadFn = @Sendable (
+    public typealias LoadFn = @Sendable (
         _ did: String
     ) async throws -> Identity
 
     /// Resolve a DID to its document.
-    typealias ResolveFn = @Sendable (
+    public typealias ResolveFn = @Sendable (
         _ did: String
     ) async throws -> DidDocument
 
     /// Default create function — delegates to UniFFI
     /// ``identityCreate(custody:)``.
-    static let defaultCreate: CreateFn = { custody in
+    public static let defaultCreate: CreateFn = { custody in
         try await identityCreate(custody: custody)
     }
 
     /// Default load function — delegates to UniFFI
     /// ``identityLoad(did:)``.
-    static let defaultLoad: LoadFn = { did in
+    public static let defaultLoad: LoadFn = { did in
         try await identityLoad(did: did)
     }
 
     /// Default resolve function — delegates to UniFFI
     /// ``identityResolve(did:)``.
-    static let defaultResolve: ResolveFn = { did in
+    public static let defaultResolve: ResolveFn = { did in
         try await identityResolve(did: did)
     }
 
     /// Check whether an identity has an agent signing key.
-    typealias HasAgentKeyFn = @Sendable (
+    public typealias HasAgentKeyFn = @Sendable (
         _ identity: Identity
     ) -> Bool
 
     /// Get the agent signing key's public key as a multibase-encoded string.
-    typealias GetAgentPublicKeyFn = @Sendable (
+    public typealias GetAgentPublicKeyFn = @Sendable (
         _ identity: Identity
     ) -> String?
 
     /// Add an agent signing key to an identity.
-    typealias AddAgentKeyFn = @Sendable (
+    public typealias AddAgentKeyFn = @Sendable (
         _ identity: Identity
     ) async throws -> Identity
 
     /// Remove the agent signing key from an identity.
-    typealias RemoveAgentKeyFn = @Sendable (
+    public typealias RemoveAgentKeyFn = @Sendable (
         _ identity: Identity
     ) async throws -> Identity
 
     /// Rotate the agent signing key for an identity.
-    typealias RotateAgentKeyFn = @Sendable (
+    public typealias RotateAgentKeyFn = @Sendable (
         _ identity: Identity
     ) async throws -> Identity
 
     /// Default has agent key function — delegates to UniFFI
     /// ``Identity.hasAgentKey()``.
-    static let defaultHasAgentKey: HasAgentKeyFn = { identity in
+    public static let defaultHasAgentKey: HasAgentKeyFn = { identity in
         identity.hasAgentKey()
     }
 
     /// Default get agent public key function — delegates to UniFFI
     /// ``Identity.getAgentPublicKey()``.
-    static let defaultGetAgentPublicKey: GetAgentPublicKeyFn = { identity in
+    public static let defaultGetAgentPublicKey: GetAgentPublicKeyFn = { identity in
         identity.getAgentPublicKey()
     }
 
     /// Default add agent key function — delegates to UniFFI
     /// ``Identity.addAgentKey()``.
-    static let defaultAddAgentKey: AddAgentKeyFn = { identity in
+    public static let defaultAddAgentKey: AddAgentKeyFn = { identity in
         try await identity.addAgentKey()
     }
 
     /// Default remove agent key function — delegates to UniFFI
     /// ``Identity.removeAgentKey()``.
-    static let defaultRemoveAgentKey: RemoveAgentKeyFn = { identity in
+    public static let defaultRemoveAgentKey: RemoveAgentKeyFn = { identity in
         try await identity.removeAgentKey()
     }
 
     /// Default rotate agent key function — delegates to UniFFI
     /// ``Identity.rotateAgentKey()``.
-    static let defaultRotateAgentKey: RotateAgentKeyFn = { identity in
+    public static let defaultRotateAgentKey: RotateAgentKeyFn = { identity in
         try await identity.rotateAgentKey()
     }
 
     /// Create a new identity with an agent key.
-    typealias CreateWithAgentKeyFn = @Sendable (
+    public typealias CreateWithAgentKeyFn = @Sendable (
         _ custody: String
     ) async throws -> Identity
 
     /// Migrate an identity to a new DID.
-    typealias MigrateFn = @Sendable (
+    public typealias MigrateFn = @Sendable (
         _ identity: Identity
     ) async throws -> Identity
 
     /// Default create with agent key function — delegates to UniFFI
     /// ``identityCreateWithAgentKey(custody:)``.
-    static let defaultCreateWithAgentKey: CreateWithAgentKeyFn = { custody in
+    public static let defaultCreateWithAgentKey: CreateWithAgentKeyFn = { custody in
         try await identityCreateWithAgentKey(custody: custody)
     }
 
     /// Default migrate function — delegates to UniFFI
     /// ``identityMigrate(identity:)``.
-    static let defaultMigrate: MigrateFn = { identity in
+    public static let defaultMigrate: MigrateFn = { identity in
         try await identityMigrate(identity: identity)
     }
 
     /// Generate a device attestation token for an identity.
-    typealias AttestDeviceFn = @Sendable (
+    public typealias AttestDeviceFn = @Sendable (
         _ identity: Identity
     ) async throws -> String
 
     /// Verify a device attestation token.
-    typealias VerifyDeviceAttestationFn = @Sendable (
+    public typealias VerifyDeviceAttestationFn = @Sendable (
         _ did: String,
         _ tokenBase64: String
     ) async throws -> Bool
 
     /// Default attest device function — delegates to UniFFI
     /// ``identityAttestDevice(identity:)``.
-    static let defaultAttestDevice: AttestDeviceFn = { identity in
+    public static let defaultAttestDevice: AttestDeviceFn = { identity in
         try await identityAttestDevice(identity: identity)
     }
 
     /// Default verify device attestation function — delegates to UniFFI
     /// ``identityVerifyDeviceAttestation(did:tokenBase64:)``.
-    static let defaultVerifyDeviceAttestation: VerifyDeviceAttestationFn = { did, tokenBase64 in
+    public static let defaultVerifyDeviceAttestation: VerifyDeviceAttestationFn = { did, tokenBase64 in
         try await identityVerifyDeviceAttestation(did: did, tokenBase64: tokenBase64)
     }
 }

@@ -180,63 +180,63 @@ public nonisolated struct BehavioralRecord: Sendable {
 /// mock inputs.
 ///
 /// See ADR-017 for the trust model and ADR-026 for the delegation pattern.
-enum TrustBridge {
+public enum TrustBridge {
     /// Evaluate trust for a subject. Returns a ``TrustEvaluation``.
-    typealias EvaluateFn = @Sendable (
+    public typealias EvaluateFn = @Sendable (
         _ subjectDid: String,
         _ contextId: String
     ) async throws -> TrustEvaluation
 
     /// Query participation-based trust score for a DID in a context.
-    typealias QueryScoreFn = @Sendable (
+    public typealias QueryScoreFn = @Sendable (
         _ did: String,
         _ contextId: String
     ) throws -> TrustScoreResult
 
     /// Verify an attestation's Ed25519 signature, evidence, expiry, and
     /// revocation status.
-    typealias VerifyAttestationFn = @Sendable (
+    public typealias VerifyAttestationFn = @Sendable (
         _ attestationJson: String
     ) throws -> AttestationVerificationResult
 
     /// Create a challenge request for capability verification.
-    typealias CreateChallengeFn = @Sendable (
+    public typealias CreateChallengeFn = @Sendable (
         _ targetDid: String
     ) throws -> ChallengeResult
 
     /// Verify a challenge response against its original challenge request.
-    typealias VerifyResponseFn = @Sendable (
+    public typealias VerifyResponseFn = @Sendable (
         _ challengeJson: String,
         _ responseJson: String
     ) throws -> Bool
 
     /// Default evaluate function that delegates to the UniFFI
     /// ``trustQueryScore`` bridge function.
-    static let defaultEvaluate: EvaluateFn = { subjectDid, contextId in
+    public static let defaultEvaluate: EvaluateFn = { subjectDid, contextId in
         let score = try trustQueryScore(did: subjectDid, contextId: contextId)
         return TrustEvaluation(from: score)
     }
 
     /// Default query score function — delegates to UniFFI ``trustQueryScore``.
-    static let defaultQueryScore: QueryScoreFn = { did, contextId in
+    public static let defaultQueryScore: QueryScoreFn = { did, contextId in
         try trustQueryScore(did: did, contextId: contextId)
     }
 
     /// Default verify attestation function — delegates to UniFFI
     /// ``trustVerifyAttestation``.
-    static let defaultVerifyAttestation: VerifyAttestationFn = { attestationJson in
+    public static let defaultVerifyAttestation: VerifyAttestationFn = { attestationJson in
         try trustVerifyAttestation(attestationJson: attestationJson)
     }
 
     /// Default create challenge function — delegates to UniFFI
     /// ``trustCreateChallenge``.
-    static let defaultCreateChallenge: CreateChallengeFn = { targetDid in
+    public static let defaultCreateChallenge: CreateChallengeFn = { targetDid in
         try trustCreateChallenge(targetDid: targetDid)
     }
 
     /// Default verify response function — delegates to UniFFI
     /// ``trustVerifyResponse``.
-    static let defaultVerifyResponse: VerifyResponseFn = { challengeJson, responseJson in
+    public static let defaultVerifyResponse: VerifyResponseFn = { challengeJson, responseJson in
         try trustVerifyResponse(challengeJson: challengeJson, responseJson: responseJson)
     }
 }

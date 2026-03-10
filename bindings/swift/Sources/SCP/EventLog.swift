@@ -51,31 +51,31 @@ final class EventLogHandle: Sendable {
 /// injected for testability; defaults call through to ScpBindings.
 ///
 /// See ADR-026 for the flat delegation pattern and ADR-011 for event log spec.
-enum EventLogBridge {
+public enum EventLogBridge {
     /// Query events from a context's event log. Maps to ``eventLogQuery``.
-    typealias QueryFn = @Sendable (
+    public typealias QueryFn = @Sendable (
         _ handle: ContextHandle,
         _ filterJson: String?
     ) async throws -> [Event]
 
     /// Verify an event log claim. Maps to ``eventLogVerify``.
-    typealias VerifyFn = @Sendable (
+    public typealias VerifyFn = @Sendable (
         _ handle: ContextHandle,
         _ claimJson: String
     ) async throws -> Proof
 
     /// Default query function that delegates to the UniFFI-generated binding.
-    static let defaultQuery: QueryFn = { handle, filterJson in
+    public static let defaultQuery: QueryFn = { handle, filterJson in
         try await eventLogQuery(handle: handle, filterJson: filterJson)
     }
 
     /// Default verify function that delegates to the UniFFI-generated binding.
-    static let defaultVerify: VerifyFn = { handle, claimJson in
+    public static let defaultVerify: VerifyFn = { handle, claimJson in
         try await eventLogVerify(handle: handle, claimJson: claimJson)
     }
 
     /// Generate a signed consistency checkpoint. Maps to ``eventLogCheckpoint``.
-    typealias CheckpointFn = @Sendable (
+    public typealias CheckpointFn = @Sendable (
         _ handle: ContextHandle,
         _ identity: Identity,
         _ epoch: UInt64
@@ -83,7 +83,7 @@ enum EventLogBridge {
 
     /// Default checkpoint function — delegates to UniFFI
     /// ``eventLogCheckpoint(handle:identity:epoch:)``.
-    static let defaultCheckpoint: CheckpointFn = { handle, identity, epoch in
+    public static let defaultCheckpoint: CheckpointFn = { handle, identity, epoch in
         try await eventLogCheckpoint(handle: handle, identity: identity, epoch: epoch)
     }
 }

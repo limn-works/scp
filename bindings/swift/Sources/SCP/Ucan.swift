@@ -61,9 +61,9 @@ public nonisolated struct UcanValidationResult: Sendable {
 /// injected for testability; defaults call through to ScpBindings.
 ///
 /// See ADR-026 for the flat delegation pattern and ADR-016 for UCAN spec.
-enum UcanBridge {
+public enum UcanBridge {
     /// Validate a UCAN token. Maps to ``ucanValidate`` in ScpBindings.
-    typealias ValidateFn = @Sendable (
+    public typealias ValidateFn = @Sendable (
         _ handle: ContextHandle,
         _ token: String,
         _ capability: String,
@@ -72,35 +72,35 @@ enum UcanBridge {
     ) async throws -> Void
 
     /// Mint a UCAN token. Maps to ``ucanMint`` in ScpBindings.
-    typealias MintFn = @Sendable (
+    public typealias MintFn = @Sendable (
         _ handle: ContextHandle,
         _ memberDid: String,
         _ capabilities: [String]
     ) async throws -> UcanToken
 
     /// Revoke a UCAN token. Maps to ``ucanRevoke`` in ScpBindings.
-    typealias RevokeFn = @Sendable (
+    public typealias RevokeFn = @Sendable (
         _ handle: ContextHandle,
         _ token: String
     ) async throws -> Void
 
     /// Default validate function that delegates to the UniFFI-generated binding.
-    static let defaultValidate: ValidateFn = { handle, token, capability, presentingAgentDid, proofTokens in
+    public static let defaultValidate: ValidateFn = { handle, token, capability, presentingAgentDid, proofTokens in
         try await ucanValidate(handle: handle, token: token, capability: capability, presentingAgentDid: presentingAgentDid, proofTokens: proofTokens)
     }
 
     /// Default mint function that delegates to the UniFFI-generated binding.
-    static let defaultMint: MintFn = { handle, memberDid, capabilities in
+    public static let defaultMint: MintFn = { handle, memberDid, capabilities in
         try await ucanMint(handle: handle, memberDid: memberDid, capabilities: capabilities)
     }
 
     /// Default revoke function that delegates to the UniFFI-generated binding.
-    static let defaultRevoke: RevokeFn = { handle, token in
+    public static let defaultRevoke: RevokeFn = { handle, token in
         try await ucanRevoke(handle: handle, token: token)
     }
 
     /// Delegate a UCAN token. Maps to ``ucanDelegate`` in ScpBindings.
-    typealias DelegateFn = @Sendable (
+    public typealias DelegateFn = @Sendable (
         _ handle: ContextHandle,
         _ delegatorDid: String,
         _ delegateeDid: String,
@@ -110,7 +110,7 @@ enum UcanBridge {
 
     /// Default delegate function — delegates to UniFFI
     /// ``ucanDelegate(handle:delegatorDid:delegateeDid:parentToken:capabilities:)``.
-    static let defaultDelegate: DelegateFn = { handle, delegatorDid, delegateeDid, parentToken, capabilities in
+    public static let defaultDelegate: DelegateFn = { handle, delegatorDid, delegateeDid, parentToken, capabilities in
         try await ucanDelegate(handle: handle, delegatorDid: delegatorDid, delegateeDid: delegateeDid, parentToken: parentToken, capabilities: capabilities)
     }
 }

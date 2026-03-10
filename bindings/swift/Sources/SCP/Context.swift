@@ -14,43 +14,43 @@ import Foundation
 ///
 /// See ADR-021 for the bridge function surface and ADR-026 for the delegation
 /// pattern (every Swift SDK method calls exactly one bridge function).
-enum ContextBridge {
+public enum ContextBridge {
     /// The closure type for context creation. Injected for testability.
-    typealias CreateFn = @Sendable (
+    public typealias CreateFn = @Sendable (
         _ contextId: String,
         _ ceiling: [String]
     ) async throws -> any ContextHandleProtocol
 
     /// The closure type for sending a message. Injected for testability.
-    typealias SendFn = @Sendable (
+    public typealias SendFn = @Sendable (
         _ handle: any ContextHandleProtocol,
         _ payload: Data
     ) async throws -> Void
 
     /// The closure type for subscribing to messages. Injected for testability.
-    typealias SubscribeFn = @Sendable (
+    public typealias SubscribeFn = @Sendable (
         _ handle: any ContextHandleProtocol,
         _ listener: any MessageListener
     ) -> Void
 
     /// The closure type for leaving a context. Injected for testability.
-    typealias LeaveFn = @Sendable (
+    public typealias LeaveFn = @Sendable (
         _ handle: any ContextHandleProtocol
     ) async throws -> Void
 
     /// The closure type for closing a context. Injected for testability.
-    typealias CloseFn = @Sendable (
+    public typealias CloseFn = @Sendable (
         _ handle: any ContextHandleProtocol
     ) async throws -> Void
 
     /// The closure type for joining an existing context. Injected for testability.
-    typealias JoinFn = @Sendable (
+    public typealias JoinFn = @Sendable (
         _ handle: ContextHandle,
         _ identity: Identity
     ) async throws -> Void
 
     /// Default join function — delegates to UniFFI ``contextJoin``.
-    static let defaultJoin: JoinFn = { handle, identity in
+    public static let defaultJoin: JoinFn = { handle, identity in
         try await contextJoin(handle: handle, identity: identity)
     }
 }

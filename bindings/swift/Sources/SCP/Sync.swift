@@ -8,15 +8,15 @@ import Foundation
 /// ScpBindings.
 ///
 /// See ADR-029 in `.docs/adrs/phase-6.md`.
-enum SyncBridge {
+public enum SyncBridge {
     /// Classify offline duration into a tier.
-    typealias ClassifyOfflineFn = @Sendable (
+    public typealias ClassifyOfflineFn = @Sendable (
         _ lastRelayContact: UInt64,
         _ now: UInt64
     ) -> String
 
     /// Classify offline duration with custom thresholds.
-    typealias ClassifyOfflineCustomFn = @Sendable (
+    public typealias ClassifyOfflineCustomFn = @Sendable (
         _ lastRelayContact: UInt64,
         _ now: UInt64,
         _ tier1ThresholdSecs: UInt64,
@@ -25,13 +25,13 @@ enum SyncBridge {
 
     /// Default classify offline function — delegates to UniFFI
     /// ``syncClassifyOffline``.
-    static let defaultClassifyOffline: ClassifyOfflineFn = { lastRelayContact, now in
+    public static let defaultClassifyOffline: ClassifyOfflineFn = { lastRelayContact, now in
         syncClassifyOffline(lastRelayContact: lastRelayContact, now: now)
     }
 
     /// Default classify offline custom function — delegates to UniFFI
     /// ``syncClassifyOfflineCustom``.
-    static let defaultClassifyOfflineCustom: ClassifyOfflineCustomFn = { lastRelayContact, now, tier1ThresholdSecs, tier2ThresholdSecs in
+    public static let defaultClassifyOfflineCustom: ClassifyOfflineCustomFn = { lastRelayContact, now, tier1ThresholdSecs, tier2ThresholdSecs in
         syncClassifyOfflineCustom(
             lastRelayContact: lastRelayContact,
             now: now,
@@ -41,11 +41,11 @@ enum SyncBridge {
     }
 
     /// Get the sync policy. Maps to UniFFI ``syncGetPolicy``.
-    typealias GetPolicyFn = @Sendable () -> SyncPolicyResult
+    public typealias GetPolicyFn = @Sendable () -> SyncPolicyResult
 
     /// Default get sync policy function — delegates to UniFFI
     /// ``syncGetPolicy()``.
-    static let defaultGetPolicy: GetPolicyFn = {
+    public static let defaultGetPolicy: GetPolicyFn = {
         syncGetPolicy()
     }
 }

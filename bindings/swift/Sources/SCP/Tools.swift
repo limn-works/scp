@@ -70,9 +70,9 @@ public nonisolated struct ToolSessionResult: Sendable {
 /// injected for testability; defaults call through to ScpBindings.
 ///
 /// See ADR-026 for the flat delegation pattern and ADR-011 for tool spec.
-enum ToolBridge {
+public enum ToolBridge {
     /// Invoke a tool. Maps to ``toolInvoke`` in ScpBindings.
-    typealias InvokeFn = @Sendable (
+    public typealias InvokeFn = @Sendable (
         _ handle: ContextHandle,
         _ toolId: String,
         _ inputJson: String,
@@ -80,19 +80,19 @@ enum ToolBridge {
     ) async throws -> String
 
     /// Register a tool. Maps to ``toolRegister`` in ScpBindings.
-    typealias RegisterFn = @Sendable (
+    public typealias RegisterFn = @Sendable (
         _ handle: ContextHandle,
         _ definition: ToolDefinition
     ) async throws -> String
 
     /// Verify a tool. Maps to ``toolVerify`` in ScpBindings.
-    typealias VerifyFn = @Sendable (
+    public typealias VerifyFn = @Sendable (
         _ handle: ContextHandle,
         _ toolId: String
     ) async throws -> ToolVerificationResult
 
     /// Invoke a tool across context boundaries (spec section 6.2).
-    typealias InvokeCrossContextFn = @Sendable (
+    public typealias InvokeCrossContextFn = @Sendable (
         _ sourceHandle: ContextHandle,
         _ targetHandle: ContextHandle,
         _ toolId: String,
@@ -102,7 +102,7 @@ enum ToolBridge {
     ) async throws -> String
 
     /// Create a stateful tool session (spec section 6.2.1).
-    typealias SessionCreateFn = @Sendable (
+    public typealias SessionCreateFn = @Sendable (
         _ handle: ContextHandle,
         _ toolId: String,
         _ sourceContextId: String,
@@ -110,7 +110,7 @@ enum ToolBridge {
     ) async throws -> String
 
     /// Invoke a tool within an active session.
-    typealias SessionInvokeFn = @Sendable (
+    public typealias SessionInvokeFn = @Sendable (
         _ handle: ContextHandle,
         _ sessionId: String,
         _ inputJson: String,
@@ -118,28 +118,28 @@ enum ToolBridge {
     ) async throws -> String
 
     /// Close a stateful tool session.
-    typealias SessionCloseFn = @Sendable (
+    public typealias SessionCloseFn = @Sendable (
         _ handle: ContextHandle,
         _ sessionId: String
     ) async throws -> Void
 
     /// Default invoke function that delegates to the UniFFI-generated binding.
-    static let defaultInvoke: InvokeFn = { handle, toolId, inputJson, identity in
+    public static let defaultInvoke: InvokeFn = { handle, toolId, inputJson, identity in
         try await toolInvoke(handle: handle, toolId: toolId, inputJson: inputJson, identity: identity)
     }
 
     /// Default register function that delegates to the UniFFI-generated binding.
-    static let defaultRegister: RegisterFn = { handle, definition in
+    public static let defaultRegister: RegisterFn = { handle, definition in
         try await toolRegister(handle: handle, definition: definition)
     }
 
     /// Default verify function that delegates to the UniFFI-generated binding.
-    static let defaultVerify: VerifyFn = { handle, toolId in
+    public static let defaultVerify: VerifyFn = { handle, toolId in
         try await toolVerify(handle: handle, toolId: toolId)
     }
 
     /// Default cross-context invoke function — delegates to UniFFI.
-    static let defaultInvokeCrossContext: InvokeCrossContextFn = { sourceHandle, targetHandle, toolId, inputJson, identity, chainDepth in
+    public static let defaultInvokeCrossContext: InvokeCrossContextFn = { sourceHandle, targetHandle, toolId, inputJson, identity, chainDepth in
         try await toolInvokeCrossContext(
             sourceHandle: sourceHandle,
             targetHandle: targetHandle,
@@ -151,7 +151,7 @@ enum ToolBridge {
     }
 
     /// Default session create function — delegates to UniFFI.
-    static let defaultSessionCreate: SessionCreateFn = { handle, toolId, sourceContextId, ttlSeconds in
+    public static let defaultSessionCreate: SessionCreateFn = { handle, toolId, sourceContextId, ttlSeconds in
         try await toolSessionCreate(
             handle: handle,
             toolId: toolId,
@@ -161,7 +161,7 @@ enum ToolBridge {
     }
 
     /// Default session invoke function — delegates to UniFFI.
-    static let defaultSessionInvoke: SessionInvokeFn = { handle, sessionId, inputJson, identity in
+    public static let defaultSessionInvoke: SessionInvokeFn = { handle, sessionId, inputJson, identity in
         try await toolSessionInvoke(
             handle: handle,
             sessionId: sessionId,
@@ -171,7 +171,7 @@ enum ToolBridge {
     }
 
     /// Default session close function — delegates to UniFFI.
-    static let defaultSessionClose: SessionCloseFn = { handle, sessionId in
+    public static let defaultSessionClose: SessionCloseFn = { handle, sessionId in
         try await toolSessionClose(handle: handle, sessionId: sessionId)
     }
 }

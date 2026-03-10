@@ -12,16 +12,16 @@ import Foundation
 /// ScpBindings.
 ///
 /// See spec section 12 (Bridge System) and ADR-023.
-enum BridgeConnectorBridge {
+public enum BridgeConnectorBridge {
     /// Evaluate trust level for a bridge action.
-    typealias EvaluateTrustFn = @Sendable (
+    public typealias EvaluateTrustFn = @Sendable (
         _ isBridged: Bool,
         _ isNativeTransport: Bool,
         _ shadowStatus: String
     ) throws -> UInt8
 
     /// Register a bridge connector with a context.
-    typealias RegisterFn = @Sendable (
+    public typealias RegisterFn = @Sendable (
         _ contextId: String,
         _ operatorDid: String,
         _ platform: String,
@@ -29,7 +29,7 @@ enum BridgeConnectorBridge {
     ) throws -> BridgeRegistrationResult
 
     /// Create a shadow identity for an external platform participant.
-    typealias CreateShadowFn = @Sendable (
+    public typealias CreateShadowFn = @Sendable (
         _ bridgeId: String,
         _ platformHandle: String,
         _ bridgeMode: String,
@@ -38,7 +38,7 @@ enum BridgeConnectorBridge {
 
     /// Default evaluate trust function — delegates to UniFFI
     /// ``bridgeEvaluateTrust``.
-    static let defaultEvaluateTrust: EvaluateTrustFn = { isBridged, isNativeTransport, shadowStatus in
+    public static let defaultEvaluateTrust: EvaluateTrustFn = { isBridged, isNativeTransport, shadowStatus in
         try bridgeEvaluateTrust(
             isBridged: isBridged,
             isNativeTransport: isNativeTransport,
@@ -48,7 +48,7 @@ enum BridgeConnectorBridge {
 
     /// Default register function — delegates to UniFFI
     /// ``bridgeRegister(contextId:operatorDid:platform:mode:)``.
-    static let defaultRegister: RegisterFn = { contextId, operatorDid, platform, mode in
+    public static let defaultRegister: RegisterFn = { contextId, operatorDid, platform, mode in
         try bridgeRegister(
             contextId: contextId,
             operatorDid: operatorDid,
@@ -59,7 +59,7 @@ enum BridgeConnectorBridge {
 
     /// Default create shadow function — delegates to UniFFI
     /// ``bridgeCreateShadow(bridgeId:platformHandle:bridgeMode:contextId:)``.
-    static let defaultCreateShadow: CreateShadowFn = { bridgeId, platformHandle, bridgeMode, contextId in
+    public static let defaultCreateShadow: CreateShadowFn = { bridgeId, platformHandle, bridgeMode, contextId in
         try bridgeCreateShadow(
             bridgeId: bridgeId,
             platformHandle: platformHandle,

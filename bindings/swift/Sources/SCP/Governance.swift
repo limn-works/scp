@@ -70,91 +70,91 @@ public enum MemberRole: String, Sendable {
 
 /// Namespace for UniFFI bridge function references used by context lifecycle
 /// operations beyond basic create/join/leave/close (drain events, TTL, export/import).
-enum ContextLifecycleBridge {
+public enum ContextLifecycleBridge {
     /// Drain pending events from a context.
-    typealias DrainEventsFn = @Sendable (
+    public typealias DrainEventsFn = @Sendable (
         _ handle: ContextHandle
     ) async throws -> [String]
 
     /// Handle TTL expiry for a context.
-    typealias HandleTtlExpiryFn = @Sendable (
+    public typealias HandleTtlExpiryFn = @Sendable (
         _ handle: ContextHandle
     ) async throws -> Void
 
     /// Propose a TTL extension with member consent.
-    typealias ProposeTtlExtensionFn = @Sendable (
+    public typealias ProposeTtlExtensionFn = @Sendable (
         _ handle: ContextHandle,
         _ memberDid: String,
         _ proposedSeconds: UInt64
     ) async throws -> Bool
 
     /// Reset the TTL timer after unanimous extension.
-    typealias ResetTtlTimerFn = @Sendable (
+    public typealias ResetTtlTimerFn = @Sendable (
         _ handle: ContextHandle,
         _ newSeconds: UInt64
     ) async throws -> Void
 
     /// Export a context's full state as serialized bytes.
-    typealias ExportFn = @Sendable (
+    public typealias ExportFn = @Sendable (
         _ handle: ContextHandle
     ) async throws -> Data
 
     /// Import a context from serialized bytes.
-    typealias ImportFn = @Sendable (
+    public typealias ImportFn = @Sendable (
         _ data: Data
     ) async throws -> String
 
     /// Register a DID as locally controlled.
-    typealias RegisterLocalDidFn = @Sendable (
+    public typealias RegisterLocalDidFn = @Sendable (
         _ did: String
     ) async throws -> Void
 
     /// Check if a DID is registered as locally controlled.
-    typealias IsLocalDidFn = @Sendable (
+    public typealias IsLocalDidFn = @Sendable (
         _ did: String
     ) async throws -> Bool
 
     /// Verify participation requirements via the UniFFI bridge.
-    typealias VerifyParticipationRequirementsFn = @Sendable (
+    public typealias VerifyParticipationRequirementsFn = @Sendable (
         _ profileJson: String,
         _ requirementsJson: String
     ) throws -> Bool
 
-    static let defaultDrainEvents: DrainEventsFn = { handle in
+    public static let defaultDrainEvents: DrainEventsFn = { handle in
         await contextDrainEvents(handle: handle)
     }
 
-    static let defaultHandleTtlExpiry: HandleTtlExpiryFn = { handle in
+    public static let defaultHandleTtlExpiry: HandleTtlExpiryFn = { handle in
         try await contextHandleTtlExpiry(handle: handle)
     }
 
-    static let defaultProposeTtlExtension: ProposeTtlExtensionFn = { handle, memberDid, proposedSeconds in
+    public static let defaultProposeTtlExtension: ProposeTtlExtensionFn = { handle, memberDid, proposedSeconds in
         try await contextProposeTtlExtension(
             handle: handle, memberDid: memberDid, proposedSeconds: proposedSeconds
         )
     }
 
-    static let defaultResetTtlTimer: ResetTtlTimerFn = { handle, newSeconds in
+    public static let defaultResetTtlTimer: ResetTtlTimerFn = { handle, newSeconds in
         await contextResetTtlTimer(handle: handle, newSeconds: newSeconds)
     }
 
     /// Default export function — delegates to UniFFI
     /// ``contextExport(handle:)``.
-    static let defaultExport: ExportFn = { handle in
+    public static let defaultExport: ExportFn = { handle in
         try await contextExport(handle: handle)
     }
 
     /// Default import function — delegates to UniFFI
     /// ``contextImport(data:)``.
-    static let defaultImport: ImportFn = { data in
+    public static let defaultImport: ImportFn = { data in
         try await contextImport(data: data)
     }
 
-    static let defaultRegisterLocalDid: RegisterLocalDidFn = { did in
+    public static let defaultRegisterLocalDid: RegisterLocalDidFn = { did in
         await registerLocalDid(did: did)
     }
 
-    static let defaultIsLocalDid: IsLocalDidFn = { did in
+    public static let defaultIsLocalDid: IsLocalDidFn = { did in
         await isLocalDid(did: did)
     }
 
@@ -163,7 +163,7 @@ enum ContextLifecycleBridge {
     ///
     /// For a pure-Swift alternative using typed inputs, see
     /// ``verifyParticipationRequirements(requirement:profile:)`` in Trust.swift.
-    static let defaultVerifyParticipationRequirements: VerifyParticipationRequirementsFn = { profileJson, requirementsJson in
+    public static let defaultVerifyParticipationRequirements: VerifyParticipationRequirementsFn = { profileJson, requirementsJson in
         try verifyParticipationRequirements(profileJson: profileJson, requirementsJson: requirementsJson)
     }
 }
@@ -171,15 +171,15 @@ enum ContextLifecycleBridge {
 // MARK: - GovernanceBridge
 
 /// Namespace for UniFFI bridge function references used by governance operations.
-enum GovernanceBridge {
+public enum GovernanceBridge {
     /// Execute a governance action. Maps to ``governanceExecute`` in ScpBindings.
-    typealias ExecuteFn = @Sendable (
+    public typealias ExecuteFn = @Sendable (
         _ handle: ContextHandle,
         _ proposalJson: String
     ) async throws -> String
 
     /// Default execute function that delegates to the UniFFI-generated binding.
-    static let defaultExecute: ExecuteFn = { handle, proposalJson in
+    public static let defaultExecute: ExecuteFn = { handle, proposalJson in
         try await governanceExecute(handle: handle, proposalJson: proposalJson)
     }
 }
@@ -187,42 +187,42 @@ enum GovernanceBridge {
 // MARK: - MembershipBridge
 
 /// Namespace for UniFFI bridge function references used by membership queries.
-enum MembershipBridge {
+public enum MembershipBridge {
     /// Return the member count for a context.
-    typealias MemberCountFn = @Sendable (
+    public typealias MemberCountFn = @Sendable (
         _ handle: ContextHandle
     ) async throws -> UInt64?
 
     /// Check whether a DID is a member.
-    typealias IsMemberFn = @Sendable (
+    public typealias IsMemberFn = @Sendable (
         _ handle: ContextHandle,
         _ did: String
     ) async throws -> Bool
 
     /// Return all member DIDs.
-    typealias MemberDidsFn = @Sendable (
+    public typealias MemberDidsFn = @Sendable (
         _ handle: ContextHandle
     ) async throws -> [String]
 
     /// Return a member's role.
-    typealias MemberRoleFn = @Sendable (
+    public typealias MemberRoleFn = @Sendable (
         _ handle: ContextHandle,
         _ did: String
     ) async throws -> String?
 
-    static let defaultMemberCount: MemberCountFn = { handle in
+    public static let defaultMemberCount: MemberCountFn = { handle in
         try await contextMemberCount(handle: handle)
     }
 
-    static let defaultIsMember: IsMemberFn = { handle, did in
+    public static let defaultIsMember: IsMemberFn = { handle, did in
         try await contextIsMember(handle: handle, did: did)
     }
 
-    static let defaultMemberDids: MemberDidsFn = { handle in
+    public static let defaultMemberDids: MemberDidsFn = { handle in
         try await contextMemberDids(handle: handle)
     }
 
-    static let defaultMemberRole: MemberRoleFn = { handle, did in
+    public static let defaultMemberRole: MemberRoleFn = { handle, did in
         try await contextMemberRole(handle: handle, did: did)
     }
 }
@@ -230,84 +230,84 @@ enum MembershipBridge {
 // MARK: - BroadcastBridge
 
 /// Namespace for UniFFI bridge function references used by broadcast operations.
-enum BroadcastBridge {
-    typealias SubscribeFn = @Sendable (
+public enum BroadcastBridge {
+    public typealias SubscribeFn = @Sendable (
         _ handle: ContextHandle,
         _ subscriberDid: String
     ) async throws -> Void
 
-    typealias UnsubscribeFn = @Sendable (
+    public typealias UnsubscribeFn = @Sendable (
         _ handle: ContextHandle,
         _ subscriberDid: String,
         _ rotateKeys: Bool
     ) async throws -> Void
 
-    typealias PublishFn = @Sendable (
+    public typealias PublishFn = @Sendable (
         _ handle: ContextHandle,
         _ authorDid: String,
         _ payload: Data
     ) async throws -> Void
 
-    typealias BlockSubscriberFn = @Sendable (
+    public typealias BlockSubscriberFn = @Sendable (
         _ handle: ContextHandle,
         _ subscriberDid: String,
         _ blockerDid: String
     ) async throws -> Void
 
-    typealias HandleKeyRequestFn = @Sendable (
+    public typealias HandleKeyRequestFn = @Sendable (
         _ handle: ContextHandle,
         _ authorDid: String,
         _ requesterDid: String
     ) async throws -> String
 
-    typealias SubscriberCountFn = @Sendable (
+    public typealias SubscriberCountFn = @Sendable (
         _ handle: ContextHandle
     ) async throws -> UInt64?
 
-    typealias IsSubscriberFn = @Sendable (
+    public typealias IsSubscriberFn = @Sendable (
         _ handle: ContextHandle,
         _ did: String
     ) async throws -> Bool
 
-    typealias AdmissionFn = @Sendable (
+    public typealias AdmissionFn = @Sendable (
         _ handle: ContextHandle
     ) async throws -> String?
 
-    static let defaultSubscribe: SubscribeFn = { handle, subscriberDid in
+    public static let defaultSubscribe: SubscribeFn = { handle, subscriberDid in
         try await broadcastSubscribe(handle: handle, subscriberDid: subscriberDid)
     }
 
-    static let defaultUnsubscribe: UnsubscribeFn = { handle, subscriberDid, rotateKeys in
+    public static let defaultUnsubscribe: UnsubscribeFn = { handle, subscriberDid, rotateKeys in
         try await broadcastUnsubscribe(
             handle: handle, subscriberDid: subscriberDid, rotateKeys: rotateKeys
         )
     }
 
-    static let defaultPublish: PublishFn = { handle, authorDid, payload in
+    public static let defaultPublish: PublishFn = { handle, authorDid, payload in
         try await broadcastPublish(handle: handle, authorDid: authorDid, payload: payload)
     }
 
-    static let defaultBlockSubscriber: BlockSubscriberFn = { handle, subscriberDid, blockerDid in
+    public static let defaultBlockSubscriber: BlockSubscriberFn = { handle, subscriberDid, blockerDid in
         try await broadcastBlockSubscriber(
             handle: handle, subscriberDid: subscriberDid, blockerDid: blockerDid
         )
     }
 
-    static let defaultHandleKeyRequest: HandleKeyRequestFn = { handle, authorDid, requesterDid in
+    public static let defaultHandleKeyRequest: HandleKeyRequestFn = { handle, authorDid, requesterDid in
         try await broadcastHandleKeyRequest(
             handle: handle, authorDid: authorDid, requesterDid: requesterDid
         )
     }
 
-    static let defaultSubscriberCount: SubscriberCountFn = { handle in
+    public static let defaultSubscriberCount: SubscriberCountFn = { handle in
         try await broadcastSubscriberCount(handle: handle)
     }
 
-    static let defaultIsSubscriber: IsSubscriberFn = { handle, did in
+    public static let defaultIsSubscriber: IsSubscriberFn = { handle, did in
         try await broadcastIsSubscriber(handle: handle, did: did)
     }
 
-    static let defaultAdmission: AdmissionFn = { handle in
+    public static let defaultAdmission: AdmissionFn = { handle in
         try await broadcastAdmission(handle: handle)
     }
 }

@@ -9,33 +9,33 @@ import Foundation
 ///
 /// See ADR-020 in `.docs/adrs/phase-4.md` and spec section 22
 /// (Addressing).
-enum DiscoveryBridge {
+public enum DiscoveryBridge {
     /// Parse an SCP address string into its components.
-    typealias ParseAddressFn = @Sendable (
+    public typealias ParseAddressFn = @Sendable (
         _ address: String
     ) throws -> String
 
     /// Create a discovery query as a JSON string.
-    typealias CreateQueryFn = @Sendable (
+    public typealias CreateQueryFn = @Sendable (
         _ capabilities: [String]?,
         _ keywords: [String]?,
         _ minHistorySecs: UInt64?
     ) throws -> String
 
     /// Normalize an address string per SCP addressing rules.
-    typealias NormalizeAddressFn = @Sendable (
+    public typealias NormalizeAddressFn = @Sendable (
         _ address: String
     ) -> String
 
     /// Default parse address function — delegates to UniFFI
     /// ``discoveryParseAddress``.
-    static let defaultParseAddress: ParseAddressFn = { address in
+    public static let defaultParseAddress: ParseAddressFn = { address in
         try discoveryParseAddress(address: address)
     }
 
     /// Default create query function — delegates to UniFFI
     /// ``discoveryCreateQuery``.
-    static let defaultCreateQuery: CreateQueryFn = { capabilities, keywords, minHistorySecs in
+    public static let defaultCreateQuery: CreateQueryFn = { capabilities, keywords, minHistorySecs in
         try discoveryCreateQuery(
             capabilities: capabilities,
             keywords: keywords,
@@ -45,18 +45,18 @@ enum DiscoveryBridge {
 
     /// Default normalize address function — delegates to UniFFI
     /// ``discoveryNormalizeAddress``.
-    static let defaultNormalizeAddress: NormalizeAddressFn = { address in
+    public static let defaultNormalizeAddress: NormalizeAddressFn = { address in
         discoveryNormalizeAddress(address: address)
     }
 
     /// Discover contexts from a DID string or ``scp://`` URI.
-    typealias DiscoverFn = @Sendable (
+    public typealias DiscoverFn = @Sendable (
         _ query: String
     ) async throws -> String
 
     /// Default discover function — delegates to UniFFI
     /// ``contextDiscover(query:)``.
-    static let defaultDiscover: DiscoverFn = { query in
+    public static let defaultDiscover: DiscoverFn = { query in
         try await contextDiscover(query: query)
     }
 }
