@@ -1237,19 +1237,25 @@ async fn handle_ws_connection(socket: WebSocket, room: Arc<ChatRoom>) {
     let mut rx = room.message_tx.subscribe();
 
     // Forward broadcast messages to this WebSocket client.
-    let send_task = tokio::spawn(async move {
+    let send_fut = async move {
         while let Ok(msg) = rx.recv().await {
             if sender.send(Message::Text(msg.into())).await.is_err() {
                 break;
             }
         }
-    });
+    };
 
     // Keep the connection alive by reading (and discarding) client messages.
     // Web clients send messages via POST /api/send, not via WebSocket.
-    while let Some(Ok(_)) = receiver.next().await {}
+    let recv_fut = async move {
+        while let Some(Ok(_)) = receiver.next().await {}
+    };
 
-    send_task.abort();
+    // When either direction finishes, cancel the other immediately.
+    tokio::select! {
+        () = send_fut => {},
+        () = recv_fut => {},
+    }
 }
 
 // ---------------------------------------------------------------------------
