@@ -738,9 +738,9 @@ The specification is complete and published under CC-BY 4.0. The reference imple
 
 [10] W3C, "Decentralized Identifiers (DIDs) v1.0," W3C Recommendation, July 2022.
 
-[11] A. Silvestri, "BEP44: Storing Arbitrary Data in the DHT," BitTorrent Enhancement Proposal 44, 2014.
+[11] S. Siloti, "BEP44: Storing Arbitrary Data in the DHT," BitTorrent Enhancement Proposal 44, 2014.
 
-[12] B. Iannone, D. Choquette, and P. Krüger, "UCAN Specification v1.0," UCAN Working Group, 2024.
+[12] B. Zelenka and P. Krüger, "UCAN Specification v1.0," UCAN Working Group, 2024.
 
 [13] M. Marlinspike and T. Perrin, "The Double Ratchet Algorithm," Signal Foundation, November 2016.
 
@@ -748,13 +748,13 @@ The specification is complete and published under CC-BY 4.0. The reference imple
 
 [15] The Matrix.org Foundation, "Matrix Specification," matrix.org/docs/spec, 2024.
 
-[16] J. Greer, "AT Protocol Specification," atproto.com/specs, 2024.
+[16] J. Graber, "AT Protocol Specification," atproto.com/specs, 2024.
 
 [17] Nostr Protocol, "Nostr Implementation Possibilities," github.com/nostr-protocol/nips, 2024.
 
-[18] P. Maymounkov and D. Mazières, "Hyperswarm: Scalable Peer Discovery," Holepunch, 2023.
+[18] M. Buus, "Hyperswarm," Holepunch, github.com/holepunchto/hyperswarm, 2023.
 
-[19] M. Ogden, "Hypercore Protocol Specification," hypercore-protocol.org, 2023.
+[19] M. Buus and Holepunch, "Hypercore Protocol," github.com/holepunchto/hypercore, 2023.
 
 [20] Anthropic, "Model Context Protocol Specification," modelcontextprotocol.io, 2024.
 
