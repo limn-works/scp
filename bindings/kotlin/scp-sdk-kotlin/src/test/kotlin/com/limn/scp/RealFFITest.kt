@@ -1,8 +1,9 @@
 // RealFFITest.kt — Phase D7: Real FFI E2E tests for the Kotlin SDK
 //
-// These tests exercise the Kotlin SDK through the real UniFFI-generated
-// bindings (NativeLib.kt) when available. When the native library is not
-// compiled, all tests are skipped gracefully.
+// STATUS: Test bodies are not yet implemented — requires UniFFI native library.
+// Each test documents the planned assertion via comments but does not execute
+// real FFI calls. The class is @Disabled until the native library build pipeline
+// is operational (cargo build cdylib → generateUniffiBindings → link).
 //
 // Prerequisites:
 //   1. Build the Rust cdylib: cargo build -p scp-ffi-uniffi --features allow_in_memory_custody
@@ -22,6 +23,7 @@ import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Disabled
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 import kotlin.test.assertEquals
@@ -50,6 +52,7 @@ import kotlin.test.assertTrue
  * - Sync classification
  */
 @OptIn(ExperimentalCoroutinesApi::class)
+@Disabled("Test bodies not yet implemented — requires UniFFI native library build pipeline")
 class RealFFITest {
     companion object {
         private var nativeAvailable = false
