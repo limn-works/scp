@@ -1,0 +1,27 @@
+[package]
+name = "scp-demo"
+version = "0.1.0"
+description = "Interactive CLI demo: two terminals exchange encrypted messages through a real SCP relay"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "scp-demo"
+path = "src/main.rs"
+
+[dependencies]
+scp-core = { path = "../scp-core" }
+scp-identity = { path = "../scp-identity" }
+scp-platform = { path = "../scp-platform", features = ["testing"] }
+scp-transport = { path = "../scp-transport" }
+tokio = { workspace = true, features = ["full"] }
+futures = "0.3"
+clap = { version = "4", features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+
+[lints]
+workspace = true
