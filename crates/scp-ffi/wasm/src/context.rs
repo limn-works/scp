@@ -561,8 +561,7 @@ pub fn broadcast_subscriber_count(handle: &WasmContextHandle) -> Option<u32> {
 #[wasm_bindgen]
 pub fn broadcast_is_subscriber(handle: &WasmContextHandle, did: String) -> bool {
     let context_id = handle.context_id();
-    with_manager(|mgr| Ok(mgr.is_broadcast_subscriber(&context_id, &did)))
-        .unwrap_or(false)
+    with_manager(|mgr| Ok(mgr.is_broadcast_subscriber(&context_id, &did))).unwrap_or(false)
 }
 
 /// Returns the admission policy for a broadcast context as a JSON string.

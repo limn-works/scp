@@ -28,7 +28,6 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-
 use crate::error::ScpWasmError;
 use crate::runtime::{
     ToolRegistration, ToolRegistry, WasmEventLog, prove_absence, prove_inclusion,
@@ -2046,29 +2045,41 @@ impl WasmContextManager {
         // Use a uniform deny reason to prevent information leakage (§5.14.8).
         const DENY_REASON: &str = "key request denied";
 
-        let ctx = self.contexts.get(context_id).ok_or_else(|| ScpWasmError::Context {
-            message: format!("context not registered: {context_id}"),
-            code: "SCP-CTX-2001".to_owned(),
-        })?;
+        let ctx = self
+            .contexts
+            .get(context_id)
+            .ok_or_else(|| ScpWasmError::Context {
+                message: format!("context not registered: {context_id}"),
+                code: "SCP-CTX-2001".to_owned(),
+            })?;
 
-        let bc = ctx.broadcast.as_ref().ok_or_else(|| ScpWasmError::Context {
-            message: "not a broadcast context".to_owned(),
-            code: "SCP-CTX-2001".to_owned(),
-        })?;
+        let bc = ctx
+            .broadcast
+            .as_ref()
+            .ok_or_else(|| ScpWasmError::Context {
+                message: "not a broadcast context".to_owned(),
+                code: "SCP-CTX-2001".to_owned(),
+            })?;
 
         // Author must be a known author.
         if !bc.authors.contains(author_did) {
-            return Ok(serde_json::json!({ "decision": "deny", "reason": DENY_REASON }).to_string());
+            return Ok(
+                serde_json::json!({ "decision": "deny", "reason": DENY_REASON }).to_string(),
+            );
         }
 
         // Requester must not be blocked.
         if bc.blocked_subscribers.contains(requester_did) {
-            return Ok(serde_json::json!({ "decision": "deny", "reason": DENY_REASON }).to_string());
+            return Ok(
+                serde_json::json!({ "decision": "deny", "reason": DENY_REASON }).to_string(),
+            );
         }
 
         // Requester must be a subscriber or author.
         if !bc.subscribers.contains(requester_did) && !bc.authors.contains(requester_did) {
-            return Ok(serde_json::json!({ "decision": "deny", "reason": DENY_REASON }).to_string());
+            return Ok(
+                serde_json::json!({ "decision": "deny", "reason": DENY_REASON }).to_string(),
+            );
         }
 
         Ok(serde_json::json!({ "decision": "grant" }).to_string())

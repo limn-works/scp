@@ -508,13 +508,12 @@ pub async fn tool_invoke_cross_context(
     )
     .map_err(napi::Error::from)?;
 
-    let input_value: serde_json::Value =
-        serde_json::from_str(&input_json).map_err(|e| {
-            napi::Error::from(ScpNapiError::Tool {
-                message: format!("invalid input JSON: {e}"),
-                code: "SCP-TOOL-6002".to_owned(),
-            })
-        })?;
+    let input_value: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
+        napi::Error::from(ScpNapiError::Tool {
+            message: format!("invalid input JSON: {e}"),
+            code: "SCP-TOOL-6002".to_owned(),
+        })
+    })?;
 
     let output = crate::runtime::with_context(&target_context_id, |rt| {
         let registration = rt

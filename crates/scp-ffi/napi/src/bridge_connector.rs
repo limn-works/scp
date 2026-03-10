@@ -156,8 +156,7 @@ pub fn bridge_register(
     })?;
 
     // The approver must differ from the operator (governance rule).
-    let approver_did: scp_identity::DID =
-        format!("{operator_did}:approver").into();
+    let approver_did: scp_identity::DID = format!("{operator_did}:approver").into();
     let (connector, _approval_event) =
         approve_registration(&mut registry, &bridge_id, &approver_did, 0).map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {

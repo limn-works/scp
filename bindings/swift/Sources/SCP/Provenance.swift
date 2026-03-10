@@ -8,9 +8,9 @@ import Foundation
 /// ScpBindings.
 ///
 /// See spec section 24 (Provenance System) and ADR-019.
-enum ProvenanceBridge {
+public enum ProvenanceBridge {
     /// Evaluate provenance quality tier.
-    typealias EvaluateQualityFn = @Sendable (
+    public typealias EvaluateQualityFn = @Sendable (
         _ sourceContext: String?,
         _ sourceType: String,
         _ contextState: String,
@@ -18,7 +18,7 @@ enum ProvenanceBridge {
     ) throws -> UInt32
 
     /// Attach provenance metadata at cross-context boundaries.
-    typealias AttachFn = @Sendable (
+    public typealias AttachFn = @Sendable (
         _ sourceContextId: String,
         _ sourceType: String,
         _ memoryScope: String,
@@ -28,14 +28,14 @@ enum ProvenanceBridge {
     ) throws -> String
 
     /// Check whether chain depth is within the allowed limit.
-    typealias CheckChainDepthFn = @Sendable (
+    public typealias CheckChainDepthFn = @Sendable (
         _ chainDepth: UInt8,
         _ maxDepth: UInt8?
     ) -> Bool
 
     /// Default evaluate quality function — delegates to UniFFI
     /// ``evaluateProvenanceQuality``.
-    static let defaultEvaluateQuality: EvaluateQualityFn = { sourceContext, sourceType, contextState, counterparties in
+    public static let defaultEvaluateQuality: EvaluateQualityFn = { sourceContext, sourceType, contextState, counterparties in
         try evaluateProvenanceQuality(
             sourceContext: sourceContext,
             sourceType: sourceType,
@@ -46,7 +46,7 @@ enum ProvenanceBridge {
 
     /// Default attach function — delegates to UniFFI
     /// ``provenanceAttach``.
-    static let defaultAttach: AttachFn = { sourceContextId, sourceType, memoryScope, members, targetContextId, existingChainDepth in
+    public static let defaultAttach: AttachFn = { sourceContextId, sourceType, memoryScope, members, targetContextId, existingChainDepth in
         try provenanceAttach(
             sourceContextId: sourceContextId,
             sourceType: sourceType,
@@ -59,7 +59,7 @@ enum ProvenanceBridge {
 
     /// Default check chain depth function — delegates to UniFFI
     /// ``provenanceCheckChainDepth``.
-    static let defaultCheckChainDepth: CheckChainDepthFn = { chainDepth, maxDepth in
+    public static let defaultCheckChainDepth: CheckChainDepthFn = { chainDepth, maxDepth in
         provenanceCheckChainDepth(chainDepth: chainDepth, maxDepth: maxDepth)
     }
 }

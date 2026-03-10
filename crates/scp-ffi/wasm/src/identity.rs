@@ -225,10 +225,7 @@ fn derive_export_hmac_key(did: &str) -> Result<zeroize::Zeroizing<[u8; 32]>, Scp
 ///
 /// Returns an error string if HMAC initialization fails (should not happen
 /// since HMAC-SHA256 accepts any key length, but we avoid `expect`/`unwrap`).
-fn hkdf_extract_sha256(
-    salt: &[u8],
-    ikm: &[u8],
-) -> Result<zeroize::Zeroizing<[u8; 32]>, String> {
+fn hkdf_extract_sha256(salt: &[u8], ikm: &[u8]) -> Result<zeroize::Zeroizing<[u8; 32]>, String> {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 

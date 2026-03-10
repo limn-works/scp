@@ -182,12 +182,7 @@ impl WasmEventLog {
     /// leaf hashes are not byte-identical to native leaf hashes, but both use the same
     /// canonical hash algorithm and domain separation. WASM event logs are local-only
     /// and never cross-verified against native event logs.
-    pub fn append_event(
-        &mut self,
-        event_type_tag: u16,
-        actor_did: &str,
-        payload: &[u8],
-    ) {
+    pub fn append_event(&mut self, event_type_tag: u16, actor_did: &str, payload: &[u8]) {
         let sequence = self.leaves.len() as u64;
         let prev_hash = self.leaves.last().copied().unwrap_or(GENESIS_PREV_HASH);
         let timestamp = crate::time::now_secs();

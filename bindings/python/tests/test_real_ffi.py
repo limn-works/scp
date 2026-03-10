@@ -13,8 +13,6 @@ event log, discovery, and provenance through real FFI.
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
 # ---------------------------------------------------------------------------
@@ -22,7 +20,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 try:
-    import _scp_core  # noqa: F401
+    import _scp_core
 except (ImportError, AttributeError):
     pytest.skip(
         "Native _scp_core extension not available — run maturin develop first",
