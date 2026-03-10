@@ -60,7 +60,7 @@ use crate::error::ScpWasmError;
 /// when the entry is removed from the registry or replaced. `Clone` is
 /// intentionally NOT derived — cloning would scatter unprotected copies of
 /// private keys through WASM linear memory.
-#[derive(Debug, Zeroize, ZeroizeOnDrop)]
+#[derive(Zeroize, ZeroizeOnDrop)]
 struct IdentityEntry {
     /// Ed25519 signing key bytes (32 bytes). Stored to produce real Ed25519
     /// signatures for device attestation and other identity operations.
@@ -79,6 +79,24 @@ struct IdentityEntry {
     /// Wrapped in `Zeroizing` for defense-in-depth (same rationale as
     /// `signing_key_bytes`).
     agent_signing_key_bytes: Option<zeroize::Zeroizing<[u8; 32]>>,
+}
+
+impl std::fmt::Debug for IdentityEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdentityEntry")
+            .field("signing_key_bytes", &"[REDACTED]")
+            .field("public_key_bytes", &self.public_key_bytes)
+            .field("custody_type", &self.custody_type)
+            .field(
+                "agent_signing_key_bytes",
+                &if self.agent_signing_key_bytes.is_some() {
+                    "[REDACTED]"
+                } else {
+                    "[None]"
+                },
+            )
+            .finish()
+    }
 }
 
 /// Maximum number of identities in the WASM-local identity registry.
@@ -192,19 +210,25 @@ fn derive_export_hmac_key(did: &str) -> Result<zeroize::Zeroizing<[u8; 32]>, Scp
                 code: "SCP-CTX-2020".to_owned(),
             }
         })?;
-        let mut key = [0u8; 32];
+        let mut key = zeroize::Zeroizing::new([0u8; 32]);
         key.copy_from_slice(&okm);
-        Ok(zeroize::Zeroizing::new(key))
+        Ok(key)
     })
 }
 
 /// HKDF-Extract (RFC 5869) using HMAC-SHA256.
 ///
+/// Returns the PRK wrapped in `Zeroizing` to ensure it is cleared from memory
+/// on drop.
+///
 /// # Errors
 ///
 /// Returns an error string if HMAC initialization fails (should not happen
 /// since HMAC-SHA256 accepts any key length, but we avoid `expect`/`unwrap`).
-fn hkdf_extract_sha256(salt: &[u8], ikm: &[u8]) -> Result<[u8; 32], String> {
+fn hkdf_extract_sha256(
+    salt: &[u8],
+    ikm: &[u8],
+) -> Result<zeroize::Zeroizing<[u8; 32]>, String> {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
@@ -212,32 +236,40 @@ fn hkdf_extract_sha256(salt: &[u8], ikm: &[u8]) -> Result<[u8; 32], String> {
     let mut mac =
         Hmac::<Sha256>::new_from_slice(effective_salt).map_err(|e| format!("HMAC init: {e}"))?;
     mac.update(ikm);
-    Ok(mac.finalize().into_bytes().into())
+    Ok(zeroize::Zeroizing::new(mac.finalize().into_bytes().into()))
 }
 
 /// HKDF-Expand (RFC 5869) using HMAC-SHA256.
 ///
 /// `length` must be <= 255 * 32 = 8160 bytes.
 ///
+/// All intermediates (`t` blocks, output buffer) are wrapped in `Zeroizing`
+/// to ensure they are cleared from memory on drop.
+///
 /// # Errors
 ///
 /// Returns an error string if HMAC initialization fails.
-fn hkdf_expand_sha256(prk: &[u8; 32], info: &[u8], length: usize) -> Result<Vec<u8>, String> {
+fn hkdf_expand_sha256(
+    prk: &zeroize::Zeroizing<[u8; 32]>,
+    info: &[u8],
+    length: usize,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
     let hash_len = 32;
     let n = length.div_ceil(hash_len);
-    let mut okm = Vec::with_capacity(n * hash_len);
-    let mut t = Vec::new();
+    let mut okm = zeroize::Zeroizing::new(Vec::with_capacity(n * hash_len));
+    let mut t = zeroize::Zeroizing::new(Vec::<u8>::new());
 
     for i in 1..=n {
-        let mut mac = Hmac::<Sha256>::new_from_slice(prk).map_err(|e| format!("HMAC init: {e}"))?;
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(prk.as_ref()).map_err(|e| format!("HMAC init: {e}"))?;
         mac.update(&t);
         mac.update(info);
         #[allow(clippy::cast_possible_truncation)]
         mac.update(&[i as u8]);
-        t = mac.finalize().into_bytes().to_vec();
+        *t = mac.finalize().into_bytes().to_vec();
         okm.extend_from_slice(&t);
     }
 
