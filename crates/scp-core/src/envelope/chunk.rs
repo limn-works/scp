@@ -309,7 +309,13 @@ pub const fn needs_chunking(payload: &[u8]) -> bool {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::cast_possible_truncation,
+    clippy::redundant_closure_for_method_calls
+)]
 mod tests {
     use super::*;
 

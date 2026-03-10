@@ -1725,6 +1725,10 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
         let dev_token = self.local_api_addr.map(generate_dev_token);
         let http_bind_addr = self.http_bind_addr.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
 
+        // Clone the TLS provider before resolve_tls consumes it — the
+        // fallthrough path (Err branch) passes it to build_no_domain_inner
+        // for optional self-signed TLS in no-domain mode.
+        let tls_provider_for_fallthrough = self.tls_provider.clone();
         let tls_provider = resolve_tls(
             self.tls_provider,
             &domain,
@@ -1796,6 +1800,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
                     self.network_detector,
                     connection_tracker,
                     subscription_registry,
+                    tls_provider_for_fallthrough,
                 )
                 .await
             }
@@ -2101,7 +2106,7 @@ async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
 // ---------------------------------------------------------------------------
 
 // Node builder internal: all parameters are required for server construction.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     identity: ScpIdentity,
     mut document: DidDocument,
@@ -2121,12 +2126,42 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
     network_detector: Option<Arc<dyn NetworkChangeDetector>>,
     connection_tracker: scp_transport::relay::rate_limit::ConnectionTracker,
     subscription_registry: scp_transport::relay::subscription::SubscriptionRegistry,
+    tls_provider: Option<Arc<dyn TlsProvider>>,
 ) -> Result<ApplicationNode<S>, NodeError> {
     let tier = nat_strategy.select_tier(bound_addr.port()).await?;
 
+    // If a TLS provider is configured, generate a self-signed cert for the
+    // discovered external address. This enables HTTPS in no-domain mode
+    // (required for browser WebCrypto and secure WebSocket on mobile).
+    // Attempt optional TLS for no-domain mode (enables browser WebCrypto
+    // and secure WebSocket). If provisioning fails, fall back to plain HTTP
+    // gracefully — TLS is defense-in-depth here, not the security layer
+    // (MLS/sender keys provide confidentiality).
+    let (tls_config, cert_resolver, scheme) = if let Some(provider) = &tls_provider {
+        match provider.provision().await {
+            Ok(cert_data) => match tls::build_reloadable_tls_config(&cert_data) {
+                Ok((config, resolver)) => (Some(Arc::new(config)), Some(resolver), "wss"),
+                Err(e) => {
+                    tracing::warn!(
+                        "TLS config build failed in no-domain mode: {e}, serving plain HTTP"
+                    );
+                    (None, None, "ws")
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "TLS provisioning failed in no-domain mode: {e}, serving plain HTTP"
+                );
+                (None, None, "ws")
+            }
+        }
+    } else {
+        (None, None, "ws")
+    };
+
     let relay_url = match &tier {
         ReachabilityTier::Upnp { external_addr } | ReachabilityTier::Stun { external_addr } => {
-            format!("ws://{external_addr}/scp/v1")
+            format!("{scheme}://{external_addr}/scp/v1")
         }
         ReachabilityTier::Bridge { bridge_url } => bridge_url.clone(),
     };
@@ -2200,8 +2235,8 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
         projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
             projection_rate_limit,
         ),
-        tls_config: None,
-        cert_resolver: None,
+        tls_config,
+        cert_resolver,
         did_document: document.clone(),
         connection_tracker,
         subscription_registry,
@@ -2319,6 +2354,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
             self.network_detector,
             connection_tracker,
             subscription_registry,
+            self.tls_provider,
         )
         .await
     }

@@ -44,6 +44,8 @@ pub use stun::{
     run_keepalive_loop, stun_binding_request,
 };
 pub use types::{NatProbeResult, NatType, StunEndpoint};
+#[cfg(feature = "upnp")]
+pub use upnp::UpnpPortMapper;
 pub use upnp::{
     MappingProtocol, NatTierChange, PortMapper, PortMappingError, PortMappingManager,
     PortMappingResult,

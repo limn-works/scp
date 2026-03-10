@@ -15,6 +15,7 @@ relay-persistence = ["dep:scp-platform"]
 postgres-blob = ["dep:sqlx"]
 s3-blob = ["dep:aws-sdk-s3", "dep:aws-config", "dep:http-body"]
 quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:zeroize"]
+upnp = ["dep:igd-next"]
 udp = ["dep:openssl", "dep:socket2"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:rustls", "dep:http"]
 webtransport-wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:web-sys", "dep:wasm-bindgen-futures", "dep:getrandom_02", "dep:getrandom_03"]
@@ -65,6 +66,7 @@ web-sys = { version = "0.3", optional = true, features = ["WebTransport", "WebTr
 wasm-bindgen-futures = { version = "0.4", optional = true }
 getrandom_02 = { package = "getrandom", version = "0.2", optional = true, features = ["js"] }
 getrandom_03 = { package = "getrandom", version = "0.3", optional = true, features = ["wasm_js"] }
+igd-next = { version = "0.16", optional = true, features = ["aio_tokio"] }
 coap-lite = { version = "0.13", optional = true }
 base64 = { workspace = true, optional = true }
 k256 = { version = "0.13", optional = true, features = ["schnorr"] }

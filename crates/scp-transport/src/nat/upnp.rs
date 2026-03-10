@@ -197,6 +197,200 @@ pub trait PortMapper: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// UpnpPortMapper (production implementation)
+// ---------------------------------------------------------------------------
+
+/// Production UPnP-IGD port mapper using the `igd-next` crate.
+///
+/// Discovers the default gateway via SSDP and requests port mappings.
+/// Maps the given internal port to the same external port with a lease
+/// description of `"SCP Relay"`.
+///
+/// # Gateway discovery
+///
+/// Each call to [`map_port`](PortMapper::map_port),
+/// [`renew`](PortMapper::renew), or [`remove`](PortMapper::remove) performs
+/// a fresh SSDP discovery (bounded by `discovery_timeout`). This keeps the
+/// implementation stateless — no cached gateway reference can go stale.
+///
+/// # Local address detection
+///
+/// The local address to pass to the gateway's `add_port` is determined by
+/// opening a UDP socket and connecting to a public address (`8.8.8.8:80`).
+/// The OS kernel selects the correct egress interface without sending any
+/// traffic.
+///
+/// Requires the `upnp` crate feature.
+#[cfg(feature = "upnp")]
+pub struct UpnpPortMapper {
+    /// Duration to wait for SSDP gateway discovery.
+    discovery_timeout: Duration,
+    /// Requested mapping lease duration in seconds.
+    lease_duration: u32,
+}
+
+#[cfg(feature = "upnp")]
+impl UpnpPortMapper {
+    /// Creates a new `UpnpPortMapper` with default settings.
+    ///
+    /// - Discovery timeout: 5 seconds.
+    /// - Lease duration: 3600 seconds (1 hour).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            discovery_timeout: Duration::from_secs(5),
+            lease_duration: 3600,
+        }
+    }
+
+    /// Creates a new `UpnpPortMapper` with custom timeouts.
+    ///
+    /// # Arguments
+    ///
+    /// * `discovery_timeout` -- Maximum time to wait for SSDP gateway discovery.
+    /// * `lease_duration` -- Requested mapping lease in seconds. A value of `0`
+    ///   requests a permanent mapping (if the gateway supports it).
+    #[must_use]
+    pub const fn with_timeout(discovery_timeout: Duration, lease_duration: u32) -> Self {
+        Self {
+            discovery_timeout,
+            lease_duration,
+        }
+    }
+
+    /// Discovers the local IP address by opening a UDP socket toward a public
+    /// address. The kernel selects the correct egress interface without sending
+    /// any traffic.
+    fn discover_local_ip() -> Result<std::net::Ipv4Addr, PortMappingError> {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0")
+            .map_err(|e| PortMappingError::Internal(format!("bind UDP socket: {e}")))?;
+        socket
+            .connect("8.8.8.8:80")
+            .map_err(|e| PortMappingError::Internal(format!("connect UDP socket: {e}")))?;
+        let local_addr = socket
+            .local_addr()
+            .map_err(|e| PortMappingError::Internal(format!("get local addr: {e}")))?;
+        match local_addr.ip() {
+            std::net::IpAddr::V4(v4) => Ok(v4),
+            std::net::IpAddr::V6(v6) => Err(PortMappingError::NotSupported(format!(
+                "UPnP-IGD requires IPv4, got IPv6 local address: {v6}"
+            ))),
+        }
+    }
+}
+
+#[cfg(feature = "upnp")]
+impl Default for UpnpPortMapper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "upnp")]
+impl PortMapper for UpnpPortMapper {
+    fn map_port(
+        &self,
+        internal_port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<PortMappingResult, PortMappingError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let search_opts = igd_next::SearchOptions {
+                timeout: Some(self.discovery_timeout),
+                ..Default::default()
+            };
+
+            let gateway = igd_next::aio::tokio::search_gateway(search_opts)
+                .await
+                .map_err(|e| PortMappingError::DiscoveryFailed(format!("{e}")))?;
+
+            let external_ip = gateway
+                .get_external_ip()
+                .await
+                .map_err(|e| PortMappingError::Internal(format!("get external IP: {e}")))?;
+
+            let local_ip = Self::discover_local_ip()?;
+            let local_addr = std::net::SocketAddrV4::new(local_ip, internal_port);
+
+            gateway
+                .add_port(
+                    igd_next::PortMappingProtocol::TCP,
+                    internal_port,
+                    local_addr.into(),
+                    self.lease_duration,
+                    "SCP Relay",
+                )
+                .await
+                .map_err(|e| PortMappingError::MappingRejected(format!("{e}")))?;
+
+            let external_addr = SocketAddr::new(external_ip, internal_port);
+
+            info!(
+                external_addr = %external_addr,
+                lease_secs = self.lease_duration,
+                "UPnP-IGD port mapping created"
+            );
+
+            Ok(PortMappingResult {
+                external_addr,
+                ttl: Duration::from_secs(u64::from(self.lease_duration)),
+                protocol: MappingProtocol::UpnpIgd,
+            })
+        })
+    }
+
+    fn renew(
+        &self,
+        internal_port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<PortMappingResult, PortMappingError>> + Send + '_>>
+    {
+        // UPnP-IGD `add_port` is idempotent — re-requesting the same mapping
+        // acts as a renewal by resetting the lease timer.
+        self.map_port(internal_port)
+    }
+
+    fn remove(
+        &self,
+        internal_port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PortMappingError>> + Send + '_>> {
+        Box::pin(async move {
+            let search_opts = igd_next::SearchOptions {
+                timeout: Some(self.discovery_timeout),
+                ..Default::default()
+            };
+
+            let gateway = igd_next::aio::tokio::search_gateway(search_opts)
+                .await
+                .map_err(|e| PortMappingError::DiscoveryFailed(format!("{e}")))?;
+
+            gateway
+                .remove_port(igd_next::PortMappingProtocol::TCP, internal_port)
+                .await
+                .map_err(|e| match e {
+                    igd_next::RemovePortError::NoSuchPortMapping => {
+                        // Not an error — the mapping may have already expired.
+                        debug!(
+                            internal_port,
+                            "remove_port: no such mapping (already expired)"
+                        );
+                        PortMappingError::Internal("no such port mapping".to_owned())
+                    }
+                    igd_next::RemovePortError::ActionNotAuthorized => {
+                        PortMappingError::MappingRejected(
+                            "not authorized to remove mapping".to_owned(),
+                        )
+                    }
+                    igd_next::RemovePortError::RequestError(req_err) => {
+                        PortMappingError::Internal(format!("remove request failed: {req_err}"))
+                    }
+                })?;
+
+            info!(internal_port, "UPnP-IGD port mapping removed");
+            Ok(())
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PortMappingManager
 // ---------------------------------------------------------------------------
 
@@ -942,5 +1136,78 @@ mod tests {
         assert_eq!(result.protocol, MappingProtocol::UpnpIgd);
         // NAT-PMP should NOT have been called.
         assert_eq!(natpmp.map_calls.load(Ordering::Relaxed), 0);
+    }
+
+    // -- UpnpPortMapper integration tests (require real UPnP gateway) --------
+
+    #[cfg(feature = "upnp")]
+    mod upnp_integration {
+        use super::*;
+
+        #[tokio::test]
+        #[ignore = "requires a real UPnP-IGD gateway on the local network"]
+        async fn upnp_mapper_acquires_and_removes_mapping() {
+            let mapper = UpnpPortMapper::with_timeout(Duration::from_secs(5), 120);
+            let port = 19876;
+
+            // Acquire mapping.
+            let result = mapper
+                .map_port(port)
+                .await
+                .expect("map_port should succeed");
+            assert_eq!(result.protocol, MappingProtocol::UpnpIgd);
+            assert_eq!(result.external_addr.port(), port);
+            assert!(result.ttl.as_secs() > 0);
+            println!("mapped {port} -> {}", result.external_addr);
+
+            // Renew (idempotent re-map).
+            let renewed = mapper.renew(port).await.expect("renew should succeed");
+            assert_eq!(renewed.protocol, MappingProtocol::UpnpIgd);
+            assert_eq!(renewed.external_addr.port(), port);
+
+            // Remove.
+            mapper.remove(port).await.expect("remove should succeed");
+            println!("removed mapping for port {port}");
+        }
+
+        #[tokio::test]
+        #[ignore = "requires a real UPnP-IGD gateway on the local network"]
+        async fn upnp_mapper_discovery_timeout_propagates() {
+            // Use an impossibly short timeout to trigger DiscoveryFailed.
+            let mapper = UpnpPortMapper::with_timeout(Duration::from_nanos(1), 60);
+            let result = mapper.map_port(12345).await;
+            assert!(
+                result.is_err(),
+                "should fail with near-zero discovery timeout"
+            );
+            let err = result.unwrap_err();
+            assert!(
+                matches!(err, PortMappingError::DiscoveryFailed(_)),
+                "expected DiscoveryFailed, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn upnp_mapper_default_values() {
+            let mapper = UpnpPortMapper::new();
+            assert_eq!(mapper.discovery_timeout, Duration::from_secs(5));
+            assert_eq!(mapper.lease_duration, 3600);
+        }
+
+        #[test]
+        fn upnp_mapper_custom_values() {
+            let mapper = UpnpPortMapper::with_timeout(Duration::from_secs(10), 7200);
+            assert_eq!(mapper.discovery_timeout, Duration::from_secs(10));
+            assert_eq!(mapper.lease_duration, 7200);
+        }
+
+        #[test]
+        fn upnp_mapper_discover_local_ip_succeeds() {
+            // This should succeed on any machine with a network interface.
+            let ip =
+                UpnpPortMapper::discover_local_ip().expect("should discover a local IPv4 address");
+            assert!(!ip.is_loopback(), "local IP should not be loopback: {ip}");
+            assert!(!ip.is_unspecified(), "local IP should not be 0.0.0.0: {ip}");
+        }
     }
 }

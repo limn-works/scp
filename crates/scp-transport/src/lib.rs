@@ -68,6 +68,8 @@ pub use heartbeat::{
     HeartbeatConfig, HeartbeatConfigError, HeartbeatMonitor, SuppressionSuspected,
 };
 pub use manager::{EvictionOutcome, TransportManager};
+#[cfg(feature = "upnp")]
+pub use nat::UpnpPortMapper;
 pub use nat::{
     MappingProtocol, NatKeepalive, NatProbeResult, NatProber, NatTierChange, NatType, PortMapper,
     PortMappingError, PortMappingManager, PortMappingResult, StunEndpoint,
