@@ -187,6 +187,56 @@ interface WasmModule {
   }) => Promise<{ did: string; custodyType: string }>;
   identity_attest_device: (did: string) => Promise<string>;
   identity_verify_device_attestation: (did: string, tokenBase64: string) => Promise<boolean>;
+  // Membership queries
+  context_member_count: (handle: BridgeContextHandle) => number | null;
+  context_is_member: (handle: BridgeContextHandle, did: string) => boolean;
+  context_member_dids: (handle: BridgeContextHandle) => string;
+  context_member_role: (handle: BridgeContextHandle, did: string) => string | null;
+  // Broadcast operations
+  broadcast_subscribe: (handle: BridgeContextHandle, subscriberDid: string) => Promise<void>;
+  broadcast_unsubscribe: (handle: BridgeContextHandle, subscriberDid: string) => Promise<void>;
+  broadcast_publish: (
+    handle: BridgeContextHandle,
+    authorDid: string,
+    payloadBase64: string,
+  ) => Promise<void>;
+  broadcast_block: (handle: BridgeContextHandle, subscriberDid: string) => Promise<void>;
+  // Governance
+  context_execute_governance: (
+    handle: BridgeContextHandle,
+    initiatorDid: string,
+    proposalId: string,
+    actionJson: string,
+  ) => Promise<string>;
+  // Event log checkpoint
+  event_log_checkpoint: (
+    handle: BridgeContextHandle,
+    identityDid: string,
+    epoch: number,
+  ) => Promise<{
+    contextId: string;
+    senderDid: string;
+    eventCount: number;
+    merkleRoot: string;
+    epoch: number | null;
+    timestamp: number;
+    signingPayloadHash: string;
+  }>;
+  // Context drain/export/import
+  context_drain_events: (handle: BridgeContextHandle) => string;
+  context_export: (handle: BridgeContextHandle) => Promise<Uint8Array>;
+  context_import: (data: Uint8Array) => Promise<string>;
+  // TTL
+  context_ttl_remaining: (handle: BridgeContextHandle) => number | null;
+  context_extend_ttl: (handle: BridgeContextHandle, additionalSecs: number) => Promise<void>;
+  // UCAN delegate
+  ucan_delegate: (
+    handle: BridgeContextHandle,
+    delegatorDid: string,
+    delegateeDid: string,
+    parentToken: string,
+    capabilitiesJson: string,
+  ) => Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -387,65 +437,64 @@ export function createWasmBridge(): Bridge {
       });
     },
 
-    // Membership queries -- not yet available in WASM bridge (ADR-034 constraints)
-    async contextMemberCount(_handle: BridgeContextHandle): Promise<number | null> {
-      throw new ScpError("Membership queries are not available in the WASM bridge", "SCP-CTX-2030");
+    // Membership queries — delegate to WASM runtime
+    async contextMemberCount(handle: BridgeContextHandle): Promise<number | null> {
+      const wasm = getWasm();
+      const count = wasm.context_member_count(handle);
+      return count ?? null;
     },
 
-    async contextIsMember(_handle: BridgeContextHandle, _did: string): Promise<boolean> {
-      throw new ScpError("Membership queries are not available in the WASM bridge", "SCP-CTX-2030");
+    async contextIsMember(handle: BridgeContextHandle, did: string): Promise<boolean> {
+      const wasm = getWasm();
+      return wasm.context_is_member(handle, did);
     },
 
-    async contextMemberDids(_handle: BridgeContextHandle): Promise<readonly string[]> {
-      throw new ScpError("Membership queries are not available in the WASM bridge", "SCP-CTX-2030");
+    async contextMemberDids(handle: BridgeContextHandle): Promise<readonly string[]> {
+      const wasm = getWasm();
+      const json = wasm.context_member_dids(handle);
+      return JSON.parse(json) as string[];
     },
 
-    async contextMemberRole(
-      _handle: BridgeContextHandle,
-      _did: string,
-    ): Promise<MemberRole | null> {
-      throw new ScpError("Membership queries are not available in the WASM bridge", "SCP-CTX-2030");
+    async contextMemberRole(handle: BridgeContextHandle, did: string): Promise<MemberRole | null> {
+      const wasm = getWasm();
+      const role = wasm.context_member_role(handle, did);
+      return (role as MemberRole | null) ?? null;
     },
 
-    // Broadcast operations -- not yet available in WASM bridge (ADR-034 constraints)
-    async broadcastSubscribe(_handle: BridgeContextHandle, _subscriberDid: string): Promise<void> {
-      throw new ScpError(
-        "Broadcast operations are not available in the WASM bridge",
-        "SCP-CTX-2030",
-      );
+    // Broadcast operations — delegate to WASM runtime
+    async broadcastSubscribe(handle: BridgeContextHandle, subscriberDid: string): Promise<void> {
+      const wasm = getWasm();
+      await wasm.broadcast_subscribe(handle, subscriberDid);
     },
 
     async broadcastUnsubscribe(
-      _handle: BridgeContextHandle,
-      _subscriberDid: string,
+      handle: BridgeContextHandle,
+      subscriberDid: string,
       _rotateKeys?: boolean,
     ): Promise<void> {
-      throw new ScpError(
-        "Broadcast operations are not available in the WASM bridge",
-        "SCP-CTX-2030",
-      );
+      const wasm = getWasm();
+      // WASM bridge does not support key rotation on unsubscribe; rotateKeys is ignored.
+      await wasm.broadcast_unsubscribe(handle, subscriberDid);
     },
 
     async broadcastPublish(
-      _handle: BridgeContextHandle,
-      _authorDid: string,
-      _payload: Uint8Array,
+      handle: BridgeContextHandle,
+      authorDid: string,
+      payload: Uint8Array,
     ): Promise<void> {
-      throw new ScpError(
-        "Broadcast operations are not available in the WASM bridge",
-        "SCP-CTX-2030",
-      );
+      const wasm = getWasm();
+      const payloadBase64 = uint8ToBase64(payload);
+      await wasm.broadcast_publish(handle, authorDid, payloadBase64);
     },
 
     async broadcastBlockSubscriber(
-      _handle: BridgeContextHandle,
-      _subscriberDid: string,
+      handle: BridgeContextHandle,
+      subscriberDid: string,
       _blockerDid: string,
     ): Promise<void> {
-      throw new ScpError(
-        "Broadcast operations are not available in the WASM bridge",
-        "SCP-CTX-2030",
-      );
+      const wasm = getWasm();
+      // WASM bridge only takes the subscriber DID; blockerDid is ignored.
+      await wasm.broadcast_block(handle, subscriberDid);
     },
 
     async broadcastHandleKeyRequest(
@@ -454,21 +503,21 @@ export function createWasmBridge(): Bridge {
       _requesterDid: string,
     ): Promise<string> {
       throw new ScpError(
-        "Broadcast operations are not available in the WASM bridge",
+        "Broadcast key request handling is not available in the WASM bridge",
         "SCP-CTX-2030",
       );
     },
 
     async broadcastSubscriberCount(_handle: BridgeContextHandle): Promise<number | null> {
       throw new ScpError(
-        "Broadcast operations are not available in the WASM bridge",
+        "Broadcast subscriber count is not available in the WASM bridge",
         "SCP-CTX-2030",
       );
     },
 
     async broadcastIsSubscriber(_handle: BridgeContextHandle, _did: string): Promise<boolean> {
       throw new ScpError(
-        "Broadcast operations are not available in the WASM bridge",
+        "Broadcast subscriber check is not available in the WASM bridge",
         "SCP-CTX-2030",
       );
     },
@@ -477,19 +526,30 @@ export function createWasmBridge(): Bridge {
       _handle: BridgeContextHandle,
     ): Promise<BroadcastAdmissionPolicy | null> {
       throw new ScpError(
-        "Broadcast operations are not available in the WASM bridge",
+        "Broadcast admission policy is not available in the WASM bridge",
         "SCP-CTX-2030",
       );
     },
 
-    // Governance -- not yet available in WASM bridge (ADR-034 constraints)
+    // Governance — delegate to WASM runtime
     async contextExecuteGovernanceAction(
-      _handle: BridgeContextHandle,
-      _proposalJson: string,
+      handle: BridgeContextHandle,
+      proposalJson: string,
     ): Promise<string> {
-      throw new ScpError(
-        "Governance operations are not available in the WASM bridge",
-        "SCP-CTX-2030",
+      const wasm = getWasm();
+      // The Bridge interface passes a single proposalJson containing initiatorDid,
+      // proposalId, and action. Parse and forward to the WASM export which takes
+      // them as separate parameters.
+      const proposal = JSON.parse(proposalJson) as {
+        initiatorDid: string;
+        proposalId: string;
+        action: unknown;
+      };
+      return await wasm.context_execute_governance(
+        handle,
+        proposal.initiatorDid,
+        proposal.proposalId,
+        JSON.stringify(proposal.action),
       );
     },
 
@@ -620,15 +680,17 @@ export function createWasmBridge(): Bridge {
       };
     },
 
-    async eventLogCheckpoint(_handle: BridgeContextHandle): Promise<Checkpoint> {
-      // Checkpoint requires access to the Merkle root — this is not directly
-      // exposed via a dedicated WASM export yet. Return a minimal checkpoint
-      // from available data. The WASM bridge stores the Merkle tree internally;
-      // the root is accessible via event_log_verify with a known leaf.
-      throw new ScpError(
-        "Event log checkpoint in the WASM bridge requires a dedicated export",
-        "SCP-CTX-2027",
-      );
+    async eventLogCheckpoint(handle: BridgeContextHandle): Promise<Checkpoint> {
+      const wasm = getWasm();
+      // The WASM export requires an identity DID and epoch. Use the context
+      // creator DID and epoch 0 (suitable for broadcast contexts; MLS contexts
+      // should pass the real epoch via a dedicated method if needed).
+      const result = await wasm.event_log_checkpoint(handle, handle.creatorDid, 0);
+      return {
+        root: result.merkleRoot,
+        eventCount: result.eventCount,
+        timestamp: result.timestamp,
+      };
     },
 
     // Bridge Connector
