@@ -52,10 +52,6 @@ Architectural decisions: `codebase(action="remember_decision")` — mirrors ADRs
 
 Artifacts (`.docs/`) are durable and versioned — the system of record. Vestige is fluid cognitive recall. They complement each other: decisions belong in both.
 
-### Loom Plugin — Autonomous dev loop ([instructions](./.claude/LOOM_PLUGIN.md))
-
-User provides a directive → dispatches parallel subagents → runs tests → commits green code → repeats. State and logs at `.loom/`. Use when given one of the / commands.
-
 ## Rules
 
 **Operating model:**

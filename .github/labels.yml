@@ -65,6 +65,3 @@
 - name: "duplicate"
   description: "This issue is a duplicate of another"
   color: "cfd3d7"
-- name: "loom"
-  description: "Created by Loom autonomous dev loop"
-  color: "c2e0c6"

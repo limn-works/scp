@@ -145,3 +145,9 @@
 - HKDF info strings are NOT the same as canonical hashes -- build_hpke_info concatenates raw bytes without length prefixes (found in access keys; check sender keys too)
 - Future timestamp rejection: always check BOTH directions (past staleness AND future clock skew) in freshness validators
 - Load-modify-store on shared storage (append_block_list_event pattern) needs atomicity or caller-side serialization
+
+### PR #465 -- scp-chat, scp-demo, UPnP, FFI E2E (2026-03-10)
+- See findings below; scp-chat is a demo app, not production, but ships as a standalone binary
+- HIGH: /api/send sender_did spoofing (no session-DID binding); WebAuthn missing origin validation; scp-demo /tmp key leakage
+- MEDIUM: Hardcoded passphrase; thread_rng for challenges; no input size limits; unbounded members/challenges; error message leakage; testing feature in prod dep
+- GOOD: textContent (no innerHTML XSS); TLS key Zeroizing; challenge TTL+GC; scp-testing isolation; gitignore for key files

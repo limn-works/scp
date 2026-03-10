@@ -38,13 +38,5 @@ bindings/kotlin/scp-sdk-kotlin/src/main/kotlin/com/limn/scp/internal/*.kt
 
 .claude/worktrees
 
-.loom/logs/
-.loom/.stop
-.loom/.pid
-.loom/.directive
-.loom/.piped_directive
-.loom/.iteration_marker
-.loom/loom.log
-
 .mcp.json
 .mcp_data

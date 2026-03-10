@@ -4,11 +4,10 @@ on:
   pull_request:
     types: [opened, synchronize, ready_for_review]
     paths:
-      - '.docs/prds/**'
-      - '.docs/specs/**'
-      - '.docs/adrs/**'
-      - '.docs/standards/prd.md'
-      - '.loom/prd.json'
+      - ".docs/prds/**"
+      - ".docs/specs/**"
+      - ".docs/adrs/**"
+      - ".docs/standards/prd.md"
 
 concurrency:
   group: prd-validate-${{ github.event.pull_request.number }}
