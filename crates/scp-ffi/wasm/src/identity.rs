@@ -1006,6 +1006,19 @@ pub fn identity_verify_device_attestation(did: String, token_base64: String) -> 
             return Ok(JsValue::from_bool(false));
         }
 
+        // Freshness check: reject attestations older than 5 minutes (300s).
+        // Prevents replay of captured attestation tokens.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let now_secs = (js_sys::Date::now() / 1000.0) as u64;
+        const ATTESTATION_MAX_AGE_SECS: u64 = 300;
+        if now_secs.saturating_sub(timestamp) > ATTESTATION_MAX_AGE_SECS {
+            return Ok(JsValue::from_bool(false));
+        }
+        // Reject future-dated attestations (clock skew tolerance: 60s).
+        if timestamp > now_secs + 60 {
+            return Ok(JsValue::from_bool(false));
+        }
+
         // Look up only the public key bytes from the registry — never
         // clone private key material out.
         let pub_key_bytes = IDENTITY_REGISTRY.with(|reg| {
