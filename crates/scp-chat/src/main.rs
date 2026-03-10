@@ -14,6 +14,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rand::RngCore;
+
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
@@ -334,6 +336,14 @@ struct Member {
     public_key: Option<String>,
 }
 
+/// Maps a session token to the authenticated sender identity.
+/// Created on join/rejoin/passkey-auth so that `/api/send` can resolve
+/// the sender server-side instead of trusting client-supplied fields.
+struct SessionInfo {
+    did: String,
+    name: String,
+}
+
 struct ChatRoom {
     context_id: String,
     routing_id: [u8; 32],
@@ -365,6 +375,9 @@ struct ChatRoom {
     message_tx: broadcast::Sender<String>,
     /// Time-limited challenge store for `WebAuthn` passkey authentication.
     challenges: PasskeyChallengeStore,
+    /// Session token → authenticated identity. Prevents sender DID spoofing
+    /// by resolving the sender server-side on `/api/send`.
+    sessions: RwLock<HashMap<String, SessionInfo>>,
     /// Accepted `WebAuthn` origins (e.g. `https://192.168.1.5:3000`). The
     /// `origin` field in `clientDataJSON` must match one of these.
     expected_origins: Vec<String>,
@@ -428,6 +441,17 @@ impl ChatRoom {
                 }
             })
             .collect()
+    }
+
+    /// Generates a cryptographically random session token, stores it in the
+    /// sessions map, and returns the hex-encoded token string.
+    async fn create_session(&self, did: String, name: String) -> String {
+        let mut bytes = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        let token = hex::encode(bytes);
+        let mut sessions = self.sessions.write().await;
+        sessions.insert(token.clone(), SessionInfo { did, name });
+        token
     }
 
     /// Persists app-level member metadata to storage.
@@ -505,12 +529,17 @@ struct JoinResponse {
     context_id: String,
     routing_id_hex: String,
     members: Vec<Member>,
+    /// Server-issued session token. Must be included in subsequent `/api/send`
+    /// requests to authenticate the sender.
+    session_token: String,
 }
 
 #[derive(Deserialize)]
 struct SendRequest {
-    sender_did: String,
-    sender_name: String,
+    /// Server-issued session token from join/rejoin/passkey-auth. The server
+    /// resolves the sender identity from this token — the client never supplies
+    /// its own DID or name for send requests.
+    session_token: String,
     text: String,
 }
 
@@ -632,7 +661,11 @@ async fn main() {
     };
 
     // Build TLS cert with SANs for all reachable addresses.
-    let mut sans = vec![host_ip.clone(), "localhost".to_owned(), "127.0.0.1".to_owned()];
+    let mut sans = vec![
+        host_ip.clone(),
+        "localhost".to_owned(),
+        "127.0.0.1".to_owned(),
+    ];
     if let Some(addr) = &public_addr {
         sans.push(addr.ip().to_string());
     }
@@ -801,6 +834,7 @@ async fn main() {
         challenges: PasskeyChallengeStore {
             challenges: std::sync::Mutex::new(HashMap::new()),
         },
+        sessions: RwLock::new(HashMap::new()),
         expected_origins: {
             let mut origins = vec![
                 format!("https://{host_ip}:{PORT}"),
@@ -935,6 +969,11 @@ async fn handle_join(
     info!("{} joined as {}", req.name, truncate_did(&identity.did));
     println!("\r{DIM}[{} joined]{RESET}", req.name,);
 
+    // Issue session token for authenticated sends.
+    let session_token = room
+        .create_session(identity.did.clone(), req.name.clone())
+        .await;
+
     // Build response with full member snapshot.
     let members = room.members_snapshot().await;
 
@@ -944,6 +983,7 @@ async fn handle_join(
         context_id: room.context_id.clone(),
         routing_id_hex: hex::encode(room.routing_id),
         members,
+        session_token,
     };
 
     (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response()
@@ -987,6 +1027,9 @@ async fn handle_rejoin(
         info!("{} rejoined (authenticated)", truncate_did(&did));
         println!("\r{DIM}[{} reconnected]{RESET}", meta.name);
 
+        // Issue session token for authenticated sends.
+        let session_token = room.create_session(did.clone(), meta.name.clone()).await;
+
         let members = room.members_snapshot().await;
 
         let resp = JoinResponse {
@@ -995,6 +1038,7 @@ async fn handle_rejoin(
             context_id: room.context_id.clone(),
             routing_id_hex: hex::encode(room.routing_id),
             members,
+            session_token,
         };
 
         (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response()
@@ -1242,6 +1286,9 @@ async fn handle_passkey_auth(
     info!("{} authenticated via passkey", truncate_did(&did));
     println!("\r{DIM}[{} signed in via passkey]{RESET}", meta.name);
 
+    // Issue session token for authenticated sends.
+    let session_token = room.create_session(did.clone(), meta.name.clone()).await;
+
     let members = room.members_snapshot().await;
 
     let resp = JoinResponse {
@@ -1250,6 +1297,7 @@ async fn handle_passkey_auth(
         context_id: room.context_id.clone(),
         routing_id_hex: hex::encode(room.routing_id),
         members,
+        session_token,
     };
 
     (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response()
@@ -1269,12 +1317,22 @@ async fn handle_send(
     State(room): State<Arc<ChatRoom>>,
     Json(req): Json<SendRequest>,
 ) -> impl IntoResponse {
-    // Verify the sender is a member.
-    if !room
-        .manager
-        .is_member(&room.context_id, &req.sender_did)
-        .await
-    {
+    // Resolve the sender identity from the session token. This prevents
+    // sender DID spoofing — the client never supplies its own DID/name.
+    let sessions = room.sessions.read().await;
+    let Some(session) = sessions.get(&req.session_token) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "invalid or expired session token"})),
+        )
+            .into_response();
+    };
+    let sender_did = session.did.clone();
+    let sender_name = session.name.clone();
+    drop(sessions);
+
+    // Verify the sender is still a member.
+    if !room.manager.is_member(&room.context_id, &sender_did).await {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({"error": "sender is not a member of this context"})),
@@ -1283,8 +1341,8 @@ async fn handle_send(
     }
 
     let msg = StoredMessage {
-        sender_did: req.sender_did,
-        sender_name: req.sender_name,
+        sender_did,
+        sender_name,
         text: req.text,
         timestamp: now_unix(),
     };
@@ -1316,9 +1374,7 @@ async fn handle_ws_connection(socket: WebSocket, room: Arc<ChatRoom>) {
 
     // Keep the connection alive by reading (and discarding) client messages.
     // Web clients send messages via POST /api/send, not via WebSocket.
-    let recv_fut = async move {
-        while let Some(Ok(_)) = receiver.next().await {}
-    };
+    let recv_fut = async move { while let Some(Ok(_)) = receiver.next().await {} };
 
     // When either direction finishes, cancel the other immediately.
     tokio::select! {

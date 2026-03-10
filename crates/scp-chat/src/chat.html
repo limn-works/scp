@@ -70,7 +70,7 @@ function fmtTime(ts){
   return d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0');
 }
 
-let S={ws:null,did:'',name:'',ctx:'',rid:null,members:[],ping:null};
+let S={ws:null,did:'',name:'',ctx:'',rid:null,members:[],ping:null,token:''};
 const $=id=>document.getElementById(id);
 const hex=h=>{const b=new Uint8Array(h.length/2);for(let i=0;i<h.length;i+=2)b[i/2]=parseInt(h.substring(i,i+2),16);return b};
 const toHex=b=>Array.from(b).map(x=>x.toString(16).padStart(2,'0')).join('');
@@ -189,7 +189,7 @@ async function authenticateWithPasskey(challengeB64){
 }
 
 async function enterChat(d){
-  S.did=d.did;S.name=d.name;S.ctx=d.context_id;S.members=d.members;
+  S.did=d.did;S.name=d.name;S.ctx=d.context_id;S.members=d.members;S.token=d.session_token||'';
   $('join').style.display='none';$('chat').style.display='flex';
   $('user-label').textContent=S.name;
   try{
@@ -250,10 +250,10 @@ function connectChat(){
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&S.ws&&S.ws.readyState!==1)connectChat()});
 
 async function doSend(){
-  const text=$('msg').value.trim();if(!text||!S.did)return;
+  const text=$('msg').value.trim();if(!text||!S.token)return;
   const ts=Math.floor(Date.now()/1000);
   try{
-    const r=await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sender_did:S.did,sender_name:S.name,text})});
+    const r=await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_token:S.token,text})});
     if(!r.ok){const e=await r.json().catch(()=>({}));sysMsg(e.error||'Send failed');return}
     addMsg(S.name,text,true,ts);$('msg').value='';
   }catch(e){sysMsg(e.message)}
