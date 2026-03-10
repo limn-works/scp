@@ -29,15 +29,15 @@ What this trajectory does *not* make trivial is the connective tissue between ap
 
 SCP provides the durable infrastructure layer beneath ephemeral software: identity, trust, relationships, transport, persistence, and provenance.
 
-This is not a marginal efficiency gain. If the protocol provides what every connected application needs — identity, encryption, trust, relationships, persistence — and if agents are building most connected applications, then agents will reach for this protocol the way they reach for HTTP today: as the default substrate for anything that touches a network. The trajectory is convergence. As agents become the primary builders of software, software that uses SCP grows organically, because the alternative is reinventing the same infrastructure from scratch for every application. Over time, the protocol is positioned to become the connective layer of the internet — not by replacing existing platforms, but by providing the social infrastructure that no existing platform offers and every generated application needs.
+This is not a marginal efficiency gain. If the protocol provides what every connected application needs — identity, encryption, trust, relationships, persistence — and if agents are building most connected applications, then agents have reason to reach for this protocol the way they reach for HTTP today: as the default substrate for anything that touches a network. The trajectory is convergence. As agents become the primary builders of software, software that uses SCP grows organically, because the alternative is reinventing the same infrastructure from scratch for every application. Over time, the protocol is positioned to become the connective layer of the internet — not by replacing existing platforms, but by providing the social infrastructure that no existing platform offers and every generated application needs.
 
 ### 1.2 Agents as Primary Actors
 
-The agent ecosystem is developing rapidly at the tool level. The Model Context Protocol (MCP) defines how language models connect to local tools via JSON-RPC. WebMCP extends this to browser-accessible tools. The Universal Commerce Protocol (UCP) addresses agent-to-commerce interactions. These protocols solve important problems: how agents *use* things.
+The agent ecosystem is developing rapidly at the tool level. The Model Context Protocol (MCP) [20] defines how language models connect to local tools via JSON-RPC. Emerging protocols like WebMCP extend this to browser-accessible tools, and the Universal Commerce Protocol (UCP) addresses agent-to-commerce interactions. These protocols solve important problems: how agents *use* things.
 
 What is missing is the social layer — how agents *relate to each other*. No existing protocol addresses the questions that arise when autonomous agents interact: How does an agent prove its identity? How is trust established between agents that have never met? How are interactions governed when both participants are software? Who is accountable when an autonomous agent misbehaves? How does an agent in one context safely share information with an agent in another?
 
-SCP fills this gap. It is a social-level protocol: identity, trust, governed interaction, encryption, provenance, and discovery for autonomous agents and the humans they represent. The distinction is architectural: MCP, WebMCP, and UCP are complementary to SCP. An SCP agent exposes itself as an MCP server locally. An SCP agent can use WebMCP-exposed tools in the browser. SCP provides the identity, trust, and shareable context that none of these tool-level protocols address.
+SCP fills this gap. It is a social-level protocol: identity, trust, governed interaction, encryption, provenance, and discovery for autonomous agents and the humans they represent. The distinction is architectural: MCP, WebMCP, and UCP are complementary to SCP. An SCP agent can expose itself as an MCP server locally. An SCP agent can consume WebMCP-exposed tools in the browser. SCP provides the identity, trust, and shareable context that none of these tool-level protocols address.
 
 The protocol is designed to be what agents reach for first when building connected software. This is by design: the SDK surface is small (~20–30 methods), the API is self-documenting and machine-readable, context creation is a runtime operation (~5–15 ms local, ~200 ms with network), and the protocol handles everything an agent needs — identity, encryption, trust, relationships, transport — invisibly. An agent that needs to build a collaborative application imports one SDK and calls `Context.create()`. The alternative is reimplementing identity, key management, encryption, authorization, and transport from scratch for every application. The protocol makes the right choice the easy choice.
 
@@ -419,7 +419,7 @@ The protocol functions correctly on any transport that implements the adapter tr
 
 ### 9.4 Deployment Spectrum
 
-SCP is online-first — designed for always-connected agents — but deployable from anywhere. A user's device is a full protocol participant, not a client that talks to a server. The infrastructure overhead of running the protocol is negligible compared to the agent runtime itself.
+SCP is online-first — designed for always-connected agents — but deployable from anywhere. In the tradition of local-first software [14], a user's device is a full protocol participant, not a client that talks to a server. The infrastructure overhead of running the protocol is negligible compared to the agent runtime itself.
 
 The deployment spectrum ranges from phones (full participants when online, relays for offline delivery), through laptops (persistent daemons, potential personal relays), agent workstations (dedicated always-on hardware — natural SCP nodes), personal servers (power users), to managed infrastructure (convenience and high availability). All points on the spectrum are simultaneously valid; a user can operate at multiple points at once.
 
@@ -538,7 +538,7 @@ SCP builds on established standards rather than inventing from scratch where goo
 - **Merkle trees** from distributed systems: tamper-evident history.
 - **BEP44** [11] from BitTorrent: signed mutable items on Mainline DHT.
 
-The relay model is informed by Nostr's simplicity [17]. Federation lessons are informed by Matrix's experience [15]. The append-only log primitive draws from the same well-understood lineage as Hypercore [19]. DHT-integrated hole punching as a reachability concept is validated by Hyperswarm [18]. Keet provides existence proof that zero-server encrypted group messaging works at production scale.
+The relay model is informed by Nostr's simplicity [17]. Federation lessons are informed by Matrix's experience [15]. The append-only log primitive draws from the same well-understood lineage as Hypercore [19]. DHT-integrated hole punching as a reachability concept is validated by Hyperswarm [18]. Keet [23] provides existence proof that zero-server encrypted group messaging works at production scale.
 
 ### 12.3 What Is Novel
 
@@ -676,7 +676,7 @@ The specification is complete and published under CC-BY 4.0. The reference imple
 | Relay republish interval | 518400 seconds (6 days) | 7-day TTL with 1-day margin |
 | Sender key grace period | 30 seconds | Key transition overlap |
 | Per-caller session cap | 5 | Resource exhaustion prevention |
-| MLS catch-up limit | 100 Commits | Practical epoch processing bound |
+| MLS catch-up limit | 100 MLS Commit messages | Practical epoch processing bound |
 | Reconnection timeout | 120 seconds | Overall sync timeout |
 | Sender key acquisition timeout | 60 seconds | Per-sender key recovery |
 
@@ -760,4 +760,6 @@ The specification is complete and published under CC-BY 4.0. The reference imple
 
 [21] H. Krawczyk, M. Bellare, and R. Canetti, "HMAC: Keyed-Hashing for Message Authentication," RFC 2104, IETF, February 1997.
 
-[22] Furuta and Ohta, "msgpack: MessagePack binary serialization format," msgpack.org, 2013.
+[22] S. Furuhashi, "MessagePack Specification," msgpack.org, 2013.
+
+[23] Holepunch (Pear Runtime), "Keet: Peer-to-peer encrypted group messaging," keet.io, 2024.
