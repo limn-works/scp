@@ -185,6 +185,7 @@ struct ToolsTests {
             "calculator",
             input: Data("{}".utf8),
             identity: Identity(noPointer: .init()),
+            invokerDid: "did:dht:z6MkTest",
             invokeFn: mockInvoke
         )
         #expect(result.output == Data(#"{"result": 42}"#.utf8))
@@ -401,6 +402,7 @@ struct ToolsTests {
             targetContext: targetContext,
             ucanToken: "test-ucan-token",
             chainDepth: 1,
+            invokerDid: "did:dht:z6MkTest",
             invokeCrossContextFn: mockInvokeCrossContext
         )
 
@@ -506,6 +508,7 @@ struct ToolsTests {
             input: Data("{\"op\":\"add\"}".utf8),
             identity: Identity(noPointer: .init()),
             ucanToken: "test-ucan-token",
+            invokerDid: "did:dht:z6MkTest",
             sessionInvokeFn: mockSessionInvoke
         )
 

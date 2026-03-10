@@ -218,6 +218,7 @@ public extension Context {
         identity: Identity,
         ucanToken: String? = nil,
         proofTokens: [String]? = nil,
+        invokerDid: String? = nil,
         invokeFn: ToolBridge.InvokeFn = ToolBridge.defaultInvoke
     ) async throws -> ToolInvocationResult {
         guard state == .active else {
@@ -241,7 +242,7 @@ public extension Context {
         let outputJson = try await invokeFn(contextHandle, tool, inputJson, identity, ucanToken, proofTokens)
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
-            invokerDid: creatorDid,
+            invokerDid: invokerDid ?? identity.did(),
             contextId: contextId,
             timestamp: UInt64(Date().timeIntervalSince1970 * 1000)
         )
@@ -348,6 +349,7 @@ public extension Context {
         ucanToken: String,
         chainDepth: UInt8 = 0,
         proofTokens: [String]? = nil,
+        invokerDid: String? = nil,
         invokeCrossContextFn: ToolBridge.InvokeCrossContextFn = ToolBridge.defaultInvokeCrossContext
     ) async throws -> ToolInvocationResult {
         guard state == .active else {
@@ -379,7 +381,7 @@ public extension Context {
         )
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
-            invokerDid: creatorDid,
+            invokerDid: invokerDid ?? identity.did(),
             contextId: contextId,
             timestamp: UInt64(Date().timeIntervalSince1970 * 1000)
         )
@@ -453,6 +455,7 @@ public extension Context {
         identity: Identity,
         ucanToken: String,
         proofTokens: [String]? = nil,
+        invokerDid: String? = nil,
         sessionInvokeFn: ToolBridge.SessionInvokeFn = ToolBridge.defaultSessionInvoke
     ) async throws -> ToolInvocationResult {
         guard state == .active else {
@@ -478,7 +481,7 @@ public extension Context {
         )
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
-            invokerDid: creatorDid,
+            invokerDid: invokerDid ?? identity.did(),
             contextId: contextId,
             timestamp: UInt64(Date().timeIntervalSince1970 * 1000)
         )
