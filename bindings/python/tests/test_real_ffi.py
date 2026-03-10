@@ -374,7 +374,7 @@ class TestTrust:
         )
         # trust_query_score may fail without attestation data, but should not crash
         try:
-            result = _scp_core.trust_query_score(handle.context_id, alice.did)
+            result = _scp_core.trust_query_score(alice.did, handle.context_id)
             assert result is not None
         except Exception:
             pass  # Expected without attestation infrastructure
