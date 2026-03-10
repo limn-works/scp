@@ -16,12 +16,10 @@ import Foundation
 // Standalone UniFFI functions:
 //   - identityCreate(_ custody: String) async throws -> Identity
 //   - identityCreateWithCustody(_ provider: KeyCustodyProvider) async throws -> Identity
+//   - identityCreateWithAgentKey(_ custody: String) async throws -> Identity
+//   - identityMigrate(_ identity: Identity) async throws -> Identity
 //   - identityLoad(_ did: String) async throws -> Identity
 //   - identityResolve(_ did: String) async throws -> DidDocument
-//
-// Not yet exported from UniFFI (descriptive error defaults):
-//   - identityCreateWithAgentKey (create with #agent VM)
-//   - identityMigrate (Layer 2 DID rotation)
 //
 // Tests should use Identity(noPointer: .init()) for mock instances.
 
@@ -132,34 +130,16 @@ enum IdentityBridge {
         _ identity: Identity
     ) async throws -> Identity
 
-    /// Default create with agent key function.
-    ///
-    /// ``identityCreateWithAgentKey`` is not yet exported from the UniFFI
-    /// bridge (ScpBindings.swift). The default throws a descriptive error.
-    /// Inject a real closure in production once the UniFFI bridge exports
-    /// this function, or in tests via the injectable parameter.
-    static let defaultCreateWithAgentKey: CreateWithAgentKeyFn = { _ in
-        throw ScpError.Identity(
-            message: "identityCreateWithAgentKey is not yet available in the UniFFI-generated "
-                + "bindings. Export the function from the Rust bridge and regenerate "
-                + "ScpBindings.swift, or inject a bridge function.",
-            code: "SCP-IDENT-1020"
-        )
+    /// Default create with agent key function — delegates to UniFFI
+    /// ``identityCreateWithAgentKey(custody:)``.
+    static let defaultCreateWithAgentKey: CreateWithAgentKeyFn = { custody in
+        try await identityCreateWithAgentKey(custody: custody)
     }
 
-    /// Default migrate function.
-    ///
-    /// ``identityMigrate`` is not yet exported from the UniFFI bridge
-    /// (ScpBindings.swift). The default throws a descriptive error.
-    /// Inject a real closure in production once the UniFFI bridge exports
-    /// this function, or in tests via the injectable parameter.
-    static let defaultMigrate: MigrateFn = { _ in
-        throw ScpError.Identity(
-            message: "identityMigrate is not yet available in the UniFFI-generated "
-                + "bindings. Export the function from the Rust bridge and regenerate "
-                + "ScpBindings.swift, or inject a bridge function.",
-            code: "SCP-IDENT-1021"
-        )
+    /// Default migrate function — delegates to UniFFI
+    /// ``identityMigrate(identity:)``.
+    static let defaultMigrate: MigrateFn = { identity in
+        try await identityMigrate(identity: identity)
     }
 
     /// Generate a device attestation token for an identity.

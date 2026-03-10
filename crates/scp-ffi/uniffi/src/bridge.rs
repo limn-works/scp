@@ -5726,6 +5726,622 @@ pub fn discovery_normalize_address(address: String) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Identity — create with agent key (#421)
+// ---------------------------------------------------------------------------
+
+/// Creates a new SCP identity with an agent signing key.
+///
+/// Same as `identity_create` but also generates an `#agent` verification
+/// method keypair in the DID document (ADR-039). The returned `Identity`
+/// has `has_agent_key() == true`.
+///
+/// Only available with `"in_memory"` custody when the
+/// `allow_in_memory_custody` feature is enabled. Production mobile builds
+/// must use `identity_create_with_custody` + `add_agent_key`.
+///
+/// # Arguments
+///
+/// * `custody` — Custody method string (`"in_memory"`).
+///
+/// # Errors
+///
+/// Returns `ScpError::Identity` if the custody method is unsupported or
+/// key generation/DHT publish fails.
+///
+/// See ADR-039 acceptance criterion 4 and SCP-AB-016.
+#[uniffi::export]
+pub async fn identity_create_with_agent_key(custody: String) -> Result<Arc<Identity>, ScpError> {
+    let custody_method = parse_custody_method(&custody)?;
+
+    runtime()
+        .spawn(async move {
+            match custody_method {
+                CustodyMethod::InMemory => {
+                    #[cfg(not(feature = "allow_in_memory_custody"))]
+                    {
+                        Err(ScpError::Identity {
+                            message: "\"in_memory\" custody is not available in this build \
+                                      — enable the \"allow_in_memory_custody\" feature for \
+                                      dev/desktop use. Production mobile builds must use \
+                                      \"platform\" custody (Secure Enclave / Android Keystore)."
+                                .to_owned(),
+                            code: "SCP-IDENT-1008".to_owned(),
+                        })
+                    }
+
+                    #[cfg(feature = "allow_in_memory_custody")]
+                    {
+                        let key_custody =
+                            Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+                        let dht = DidDht::new();
+                        let (identity, document) = dht
+                            .create_with_agent_key(&key_custody.0)
+                            .await
+                            .map_err(ScpError::from)?;
+
+                        let handle = Arc::new(Identity {
+                            did: identity.did.clone(),
+                            custody_type: CustodyMethod::InMemory,
+                            core_id: Some(identity),
+                            core_document: Some(document),
+                            in_memory_custody: Some(key_custody),
+                            callback_custody: None,
+                        });
+                        increment_handle_count();
+                        Ok(handle)
+                    }
+                }
+                CustodyMethod::Platform | CustodyMethod::Software => Err(ScpError::Identity {
+                    message: format!(
+                        "custody type {custody:?} requires a KeyCustodyProvider — \
+                             use identity_create_with_custody() + add_agent_key() to create \
+                             an identity with an agent key using platform custody"
+                    ),
+                    code: "SCP-IDENT-1003".to_owned(),
+                }),
+                CustodyMethod::External => Err(ScpError::Identity {
+                    message: "internal: CustodyMethod::External cannot be used with \
+                                  identity_create_with_agent_key — use identity_load for \
+                                  external DID handles"
+                        .to_owned(),
+                    code: "SCP-IDENT-1005".to_owned(),
+                }),
+            }
+        })
+        .await
+        .map_err(|e| ScpError::Identity {
+            message: format!("tokio task join error during identity creation with agent key: {e}"),
+            code: "SCP-IDENT-1007".to_owned(),
+        })?
+}
+
+// ---------------------------------------------------------------------------
+// Identity — migrate (#421)
+// ---------------------------------------------------------------------------
+
+/// Migrates an identity to a new DID (Layer 2 DID rotation).
+///
+/// Generates a new keypair, creates a new DID, and links the old DID to
+/// the new one via `alsoKnownAs` in the old DID document.
+///
+/// # Arguments
+///
+/// * `identity` — The identity to migrate. Must have retained crypto state
+///   (created via `identity_create` or `identity_create_with_agent_key`,
+///   not via `identity_load`).
+///
+/// # Returns
+///
+/// A new `Identity` handle with the migrated DID.
+///
+/// # Errors
+///
+/// Returns `ScpError::Identity` if the identity has no retained crypto
+/// state, key generation fails, or DHT publish fails.
+///
+/// See ADR-003 acceptance criterion 4b.
+#[uniffi::export]
+pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, ScpError> {
+    let core_id = identity
+        .core_id
+        .as_ref()
+        .ok_or_else(|| ScpError::Identity {
+            message: "identity migration requires retained crypto state — this identity \
+                  was loaded without key material (use identity_create or \
+                  identity_create_with_custody)"
+                .to_owned(),
+            code: "SCP-IDENT-1009".to_owned(),
+        })?;
+    let core_document = identity
+        .core_document
+        .as_ref()
+        .ok_or_else(|| ScpError::Identity {
+            message: "identity migration requires a retained DID document".to_owned(),
+            code: "SCP-IDENT-1009".to_owned(),
+        })?;
+
+    // We need a custody provider to generate new keys.
+    #[cfg(feature = "allow_in_memory_custody")]
+    let in_memory = identity.in_memory_custody.as_ref();
+
+    let old_identity = core_id.clone();
+    let old_document = core_document.clone();
+    let custody_type = identity.custody_type.clone();
+
+    #[cfg(feature = "allow_in_memory_custody")]
+    let custody_arc = in_memory.map(Arc::clone);
+    let callback_custody = identity.callback_custody.as_ref().map(Arc::clone);
+
+    runtime()
+        .spawn(async move {
+            // Determine which custody to use for key generation.
+            #[cfg(feature = "allow_in_memory_custody")]
+            if let Some(ref kc) = custody_arc {
+                let pre_rotation_key =
+                    kc.0.generate_keypair(scp_platform::traits::KeyType::Ed25519)
+                        .await
+                        .map_err(|e| ScpError::Identity {
+                            message: format!("key generation failed during migration: {e}"),
+                            code: "SCP-IDENT-1009".to_owned(),
+                        })?;
+
+                let rotated_at = scp_core::time::now_secs().map_err(|e| ScpError::Identity {
+                    message: format!("failed to get current time: {e}"),
+                    code: "SCP-IDENT-1009".to_owned(),
+                })?;
+
+                let dht = DidDht::new();
+                let (new_identity, new_document, _rotation_event) = dht
+                    .migrate_identity(
+                        &old_identity,
+                        &old_document,
+                        &pre_rotation_key,
+                        &kc.0,
+                        rotated_at,
+                    )
+                    .await
+                    .map_err(ScpError::from)?;
+
+                let has_agent = new_document.has_agent_key();
+                let handle = Arc::new(Identity {
+                    did: new_identity.did.clone(),
+                    custody_type,
+                    core_id: Some(new_identity),
+                    core_document: Some(new_document),
+                    #[cfg(feature = "allow_in_memory_custody")]
+                    in_memory_custody: custody_arc,
+                    callback_custody,
+                });
+                increment_handle_count();
+                let _ = has_agent; // suppress unused warning
+                return Ok(handle);
+            }
+
+            if let Some(ref cc) = callback_custody {
+                let pre_rotation_key = cc
+                    .generate_keypair(scp_platform::traits::KeyType::Ed25519)
+                    .await
+                    .map_err(|e| ScpError::Identity {
+                        message: format!("key generation failed during migration: {e}"),
+                        code: "SCP-IDENT-1009".to_owned(),
+                    })?;
+
+                let rotated_at = scp_core::time::now_secs().map_err(|e| ScpError::Identity {
+                    message: format!("failed to get current time: {e}"),
+                    code: "SCP-IDENT-1009".to_owned(),
+                })?;
+
+                let dht = DidDht::new();
+                let (new_identity, new_document, _rotation_event) = dht
+                    .migrate_identity(
+                        &old_identity,
+                        &old_document,
+                        &pre_rotation_key,
+                        cc.as_ref(),
+                        rotated_at,
+                    )
+                    .await
+                    .map_err(ScpError::from)?;
+
+                let handle = Arc::new(Identity {
+                    did: new_identity.did.clone(),
+                    custody_type,
+                    core_id: Some(new_identity),
+                    core_document: Some(new_document),
+                    #[cfg(feature = "allow_in_memory_custody")]
+                    in_memory_custody: None,
+                    callback_custody: Some(Arc::clone(cc)),
+                });
+                increment_handle_count();
+                return Ok(handle);
+            }
+
+            Err(ScpError::Identity {
+                message: "identity migration requires a retained custody provider \
+                          (in-memory or callback)"
+                    .to_owned(),
+                code: "SCP-IDENT-1009".to_owned(),
+            })
+        })
+        .await
+        .map_err(|e| ScpError::Identity {
+            message: format!("tokio task join error during identity migration: {e}"),
+            code: "SCP-IDENT-1007".to_owned(),
+        })?
+}
+
+// ---------------------------------------------------------------------------
+// Sync — get policy (#428)
+// ---------------------------------------------------------------------------
+
+/// Sync policy parameters record.
+///
+/// Contains the default sync policy values. Returned by `sync_get_policy`.
+///
+/// See ADR-029 in `.docs/adrs/phase-6.md`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SyncPolicyResult {
+    /// Tier 1 upper bound in seconds (default 14400 = 4 hours).
+    pub tier_1_threshold_secs: u64,
+    /// Tier 2 upper bound in seconds (default 604800 = 7 days).
+    pub tier_2_threshold_secs: u64,
+    /// Gap timeout in seconds (default 30).
+    pub gap_timeout_secs: u64,
+    /// Max buffered messages in the reorder buffer (default 100).
+    pub reorder_buffer_capacity: u32,
+    /// Max sequential MLS Commits for epoch catch-up (default 100).
+    pub max_sequential_commits: u64,
+    /// Per-Commit processing timeout in seconds (default 5).
+    pub commit_process_timeout_secs: u64,
+    /// Sender key re-acquisition timeout in seconds (default 60).
+    pub sender_key_timeout_secs: u64,
+    /// Reconnection dedup window in seconds (default 30).
+    pub reconnection_dedup_window_secs: u64,
+}
+
+/// Returns the default sync policy parameters.
+///
+/// Returns a `SyncPolicyResult` record with all default values from
+/// `SyncPolicy::default()`.
+///
+/// See ADR-029 in `.docs/adrs/phase-6.md`.
+#[uniffi::export]
+#[must_use]
+pub fn sync_get_policy() -> SyncPolicyResult {
+    let policy = scp_core::sync::SyncPolicy::default();
+
+    #[allow(clippy::cast_possible_truncation)]
+    SyncPolicyResult {
+        tier_1_threshold_secs: policy.tier_1_threshold_secs,
+        tier_2_threshold_secs: policy.tier_2_threshold_secs,
+        gap_timeout_secs: policy.gap_timeout.as_secs(),
+        reorder_buffer_capacity: policy.reorder_buffer_capacity as u32,
+        max_sequential_commits: policy.max_sequential_commits,
+        commit_process_timeout_secs: policy.commit_process_timeout.as_secs(),
+        sender_key_timeout_secs: policy.sender_key_timeout.as_secs(),
+        reconnection_dedup_window_secs: policy.reconnection_dedup_window.as_secs(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bridge connector — register and create shadow (#421)
+// ---------------------------------------------------------------------------
+
+/// Bridge registration result record.
+///
+/// Returned by `bridge_register`. Contains the details of a successfully
+/// registered bridge connector.
+///
+/// See spec section 12 (Bridge System) and ADR-023.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct BridgeRegistrationResult {
+    /// Unique identifier for the registered bridge.
+    pub bridge_id: String,
+    /// DID of the bridge operator.
+    pub operator_did: String,
+    /// External platform name (e.g., `"discord"`, `"slack"`).
+    pub platform: String,
+    /// Bridge operating mode (`"relay"`, `"puppet"`, `"api"`, `"cooperative"`).
+    pub mode: String,
+    /// Bridge status after registration (e.g., `"active"`).
+    pub status: String,
+    /// Context the bridge is registered in.
+    pub context_id: String,
+}
+
+/// Shadow identity result record.
+///
+/// Returned by `bridge_create_shadow`. Contains the details of a shadow
+/// identity representing an external platform participant.
+///
+/// See spec section 12 (Bridge System) and ADR-023.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ShadowIdentityResult {
+    /// Unique identifier for this shadow identity.
+    pub shadow_id: String,
+    /// External platform handle (e.g., `"@user#1234"`).
+    pub platform_handle: String,
+    /// Bridge connector that created this shadow.
+    pub bridge_id: String,
+    /// Role attributed to this shadow.
+    pub attributed_role: String,
+    /// Provenance status: `"Shadow"` or `"Claimed"`.
+    pub provenance_status: String,
+}
+
+/// Registers a new bridge connector with a context.
+///
+/// Creates a bridge registration, submits a registration request, and
+/// immediately approves it (for FFI / testing purposes).
+///
+/// # Arguments
+///
+/// * `context_id` — Context to register the bridge in.
+/// * `operator_did` — DID of the human operator accountable for the bridge.
+/// * `platform` — External platform name (e.g., `"discord"`, `"slack"`).
+/// * `mode` — Bridge mode: `"relay"`, `"puppet"`, `"api"`, or `"cooperative"`.
+///
+/// # Returns
+///
+/// A `BridgeRegistrationResult` with the registration details.
+///
+/// # Errors
+///
+/// Returns `ScpError::Validation` if `mode` is not recognized, or
+/// `ScpError::Context` if registration fails.
+///
+/// See spec section 12 (Bridge System) and ADR-023.
+#[uniffi::export]
+pub fn bridge_register(
+    context_id: String,
+    operator_did: String,
+    platform: String,
+    mode: String,
+) -> Result<BridgeRegistrationResult, ScpError> {
+    let bridge_mode = match mode.as_str() {
+        "relay" => scp_core::bridge::BridgeMode::Relay,
+        "puppet" => scp_core::bridge::BridgeMode::Puppet,
+        "api" => scp_core::bridge::BridgeMode::Api,
+        "cooperative" => scp_core::bridge::BridgeMode::Cooperative,
+        other => {
+            return Err(ScpError::Validation {
+                message: format!(
+                    "invalid bridge mode '{other}': expected 'relay', 'puppet', 'api', or 'cooperative'"
+                ),
+                code: "SCP-VALID-7050".to_owned(),
+            });
+        }
+    };
+
+    let mut registry = scp_core::bridge::registration::BridgeRegistry::new(context_id.clone());
+
+    let bridge_id = format!(
+        "bridge-{platform}-{}",
+        context_id.chars().take(8).collect::<String>()
+    );
+    let request = scp_core::bridge::registration::BridgeRegistrationRequest {
+        bridge_id: bridge_id.clone(),
+        operator_did: operator_did.clone().into(),
+        platform: platform.clone(),
+        mode: bridge_mode,
+        context_id: context_id.clone(),
+        requested_at: 0,
+        self_hosted: false,
+    };
+
+    scp_core::bridge::registration::register_bridge(&mut registry, request).map_err(|e| {
+        ScpError::Context {
+            message: format!("bridge registration failed: {e}"),
+            code: "SCP-CTX-2100".to_owned(),
+        }
+    })?;
+
+    let governance_did: scp_identity::DID = operator_did.clone().into();
+    let (connector, _approval_event) = scp_core::bridge::registration::approve_registration(
+        &mut registry,
+        &bridge_id,
+        &governance_did,
+        0,
+    )
+    .map_err(|e| ScpError::Context {
+        message: format!("bridge approval failed: {e}"),
+        code: "SCP-CTX-2101".to_owned(),
+    })?;
+
+    Ok(BridgeRegistrationResult {
+        bridge_id: connector.bridge_id,
+        operator_did,
+        platform,
+        mode,
+        status: "active".to_owned(),
+        context_id,
+    })
+}
+
+/// Creates a shadow identity for an external platform participant.
+///
+/// Shadow identities represent non-SCP participants in a bridged context.
+/// They carry provenance metadata indicating they are not native SCP
+/// identities.
+///
+/// # Arguments
+///
+/// * `bridge_id` — The bridge connector ID that owns this shadow.
+/// * `platform_handle` — External platform handle (e.g., `"@user#1234"`).
+/// * `bridge_mode` — Bridge mode: `"relay"`, `"puppet"`, `"api"`, or
+///   `"cooperative"`.
+/// * `context_id` — Context the shadow is being created in.
+///
+/// # Returns
+///
+/// A `ShadowIdentityResult` with the shadow identity details.
+///
+/// # Errors
+///
+/// Returns `ScpError::Validation` if `bridge_mode` is not recognized, or
+/// `ScpError::Context` if shadow creation fails.
+///
+/// See spec section 12 (Bridge System) and ADR-023.
+#[uniffi::export]
+pub fn bridge_create_shadow(
+    bridge_id: String,
+    platform_handle: String,
+    bridge_mode: String,
+    context_id: String,
+) -> Result<ShadowIdentityResult, ScpError> {
+    let mode = match bridge_mode.as_str() {
+        "relay" => scp_core::bridge::BridgeMode::Relay,
+        "puppet" => scp_core::bridge::BridgeMode::Puppet,
+        "api" => scp_core::bridge::BridgeMode::Api,
+        "cooperative" => scp_core::bridge::BridgeMode::Cooperative,
+        other => {
+            return Err(ScpError::Validation {
+                message: format!(
+                    "invalid bridge mode '{other}': expected 'relay', 'puppet', 'api', or 'cooperative'"
+                ),
+                code: "SCP-VALID-7050".to_owned(),
+            });
+        }
+    };
+
+    let shadow_id = format!("shadow-{bridge_id}-{}", platform_handle.replace('@', ""));
+    let mut shadow_registry = scp_core::bridge::shadow::ShadowRegistry::new(context_id);
+    let mut sender_key_store = scp_core::crypto::sender_keys::SenderKeyStore::new();
+
+    let params = scp_core::bridge::shadow::CreateShadowParams {
+        shadow_id: &shadow_id,
+        bridge_id: &bridge_id,
+        bridge_mode: mode,
+        platform_handle: &platform_handle,
+        context_member_dids: &[],
+        timestamp: 0,
+    };
+
+    let (shadow, _event) = scp_core::bridge::shadow::create_shadow(
+        &mut shadow_registry,
+        &mut sender_key_store,
+        &params,
+    )
+    .map_err(|e| ScpError::Context {
+        message: format!("shadow creation failed: {e}"),
+        code: "SCP-CTX-2102".to_owned(),
+    })?;
+
+    Ok(ShadowIdentityResult {
+        shadow_id: shadow.shadow_id,
+        platform_handle: shadow.platform_handle,
+        bridge_id: shadow.bridge_id,
+        attributed_role: shadow.attributed_role,
+        provenance_status: format!("{:?}", shadow.provenance_status),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Discovery — context_discover (#428)
+// ---------------------------------------------------------------------------
+
+/// Discovers contexts from a DID string or `scp://` URI.
+///
+/// Detects whether the query is a DID or an `scp://` URI and delegates to
+/// the appropriate core discovery function.
+///
+/// Returns a JSON string containing an array of discovery results, each
+/// with: `context_id`, `relay_urls`, `publisher_did`, `discovery_source`,
+/// `mode`, `metadata_summary`.
+///
+/// # Arguments
+///
+/// * `query` — A DID string (e.g., `"did:dht:z6Mk..."`) or an `scp://`
+///   URI (e.g., `"scp://context/a1b2c3?relay=wss%3A%2F%2Frelay.example.com"`).
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` if DID resolution or URI parsing fails.
+/// Returns `ScpError::Validation` if the query is neither a DID nor an
+/// `scp://` URI.
+///
+/// See §5.14.11, §18.2.2, §18.4.
+#[uniffi::export]
+pub async fn context_discover(query: String) -> Result<String, ScpError> {
+    if query.starts_with("scp://") {
+        // Parse scp:// URI — synchronous, no network I/O.
+        let result =
+            scp_core::discovery::resolve_context_uri(&query).map_err(|e| ScpError::Context {
+                message: format!("failed to resolve scp:// URI: {e}"),
+                code: "SCP-CTX-2020".to_owned(),
+            })?;
+
+        let results = vec![discovery_result_to_json(&result)];
+        serde_json::to_string(&results).map_err(|e| ScpError::Context {
+            message: format!("failed to serialize discovery results: {e}"),
+            code: "SCP-CTX-2021".to_owned(),
+        })
+    } else if query.starts_with("did:") {
+        validate_did(&query)?;
+
+        runtime()
+            .spawn(async move {
+                let did_dht = DidDht::new();
+                let results = scp_core::discovery::resolve_contexts_from_did(&query, &did_dht)
+                    .await
+                    .map_err(|e| ScpError::Context {
+                        message: format!("DHT discovery failed for '{query}': {e}"),
+                        code: "SCP-CTX-2022".to_owned(),
+                    })?;
+
+                let json_results: Vec<serde_json::Value> =
+                    results.iter().map(discovery_result_to_json).collect();
+                serde_json::to_string(&json_results).map_err(|e| ScpError::Context {
+                    message: format!("failed to serialize discovery results: {e}"),
+                    code: "SCP-CTX-2023".to_owned(),
+                })
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                message: format!("tokio task join error during discovery: {e}"),
+                code: "SCP-CTX-2024".to_owned(),
+            })?
+    } else {
+        Err(ScpError::Validation {
+            message: format!(
+                "query must be a DID (starts with 'did:') or an scp:// URI \
+                 (starts with 'scp://'), got: {query}"
+            ),
+            code: "SCP-VALID-7062".to_owned(),
+        })
+    }
+}
+
+/// Converts a `ContextDiscoveryResult` into a JSON value (helper).
+fn discovery_result_to_json(
+    result: &scp_core::discovery::ContextDiscoveryResult,
+) -> serde_json::Value {
+    let source_str = match &result.discovery_source {
+        scp_core::discovery::ContextDiscoverySource::DhtDidDocument => "dht_did_document",
+        scp_core::discovery::ContextDiscoverySource::WellKnown => "well_known",
+        scp_core::discovery::ContextDiscoverySource::DiscoveryContext { .. } => "discovery_context",
+        scp_core::discovery::ContextDiscoverySource::ContextUri => "context_uri",
+    };
+
+    let mut obj = serde_json::json!({
+        "context_id": result.context_id,
+        "relay_urls": result.relay_urls,
+        "publisher_did": &*result.publisher_did,
+        "discovery_source": source_str,
+        "mode": result.mode,
+        "metadata_summary": result.metadata_summary,
+    });
+
+    if let scp_core::discovery::ContextDiscoverySource::DiscoveryContext { context_id } =
+        &result.discovery_source
+    {
+        obj["discovery_context_id"] = serde_json::Value::String(context_id.clone());
+    }
+
+    obj
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

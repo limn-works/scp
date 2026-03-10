@@ -128,15 +128,9 @@ struct DiscoveryTests {
         #expect(result.contains("relay.example"))
     }
 
-    @Test("discover default throws descriptive error")
-    func discoverDefaultThrows() async {
-        do {
-            _ = try await discover(query: "did:dht:z6MkBob")
-            Issue.record("Expected discover to throw")
-        } catch {
-            #expect(error is ScpError)
-        }
-    }
+    // discover now delegates to the real UniFFI bridge (contextDiscover).
+    // The "default throws" test has been removed — the injected-mock
+    // roundtrip test above covers SDK logic.
 
     @Test("discover propagates bridge errors")
     func discoverError() async {

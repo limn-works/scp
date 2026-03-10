@@ -40,25 +40,13 @@ enum SyncBridge {
         )
     }
 
-    /// Get the sync policy for a context. Maps to a future ``syncGetPolicy``
-    /// UniFFI export.
-    typealias GetPolicyFn = @Sendable (
-        _ contextId: String
-    ) async throws -> String
+    /// Get the sync policy. Maps to UniFFI ``syncGetPolicy``.
+    typealias GetPolicyFn = @Sendable () -> SyncPolicyResult
 
-    /// Default get sync policy function.
-    ///
-    /// ``syncGetPolicy`` is not yet available in the UniFFI bridge or the
-    /// generated bindings (ScpBindings.swift). The default throws a descriptive
-    /// error. Inject a real closure in production once the UniFFI bridge is
-    /// exported and regenerated, or in tests via the injectable parameter.
-    static let defaultGetPolicy: GetPolicyFn = { _ in
-        throw ScpError.Context(
-            message: "syncGetPolicy is not yet available in the UniFFI bridge or the "
-                + "generated bindings. Export the function from the Rust bridge and "
-                + "regenerate ScpBindings.swift, or inject a bridge function.",
-            code: "SCP-CTX-2040"
-        )
+    /// Default get sync policy function — delegates to UniFFI
+    /// ``syncGetPolicy()``.
+    static let defaultGetPolicy: GetPolicyFn = {
+        syncGetPolicy()
     }
 }
 
@@ -111,24 +99,20 @@ public func classifyOfflineCustom(
     classifyOfflineCustomFn(lastRelayContact, now, tier1ThresholdSecs, tier2ThresholdSecs)
 }
 
-/// Retrieves the sync policy for a context.
+/// Retrieves the default sync policy parameters.
 ///
 /// The sync policy determines how offline recovery and state reconciliation
-/// operate for the given context. Returns the policy as a JSON string.
+/// operate. Returns a ``SyncPolicyResult`` with all default thresholds and
+/// timeouts.
 ///
-/// - Parameters:
-///   - contextId: The context ID to query.
-///   - getPolicyFn: Bridge function override for testing.
-/// - Returns: A JSON string describing the sync policy.
-/// - Throws: ``ScpError/Context(message:code:)`` if the policy cannot be
-///   retrieved.
+/// - Parameter getPolicyFn: Bridge function override for testing.
+/// - Returns: A ``SyncPolicyResult`` with the default sync policy values.
 ///
 /// ## Provenance
 ///
 /// - ADR-029 in `.docs/adrs/phase-6.md`
 public func getSyncPolicy(
-    contextId: String,
     getPolicyFn: SyncBridge.GetPolicyFn = SyncBridge.defaultGetPolicy
-) async throws -> String {
-    try await getPolicyFn(contextId)
+) -> SyncPolicyResult {
+    getPolicyFn()
 }

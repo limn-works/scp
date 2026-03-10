@@ -125,65 +125,31 @@ struct SyncTests {
 
     // MARK: - getSyncPolicy via injectable bridge (roundtrip)
 
-    @Test("getSyncPolicy calls bridge and returns policy JSON")
-    func getSyncPolicyRoundtrip() async throws {
-        var receivedContextId: String?
-
-        let mockGetPolicy: SyncBridge.GetPolicyFn = { contextId in
-            receivedContextId = contextId
-            return #"{"tier1_threshold_secs":14400,"tier2_threshold_secs":604800}"#
-        }
-
-        let result = try await getSyncPolicy(
-            contextId: "ctx-sync-001",
-            getPolicyFn: mockGetPolicy
-        )
-
-        #expect(result.contains("tier1_threshold_secs"))
-        #expect(result.contains("14400"))
-        #expect(receivedContextId == "ctx-sync-001")
-    }
-
-    @Test("getSyncPolicy propagates bridge errors")
-    func getSyncPolicyPropagatesErrors() async throws {
-        let mockGetPolicy: SyncBridge.GetPolicyFn = { _ in
-            throw ScpError.Context(
-                message: "context not found",
-                code: "SCP-CTX-2041"
+    @Test("getSyncPolicy calls bridge and returns policy record")
+    func getSyncPolicyRoundtrip() {
+        let mockGetPolicy: SyncBridge.GetPolicyFn = {
+            SyncPolicyResult(
+                tier1ThresholdSecs: 14400,
+                tier2ThresholdSecs: 604_800,
+                gapTimeoutSecs: 30,
+                reorderBufferCapacity: 100,
+                maxSequentialCommits: 100,
+                commitProcessTimeoutSecs: 5,
+                senderKeyTimeoutSecs: 60,
+                reconnectionDedupWindowSecs: 30
             )
         }
 
-        do {
-            _ = try await getSyncPolicy(
-                contextId: "ctx-nonexistent",
-                getPolicyFn: mockGetPolicy
-            )
-            Issue.record("Expected getSyncPolicy to throw")
-        } catch let error as ScpError {
-            if case let .Context(_, code) = error {
-                #expect(code == "SCP-CTX-2041")
-            } else {
-                Issue.record("Expected ScpError.Context, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
-        }
+        let result = getSyncPolicy(getPolicyFn: mockGetPolicy)
+
+        #expect(result.tier1ThresholdSecs == 14400)
+        #expect(result.tier2ThresholdSecs == 604_800)
+        #expect(result.gapTimeoutSecs == 30)
+        #expect(result.reorderBufferCapacity == 100)
     }
 
-    @Test("getSyncPolicy default throws descriptive error")
-    func getSyncPolicyDefaultThrows() async throws {
-        do {
-            _ = try await getSyncPolicy(contextId: "ctx-default")
-            Issue.record("Expected default to throw")
-        } catch let error as ScpError {
-            if case let .Context(message, code) = error {
-                #expect(code == "SCP-CTX-2040")
-                #expect(message.contains("not yet available"))
-            } else {
-                Issue.record("Expected ScpError.Context, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
-        }
-    }
+    // getSyncPolicy now delegates to the real UniFFI bridge
+    // (syncGetPolicy), which is synchronous and never throws.
+    // The "default throws" and "propagates errors" tests have been
+    // removed.
 } // end SyncTests

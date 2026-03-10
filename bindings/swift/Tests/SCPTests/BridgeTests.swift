@@ -162,20 +162,9 @@ struct BridgeTests {
         #expect(result.status == "active")
     }
 
-    @Test("bridgeRegister default throws descriptive error")
-    func bridgeRegisterDefaultThrows() {
-        do {
-            _ = try bridgeRegister(
-                contextId: "ctx-001",
-                operatorDid: "did:dht:z6MkOp",
-                platform: "discord",
-                mode: "relay"
-            )
-            Issue.record("Expected bridgeRegister to throw")
-        } catch {
-            #expect(error is ScpError)
-        }
-    }
+    // bridgeRegister now delegates to the real UniFFI bridge
+    // (bridgeRegister). The "default throws" test has been removed —
+    // the injected-mock roundtrip test above covers SDK logic.
 
     // MARK: - bridgeCreateShadow via injectable bridge (roundtrip)
 
@@ -216,18 +205,7 @@ struct BridgeTests {
         #expect(result.provenanceStatus == "Shadow")
     }
 
-    @Test("bridgeCreateShadow default throws descriptive error")
-    func bridgeCreateShadowDefaultThrows() {
-        do {
-            _ = try bridgeCreateShadow(
-                bridgeId: "bridge-001",
-                platformHandle: "@alice",
-                bridgeMode: "relay",
-                contextId: "ctx-001"
-            )
-            Issue.record("Expected bridgeCreateShadow to throw")
-        } catch {
-            #expect(error is ScpError)
-        }
-    }
+    // bridgeCreateShadow now delegates to the real UniFFI bridge
+    // (bridgeCreateShadow). The "default throws" test has been removed —
+    // the injected-mock roundtrip test above covers SDK logic.
 } // end BridgeTests

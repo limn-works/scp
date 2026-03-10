@@ -54,17 +54,10 @@ enum DiscoveryBridge {
         _ query: String
     ) async throws -> String
 
-    /// Default discover function.
-    ///
-    /// UniFFI does not yet export ``contextDiscover``; the default throws
-    /// a descriptive error. Inject a real closure in production once the
-    /// UniFFI bridge is extended, or in tests via the injectable parameter.
-    static let defaultDiscover: DiscoverFn = { _ in
-        throw ScpError.Context(
-            message: "contextDiscover is not yet available in the UniFFI bridge. "
-                + "Inject a bridge function or wait for the UniFFI export.",
-            code: "SCP-CTX-2050"
-        )
+    /// Default discover function — delegates to UniFFI
+    /// ``contextDiscover(query:)``.
+    static let defaultDiscover: DiscoverFn = { query in
+        try await contextDiscover(query: query)
     }
 }
 

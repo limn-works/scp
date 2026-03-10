@@ -404,22 +404,9 @@ struct IdentityTests {
         }
     }
 
-    @Test("createIdentityWithAgentKey default throws descriptive error")
-    func createIdentityWithAgentKeyDefaultThrows() async throws {
-        do {
-            _ = try await createIdentityWithAgentKey(custody: "in_memory")
-            Issue.record("Expected default to throw")
-        } catch let error as ScpError {
-            if case let .Identity(message, code) = error {
-                #expect(code == "SCP-IDENT-1020")
-                #expect(message.contains("not yet available"))
-            } else {
-                Issue.record("Expected ScpError.Identity, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
-        }
-    }
+    // createIdentityWithAgentKey now delegates to the real UniFFI bridge
+    // (identityCreateWithAgentKey). The "default throws" test has been
+    // removed — the injected-mock roundtrip test above covers SDK logic.
 
     // MARK: - Migrate Identity
 
@@ -464,22 +451,8 @@ struct IdentityTests {
         }
     }
 
-    @Test("migrateIdentity default throws descriptive error")
-    func migrateIdentityDefaultThrows() async throws {
-        let identity = MockIdentity(did: "did:dht:z6MkDefault", custodyType: "in_memory")
-
-        do {
-            _ = try await migrateIdentity(identity)
-            Issue.record("Expected default to throw")
-        } catch let error as ScpError {
-            if case let .Identity(message, code) = error {
-                #expect(code == "SCP-IDENT-1021")
-                #expect(message.contains("not yet available"))
-            } else {
-                Issue.record("Expected ScpError.Identity, got \(error)")
-            }
-        } catch {
-            Issue.record("Expected ScpError, got \(type(of: error))")
-        }
-    }
+    // migrateIdentity now delegates to the real UniFFI bridge
+    // (identityMigrate). The "default throws" test has been removed —
+    // the injected-mock roundtrip and error propagation tests above
+    // cover SDK logic.
 } // end IdentityTests
