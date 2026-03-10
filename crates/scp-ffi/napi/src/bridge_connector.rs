@@ -16,7 +16,7 @@ use scp_core::bridge::provenance::{
 use scp_core::bridge::registration::{
     approve_registration, register_bridge, BridgeRegistrationRequest, BridgeRegistry,
 };
-use scp_core::bridge::shadow::{create_shadow, ShadowRegistry};
+use scp_core::bridge::shadow::{create_shadow, CreateShadowParams, ShadowRegistry};
 use scp_core::bridge::{
     BridgeConnector, BridgeMode, BridgeStatus, ShadowIdentity, ShadowProvenanceStatus,
 };
@@ -191,16 +191,17 @@ pub fn bridge_create_shadow(
     let shadow_id = format!("shadow-{bridge_id}-{}", platform_handle.replace('@', ""));
     let mut shadow_registry = ShadowRegistry::new(ctx_id);
 
-    let (shadow, _event) = create_shadow(
-        &mut shadow_registry,
-        &shadow_id,
-        &bridge_id,
-        mode,
-        &platform_handle,
-        &[], // no existing context member DIDs for collision check
-        0,   // timestamp
-    )
-    .map_err(|e| {
+    let params = CreateShadowParams {
+        shadow_id: &shadow_id,
+        bridge_id: &bridge_id,
+        bridge_mode: mode,
+        platform_handle: &platform_handle,
+        context_member_dids: &[],
+        timestamp: 0,
+    };
+    let mut sender_key_store = scp_core::crypto::sender_keys::SenderKeyStore::new();
+    let (shadow, _event) = create_shadow(&mut shadow_registry, &mut sender_key_store, &params)
+        .map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("shadow creation failed: {e}"),
             code: "SCP-VALID-7014".to_owned(),
