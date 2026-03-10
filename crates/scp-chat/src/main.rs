@@ -62,6 +62,12 @@ const CTX_ID: &str = "scp-chat";
 const MAX_HISTORY: usize = 200;
 const SALT_FILE_NAME: &str = ".passphrase_salt";
 
+/// Maximum length for display names (bytes). HTML `maxlength` is trivially
+/// bypassed, so the server enforces this independently.
+const MAX_NAME_LEN: usize = 64;
+/// Maximum length for message text (bytes).
+const MAX_TEXT_LEN: usize = 4096;
+
 /// Derives a passphrase for `FileKeyCustody` from machine-specific entropy.
 ///
 /// Priority:
@@ -914,6 +920,15 @@ async fn handle_join(
     State(room): State<Arc<ChatRoom>>,
     Json(req): Json<JoinRequest>,
 ) -> impl IntoResponse {
+    // Validate name length.
+    if req.name.is_empty() || req.name.len() > MAX_NAME_LEN {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("name must be 1-{MAX_NAME_LEN} characters")})),
+        )
+            .into_response();
+    }
+
     // Validate client_id if provided (must be 64 hex chars = 32 bytes SHA-256).
     if let Some(ref cid) = req.client_id
         && (cid.len() != 64 || hex::decode(cid).is_err())
@@ -1317,6 +1332,15 @@ async fn handle_send(
     State(room): State<Arc<ChatRoom>>,
     Json(req): Json<SendRequest>,
 ) -> impl IntoResponse {
+    // Validate text length. Empty messages and oversized payloads are rejected.
+    if req.text.is_empty() || req.text.len() > MAX_TEXT_LEN {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("text must be 1-{MAX_TEXT_LEN} characters")})),
+        )
+            .into_response();
+    }
+
     // Resolve the sender identity from the session token. This prevents
     // sender DID spoofing — the client never supplies its own DID/name.
     let sessions = room.sessions.read().await;
