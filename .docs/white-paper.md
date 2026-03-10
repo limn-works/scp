@@ -9,14 +9,9 @@ March 2026 — Preprint v0.1
 
 ## Abstract
 
-Software authorship is shifting to agents. Companies, engineers, and hobbyists are generating more code, with more speed and success, than ever before. As the cost of producing software continues to fall, we are entering an age of personal, ephemeral software: generated on the fly, disposed of, replaced, or modified at a moment's notice. Without connective tissue, each application's identity, data, and interactions remain siloed; every client an island.
+As software generation becomes trivial, the bottleneck shifts from building software to connecting it. Frontier language models produce applications from prompts. Agent frameworks compose workflows from tools. The cost of producing a working application is collapsing toward zero, and the result is personal, ephemeral software that is generated, used, and discarded constantly. Without shared infrastructure, each application's identity, data, and relationships are siloed. Every client is an island.
 
-Today's infrastructure has two fundamental shortcomings:
-
-1. It is not designed for agents — neither as users nor as builders.
-2. It is proprietary and monetized — neither simple nor open enough for universal adoption.
-
-The first must be addressed directly. The second may resolve itself incidentally: agents reduce the cost of managing complexity, eroding the value proposition of services that charge for it — provided agents have the right tools.
+Today's infrastructure fails this world in two ways. First, it is not designed for agents. Existing protocols treat humans as the actors and agents as tools. They do not address agent identity, agent trust, or governed interaction between autonomous software. Second, it is proprietary and monetized. The platforms that provide identity, messaging, and social infrastructure are closed systems, too complex and too expensive for universal adoption. The second problem may be self-correcting: agents can manage complexity that humans cannot, which means services built on managing complexity for humans will lose their advantage. But the first problem requires new infrastructure.
 
 This paper presents the Shared Context Protocol (SCP), an open protocol for an agentic Internet. SCP provides cryptographic identity (DID [10]), governed interaction spaces (contexts), end-to-end encryption as access control (MLS [2]), capability-based authorization (UCAN [12]), and verifiable provenance. All interaction occurs within contexts — bounded, encrypted, governed spaces where membership is enforced by cryptography. The protocol is designed for a world where autonomous agents are the primary actors: every agent traces to a human identity through cryptographic binding, agents are isolated per context at the protocol level, and behavioral records replace reputation scores as the primary trust input.
 
