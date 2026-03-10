@@ -152,6 +152,13 @@ public actor Context {
     /// Retained so that ``close()`` and ``leave()`` can finish the stream.
     private var streamContinuation: AsyncStream<Message>.Continuation?
 
+    /// Whether ``close()`` or ``leave()`` has already been called.
+    /// Checked in `deinit` to avoid redundant cleanup. Marked
+    /// `nonisolated(unsafe)` because `deinit` cannot access actor-isolated
+    /// storage — the flag is only read in `deinit` after all actor-isolated
+    /// methods have finished.
+    nonisolated(unsafe) var didClose = false
+
     // MARK: - Bridge function references (injected for testability)
 
     private let sendFn: ContextBridge.SendFn
@@ -226,9 +233,10 @@ public actor Context {
         // `try?` intentionally suppresses errors in the deinit path. The detached
         // task captures only the handle and closeFn (both Sendable) — it does not
         // capture `self`, which would be invalid in deinit.
+        streamContinuation?.finish()
+        guard !didClose else { return }
         let capturedHandle = handle
         let capturedCloseFn = closeFn
-        streamContinuation?.finish()
         Task.detached {
             try? await capturedCloseFn(capturedHandle)
         }
@@ -302,7 +310,7 @@ public actor Context {
     ///
     /// Only one active message stream per context is supported. Accessing this
     /// property while a previous stream is still active throws
-    /// ``ScpError/Context(message:code:)`` with code `"SCP-CTX-2002"`.
+    /// ``ScpError/Context(message:code:)`` with code `"SCP-CTX-2003"`.
     /// To create a new stream, first ``close()`` or ``leave()`` the context
     /// (which finishes the existing stream), or consume the existing stream
     /// to completion.
@@ -315,24 +323,43 @@ public actor Context {
     /// }
     /// ```
     ///
-    /// - Throws: ``ScpError/Context(message:code:)`` with code `"SCP-CTX-2002"`
-    ///   if a message stream is already active on this context.
+    /// - Throws: ``ScpError/Context(message:code:)`` with code `"SCP-CTX-2001"`
+    ///   if the context is not active, or `"SCP-CTX-2003"` if a message stream
+    ///   is already active on this context.
     public var messages: AsyncStream<Message> {
         get throws {
+            guard state == .active else {
+                throw ScpError.Context(
+                    message: "Context is not active",
+                    code: "SCP-CTX-2001"
+                )
+            }
             guard streamContinuation == nil else {
                 throw ScpError.Context(
                     message: "A message stream is already active on this context. "
                         + "Consume or close the existing stream before creating a new one.",
-                    code: "SCP-CTX-2002"
+                    code: "SCP-CTX-2003"
                 )
             }
 
             let (stream, continuation) = AsyncStream<Message>.makeStream()
             streamContinuation = continuation
+            continuation.onTermination = { [weak self] _ in
+                // Clear the continuation when the stream finishes naturally so
+                // a new stream can be created on re-subscribe.
+                guard let self else { return }
+                Task { await self.clearStreamContinuation() }
+            }
             let listener = MessageListenerAdapter(continuation: continuation)
             subscribeFn(handle, listener)
             return stream
         }
+    }
+
+    /// Clears the stream continuation reference. Called from `onTermination`
+    /// to allow a new message stream after the previous one finishes.
+    private func clearStreamContinuation() {
+        streamContinuation = nil
     }
 
     /// Leaves this context gracefully.
@@ -352,6 +379,7 @@ public actor Context {
         }
         try await leaveFn(handle)
         state = .closed
+        didClose = true
         streamContinuation?.finish()
         streamContinuation = nil
     }
@@ -375,6 +403,7 @@ public actor Context {
         }
         try await closeFn(handle)
         state = .closed
+        didClose = true
         streamContinuation?.finish()
         streamContinuation = nil
     }

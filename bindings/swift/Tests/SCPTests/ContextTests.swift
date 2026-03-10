@@ -504,7 +504,7 @@ struct ContextTests {
 
     // MARK: - Single-stream enforcement tests
 
-    @Test("messages throws SCP-CTX-2002 when a stream is already active")
+    @Test("messages throws SCP-CTX-2003 when a stream is already active")
     func messagesThrowsWhenStreamAlreadyActive() async throws {
         let context = makeTestContext()
 
@@ -515,14 +515,16 @@ struct ContextTests {
         }
     }
 
-    @Test("messages allows new stream after close nils the continuation")
-    func messagesAllowsNewStreamAfterClose() async throws {
+    @Test("messages throws SCP-CTX-2001 after close")
+    func messagesThrowsAfterClose() async throws {
         let context = makeTestContext()
 
         _ = try await context.messages
         try await context.close()
 
-        _ = try await context.messages
+        await #expect(throws: ScpError.self) {
+            _ = try await context.messages
+        }
     }
 
     // MARK: - ContextState tests
