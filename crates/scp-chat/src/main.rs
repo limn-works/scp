@@ -80,10 +80,10 @@ const MAX_MEMBERS: usize = 50;
 ///    on first run and persisted alongside the identity.
 fn derive_passphrase(data_dir: &std::path::Path) -> String {
     // Allow explicit override via environment variable.
-    if let Ok(val) = std::env::var("SCP_CHAT_PASSPHRASE") {
-        if !val.is_empty() {
-            return val;
-        }
+    if let Ok(val) = std::env::var("SCP_CHAT_PASSPHRASE")
+        && !val.is_empty()
+    {
+        return val;
     }
 
     let salt_path = data_dir.join(SALT_FILE_NAME);
@@ -569,7 +569,7 @@ fn truncate_did(did: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Self-signed TLS provider that generates a cert with multiple Subject
-/// Alternative Names (SANs). Covers LAN IP, public IP (if UPnP mapped),
+/// Alternative Names (SANs). Covers LAN IP, public IP (if `UPnP` mapped),
 /// localhost, and 127.0.0.1 so devices connecting via any address get a
 /// valid cert (after accepting the self-signed warning).
 struct SelfSignedTls(Vec<String>);
@@ -913,10 +913,12 @@ async fn serve_web_ui() -> impl IntoResponse {
     // Read from disk so frontend changes take effect without rebuilding.
     // Falls back to the compile-time embedded copy if the file is missing
     // (e.g. running the binary outside the source tree).
-    match tokio::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/chat.html")).await {
-        Ok(html) => Html(html).into_response(),
-        Err(_) => Html(include_str!("chat.html")).into_response(),
-    }
+    tokio::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/chat.html"))
+        .await
+        .map_or_else(
+            |_| Html(include_str!("chat.html")).into_response(),
+            |html| Html(html).into_response(),
+        )
 }
 
 async fn handle_join(
