@@ -1010,8 +1010,7 @@ pub fn identity_verify_device_attestation(did: String, token_base64: String) -> 
         // Prevents replay of captured attestation tokens.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let now_secs = (js_sys::Date::now() / 1000.0) as u64;
-        const ATTESTATION_MAX_AGE_SECS: u64 = 300;
-        if now_secs.saturating_sub(timestamp) > ATTESTATION_MAX_AGE_SECS {
+        if now_secs.saturating_sub(timestamp) > 300 {
             return Ok(JsValue::from_bool(false));
         }
         // Reject future-dated attestations (clock skew tolerance: 60s).

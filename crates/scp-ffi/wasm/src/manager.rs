@@ -525,18 +525,22 @@ impl WasmContextManager {
         let economic_policy = params["economicPolicy"].as_str().map(str::to_owned);
 
         // Build default ceiling strings (matching scp-core ContextRoleState::new).
+        // Default ceiling strings must match scp-core's `Capability::Display`
+        // format exactly. scp-core uses `{resource}:{action}` (colon-separated),
+        // NOT `{resource}_{action}:*` (underscore + wildcard). Cross-bridge
+        // UCAN delegation breaks if formats differ (H5).
         let ceiling_strings: HashSet<String> = if ceiling.is_empty() {
             [
                 "messages:read",
                 "messages:write",
-                "tool_register:*",
-                "tool_invoke:*",
-                "role_assign:*",
-                "member_invite:*",
-                "member_remove:*",
-                "governance_propose:*",
-                "governance_vote:*",
-                "context_close:*",
+                "tool:register",
+                "tool:invoke:*",
+                "role:assign",
+                "member:invite",
+                "member:remove",
+                "governance:propose",
+                "governance:vote",
+                "context:close",
             ]
             .iter()
             .map(|s| (*s).to_owned())
@@ -738,11 +742,9 @@ impl WasmContextManager {
         let ctx = self.require_active_context_mut(context_id)?;
 
         // Authorization: check ContextClose capability, matching
-        // ttl::close_context in scp-core. Admin role members have all
-        // capabilities in the ceiling; regular members do not have
-        // context_close by default. Uses WASM ceiling format
-        // ("context_close:*") not scp-core format ("context:close").
-        if !ctx.member_has_capability(initiator_did, "context_close:*") {
+        // ttl::close_context in scp-core. Uses scp-core Capability::Display
+        // format ("context:close").
+        if !ctx.member_has_capability(initiator_did, "context:close") {
             return Err(ScpWasmError::Permission {
                 message: format!("member {initiator_did} does not have context:close capability"),
                 code: "SCP-PERM-3000".to_owned(),
@@ -1430,26 +1432,27 @@ impl WasmContextManager {
     ///
     /// Maps each `WasmGovernanceAction` variant to the capability that
     /// the initiator must hold. Uses the WASM ceiling format
-    /// (`"{resource}_{action}:*"`), matching `member_has_capability`.
+    /// Uses scp-core `Capability::Display` format (`"{resource}:{action}"`),
+    /// matching `member_has_capability` and the ceiling strings.
     fn required_capability_for_action(action: &WasmGovernanceAction) -> &'static str {
         match action {
             WasmGovernanceAction::AddMember { .. }
             | WasmGovernanceAction::RestoreWriteAccess { .. }
-            | WasmGovernanceAction::RestoreReadAccess { .. } => "member_invite:*",
+            | WasmGovernanceAction::RestoreReadAccess { .. } => "member:invite",
 
             WasmGovernanceAction::RemoveMember { .. }
             | WasmGovernanceAction::RevokeWriteAccess { .. }
             | WasmGovernanceAction::BlockAuthor { .. }
             | WasmGovernanceAction::RevokeReadAccess { .. }
-            | WasmGovernanceAction::ResetMember { .. } => "member_remove:*",
+            | WasmGovernanceAction::ResetMember { .. } => "member:remove",
 
-            WasmGovernanceAction::ChangeRole { .. } => "role_assign:*",
+            WasmGovernanceAction::ChangeRole { .. } => "role:assign",
 
             WasmGovernanceAction::RegisterTool { .. }
             | WasmGovernanceAction::RemoveTool { .. }
-            | WasmGovernanceAction::EstablishToolInterface { .. } => "tool_register:*",
+            | WasmGovernanceAction::EstablishToolInterface { .. } => "tool:register",
 
-            WasmGovernanceAction::CloseContext { .. } => "context_close:*",
+            WasmGovernanceAction::CloseContext { .. } => "context:close",
 
             WasmGovernanceAction::ModifyCeiling { .. }
             | WasmGovernanceAction::ExtendTtl { .. }
@@ -1462,7 +1465,7 @@ impl WasmContextManager {
             | WasmGovernanceAction::ModifyThreshold { .. }
             | WasmGovernanceAction::ResolveConflict { .. }
             | WasmGovernanceAction::RotateContentKeys { .. }
-            | WasmGovernanceAction::ReconfigureGovernance { .. } => "governance_propose:*",
+            | WasmGovernanceAction::ReconfigureGovernance { .. } => "governance:propose",
         }
     }
 
