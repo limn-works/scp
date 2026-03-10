@@ -338,9 +338,7 @@ class TestProvenance:
     """Provenance evaluation and attachment through real FFI."""
 
     async def test_evaluate_quality(self):
-        result = _scp_core.evaluate_provenance_quality(
-            None, "persistent", "active", None
-        )
+        result = _scp_core.evaluate_provenance_quality(None, "persistent", "active", None)
         assert isinstance(result, int)
         assert 0 <= result <= 3
 
@@ -467,9 +465,7 @@ class TestBridgeConnector:
         # the "approver cannot be the same as operator" check. This is a known
         # bug in the bridge (should use context creator DID as approver).
         with pytest.raises(Exception, match="approver cannot be the same as operator"):
-            _scp_core.bridge_register(
-                handle.context_id, alice.did, "discord", "relay"
-            )
+            _scp_core.bridge_register(handle.context_id, alice.did, "discord", "relay")
 
     async def test_evaluate_trust_native(self):
         # Non-bridged, native transport → NativeNative (3)
