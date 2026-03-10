@@ -1606,6 +1606,8 @@ impl GovernanceEngine for SingleAdminEngine {
 /// - `RevokeWriteAccess` + `RestoreWriteAccess` for the same DID
 /// - Multiple `RevokeReadAccess` for same DID with different scopes
 /// - Multiple `RevokeWriteAccess` for same DID with different scopes
+/// - Multiple `RestoreReadAccess` for same DID
+/// - Multiple `RestoreWriteAccess` for same DID
 ///
 /// # Arguments
 /// * `action_a` - The first governance action
@@ -1665,12 +1667,14 @@ pub fn actions_conflict(
             did_a == did_b || (did_a == proposer_b && did_b == proposer_a)
         }
 
-        // Two concurrent revocations of the same type targeting the same DID
-        // conflict (scope may differ, but concurrent revocation is unsafe —
-        // ADR-031 §7). Revoke and Restore for the same DID also conflict
-        // (contradictory intent on the same member's access state).
+        // Two concurrent revocations or restorations of the same type targeting
+        // the same DID conflict (scope may differ, but concurrent modification
+        // is unsafe — ADR-031 §7). Revoke and Restore for the same DID also
+        // conflict (contradictory intent on the same member's access state).
         (RevokeReadAccess { did: did_a, .. }, RevokeReadAccess { did: did_b, .. })
         | (RevokeWriteAccess { did: did_a, .. }, RevokeWriteAccess { did: did_b, .. })
+        | (RestoreReadAccess { did: did_a }, RestoreReadAccess { did: did_b })
+        | (RestoreWriteAccess { did: did_a }, RestoreWriteAccess { did: did_b })
         | (RevokeReadAccess { did: did_a, .. }, RestoreReadAccess { did: did_b })
         | (RestoreReadAccess { did: did_a }, RevokeReadAccess { did: did_b, .. })
         | (RevokeWriteAccess { did: did_a, .. }, RestoreWriteAccess { did: did_b })

@@ -873,6 +873,73 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn conflicting_restore_read_access_same_did() {
+        // Two concurrent restore-read proposals for the same member conflict
+        // (concurrent modification of the same member's access state — ADR-031 §7).
+        let a = GovernanceAction::RestoreReadAccess {
+            did: did("did:dht:alice"),
+        };
+        let b = GovernanceAction::RestoreReadAccess {
+            did: did("did:dht:alice"),
+        };
+        assert!(actions_conflict(
+            &a,
+            &did("did:dht:bob"),
+            &b,
+            &did("did:dht:carol"),
+        ));
+    }
+
+    #[test]
+    fn non_conflicting_restore_read_access_different_dids() {
+        let a = GovernanceAction::RestoreReadAccess {
+            did: did("did:dht:alice"),
+        };
+        let b = GovernanceAction::RestoreReadAccess {
+            did: did("did:dht:bob"),
+        };
+        assert!(!actions_conflict(
+            &a,
+            &did("did:dht:carol"),
+            &b,
+            &did("did:dht:dave"),
+        ));
+    }
+
+    #[test]
+    fn conflicting_restore_write_access_same_did() {
+        // Two concurrent restore-write proposals for the same member conflict.
+        let a = GovernanceAction::RestoreWriteAccess {
+            did: did("did:dht:alice"),
+        };
+        let b = GovernanceAction::RestoreWriteAccess {
+            did: did("did:dht:alice"),
+        };
+        assert!(actions_conflict(
+            &a,
+            &did("did:dht:bob"),
+            &b,
+            &did("did:dht:carol"),
+        ));
+    }
+
+    #[test]
+    fn non_conflicting_restore_write_access_different_dids() {
+        let a = GovernanceAction::RestoreWriteAccess {
+            did: did("did:dht:alice"),
+        };
+        let b = GovernanceAction::RestoreWriteAccess {
+            did: did("did:dht:bob"),
+        };
+        assert!(!actions_conflict(
+            &a,
+            &did("did:dht:carol"),
+            &b,
+            &did("did:dht:dave"),
+        ));
+    }
+
     // -----------------------------------------------------------------------
     // resolve_metadata_conflict
     // -----------------------------------------------------------------------
