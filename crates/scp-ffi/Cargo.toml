@@ -55,5 +55,10 @@ scp-ffi-common = { path = "common", features = ["testing"] }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
 tempfile = "3"
 
+[[test]]
+name = "e2e_bridge"
+path = "tests/e2e_bridge.rs"
+required-features = ["allow_in_memory_custody"]
+
 [lints]
 workspace = true

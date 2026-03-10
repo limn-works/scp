@@ -7,7 +7,7 @@ repository.workspace = true
 license.workspace = true
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "lib"]
 
 [features]
 default = []
@@ -34,10 +34,6 @@ scp-ffi-common = { path = "../common" }
 scp-platform = { path = "../../scp-platform", features = ["testing"] }
 scp-mcp = { path = "../../scp-mcp" }
 scp-transport = { path = "../../scp-transport" }
-
-[dev-dependencies]
-scp-ffi-common = { path = "../common", features = ["testing"] }
-scp-platform = { path = "../../scp-platform", features = ["testing"] }
 
 [build-dependencies]
 napi-build = "2"
