@@ -118,6 +118,11 @@ pub struct TestVector {
 // WasmEventLog — Merkle tree (mirrors scp-core EventLog)
 // ---------------------------------------------------------------------------
 
+/// The genesis sentinel hash used as `prev_hash` for the first event.
+///
+/// This is `[0u8; 32]` — all zeros. Matches native `scp_event_log::tree::GENESIS_PREV_HASH`.
+const GENESIS_PREV_HASH: [u8; 32] = [0u8; 32];
+
 /// An append-only Merkle tree for a single SCP context.
 ///
 /// Mirrors `scp_event_log::EventLog`. Follows Certificate Transparency
@@ -161,6 +166,48 @@ impl WasmEventLog {
         self.leaves.push(leaf_hash);
         self.sorted_leaves.insert((leaf_hash, leaf_index));
         self.incremental_update();
+    }
+
+    /// Appends an event to the log using the canonical hash format matching
+    /// native `scp_event_log::tree::compute_event_canonical_hash`.
+    ///
+    /// Computes `canonical_hash = SHA-256("SCP-EVENT-V1:" || event_type_tag(u16 BE) ||
+    /// len(actor_did)(u32 BE) || actor_did || timestamp(u64 BE) || sequence(u64 BE) ||
+    /// len(payload)(u32 BE) || payload || prev_hash(32B))`, then wraps with RFC 6962
+    /// leaf domain separation: `leaf_hash = SHA-256(0x00 || canonical_hash)`.
+    ///
+    /// Note: Native uses `SHA-256(0x00 || rmp_serde(full_event))` for the leaf hash.
+    /// WASM cannot use `MessagePack` serialization (no scp-core dependency per ADR-034),
+    /// so it uses the canonical hash bytes as the serialized content. This means WASM
+    /// leaf hashes are not byte-identical to native leaf hashes, but both use the same
+    /// canonical hash algorithm and domain separation. WASM event logs are local-only
+    /// and never cross-verified against native event logs.
+    pub fn append_event(
+        &mut self,
+        event_type_tag: u16,
+        actor_did: &str,
+        payload: &[u8],
+    ) {
+        let sequence = self.leaves.len() as u64;
+        let prev_hash = self.leaves.last().copied().unwrap_or(GENESIS_PREV_HASH);
+        let timestamp = crate::time::now_secs();
+
+        let canonical_hash = compute_canonical_event_hash(
+            event_type_tag,
+            actor_did,
+            timestamp,
+            sequence,
+            payload,
+            &prev_hash,
+        );
+
+        // Leaf hash = SHA-256(0x00 || canonical_hash) — RFC 6962 leaf domain separation.
+        let mut hasher = Sha256::new();
+        hasher.update([0x00]);
+        hasher.update(&canonical_hash);
+        let leaf_hash: [u8; 32] = hasher.finalize().into();
+
+        self.append_leaf(leaf_hash);
     }
 
     /// Returns the current Merkle root hash.
@@ -291,6 +338,89 @@ impl WasmEventLog {
             idx = parent_idx;
             level = next_level;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Canonical event hash (mirrors scp_event_log::tree)
+// ---------------------------------------------------------------------------
+
+/// Computes the canonical event hash matching native
+/// `scp_event_log::tree::compute_event_canonical_hash`.
+///
+/// Format: `SHA-256("SCP-EVENT-V1:" || event_type_tag(u16 BE) ||
+///          len(actor_did)(u32 BE) || actor_did || timestamp(u64 BE) ||
+///          sequence(u64 BE) || len(payload)(u32 BE) || payload ||
+///          prev_hash(32B))`.
+///
+/// Variable-length fields are length-prefixed with a 4-byte big-endian u32
+/// to prevent field-boundary ambiguity. The `SCP-EVENT-V1:` domain separator
+/// prevents cross-protocol hash confusion.
+fn compute_canonical_event_hash(
+    event_type_tag: u16,
+    actor_did: &str,
+    timestamp: u64,
+    sequence: u64,
+    payload: &[u8],
+    prev_hash: &[u8; 32],
+) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"SCP-EVENT-V1:");
+    hasher.update(event_type_tag.to_be_bytes());
+    // Length-prefix actor_did.
+    #[allow(clippy::cast_possible_truncation)]
+    hasher.update((actor_did.len() as u32).to_be_bytes());
+    hasher.update(actor_did.as_bytes());
+    hasher.update(timestamp.to_be_bytes());
+    hasher.update(sequence.to_be_bytes());
+    // Length-prefix payload.
+    #[allow(clippy::cast_possible_truncation)]
+    hasher.update((payload.len() as u32).to_be_bytes());
+    hasher.update(payload);
+    hasher.update(prev_hash);
+    hasher.finalize().to_vec()
+}
+
+/// Maps event type strings to protocol tag values matching native
+/// `scp_event_log::tree::event_type_tag`. These tags are protocol constants
+/// and must never change.
+#[must_use]
+pub fn wasm_event_type_tag(event_type: &str) -> u16 {
+    match event_type {
+        "ContextCreated" => 0,
+        "ContextClosing" => 1,
+        "ContextClosed" => 2,
+        "ContextExpired" => 3,
+        "MemberJoined" => 4,
+        "MemberLeft" => 5,
+        "RoleAssigned" => 6,
+        "TokenRevoked" | "UcanRevoked" => 7,
+        "MessageSent" => 8,
+        "ToolRegistered" => 9,
+        "ToolUpdated" => 10,
+        "ToolInvoked" => 11,
+        "ToolVerified" => 12,
+        "ToolInterfaceEstablished" => 13,
+        "GovernanceAction" => 14,
+        "ConsistencyCheckpoint" => 15,
+        "AbsenceProofRequested" => 16,
+        "MemberBlocked" => 17,
+        "KeyEpochAdvance" => 18,
+        "MediaSessionStarted" => 19,
+        "MediaSessionEnded" => 20,
+        "PaymentReceived" => 21,
+        "EconomicPolicyChanged" => 22,
+        "SpendingUcanGranted" => 23,
+        "SpendingUcanRevoked" => 24,
+        "GovernanceProposalCreated" => 25,
+        "GovernanceVoteCast" => 26,
+        "GovernanceVoteWithdrawn" => 27,
+        "GovernanceProposalResolved" => 28,
+        "GovernanceConflictDetected" => 29,
+        "GovernanceConflictResolved" => 30,
+        "GovernanceDeadlockRecovery" => 31,
+        "GovernanceActionExecuted" | "GovernanceExecuted" => 32,
+        _ => 0xFFFF, // Unknown event type — uses max u16 as sentinel.
     }
 }
 

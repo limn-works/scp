@@ -28,7 +28,6 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use sha2::{Digest, Sha256};
 
 use crate::error::ScpWasmError;
 use crate::runtime::{
@@ -603,10 +602,13 @@ impl WasmContextManager {
         self.contexts.insert(context_id.to_owned(), per_context);
 
         // Append ContextCreated event to event log.
-        let leaf_hash = compute_event_hash("ContextCreated", context_id);
         // Safe: we just inserted the context above, so the key is present.
         if let Some(ctx) = self.contexts.get_mut(context_id) {
-            ctx.event_log.append_leaf(leaf_hash);
+            ctx.event_log.append_event(
+                crate::runtime::wasm_event_type_tag("ContextCreated"),
+                creator_did,
+                b"",
+            );
         }
 
         Ok(())
@@ -641,8 +643,11 @@ impl WasmContextManager {
             role_name: "member".to_owned(),
         });
 
-        let leaf_hash = compute_event_hash("MemberJoined", context_id);
-        ctx.event_log.append_leaf(leaf_hash);
+        ctx.event_log.append_event(
+            crate::runtime::wasm_event_type_tag("MemberJoined"),
+            member_did,
+            b"",
+        );
 
         Ok(())
     }
@@ -675,8 +680,11 @@ impl WasmContextManager {
             member_did: member_did.to_owned(),
         });
 
-        let leaf_hash = compute_event_hash("MemberLeft", context_id);
-        ctx.event_log.append_leaf(leaf_hash);
+        ctx.event_log.append_event(
+            crate::runtime::wasm_event_type_tag("MemberLeft"),
+            member_did,
+            b"",
+        );
 
         // Auto-close if no members remain.
         if ctx.members.is_empty() {
@@ -726,8 +734,11 @@ impl WasmContextManager {
             payload_base64: payload_base64.to_owned(),
         });
 
-        let leaf_hash = compute_event_hash("MessageSent", context_id);
-        ctx.event_log.append_leaf(leaf_hash);
+        ctx.event_log.append_event(
+            crate::runtime::wasm_event_type_tag("MessageSent"),
+            sender_did,
+            payload_base64.as_bytes(),
+        );
 
         Ok(())
     }
@@ -762,8 +773,11 @@ impl WasmContextManager {
             initiator_did: initiator_did.to_owned(),
         });
 
-        let leaf_hash = compute_event_hash("ContextClosing", context_id);
-        ctx.event_log.append_leaf(leaf_hash);
+        ctx.event_log.append_event(
+            crate::runtime::wasm_event_type_tag("ContextClosing"),
+            initiator_did,
+            b"",
+        );
 
         Ok(())
     }
@@ -841,8 +855,12 @@ impl WasmContextManager {
                 code: "SCP-TOOL-6001".to_owned(),
             })?;
 
-        let leaf_hash = compute_event_hash("ToolRegistered", context_id);
-        ctx.event_log.append_leaf(leaf_hash);
+        let actor = ctx.creator_did.clone();
+        ctx.event_log.append_event(
+            crate::runtime::wasm_event_type_tag("ToolRegistered"),
+            &actor,
+            tool_id.as_bytes(),
+        );
 
         Ok(tool_id)
     }
@@ -889,7 +907,7 @@ impl WasmContextManager {
         context_id: &str,
         tool_id: &str,
         input_json: &serde_json::Value,
-        _identity_did: &str,
+        identity_did: &str,
     ) -> Result<serde_json::Value, ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
@@ -934,8 +952,11 @@ impl WasmContextManager {
             })
         };
 
-        let leaf_hash = compute_event_hash("ToolInvoked", context_id);
-        ctx.event_log.append_leaf(leaf_hash);
+        ctx.event_log.append_event(
+            crate::runtime::wasm_event_type_tag("ToolInvoked"),
+            identity_did,
+            tool_id.as_bytes(),
+        );
 
         Ok(result)
     }
@@ -1461,8 +1482,12 @@ impl WasmContextManager {
 
         ctx.revoked_tokens.insert(token_cid.to_owned());
 
-        let leaf_hash = compute_event_hash("UcanRevoked", context_id);
-        ctx.event_log.append_leaf(leaf_hash);
+        let actor = ctx.creator_did.clone();
+        ctx.event_log.append_event(
+            crate::runtime::wasm_event_type_tag("UcanRevoked"),
+            &actor,
+            token_cid.as_bytes(),
+        );
 
         Ok(())
     }
@@ -1601,8 +1626,11 @@ impl WasmContextManager {
                 action_type,
                 proposal_id: proposal_id.to_owned(),
             });
-            let leaf_hash = compute_event_hash("GovernanceExecuted", context_id);
-            ctx.event_log.append_leaf(leaf_hash);
+            ctx.event_log.append_event(
+                crate::runtime::wasm_event_type_tag("GovernanceExecuted"),
+                initiator_did,
+                proposal_id.as_bytes(),
+            );
         }
 
         result
@@ -1903,8 +1931,11 @@ impl WasmContextManager {
             payload_base64: payload_base64.to_owned(),
         });
 
-        let leaf_hash = compute_event_hash("MessageSent", context_id);
-        ctx.event_log.append_leaf(leaf_hash);
+        ctx.event_log.append_event(
+            crate::runtime::wasm_event_type_tag("MessageSent"),
+            author_did,
+            payload_base64.as_bytes(),
+        );
 
         Ok(())
     }
@@ -2014,8 +2045,11 @@ impl WasmContextManager {
         "expired".clone_into(&mut ctx.state);
         ctx.push_event(WasmContextEvent::Expired);
 
-        let leaf_hash = compute_event_hash("ContextExpired", context_id);
-        ctx.event_log.append_leaf(leaf_hash);
+        ctx.event_log.append_event(
+            crate::runtime::wasm_event_type_tag("ContextExpired"),
+            "", // System event — no actor.
+            b"",
+        );
 
         Ok(())
     }
@@ -2482,17 +2516,6 @@ struct WasmExportBroadcast {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Computes a leaf hash for the event log from event type and context ID.
-///
-/// Uses `SHA-256(0x00 || event_type || context_id)` with RFC 6962 leaf
-/// domain separation prefix.
-fn compute_event_hash(event_type: &str, context_id: &str) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update([0x00]); // RFC 6962 leaf prefix.
-    hasher.update(event_type.as_bytes());
-    hasher.update(context_id.as_bytes());
-    // Include a timestamp-like value for uniqueness. In WASM, use crate::time::now_ms().
-    let now_ms = crate::time::now_ms();
-    hasher.update(now_ms.to_bits().to_le_bytes());
-    hasher.finalize().into()
-}
+// `compute_event_hash` replaced by `WasmEventLog::append_event` which uses
+// the canonical hash format matching native `compute_event_canonical_hash`.
+// See `crate::runtime::compute_canonical_event_hash`.
