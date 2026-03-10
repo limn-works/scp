@@ -121,10 +121,19 @@ pub fn split_into_chunks(
         ));
     }
 
-    // Derive message_id = SHA-256(payload || sender_did || timestamp_be).
+    // Derive message_id with length-prefixed fields for unambiguous domain
+    // separation. Without length prefixes, payload="ab" + did="cd" collides
+    // with payload="abc" + did="d".
+    // Format: SHA-256("SCP-CHUNK-V1:" || LE32(payload.len) || payload
+    //                  || LE32(did.len) || sender_did || BE64(timestamp))
     let message_id: [u8; 32] = {
         let mut hasher = Sha256::new();
+        hasher.update(b"SCP-CHUNK-V1:");
+        #[allow(clippy::cast_possible_truncation)]
+        hasher.update((payload.len() as u32).to_le_bytes());
         hasher.update(payload);
+        #[allow(clippy::cast_possible_truncation)]
+        hasher.update((sender_did.len() as u32).to_le_bytes());
         hasher.update(sender_did.as_bytes());
         hasher.update(timestamp.to_be_bytes());
         hasher.finalize().into()
