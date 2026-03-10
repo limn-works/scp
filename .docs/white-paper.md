@@ -9,7 +9,7 @@ March 2026 — Preprint v0.1
 
 ## Abstract
 
-Software authorship is shifting to agents. Companies, engineers, and hobbyists are generating more code, with more speed and success, than ever before — and as the cost of producing software continues to fall, we are entering an age of personal, ephemeral software: generated on the fly, disposed of, replaced, or modified at a moment's notice. Without connective tissue, each application's identity, data, and interactions remain siloed; every client an island.
+Software authorship is shifting to agents. Companies, engineers, and hobbyists are generating more code, with more speed and success, than ever before. As the cost of producing software continues to fall, we are entering an age of personal, ephemeral software: generated on the fly, disposed of, replaced, or modified at a moment's notice. Without connective tissue, each application's identity, data, and interactions remain siloed; every client an island.
 
 Today's infrastructure has two fundamental shortcomings:
 
