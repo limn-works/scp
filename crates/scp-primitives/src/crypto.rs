@@ -12,8 +12,6 @@
 //!
 //! See GitHub issue #81.
 
-
-
 /// Verifies an Ed25519 signature against a public key and message bytes.
 ///
 /// This is the primary verification entry point for SCP. Module-specific

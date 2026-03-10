@@ -10,9 +10,7 @@
 
 use napi_derive::napi;
 
-use scp_core::bridge::provenance::{
-    BridgeTrustLevel, evaluate_trust_level, mark_bridge_provenance,
-};
+use scp_core::bridge::provenance::{evaluate_trust_level, mark_bridge_provenance};
 use scp_core::bridge::registration::{
     BridgeRegistrationRequest, BridgeRegistry, approve_registration, register_bridge,
 };
@@ -257,6 +255,7 @@ fn parse_shadow_status(s: &str) -> napi::Result<ShadowProvenanceStatus> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use scp_core::bridge::provenance::BridgeTrustLevel;
 
     #[test]
     fn evaluate_trust_native_native() {

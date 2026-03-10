@@ -1673,11 +1673,15 @@ pub fn actions_conflict(
         // conflict (contradictory intent on the same member's access state).
         (RevokeReadAccess { did: did_a, .. }, RevokeReadAccess { did: did_b, .. })
         | (RevokeWriteAccess { did: did_a, .. }, RevokeWriteAccess { did: did_b, .. })
-        | (RestoreReadAccess { did: did_a }, RestoreReadAccess { did: did_b })
-        | (RestoreWriteAccess { did: did_a }, RestoreWriteAccess { did: did_b })
-        | (RevokeReadAccess { did: did_a, .. }, RestoreReadAccess { did: did_b })
+        | (
+            RestoreReadAccess { did: did_a } | RevokeReadAccess { did: did_a, .. },
+            RestoreReadAccess { did: did_b },
+        )
+        | (
+            RestoreWriteAccess { did: did_a } | RevokeWriteAccess { did: did_a, .. },
+            RestoreWriteAccess { did: did_b },
+        )
         | (RestoreReadAccess { did: did_a }, RevokeReadAccess { did: did_b, .. })
-        | (RevokeWriteAccess { did: did_a, .. }, RestoreWriteAccess { did: did_b })
         | (RestoreWriteAccess { did: did_a }, RevokeWriteAccess { did: did_b, .. }) => {
             did_a == did_b
         }
