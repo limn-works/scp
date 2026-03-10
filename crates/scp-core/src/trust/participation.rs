@@ -706,13 +706,13 @@ fn verify_statement_signature(
     let signature = Signature::from_bytes(&statement.signature);
     let signable = statement.signable_bytes();
 
-    verifying_key.verify(&signable, &signature).map_err(|e| {
-        ParticipationAdmissionError::InvalidSignature {
+    verifying_key
+        .verify_strict(&signable, &signature)
+        .map_err(|e| ParticipationAdmissionError::InvalidSignature {
             subject_did: statement.subject_did.clone(),
             signer_hex: hex::encode(&statement.signer_public_key[..8]),
             reason: format!("signature verification failed: {e}"),
-        }
-    })?;
+        })?;
 
     Ok(())
 }

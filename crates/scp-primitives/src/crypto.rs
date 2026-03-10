@@ -38,7 +38,7 @@ pub fn verify_ed25519_signature(
     let (verifying_key, sig) = parse_key_and_signature(public_key, signature)?;
 
     verifying_key
-        .verify(message, &sig)
+        .verify_strict(message, &sig)
         .map_err(|e| format!("signature verification failed: {e}"))
 }
 
