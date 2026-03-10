@@ -161,7 +161,9 @@ impl SimulatedClock {
     /// Advance to an absolute `target_millis` (must be >= current time).
     ///
     /// Fires all pending timers whose scheduled time is <= `target_millis` in
-    /// chronological order. Callbacks registered by other callbacks during this
+    /// chronological order. `current_millis` is updated progressively before
+    /// each batch so that `now_millis()` returns the correct time during
+    /// callback execution. Callbacks registered by other callbacks during this
     /// advance also fire if their time <= `target_millis`.
     pub fn advance_to(&self, target_millis: u64) {
         let current = self.current_millis.load(Ordering::Acquire);
@@ -172,11 +174,14 @@ impl SimulatedClock {
         // Drain and fire in a loop so that timers registered by callbacks also
         // get a chance to fire within this advance window.
         loop {
-            let batch = self.drain_due_timers(target_millis);
+            let batch = self.drain_due_timers_with_times(target_millis);
             if batch.is_empty() {
                 break;
             }
-            for callback in batch {
+            for (fire_time, callback) in batch {
+                // Update current_millis before firing so now_millis() returns
+                // the correct time during callback execution.
+                self.current_millis.fetch_max(fire_time, Ordering::AcqRel);
                 callback();
             }
         }
@@ -208,8 +213,12 @@ impl SimulatedClock {
         }
     }
 
-    /// Remove and return all callbacks whose fire-time is <= `up_to_millis`.
-    fn drain_due_timers(&self, up_to_millis: u64) -> Vec<Box<dyn FnOnce() + Send>> {
+    /// Remove and return all callbacks (with their fire times) whose fire-time
+    /// is <= `up_to_millis`, sorted chronologically.
+    fn drain_due_timers_with_times(
+        &self,
+        up_to_millis: u64,
+    ) -> Vec<(u64, Box<dyn FnOnce() + Send>)> {
         let mut guard = self.lock_timers();
 
         // Collect keys that are due. We split the map at up_to_millis + 1 so
@@ -221,10 +230,10 @@ impl SimulatedClock {
         std::mem::swap(&mut *guard, &mut due);
         drop(guard);
 
-        let mut callbacks: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
-        for (_time, entries) in due {
+        let mut callbacks: Vec<(u64, Box<dyn FnOnce() + Send>)> = Vec::new();
+        for (time, entries) in due {
             for (_handle, cb) in entries {
-                callbacks.push(cb);
+                callbacks.push((time, cb));
             }
         }
         callbacks
