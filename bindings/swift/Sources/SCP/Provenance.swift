@@ -50,7 +50,7 @@ public enum ProvenanceBridge {
         try provenanceAttach(
             sourceContextId: sourceContextId,
             sourceType: sourceType,
-            memoryScope: memoryScope,
+            memoryScopeStr: memoryScope,
             members: members,
             targetContextId: targetContextId,
             existingChainDepth: existingChainDepth
