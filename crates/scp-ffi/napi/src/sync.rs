@@ -44,6 +44,7 @@ pub struct NapiSyncPolicy {
 /// Classifies an offline duration into the appropriate recovery tier.
 ///
 /// Returns `"short"`, `"extended"`, or `"long"`.
+#[must_use]
 #[napi]
 pub fn sync_classify_offline(last_relay_contact: i64, now: i64) -> String {
     #[allow(clippy::cast_sign_loss)]
@@ -55,11 +56,12 @@ pub fn sync_classify_offline(last_relay_contact: i64, now: i64) -> String {
 }
 
 /// Returns the default sync policy parameters.
+#[must_use]
 #[napi]
 pub fn sync_get_policy() -> NapiSyncPolicy {
     let policy = SyncPolicy::default();
 
-    #[allow(clippy::cast_possible_wrap)]
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     NapiSyncPolicy {
         tier_1_threshold_secs: policy.tier_1_threshold_secs as i64,
         tier_2_threshold_secs: policy.tier_2_threshold_secs as i64,
@@ -75,6 +77,7 @@ pub fn sync_get_policy() -> NapiSyncPolicy {
 /// Classifies an offline duration using custom policy thresholds.
 ///
 /// Returns `"short"`, `"extended"`, or `"long"`.
+#[must_use]
 #[napi]
 pub fn sync_classify_offline_custom(
     last_relay_contact: i64,

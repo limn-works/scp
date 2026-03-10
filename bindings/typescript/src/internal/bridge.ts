@@ -18,19 +18,22 @@
  * See ADR-022 in `.docs/adrs/phase-4.md`.
  */
 
+import type { BridgeMode, ShadowStatus } from "../bridge";
 import type {
+  BroadcastAdmissionPolicy,
   Checkpoint,
   DIDDocument,
   Event,
   EventClaim,
   EventFilter,
+  MemberRole,
   Message,
   Proof,
   ToolDefinition,
   ToolVerificationResult,
   TransportStatus,
   UcanToken,
-} from "../types.js";
+} from "../types";
 
 // ---------------------------------------------------------------------------
 // Bridge interface — the contract both native and WASM bridges implement
@@ -76,6 +79,44 @@ export interface Bridge {
     callback: MessageCallback,
   ): void;
 
+  // Membership queries
+  contextMemberCount(handle: BridgeContextHandle): Promise<number | null>;
+  contextIsMember(handle: BridgeContextHandle, did: string): Promise<boolean>;
+  contextMemberDids(handle: BridgeContextHandle): Promise<readonly string[]>;
+  contextMemberRole(handle: BridgeContextHandle, did: string): Promise<MemberRole | null>;
+
+  // Broadcast operations
+  broadcastSubscribe(handle: BridgeContextHandle, subscriberDid: string): Promise<void>;
+  broadcastUnsubscribe(
+    handle: BridgeContextHandle,
+    subscriberDid: string,
+    rotateKeys?: boolean,
+  ): Promise<void>;
+  broadcastPublish(
+    handle: BridgeContextHandle,
+    authorDid: string,
+    payload: Uint8Array,
+  ): Promise<void>;
+  broadcastBlockSubscriber(
+    handle: BridgeContextHandle,
+    subscriberDid: string,
+    blockerDid: string,
+  ): Promise<void>;
+  broadcastHandleKeyRequest(
+    handle: BridgeContextHandle,
+    authorDid: string,
+    requesterDid: string,
+  ): Promise<string>;
+  broadcastSubscriberCount(handle: BridgeContextHandle): Promise<number | null>;
+  broadcastIsSubscriber(handle: BridgeContextHandle, did: string): Promise<boolean>;
+  broadcastAdmission(handle: BridgeContextHandle): Promise<BroadcastAdmissionPolicy | null>;
+
+  // Governance
+  contextExecuteGovernanceAction(
+    handle: BridgeContextHandle,
+    proposalJson: string,
+  ): Promise<string>;
+
   // Tools
   toolRegister(handle: BridgeContextHandle, definition: ToolDefinition): Promise<string>;
   toolInvoke(
@@ -106,7 +147,92 @@ export interface Bridge {
     filter: EventFilter | undefined,
   ): Promise<readonly Event[]>;
   eventLogVerify(handle: BridgeContextHandle, claim: EventClaim): Promise<Proof>;
-  eventLogCheckpoint(handle: BridgeContextHandle): Promise<Checkpoint>;
+  eventLogCheckpoint(
+    handle: BridgeContextHandle,
+    identityDid: string,
+    epoch: number,
+  ): Promise<Checkpoint>;
+
+  // Bridge Connector
+  bridgeRegister(
+    contextId: string,
+    operatorDid: string,
+    platform: string,
+    mode: BridgeMode,
+  ): {
+    bridge_id: string;
+    operator_did: string;
+    platform: string;
+    mode: BridgeMode;
+    status: string;
+    context_id: string;
+  };
+  bridgeEvaluateTrust(
+    isBridged: boolean,
+    isNativeTransport: boolean,
+    shadowStatus: ShadowStatus,
+  ): number;
+  bridgeCreateShadow(
+    bridgeId: string,
+    platformHandle: string,
+    bridgeMode: BridgeMode,
+    contextId: string | undefined,
+  ): {
+    shadow_id: string;
+    platform_handle: string;
+    bridge_id: string;
+    attributed_role: string;
+    provenance_status: ShadowStatus;
+  };
+
+  // Discovery
+  discoveryParseAddress(address: string): string;
+  discoveryCreateQuery(
+    capabilities: string[] | undefined,
+    keywords: string[] | undefined,
+    minHistorySecs: number | undefined,
+  ): string;
+  discoveryNormalizeAddress(address: string): string;
+  contextDiscover(query: string): Promise<string>;
+
+  // Provenance
+  evaluateProvenanceQuality(
+    sourceContext: string | undefined,
+    sourceType: string,
+    contextState: string,
+    counterparties: string[] | undefined,
+  ): Promise<number>;
+  provenanceAttach(
+    sourceContextId: string,
+    sourceType: string,
+    memoryScope: string,
+    members: string[],
+    targetContextId: string,
+    existingChainDepth: number | undefined,
+  ): string;
+  provenanceCheckChainDepth(chainDepth: number, maxDepth: number | undefined): boolean;
+
+  // Sync
+  syncClassifyOffline(lastRelayContact: number, now: number): string;
+  syncGetPolicy(): {
+    tier_1_threshold_secs: number;
+    tier_2_threshold_secs: number;
+    gap_timeout_secs: number;
+    reorder_buffer_capacity: number;
+    max_sequential_commits: number;
+    commit_process_timeout_secs: number;
+    sender_key_timeout_secs: number;
+    reconnection_dedup_window_secs: number;
+  };
+
+  // Identity Advanced
+  identityCreateWithAgentKey(custody: string): Promise<BridgeIdentityHandle>;
+  identityAddAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle>;
+  identityRotateAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle>;
+  identityRemoveAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle>;
+  identityMigrate(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle>;
+  identityAttestDevice(did: string): Promise<string>;
+  identityVerifyDeviceAttestation(did: string, tokenBase64: string): Promise<boolean>;
 
   // Lifecycle
   version(): string;

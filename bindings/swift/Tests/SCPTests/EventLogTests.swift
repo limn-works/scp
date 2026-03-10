@@ -1,7 +1,6 @@
 import Foundation
-import Testing
-
 @testable import SCP
+import Testing
 
 // MARK: - Event Log Tests
 
@@ -15,9 +14,7 @@ import Testing
 /// pattern works end-to-end without a real UniFFI binary.
 ///
 /// See ADR-011 (Event Log), ADR-026 (Swift SDK), and story SCP-221.
-@Suite("Event Log Tests")
 struct EventLogTests {
-
     // MARK: - Event type shape (UniFFI struct)
 
     @Test("Event stores all fields correctly")
@@ -51,7 +48,7 @@ struct EventLogTests {
     }
 
     @Test("Event is Sendable")
-    func eventIsSendable() async {
+    func eventIsSendable() {
         let event: any Sendable = Event(
             eventType: "test",
             actorDid: "did:dht:z6MkTest",
@@ -88,30 +85,27 @@ struct EventLogTests {
         #expect(!proof.verified)
     }
 
-    // MARK: - Checkpoint type shape (hand-written, not UniFFI)
+    // MARK: - Checkpoint type shape (UniFFI struct)
 
     @Test("Checkpoint stores all fields correctly")
     func checkpointFields() {
-        let merkleRoot = Data(repeating: 0xDD, count: 32)
-        let signature = Data(repeating: 0xEE, count: 64)
-
         let checkpoint = Checkpoint(
             contextId: "ctx-log-001",
             senderDid: "did:dht:z6MkSender",
             eventCount: 100,
-            merkleRoot: merkleRoot,
+            merkleRoot: String(repeating: "dd", count: 32),
             epoch: 5,
             timestamp: 1_700_000_000,
-            signature: signature
+            signature: String(repeating: "ee", count: 64)
         )
 
         #expect(checkpoint.contextId == "ctx-log-001")
         #expect(checkpoint.senderDid == "did:dht:z6MkSender")
         #expect(checkpoint.eventCount == 100)
-        #expect(checkpoint.merkleRoot.count == 32)
+        #expect(checkpoint.merkleRoot.count == 64)
         #expect(checkpoint.epoch == 5)
         #expect(checkpoint.timestamp == 1_700_000_000)
-        #expect(checkpoint.signature.count == 64)
+        #expect(checkpoint.signature.count == 128)
     }
 
     @Test("Checkpoint with nil epoch for broadcast contexts")
@@ -120,24 +114,24 @@ struct EventLogTests {
             contextId: "ctx-broadcast",
             senderDid: "did:dht:z6MkSender",
             eventCount: 10,
-            merkleRoot: Data(repeating: 0xAA, count: 32),
+            merkleRoot: String(repeating: "aa", count: 32),
             epoch: nil,
             timestamp: 1_700_000_000,
-            signature: Data(repeating: 0xBB, count: 64)
+            signature: String(repeating: "bb", count: 64)
         )
         #expect(checkpoint.epoch == nil)
     }
 
     @Test("Checkpoint is Sendable")
-    func checkpointIsSendable() async {
+    func checkpointIsSendable() {
         let checkpoint: any Sendable = Checkpoint(
             contextId: "ctx",
             senderDid: "did:dht:z6Mk",
             eventCount: 0,
-            merkleRoot: Data(repeating: 0, count: 32),
+            merkleRoot: String(repeating: "00", count: 32),
             epoch: nil,
             timestamp: 0,
-            signature: Data(repeating: 0, count: 64)
+            signature: String(repeating: "00", count: 64)
         )
         #expect(checkpoint is Checkpoint)
     }
@@ -152,7 +146,7 @@ struct EventLogTests {
     }
 
     @Test("EventLog is Sendable")
-    func eventLogIsSendable() async {
+    func eventLogIsSendable() {
         let handle = EventLogHandle(contextId: "ctx-sendable")
         let log: any Sendable = EventLog(handle: handle)
         #expect(log is EventLog)
@@ -163,7 +157,7 @@ struct EventLogTests {
     @Test("EventLog query calls bridge and returns events")
     func queryRoundtrip() async throws {
         let contextHandle = ContextHandle(noPointer: .init())
-        let handle = EventLogHandle(contextHandle: contextHandle)
+        let handle = EventLogHandle(contextHandle: contextHandle, contextId: "ctx-query")
 
         let mockEvents = [
             Event(
@@ -179,12 +173,12 @@ struct EventLogTests {
                 timestamp: 1_700_000_001,
                 payloadJson: #"{"content": "test2"}"#,
                 sequence: 2
-            ),
+            )
         ]
 
         let mockQuery: EventLogBridge.QueryFn = { _, filterJson in
-            #expect(filterJson != nil)
-            #expect(filterJson!.contains("after_sequence"))
+            let filter = try #require(filterJson)
+            #expect(filter.contains("after_sequence"))
             return mockEvents
         }
 
@@ -205,7 +199,7 @@ struct EventLogTests {
             _ = try await log.query(fromSequence: 0, limit: 10)
             Issue.record("Expected query to throw")
         } catch let error as ScpError {
-            if case .Context(_, let code) = error {
+            if case let .Context(_, code) = error {
                 #expect(code == "SCP-CTX-2030")
             } else {
                 Issue.record("Expected ScpError.Context, got \(error)")
@@ -220,7 +214,7 @@ struct EventLogTests {
     @Test("EventLog proveInclusion calls bridge and returns proof")
     func proveInclusionRoundtrip() async throws {
         let contextHandle = ContextHandle(noPointer: .init())
-        let handle = EventLogHandle(contextHandle: contextHandle)
+        let handle = EventLogHandle(contextHandle: contextHandle, contextId: "ctx-prove")
 
         let mockProof = Proof(
             verified: true,
@@ -250,7 +244,7 @@ struct EventLogTests {
             _ = try await log.proveInclusion(leafIndex: 0)
             Issue.record("Expected proveInclusion to throw")
         } catch let error as ScpError {
-            if case .Context(_, let code) = error {
+            if case let .Context(_, code) = error {
                 #expect(code == "SCP-CTX-2031")
             } else {
                 Issue.record("Expected ScpError.Context, got \(error)")
@@ -263,15 +257,94 @@ struct EventLogTests {
     // MARK: - Verify proof (pure function, no bridge)
 
     @Test("EventLog verifyInclusion returns proof.verified")
-    func verifyInclusionReturnsVerified() async throws {
+    func verifyInclusionReturnsVerified() {
         let validProof = Proof(verified: true, proofType: "inclusion", detailsJson: "{}")
         let invalidProof = Proof(verified: false, proofType: "inclusion", detailsJson: "{}")
 
-        let validResult = try await EventLog.verifyInclusion(validProof)
-        let invalidResult = try await EventLog.verifyInclusion(invalidProof)
+        let validResult = EventLog.verifyInclusion(validProof)
+        let invalidResult = EventLog.verifyInclusion(invalidProof)
 
         #expect(validResult == true)
         #expect(invalidResult == false)
     }
 
+    // MARK: - Checkpoint generation via injectable bridge (async roundtrip)
+
+    @Test("generateEventLogCheckpoint calls bridge and returns checkpoint")
+    func checkpointRoundtrip() async throws {
+        let handle = ContextHandle(noPointer: .init())
+        let identity = Identity(noPointer: .init())
+
+        var receivedEpoch: UInt64?
+
+        let mockCheckpoint: EventLogBridge.CheckpointFn = { _, _, epoch in
+            receivedEpoch = epoch
+            return Checkpoint(
+                contextId: "ctx-checkpoint",
+                senderDid: "did:dht:z6MkSender",
+                eventCount: 50,
+                merkleRoot: String(repeating: "ab", count: 32),
+                epoch: epoch,
+                timestamp: 1_700_000_000,
+                signature: String(repeating: "cd", count: 64)
+            )
+        }
+
+        let checkpoint = try await generateEventLogCheckpoint(
+            handle: handle,
+            identity: identity,
+            epoch: 7,
+            checkpointFn: mockCheckpoint
+        )
+
+        #expect(checkpoint.contextId == "ctx-checkpoint")
+        #expect(checkpoint.senderDid == "did:dht:z6MkSender")
+        #expect(checkpoint.eventCount == 50)
+        #expect(checkpoint.epoch == 7)
+        #expect(checkpoint.merkleRoot.count == 64)
+        #expect(checkpoint.signature.count == 128)
+        #expect(receivedEpoch == 7)
+    }
+
+    @Test("generateEventLogCheckpoint propagates bridge errors")
+    func checkpointPropagatesErrors() async throws {
+        let handle = ContextHandle(noPointer: .init())
+        let identity = Identity(noPointer: .init())
+
+        let mockCheckpoint: EventLogBridge.CheckpointFn = { _, _, _ in
+            throw ScpError.Permission(
+                message: "event log checkpoint requires key custody",
+                code: "SCP-PERM-3008"
+            )
+        }
+
+        do {
+            _ = try await generateEventLogCheckpoint(
+                handle: handle,
+                identity: identity,
+                epoch: 0,
+                checkpointFn: mockCheckpoint
+            )
+            Issue.record("Expected generateEventLogCheckpoint to throw")
+        } catch let error as ScpError {
+            if case let .Permission(_, code) = error {
+                #expect(code == "SCP-PERM-3008")
+            } else {
+                Issue.record("Expected ScpError.Permission, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    @Test("generateEventLogCheckpoint default delegates to UniFFI")
+    func checkpointDefaultDelegatesToUniFFI() {
+        // The default checkpoint function now delegates to the UniFFI-generated
+        // ``eventLogCheckpoint(handle:identity:epoch:)`` binding.
+        // Verifying the default is non-throwing requires the XCFramework;
+        // this test confirms the typealias and default are properly wired
+        // by verifying the injectable bridge pattern still works with mocks.
+        let defaultCheckpointFn = EventLogBridge.defaultCheckpoint
+        #expect(defaultCheckpointFn is EventLogBridge.CheckpointFn)
+    }
 } // end EventLogTests

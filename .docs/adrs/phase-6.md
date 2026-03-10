@@ -4,7 +4,7 @@
 **Phase goal:** Android platform, Kotlin SDK, scale hardening, security audit, advanced governance, offline strategy.
 **Timeline:** Weeks 21+
 
-**Note:** Phase 6 follows Phases 1-5 implementation. All ADRs in this phase — ADR-027 (Android), ADR-028 (Kotlin), ADR-029 (Offline/Sync), ADR-030 (Event Log Pruning), and ADR-031 (Multi-Admin Governance) — are Decided.
+**Note:** Phase 6 follows Phases 1-5 implementation. All ADRs in this phase — ADR-027 (Android), ADR-028 (Kotlin), ADR-029 (Offline/Sync), ADR-030 (Event Log Pruning), ADR-031 (Multi-Admin Governance), and ADR-038 (Content Access Key Layer) — are Decided.
 
 **Dependencies between ADRs:**
 
@@ -18,7 +18,8 @@ Phase 1-5 ADRs
        │
        ├── ADR-029 (Offline/Sync) <── Phase 1-2 implementation + empirical data
        ├── ADR-030 (Event Log Pruning) <── Phase 2 event log + empirical data
-       └── ADR-031 (Multi-Admin Governance) <── Phase 2 UCAN + single-admin governance
+       ├── ADR-031 (Multi-Admin Governance) <── Phase 2 UCAN + single-admin governance
+       └── ADR-038 (Content Access Key Layer) <── ADR-007 (Sender Keys) + ADR-031 (Governance)
 ```
 
 ---
@@ -2610,10 +2611,22 @@ pub enum GovernanceAction {
     /// Not DID-targeted — rotates keys for all members.
     /// Use after compromise detection, bulk revocations, or periodic hygiene.
     RotateContentKeys { reason: Option<String> },
+    /// Block an author in a broadcast context (§5.14.8).
+    /// Removes the author from the broadcast context, destroying their sender
+    /// key and preventing future publishing. Requires governance approval.
+    BlockAuthor { did: DID, reason: Option<String> },
     /// Deadlock recovery: modify governance parameters without changing model type.
     /// Uses fallback quorum (majority-of-active) regardless of original model.
     /// See section 10 (Deadlock Recovery).
     ReconfigureGovernance { changes: Vec<GovernanceReconfigAction>, justification: DeadlockJustification },
+    /// Set or update the context's economic policy (§19.3, ADR-033).
+    /// Requires the economic policy to not be locked.
+    SetEconomicPolicy { policy: EconomicPolicy },
+    /// Approve a spending authorization for a member (§19.5, ADR-033).
+    ApproveSpend { spender: DID, amount: Amount, purpose: String },
+    /// Lock the context's economic policy, making it immutable (§19.3).
+    /// Once locked, the economic policy cannot be changed through governance.
+    LockEconomicPolicy,
 }
 
 /// Scope of content access revocation.
@@ -2860,7 +2873,7 @@ UCAN delegation chains require a single root issuer (ADR-016 step 4). Distributi
 2. **`GovernanceProposal` struct and `GovernanceAction` enum:**
 
    - `GovernanceProposal` with `proposal_id`, `context_id`, `proposer_did`, `action`, `status`, `created_at`, `voting_deadline`, `approvals`, `rejections`, `created_at_epoch`.
-   - `GovernanceAction` with all 24 variants listed in section 3 (including content access actions: RevokeReadAccess, RestoreReadAccess, RevokeWriteAccess, RestoreWriteAccess, RotateContentKeys) and `RevocationScope` enum (Full, FutureOnly).
+   - `GovernanceAction` with all 28 variants listed in section 3 (including content access actions: RevokeReadAccess, RestoreReadAccess, RevokeWriteAccess, RestoreWriteAccess, RotateContentKeys; broadcast action: BlockAuthor; economic actions: SetEconomicPolicy, ApproveSpend, LockEconomicPolicy) and `RevocationScope` enum (Full, FutureOnly).
    - `ProposalStatus` with `Pending`, `Approved`, `Rejected`, `Expired`, `Cancelled`, `Invalidated`.
    - Proposals are persisted to `ProtocolStore` on creation and on every status change.
 

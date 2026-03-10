@@ -74,12 +74,16 @@
 
 pub mod context;
 pub mod custody;
+pub mod discovery;
 pub mod error;
 pub mod event_log;
 pub mod identity;
 pub mod manager;
+pub mod provenance;
 pub mod runtime;
 pub mod storage;
+pub mod sync;
+pub mod time;
 pub mod tools;
 pub mod transport;
 pub mod trust;

@@ -44,9 +44,12 @@
 - CRITICAL: scp-platform testing feature in production deps
 - HIGH: transport_connect accepts ANY URL scheme; did:key hex not gated
 
-### FFI Bridge -- WASM (`crates/scp-ffi/wasm/`) -- PR#86 + PR#127 R2
+### FFI Bridge -- WASM (`crates/scp-ffi/wasm/`) -- PR#86 + PR#127 R2 + PR#479
 - HIGH: did:key hex in production; runtime.rs reimplements scp-core logic
 - GOOD: Full 11-step UCAN validation; RED-105 prefix collision protection
+- CRITICAL (UNFIXED): compute_event_hash uses SHA-256(0x00||event_type||context_id||timestamp) vs native SHA-256(0x00||MessagePack(full_event)). Merkle roots never match cross-platform. Conformance tests only verify tree structure, not leaf hash computation.
+- FIXED (PR#479 815461c0): governance authorization -- initiator_did + member_has_capability + required_capability_for_action for all 24 variants
+- FIXED (PR#479 02b47eac): IdentityEntry Zeroize+ZeroizeOnDrop, Zeroizing<[u8;32]>, no Clone. Minor: Debug derived on private struct prints raw bytes via Zeroizing
 
 ### FFI Bridge -- NAPI (`crates/scp-ffi/napi/`) -- PR#86 + PR#127
 - CRITICAL: ucan_mint uses [0u8; 64] placeholder zero signature

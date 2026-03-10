@@ -8,7 +8,7 @@ license.workspace = true
 
 [lib]
 name = "scp_ffi_uniffi"
-crate-type = ["cdylib", "staticlib"]
+crate-type = ["cdylib", "staticlib", "lib"]
 
 [[bin]]
 name = "uniffi-bindgen"
@@ -51,6 +51,13 @@ z-base-32 = { workspace = true }
 [dev-dependencies]
 # Tests need InMemoryKeyCustody — enable the `testing` feature for dev-deps.
 scp-platform = { path = "../../scp-platform", features = ["testing"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json = { workspace = true }
+
+[[test]]
+name = "e2e_bridge"
+path = "tests/e2e_bridge.rs"
+required-features = ["allow_in_memory_custody"]
 
 [build-dependencies]
 uniffi = { version = "0.29", features = ["build", "tokio"] }

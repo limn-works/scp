@@ -1,7 +1,6 @@
 import Foundation
-import Testing
-
 @testable import SCP
+import Testing
 
 // MARK: - Conformance Tests
 
@@ -19,14 +18,12 @@ import Testing
 ///
 /// See `.docs/scaffold/shared.md` section "Conformance Testing" and story
 /// SCP-102.
-@Suite("Conformance Tests")
 struct ConformanceTests {
-
     // MARK: - ConformanceFixture model
 
     /// A single conformance test fixture, matching the JSON format defined
     /// in `.docs/scaffold/shared.md`.
-    private struct ConformanceFixture: Sendable {
+    private struct ConformanceFixture {
         let testId: String
         let category: String
         let description: String
@@ -37,42 +34,53 @@ struct ConformanceTests {
 
     // MARK: - Operation dispatcher
 
-    /// Maps an operation string to a Swift SDK call and returns a result
-    /// dictionary for comparison against `expected`.
-    ///
-    /// This dispatcher handles the conformance test categories:
-    /// - `identity_create` -> `Identity.create(custody:)` (removed -- Identity is now UniFFI class)
-    /// - `identity_load` -> `Identity.load(did:)` (removed -- Identity is now UniFFI class)
-    /// - `ucan_validate` -> `validate(encoded:contextId:presenterDid:)`
-    /// - `ucan_mint` -> `mint(issuerDid:audienceDid:capabilities:...)`
-    /// - `ucan_revoke` -> `revoke(encoded:revokerDid:)`
-    /// - `transport_connect` -> `connectTransport(config:)`
-    /// - `transport_status` -> `transportStatus()`
-    /// - `event_log_query` -> `EventLog.query(fromSequence:limit:)`
-    /// - `event_log_prove` -> `EventLog.proveInclusion(leafIndex:)`
-    /// - `event_log_verify` -> `EventLog.verifyInclusion(_:)`
-    ///
-    /// Returns a dictionary with result keys, or an "error" key with the
-    /// error code if the operation threw.
+    // Maps an operation string to a Swift SDK call and returns a result
+    // dictionary for comparison against `expected`.
+    //
+    // This dispatcher handles the conformance test categories:
+    // - `identity_create` -> `Identity.create(custody:)` (removed -- Identity is now UniFFI class)
+    // - `identity_load` -> `Identity.load(did:)` (removed -- Identity is now UniFFI class)
+    // - `ucan_validate` -> `validate(encoded:contextId:presenterDid:)`
+    // - `ucan_mint` -> `mint(issuerDid:audienceDid:capabilities:...)`
+    // - `ucan_revoke` -> `revoke(encoded:revokerDid:)`
+    // - `transport_connect` -> `connectTransport(config:)`
+    // - `transport_status` -> `transportStatus()`
+    // - `event_log_query` -> `EventLog.query(fromSequence:limit:)`
+    // - `event_log_prove` -> `EventLog.proveInclusion(leafIndex:)`
+    // - `event_log_verify` -> `EventLog.verifyInclusion(_:)`
+    //
+    // Returns a dictionary with result keys, or an "error" key with the
+    // error code if the operation threw.
+    // swiftlint:disable:next cyclomatic_complexity function_body_length
     private func dispatch(
         operation: String,
         input: [String: String]
     ) async -> [String: String] {
         switch operation {
-
         case "ucan_validate":
             let encoded = input["encoded"] ?? ""
             let contextId = input["context_id"] ?? ""
             let presenterDid = input["presenter_did"] ?? ""
+            let handle = ContextHandle(noPointer: .init())
+            // Inject a mock validateFn to avoid calling the real UniFFI bridge
+            // (which would crash on the nil-pointer handle).
+            let mockValidate: UcanBridge.ValidateFn = { _, _, _, _, _ in
+                throw ScpError.Validation(
+                    message: "Conformance stub: no real Rust runtime",
+                    code: "SCP-VALID-7999"
+                )
+            }
             do {
                 let result = try await validate(
                     encoded: encoded,
+                    handle: handle,
                     contextId: contextId,
-                    presenterDid: presenterDid
+                    presenterDid: presenterDid,
+                    validateFn: mockValidate
                 )
                 return [
                     "is_valid": String(result.isValid),
-                    "failure_reason": result.failureReason ?? "",
+                    "failure_reason": result.failureReason ?? ""
                 ]
             } catch let error as ScpError {
                 return ["error": errorCode(error)]
@@ -83,15 +91,24 @@ struct ConformanceTests {
         case "ucan_mint":
             let issuer = input["issuer_did"] ?? ""
             let audience = input["audience_did"] ?? ""
+            let handle = ContextHandle(noPointer: .init())
+            let mockMint: UcanBridge.MintFn = { _, _, _ in
+                throw ScpError.Validation(
+                    message: "Conformance stub: no real Rust runtime",
+                    code: "SCP-VALID-7999"
+                )
+            }
             do {
                 let token = try await mint(
+                    handle: handle,
                     issuerDid: issuer,
                     audienceDid: audience,
-                    capabilities: []
+                    capabilities: [],
+                    mintFn: mockMint
                 )
                 return [
                     "issuer": token.issuer(),
-                    "audience": token.audience(),
+                    "audience": token.audience()
                 ]
             } catch let error as ScpError {
                 return ["error": errorCode(error)]
@@ -102,8 +119,20 @@ struct ConformanceTests {
         case "ucan_revoke":
             let encoded = input["encoded"] ?? ""
             let revoker = input["revoker_did"] ?? ""
+            let handle = ContextHandle(noPointer: .init())
+            let mockRevoke: UcanBridge.RevokeFn = { _, _ in
+                throw ScpError.Validation(
+                    message: "Conformance stub: no real Rust runtime",
+                    code: "SCP-VALID-7999"
+                )
+            }
             do {
-                try await revoke(encoded: encoded, revokerDid: revoker)
+                try await revoke(
+                    handle: handle,
+                    encoded: encoded,
+                    revokerDid: revoker,
+                    revokeFn: mockRevoke
+                )
                 return ["status": "revoked"]
             } catch let error as ScpError {
                 return ["error": errorCode(error)]
@@ -114,8 +143,14 @@ struct ConformanceTests {
         case "transport_connect":
             let relayUrl = input["relay_url"] ?? ""
             let config = TransportConfig(relayUrls: relayUrl.isEmpty ? [] : [relayUrl])
+            let mockConnect: TransportBridge.ConnectFn = { _ in
+                throw ScpError.Transport(
+                    message: "Conformance stub: no real Rust runtime",
+                    code: "SCP-TRANS-5999"
+                )
+            }
             do {
-                try await connectTransport(config: config)
+                try await connectTransport(config: config, connectFn: mockConnect)
                 return ["status": "connected"]
             } catch let error as ScpError {
                 return ["error": errorCode(error)]
@@ -124,8 +159,17 @@ struct ConformanceTests {
             }
 
         case "transport_status":
+            let mockStatus: TransportBridge.StatusFn = { _ in
+                throw ScpError.Transport(
+                    message: "Conformance stub: no real Rust runtime",
+                    code: "SCP-TRANS-5999"
+                )
+            }
             do {
-                let status = try await transportStatus()
+                let status = try await queryTransportStatus(
+                    manager: TransportManager(noPointer: .init()),
+                    statusFn: mockStatus
+                )
                 // TransportStatus is a struct with connected, relayUrl, latencyMs
                 return ["connected": String(status.connected)]
             } catch let error as ScpError {
@@ -167,14 +211,8 @@ struct ConformanceTests {
                 proofType: "inclusion",
                 detailsJson: "{}"
             )
-            do {
-                let valid = try await EventLog.verifyInclusion(proof)
-                return ["is_valid": String(valid)]
-            } catch let error as ScpError {
-                return ["error": errorCode(error)]
-            } catch {
-                return ["error": "unknown"]
-            }
+            let valid = EventLog.verifyInclusion(proof)
+            return ["is_valid": String(valid)]
 
         default:
             return ["error": "unsupported_operation"]
@@ -184,13 +222,13 @@ struct ConformanceTests {
     /// Extracts the machine-readable error code from an ``ScpError``.
     private func errorCode(_ error: ScpError) -> String {
         switch error {
-        case .Identity(_, let code): code
-        case .Context(_, let code): code
-        case .Permission(_, let code): code
-        case .Crypto(_, let code): code
-        case .Transport(_, let code): code
-        case .Tool(_, let code): code
-        case .Validation(_, let code): code
+        case let .Identity(_, code): code
+        case let .Context(_, code): code
+        case let .Permission(_, code): code
+        case let .Crypto(_, code): code
+        case let .Transport(_, code): code
+        case let .Tool(_, code): code
+        case let .Validation(_, code): code
         }
     }
 
@@ -216,7 +254,7 @@ struct ConformanceTests {
         let possiblePaths = [
             "tests/conformance",
             "../../tests/conformance",
-            "../../../../tests/conformance",
+            "../../../../tests/conformance"
         ]
 
         for relativePath in possiblePaths {
@@ -261,10 +299,11 @@ struct ConformanceTests {
             input: [
                 "encoded": "test.token.sig",
                 "context_id": "ctx-1",
-                "presenter_did": "did:dht:z6MkPresenter",
+                "presenter_did": "did:dht:z6MkPresenter"
             ]
         )
-        #expect(result["error"] == "SCP-PERM-3001")
+        // validate() catches errors internally and returns is_valid: false
+        #expect(result["is_valid"] == "false")
     }
 
     @Test("Conformance runner dispatches ucan_mint operation")
@@ -273,10 +312,11 @@ struct ConformanceTests {
             operation: "ucan_mint",
             input: [
                 "issuer_did": "did:dht:z6MkIssuer",
-                "audience_did": "did:dht:z6MkAudience",
+                "audience_did": "did:dht:z6MkAudience"
             ]
         )
-        #expect(result["error"] == "SCP-PERM-3002")
+        // Mock bridge throws SCP-VALID-7999 (no real Rust runtime)
+        #expect(result["error"] == "SCP-VALID-7999")
     }
 
     @Test("Conformance runner dispatches ucan_revoke operation")
@@ -285,10 +325,11 @@ struct ConformanceTests {
             operation: "ucan_revoke",
             input: [
                 "encoded": "test.token.sig",
-                "revoker_did": "did:dht:z6MkRevoker",
+                "revoker_did": "did:dht:z6MkRevoker"
             ]
         )
-        #expect(result["error"] == "SCP-PERM-3003")
+        // Mock bridge throws SCP-VALID-7999 (no real Rust runtime)
+        #expect(result["error"] == "SCP-VALID-7999")
     }
 
     @Test("Conformance runner dispatches transport_connect operation")
@@ -297,7 +338,8 @@ struct ConformanceTests {
             operation: "transport_connect",
             input: ["relay_url": "wss://relay.test/scp/v1"]
         )
-        #expect(result["error"] == "SCP-TRANS-5001")
+        // Mock bridge throws SCP-TRANS-5999 (no real Rust runtime)
+        #expect(result["error"] == "SCP-TRANS-5999")
     }
 
     @Test("Conformance runner dispatches transport_status operation")
@@ -306,7 +348,8 @@ struct ConformanceTests {
             operation: "transport_status",
             input: [:]
         )
-        #expect(result["error"] == "SCP-TRANS-5002")
+        // Mock bridge throws SCP-TRANS-5999 (no real Rust runtime)
+        #expect(result["error"] == "SCP-TRANS-5999")
     }
 
     @Test("Conformance runner dispatches event_log_query operation")
@@ -333,7 +376,8 @@ struct ConformanceTests {
             operation: "event_log_verify",
             input: [:]
         )
-        #expect(result["error"] == "SCP-CTX-2032")
+        // verifyInclusion is a pure function — returns is_valid, not an error
+        #expect(result["is_valid"] == "false")
     }
 
     @Test("Conformance runner returns error for unsupported operation")
@@ -344,7 +388,11 @@ struct ConformanceTests {
         )
         #expect(result["error"] == "unsupported_operation")
     }
+} // end ConformanceTests
 
+// MARK: - Fixture Loading & Model Tests
+
+extension ConformanceTests {
     @Test("Conformance fixture loader handles missing directory gracefully")
     func fixtureLoaderHandlesMissingDirectory() {
         let fixtures = loadFixtures()
@@ -375,18 +423,19 @@ struct ConformanceTests {
     func resultComparisonMatchesExpected() async {
         // When the bridge is live, the dispatcher should return results
         // that match the fixture's expected values. With stubs, we verify
-        // the error code matches what we'd document in fixtures.
+        // the mock behavior matches what we expect.
         let fixture = ConformanceFixture(
             testId: "ucan-validate-stub-001",
             category: "ucan",
-            description: "Stub returns bridge-unavailable error",
+            description: "Stub returns validation failure (mock bridge)",
             operation: "ucan_validate",
             input: [
                 "encoded": "test.token.sig",
                 "context_id": "ctx-1",
-                "presenter_did": "did:dht:z6MkPresenter",
+                "presenter_did": "did:dht:z6MkPresenter"
             ],
-            expected: ["error": "SCP-PERM-3001"]
+            // validate() catches errors internally → returns is_valid: false
+            expected: ["is_valid": "false"]
         )
 
         let result = await dispatch(operation: fixture.operation, input: fixture.input)
@@ -399,5 +448,4 @@ struct ConformanceTests {
             )
         }
     }
-
-} // end ConformanceTests
+}

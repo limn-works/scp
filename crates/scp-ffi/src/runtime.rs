@@ -256,9 +256,22 @@ where
 ///
 /// Governance vote signature verification is not yet wired at the FFI layer —
 /// the no-op resolver returns `None` for all DIDs, which causes vote
-/// verification to be skipped (permissive mode).
+/// verification to be skipped (permissive mode). A warning is emitted on
+/// first invocation to alert operators.
 fn noop_key_resolver() -> scp_core::context::governance::KeyResolver {
-    Arc::new(|_: &scp_identity::DID| -> Option<ed25519_dalek::VerifyingKey> { None })
+    Arc::new(
+        |_: &scp_identity::DID| -> Option<ed25519_dalek::VerifyingKey> {
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| {
+                tracing::warn!(
+                    "noop_key_resolver: returning None for all DIDs — \
+                 governance vote signature verification is skipped. \
+                 Wire a production KeyResolver before deploying."
+                );
+            });
+            None
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -330,12 +343,15 @@ impl ContextCryptoProvider for NoOpCryptoProvider {
         &self,
         _context_id: &[u8; 32],
         _sender_did: &str,
-        payload: &[u8],
+        _payload: &[u8],
         _epoch: u64,
         _sequence: u64,
     ) -> Result<Vec<u8>, ContextError> {
-        // Return payload as-is (no real encryption at bridge layer).
-        Ok(payload.to_vec())
+        Err(ContextError::CryptoFailed(
+            "NoOpCryptoProvider::encrypt_message is not a real implementation — \
+             wire a production crypto provider for MLS/sender-key encryption"
+                .to_owned(),
+        ))
     }
 }
 

@@ -26,9 +26,7 @@
 //! See ADR-034 in `.docs/adrs/phase-4.md` for the full rationale.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-
-use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::error::ScpWasmError;
 use crate::runtime::{
@@ -274,16 +272,19 @@ struct PerContextState {
     tool_handlers: ToolHandlerMap,
     /// Event log (Merkle tree).
     event_log: WasmEventLog,
-    /// UCAN revocation set (token CIDs).
+    /// UCAN revocation set (token CIDs). Capped at [`WASM_REVOKED_TOKENS_CAP`].
     revoked_tokens: HashSet<String>,
-    /// UCAN nonce replay tracker.
-    seen_nonces: HashSet<String>,
+    /// UCAN nonce replay tracker. Stores `(nonce, insertion_timestamp_ms)`.
+    /// Evicts entries older than [`WASM_NONCE_TTL_MS`] when exceeding [`WASM_NONCE_CAP`].
+    seen_nonces: HashMap<String, f64>,
     /// Members indexed by DID.
     members: HashMap<String, MemberEntry>,
-    /// Receive buffer for events.
-    event_buffer: Vec<WasmContextEvent>,
-    /// Executed proposal IDs (replay protection).
-    executed_proposals: HashSet<String>,
+    /// Receive buffer for events. Capped at [`WASM_EVENT_BUFFER_CAP`] (FIFO overflow).
+    /// Uses `VecDeque` for O(1) `pop_front` instead of `Vec::remove(0)` O(n) shift.
+    event_buffer: VecDeque<WasmContextEvent>,
+    /// Executed proposal IDs with insertion timestamps (replay protection).
+    /// Evicts entries older than [`WASM_PROPOSAL_TTL_MS`] when exceeding [`WASM_PROPOSAL_CAP`].
+    executed_proposals: HashMap<String, f64>,
     /// Write-revoked member DIDs (§9.17, ADR-038).
     write_revoked_members: HashSet<String>,
     /// Read-revoked member DIDs (ADR-038, §9.17).
@@ -322,7 +323,7 @@ struct WasmToolSession {
 impl WasmToolSession {
     /// Returns `true` if this session has expired.
     fn is_expired(&self) -> bool {
-        let now = js_sys::Date::now();
+        let now = crate::time::now_ms();
         (now - self.created_at_ms) >= self.ttl_ms
     }
 }
@@ -330,7 +331,40 @@ impl WasmToolSession {
 /// Maximum concurrent sessions per calling context (spec section 6.2.1).
 const WASM_SESSION_CAP_PER_CALLER: usize = 5;
 
+/// Maximum concurrent sessions across all callers (global cap).
+const WASM_SESSION_GLOBAL_CAP: usize = 100;
+
+/// Maximum number of nonces tracked per context before triggering eviction.
+const WASM_NONCE_CAP: usize = 10_000;
+
+/// Nonce TTL in milliseconds (24 hours — UCAN max lifetime per ADR-016 step 11).
+const WASM_NONCE_TTL_MS: f64 = 24.0 * 60.0 * 60.0 * 1000.0;
+
+/// Nonce freshness tolerance: 5 minutes in milliseconds (spec section 9.14).
+/// Matches native `NonceTracker::NONCE_FRESHNESS_TOLERANCE_MS`.
+const WASM_NONCE_FRESHNESS_TOLERANCE_MS: f64 = 5.0 * 60.0 * 1000.0;
+
+/// Maximum number of revoked token CIDs per context.
+const WASM_REVOKED_TOKENS_CAP: usize = 100_000;
+
+/// Maximum number of executed proposals tracked per context before triggering eviction.
+const WASM_PROPOSAL_CAP: usize = 10_000;
+
+/// Executed proposal TTL in milliseconds (24 hours).
+const WASM_PROPOSAL_TTL_MS: f64 = 24.0 * 60.0 * 60.0 * 1000.0;
+
+/// Maximum events in the receive buffer. Matches `PyO3` channel capacity.
+const WASM_EVENT_BUFFER_CAP: usize = 1000;
+
 impl PerContextState {
+    /// Pushes an event to the receive buffer, evicting the oldest if at capacity.
+    fn push_event(&mut self, event: WasmContextEvent) {
+        if self.event_buffer.len() >= WASM_EVENT_BUFFER_CAP {
+            self.event_buffer.pop_front();
+        }
+        self.event_buffer.push_back(event);
+    }
+
     /// Returns `true` if the member has the given capability string.
     ///
     /// Mirrors `ContextRoleState::member_has_capability` in scp-core. In the
@@ -378,6 +412,59 @@ impl PerContextState {
 /// call these synchronously within `future_to_promise`).
 pub struct WasmContextManager {
     contexts: HashMap<String, PerContextState>,
+}
+
+// ---------------------------------------------------------------------------
+// Import validation helpers
+// ---------------------------------------------------------------------------
+
+/// Validates a string field from imported (untrusted) data.
+fn validate_imported_string(
+    value: &str,
+    field_name: &str,
+    max_len: usize,
+) -> Result<(), ScpWasmError> {
+    if value.is_empty() {
+        return Err(ScpWasmError::Context {
+            message: format!("{field_name} must not be empty"),
+            code: "SCP-CTX-2032".to_owned(),
+        });
+    }
+    if value.len() > max_len {
+        return Err(ScpWasmError::Context {
+            message: format!(
+                "{field_name} exceeds maximum length ({} > {max_len})",
+                value.len()
+            ),
+            code: "SCP-CTX-2032".to_owned(),
+        });
+    }
+    if value.chars().any(char::is_control) {
+        return Err(ScpWasmError::Context {
+            message: format!("{field_name} contains control characters"),
+            code: "SCP-CTX-2032".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Validates a DID string from imported (untrusted) data.
+fn validate_imported_did(value: &str, field_name: &str) -> Result<(), ScpWasmError> {
+    validate_imported_string(value, field_name, 512)?;
+    if !value.starts_with("did:") {
+        return Err(ScpWasmError::Context {
+            message: format!("{field_name} must start with 'did:': got '{value}'"),
+            code: "SCP-CTX-2032".to_owned(),
+        });
+    }
+    // Must have at least did:method:id (3 colon-separated parts)
+    if value.splitn(4, ':').count() < 3 {
+        return Err(ScpWasmError::Context {
+            message: format!("{field_name} must have format 'did:method:id': got '{value}'"),
+            code: "SCP-CTX-2032".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 impl Default for WasmContextManager {
@@ -440,18 +527,22 @@ impl WasmContextManager {
         let economic_policy = params["economicPolicy"].as_str().map(str::to_owned);
 
         // Build default ceiling strings (matching scp-core ContextRoleState::new).
+        // Default ceiling strings must match scp-core's `Capability::Display`
+        // format exactly. scp-core uses `{resource}:{action}` (colon-separated),
+        // NOT `{resource}_{action}:*` (underscore + wildcard). Cross-bridge
+        // UCAN delegation breaks if formats differ (H5).
         let ceiling_strings: HashSet<String> = if ceiling.is_empty() {
             [
                 "messages:read",
                 "messages:write",
-                "tool_register:*",
-                "tool_invoke:*",
-                "role_assign:*",
-                "member_invite:*",
-                "member_remove:*",
-                "governance_propose:*",
-                "governance_vote:*",
-                "context_close:*",
+                "tool:register",
+                "tool:invoke:*",
+                "role:assign",
+                "member:invite",
+                "member:remove",
+                "governance:propose",
+                "governance:vote",
+                "context:close",
             ]
             .iter()
             .map(|s| (*s).to_owned())
@@ -496,10 +587,10 @@ impl WasmContextManager {
             tool_handlers: HashMap::new(),
             event_log: WasmEventLog::new(context_id.to_owned()),
             revoked_tokens: HashSet::new(),
-            seen_nonces: HashSet::new(),
+            seen_nonces: HashMap::new(),
             members,
-            event_buffer: Vec::new(),
-            executed_proposals: HashSet::new(),
+            event_buffer: VecDeque::new(),
+            executed_proposals: HashMap::new(),
             write_revoked_members: HashSet::new(),
             read_revoked_members: HashSet::new(),
             read_exclusion_list: HashSet::new(),
@@ -510,10 +601,13 @@ impl WasmContextManager {
         self.contexts.insert(context_id.to_owned(), per_context);
 
         // Append ContextCreated event to event log.
-        let leaf_hash = compute_event_hash("ContextCreated", context_id);
         // Safe: we just inserted the context above, so the key is present.
         if let Some(ctx) = self.contexts.get_mut(context_id) {
-            ctx.event_log.append_leaf(leaf_hash);
+            ctx.event_log.append_event(
+                crate::runtime::wasm_event_type_tag("ContextCreated"),
+                creator_did,
+                b"",
+            );
         }
 
         Ok(())
@@ -543,13 +637,16 @@ impl WasmContextManager {
             },
         );
 
-        ctx.event_buffer.push(WasmContextEvent::MemberJoined {
+        ctx.push_event(WasmContextEvent::MemberJoined {
             member_did: member_did.to_owned(),
             role_name: "member".to_owned(),
         });
 
-        let leaf_hash = compute_event_hash("MemberJoined", context_id);
-        ctx.event_log.append_leaf(leaf_hash);
+        ctx.event_log.append_event(
+            crate::runtime::wasm_event_type_tag("MemberJoined"),
+            member_did,
+            b"",
+        );
 
         Ok(())
     }
@@ -578,12 +675,15 @@ impl WasmContextManager {
             bc.subscribers.remove(member_did);
         }
 
-        ctx.event_buffer.push(WasmContextEvent::MemberLeft {
+        ctx.push_event(WasmContextEvent::MemberLeft {
             member_did: member_did.to_owned(),
         });
 
-        let leaf_hash = compute_event_hash("MemberLeft", context_id);
-        ctx.event_log.append_leaf(leaf_hash);
+        ctx.event_log.append_event(
+            crate::runtime::wasm_event_type_tag("MemberLeft"),
+            member_did,
+            b"",
+        );
 
         // Auto-close if no members remain.
         if ctx.members.is_empty() {
@@ -627,14 +727,17 @@ impl WasmContextManager {
         let seq = member.sequence_number;
         member.sequence_number += 1;
 
-        ctx.event_buffer.push(WasmContextEvent::MessageSent {
+        ctx.push_event(WasmContextEvent::MessageSent {
             sender_did: sender_did.to_owned(),
             sequence_number: seq,
             payload_base64: payload_base64.to_owned(),
         });
 
-        let leaf_hash = compute_event_hash("MessageSent", context_id);
-        ctx.event_log.append_leaf(leaf_hash);
+        ctx.event_log.append_event(
+            crate::runtime::wasm_event_type_tag("MessageSent"),
+            sender_did,
+            payload_base64.as_bytes(),
+        );
 
         Ok(())
     }
@@ -653,11 +756,9 @@ impl WasmContextManager {
         let ctx = self.require_active_context_mut(context_id)?;
 
         // Authorization: check ContextClose capability, matching
-        // ttl::close_context in scp-core. Admin role members have all
-        // capabilities in the ceiling; regular members do not have
-        // context_close by default. Uses WASM ceiling format
-        // ("context_close:*") not scp-core format ("context:close").
-        if !ctx.member_has_capability(initiator_did, "context_close:*") {
+        // ttl::close_context in scp-core. Uses scp-core Capability::Display
+        // format ("context:close").
+        if !ctx.member_has_capability(initiator_did, "context:close") {
             return Err(ScpWasmError::Permission {
                 message: format!("member {initiator_did} does not have context:close capability"),
                 code: "SCP-PERM-3000".to_owned(),
@@ -667,12 +768,15 @@ impl WasmContextManager {
         "closed".clone_into(&mut ctx.state);
         ctx.broadcast = None;
 
-        ctx.event_buffer.push(WasmContextEvent::SystemClose {
+        ctx.push_event(WasmContextEvent::SystemClose {
             initiator_did: initiator_did.to_owned(),
         });
 
-        let leaf_hash = compute_event_hash("ContextClosing", context_id);
-        ctx.event_log.append_leaf(leaf_hash);
+        ctx.event_log.append_event(
+            crate::runtime::wasm_event_type_tag("ContextClosing"),
+            initiator_did,
+            b"",
+        );
 
         Ok(())
     }
@@ -721,7 +825,7 @@ impl WasmContextManager {
     pub fn drain_events(&mut self, context_id: &str) -> Vec<WasmContextEvent> {
         self.contexts
             .get_mut(context_id)
-            .map(|ctx| std::mem::take(&mut ctx.event_buffer))
+            .map(|ctx| std::mem::take(&mut ctx.event_buffer).into())
             .unwrap_or_default()
     }
 
@@ -750,8 +854,12 @@ impl WasmContextManager {
                 code: "SCP-TOOL-6001".to_owned(),
             })?;
 
-        let leaf_hash = compute_event_hash("ToolRegistered", context_id);
-        ctx.event_log.append_leaf(leaf_hash);
+        let actor = ctx.creator_did.clone();
+        ctx.event_log.append_event(
+            crate::runtime::wasm_event_type_tag("ToolRegistered"),
+            &actor,
+            tool_id.as_bytes(),
+        );
 
         Ok(tool_id)
     }
@@ -798,7 +906,7 @@ impl WasmContextManager {
         context_id: &str,
         tool_id: &str,
         input_json: &serde_json::Value,
-        _identity_did: &str,
+        identity_did: &str,
     ) -> Result<serde_json::Value, ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
@@ -843,8 +951,11 @@ impl WasmContextManager {
             })
         };
 
-        let leaf_hash = compute_event_hash("ToolInvoked", context_id);
-        ctx.event_log.append_leaf(leaf_hash);
+        ctx.event_log.append_event(
+            crate::runtime::wasm_event_type_tag("ToolInvoked"),
+            identity_did,
+            tool_id.as_bytes(),
+        );
 
         Ok(result)
     }
@@ -991,6 +1102,20 @@ impl WasmContextManager {
     ) -> Result<String, ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
+        // Evict expired sessions before checking caps.
+        ctx.sessions.retain(|_, s| !s.is_expired());
+
+        // Enforce global cap.
+        if ctx.sessions.len() >= WASM_SESSION_GLOBAL_CAP {
+            return Err(ScpWasmError::Tool {
+                message: format!(
+                    "global session cap exceeded: {} active (max {WASM_SESSION_GLOBAL_CAP})",
+                    ctx.sessions.len()
+                ),
+                code: "SCP-TOOL-6015".to_owned(),
+            });
+        }
+
         // Enforce per-caller cap.
         let current = ctx
             .sessions
@@ -1007,7 +1132,7 @@ impl WasmContextManager {
         }
 
         let session_id = uuid::Uuid::new_v4().to_string();
-        let now = js_sys::Date::now();
+        let now = crate::time::now_ms();
 
         let session = WasmToolSession {
             session_id: session_id.clone(),
@@ -1242,47 +1367,126 @@ impl WasmContextManager {
     /// # Errors
     ///
     /// Returns an error if the context is not found.
-    #[allow(clippy::type_complexity)]
     pub fn ucan_context_state(
         &self,
         context_id: &str,
-    ) -> Result<(HashSet<String>, String, HashSet<String>, HashSet<String>), ScpWasmError> {
+    ) -> Result<(HashSet<String>, String, HashSet<String>), ScpWasmError> {
         let ctx = self.require_context(context_id)?;
         Ok((
             ctx.ceiling_strings.clone(),
             ctx.creator_did.clone(),
-            ctx.seen_nonces.clone(),
             ctx.revoked_tokens.clone(),
         ))
     }
 
     /// Records a nonce as seen (for replay prevention).
     ///
+    /// Performs the same validation as native `NonceTracker::check_and_record`:
+    /// 1. **Format** — nonce must match `{unix_millis}-{32_hex_chars}`.
+    /// 2. **Freshness** — timestamp must be within +/- 5 minutes of now
+    ///    (matching spec section 9.14 clock skew tolerance).
+    /// 3. **Uniqueness** — nonce must not have been seen before.
+    ///
+    /// When the nonce map exceeds [`WASM_NONCE_CAP`], evicts entries older than
+    /// [`WASM_NONCE_TTL_MS`] (24 hours — UCAN max lifetime per ADR-016 step 11).
+    ///
     /// # Errors
     ///
-    /// Returns [`ScpWasmError::Permission`] if the nonce was already seen.
+    /// Returns [`ScpWasmError::Permission`] if format is invalid, nonce is
+    /// stale/future, or was already seen.
     pub fn ucan_record_nonce(&mut self, context_id: &str, nonce: &str) -> Result<(), ScpWasmError> {
+        // 1. Validate nonce format: {unix_millis}-{32_hex_chars}
+        let (ts_part, hex_part) =
+            nonce
+                .split_once('-')
+                .ok_or_else(|| ScpWasmError::Permission {
+                    message: format!(
+                        "nonce format invalid: missing '-' separator in nonce: {nonce}"
+                    ),
+                    code: "SCP-PERM-3000".to_owned(),
+                })?;
+
+        let nonce_millis: f64 = ts_part.parse().map_err(|_| ScpWasmError::Permission {
+            message: format!("nonce format invalid: non-numeric timestamp in nonce: {ts_part}"),
+            code: "SCP-PERM-3000".to_owned(),
+        })?;
+
+        if hex_part.len() != 32 || !hex_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ScpWasmError::Permission {
+                message: format!(
+                    "nonce format invalid: expected 32 hex chars suffix, got: {hex_part}"
+                ),
+                code: "SCP-PERM-3000".to_owned(),
+            });
+        }
+
+        // 2. Freshness check: timestamp within now +/- 5 minutes.
+        let now = crate::time::now_ms();
+
+        if nonce_millis + WASM_NONCE_FRESHNESS_TOLERANCE_MS < now {
+            return Err(ScpWasmError::Permission {
+                message: format!("nonce too old: {nonce}"),
+                code: "SCP-PERM-3000".to_owned(),
+            });
+        }
+
+        if nonce_millis > now + WASM_NONCE_FRESHNESS_TOLERANCE_MS {
+            return Err(ScpWasmError::Permission {
+                message: format!("nonce too far in the future: {nonce}"),
+                code: "SCP-PERM-3000".to_owned(),
+            });
+        }
+
+        // 3. Replay check.
         let ctx = self.require_context_mut(context_id)?;
-        if !ctx.seen_nonces.insert(nonce.to_owned()) {
+
+        if ctx.seen_nonces.contains_key(nonce) {
             return Err(ScpWasmError::Permission {
                 message: format!("nonce reused: {nonce}"),
                 code: "SCP-PERM-3000".to_owned(),
             });
         }
+
+        // Evict expired nonces when over capacity.
+        if ctx.seen_nonces.len() >= WASM_NONCE_CAP {
+            let cutoff = now - WASM_NONCE_TTL_MS;
+            ctx.seen_nonces.retain(|_, ts| *ts > cutoff);
+        }
+
+        ctx.seen_nonces.insert(nonce.to_owned(), now);
         Ok(())
     }
 
     /// Revokes a UCAN token by CID.
     ///
+    /// Revocation is permanent (no TTL). The set is capped at
+    /// [`WASM_REVOKED_TOKENS_CAP`] entries — overflow returns an error.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the context is not active.
+    /// Returns an error if the context is not active or the revocation set
+    /// has reached capacity.
     pub fn ucan_revoke(&mut self, context_id: &str, token_cid: &str) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
+
+        if ctx.revoked_tokens.len() >= WASM_REVOKED_TOKENS_CAP {
+            return Err(ScpWasmError::Validation {
+                message: format!(
+                    "revoked token set has reached capacity ({WASM_REVOKED_TOKENS_CAP}) — \
+                     cannot revoke additional tokens"
+                ),
+                code: "SCP-VALID-7300".to_owned(),
+            });
+        }
+
         ctx.revoked_tokens.insert(token_cid.to_owned());
 
-        let leaf_hash = compute_event_hash("UcanRevoked", context_id);
-        ctx.event_log.append_leaf(leaf_hash);
+        let actor = ctx.creator_did.clone();
+        ctx.event_log.append_event(
+            crate::runtime::wasm_event_type_tag("UcanRevoked"),
+            &actor,
+            token_cid.as_bytes(),
+        );
 
         Ok(())
     }
@@ -1301,31 +1505,99 @@ impl WasmContextManager {
     // Governance
     // -----------------------------------------------------------------------
 
+    /// Returns the required capability string for a governance action.
+    ///
+    /// Maps each `WasmGovernanceAction` variant to the capability that
+    /// the initiator must hold. Uses the WASM ceiling format
+    /// Uses scp-core `Capability::Display` format (`"{resource}:{action}"`),
+    /// matching `member_has_capability` and the ceiling strings.
+    fn required_capability_for_action(action: &WasmGovernanceAction) -> &'static str {
+        match action {
+            WasmGovernanceAction::AddMember { .. }
+            | WasmGovernanceAction::RestoreWriteAccess { .. }
+            | WasmGovernanceAction::RestoreReadAccess { .. } => "member:invite",
+
+            WasmGovernanceAction::RemoveMember { .. }
+            | WasmGovernanceAction::RevokeWriteAccess { .. }
+            | WasmGovernanceAction::BlockAuthor { .. }
+            | WasmGovernanceAction::RevokeReadAccess { .. }
+            | WasmGovernanceAction::ResetMember { .. } => "member:remove",
+
+            WasmGovernanceAction::ChangeRole { .. } => "role:assign",
+
+            WasmGovernanceAction::RegisterTool { .. }
+            | WasmGovernanceAction::RemoveTool { .. }
+            | WasmGovernanceAction::EstablishToolInterface { .. } => "tool:register",
+
+            WasmGovernanceAction::CloseContext { .. } => "context:close",
+
+            WasmGovernanceAction::ModifyCeiling { .. }
+            | WasmGovernanceAction::ExtendTtl { .. }
+            | WasmGovernanceAction::TransferAdmin { .. }
+            | WasmGovernanceAction::PromoteContext
+            | WasmGovernanceAction::CreateChildContext { .. }
+            | WasmGovernanceAction::ModifyPruningPolicy { .. }
+            | WasmGovernanceAction::AddSigner { .. }
+            | WasmGovernanceAction::RemoveSigner { .. }
+            | WasmGovernanceAction::ModifyThreshold { .. }
+            | WasmGovernanceAction::ResolveConflict { .. }
+            | WasmGovernanceAction::RotateContentKeys { .. }
+            | WasmGovernanceAction::ReconfigureGovernance { .. } => "governance:propose",
+        }
+    }
+
     /// Executes a governance action. Mirrors `ContextManager::execute_governance_action`.
     ///
-    /// Validates that the proposal is not a replay, dispatches to the
+    /// Validates that the initiator has the required capability for the
+    /// action, that the proposal is not a replay, dispatches to the
     /// appropriate action handler, and records the proposal as executed.
     ///
     /// # Errors
     ///
-    /// Returns an error if the context is not active, the proposal was
-    /// already executed, or the action fails.
+    /// Returns an error if the context is not active, the initiator lacks
+    /// the required capability, the proposal was already executed, or the
+    /// action fails.
     pub fn execute_governance_action(
         &mut self,
         context_id: &str,
+        initiator_did: &str,
         proposal_id: &str,
         action: &WasmGovernanceAction,
     ) -> Result<serde_json::Value, ScpWasmError> {
+        // Authorization: check that initiator has the required capability
+        // for this governance action. Matches close_context's pattern.
+        {
+            let ctx = self.require_active_context_mut(context_id)?;
+            let required = Self::required_capability_for_action(action);
+            if !ctx.member_has_capability(initiator_did, required) {
+                return Err(ScpWasmError::Permission {
+                    message: format!(
+                        "member {initiator_did} does not have '{required}' capability required for this governance action"
+                    ),
+                    code: "SCP-PERM-3000".to_owned(),
+                });
+            }
+        }
+
         // Replay protection: check+mark atomically.
         {
             let ctx = self.require_active_context_mut(context_id)?;
-            if ctx.executed_proposals.contains(proposal_id) {
+            let now = crate::time::now_ms();
+
+            if ctx.executed_proposals.contains_key(proposal_id) {
                 return Err(ScpWasmError::Permission {
                     message: "governance proposal has already been executed".to_owned(),
                     code: "SCP-PERM-3000".to_owned(),
                 });
             }
-            ctx.executed_proposals.insert(proposal_id.to_owned());
+
+            // Evict expired proposals when over capacity.
+            if ctx.executed_proposals.len() >= WASM_PROPOSAL_CAP {
+                let cutoff = now - WASM_PROPOSAL_TTL_MS;
+                ctx.executed_proposals.retain(|_, ts| *ts > cutoff);
+            }
+
+            ctx.executed_proposals.insert(proposal_id.to_owned(), now);
         }
 
         let result = self.dispatch_governance_action(context_id, action);
@@ -1349,12 +1621,15 @@ impl WasmContextManager {
                 },
                 |(t, _)| t.trim().to_owned(),
             );
-            ctx.event_buffer.push(WasmContextEvent::GovernanceExecuted {
+            ctx.push_event(WasmContextEvent::GovernanceExecuted {
                 action_type,
                 proposal_id: proposal_id.to_owned(),
             });
-            let leaf_hash = compute_event_hash("GovernanceExecuted", context_id);
-            ctx.event_log.append_leaf(leaf_hash);
+            ctx.event_log.append_event(
+                crate::runtime::wasm_event_type_tag("GovernanceExecuted"),
+                initiator_did,
+                proposal_id.as_bytes(),
+            );
         }
 
         result
@@ -1379,7 +1654,7 @@ impl WasmContextManager {
                         sequence_number: 0,
                     },
                 );
-                ctx.event_buffer.push(WasmContextEvent::MemberJoined {
+                ctx.push_event(WasmContextEvent::MemberJoined {
                     member_did: did.clone(),
                     role_name: role.clone(),
                 });
@@ -1393,7 +1668,7 @@ impl WasmContextManager {
                         code: "SCP-CTX-2015".to_owned(),
                     });
                 }
-                ctx.event_buffer.push(WasmContextEvent::MemberLeft {
+                ctx.push_event(WasmContextEvent::MemberLeft {
                     member_did: did.clone(),
                 });
                 Ok(serde_json::json!({"action": "RemoveMember", "did": did}))
@@ -1494,8 +1769,7 @@ impl WasmContextManager {
                     bc.authors.remove(did);
                 }
                 ctx.write_revoked_members.insert(did.clone());
-                ctx.event_buffer
-                    .push(WasmContextEvent::WriteAccessRevoked { did: did.clone() });
+                ctx.push_event(WasmContextEvent::WriteAccessRevoked { did: did.clone() });
                 Ok(serde_json::json!({"action": "WriteAccessRevoked", "did": did, "scope": "Full"}))
             }
             WasmGovernanceAction::RevokeReadAccess { did } => {
@@ -1650,14 +1924,17 @@ impl WasmContextManager {
         let seq = member.sequence_number;
         member.sequence_number += 1;
 
-        ctx.event_buffer.push(WasmContextEvent::MessageSent {
+        ctx.push_event(WasmContextEvent::MessageSent {
             sender_did: author_did.to_owned(),
             sequence_number: seq,
             payload_base64: payload_base64.to_owned(),
         });
 
-        let leaf_hash = compute_event_hash("MessageSent", context_id);
-        ctx.event_log.append_leaf(leaf_hash);
+        ctx.event_log.append_event(
+            crate::runtime::wasm_event_type_tag("MessageSent"),
+            author_did,
+            payload_base64.as_bytes(),
+        );
 
         Ok(())
     }
@@ -1684,7 +1961,7 @@ impl WasmContextManager {
 
         bc.subscribers.remove(subscriber_did);
 
-        ctx.event_buffer.push(WasmContextEvent::MemberLeft {
+        ctx.push_event(WasmContextEvent::MemberLeft {
             member_did: subscriber_did.to_owned(),
         });
 
@@ -1715,6 +1992,97 @@ impl WasmContextManager {
         bc.blocked_subscribers.insert(subscriber_did.to_owned());
 
         Ok(())
+    }
+
+    /// Returns the number of subscribers in a broadcast context.
+    ///
+    /// Returns `None` if the context is not a broadcast context.
+    #[must_use]
+    pub fn broadcast_subscriber_count(&self, context_id: &str) -> Option<usize> {
+        self.contexts
+            .get(context_id)
+            .and_then(|ctx| ctx.broadcast.as_ref().map(|bc| bc.subscribers.len()))
+    }
+
+    /// Returns `true` if the given DID is a subscriber in a broadcast context.
+    #[must_use]
+    pub fn is_broadcast_subscriber(&self, context_id: &str, did: &str) -> bool {
+        self.contexts
+            .get(context_id)
+            .and_then(|ctx| {
+                ctx.broadcast
+                    .as_ref()
+                    .map(|bc| bc.subscribers.contains(did))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Returns the admission policy string for a broadcast context.
+    ///
+    /// Returns `None` if the context is not a broadcast context.
+    #[must_use]
+    pub fn broadcast_admission(&self, context_id: &str) -> Option<String> {
+        self.contexts
+            .get(context_id)
+            .and_then(|ctx| ctx.broadcast.as_ref().map(|bc| bc.admission.clone()))
+    }
+
+    /// Handles a broadcast key request.
+    ///
+    /// Validates that the requester is a non-blocked subscriber (or author) and
+    /// returns a grant/deny decision. In the WASM bridge, key material is managed
+    /// by `WebCrypto` — the grant decision carries no actual key bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not active or not a broadcast context.
+    pub fn handle_broadcast_key_request(
+        &self,
+        context_id: &str,
+        author_did: &str,
+        requester_did: &str,
+    ) -> Result<String, ScpWasmError> {
+        // Use a uniform deny reason to prevent information leakage (§5.14.8).
+        const DENY_REASON: &str = "key request denied";
+
+        let ctx = self
+            .contexts
+            .get(context_id)
+            .ok_or_else(|| ScpWasmError::Context {
+                message: format!("context not registered: {context_id}"),
+                code: "SCP-CTX-2001".to_owned(),
+            })?;
+
+        let bc = ctx
+            .broadcast
+            .as_ref()
+            .ok_or_else(|| ScpWasmError::Context {
+                message: "not a broadcast context".to_owned(),
+                code: "SCP-CTX-2001".to_owned(),
+            })?;
+
+        // Author must be a known author.
+        if !bc.authors.contains(author_did) {
+            return Ok(
+                serde_json::json!({ "decision": "deny", "reason": DENY_REASON }).to_string(),
+            );
+        }
+
+        // Requester must not be blocked.
+        if bc.blocked_subscribers.contains(requester_did) {
+            return Ok(
+                serde_json::json!({ "decision": "deny", "reason": DENY_REASON }).to_string(),
+            );
+        }
+
+        // Requester must be a subscriber or author.
+        if !bc.subscribers.contains(requester_did) && !bc.authors.contains(requester_did) {
+            return Ok(
+                serde_json::json!({ "decision": "deny", "reason": DENY_REASON }).to_string(),
+            );
+        }
+
+        Ok(serde_json::json!({ "decision": "grant" }).to_string())
     }
 
     // -----------------------------------------------------------------------
@@ -1765,10 +2133,13 @@ impl WasmContextManager {
     pub fn handle_ttl_expiry(&mut self, context_id: &str) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
         "expired".clone_into(&mut ctx.state);
-        ctx.event_buffer.push(WasmContextEvent::Expired);
+        ctx.push_event(WasmContextEvent::Expired);
 
-        let leaf_hash = compute_event_hash("ContextExpired", context_id);
-        ctx.event_log.append_leaf(leaf_hash);
+        ctx.event_log.append_event(
+            crate::runtime::wasm_event_type_tag("ContextExpired"),
+            "", // System event — no actor.
+            b"",
+        );
 
         Ok(())
     }
@@ -1883,6 +2254,248 @@ impl WasmContextManager {
         }
         Ok(ctx)
     }
+
+    // -----------------------------------------------------------------------
+    // Context export/import (#424)
+    // -----------------------------------------------------------------------
+
+    /// Exports a context's full state as serialized JSON bytes.
+    ///
+    /// Returns a `WasmContextExportEnvelope` serialized as JSON bytes. The
+    /// envelope contains a version number and a snapshot of all context state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not registered or serialization fails.
+    pub fn export_context(
+        &self,
+        context_id: &str,
+        exporter_did: &str,
+    ) -> Result<Vec<u8>, ScpWasmError> {
+        let ctx = self.require_context(context_id)?;
+
+        let members: Vec<WasmExportMember> = ctx
+            .members
+            .iter()
+            .map(|(did, entry)| WasmExportMember {
+                did: did.clone(),
+                role: entry.role.clone(),
+                sequence_number: entry.sequence_number,
+            })
+            .collect();
+
+        let broadcast = ctx.broadcast.as_ref().map(|bc| WasmExportBroadcast {
+            authors: bc.authors.iter().cloned().collect(),
+            subscribers: bc.subscribers.iter().cloned().collect(),
+            blocked_subscribers: bc.blocked_subscribers.iter().cloned().collect(),
+            admission: bc.admission.clone(),
+        });
+
+        let snapshot = WasmContextExportSnapshot {
+            context_id: context_id.to_owned(),
+            state: ctx.state.clone(),
+            params_json: ctx.params_json.clone(),
+            creator_did: ctx.creator_did.clone(),
+            mode: ctx.mode.clone(),
+            ceiling_strings: ctx.ceiling_strings.iter().cloned().collect(),
+            ceiling_policy: ctx.ceiling_policy.clone(),
+            ttl_seconds: ctx.ttl_seconds,
+            promotion_policy: ctx.promotion_policy.clone(),
+            governance: ctx.governance.clone(),
+            economic_policy: ctx.economic_policy.clone(),
+            members,
+            write_revoked_members: ctx.write_revoked_members.iter().cloned().collect(),
+            read_revoked_members: ctx.read_revoked_members.iter().cloned().collect(),
+            read_exclusion_list: ctx.read_exclusion_list.iter().cloned().collect(),
+            broadcast,
+            revoked_tokens: ctx.revoked_tokens.iter().cloned().collect(),
+            seen_nonces: ctx.seen_nonces.keys().cloned().collect(),
+        };
+
+        // Serialize snapshot to canonical JSON for HMAC computation.
+        // The HMAC is computed over this stable serialization — NOT the full
+        // envelope — to avoid a circular dependency (envelope contains the MAC).
+        let snapshot_json = serde_json::to_vec(&snapshot).map_err(|e| ScpWasmError::Context {
+            message: format!("export snapshot serialization failed: {e}"),
+            code: "SCP-CTX-2030".to_owned(),
+        })?;
+
+        // Compute HMAC-SHA256 over the snapshot JSON using the creator's
+        // signing key (via HKDF domain separation). The creator DID is in the
+        // snapshot — look up their identity in the registry.
+        let integrity_mac = crate::identity::compute_export_hmac(&ctx.creator_did, &snapshot_json)?;
+
+        let now_ms = crate::time::now_ms();
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let exported_at = (now_ms / 1000.0) as u64;
+
+        let envelope = WasmContextExportEnvelope {
+            version: WASM_EXPORT_VERSION,
+            exported_at,
+            exporter_did: exporter_did.to_owned(),
+            integrity_mac,
+            snapshot,
+        };
+
+        serde_json::to_vec(&envelope).map_err(|e| ScpWasmError::Context {
+            message: format!("export serialization failed: {e}"),
+            code: "SCP-CTX-2030".to_owned(),
+        })
+    }
+
+    /// Deserializes and verifies a context export envelope.
+    ///
+    /// Performs version check and HMAC integrity verification before returning
+    /// the parsed envelope. Extracted to keep `import_context` within the line
+    /// limit.
+    fn deserialize_and_verify_envelope(
+        data: &[u8],
+    ) -> Result<WasmContextExportEnvelope, ScpWasmError> {
+        let envelope: WasmContextExportEnvelope =
+            serde_json::from_slice(data).map_err(|e| ScpWasmError::Context {
+                message: format!("invalid export data: {e}"),
+                code: "SCP-CTX-2032".to_owned(),
+            })?;
+
+        if envelope.version > WASM_EXPORT_VERSION {
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "incompatible export version: got {}, max supported is {WASM_EXPORT_VERSION}",
+                    envelope.version
+                ),
+                code: "SCP-CTX-2032".to_owned(),
+            });
+        }
+
+        // Re-serialize the snapshot to canonical JSON and verify the HMAC tag
+        // using the creator's signing key. This MUST happen before any state
+        // reconstruction to prevent an attacker from crafting payloads that
+        // grant them admin of a context.
+        let snapshot_json =
+            serde_json::to_vec(&envelope.snapshot).map_err(|e| ScpWasmError::Context {
+                message: format!("snapshot re-serialization failed: {e}"),
+                code: "SCP-CTX-2032".to_owned(),
+            })?;
+
+        if envelope.integrity_mac.is_empty() {
+            return Err(ScpWasmError::Context {
+                message: "export integrity_mac is missing — refusing to import unsigned export"
+                    .to_owned(),
+                code: "SCP-CTX-2020".to_owned(),
+            });
+        }
+
+        crate::identity::verify_export_hmac(
+            &envelope.snapshot.creator_did,
+            &snapshot_json,
+            &envelope.integrity_mac,
+        )?;
+
+        Ok(envelope)
+    }
+
+    /// Imports a context from serialized JSON bytes produced by [`export_context`].
+    ///
+    /// Deserializes the envelope, validates the version and integrity MAC,
+    /// then reconstructs the context state in the manager.
+    ///
+    /// # Returns
+    ///
+    /// The context ID of the imported context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deserialization fails, version is incompatible,
+    /// the integrity MAC is missing/invalid, or the context already exists.
+    pub fn import_context(&mut self, data: &[u8]) -> Result<String, ScpWasmError> {
+        let envelope = Self::deserialize_and_verify_envelope(data)?;
+
+        let snap = &envelope.snapshot;
+        let context_id = snap.context_id.clone();
+
+        // Validate imported fields from untrusted data (defense-in-depth)
+        validate_imported_string(&context_id, "context_id", 256)?;
+        validate_imported_did(&snap.creator_did, "creator_did")?;
+        for m in &snap.members {
+            validate_imported_did(&m.did, "member DID")?;
+            if m.role.is_empty() || m.role.len() > 64 {
+                return Err(ScpWasmError::Context {
+                    message: format!("invalid member role '{}': must be 1-64 chars", m.role),
+                    code: "SCP-CTX-2032".to_owned(),
+                });
+            }
+        }
+        let valid_states = ["active", "closed", "suspended", "archived"];
+        if !valid_states.contains(&snap.state.as_str()) {
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "invalid context state '{}': must be one of {valid_states:?}",
+                    snap.state
+                ),
+                code: "SCP-CTX-2032".to_owned(),
+            });
+        }
+
+        if self.contexts.contains_key(&context_id) {
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "context '{context_id}' already exists — cannot import over existing context"
+                ),
+                code: "SCP-CTX-2000".to_owned(),
+            });
+        }
+
+        let mut members = HashMap::new();
+        for m in &snap.members {
+            members.insert(
+                m.did.clone(),
+                MemberEntry {
+                    did: m.did.clone(),
+                    role: m.role.clone(),
+                    sequence_number: m.sequence_number,
+                },
+            );
+        }
+
+        let broadcast = snap.broadcast.as_ref().map(|bc| BroadcastState {
+            authors: bc.authors.iter().cloned().collect(),
+            subscribers: bc.subscribers.iter().cloned().collect(),
+            blocked_subscribers: bc.blocked_subscribers.iter().cloned().collect(),
+            admission: bc.admission.clone(),
+        });
+
+        let ctx = PerContextState {
+            state: snap.state.clone(),
+            params_json: snap.params_json.clone(),
+            creator_did: snap.creator_did.clone(),
+            mode: snap.mode.clone(),
+            ceiling_strings: snap.ceiling_strings.iter().cloned().collect(),
+            ceiling_policy: snap.ceiling_policy.clone(),
+            ttl_seconds: snap.ttl_seconds,
+            promotion_policy: snap.promotion_policy.clone(),
+            governance: snap.governance.clone(),
+            economic_policy: snap.economic_policy.clone(),
+            tool_registry: ToolRegistry::new(),
+            tool_handlers: HashMap::new(),
+            event_log: WasmEventLog::new(context_id.clone()),
+            revoked_tokens: snap.revoked_tokens.iter().cloned().collect(),
+            seen_nonces: {
+                let now = crate::time::now_ms();
+                snap.seen_nonces.iter().map(|n| (n.clone(), now)).collect()
+            },
+            members,
+            event_buffer: VecDeque::new(),
+            executed_proposals: HashMap::new(),
+            write_revoked_members: snap.write_revoked_members.iter().cloned().collect(),
+            read_revoked_members: snap.read_revoked_members.iter().cloned().collect(),
+            read_exclusion_list: snap.read_exclusion_list.iter().cloned().collect(),
+            broadcast,
+            sessions: HashMap::new(),
+        };
+
+        self.contexts.insert(context_id.clone(), ctx);
+        Ok(context_id)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1905,20 +2518,94 @@ pub struct ContextMetadata {
 }
 
 // ---------------------------------------------------------------------------
+// Context export/import types (#424)
+// ---------------------------------------------------------------------------
+
+/// Current version of the WASM context export format.
+const WASM_EXPORT_VERSION: u32 = 1;
+
+/// Versioned envelope for context exports.
+///
+/// Serialized as JSON bytes. The version field enables forward-compatible
+/// deserialization: import rejects exports with version > `WASM_EXPORT_VERSION`.
+///
+/// Integrity protection: `integrity_mac` contains an HMAC-SHA256 tag computed
+/// over the canonical JSON serialization of the `snapshot` field, keyed by an
+/// HKDF-derived key from the context creator's Ed25519 signing key. This
+/// prevents an attacker from crafting import payloads that grant themselves
+/// admin over a context.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WasmContextExportEnvelope {
+    /// Export format version.
+    version: u32,
+    /// Unix timestamp (seconds) when the export was created.
+    exported_at: u64,
+    /// DID of the identity that performed the export.
+    exporter_did: String,
+    /// HMAC-SHA256 tag (hex-encoded) over the canonical JSON serialization of
+    /// the `snapshot` field. Keyed by `HKDF(creator_signing_key,
+    /// info="scp-context-export-integrity-v1")`. Verified on import to prevent
+    /// tampering with membership, roles, or governance state.
+    integrity_mac: String,
+    /// The context state snapshot.
+    snapshot: WasmContextExportSnapshot,
+}
+
+/// Snapshot of a context's state for export.
+///
+/// Contains all fields needed to reconstruct a `PerContextState` on import.
+/// Tool registry, event log, and tool handlers are NOT exported (they can be
+/// re-registered after import). Membership, roles, governance, broadcast,
+/// UCAN revocation, and nonce replay state are preserved.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WasmContextExportSnapshot {
+    context_id: String,
+    state: String,
+    params_json: serde_json::Value,
+    creator_did: String,
+    mode: String,
+    ceiling_strings: Vec<String>,
+    ceiling_policy: String,
+    ttl_seconds: Option<u64>,
+    promotion_policy: Option<String>,
+    governance: String,
+    economic_policy: Option<String>,
+    members: Vec<WasmExportMember>,
+    write_revoked_members: Vec<String>,
+    read_revoked_members: Vec<String>,
+    read_exclusion_list: Vec<String>,
+    broadcast: Option<WasmExportBroadcast>,
+    /// UCAN revocation CIDs. Preserves revocation state across export/import
+    /// so that previously revoked tokens remain rejected.
+    #[serde(default)]
+    revoked_tokens: Vec<String>,
+    /// Seen UCAN nonces. Preserves nonce replay protection across
+    /// export/import so that previously used nonces are still rejected.
+    #[serde(default)]
+    seen_nonces: Vec<String>,
+}
+
+/// Serializable member entry for export.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WasmExportMember {
+    did: String,
+    role: String,
+    sequence_number: u64,
+}
+
+/// Serializable broadcast state for export.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WasmExportBroadcast {
+    authors: Vec<String>,
+    subscribers: Vec<String>,
+    blocked_subscribers: Vec<String>,
+    admission: String,
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Computes a leaf hash for the event log from event type and context ID.
-///
-/// Uses `SHA-256(0x00 || event_type || context_id)` with RFC 6962 leaf
-/// domain separation prefix.
-fn compute_event_hash(event_type: &str, context_id: &str) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update([0x00]); // RFC 6962 leaf prefix.
-    hasher.update(event_type.as_bytes());
-    hasher.update(context_id.as_bytes());
-    // Include a timestamp-like value for uniqueness. In WASM, use js_sys::Date::now().
-    let now_ms = js_sys::Date::now();
-    hasher.update(now_ms.to_bits().to_le_bytes());
-    hasher.finalize().into()
-}
+// `compute_event_hash` replaced by `WasmEventLog::append_event` which uses
+// the canonical hash format matching native `compute_event_canonical_hash`.
+// See `crate::runtime::compute_canonical_event_hash`.

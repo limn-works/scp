@@ -13,27 +13,30 @@
 
 import { createRequire } from "node:module";
 
-import { TransportError } from "../errors.js";
+import type { BridgeMode, ShadowStatus } from "../bridge";
+import { TransportError } from "../errors";
 import type {
+  BroadcastAdmissionPolicy,
   Checkpoint,
   DIDDocument,
   Event,
   EventClaim,
   EventFilter,
+  MemberRole,
   Message,
   Proof,
   ToolDefinition,
   ToolVerificationResult,
   TransportStatus,
   UcanToken,
-} from "../types.js";
+} from "../types";
 import type {
   Bridge,
   BridgeContextHandle,
   BridgeIdentityHandle,
   BridgeTransportHandle,
   MessageCallback,
-} from "./bridge.js";
+} from "./bridge";
 
 // ---------------------------------------------------------------------------
 // Platform detection
@@ -224,6 +227,134 @@ export function createNativeBridge(): Bridge {
       });
     },
 
+    // Membership queries
+    async contextMemberCount(handle: BridgeContextHandle): Promise<number | null> {
+      const result = await (
+        addon.contextMemberCount as (h: BridgeContextHandle) => Promise<number | null>
+      )(handle);
+      return result;
+    },
+
+    async contextIsMember(handle: BridgeContextHandle, did: string): Promise<boolean> {
+      return await (
+        addon.contextIsMember as (h: BridgeContextHandle, d: string) => Promise<boolean>
+      )(handle, did);
+    },
+
+    async contextMemberDids(handle: BridgeContextHandle): Promise<readonly string[]> {
+      return await (
+        addon.contextMemberDids as (h: BridgeContextHandle) => Promise<readonly string[]>
+      )(handle);
+    },
+
+    async contextMemberRole(handle: BridgeContextHandle, did: string): Promise<MemberRole | null> {
+      return await (
+        addon.contextMemberRole as (h: BridgeContextHandle, d: string) => Promise<MemberRole | null>
+      )(handle, did);
+    },
+
+    // Broadcast operations
+    async broadcastSubscribe(handle: BridgeContextHandle, subscriberDid: string): Promise<void> {
+      await (addon.broadcastSubscribe as (h: BridgeContextHandle, d: string) => Promise<void>)(
+        handle,
+        subscriberDid,
+      );
+    },
+
+    async broadcastUnsubscribe(
+      handle: BridgeContextHandle,
+      subscriberDid: string,
+      rotateKeys?: boolean,
+    ): Promise<void> {
+      await (
+        addon.broadcastUnsubscribe as (
+          h: BridgeContextHandle,
+          d: string,
+          r: boolean | undefined,
+        ) => Promise<void>
+      )(handle, subscriberDid, rotateKeys);
+    },
+
+    async broadcastPublish(
+      handle: BridgeContextHandle,
+      authorDid: string,
+      payload: Uint8Array,
+    ): Promise<void> {
+      await (
+        addon.broadcastPublish as (
+          h: BridgeContextHandle,
+          d: string,
+          p: Uint8Array,
+        ) => Promise<void>
+      )(handle, authorDid, payload);
+    },
+
+    async broadcastBlockSubscriber(
+      handle: BridgeContextHandle,
+      subscriberDid: string,
+      blockerDid: string,
+    ): Promise<void> {
+      await (
+        addon.broadcastBlockSubscriber as (
+          h: BridgeContextHandle,
+          s: string,
+          b: string,
+        ) => Promise<void>
+      )(handle, subscriberDid, blockerDid);
+    },
+
+    async broadcastHandleKeyRequest(
+      handle: BridgeContextHandle,
+      authorDid: string,
+      requesterDid: string,
+    ): Promise<string> {
+      return await (
+        addon.broadcastHandleKeyRequest as (
+          h: BridgeContextHandle,
+          a: string,
+          r: string,
+        ) => Promise<string>
+      )(handle, authorDid, requesterDid);
+    },
+
+    async broadcastSubscriberCount(handle: BridgeContextHandle): Promise<number | null> {
+      return await (
+        addon.contextBroadcastSubscriberCount as (h: BridgeContextHandle) => Promise<number | null>
+      )(handle);
+    },
+
+    async broadcastIsSubscriber(handle: BridgeContextHandle, did: string): Promise<boolean> {
+      return await (
+        addon.contextIsBroadcastSubscriber as (
+          h: BridgeContextHandle,
+          d: string,
+        ) => Promise<boolean>
+      )(handle, did);
+    },
+
+    async broadcastAdmission(
+      handle: BridgeContextHandle,
+    ): Promise<BroadcastAdmissionPolicy | null> {
+      return await (
+        addon.contextBroadcastAdmission as (
+          h: BridgeContextHandle,
+        ) => Promise<BroadcastAdmissionPolicy | null>
+      )(handle);
+    },
+
+    // Governance
+    async contextExecuteGovernanceAction(
+      handle: BridgeContextHandle,
+      proposalJson: string,
+    ): Promise<string> {
+      return await (
+        addon.contextExecuteGovernanceAction as (
+          h: BridgeContextHandle,
+          p: string,
+        ) => Promise<string>
+      )(handle, proposalJson);
+    },
+
     // Tools
     async toolRegister(handle: BridgeContextHandle, definition: ToolDefinition): Promise<string> {
       const toolId = await (
@@ -315,29 +446,247 @@ export function createNativeBridge(): Bridge {
       handle: BridgeContextHandle,
       filter: EventFilter | undefined,
     ): Promise<readonly Event[]> {
-      const filterJson = filter !== undefined ? JSON.stringify(filter) : undefined;
-      const events = await (
+      // Convert camelCase filter keys to snake_case for the Rust bridge.
+      let filterJson: string | undefined;
+      if (filter !== undefined) {
+        const snakeFilter: Record<string, unknown> = {};
+        if (filter.eventType !== undefined) snakeFilter.event_type = filter.eventType;
+        if (filter.actorDid !== undefined) snakeFilter.actor_did = filter.actorDid;
+        if (filter.afterSequence !== undefined) snakeFilter.after_sequence = filter.afterSequence;
+        if (filter.beforeSequence !== undefined)
+          snakeFilter.before_sequence = filter.beforeSequence;
+        if (filter.limit !== undefined) snakeFilter.limit = filter.limit;
+        filterJson = JSON.stringify(snakeFilter);
+      }
+      const raw = await (
         addon.eventLogQuery as (
           h: BridgeContextHandle,
           f: string | undefined,
-        ) => Promise<readonly Event[]>
+        ) => Promise<
+          readonly {
+            eventType: string;
+            actorDid: string;
+            timestamp: number;
+            payloadJson: string;
+            sequence: number;
+          }[]
+        >
       )(handle, filterJson);
-      return events;
+      // NAPI #[napi(object)] returns camelCase keys, but payloadJson is a JSON
+      // string that needs to be parsed into the `payload` object.
+      return raw.map((e) => ({
+        eventType: e.eventType,
+        actorDid: e.actorDid,
+        timestamp: e.timestamp,
+        payload: JSON.parse(e.payloadJson) as Readonly<Record<string, unknown>>,
+        sequence: e.sequence,
+      }));
     },
 
     async eventLogVerify(handle: BridgeContextHandle, claim: EventClaim): Promise<Proof> {
-      const claimJson = JSON.stringify(claim);
-      const proof = await (
-        addon.eventLogVerify as (h: BridgeContextHandle, c: string) => Promise<Proof>
+      // Convert camelCase claim keys to snake_case for the Rust bridge.
+      const snakeClaim: Record<string, unknown> = { type: claim.type };
+      if (claim.leafIndex !== undefined) snakeClaim.leaf_index = claim.leafIndex;
+      if (claim.eventHash !== undefined) snakeClaim.event_hash = claim.eventHash;
+      const claimJson = JSON.stringify(snakeClaim);
+      const raw = await (
+        addon.eventLogVerify as (
+          h: BridgeContextHandle,
+          c: string,
+        ) => Promise<{ verified: boolean; proofType: string; detailsJson: string }>
       )(handle, claimJson);
-      return proof;
+      // NAPI returns detailsJson as a JSON string; parse into the details object.
+      return {
+        verified: raw.verified,
+        proofType: raw.proofType as "inclusion" | "absence",
+        details: JSON.parse(raw.detailsJson) as Readonly<Record<string, unknown>>,
+      };
     },
 
-    async eventLogCheckpoint(handle: BridgeContextHandle): Promise<Checkpoint> {
-      const checkpoint = await (
-        addon.eventLogCheckpoint as (h: BridgeContextHandle) => Promise<Checkpoint>
+    async eventLogCheckpoint(
+      handle: BridgeContextHandle,
+      identityDid: string,
+      epoch: number,
+    ): Promise<Checkpoint> {
+      // The NAPI Rust function requires (handle, identity, epoch).
+      // identity is passed as an object matching the NapiIdentity shape.
+      const raw = await (
+        addon.eventLogCheckpoint as (
+          h: BridgeContextHandle,
+          identity: { did: string; custodyType: string },
+          epoch: number,
+        ) => Promise<{
+          merkleRoot: string;
+          eventCount: number;
+          timestamp: number;
+        }>
+      )(handle, { did: identityDid, custodyType: "in_memory" }, epoch);
+      return {
+        root: raw.merkleRoot,
+        eventCount: raw.eventCount,
+        timestamp: raw.timestamp,
+      };
+    },
+
+    // Bridge Connector
+    bridgeRegister(contextId: string, operatorDid: string, platform: string, mode: BridgeMode) {
+      return (
+        addon.bridgeRegister as (
+          c: string,
+          o: string,
+          p: string,
+          m: BridgeMode,
+        ) => ReturnType<Bridge["bridgeRegister"]>
+      )(contextId, operatorDid, platform, mode);
+    },
+
+    bridgeEvaluateTrust(
+      isBridged: boolean,
+      isNativeTransport: boolean,
+      shadowStatus: ShadowStatus,
+    ) {
+      return (addon.bridgeEvaluateTrust as (b: boolean, n: boolean, s: ShadowStatus) => number)(
+        isBridged,
+        isNativeTransport,
+        shadowStatus,
+      );
+    },
+
+    bridgeCreateShadow(
+      bridgeId: string,
+      platformHandle: string,
+      bridgeMode: BridgeMode,
+      contextId: string | undefined,
+    ) {
+      return (
+        addon.bridgeCreateShadow as (
+          b: string,
+          p: string,
+          m: BridgeMode,
+          c: string | undefined,
+        ) => ReturnType<Bridge["bridgeCreateShadow"]>
+      )(bridgeId, platformHandle, bridgeMode, contextId);
+    },
+
+    // Discovery
+    discoveryParseAddress(address: string) {
+      return (addon.discoveryParseAddress as (a: string) => string)(address);
+    },
+
+    discoveryCreateQuery(
+      capabilities: string[] | undefined,
+      keywords: string[] | undefined,
+      minHistorySecs: number | undefined,
+    ) {
+      return (
+        addon.discoveryCreateQuery as (
+          c: string[] | undefined,
+          k: string[] | undefined,
+          m: number | undefined,
+        ) => string
+      )(capabilities, keywords, minHistorySecs);
+    },
+
+    discoveryNormalizeAddress(address: string) {
+      return (addon.discoveryNormalizeAddress as (a: string) => string)(address);
+    },
+
+    async contextDiscover(query: string): Promise<string> {
+      return await (addon.contextDiscover as (q: string) => Promise<string>)(query);
+    },
+
+    // Provenance
+    async evaluateProvenanceQuality(
+      sourceContext: string | undefined,
+      sourceType: string,
+      contextState: string,
+      counterparties: string[] | undefined,
+    ): Promise<number> {
+      return await (
+        addon.evaluateProvenanceQuality as (
+          sc: string | undefined,
+          st: string,
+          cs: string,
+          cp: string[] | undefined,
+        ) => Promise<number>
+      )(sourceContext, sourceType, contextState, counterparties);
+    },
+
+    provenanceAttach(
+      sourceContextId: string,
+      sourceType: string,
+      memoryScope: string,
+      members: string[],
+      targetContextId: string,
+      existingChainDepth: number | undefined,
+    ) {
+      return (
+        addon.provenanceAttach as (
+          sc: string,
+          st: string,
+          ms: string,
+          m: string[],
+          tc: string,
+          e: number | undefined,
+        ) => string
+      )(sourceContextId, sourceType, memoryScope, members, targetContextId, existingChainDepth);
+    },
+
+    provenanceCheckChainDepth(chainDepth: number, maxDepth: number | undefined) {
+      return (addon.provenanceCheckChainDepth as (c: number, m: number | undefined) => boolean)(
+        chainDepth,
+        maxDepth,
+      );
+    },
+
+    // Sync
+    syncClassifyOffline(lastRelayContact: number, now: number) {
+      return (addon.syncClassifyOffline as (l: number, n: number) => string)(lastRelayContact, now);
+    },
+
+    syncGetPolicy() {
+      return (addon.syncGetPolicy as () => ReturnType<Bridge["syncGetPolicy"]>)();
+    },
+
+    // Identity Advanced
+    async identityCreateWithAgentKey(custody: string): Promise<BridgeIdentityHandle> {
+      return await (
+        addon.identityCreateWithAgentKey as (c: string) => Promise<BridgeIdentityHandle>
+      )(custody);
+    },
+
+    async identityAddAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      return await (
+        addon.identityAddAgentKey as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
       )(handle);
-      return checkpoint;
+    },
+
+    async identityRotateAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      return await (
+        addon.identityRotateAgentKey as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
+      )(handle);
+    },
+
+    async identityRemoveAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      return await (
+        addon.identityRemoveAgentKey as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
+      )(handle);
+    },
+
+    async identityMigrate(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      return await (
+        addon.identityMigrate as (h: BridgeIdentityHandle) => Promise<BridgeIdentityHandle>
+      )(handle);
+    },
+
+    async identityAttestDevice(did: string): Promise<string> {
+      return await (addon.identityAttestDevice as (d: string) => Promise<string>)(did);
+    },
+
+    async identityVerifyDeviceAttestation(did: string, tokenBase64: string): Promise<boolean> {
+      return await (
+        addon.identityVerifyDeviceAttestation as (d: string, t: string) => Promise<boolean>
+      )(did, tokenBase64);
     },
 
     // Lifecycle

@@ -61,9 +61,9 @@ public nonisolated struct UcanValidationResult: Sendable {
 /// injected for testability; defaults call through to ScpBindings.
 ///
 /// See ADR-026 for the flat delegation pattern and ADR-016 for UCAN spec.
-internal enum UcanBridge {
+public enum UcanBridge {
     /// Validate a UCAN token. Maps to ``ucanValidate`` in ScpBindings.
-    internal typealias ValidateFn = @Sendable (
+    public typealias ValidateFn = @Sendable (
         _ handle: ContextHandle,
         _ token: String,
         _ capability: String,
@@ -72,31 +72,46 @@ internal enum UcanBridge {
     ) async throws -> Void
 
     /// Mint a UCAN token. Maps to ``ucanMint`` in ScpBindings.
-    internal typealias MintFn = @Sendable (
+    public typealias MintFn = @Sendable (
         _ handle: ContextHandle,
         _ memberDid: String,
         _ capabilities: [String]
     ) async throws -> UcanToken
 
     /// Revoke a UCAN token. Maps to ``ucanRevoke`` in ScpBindings.
-    internal typealias RevokeFn = @Sendable (
+    public typealias RevokeFn = @Sendable (
         _ handle: ContextHandle,
         _ token: String
     ) async throws -> Void
 
     /// Default validate function that delegates to the UniFFI-generated binding.
-    internal static let defaultValidate: ValidateFn = { handle, token, capability, presentingAgentDid, proofTokens in
+    public static let defaultValidate: ValidateFn = { handle, token, capability, presentingAgentDid, proofTokens in
         try await ucanValidate(handle: handle, token: token, capability: capability, presentingAgentDid: presentingAgentDid, proofTokens: proofTokens)
     }
 
     /// Default mint function that delegates to the UniFFI-generated binding.
-    internal static let defaultMint: MintFn = { handle, memberDid, capabilities in
+    public static let defaultMint: MintFn = { handle, memberDid, capabilities in
         try await ucanMint(handle: handle, memberDid: memberDid, capabilities: capabilities)
     }
 
     /// Default revoke function that delegates to the UniFFI-generated binding.
-    internal static let defaultRevoke: RevokeFn = { handle, token in
+    public static let defaultRevoke: RevokeFn = { handle, token in
         try await ucanRevoke(handle: handle, token: token)
+    }
+
+    /// Delegate a UCAN token. Maps to ``ucanDelegate`` in ScpBindings.
+    public typealias DelegateFn = @Sendable (
+        _ handle: ContextHandle,
+        _ delegatorDid: String,
+        _ delegateeDid: String,
+        _ parentToken: String,
+        _ capabilities: [String]
+    ) async throws -> UcanToken
+
+    /// Default delegate function — delegates to UniFFI
+    /// ``ucanDelegate(handle:delegatorDid:delegateeDid:parentToken:capabilities:)``.
+    public static let defaultDelegate: DelegateFn = { handle, delegatorDid, delegateeDid, parentToken, capabilities in
+        try await ucanDelegate(handle: handle, delegatorDid: delegatorDid, delegateeDid: delegateeDid, parentToken: parentToken, capabilities: capabilities)
     }
 }
 
@@ -181,12 +196,44 @@ public func revokeUcanToken(
     try await revokeFn(handle, token)
 }
 
+/// Delegates a UCAN token to another entity.
+///
+/// Creates a new UCAN token derived from a parent token with attenuated
+/// capabilities. The delegator must be the audience of the parent token.
+/// Delegated capabilities must be a subset of the parent's capabilities.
+///
+/// - Parameters:
+///   - handle: The ``ContextHandle`` for the context.
+///   - delegatorDid: The DID of the entity delegating (must match parent
+///     token's audience).
+///   - delegateeDid: The DID of the entity receiving the delegation.
+///   - parentToken: The encoded parent UCAN token (JWT format).
+///   - capabilities: Capability URI strings to delegate (subset of parent's).
+///   - delegateFn: Bridge function override for testing.
+/// - Returns: A ``UcanToken`` with the delegated token's metadata.
+/// - Throws: ``ScpError/Permission(message:code:)`` if delegation fails.
+///
+/// ## Provenance
+///
+/// - ADR-016 (UCAN) in `.docs/adrs/phase-3.md`, criterion 4
+/// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
+public func delegateUcanToken(
+    handle: ContextHandle,
+    delegatorDid: String,
+    delegateeDid: String,
+    parentToken: String,
+    capabilities: [String],
+    delegateFn: UcanBridge.DelegateFn = UcanBridge.defaultDelegate
+) async throws -> UcanToken {
+    try await delegateFn(handle, delegatorDid, delegateeDid, parentToken, capabilities)
+}
+
 // MARK: - Legacy API (backward compatibility)
 
 /// Validates a UCAN token against the full 11-step validation pipeline.
 ///
-/// Legacy wrapper that creates a ``ContextHandle`` placeholder and delegates
-/// to ``validateUcanToken(handle:token:capability:validateFn:)``. Prefer the
+/// Legacy wrapper that delegates to
+/// ``validateUcanToken(handle:token:capability:validateFn:)``. Prefer the
 /// handle-based API for production use.
 ///
 /// ## Provenance
@@ -196,11 +243,11 @@ public func revokeUcanToken(
 /// - Story SCP-221
 public func validate(
     encoded: String,
-    contextId: String,
+    handle: ContextHandle,
+    contextId _: String,
     presenterDid: String,
     validateFn: UcanBridge.ValidateFn = UcanBridge.defaultValidate
 ) async throws -> UcanValidationResult {
-    let handle = ContextHandle(noPointer: .init())
     do {
         try await validateFn(handle, encoded, presenterDid, nil, nil)
         return UcanValidationResult(isValid: true, token: nil, failureReason: nil)
@@ -211,8 +258,8 @@ public func validate(
 
 /// Mints a new UCAN token with the specified capabilities.
 ///
-/// Legacy wrapper that creates a ``ContextHandle`` placeholder and delegates
-/// to ``mintUcanToken(handle:memberDid:capabilities:mintFn:)``. Prefer the
+/// Legacy wrapper that delegates to
+/// ``mintUcanToken(handle:memberDid:capabilities:mintFn:)``. Prefer the
 /// handle-based API for production use.
 ///
 /// ## Provenance
@@ -221,22 +268,22 @@ public func validate(
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
 /// - Story SCP-221
 public func mint(
-    issuerDid: String,
+    handle: ContextHandle,
+    issuerDid _: String,
     audienceDid: String,
     capabilities: [UcanCapability],
-    expirySecs: UInt64 = 3_600,
-    proofs: [String] = [],
+    expirySecs _: UInt64 = 3600,
+    proofs _: [String] = [],
     mintFn: UcanBridge.MintFn = UcanBridge.defaultMint
 ) async throws -> UcanToken {
-    let handle = ContextHandle(noPointer: .init())
     let capStrings = capabilities.map { "\($0.resource):\($0.action)" }
     return try await mintFn(handle, audienceDid, capStrings)
 }
 
 /// Revokes a UCAN token.
 ///
-/// Legacy wrapper that creates a ``ContextHandle`` placeholder and delegates
-/// to ``revokeUcanToken(handle:token:revokeFn:)``. Prefer the
+/// Legacy wrapper that delegates to
+/// ``revokeUcanToken(handle:token:revokeFn:)``. Prefer the
 /// handle-based API for production use.
 ///
 /// ## Provenance
@@ -245,10 +292,10 @@ public func mint(
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
 /// - Story SCP-221
 public func revoke(
+    handle: ContextHandle,
     encoded: String,
-    revokerDid: String,
+    revokerDid _: String,
     revokeFn: UcanBridge.RevokeFn = UcanBridge.defaultRevoke
 ) async throws {
-    let handle = ContextHandle(noPointer: .init())
     try await revokeFn(handle, encoded)
 }

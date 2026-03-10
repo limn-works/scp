@@ -47,16 +47,12 @@ const DEFAULT_DEDUP_CAPACITY: usize = 10_000;
 /// Default deduplication cache entry TTL.
 const DEFAULT_DEDUP_TTL: Duration = Duration::from_secs(3600);
 
-/// Minimum number of relays required per context for suppression resistance.
-///
-/// Publishing to fewer than this many relays gives individual relays veto
-/// power over message delivery (spec section 9.9.2).
-const MIN_RELAYS_PER_CONTEXT: usize = 3;
-
-/// Minimum number of successful relay deliveries required for a send to
-/// succeed. If fewer than this many relays accept the envelope, the send
-/// returns an error (insufficient redundancy).
-const MIN_SUCCESSFUL_SENDS: usize = 2;
+// MIN_RELAYS_PER_CONTEXT and MIN_SUCCESSFUL_SENDS were formerly hardcoded
+// constants (3 and 2 respectively). They are now derived from the
+// TransportProfile stored on TransportManager — see profile.min_relays()
+// and profile.min_successful_sends(). This ensures constrained devices
+// (1 relay) and mobile devices (2 relays) can operate without violating
+// thresholds designed for server/desktop profiles (#406, §10.13.1).
 
 /// Idle threshold for mobile connection shedding (spec section 10.13.3 item 3).
 ///
@@ -89,12 +85,14 @@ pub struct EvictionOutcome {
 ///
 /// Holds multiple [`TransportAdapter`] instances and routes operations
 /// through them based on per-context relay set assignments. Each context is
-/// assigned a set of at least 3 relays for suppression resistance.
+/// assigned a relay set sized by the transport profile (§10.13.1):
+/// Server/Desktop=3, Mobile=2, Constrained=1.
 ///
 /// # Phase 2 Features
 ///
 /// - **Multi-relay publishing:** `send_to_context` sends envelopes to ALL
-///   relays in a context's relay set concurrently. At least 2 must succeed.
+///   relays in a context's relay set concurrently. The minimum successful
+///   sends threshold is profile-aware (majority of the relay set).
 /// - **Merged subscription streams:** `subscribe_context` merges streams
 ///   from all relays in a context's relay set, deduplicated by `BlobId`
 ///   using an LRU cache with configurable TTL.
@@ -111,6 +109,11 @@ pub struct EvictionOutcome {
 ///
 /// See ADR-012 in `.docs/adrs/phase-2.md` for the full design.
 pub struct TransportManager {
+    /// Transport profile governing relay minimums and connection behavior.
+    ///
+    /// Determines `min_relays()` for relay set assignment and
+    /// `min_successful_sends()` for send fanout thresholds (§10.13.1).
+    profile: TransportProfile,
     /// Registered transport adapters, in insertion order.
     adapters: Vec<Box<dyn TransportAdapter>>,
     /// Per-context relay set assignments: context -> adapter indices.
@@ -210,9 +213,11 @@ impl TransportManager {
     /// [`TransportManager::with_config`].
     #[must_use]
     pub fn new(adapter: Box<dyn TransportAdapter>) -> Self {
+        let profile = TransportProfile::platform_default();
         let mut last_used = HashMap::new();
         last_used.insert(0, Instant::now());
         Self {
+            profile,
             adapters: vec![adapter],
             relay_assignments: RwLock::new(HashMap::new()),
             reliability_scores: Arc::new(Mutex::new(HashMap::new())),
@@ -237,7 +242,9 @@ impl TransportManager {
     /// adapters before performing any operations.
     #[must_use]
     pub fn builder() -> Self {
+        let profile = TransportProfile::platform_default();
         Self {
+            profile,
             adapters: Vec::new(),
             relay_assignments: RwLock::new(HashMap::new()),
             reliability_scores: Arc::new(Mutex::new(HashMap::new())),
@@ -261,6 +268,7 @@ impl TransportManager {
     #[must_use]
     pub fn with_config(config: &TransportConfig) -> Self {
         Self {
+            profile: config.profile,
             adapters: Vec::new(),
             relay_assignments: RwLock::new(HashMap::new()),
             reliability_scores: Arc::new(Mutex::new(HashMap::new())),
@@ -287,7 +295,9 @@ impl TransportManager {
     /// See SCP-253 and ADR-036 acceptance criterion 3.
     #[must_use]
     pub fn with_pool(pool: Arc<ConnectionPool>) -> Self {
+        let profile = TransportProfile::platform_default();
         Self {
+            profile,
             adapters: Vec::new(),
             relay_assignments: RwLock::new(HashMap::new()),
             reliability_scores: Arc::new(Mutex::new(HashMap::new())),
@@ -312,6 +322,7 @@ impl TransportManager {
     #[must_use]
     pub fn with_config_and_pool(config: &TransportConfig, pool: Arc<ConnectionPool>) -> Self {
         Self {
+            profile: config.profile,
             adapters: Vec::new(),
             relay_assignments: RwLock::new(HashMap::new()),
             reliability_scores: Arc::new(Mutex::new(HashMap::new())),
@@ -326,6 +337,12 @@ impl TransportManager {
             connection_pool: pool,
             max_publish_jitter_ms: config.max_publish_jitter_ms,
         }
+    }
+
+    /// Returns the transport profile governing this manager.
+    #[must_use]
+    pub const fn profile(&self) -> TransportProfile {
+        self.profile
     }
 
     /// Returns the maximum connection budget for this manager.
@@ -419,8 +436,9 @@ impl TransportManager {
     ///
     /// Looks up the relay set for the given `context_id`, sends the envelope
     /// to ALL relays concurrently via [`FuturesUnordered`], and returns a
-    /// `BlobId` per successful relay. If fewer than 2 relays succeed, returns
-    /// an error indicating insufficient redundancy.
+    /// `BlobId` per successful relay. If fewer than
+    /// [`TransportProfile::min_successful_sends`] relays succeed, returns an
+    /// error indicating insufficient redundancy.
     ///
     /// When `max_publish_jitter_ms > 0` and the relay set has more than one
     /// relay, the first relay receives the message immediately while each
@@ -438,7 +456,8 @@ impl TransportManager {
     ///
     /// Returns [`TransportError::NotConnected`] if no adapters are registered
     /// or no relay set is assigned to the context.
-    /// Returns [`TransportError::SendFailed`] if fewer than 2 relays succeed.
+    /// Returns [`TransportError::SendFailed`] if fewer than
+    /// [`TransportProfile::min_successful_sends`] relays succeed.
     pub async fn send_to_context(
         &self,
         envelope: &OuterEnvelope,
@@ -529,12 +548,14 @@ impl TransportManager {
             }
         }
 
-        if successes.len() < MIN_SUCCESSFUL_SENDS {
+        let min_sends = self.profile.min_successful_sends();
+        if successes.len() < min_sends {
             return Err(TransportError::SendFailed(format!(
-                "insufficient redundancy: only {} of {} relays accepted the envelope (minimum {})",
+                "insufficient redundancy: only {} of {} relays accepted the envelope (minimum {} for {} profile)",
                 successes.len(),
                 relay_indices.len(),
-                MIN_SUCCESSFUL_SENDS,
+                min_sends,
+                self.profile,
             )));
         }
 
@@ -745,9 +766,11 @@ impl TransportManager {
 
     /// Assigns a relay set for a context.
     ///
-    /// Selects at least [`MIN_RELAYS_PER_CONTEXT`] (3) adapters per context
+    /// Selects at least [`TransportProfile::min_relays`] adapters per context
     /// using round-robin spread to minimize overlap between contexts' relay
-    /// sets. Prefers adapters with higher reliability scores.
+    /// sets. Prefers adapters with higher reliability scores. The minimum
+    /// relay count is profile-aware (§10.13.1): Server/Desktop=3, Mobile=2,
+    /// Constrained=1.
     ///
     /// The assigned relay set is stored in `relay_assignments` and returned
     /// as a vector of adapter indices.
@@ -763,7 +786,7 @@ impl TransportManager {
         }
 
         let adapter_count = self.adapters.len();
-        let set_size = MIN_RELAYS_PER_CONTEXT.min(adapter_count);
+        let set_size = self.profile.min_relays().min(adapter_count);
 
         // Build a list of adapter indices sorted by:
         //   (overlap count ASC, reliability score DESC, cost ASC,
@@ -1893,7 +1916,7 @@ mod tests {
     #[tokio::test]
     async fn send_to_context_error_when_fewer_than_two_succeed() {
         let mut manager = TransportManager::builder();
-        // One succeeds, two fail => only 1 success < MIN_SUCCESSFUL_SENDS (2).
+        // One succeeds, two fail => only 1 success < min_successful_sends (2 for desktop).
         manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))));
         manager.add_adapter(Box::new(MockAdapter::failing(TransportError::SendFailed(
             "fail1".to_string(),
@@ -1917,7 +1940,7 @@ mod tests {
     #[tokio::test]
     async fn send_to_context_succeeds_with_exactly_two_relays() {
         let mut manager = TransportManager::builder();
-        // Two succeed, one fails => 2 successes >= MIN_SUCCESSFUL_SENDS.
+        // Two succeed, one fails => 2 successes >= min_successful_sends (2 for desktop).
         manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x01; 32]))));
         manager.add_adapter(Box::new(MockAdapter::with_blob_id(BlobId::new([0x02; 32]))));
         manager.add_adapter(Box::new(MockAdapter::failing(TransportError::SendFailed(

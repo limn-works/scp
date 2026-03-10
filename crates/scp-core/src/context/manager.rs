@@ -28,7 +28,10 @@ use super::governance::{
     CheckpointAttestationStatus, ContextCheckpoint, CosignedCheckpoint, GovernanceAction,
     GovernanceContext, GovernanceEngine, GovernanceEvent, GovernanceModelConfig,
     GovernanceProposal, KeyResolver, ProposalId, ProposalStatus, PruningPolicy, RevocationScope,
-    SingleAdminEngine, majority::MajorityVoteEngine, multisig::ThresholdEngine,
+    SingleAdminEngine,
+    majority::MajorityVoteEngine,
+    mls_integration::{MlsImpact, classify_action},
+    multisig::ThresholdEngine,
     unanimity::UnanimityEngine,
 };
 use super::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
@@ -336,6 +339,11 @@ pub struct ContextSnapshot {
     /// Format: `(new_ceiling_capabilities, notification_timestamp, proposal_id)`.
     #[serde(default)]
     pub pending_ceiling_modification: Option<PendingCeilingModification>,
+    /// Monotonic MLS epoch counter. Tracks epoch advances from membership-
+    /// mutating governance actions (`AddMember`, `RemoveMember`,
+    /// `RevokeReadAccess`, `ResetMember`).
+    #[serde(default)]
+    pub mls_epoch: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +495,12 @@ struct PerContextState {
     governance_timeout_task: GovernanceTimeoutTask,
     /// Pending ceiling modification awaiting notification period (M7, §5.3).
     pending_ceiling_modification: Option<PendingCeilingModification>,
+    /// Monotonic MLS epoch counter. Incremented each time a governance action
+    /// triggers an MLS membership change (`AddMember`, `RemoveMember`,
+    /// `RevokeReadAccess`, `ResetMember`). Used to populate
+    /// `GovernanceActionExecuted.resulting_epoch` and
+    /// `GovernanceContext.current_epoch`.
+    mls_epoch: u64,
 }
 
 /// Creates a governance engine from a [`GovernanceModel`] selector and
@@ -950,6 +964,16 @@ impl ContextManager {
         }
     }
 
+    /// Returns `true` if a persistence provider is configured.
+    ///
+    /// Use this to guard snapshot creation so that expensive deep-clones
+    /// of `PerContextState` are skipped when no persistence provider
+    /// exists (the common case for most bridges).
+    #[inline]
+    fn has_persistence(&self) -> bool {
+        self.persistence.is_some()
+    }
+
     /// Persists a context snapshot if a persistence provider is configured.
     ///
     /// Best-effort: logs errors but does not propagate them to callers.
@@ -1012,6 +1036,7 @@ impl ContextManager {
             approved_proposals: ctx.approved_proposals.clone(),
             governance_freeze: ctx.governance_freeze,
             pending_ceiling_modification: ctx.pending_ceiling_modification.clone(),
+            mls_epoch: ctx.mls_epoch,
         }
     }
 
@@ -1112,6 +1137,7 @@ impl ContextManager {
             economic_policy: ctx_snapshot.economic_policy,
             governance_timeout_task: GovernanceTimeoutTask::new(),
             pending_ceiling_modification: ctx_snapshot.pending_ceiling_modification,
+            mls_epoch: ctx_snapshot.mls_epoch,
         };
 
         {
@@ -1353,6 +1379,7 @@ impl ContextManager {
             economic_policy: export.snapshot.economic_policy,
             governance_timeout_task: GovernanceTimeoutTask::new(),
             pending_ceiling_modification: export.snapshot.pending_ceiling_modification,
+            mls_epoch: export.snapshot.mls_epoch,
         };
 
         // 6. Register the context.
@@ -1367,12 +1394,13 @@ impl ContextManager {
         }
 
         // 7. Persist if persistence is configured.
-        let snapshot_for_persist = {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
-            contexts.get(&context_id).map(Self::snapshot_context)
-        };
-        if let Some(snap) = snapshot_for_persist {
-            self.persist_context_snapshot(&context_id, &snap);
+            if let Some(ctx) = contexts.get(&context_id) {
+                let snap = Self::snapshot_context(ctx);
+                drop(contexts);
+                self.persist_context_snapshot(&context_id, &snap);
+            }
         }
 
         // 8. Re-spawn TTL timer if there was remaining TTL.
@@ -1468,7 +1496,9 @@ impl ContextManager {
             bc.add_author(&creator_did)
                 .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
             // Persist initial broadcast state for crash recovery.
-            self.persist_broadcast_snapshot(&context_id, &bc.to_snapshot());
+            if self.has_persistence() {
+                self.persist_broadcast_snapshot(&context_id, &bc.to_snapshot());
+            }
             Some(bc)
         } else {
             None
@@ -1505,6 +1535,7 @@ impl ContextManager {
             economic_policy: params.economic_policy.clone(),
             governance_timeout_task: GovernanceTimeoutTask::new(),
             pending_ceiling_modification: None,
+            mls_epoch: 0,
         };
 
         // Atomic duplicate check + insert under lock -- no .await inside this scope.
@@ -1519,7 +1550,7 @@ impl ContextManager {
         }
 
         // Persist context + broadcast state after creation (best-effort).
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(&context_id) {
                 let snapshot = Self::snapshot_context(ctx);
@@ -1637,7 +1668,9 @@ impl ContextManager {
                 .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
             bc.add_author(&creator_did)
                 .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
-            self.persist_broadcast_snapshot(&context_id, &bc.to_snapshot());
+            if self.has_persistence() {
+                self.persist_broadcast_snapshot(&context_id, &bc.to_snapshot());
+            }
             Some(bc)
         } else {
             None
@@ -1666,7 +1699,7 @@ impl ContextManager {
         }
 
         // Persist context + broadcast state after creation (best-effort).
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(&context_id) {
                 let snapshot = Self::snapshot_context(ctx);
@@ -1765,6 +1798,7 @@ impl ContextManager {
             economic_policy: params.economic_policy.clone(),
             governance_timeout_task: GovernanceTimeoutTask::new(),
             pending_ceiling_modification: None,
+            mls_epoch: 0,
         })
     }
 
@@ -1863,7 +1897,7 @@ impl ContextManager {
             .append_context_event(&context_id_bytes, "MemberJoined")?;
 
         // Persist context state after join (best-effort).
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(&context_id) {
                 let snapshot = Self::snapshot_context(ctx);
@@ -1983,7 +2017,7 @@ impl ContextManager {
             .append_context_event(&context_id_bytes, "MemberLeft")?;
 
         // Persist context state after leave (best-effort).
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(&context_id) {
                 let snapshot = Self::snapshot_context(ctx);
@@ -2140,7 +2174,9 @@ impl ContextManager {
             .append_context_event(&context_id_bytes, "MessageSent")?;
 
         // Persist context state after send (best-effort).
-        {
+        // Guarded: skip mutex re-acquisition and deep-clone when no
+        // persistence provider is configured (the common case for bridges).
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(&context_id) {
                 let snapshot = Self::snapshot_context(ctx);
@@ -2272,8 +2308,13 @@ impl ContextManager {
 
             let result = bc.subscribe(subscriber_did, ucan, timestamp, validation_ctx)?;
 
-            // Take snapshot for persistence before dropping lock.
-            let snapshot = bc.to_snapshot();
+            // Take snapshot for persistence before dropping lock (skip if
+            // no persistence provider is configured).
+            let snapshot = if self.has_persistence() {
+                Some(bc.to_snapshot())
+            } else {
+                None
+            };
 
             // Add subscriber to membership tracking (role = "subscriber").
             ctx.membership
@@ -2287,10 +2328,12 @@ impl ContextManager {
         // Lock dropped.
 
         // Persist broadcast state for crash recovery.
-        self.persist_broadcast_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_broadcast_snapshot(context_id, snapshot);
+        }
 
         // Persist context state after subscribe (best-effort).
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(context_id) {
                 let ctx_snapshot = Self::snapshot_context(ctx);
@@ -2340,8 +2383,13 @@ impl ContextManager {
 
             let result = bc.unsubscribe(subscriber_did, rotate_keys)?;
 
-            // Take snapshot for persistence before dropping lock.
-            let snapshot = bc.to_snapshot();
+            // Take snapshot for persistence before dropping lock (skip if
+            // no persistence provider is configured).
+            let snapshot = if self.has_persistence() {
+                Some(bc.to_snapshot())
+            } else {
+                None
+            };
 
             // Remove from membership tracking.
             ctx.membership.remove_member(subscriber_did);
@@ -2356,10 +2404,12 @@ impl ContextManager {
         // Lock dropped.
 
         // Persist broadcast state for crash recovery.
-        self.persist_broadcast_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_broadcast_snapshot(context_id, snapshot);
+        }
 
         // Persist context state after unsubscribe (best-effort).
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(context_id) {
                 let ctx_snapshot = Self::snapshot_context(ctx);
@@ -2519,8 +2569,13 @@ impl ContextManager {
 
             let result = bc.block_subscriber(author_did, subscriber_did)?;
 
-            // Take snapshot for persistence before dropping lock.
-            let snapshot = bc.to_snapshot();
+            // Take snapshot for persistence before dropping lock (skip if
+            // no persistence provider is configured).
+            let snapshot = if self.has_persistence() {
+                Some(bc.to_snapshot())
+            } else {
+                None
+            };
 
             // Emit block event to receive buffer.
             ctx.receive_buffer.push(ContextEvent::MemberBlocked {
@@ -2533,7 +2588,9 @@ impl ContextManager {
         // Lock dropped.
 
         // Persist broadcast state for crash recovery.
-        self.persist_broadcast_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_broadcast_snapshot(context_id, snapshot);
+        }
 
         self.event_log
             .append_context_event(&context_id_bytes, "MemberBlocked")?;
@@ -2614,6 +2671,55 @@ impl ContextManager {
             }
         };
 
+        // For MLS-mutating actions (AddMember, RemoveMember, RevokeReadAccess,
+        // ResetMember), increment the epoch counter and report it. Non-MLS
+        // actions leave the epoch unchanged and report None.
+        let resulting_epoch = if classify_action(&proposal.action) == MlsImpact::MembershipChange {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.mls_epoch = ctx.mls_epoch.saturating_add(1);
+                Some(ctx.mls_epoch)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Construct the structured GovernanceEvent::GovernanceActionExecuted
+        // and emit it to both the Merkle event log and the receive buffer
+        // (ADR-031 §8, PRD SCP-269/SCP-270).
+        {
+            let executed_event = GovernanceEvent::GovernanceActionExecuted {
+                proposal_id: proposal.proposal_id,
+                action: Box::new(proposal.action.clone()),
+                executor_did: proposal.proposer_did.clone(),
+                resulting_epoch,
+            };
+
+            // Append to Merkle event log using the standard governance event
+            // label path (same pattern as propose/approve/reject/withdraw).
+            let context_id_bytes = context_id_to_bytes(context_id);
+            self.event_log.append_context_event(
+                &context_id_bytes,
+                Self::governance_event_label(&executed_event),
+            )?;
+
+            // Push to receive buffer so SDK consumers observe outcomes with
+            // rich context.
+            let action_summary = proposal.action.variant_name().to_owned();
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.receive_buffer
+                    .push(ContextEvent::GovernanceActionExecuted {
+                        proposal_id: proposal.proposal_id,
+                        action_summary,
+                        executor_did: proposal.proposer_did.clone(),
+                        resulting_epoch,
+                    });
+            }
+        }
+
         // Remove the executed proposal from approved_proposals so it no
         // longer participates in conflict detection (ADR-031 §7).  Replay
         // prevention is already handled by `executed_proposals`.
@@ -2622,9 +2728,11 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(context_id) {
                 ctx.approved_proposals.remove(&proposal.proposal_id);
-                let snapshot = Self::snapshot_context(ctx);
-                drop(contexts);
-                self.persist_context_snapshot(context_id, &snapshot);
+                if self.has_persistence() {
+                    let snapshot = Self::snapshot_context(ctx);
+                    drop(contexts);
+                    self.persist_context_snapshot(context_id, &snapshot);
+                }
             }
         }
 
@@ -2644,10 +2752,19 @@ impl ContextManager {
         let pid = proposal.proposal_id;
         match &proposal.action {
             GovernanceAction::BlockAuthor { did, .. } => {
-                let r = self
-                    .block_broadcast_author_internal(context_id, did)
+                // Delegate to RevokeWriteAccess with Full scope (SCP-RG-016,
+                // ADR-038). BlockAuthor is a legacy action; the content access
+                // key layer provides the proper mechanism for revoking write
+                // access. Delegation ensures key rotation and access tracking
+                // are handled consistently.
+                self.execute_revoke_write_access(context_id, did, RevocationScope::Full, pid)
                     .await?;
-                Ok(GovernanceActionResult::AuthorBlocked(r))
+                Ok(GovernanceActionResult::WriteAccessRevoked(
+                    WriteAccessRevokedResult {
+                        did: did.clone(),
+                        scope: RevocationScope::Full,
+                    },
+                ))
             }
             GovernanceAction::RevokeReadAccess { did, scope } => {
                 let r = self
@@ -2947,11 +3064,29 @@ impl ContextManager {
             context_id: ctx.handle.context_id().to_owned(),
             members,
             admin_dids,
-            current_epoch: None, // MLS epoch not tracked here; governance doesn't need it.
+            current_epoch: Some(ctx.mls_epoch),
             now: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+        }
+    }
+
+    /// Returns the event-log label string for a [`GovernanceEvent`] variant.
+    ///
+    /// Used when appending governance events to the Merkle event log. Each
+    /// variant maps to a deterministic string label so event consumers can
+    /// filter by type without deserializing the full event.
+    const fn governance_event_label(event: &GovernanceEvent) -> &'static str {
+        match event {
+            GovernanceEvent::ProposalCreated { .. } => "GovernanceProposalCreated",
+            GovernanceEvent::VoteCast { .. } => "GovernanceVoteCast",
+            GovernanceEvent::VoteWithdrawn { .. } => "GovernanceVoteWithdrawn",
+            GovernanceEvent::ProposalResolved { .. } => "GovernanceProposalResolved",
+            GovernanceEvent::DeadlockRecovery { .. } => "GovernanceDeadlockRecovery",
+            GovernanceEvent::ConflictDetected { .. } => "GovernanceConflictDetected",
+            GovernanceEvent::ConflictResolved { .. } => "GovernanceConflictResolved",
+            GovernanceEvent::GovernanceActionExecuted { .. } => "GovernanceActionExecuted",
         }
     }
 
@@ -3117,7 +3252,7 @@ impl ContextManager {
         };
 
         // Persist context state after proposal creation.
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(context_id) {
                 let snapshot = Self::snapshot_context(ctx);
@@ -3252,7 +3387,7 @@ impl ContextManager {
         }
 
         // Persist context state after vote.
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(context_id) {
                 let snapshot = Self::snapshot_context(ctx);
@@ -3493,22 +3628,13 @@ impl ContextManager {
 
         let context_id_bytes = context_id_to_bytes(context_id);
         for event in &events {
-            let event_str = match event {
-                GovernanceEvent::ProposalCreated { .. } => "GovernanceProposalCreated",
-                GovernanceEvent::VoteCast { .. } => "GovernanceVoteCast",
-                GovernanceEvent::VoteWithdrawn { .. } => "GovernanceVoteWithdrawn",
-                GovernanceEvent::ProposalResolved { .. } => "GovernanceProposalResolved",
-                GovernanceEvent::DeadlockRecovery { .. } => "GovernanceDeadlockRecovery",
-                GovernanceEvent::ConflictDetected { .. } => "GovernanceConflictDetected",
-                GovernanceEvent::ConflictResolved { .. } => "GovernanceConflictResolved",
-            };
             let _ = self
                 .event_log
-                .append_context_event(&context_id_bytes, event_str);
+                .append_context_event(&context_id_bytes, Self::governance_event_label(event));
         }
 
         // Persist context state after withdrawal.
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(context_id) {
                 let snapshot = Self::snapshot_context(ctx);
@@ -3520,77 +3646,10 @@ impl ContextManager {
         Ok(status)
     }
 
-    /// Internal implementation of author blocking. Only callable within the
-    /// crate -- external callers must go through [`execute_governance_action`]
-    /// with an approved [`GovernanceProposal`] containing a
-    /// [`GovernanceAction::BlockAuthor`] action.
-    ///
-    /// Removes the author from the broadcast context's author map, destroying
-    /// their sender key. After this call:
-    ///
-    /// - `publish_broadcast()` by this author returns `PermissionDenied`.
-    /// - `handle_broadcast_key_request()` for this author returns `Deny`.
-    /// - Subscribers who cached the author's old key can still decrypt old
-    ///   messages, but no new messages can be sealed.
-    ///
-    /// Emits an `AuthorBlocked` event. See SCP-227 AC4 and spec section 5.14.8.
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-    /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
-    ///   context.
-    async fn block_broadcast_author_internal(
-        &self,
-        context_id: &str,
-        author_did: &DID,
-    ) -> Result<AuthorBlockResult, ContextError> {
-        let context_id_bytes = context_id_to_bytes(context_id);
-
-        // Replay check and executed_proposals tracking are handled by the
-        // outer execute_governance_action wrapper — not duplicated here.
-        let (result, snapshot) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
-            require_active(&ctx.handle)?;
-
-            // Gate: ceiling must include MemberBan (§5.3, ADR-031, #339).
-            // Consistent with revoke_read_access_internal and
-            // restore_read_access_internal which already check this.
-            if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
-                return Err(ContextError::PermissionDenied(
-                    "context ceiling does not include member:ban capability".into(),
-                ));
-            }
-
-            let bc = ctx
-                .broadcast_context
-                .as_mut()
-                .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
-
-            let result = bc.block_author(author_did)?;
-
-            // Take snapshot for persistence before dropping lock.
-            let snapshot = bc.to_snapshot();
-
-            // Emit block event to receive buffer.
-            ctx.receive_buffer.push(ContextEvent::AuthorBlocked {
-                author_did: author_did.clone(),
-            });
-
-            (result, snapshot)
-        };
-
-        // Persist broadcast state for crash recovery.
-        self.persist_broadcast_snapshot(context_id, &snapshot);
-
-        self.event_log
-            .append_context_event(&context_id_bytes, "AuthorBlocked")?;
-
-        Ok(result)
-    }
+    // block_broadcast_author_internal removed (SCP-RG-016, #425).
+    // BlockAuthor now delegates to execute_revoke_write_access with
+    // RevocationScope::Full, which handles key destruction, event emission,
+    // and persistence through the content access key layer (ADR-038).
 
     /// Internal implementation of read access revocation. Only callable within
     /// the crate -- external callers must go through [`execute_governance_action`]
@@ -3676,7 +3735,12 @@ impl ContextManager {
             // Broadcast mode: also ban via broadcast-specific subscriber registry.
             let (ban_result, bc_snap) = if let Some(ref mut bc) = ctx.broadcast_context {
                 let r = bc.governance_ban_subscriber(&did.0, scope)?;
-                (r, Some(bc.to_snapshot()))
+                let snap = if self.has_persistence() {
+                    Some(bc.to_snapshot())
+                } else {
+                    None
+                };
+                (r, snap)
             } else {
                 // Encrypted mode: access key deletion signals the key layer.
                 (
@@ -3695,11 +3759,18 @@ impl ContextManager {
             ctx.receive_buffer
                 .push(ContextEvent::AccessKeyRevoked { did: did.clone() });
 
-            (ban_result, Self::snapshot_context(ctx), bc_snap)
+            let snap = if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            };
+            (ban_result, snap, bc_snap)
         };
 
         // Persist context and broadcast state for crash recovery.
-        self.persist_context_snapshot(context_id, &ctx_snapshot);
+        if let Some(ref ctx_snapshot) = ctx_snapshot {
+            self.persist_context_snapshot(context_id, ctx_snapshot);
+        }
         if let Some(ref bc_snap) = bc_snapshot {
             self.persist_broadcast_snapshot(context_id, bc_snap);
         }
@@ -3775,9 +3846,13 @@ impl ContextManager {
             }
 
             // Broadcast mode: also unban via broadcast-specific subscriber registry.
-            let bc_snap = ctx.broadcast_context.as_mut().map(|bc| {
+            let bc_snap = ctx.broadcast_context.as_mut().and_then(|bc| {
                 bc.governance_unban_subscriber(&did.0);
-                bc.to_snapshot()
+                if self.has_persistence() {
+                    Some(bc.to_snapshot())
+                } else {
+                    None
+                }
             });
 
             // Emit restoration events to receive buffer.
@@ -3788,11 +3863,18 @@ impl ContextManager {
                 new_epoch: 1,
             });
 
-            (Self::snapshot_context(ctx), bc_snap)
+            let snap = if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            };
+            (snap, bc_snap)
         };
 
         // Persist context and broadcast state for crash recovery.
-        self.persist_context_snapshot(context_id, &ctx_snapshot);
+        if let Some(ref ctx_snapshot) = ctx_snapshot {
+            self.persist_context_snapshot(context_id, ctx_snapshot);
+        }
         if let Some(ref bc_snap) = bc_snapshot {
             self.persist_broadcast_snapshot(context_id, bc_snap);
         }
@@ -3848,10 +3930,16 @@ impl ContextManager {
                 role_name: role.to_owned(),
             });
 
-            Self::snapshot_context(ctx)
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            }
         };
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "MemberJoined")?;
         Ok(())
@@ -3891,10 +3979,16 @@ impl ContextManager {
                 member_did: did.clone(),
             });
 
-            Self::snapshot_context(ctx)
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            }
         };
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "MemberLeft")?;
         Ok(())
@@ -3932,10 +4026,16 @@ impl ContextManager {
                 info.tokens = tokens;
             }
 
-            Self::snapshot_context(ctx)
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            }
         };
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "RoleAssigned")?;
         Ok(())
@@ -3972,10 +4072,16 @@ impl ContextManager {
                 )));
             }
             ctx.registered_tools.push(registration.clone());
-            Self::snapshot_context(ctx)
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            }
         };
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "ToolRegistered")?;
         Ok(())
@@ -3997,10 +4103,16 @@ impl ContextManager {
             require_active(&ctx.handle)?;
 
             ctx.registered_tools.retain(|t| t.tool_id != tool_id);
-            Self::snapshot_context(ctx)
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            }
         };
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "ToolRemoved")?;
         Ok(())
@@ -4048,10 +4160,16 @@ impl ContextManager {
                 proposal_id,
             });
 
-            Self::snapshot_context(ctx)
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            }
         };
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "CeilingModificationPending")?;
         Ok(())
@@ -4092,11 +4210,18 @@ impl ContextManager {
                 CapabilityCeiling::new(pending.new_capabilities.iter().cloned());
             ctx.pending_ceiling_modification = None;
 
-            (true, Self::snapshot_context(ctx))
+            let snap = if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            };
+            (true, snap)
         };
 
         if applied {
-            self.persist_context_snapshot(context_id, &snapshot);
+            if let Some(ref snapshot) = snapshot {
+                self.persist_context_snapshot(context_id, snapshot);
+            }
             self.event_log
                 .append_context_event(&context_id_bytes, "CeilingModified")?;
         }
@@ -4143,10 +4268,16 @@ impl ContextManager {
             // Drop broadcast context state -- keys are zeroed by Zeroize.
             ctx.broadcast_context = None;
 
-            Self::snapshot_context(ctx)
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            }
         };
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "ContextClosing")?;
         Ok(())
@@ -4209,7 +4340,12 @@ impl ContextManager {
             ctx.ttl_timer.task = None;
 
             let h = ctx.handle.clone();
-            (Self::snapshot_context(ctx), remaining_secs, h)
+            let snap = if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            };
+            (snap, remaining_secs, h)
         };
 
         // Respawn the TTL timer with the updated remaining duration.
@@ -4218,7 +4354,9 @@ impl ContextManager {
                 .await;
         }
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "TtlExtended")?;
         Ok(())
@@ -4268,10 +4406,16 @@ impl ContextManager {
                 info.tokens = tokens;
             }
 
-            Self::snapshot_context(ctx)
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            }
         };
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "AdminTransferred")?;
         Ok(())
@@ -4370,10 +4514,16 @@ impl ContextManager {
             require_active(&ctx.handle)?;
 
             ctx.pruning_policy = Some(new_policy.clone());
-            Self::snapshot_context(ctx)
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            }
         };
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "PruningPolicyModified")?;
         Ok(())
@@ -4440,10 +4590,16 @@ impl ContextManager {
                 }
             }
 
-            Self::snapshot_context(ctx)
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            }
         };
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "SignerAdded")?;
         Ok(())
@@ -4504,10 +4660,16 @@ impl ContextManager {
                 });
             }
 
-            Self::snapshot_context(ctx)
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            }
         };
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "SignerRemoved")?;
         Ok(())
@@ -4535,10 +4697,16 @@ impl ContextManager {
                 )));
             }
             ctx.threshold_value = new_threshold;
-            Self::snapshot_context(ctx)
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            }
         };
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "ThresholdModified")?;
         Ok(())
@@ -4575,10 +4743,16 @@ impl ContextManager {
                 )));
             }
             ctx.tool_interfaces.push(interface.clone());
-            Self::snapshot_context(ctx)
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            }
         };
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "ToolInterfaceEstablished")?;
         Ok(())
@@ -4664,10 +4838,16 @@ impl ContextManager {
             // Clear governance freeze now that the conflict is resolved.
             ctx.governance_freeze = None;
 
-            Self::snapshot_context(ctx)
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            }
         };
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "GovernanceConflictResolved")?;
         Ok(())
@@ -4732,10 +4912,16 @@ impl ContextManager {
             ctx.ttl_timer.deadline_unix_secs = None;
             ctx.handle.promote_memory_scope();
 
-            Self::snapshot_context(ctx)
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            }
         };
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "ContextPromoted")?;
         Ok(())
@@ -4805,9 +4991,14 @@ impl ContextManager {
                             Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
                             Err(e) => return Err(e),
                         }
-                        Ok(bc.to_snapshot())
+                        Ok(if self.has_persistence() {
+                            Some(bc.to_snapshot())
+                        } else {
+                            None
+                        })
                     })
-                    .transpose()?,
+                    .transpose()?
+                    .flatten(),
                 RevocationScope::FutureOnly => None,
             };
 
@@ -4815,10 +5006,17 @@ impl ContextManager {
             ctx.receive_buffer
                 .push(ContextEvent::WriteAccessRevoked { did: did.clone() });
 
-            (Self::snapshot_context(ctx), bc_snap)
+            let snap = if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            };
+            (snap, bc_snap)
         };
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         if let Some(ref bc_snap) = bc_snapshot {
             self.persist_broadcast_snapshot(context_id, bc_snap);
         }
@@ -4878,10 +5076,16 @@ impl ContextManager {
             ctx.receive_buffer
                 .push(ContextEvent::WriteAccessRestored { did: did.clone() });
 
-            Self::snapshot_context(ctx)
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            }
         };
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "WriteAccessRestored")?;
         Ok(())
@@ -4913,7 +5117,11 @@ impl ContextManager {
             let bc_snap = if let Some(ref mut bc) = ctx.broadcast_context {
                 // Rotate every author's broadcast key (epoch advance + new key).
                 bc.rotate_all_author_keys()?;
-                Some(bc.to_snapshot())
+                if self.has_persistence() {
+                    Some(bc.to_snapshot())
+                } else {
+                    None
+                }
             } else {
                 // Encrypted mode: the MLS backend handles key rotation via
                 // update proposals. No direct crypto call needed — the event
@@ -4926,10 +5134,17 @@ impl ContextManager {
                 reason: reason.map(String::from),
             });
 
-            (Self::snapshot_context(ctx), bc_snap)
+            let snap = if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            };
+            (snap, bc_snap)
         };
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         if let Some(ref snap) = bc_snapshot {
             self.persist_broadcast_snapshot(context_id, snap);
         }
@@ -5019,10 +5234,16 @@ impl ContextManager {
                 return Err(e);
             }
 
-            Self::snapshot_context(ctx)
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            }
         };
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "GovernanceReconfigured")?;
         Ok(())
@@ -5063,10 +5284,16 @@ impl ContextManager {
             }
 
             ctx.economic_policy = Some(policy.clone());
-            Self::snapshot_context(ctx)
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            }
         };
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "EconomicPolicyChanged")?;
         Ok(())
@@ -5105,10 +5332,16 @@ impl ContextManager {
                 return Err(ContextError::MemberNotFound(spender.to_string()));
             }
 
-            Self::snapshot_context(ctx)
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            }
         };
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "SpendApproved")?;
         Ok(())
@@ -5152,10 +5385,16 @@ impl ContextManager {
                 }
             }
 
-            Self::snapshot_context(ctx)
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            }
         };
 
-        self.persist_context_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
         self.event_log
             .append_context_event(&context_id_bytes, "EconomicPolicyLocked")?;
         Ok(())
@@ -5325,7 +5564,7 @@ impl ContextManager {
         }
 
         // Persist context state after close (best-effort).
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(&context_id) {
                 let snapshot = Self::snapshot_context(ctx);
@@ -5402,7 +5641,7 @@ impl ContextManager {
         }
 
         // Persist context state after TTL expiry (best-effort).
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(&context_id) {
                 let snapshot = Self::snapshot_context(ctx);
@@ -5453,9 +5692,11 @@ impl ContextManager {
         let unanimous = extension.is_unanimous();
 
         // Persist context state after proposal consent (best-effort).
-        let ctx_snapshot = Self::snapshot_context(ctx);
-        drop(contexts);
-        self.persist_context_snapshot(context_id, &ctx_snapshot);
+        if self.has_persistence() {
+            let ctx_snapshot = Self::snapshot_context(ctx);
+            drop(contexts);
+            self.persist_context_snapshot(context_id, &ctx_snapshot);
+        }
 
         Ok(unanimous)
     }
@@ -5482,7 +5723,7 @@ impl ContextManager {
         self.spawn_ttl_timer(context_id, new_duration, handle).await;
 
         // Persist context state after TTL reset (best-effort).
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(context_id) {
                 let snapshot = Self::snapshot_context(ctx);
@@ -7728,12 +7969,13 @@ mod tests {
             approved_block_author_proposal(&"did:key:alice".into(), &ctx_id, &"did:key:bob".into());
         let action_result = manager.execute_governance_action(&ctx_id, &proposal).await;
         assert!(action_result.is_ok());
-        let super::GovernanceActionResult::AuthorBlocked(block_result) = action_result.unwrap()
+        let super::GovernanceActionResult::WriteAccessRevoked(revoke_result) =
+            action_result.unwrap()
         else {
-            panic!("expected AuthorBlocked result");
+            panic!("expected WriteAccessRevoked result from BlockAuthor delegation");
         };
-        assert_eq!(block_result.author_did, "did:key:bob");
-        assert_eq!(block_result.final_epoch, 0);
+        assert_eq!(revoke_result.did.0, "did:key:bob");
+        assert_eq!(revoke_result.scope, RevocationScope::Full);
 
         // Alice can still publish (unaffected).
         assert!(
@@ -9659,6 +9901,7 @@ mod tests {
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
+            mls_epoch: 0,
         };
 
         let bc_snapshot = test_broadcast_snapshot("persist-ctx-2");
@@ -9756,6 +9999,7 @@ mod tests {
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
+            mls_epoch: 0,
         };
 
         persistence
@@ -9841,6 +10085,7 @@ mod tests {
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
+            mls_epoch: 0,
         };
 
         persistence.persist_context("ttl-ctx", &snapshot).unwrap();
@@ -9905,6 +10150,7 @@ mod tests {
                 approved_proposals: HashMap::new(),
                 governance_freeze: None,
                 pending_ceiling_modification: None,
+                mls_epoch: 0,
             };
             persistence.persist_context(ctx_name, &snapshot).unwrap();
         }
@@ -9968,6 +10214,7 @@ mod tests {
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
+            mls_epoch: 0,
         };
 
         let bc_snapshot = test_broadcast_snapshot("dup-ctx");
@@ -10286,8 +10533,11 @@ mod tests {
                 target_context: format!("target-{i}"),
                 tool_id: format!("tool-{i}"),
                 rate_limit: None,
+                per_caller_rate_limit: None,
                 approved_by_source: true,
                 approved_by_target: true,
+                outbound_policy: None,
+                inbound_policy: None,
             };
             manager
                 .execute_establish_tool_interface("test-ctx", &iface, pid)
@@ -10301,8 +10551,11 @@ mod tests {
             target_context: "target-overflow".to_owned(),
             tool_id: "tool-overflow".to_owned(),
             rate_limit: None,
+            per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: true,
+            outbound_policy: None,
+            inbound_policy: None,
         };
         let err = manager
             .execute_establish_tool_interface("test-ctx", &overflow, pid)
@@ -10961,6 +11214,7 @@ mod tests {
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
+            mls_epoch: 0,
         };
 
         let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -11322,8 +11576,11 @@ mod tests {
                     target_context: "other-ctx".into(),
                     tool_id: "tool-a".into(),
                     rate_limit: None,
+                    per_caller_rate_limit: None,
                     approved_by_source: true,
                     approved_by_target: false,
+                    outbound_policy: None,
+                    inbound_policy: None,
                 },
             },
         );
@@ -11411,8 +11668,8 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("member:ban")),
-            "expected PermissionDenied about member:ban, got: {err}"
+            matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("MemberBan")),
+            "expected PermissionDenied about MemberBan, got: {err}"
         );
     }
 

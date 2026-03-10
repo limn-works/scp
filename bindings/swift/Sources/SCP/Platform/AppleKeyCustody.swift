@@ -41,17 +41,17 @@ nonisolated extension PlatformError: LocalizedError {
     /// Human-readable error description. Safe for logging; no key material.
     public nonisolated var errorDescription: String? {
         switch self {
-        case .keychainError(let status):
+        case let .keychainError(status):
             "Keychain operation failed with OSStatus \(status)"
-        case .keyNotFound(let handle):
+        case let .keyNotFound(handle):
             "Key not found for handle '\(handle)'"
-        case .wrongKeyType(let detail):
+        case let .wrongKeyType(detail):
             "Wrong key type: \(detail)"
-        case .destructionFailed(let handle):
+        case let .destructionFailed(handle):
             "Key destruction failed: item persisted for handle '\(handle)'"
-        case .biometricAuthenticationFailed(let detail):
+        case let .biometricAuthenticationFailed(detail):
             "Biometric authentication failed: \(detail)"
-        case .custodyError(let message):
+        case let .custodyError(message):
             "Key custody error: \(message)"
         }
     }
@@ -169,7 +169,7 @@ public nonisolated struct PseudonymResult: Sendable {
 /// Encoded as a compact JSON blob and stored in `kSecAttrLabel`. This allows
 /// type-checking and public key retrieval without accessing key material
 /// (which would trigger biometric prompts on gated keys).
-private nonisolated struct KeyMetadata: Codable, Sendable {
+private nonisolated struct KeyMetadata: Codable {
     /// The ``KeyType`` of the stored key.
     let keyType: String
     /// Base64-encoded 32-byte public key bytes, stored at generation time.
@@ -257,7 +257,7 @@ public final class AppleKeyCustody: Sendable {
     /// no biometric gate.
     ///
     /// See ADR-025 Biometric gating.
-    internal let biometricPolicy: BiometricPolicy
+    let biometricPolicy: BiometricPolicy
 
     // MARK: - Keychain item attribute helpers
 
@@ -297,7 +297,7 @@ public final class AppleKeyCustody: Sendable {
     private nonisolated func baseQuery(for handle: String) -> [String: Any] {
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrAccount as String: account(for: handle),
+            kSecAttrAccount as String: account(for: handle)
         ]
         if let group = accessGroup {
             query[kSecAttrAccessGroup as String] = group
@@ -403,7 +403,7 @@ public final class AppleKeyCustody: Sendable {
     ///   - keyType: The ``KeyType`` to tag this item with.
     ///   - publicKeyBytes: The 32-byte public key bytes to cache in metadata.
     /// - Throws: ``PlatformError/keychainError(_:)`` if the add operation fails.
-    internal nonisolated func storePrivateKeyBytes(
+    nonisolated func storePrivateKeyBytes(
         _ bytes: Data,
         for handle: String,
         keyType: KeyType,
@@ -476,7 +476,7 @@ public final class AppleKeyCustody: Sendable {
 
 // MARK: - KeyCustodyProvider conformance
 
-extension AppleKeyCustody {
+public extension AppleKeyCustody {
     // MARK: generateKeypair
 
     /// Generates an Ed25519 or X25519 keypair and stores the private key in
@@ -498,7 +498,7 @@ extension AppleKeyCustody {
     ///
     /// See ADR-025 Key custody and ADR-006 `generate_keypair`.
     @concurrent
-    public func generateKeypair(keyType: String) async throws -> String {
+    func generateKeypair(keyType: String) async throws -> String {
         guard let parsedType = KeyType(rawValue: keyType) else {
             throw PlatformError.custodyError("Unknown key type '\(keyType)'")
         }
@@ -549,7 +549,7 @@ extension AppleKeyCustody {
     ///
     /// See ADR-025 Key custody and ADR-006 `sign`.
     @concurrent
-    public func sign(_ keyHandle: String, data: Data) async throws -> Data {
+    func sign(_ keyHandle: String, data: Data) async throws -> Data {
         let storedType = try fetchKeyType(for: keyHandle)
         guard storedType == .ed25519 else {
             throw PlatformError.wrongKeyType(
@@ -558,12 +558,11 @@ extension AppleKeyCustody {
         }
 
         var privateKeyBytes = try fetchPrivateKeyBytes(for: keyHandle)
-        defer { privateKeyBytes.resetBytes(in: 0..<privateKeyBytes.count) }
+        defer { privateKeyBytes.resetBytes(in: 0 ..< privateKeyBytes.count) }
 
         do {
             let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: privateKeyBytes)
-            let signature = try signingKey.signature(for: data)
-            return signature
+            return try signingKey.signature(for: data)
         } catch let platformErr as PlatformError {
             throw platformErr
         } catch {
@@ -591,7 +590,7 @@ extension AppleKeyCustody {
     ///
     /// See ADR-025 Key custody and ADR-006 `public_key`.
     @concurrent
-    public func publicKey(_ keyHandle: String) async throws -> Data {
+    func publicKey(_ keyHandle: String) async throws -> Data {
         let metadata = try fetchMetadata(for: keyHandle)
         guard let keyType = KeyType(rawValue: metadata.keyType) else {
             throw PlatformError.custodyError(
@@ -609,7 +608,7 @@ extension AppleKeyCustody {
         // Fallback for legacy keys stored before metadata caching: derive
         // from private key. This WILL trigger biometric prompt if active.
         var privateKeyBytes = try fetchPrivateKeyBytes(for: keyHandle)
-        defer { privateKeyBytes.resetBytes(in: 0..<privateKeyBytes.count) }
+        defer { privateKeyBytes.resetBytes(in: 0 ..< privateKeyBytes.count) }
 
         do {
             switch keyType {
@@ -664,7 +663,7 @@ extension AppleKeyCustody {
     /// See ADR-025 Key destruction attestation and 9.15.
     @concurrent
     @discardableResult
-    public func destroyKey(_ keyHandle: String) async throws -> DestructionAttestation {
+    func destroyKey(_ keyHandle: String) async throws -> DestructionAttestation {
         let deleteQuery = baseQuery(for: keyHandle)
         let deleteStatus = SecItemDelete(deleteQuery as CFDictionary)
 
@@ -717,7 +716,7 @@ extension AppleKeyCustody {
     ///
     /// See ADR-025 Key custody and ADR-006 `dh_agree`.
     @concurrent
-    public func dhAgree(_ keyHandle: String, peerPublic: Data) async throws -> Data {
+    func dhAgree(_ keyHandle: String, peerPublic: Data) async throws -> Data {
         let storedType = try fetchKeyType(for: keyHandle)
         guard storedType == .x25519 else {
             throw PlatformError.wrongKeyType(
@@ -726,7 +725,7 @@ extension AppleKeyCustody {
         }
 
         var privateKeyBytes = try fetchPrivateKeyBytes(for: keyHandle)
-        defer { privateKeyBytes.resetBytes(in: 0..<privateKeyBytes.count) }
+        defer { privateKeyBytes.resetBytes(in: 0 ..< privateKeyBytes.count) }
 
         do {
             let agreementKey = try Curve25519.KeyAgreement.PrivateKey(
@@ -784,7 +783,7 @@ extension AppleKeyCustody {
     /// `scp-platform/src/testing/key_custody.rs` for the canonical Rust
     /// reference implementation.
     @concurrent
-    public func derivePseudonym(
+    func derivePseudonym(
         _ keyHandle: String,
         contextId: Data
     ) async throws -> PseudonymResult {
@@ -796,7 +795,7 @@ extension AppleKeyCustody {
         }
 
         var privateKeyBytes = try fetchPrivateKeyBytes(for: keyHandle)
-        defer { privateKeyBytes.resetBytes(in: 0..<privateKeyBytes.count) }
+        defer { privateKeyBytes.resetBytes(in: 0 ..< privateKeyBytes.count) }
 
         do {
             // ADR-027: use public key bytes as HMAC key for cross-platform
@@ -858,7 +857,7 @@ extension AppleKeyCustody {
     /// - Returns: `"software"` or `"software_biometric"` -- mirroring
     ///   `CustodyType::Software` in `scp-platform/src/traits.rs` with an
     ///   additional biometric qualifier when applicable.
-    public nonisolated func custodyType(_ keyHandle: String) -> String {
+    nonisolated func custodyType(_: String) -> String {
         switch biometricPolicy {
         case .none: "software"
         case .required: "software_biometric"

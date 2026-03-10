@@ -694,6 +694,43 @@ pub enum GovernanceAction {
     LockEconomicPolicy,
 }
 
+impl GovernanceAction {
+    /// Returns the variant name as a static string for logging and event summaries.
+    #[must_use]
+    pub const fn variant_name(&self) -> &'static str {
+        match self {
+            Self::AddMember { .. } => "AddMember",
+            Self::RemoveMember { .. } => "RemoveMember",
+            Self::ChangeRole { .. } => "ChangeRole",
+            Self::RegisterTool { .. } => "RegisterTool",
+            Self::RemoveTool { .. } => "RemoveTool",
+            Self::ModifyCeiling { .. } => "ModifyCeiling",
+            Self::CloseContext { .. } => "CloseContext",
+            Self::ExtendTtl { .. } => "ExtendTtl",
+            Self::TransferAdmin { .. } => "TransferAdmin",
+            Self::CreateChildContext { .. } => "CreateChildContext",
+            Self::BlockAuthor { .. } => "BlockAuthor",
+            Self::RevokeReadAccess { .. } => "RevokeReadAccess",
+            Self::RestoreReadAccess { .. } => "RestoreReadAccess",
+            Self::ModifyPruningPolicy { .. } => "ModifyPruningPolicy",
+            Self::AddSigner { .. } => "AddSigner",
+            Self::RemoveSigner { .. } => "RemoveSigner",
+            Self::ModifyThreshold { .. } => "ModifyThreshold",
+            Self::EstablishToolInterface { .. } => "EstablishToolInterface",
+            Self::ResetMember { .. } => "ResetMember",
+            Self::ResolveConflict { .. } => "ResolveConflict",
+            Self::PromoteContext => "PromoteContext",
+            Self::RevokeWriteAccess { .. } => "RevokeWriteAccess",
+            Self::RestoreWriteAccess { .. } => "RestoreWriteAccess",
+            Self::RotateContentKeys { .. } => "RotateContentKeys",
+            Self::ReconfigureGovernance { .. } => "ReconfigureGovernance",
+            Self::SetEconomicPolicy { .. } => "SetEconomicPolicy",
+            Self::ApproveSpend { .. } => "ApproveSpend",
+            Self::LockEconomicPolicy => "LockEconomicPolicy",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // VoteType / SignedVote
 // ---------------------------------------------------------------------------
@@ -1042,6 +1079,23 @@ pub enum GovernanceEvent {
     ConflictResolved {
         winner_id: ProposalId,
         loser_id: ProposalId,
+    },
+    /// A governance action was successfully executed (ADR-031 §8).
+    ///
+    /// Emitted after every successful governance action execution in
+    /// `execute_governance_action`. Records the proposal ID, the action
+    /// that was executed, the DID of the executor (proposer), and the
+    /// resulting MLS epoch (if applicable). This is the 8th governance
+    /// event type per PRD SCP-269/SCP-270.
+    GovernanceActionExecuted {
+        /// The proposal that was executed.
+        proposal_id: ProposalId,
+        /// The governance action that was executed.
+        action: Box<GovernanceAction>,
+        /// The DID of the executor (proposer of the approved proposal).
+        executor_did: DID,
+        /// The MLS epoch after execution, if applicable.
+        resulting_epoch: Option<u64>,
     },
 }
 
@@ -1552,6 +1606,8 @@ impl GovernanceEngine for SingleAdminEngine {
 /// - `RevokeWriteAccess` + `RestoreWriteAccess` for the same DID
 /// - Multiple `RevokeReadAccess` for same DID with different scopes
 /// - Multiple `RevokeWriteAccess` for same DID with different scopes
+/// - Multiple `RestoreReadAccess` for same DID
+/// - Multiple `RestoreWriteAccess` for same DID
 ///
 /// # Arguments
 /// * `action_a` - The first governance action
@@ -1569,16 +1625,15 @@ pub fn actions_conflict(
     proposer_b: &DID,
 ) -> bool {
     use GovernanceAction::{
-        ChangeRole, ModifyCeiling, RemoveMember, RestoreReadAccess, RestoreWriteAccess,
-        RevokeReadAccess, RevokeWriteAccess,
+        AddSigner, ChangeRole, ModifyCeiling, ModifyPruningPolicy, ModifyThreshold,
+        ReconfigureGovernance, RemoveMember, RemoveSigner, RestoreReadAccess, RestoreWriteAccess,
+        RevokeReadAccess, RevokeWriteAccess, RotateContentKeys,
     };
 
-    match (action_a, action_b) {
-        // Mutual RemoveMember (each targeting the other's proposer)
-        (RemoveMember { did: target_a, .. }, RemoveMember { did: target_b, .. }) => {
-            target_a == proposer_b && target_b == proposer_a
-        }
+    // Canonical conflict matrix. The sync module's `actions_conflict`
+    // delegates here for offline-merge conflict detection (ADR-029 / ADR-031).
 
+    match (action_a, action_b) {
         // Competing ChangeRole proposals for the same DID with different roles
         (
             ChangeRole {
@@ -1591,51 +1646,51 @@ pub fn actions_conflict(
             },
         ) => did_a == did_b && role_a != role_b,
 
-        // Competing ModifyCeiling proposals with different ceiling sets
-        (
-            ModifyCeiling {
-                new_ceiling: ceiling_a,
-            },
-            ModifyCeiling {
-                new_ceiling: ceiling_b,
-            },
-        ) => ceiling_a != ceiling_b,
+        // Any two concurrent modifications to the same global context property
+        // conflict — the values may or may not differ, but concurrent
+        // modification is unsafe (ADR-031 §7).
+        (ModifyCeiling { .. }, ModifyCeiling { .. })
+        | (ModifyThreshold { .. }, ModifyThreshold { .. })
+        | (ModifyPruningPolicy { .. }, ModifyPruningPolicy { .. })
+        | (ReconfigureGovernance { .. }, ReconfigureGovernance { .. })
+        // Concurrent context-wide key rotations conflict (global property mutation).
+        | (RotateContentKeys { .. }, RotateContentKeys { .. }) => true,
 
-        // RemoveMember + ChangeRole for the same DID
+        // Remove + role change for the same DID.
         (RemoveMember { did: did_a, .. }, ChangeRole { did: did_b, .. })
-        | (ChangeRole { did: did_a, .. }, RemoveMember { did: did_b, .. })
-        // RevokeReadAccess + RestoreReadAccess for the same DID (mutually contradictory)
-        | (RevokeReadAccess { did: did_a, .. }, RestoreReadAccess { did: did_b })
+        | (ChangeRole { did: did_a, .. }, RemoveMember { did: did_b, .. }) => did_a == did_b,
+
+        // Two concurrent removals of the same member conflict (ADR-031 §7:
+        // concurrent modifications to the same membership state).
+        // Also catches mutual removal (each proposer removes the other).
+        (RemoveMember { did: did_a, .. }, RemoveMember { did: did_b, .. }) => {
+            did_a == did_b || (did_a == proposer_b && did_b == proposer_a)
+        }
+
+        // Two concurrent revocations or restorations of the same type targeting
+        // the same DID conflict (scope may differ, but concurrent modification
+        // is unsafe — ADR-031 §7). Revoke and Restore for the same DID also
+        // conflict (contradictory intent on the same member's access state).
+        (RevokeReadAccess { did: did_a, .. }, RevokeReadAccess { did: did_b, .. })
+        | (RevokeWriteAccess { did: did_a, .. }, RevokeWriteAccess { did: did_b, .. })
+        | (
+            RestoreReadAccess { did: did_a } | RevokeReadAccess { did: did_a, .. },
+            RestoreReadAccess { did: did_b },
+        )
+        | (
+            RestoreWriteAccess { did: did_a } | RevokeWriteAccess { did: did_a, .. },
+            RestoreWriteAccess { did: did_b },
+        )
         | (RestoreReadAccess { did: did_a }, RevokeReadAccess { did: did_b, .. })
-        // RevokeWriteAccess + RestoreWriteAccess for the same DID (mutually contradictory)
-        | (RevokeWriteAccess { did: did_a, .. }, RestoreWriteAccess { did: did_b })
         | (RestoreWriteAccess { did: did_a }, RevokeWriteAccess { did: did_b, .. }) => {
             did_a == did_b
         }
 
-        // Two RevokeReadAccess or RevokeWriteAccess for same DID with different scopes
-        (
-            RevokeReadAccess {
-                did: did_a,
-                scope: scope_a,
-            },
-            RevokeReadAccess {
-                did: did_b,
-                scope: scope_b,
-            },
-        )
-        | (
-            RevokeWriteAccess {
-                did: did_a,
-                scope: scope_a,
-            },
-            RevokeWriteAccess {
-                did: did_b,
-                scope: scope_b,
-            },
-        ) => did_a == did_b && scope_a != scope_b,
+        // AddSigner and RemoveSigner for the same DID conflict.
+        (AddSigner { did: add_did }, RemoveSigner { did: remove_did })
+        | (RemoveSigner { did: remove_did }, AddSigner { did: add_did }) => add_did == remove_did,
 
-        // All other combinations are not conflicting
+        // All other action pairs are non-conflicting.
         _ => false,
     }
 }
@@ -1924,8 +1979,11 @@ mod tests {
                     target_context: "ctx-tgt".to_owned(),
                     tool_id: "tool-1".to_owned(),
                     rate_limit: None,
+                    per_caller_rate_limit: None,
                     approved_by_source: true,
                     approved_by_target: false,
+                    outbound_policy: None,
+                    inbound_policy: None,
                 },
             },
             GovernanceAction::ResetMember {

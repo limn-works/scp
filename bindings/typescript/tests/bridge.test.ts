@@ -9,7 +9,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { BRIDGE_TARGET } from "../src/internal/bridge.js";
+import { BRIDGE_TARGET } from "../src/internal/bridge";
 
 describe("bridge selection", () => {
   it("detects native bridge target in Node.js/Bun", () => {

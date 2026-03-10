@@ -285,12 +285,124 @@ async def evaluate_trust(
     )
 
 
+# ---------------------------------------------------------------------------
+# Participation types (spec section 9.3, SCP-BA-004)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ParticipationFact:
+    """A verified participation fact used in admission evaluation.
+
+    See spec section 9.3 (Sybil Resistance and Identity Uniqueness).
+    """
+
+    #: Type of participation fact (e.g., ``"context_membership"``).
+    fact_type: str
+
+    #: DID of the participant this fact pertains to.
+    participant_did: str
+
+    #: Context ID where the fact was observed.
+    context_id: str
+
+    #: Numeric value of the fact (e.g., participation count).
+    value: float = 0.0
+
+
+@dataclass
+class ParticipationThreshold:
+    """A threshold requirement for context admission.
+
+    See spec section 9.3 (Sybil Resistance and Identity Uniqueness).
+    """
+
+    #: The fact type this threshold applies to.
+    fact_type: str
+
+    #: Minimum value required to satisfy the threshold.
+    minimum: float
+
+    #: Optional maximum value constraint.
+    maximum: float | None = None
+
+
+@dataclass
+class ParticipationProfile:
+    """A participant's aggregated participation profile.
+
+    See spec section 9.3 (Sybil Resistance and Identity Uniqueness).
+    """
+
+    #: DID of the participant.
+    participant_did: str
+
+    #: Verified participation facts.
+    facts: list[ParticipationFact] = field(default_factory=list)
+
+
+@dataclass
+class RequireParticipation:
+    """Participation-based admission requirement for a context.
+
+    See spec section 9.3 (Sybil Resistance and Identity Uniqueness).
+    """
+
+    #: Thresholds that must be met for admission.
+    thresholds: list[ParticipationThreshold] = field(default_factory=list)
+
+    #: Whether ALL thresholds must be met (True) or ANY (False).
+    require_all: bool = True
+
+
+def verify_participation_requirements(
+    requirement: RequireParticipation,
+    profile: ParticipationProfile,
+) -> bool:
+    """Verify whether a participant meets participation requirements.
+
+    Evaluates the participant's profile against the requirement's
+    thresholds. Returns ``True`` if the participant meets the
+    criteria, ``False`` otherwise.
+
+    Args:
+        requirement: The participation requirement to verify against.
+        profile: The participant's participation profile.
+
+    Returns:
+        ``True`` if requirements are met, ``False`` otherwise.
+    """
+    if not requirement.thresholds:
+        return True
+
+    results: list[bool] = []
+    for threshold in requirement.thresholds:
+        matching_facts = [f for f in profile.facts if f.fact_type == threshold.fact_type]
+        if not matching_facts:
+            results.append(False)
+            continue
+
+        total_value = sum(f.value for f in matching_facts)
+        meets_min = total_value >= threshold.minimum
+        meets_max = threshold.maximum is None or total_value <= threshold.maximum
+        results.append(meets_min and meets_max)
+
+    if requirement.require_all:
+        return all(results)
+    return any(results)
+
+
 __all__ = [
     "Attestation",
     "BehavioralRecord",
     "CapabilityValidation",
     "ChallengeResult",
     "Endorsement",
+    "ParticipationFact",
+    "ParticipationProfile",
+    "ParticipationThreshold",
+    "RequireParticipation",
     "TrustEvaluation",
     "evaluate_trust",
+    "verify_participation_requirements",
 ]

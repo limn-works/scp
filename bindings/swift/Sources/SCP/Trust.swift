@@ -29,7 +29,6 @@ import Foundation
 /// - `.docs/sketch.md` section 5 "Trust & Capabilities"
 /// - Story SCP-221, #331
 public nonisolated struct TrustEvaluation: Sendable {
-
     // MARK: - Layer 1: Protocol Enforcement
 
     /// Whether all UCAN tokens in the subject's presentation are valid.
@@ -88,12 +87,12 @@ public nonisolated struct TrustEvaluation: Sendable {
     /// Maps the flat UniFFI record to the four-layer trust model structure.
     /// Protocol enforcement fields (Layer 1) default to `true` since the
     /// Rust engine enforces these mechanically.
-    internal init(from input: TrustInput) {
-        self.tokensValid = true
-        self.signaturesValid = true
-        self.withinCeiling = true
-        self.notRevoked = true
-        self.behavioralRecord = BehavioralRecord(
+    init(from input: TrustInput) {
+        tokensValid = true
+        signaturesValid = true
+        withinCeiling = true
+        notRevoked = true
+        behavioralRecord = BehavioralRecord(
             contextsParticipated: Int(input.participationCount),
             // TrustInput provides participation count and consequence count only.
             // Duration, tool invocations, and role transitions require event log
@@ -103,9 +102,9 @@ public nonisolated struct TrustEvaluation: Sendable {
             toolInvocations: 0,
             roleTransitions: 0
         )
-        self.verifiedAttestationCount = Int(input.verifiedAttestationCount)
-        self.challengeResultCount = 0
-        self.consequenceRuleCount = Int(input.triggeredConsequences)
+        verifiedAttestationCount = Int(input.verifiedAttestationCount)
+        challengeResultCount = 0
+        consequenceRuleCount = Int(input.triggeredConsequences)
     }
 
     /// Creates a ``TrustEvaluation`` from a UniFFI ``TrustScoreResult``.
@@ -113,12 +112,12 @@ public nonisolated struct TrustEvaluation: Sendable {
     /// Maps the participation-based trust score to the four-layer model.
     /// Protocol enforcement fields (Layer 1) default to `true` since the
     /// Rust engine enforces these mechanically.
-    internal init(from score: TrustScoreResult) {
-        self.tokensValid = true
-        self.signaturesValid = true
-        self.withinCeiling = true
-        self.notRevoked = true
-        self.behavioralRecord = BehavioralRecord(
+    init(from score: TrustScoreResult) {
+        tokensValid = true
+        signaturesValid = true
+        withinCeiling = true
+        notRevoked = true
+        behavioralRecord = BehavioralRecord(
             // TrustScoreResult provides message_count and governance_count only.
             // Context participation count requires cross-context event log queries
             // not exposed in the current UniFFI bridge.
@@ -128,9 +127,9 @@ public nonisolated struct TrustEvaluation: Sendable {
             toolInvocations: 0,
             roleTransitions: 0
         )
-        self.verifiedAttestationCount = 0
-        self.challengeResultCount = 0
-        self.consequenceRuleCount = 0
+        verifiedAttestationCount = 0
+        challengeResultCount = 0
+        consequenceRuleCount = 0
     }
 }
 
@@ -181,63 +180,63 @@ public nonisolated struct BehavioralRecord: Sendable {
 /// mock inputs.
 ///
 /// See ADR-017 for the trust model and ADR-026 for the delegation pattern.
-internal enum TrustBridge {
+public enum TrustBridge {
     /// Evaluate trust for a subject. Returns a ``TrustEvaluation``.
-    internal typealias EvaluateFn = @Sendable (
+    public typealias EvaluateFn = @Sendable (
         _ subjectDid: String,
         _ contextId: String
     ) async throws -> TrustEvaluation
 
     /// Query participation-based trust score for a DID in a context.
-    internal typealias QueryScoreFn = @Sendable (
+    public typealias QueryScoreFn = @Sendable (
         _ did: String,
         _ contextId: String
     ) throws -> TrustScoreResult
 
     /// Verify an attestation's Ed25519 signature, evidence, expiry, and
     /// revocation status.
-    internal typealias VerifyAttestationFn = @Sendable (
+    public typealias VerifyAttestationFn = @Sendable (
         _ attestationJson: String
     ) throws -> AttestationVerificationResult
 
     /// Create a challenge request for capability verification.
-    internal typealias CreateChallengeFn = @Sendable (
+    public typealias CreateChallengeFn = @Sendable (
         _ targetDid: String
     ) throws -> ChallengeResult
 
     /// Verify a challenge response against its original challenge request.
-    internal typealias VerifyResponseFn = @Sendable (
+    public typealias VerifyResponseFn = @Sendable (
         _ challengeJson: String,
         _ responseJson: String
     ) throws -> Bool
 
     /// Default evaluate function that delegates to the UniFFI
     /// ``trustQueryScore`` bridge function.
-    internal static let defaultEvaluate: EvaluateFn = { subjectDid, contextId in
+    public static let defaultEvaluate: EvaluateFn = { subjectDid, contextId in
         let score = try trustQueryScore(did: subjectDid, contextId: contextId)
         return TrustEvaluation(from: score)
     }
 
     /// Default query score function — delegates to UniFFI ``trustQueryScore``.
-    internal static let defaultQueryScore: QueryScoreFn = { did, contextId in
+    public static let defaultQueryScore: QueryScoreFn = { did, contextId in
         try trustQueryScore(did: did, contextId: contextId)
     }
 
     /// Default verify attestation function — delegates to UniFFI
     /// ``trustVerifyAttestation``.
-    internal static let defaultVerifyAttestation: VerifyAttestationFn = { attestationJson in
+    public static let defaultVerifyAttestation: VerifyAttestationFn = { attestationJson in
         try trustVerifyAttestation(attestationJson: attestationJson)
     }
 
     /// Default create challenge function — delegates to UniFFI
     /// ``trustCreateChallenge``.
-    internal static let defaultCreateChallenge: CreateChallengeFn = { targetDid in
+    public static let defaultCreateChallenge: CreateChallengeFn = { targetDid in
         try trustCreateChallenge(targetDid: targetDid)
     }
 
     /// Default verify response function — delegates to UniFFI
     /// ``trustVerifyResponse``.
-    internal static let defaultVerifyResponse: VerifyResponseFn = { challengeJson, responseJson in
+    public static let defaultVerifyResponse: VerifyResponseFn = { challengeJson, responseJson in
         try trustVerifyResponse(challengeJson: challengeJson, responseJson: responseJson)
     }
 }
@@ -372,4 +371,136 @@ public func verifyChallengeResponse(
     verifyResponseFn: TrustBridge.VerifyResponseFn = TrustBridge.defaultVerifyResponse
 ) throws -> Bool {
     try verifyResponseFn(challengeJson, responseJson)
+}
+
+// MARK: - Participation Types
+
+/// A verifiable participation fact type.
+///
+/// Participation facts represent quantifiable behavioral signals that can
+/// be observed from a context's event log. They are inputs to the trust
+/// model's behavioral validation layer (Layer 2).
+///
+/// ## Provenance
+///
+/// - ADR-017 Layer 2 (Behavioral Validation)
+/// - Spec section 23.7 (Participation Requirements)
+public enum ParticipationFact: String, Sendable, CaseIterable {
+    /// Number of messages sent by the participant.
+    case messagesSent = "messages_sent"
+
+    /// Number of tools invoked by the participant.
+    case toolsInvoked = "tools_invoked"
+
+    /// Number of governance actions taken by the participant.
+    case governanceActions = "governance_actions"
+
+    /// Number of contexts the participant has joined.
+    case contextsParticipated = "contexts_participated"
+
+    /// Number of attestations the participant has verified.
+    case attestationsVerified = "attestations_verified"
+}
+
+/// A minimum threshold for a specific participation fact.
+///
+/// Used in ``RequireParticipation`` to define the minimum observed value
+/// a participant must have for a given fact type.
+///
+/// ## Provenance
+///
+/// - ADR-017 Layer 2 (Behavioral Validation)
+/// - Spec section 23.7 (Participation Requirements)
+public nonisolated struct ParticipationThreshold: Sendable {
+    /// The participation fact to check.
+    public let fact: ParticipationFact
+
+    /// The minimum value required.
+    public let minimum: UInt64
+
+    /// Memberwise initializer.
+    public init(fact: ParticipationFact, minimum: UInt64) {
+        self.fact = fact
+        self.minimum = minimum
+    }
+}
+
+/// A participant's observed values for each participation fact.
+///
+/// Maps ``ParticipationFact`` cases to their observed counts. Missing
+/// keys are treated as zero when checked against thresholds.
+///
+/// ## Provenance
+///
+/// - ADR-017 Layer 2 (Behavioral Validation)
+/// - Spec section 23.7 (Participation Requirements)
+public typealias ParticipationProfile = [ParticipationFact: UInt64]
+
+/// A set of participation thresholds for admission gating.
+///
+/// Used as admission criteria or trust-gating requirements. When
+/// ``requireAll`` is `true` (the default), all thresholds must be
+/// satisfied (AND/conjunction). When `false`, any single threshold
+/// passing is sufficient (OR/disjunction).
+///
+/// ## Provenance
+///
+/// - ADR-017 Layer 2 (Behavioral Validation)
+/// - Spec section 23.7 (Participation Requirements)
+public nonisolated struct RequireParticipation: Sendable {
+    /// The thresholds to check.
+    public let thresholds: [ParticipationThreshold]
+
+    /// If `true`, **all** thresholds must be met (AND logic).
+    /// If `false`, **any** single threshold is sufficient (OR logic).
+    public let requireAll: Bool
+
+    /// Memberwise initializer.
+    ///
+    /// - Parameters:
+    ///   - thresholds: The participation thresholds to check.
+    ///   - requireAll: Whether all thresholds must be met (`true`, default)
+    ///     or any single threshold is sufficient (`false`).
+    public init(thresholds: [ParticipationThreshold], requireAll: Bool = true) {
+        self.thresholds = thresholds
+        self.requireAll = requireAll
+    }
+}
+
+// MARK: - Participation Verification
+
+/// Verifies that a participation profile meets the required thresholds.
+///
+/// When ``RequireParticipation/requireAll`` is `true` (default), returns
+/// `true` only if **every** threshold is met (AND). When `false`, returns
+/// `true` if **any** threshold is met (OR). Missing profile entries are
+/// treated as zero.
+///
+/// This is a pure Swift function with no bridge dependency.
+///
+/// - Parameters:
+///   - requirement: The participation thresholds to check.
+///   - profile: The observed participation values.
+/// - Returns: `true` if the requirement is satisfied, `false` otherwise.
+///
+/// ## Provenance
+///
+/// - ADR-017 Layer 2 (Behavioral Validation)
+/// - Spec section 23.7 (Participation Requirements)
+public func verifyParticipationRequirements(
+    requirement: RequireParticipation,
+    profile: ParticipationProfile
+) -> Bool {
+    if requirement.thresholds.isEmpty {
+        return true
+    }
+
+    let results = requirement.thresholds.map { threshold -> Bool in
+        let observed = profile[threshold.fact] ?? 0
+        return observed >= threshold.minimum
+    }
+
+    return requirement.requireAll
+        ? results.allSatisfy { $0 }
+        : results.contains { $0 }
 }

@@ -287,7 +287,10 @@ pub async fn tool_invoke(
 
         // Validate input against the tool's input schema.
         let input_value: serde_json::Value =
-            serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
+            serde_json::from_str(&input_json).map_err(|e| ScpNapiError::Tool {
+                message: format!("invalid input JSON: {e}"),
+                code: "SCP-TOOL-6002".to_owned(),
+            })?;
         scp_core::context::tools::validate_value_against_schema(
             &input_value,
             &registration.schema.input_schema,
@@ -505,8 +508,12 @@ pub async fn tool_invoke_cross_context(
     )
     .map_err(napi::Error::from)?;
 
-    let input_value: serde_json::Value =
-        serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
+    let input_value: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
+        napi::Error::from(ScpNapiError::Tool {
+            message: format!("invalid input JSON: {e}"),
+            code: "SCP-TOOL-6002".to_owned(),
+        })
+    })?;
 
     let output = crate::runtime::with_context(&target_context_id, |rt| {
         let registration = rt
@@ -732,7 +739,10 @@ pub async fn tool_session_invoke(
         let call_count = session.call_count;
 
         let input_value: serde_json::Value =
-            serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
+            serde_json::from_str(&input_json).map_err(|e| ScpNapiError::Tool {
+                message: format!("invalid input JSON: {e}"),
+                code: "SCP-TOOL-6002".to_owned(),
+            })?;
 
         // Validate input against tool's input schema if tool is registered.
         if let Some(registration) = rt.tool_registry.get(&tool_id) {

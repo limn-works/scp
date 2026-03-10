@@ -76,6 +76,7 @@ use std::time::Duration;
 
 use napi_derive::napi;
 
+pub mod bridge_connector;
 pub mod context;
 pub mod discovery;
 pub mod error;
@@ -84,6 +85,7 @@ pub mod identity;
 pub mod mcp;
 pub mod provenance;
 pub mod runtime;
+pub mod sync;
 pub mod tools;
 pub mod transport;
 pub mod trust;

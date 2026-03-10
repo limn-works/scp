@@ -1,63 +1,21 @@
 import Foundation
 
-// Event and Proof are now defined by UniFFI in ScpBindings.swift.
+// Event, Proof, and Checkpoint are defined by UniFFI in ScpBindings.swift.
 //
 // UniFFI Event fields: eventType, actorDid, timestamp, payloadJson (String), sequence
 // UniFFI Proof fields: verified (Bool), proofType (String), detailsJson (String)
+// UniFFI Checkpoint fields: contextId, senderDid, eventCount, merkleRoot (hex),
+//   epoch (optional), timestamp, signature (hex)
 //
-// Checkpoint and EventLog are pure Swift types. EventLogHandle is replaced by
-// ContextHandle from UniFFI for bridge calls.
+// EventLog is a pure Swift type. EventLogHandle is replaced by ContextHandle
+// from UniFFI for bridge calls.
 
-// MARK: - Checkpoint
-
-/// A signed consistency checkpoint for equivocation detection.
-///
-/// Members periodically exchange signed Merkle roots. If two members have
-/// different roots for the same event count, the relay is equivocating
-/// (showing different histories to different members).
-///
-/// See ADR-011 acceptance criterion 8 in `.docs/adrs/phase-2.md`.
-public nonisolated struct Checkpoint: Sendable {
-    /// The context this checkpoint belongs to.
-    public let contextId: String
-
-    /// The DID of the member who generated this checkpoint.
-    public let senderDid: String
-
-    /// The number of events in the log at checkpoint time.
-    public let eventCount: UInt64
-
-    /// The Merkle root hash at checkpoint time (32 bytes).
-    public let merkleRoot: Data
-
-    /// Current MLS epoch, if applicable. `nil` for broadcast contexts.
-    public let epoch: UInt64?
-
-    /// Unix timestamp (seconds since epoch) when the checkpoint was generated.
-    public let timestamp: UInt64
-
-    /// Ed25519 signature over the checkpoint content (64 bytes).
-    public let signature: Data
-
-    /// Memberwise initializer.
-    public init(
-        contextId: String,
-        senderDid: String,
-        eventCount: UInt64,
-        merkleRoot: Data,
-        epoch: UInt64?,
-        timestamp: UInt64,
-        signature: Data
-    ) {
-        self.contextId = contextId
-        self.senderDid = senderDid
-        self.eventCount = eventCount
-        self.merkleRoot = merkleRoot
-        self.epoch = epoch
-        self.timestamp = timestamp
-        self.signature = signature
-    }
-}
+// Checkpoint is defined by UniFFI in ScpBindings.swift as a public struct with
+// fields: contextId (String), senderDid (String), eventCount (UInt64),
+// merkleRoot (String, hex-encoded), epoch (UInt64?), timestamp (UInt64),
+// signature (String, hex-encoded).
+//
+// See ADR-011 acceptance criterion 8 in `.docs/adrs/phase-2.md`.
 
 // MARK: - EventLogHandle
 
@@ -66,7 +24,7 @@ public nonisolated struct Checkpoint: Sendable {
 /// Holds either a real ``ContextHandle`` for UniFFI bridge calls or a
 /// standalone context ID for testing. When the XCFramework is available,
 /// all event log operations delegate through the ``ContextHandle``.
-internal final class EventLogHandle: Sendable {
+final class EventLogHandle: Sendable {
     /// The context ID this event log belongs to.
     let contextId: String
 
@@ -76,12 +34,18 @@ internal final class EventLogHandle: Sendable {
     /// Creates an ``EventLogHandle`` for the given context.
     init(contextId: String) {
         self.contextId = contextId
-        self.contextHandle = nil
+        contextHandle = nil
     }
 
     /// Creates an ``EventLogHandle`` backed by a UniFFI context handle.
-    init(contextHandle: ContextHandle) {
-        self.contextId = contextHandle.contextId()
+    ///
+    /// - Parameters:
+    ///   - contextHandle: The UniFFI context handle.
+    ///   - contextId: Optional override for the context ID. When `nil`,
+    ///     the ID is read from the handle. Pass explicitly in tests where
+    ///     the handle has no backing FFI pointer.
+    init(contextHandle: ContextHandle, contextId: String? = nil) {
+        self.contextId = contextId ?? contextHandle.contextId()
         self.contextHandle = contextHandle
     }
 }
@@ -93,27 +57,40 @@ internal final class EventLogHandle: Sendable {
 /// injected for testability; defaults call through to ScpBindings.
 ///
 /// See ADR-026 for the flat delegation pattern and ADR-011 for event log spec.
-internal enum EventLogBridge {
+public enum EventLogBridge {
     /// Query events from a context's event log. Maps to ``eventLogQuery``.
-    internal typealias QueryFn = @Sendable (
+    public typealias QueryFn = @Sendable (
         _ handle: ContextHandle,
         _ filterJson: String?
     ) async throws -> [Event]
 
     /// Verify an event log claim. Maps to ``eventLogVerify``.
-    internal typealias VerifyFn = @Sendable (
+    public typealias VerifyFn = @Sendable (
         _ handle: ContextHandle,
         _ claimJson: String
     ) async throws -> Proof
 
     /// Default query function that delegates to the UniFFI-generated binding.
-    internal static let defaultQuery: QueryFn = { handle, filterJson in
+    public static let defaultQuery: QueryFn = { handle, filterJson in
         try await eventLogQuery(handle: handle, filterJson: filterJson)
     }
 
     /// Default verify function that delegates to the UniFFI-generated binding.
-    internal static let defaultVerify: VerifyFn = { handle, claimJson in
+    public static let defaultVerify: VerifyFn = { handle, claimJson in
         try await eventLogVerify(handle: handle, claimJson: claimJson)
+    }
+
+    /// Generate a signed consistency checkpoint. Maps to ``eventLogCheckpoint``.
+    public typealias CheckpointFn = @Sendable (
+        _ handle: ContextHandle,
+        _ identity: Identity,
+        _ epoch: UInt64
+    ) async throws -> Checkpoint
+
+    /// Default checkpoint function — delegates to UniFFI
+    /// ``eventLogCheckpoint(handle:identity:epoch:)``.
+    public static let defaultCheckpoint: CheckpointFn = { handle, identity, epoch in
+        try await eventLogCheckpoint(handle: handle, identity: identity, epoch: epoch)
     }
 }
 
@@ -145,12 +122,12 @@ public nonisolated struct EventLog: Sendable {
     private let verifyFn: EventLogBridge.VerifyFn
 
     /// Creates an ``EventLog`` from an internal ``EventLogHandle``.
-    internal init(
+    init(
         handle: EventLogHandle,
         queryFn: @escaping EventLogBridge.QueryFn = EventLogBridge.defaultQuery,
         verifyFn: @escaping EventLogBridge.VerifyFn = EventLogBridge.defaultVerify
     ) {
-        self.contextId = handle.contextId
+        contextId = handle.contextId
         self.handle = handle
         self.queryFn = queryFn
         self.verifyFn = verifyFn
@@ -194,7 +171,40 @@ public nonisolated struct EventLog: Sendable {
     ///
     /// - Parameter proof: The proof to verify.
     /// - Returns: `true` if the proof is valid.
-    public static func verifyInclusion(_ proof: Proof) async throws -> Bool {
-        return proof.verified
+    public static func verifyInclusion(_ proof: Proof) -> Bool {
+        proof.verified
     }
+}
+
+// MARK: - Event Log Checkpoint (free function)
+
+/// Generates a signed consistency checkpoint for equivocation detection.
+///
+/// Members periodically exchange signed Merkle roots. If two members have
+/// different roots for the same event count, the relay is equivocating
+/// (showing different histories to different members).
+///
+/// Delegates to the UniFFI ``eventLogCheckpoint`` bridge function.
+///
+/// - Parameters:
+///   - handle: The ``ContextHandle`` for the context whose event log to
+///     checkpoint.
+///   - identity: The ``Identity`` generating the checkpoint (used for signing).
+///   - epoch: The current MLS epoch (pass 0 for broadcast contexts).
+///   - checkpointFn: Bridge function override for testing.
+/// - Returns: A ``Checkpoint`` containing the signed checkpoint data.
+/// - Throws: ``ScpError/Context(message:code:)`` if the context is not found.
+///   ``ScpError/Permission(message:code:)`` if key custody is not available.
+///
+/// ## Provenance
+///
+/// - ADR-011 (Event Log) acceptance criterion 8 in `.docs/adrs/phase-2.md`
+/// - ADR-030 (Pruning/Checkpointing)
+public func generateEventLogCheckpoint(
+    handle: ContextHandle,
+    identity: Identity,
+    epoch: UInt64,
+    checkpointFn: EventLogBridge.CheckpointFn = EventLogBridge.defaultCheckpoint
+) async throws -> Checkpoint {
+    try await checkpointFn(handle, identity, epoch)
 }

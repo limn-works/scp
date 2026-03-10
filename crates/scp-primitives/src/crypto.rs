@@ -12,8 +12,6 @@
 //!
 //! See GitHub issue #81.
 
-use ed25519_dalek::Verifier;
-
 /// Verifies an Ed25519 signature against a public key and message bytes.
 ///
 /// This is the primary verification entry point for SCP. Module-specific
@@ -38,7 +36,7 @@ pub fn verify_ed25519_signature(
     let (verifying_key, sig) = parse_key_and_signature(public_key, signature)?;
 
     verifying_key
-        .verify(message, &sig)
+        .verify_strict(message, &sig)
         .map_err(|e| format!("signature verification failed: {e}"))
 }
 

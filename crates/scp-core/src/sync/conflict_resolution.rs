@@ -13,7 +13,7 @@
 //!
 //! # Resolution strategies
 //!
-//! - **Metadata conflicts:** Last-writer-wins, where "last" is determined by
+//! - **Metadata conflicts:** First-writer-wins, where "first" is determined by
 //!   Merkle tree leaf index (lower index = earlier = wins).
 //! - **Governance conflicts:** The proposal with the lower event log sequence
 //!   number wins. The losing proposal is invalidated.
@@ -50,7 +50,7 @@ pub type MerkleRoot = [u8; 32];
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConflictType {
     /// Two concurrent metadata changes to the same field (e.g., context
-    /// settings). Resolved via last-writer-wins by Merkle position.
+    /// settings). Resolved via first-writer-wins by Merkle position.
     MetadataConflict,
     /// Two concurrent governance proposals that are incompatible (e.g.,
     /// conflicting role changes, mutual removal). Resolved by Merkle log
@@ -74,9 +74,9 @@ pub enum ConflictType {
 /// strategies are deterministic and clock-independent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConflictResolutionStrategy {
-    /// Last-writer-wins based on Merkle tree leaf index. The operation with
+    /// First-writer-wins based on Merkle tree leaf index. The operation with
     /// the lower leaf index (committed first) wins.
-    LastWriterWins {
+    FirstWriterWins {
         /// Leaf index of the winning operation.
         winner_leaf_index: u64,
         /// Leaf index of the losing operation.
@@ -255,17 +255,9 @@ pub enum ConflictResolutionError {
 
 /// Checks whether two governance actions are conflicting.
 ///
-/// Two actions conflict if they target the same entity with incompatible
-/// changes. See ADR-031 section 7 for the conflict taxonomy.
-///
-/// # Examples of conflicts
-///
-/// - Two `ChangeRole` actions for the same DID with different target roles.
-/// - Two `ModifyCeiling` actions with different ceiling sets.
-/// - A `RemoveMember` and a `ChangeRole` targeting the same DID.
-/// - Two `RemoveMember` actions targeting the same member (concurrent removal).
-/// - Two `RemoveMember` actions targeting each other's proposers (mutual removal).
-/// - Two `RotateContentKeys` actions (global property mutation).
+/// Delegates to the canonical implementation in
+/// [`crate::context::governance::actions_conflict`]. See ADR-031 section 7
+/// for the conflict taxonomy.
 #[must_use]
 pub fn actions_conflict(
     a: &GovernanceAction,
@@ -273,122 +265,14 @@ pub fn actions_conflict(
     b: &GovernanceAction,
     b_proposer: &DID,
 ) -> bool {
-    match (a, b) {
-        // Two role changes for the same DID with different roles.
-        (
-            GovernanceAction::ChangeRole {
-                did: did_a,
-                new_role: role_a,
-            },
-            GovernanceAction::ChangeRole {
-                did: did_b,
-                new_role: role_b,
-            },
-        ) => did_a == did_b && role_a != role_b,
-
-        // Any two concurrent modifications to the same global context property
-        // conflict — the values may or may not differ, but concurrent
-        // modification is unsafe.
-        (GovernanceAction::ModifyCeiling { .. }, GovernanceAction::ModifyCeiling { .. })
-        | (GovernanceAction::ModifyThreshold { .. }, GovernanceAction::ModifyThreshold { .. })
-        | (
-            GovernanceAction::ModifyPruningPolicy { .. },
-            GovernanceAction::ModifyPruningPolicy { .. },
-        )
-        | (
-            GovernanceAction::ReconfigureGovernance { .. },
-            GovernanceAction::ReconfigureGovernance { .. },
-        )
-        // Concurrent context-wide key rotations conflict (global property mutation).
-        | (
-            GovernanceAction::RotateContentKeys { .. },
-            GovernanceAction::RotateContentKeys { .. },
-        ) => true,
-
-        // Remove + role change for the same DID.
-        (
-            GovernanceAction::RemoveMember {
-                did: remove_did, ..
-            },
-            GovernanceAction::ChangeRole {
-                did: change_did, ..
-            },
-        )
-        | (
-            GovernanceAction::ChangeRole {
-                did: change_did, ..
-            },
-            GovernanceAction::RemoveMember {
-                did: remove_did, ..
-            },
-        ) => remove_did == change_did,
-
-        // Two concurrent removals of the same member conflict (ADR-031 §7:
-        // concurrent modifications to the same membership state).
-        // Also catches mutual removal (each proposer removes the other).
-        (
-            GovernanceAction::RemoveMember { did: did_a, .. },
-            GovernanceAction::RemoveMember { did: did_b, .. },
-        ) => did_a == did_b || (did_a == b_proposer && did_b == a_proposer),
-
-        // Two concurrent revocations of the same type targeting the same DID
-        // conflict (scope may differ, but concurrent revocation is unsafe — ADR-031 §7).
-        (
-            GovernanceAction::RevokeReadAccess { did: did_a, .. },
-            GovernanceAction::RevokeReadAccess { did: did_b, .. },
-        )
-        | (
-            GovernanceAction::RevokeWriteAccess { did: did_a, .. },
-            GovernanceAction::RevokeWriteAccess { did: did_b, .. },
-        ) => did_a == did_b,
-
-        // Revoke and Restore for the same DID conflict (contradictory intent
-        // on the same member's access state).
-        (
-            GovernanceAction::RevokeReadAccess {
-                did: revoke_did, ..
-            },
-            GovernanceAction::RestoreReadAccess { did: restore_did },
-        )
-        | (
-            GovernanceAction::RestoreReadAccess { did: restore_did },
-            GovernanceAction::RevokeReadAccess {
-                did: revoke_did, ..
-            },
-        )
-        | (
-            GovernanceAction::RevokeWriteAccess {
-                did: revoke_did, ..
-            },
-            GovernanceAction::RestoreWriteAccess { did: restore_did },
-        )
-        | (
-            GovernanceAction::RestoreWriteAccess { did: restore_did },
-            GovernanceAction::RevokeWriteAccess {
-                did: revoke_did, ..
-            },
-        ) => revoke_did == restore_did,
-
-        // AddSigner and RemoveSigner for the same DID conflict.
-        (
-            GovernanceAction::AddSigner { did: add_did },
-            GovernanceAction::RemoveSigner { did: remove_did },
-        )
-        | (
-            GovernanceAction::RemoveSigner { did: remove_did },
-            GovernanceAction::AddSigner { did: add_did },
-        ) => add_did == remove_did,
-
-        // All other action pairs are non-conflicting.
-        _ => false,
-    }
+    crate::context::governance::actions_conflict(a, a_proposer, b, b_proposer)
 }
 
 // ---------------------------------------------------------------------------
 // Metadata conflict resolution
 // ---------------------------------------------------------------------------
 
-/// Resolves a metadata conflict using last-writer-wins by Merkle position.
+/// Resolves a metadata conflict using first-writer-wins by Merkle position.
 ///
 /// When two offline members concurrently modify the same metadata field,
 /// the operation committed first to the Merkle event log wins. "First"
@@ -399,7 +283,7 @@ pub fn actions_conflict(
 ///
 /// # Returns
 ///
-/// - `LastWriterWins` with the winner and loser leaf indices.
+/// - `FirstWriterWins` with the winner and loser leaf indices.
 /// - `Merged` if the operations modify different fields (no conflict).
 ///
 /// See ADR-029 section 5c.
@@ -412,12 +296,12 @@ pub fn resolve_metadata_conflict(a: &MetadataOp, b: &MetadataOp) -> ConflictReso
 
     // Same field — lower leaf index wins.
     if a.leaf_index <= b.leaf_index {
-        ConflictResolutionStrategy::LastWriterWins {
+        ConflictResolutionStrategy::FirstWriterWins {
             winner_leaf_index: a.leaf_index,
             loser_leaf_index: b.leaf_index,
         }
     } else {
-        ConflictResolutionStrategy::LastWriterWins {
+        ConflictResolutionStrategy::FirstWriterWins {
             winner_leaf_index: b.leaf_index,
             loser_leaf_index: a.leaf_index,
         }
@@ -989,6 +873,73 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn conflicting_restore_read_access_same_did() {
+        // Two concurrent restore-read proposals for the same member conflict
+        // (concurrent modification of the same member's access state — ADR-031 §7).
+        let a = GovernanceAction::RestoreReadAccess {
+            did: did("did:dht:alice"),
+        };
+        let b = GovernanceAction::RestoreReadAccess {
+            did: did("did:dht:alice"),
+        };
+        assert!(actions_conflict(
+            &a,
+            &did("did:dht:bob"),
+            &b,
+            &did("did:dht:carol"),
+        ));
+    }
+
+    #[test]
+    fn non_conflicting_restore_read_access_different_dids() {
+        let a = GovernanceAction::RestoreReadAccess {
+            did: did("did:dht:alice"),
+        };
+        let b = GovernanceAction::RestoreReadAccess {
+            did: did("did:dht:bob"),
+        };
+        assert!(!actions_conflict(
+            &a,
+            &did("did:dht:carol"),
+            &b,
+            &did("did:dht:dave"),
+        ));
+    }
+
+    #[test]
+    fn conflicting_restore_write_access_same_did() {
+        // Two concurrent restore-write proposals for the same member conflict.
+        let a = GovernanceAction::RestoreWriteAccess {
+            did: did("did:dht:alice"),
+        };
+        let b = GovernanceAction::RestoreWriteAccess {
+            did: did("did:dht:alice"),
+        };
+        assert!(actions_conflict(
+            &a,
+            &did("did:dht:bob"),
+            &b,
+            &did("did:dht:carol"),
+        ));
+    }
+
+    #[test]
+    fn non_conflicting_restore_write_access_different_dids() {
+        let a = GovernanceAction::RestoreWriteAccess {
+            did: did("did:dht:alice"),
+        };
+        let b = GovernanceAction::RestoreWriteAccess {
+            did: did("did:dht:bob"),
+        };
+        assert!(!actions_conflict(
+            &a,
+            &did("did:dht:carol"),
+            &b,
+            &did("did:dht:dave"),
+        ));
+    }
+
     // -----------------------------------------------------------------------
     // resolve_metadata_conflict
     // -----------------------------------------------------------------------
@@ -1009,7 +960,7 @@ mod tests {
         let b = metadata_op("did:dht:bob", "description", b"second", 7);
         assert_eq!(
             resolve_metadata_conflict(&a, &b),
-            ConflictResolutionStrategy::LastWriterWins {
+            ConflictResolutionStrategy::FirstWriterWins {
                 winner_leaf_index: 3,
                 loser_leaf_index: 7,
             },
@@ -1022,7 +973,7 @@ mod tests {
         let b = metadata_op("did:dht:bob", "description", b"first", 2);
         assert_eq!(
             resolve_metadata_conflict(&a, &b),
-            ConflictResolutionStrategy::LastWriterWins {
+            ConflictResolutionStrategy::FirstWriterWins {
                 winner_leaf_index: 2,
                 loser_leaf_index: 10,
             },
@@ -1036,7 +987,7 @@ mod tests {
         let b = metadata_op("did:dht:bob", "description", b"tied-b", 5);
         assert_eq!(
             resolve_metadata_conflict(&a, &b),
-            ConflictResolutionStrategy::LastWriterWins {
+            ConflictResolutionStrategy::FirstWriterWins {
                 winner_leaf_index: 5,
                 loser_leaf_index: 5,
             },
@@ -1466,7 +1417,7 @@ mod tests {
     #[test]
     fn resolution_strategies_are_serializable() {
         let strategies = vec![
-            ConflictResolutionStrategy::LastWriterWins {
+            ConflictResolutionStrategy::FirstWriterWins {
                 winner_leaf_index: 3,
                 loser_leaf_index: 7,
             },
@@ -1520,7 +1471,7 @@ mod tests {
         let result = resolve_metadata_conflict(&early_clock_late_log, &late_clock_early_log);
         assert_eq!(
             result,
-            ConflictResolutionStrategy::LastWriterWins {
+            ConflictResolutionStrategy::FirstWriterWins {
                 winner_leaf_index: 2,
                 loser_leaf_index: 10,
             },

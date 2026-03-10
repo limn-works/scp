@@ -556,8 +556,9 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 /**
  * Opaque handle to an SCP context.
  *
- * Stores context metadata (ID, state, creator DID) and, for in-memory
- * custody, the key custody and signing key needed for UCAN minting.
+ * Stores context metadata (ID, state, creator DID) and the retained key
+ * custody provider (in-memory or callback) for UCAN signing and inner
+ * envelope creation.
  *
  * Generated as `class ContextHandle` in both Swift and Kotlin.
  *
@@ -590,8 +591,9 @@ public protocol ContextHandleProtocol: AnyObject, Sendable {
 /**
  * Opaque handle to an SCP context.
  *
- * Stores context metadata (ID, state, creator DID) and, for in-memory
- * custody, the key custody and signing key needed for UCAN minting.
+ * Stores context metadata (ID, state, creator DID) and the retained key
+ * custody provider (in-memory or callback) for UCAN signing and inner
+ * envelope creation.
  *
  * Generated as `class ContextHandle` in both Swift and Kotlin.
  *
@@ -746,14 +748,20 @@ public func FfiConverterTypeContextHandle_lower(_ value: ContextHandle) -> Unsaf
 /**
  * Opaque handle to an SCP identity.
  *
- * Stores the DID string, custody type, and — for in-memory custody — the
- * retained [`ScpIdentity`] and [`InMemoryKeyCustody`] so that key material
- * remains live for the lifetime of the handle. Platform custody paths use
- * the `KeyCustodyProvider` callback interface instead.
+ * Stores the DID string, custody type, and key custody provider so that
+ * key material remains live for the lifetime of the handle:
+ *
+ * - **In-memory custody** (dev/desktop): retained [`InMemoryKeyCustody`]
+ * with key material in heap memory. Only available when the
+ * `allow_in_memory_custody` feature is enabled.
+ * - **Platform/Software custody** (production mobile): retained
+ * [`CallbackKeyCustody`] adapter wrapping the injected
+ * [`KeyCustodyProvider`](crate::KeyCustodyProvider) callback. Private
+ * key material stays in the platform TEE (Secure Enclave / Keystore).
  *
  * Generated as `class Identity` in both Swift and Kotlin.
  *
- * See ADR-002 (DID) and ADR-013 §2 (bridge pattern).
+ * See ADR-002 (DID), ADR-006 (Platform Abstraction), and SCP-214.
  */
 public protocol IdentityProtocol: AnyObject, Sendable {
     
@@ -867,9 +875,15 @@ public protocol IdentityProtocol: AnyObject, Sendable {
      * DHT, and returns an updated `Identity` with the same DID but a new
      * active signing key.
      *
+     * Requires a retained custody provider (in-memory or platform callback).
+     * External/loaded identities without retained crypto state cannot rotate.
+     *
      * # Errors
      *
-     * Returns `ScpError::Identity` if key rotation or DID document publish fails.
+     * Returns `ScpError::Identity` if key rotation or DID document publish fails,
+     * or if no custody provider is available.
+     *
+     * See SCP-214 acceptance criterion 9.
      */
     func rotateKey() async throws  -> Identity
     
@@ -877,14 +891,20 @@ public protocol IdentityProtocol: AnyObject, Sendable {
 /**
  * Opaque handle to an SCP identity.
  *
- * Stores the DID string, custody type, and — for in-memory custody — the
- * retained [`ScpIdentity`] and [`InMemoryKeyCustody`] so that key material
- * remains live for the lifetime of the handle. Platform custody paths use
- * the `KeyCustodyProvider` callback interface instead.
+ * Stores the DID string, custody type, and key custody provider so that
+ * key material remains live for the lifetime of the handle:
+ *
+ * - **In-memory custody** (dev/desktop): retained [`InMemoryKeyCustody`]
+ * with key material in heap memory. Only available when the
+ * `allow_in_memory_custody` feature is enabled.
+ * - **Platform/Software custody** (production mobile): retained
+ * [`CallbackKeyCustody`] adapter wrapping the injected
+ * [`KeyCustodyProvider`](crate::KeyCustodyProvider) callback. Private
+ * key material stays in the platform TEE (Secure Enclave / Keystore).
  *
  * Generated as `class Identity` in both Swift and Kotlin.
  *
- * See ADR-002 (DID) and ADR-013 §2 (bridge pattern).
+ * See ADR-002 (DID), ADR-006 (Platform Abstraction), and SCP-214.
  */
 open class Identity: IdentityProtocol, @unchecked Sendable {
     fileprivate let pointer: UnsafeMutableRawPointer!
@@ -1113,9 +1133,15 @@ open func rotateAgentKey()async throws  -> Identity  {
      * DHT, and returns an updated `Identity` with the same DID but a new
      * active signing key.
      *
+     * Requires a retained custody provider (in-memory or platform callback).
+     * External/loaded identities without retained crypto state cannot rotate.
+     *
      * # Errors
      *
-     * Returns `ScpError::Identity` if key rotation or DID document publish fails.
+     * Returns `ScpError::Identity` if key rotation or DID document publish fails,
+     * or if no custody provider is available.
+     *
+     * See SCP-214 acceptance criterion 9.
      */
 open func rotateKey()async throws  -> Identity  {
     return
@@ -1676,6 +1702,152 @@ public func FfiConverterTypeAttestationVerificationResult_lower(_ value: Attesta
 
 
 /**
+ * Bridge registration result record.
+ *
+ * Returned by `bridge_register`. Contains the details of a successfully
+ * registered bridge connector.
+ *
+ * See spec section 12 (Bridge System) and ADR-023.
+ */
+public struct BridgeRegistrationResult {
+    /**
+     * Unique identifier for the registered bridge.
+     */
+    public var bridgeId: String
+    /**
+     * DID of the bridge operator.
+     */
+    public var operatorDid: String
+    /**
+     * External platform name (e.g., `"discord"`, `"slack"`).
+     */
+    public var platform: String
+    /**
+     * Bridge operating mode (`"relay"`, `"puppet"`, `"api"`, `"cooperative"`).
+     */
+    public var mode: String
+    /**
+     * Bridge status after registration (e.g., `"active"`).
+     */
+    public var status: String
+    /**
+     * Context the bridge is registered in.
+     */
+    public var contextId: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Unique identifier for the registered bridge.
+         */bridgeId: String, 
+        /**
+         * DID of the bridge operator.
+         */operatorDid: String, 
+        /**
+         * External platform name (e.g., `"discord"`, `"slack"`).
+         */platform: String, 
+        /**
+         * Bridge operating mode (`"relay"`, `"puppet"`, `"api"`, `"cooperative"`).
+         */mode: String, 
+        /**
+         * Bridge status after registration (e.g., `"active"`).
+         */status: String, 
+        /**
+         * Context the bridge is registered in.
+         */contextId: String) {
+        self.bridgeId = bridgeId
+        self.operatorDid = operatorDid
+        self.platform = platform
+        self.mode = mode
+        self.status = status
+        self.contextId = contextId
+    }
+}
+
+#if compiler(>=6)
+extension BridgeRegistrationResult: Sendable {}
+#endif
+
+
+extension BridgeRegistrationResult: Equatable, Hashable {
+    public static func ==(lhs: BridgeRegistrationResult, rhs: BridgeRegistrationResult) -> Bool {
+        if lhs.bridgeId != rhs.bridgeId {
+            return false
+        }
+        if lhs.operatorDid != rhs.operatorDid {
+            return false
+        }
+        if lhs.platform != rhs.platform {
+            return false
+        }
+        if lhs.mode != rhs.mode {
+            return false
+        }
+        if lhs.status != rhs.status {
+            return false
+        }
+        if lhs.contextId != rhs.contextId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(bridgeId)
+        hasher.combine(operatorDid)
+        hasher.combine(platform)
+        hasher.combine(mode)
+        hasher.combine(status)
+        hasher.combine(contextId)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBridgeRegistrationResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BridgeRegistrationResult {
+        return
+            try BridgeRegistrationResult(
+                bridgeId: FfiConverterString.read(from: &buf), 
+                operatorDid: FfiConverterString.read(from: &buf), 
+                platform: FfiConverterString.read(from: &buf), 
+                mode: FfiConverterString.read(from: &buf), 
+                status: FfiConverterString.read(from: &buf), 
+                contextId: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: BridgeRegistrationResult, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.bridgeId, into: &buf)
+        FfiConverterString.write(value.operatorDid, into: &buf)
+        FfiConverterString.write(value.platform, into: &buf)
+        FfiConverterString.write(value.mode, into: &buf)
+        FfiConverterString.write(value.status, into: &buf)
+        FfiConverterString.write(value.contextId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBridgeRegistrationResult_lift(_ buf: RustBuffer) throws -> BridgeRegistrationResult {
+    return try FfiConverterTypeBridgeRegistrationResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBridgeRegistrationResult_lower(_ value: BridgeRegistrationResult) -> RustBuffer {
+    return FfiConverterTypeBridgeRegistrationResult.lower(value)
+}
+
+
+/**
  * Result of creating a challenge request.
  */
 public struct ChallengeResult {
@@ -1757,6 +1929,168 @@ public func FfiConverterTypeChallengeResult_lift(_ buf: RustBuffer) throws -> Ch
 #endif
 public func FfiConverterTypeChallengeResult_lower(_ value: ChallengeResult) -> RustBuffer {
     return FfiConverterTypeChallengeResult.lower(value)
+}
+
+
+/**
+ * A signed consistency checkpoint from the context event log.
+ *
+ * Checkpoints are signed snapshots of the event log state at a point in time.
+ * Members exchange checkpoints to detect relay equivocation: if two members
+ * have different Merkle roots for the same event count, the relay is showing
+ * different histories to different members.
+ *
+ * See ADR-011 acceptance criterion 8 and ADR-030 (pruning/checkpointing).
+ */
+public struct Checkpoint {
+    /**
+     * The context this checkpoint belongs to.
+     */
+    public var contextId: String
+    /**
+     * The DID of the member who generated this checkpoint.
+     */
+    public var senderDid: String
+    /**
+     * The number of events in the log at checkpoint time.
+     */
+    public var eventCount: UInt64
+    /**
+     * The Merkle root hash at checkpoint time, hex-encoded.
+     */
+    public var merkleRoot: String
+    /**
+     * Current MLS epoch. `None` for Broadcast contexts.
+     */
+    public var epoch: UInt64?
+    /**
+     * Unix timestamp (seconds) when the checkpoint was generated.
+     */
+    public var timestamp: UInt64
+    /**
+     * Ed25519 signature over the canonical checkpoint fields, hex-encoded.
+     */
+    public var signature: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The context this checkpoint belongs to.
+         */contextId: String, 
+        /**
+         * The DID of the member who generated this checkpoint.
+         */senderDid: String, 
+        /**
+         * The number of events in the log at checkpoint time.
+         */eventCount: UInt64, 
+        /**
+         * The Merkle root hash at checkpoint time, hex-encoded.
+         */merkleRoot: String, 
+        /**
+         * Current MLS epoch. `None` for Broadcast contexts.
+         */epoch: UInt64?, 
+        /**
+         * Unix timestamp (seconds) when the checkpoint was generated.
+         */timestamp: UInt64, 
+        /**
+         * Ed25519 signature over the canonical checkpoint fields, hex-encoded.
+         */signature: String) {
+        self.contextId = contextId
+        self.senderDid = senderDid
+        self.eventCount = eventCount
+        self.merkleRoot = merkleRoot
+        self.epoch = epoch
+        self.timestamp = timestamp
+        self.signature = signature
+    }
+}
+
+#if compiler(>=6)
+extension Checkpoint: Sendable {}
+#endif
+
+
+extension Checkpoint: Equatable, Hashable {
+    public static func ==(lhs: Checkpoint, rhs: Checkpoint) -> Bool {
+        if lhs.contextId != rhs.contextId {
+            return false
+        }
+        if lhs.senderDid != rhs.senderDid {
+            return false
+        }
+        if lhs.eventCount != rhs.eventCount {
+            return false
+        }
+        if lhs.merkleRoot != rhs.merkleRoot {
+            return false
+        }
+        if lhs.epoch != rhs.epoch {
+            return false
+        }
+        if lhs.timestamp != rhs.timestamp {
+            return false
+        }
+        if lhs.signature != rhs.signature {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(contextId)
+        hasher.combine(senderDid)
+        hasher.combine(eventCount)
+        hasher.combine(merkleRoot)
+        hasher.combine(epoch)
+        hasher.combine(timestamp)
+        hasher.combine(signature)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCheckpoint: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Checkpoint {
+        return
+            try Checkpoint(
+                contextId: FfiConverterString.read(from: &buf), 
+                senderDid: FfiConverterString.read(from: &buf), 
+                eventCount: FfiConverterUInt64.read(from: &buf), 
+                merkleRoot: FfiConverterString.read(from: &buf), 
+                epoch: FfiConverterOptionUInt64.read(from: &buf), 
+                timestamp: FfiConverterUInt64.read(from: &buf), 
+                signature: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: Checkpoint, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.contextId, into: &buf)
+        FfiConverterString.write(value.senderDid, into: &buf)
+        FfiConverterUInt64.write(value.eventCount, into: &buf)
+        FfiConverterString.write(value.merkleRoot, into: &buf)
+        FfiConverterOptionUInt64.write(value.epoch, into: &buf)
+        FfiConverterUInt64.write(value.timestamp, into: &buf)
+        FfiConverterString.write(value.signature, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCheckpoint_lift(_ buf: RustBuffer) throws -> Checkpoint {
+    return try FfiConverterTypeCheckpoint.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCheckpoint_lower(_ value: Checkpoint) -> RustBuffer {
+    return FfiConverterTypeCheckpoint.lower(value)
 }
 
 
@@ -2508,6 +2842,311 @@ public func FfiConverterTypeProof_lift(_ buf: RustBuffer) throws -> Proof {
 #endif
 public func FfiConverterTypeProof_lower(_ value: Proof) -> RustBuffer {
     return FfiConverterTypeProof.lower(value)
+}
+
+
+/**
+ * Shadow identity result record.
+ *
+ * Returned by `bridge_create_shadow`. Contains the details of a shadow
+ * identity representing an external platform participant.
+ *
+ * See spec section 12 (Bridge System) and ADR-023.
+ */
+public struct ShadowIdentityResult {
+    /**
+     * Unique identifier for this shadow identity.
+     */
+    public var shadowId: String
+    /**
+     * External platform handle (e.g., `"@user#1234"`).
+     */
+    public var platformHandle: String
+    /**
+     * Bridge connector that created this shadow.
+     */
+    public var bridgeId: String
+    /**
+     * Role attributed to this shadow.
+     */
+    public var attributedRole: String
+    /**
+     * Provenance status: `"Shadow"` or `"Claimed"`.
+     */
+    public var provenanceStatus: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Unique identifier for this shadow identity.
+         */shadowId: String, 
+        /**
+         * External platform handle (e.g., `"@user#1234"`).
+         */platformHandle: String, 
+        /**
+         * Bridge connector that created this shadow.
+         */bridgeId: String, 
+        /**
+         * Role attributed to this shadow.
+         */attributedRole: String, 
+        /**
+         * Provenance status: `"Shadow"` or `"Claimed"`.
+         */provenanceStatus: String) {
+        self.shadowId = shadowId
+        self.platformHandle = platformHandle
+        self.bridgeId = bridgeId
+        self.attributedRole = attributedRole
+        self.provenanceStatus = provenanceStatus
+    }
+}
+
+#if compiler(>=6)
+extension ShadowIdentityResult: Sendable {}
+#endif
+
+
+extension ShadowIdentityResult: Equatable, Hashable {
+    public static func ==(lhs: ShadowIdentityResult, rhs: ShadowIdentityResult) -> Bool {
+        if lhs.shadowId != rhs.shadowId {
+            return false
+        }
+        if lhs.platformHandle != rhs.platformHandle {
+            return false
+        }
+        if lhs.bridgeId != rhs.bridgeId {
+            return false
+        }
+        if lhs.attributedRole != rhs.attributedRole {
+            return false
+        }
+        if lhs.provenanceStatus != rhs.provenanceStatus {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(shadowId)
+        hasher.combine(platformHandle)
+        hasher.combine(bridgeId)
+        hasher.combine(attributedRole)
+        hasher.combine(provenanceStatus)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShadowIdentityResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShadowIdentityResult {
+        return
+            try ShadowIdentityResult(
+                shadowId: FfiConverterString.read(from: &buf), 
+                platformHandle: FfiConverterString.read(from: &buf), 
+                bridgeId: FfiConverterString.read(from: &buf), 
+                attributedRole: FfiConverterString.read(from: &buf), 
+                provenanceStatus: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ShadowIdentityResult, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.shadowId, into: &buf)
+        FfiConverterString.write(value.platformHandle, into: &buf)
+        FfiConverterString.write(value.bridgeId, into: &buf)
+        FfiConverterString.write(value.attributedRole, into: &buf)
+        FfiConverterString.write(value.provenanceStatus, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShadowIdentityResult_lift(_ buf: RustBuffer) throws -> ShadowIdentityResult {
+    return try FfiConverterTypeShadowIdentityResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShadowIdentityResult_lower(_ value: ShadowIdentityResult) -> RustBuffer {
+    return FfiConverterTypeShadowIdentityResult.lower(value)
+}
+
+
+/**
+ * Sync policy parameters record.
+ *
+ * Contains the default sync policy values. Returned by `sync_get_policy`.
+ *
+ * See ADR-029 in `.docs/adrs/phase-6.md`.
+ */
+public struct SyncPolicyResult {
+    /**
+     * Tier 1 upper bound in seconds (default 14400 = 4 hours).
+     */
+    public var tier1ThresholdSecs: UInt64
+    /**
+     * Tier 2 upper bound in seconds (default 604800 = 7 days).
+     */
+    public var tier2ThresholdSecs: UInt64
+    /**
+     * Gap timeout in seconds (default 30).
+     */
+    public var gapTimeoutSecs: UInt64
+    /**
+     * Max buffered messages in the reorder buffer (default 100).
+     */
+    public var reorderBufferCapacity: UInt32
+    /**
+     * Max sequential MLS Commits for epoch catch-up (default 100).
+     */
+    public var maxSequentialCommits: UInt64
+    /**
+     * Per-Commit processing timeout in seconds (default 5).
+     */
+    public var commitProcessTimeoutSecs: UInt64
+    /**
+     * Sender key re-acquisition timeout in seconds (default 60).
+     */
+    public var senderKeyTimeoutSecs: UInt64
+    /**
+     * Reconnection dedup window in seconds (default 30).
+     */
+    public var reconnectionDedupWindowSecs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Tier 1 upper bound in seconds (default 14400 = 4 hours).
+         */tier1ThresholdSecs: UInt64, 
+        /**
+         * Tier 2 upper bound in seconds (default 604800 = 7 days).
+         */tier2ThresholdSecs: UInt64, 
+        /**
+         * Gap timeout in seconds (default 30).
+         */gapTimeoutSecs: UInt64, 
+        /**
+         * Max buffered messages in the reorder buffer (default 100).
+         */reorderBufferCapacity: UInt32, 
+        /**
+         * Max sequential MLS Commits for epoch catch-up (default 100).
+         */maxSequentialCommits: UInt64, 
+        /**
+         * Per-Commit processing timeout in seconds (default 5).
+         */commitProcessTimeoutSecs: UInt64, 
+        /**
+         * Sender key re-acquisition timeout in seconds (default 60).
+         */senderKeyTimeoutSecs: UInt64, 
+        /**
+         * Reconnection dedup window in seconds (default 30).
+         */reconnectionDedupWindowSecs: UInt64) {
+        self.tier1ThresholdSecs = tier1ThresholdSecs
+        self.tier2ThresholdSecs = tier2ThresholdSecs
+        self.gapTimeoutSecs = gapTimeoutSecs
+        self.reorderBufferCapacity = reorderBufferCapacity
+        self.maxSequentialCommits = maxSequentialCommits
+        self.commitProcessTimeoutSecs = commitProcessTimeoutSecs
+        self.senderKeyTimeoutSecs = senderKeyTimeoutSecs
+        self.reconnectionDedupWindowSecs = reconnectionDedupWindowSecs
+    }
+}
+
+#if compiler(>=6)
+extension SyncPolicyResult: Sendable {}
+#endif
+
+
+extension SyncPolicyResult: Equatable, Hashable {
+    public static func ==(lhs: SyncPolicyResult, rhs: SyncPolicyResult) -> Bool {
+        if lhs.tier1ThresholdSecs != rhs.tier1ThresholdSecs {
+            return false
+        }
+        if lhs.tier2ThresholdSecs != rhs.tier2ThresholdSecs {
+            return false
+        }
+        if lhs.gapTimeoutSecs != rhs.gapTimeoutSecs {
+            return false
+        }
+        if lhs.reorderBufferCapacity != rhs.reorderBufferCapacity {
+            return false
+        }
+        if lhs.maxSequentialCommits != rhs.maxSequentialCommits {
+            return false
+        }
+        if lhs.commitProcessTimeoutSecs != rhs.commitProcessTimeoutSecs {
+            return false
+        }
+        if lhs.senderKeyTimeoutSecs != rhs.senderKeyTimeoutSecs {
+            return false
+        }
+        if lhs.reconnectionDedupWindowSecs != rhs.reconnectionDedupWindowSecs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(tier1ThresholdSecs)
+        hasher.combine(tier2ThresholdSecs)
+        hasher.combine(gapTimeoutSecs)
+        hasher.combine(reorderBufferCapacity)
+        hasher.combine(maxSequentialCommits)
+        hasher.combine(commitProcessTimeoutSecs)
+        hasher.combine(senderKeyTimeoutSecs)
+        hasher.combine(reconnectionDedupWindowSecs)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncPolicyResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncPolicyResult {
+        return
+            try SyncPolicyResult(
+                tier1ThresholdSecs: FfiConverterUInt64.read(from: &buf), 
+                tier2ThresholdSecs: FfiConverterUInt64.read(from: &buf), 
+                gapTimeoutSecs: FfiConverterUInt64.read(from: &buf), 
+                reorderBufferCapacity: FfiConverterUInt32.read(from: &buf), 
+                maxSequentialCommits: FfiConverterUInt64.read(from: &buf), 
+                commitProcessTimeoutSecs: FfiConverterUInt64.read(from: &buf), 
+                senderKeyTimeoutSecs: FfiConverterUInt64.read(from: &buf), 
+                reconnectionDedupWindowSecs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SyncPolicyResult, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.tier1ThresholdSecs, into: &buf)
+        FfiConverterUInt64.write(value.tier2ThresholdSecs, into: &buf)
+        FfiConverterUInt64.write(value.gapTimeoutSecs, into: &buf)
+        FfiConverterUInt32.write(value.reorderBufferCapacity, into: &buf)
+        FfiConverterUInt64.write(value.maxSequentialCommits, into: &buf)
+        FfiConverterUInt64.write(value.commitProcessTimeoutSecs, into: &buf)
+        FfiConverterUInt64.write(value.senderKeyTimeoutSecs, into: &buf)
+        FfiConverterUInt64.write(value.reconnectionDedupWindowSecs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncPolicyResult_lift(_ buf: RustBuffer) throws -> SyncPolicyResult {
+    return try FfiConverterTypeSyncPolicyResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncPolicyResult_lower(_ value: SyncPolicyResult) -> RustBuffer {
+    return FfiConverterTypeSyncPolicyResult.lower(value)
 }
 
 
@@ -5297,6 +5936,30 @@ public func FfiConverterCallbackInterfaceStorageProvider_lower(_ v: StorageProvi
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionUInt8: FfiConverterRustBuffer {
+    typealias SwiftType = UInt8?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt8.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt8.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
     typealias SwiftType = UInt64?
 
@@ -5617,6 +6280,90 @@ public func uniffiForeignFutureHandleCountScp() -> Int {
     UNIFFI_FOREIGN_FUTURE_HANDLE_MAP.count
 }
 /**
+ * Creates a shadow identity for an external platform participant.
+ *
+ * Shadow identities represent non-SCP participants in a bridged context.
+ * They carry provenance metadata indicating they are not native SCP
+ * identities.
+ *
+ * # Arguments
+ *
+ * * `bridge_id` — The bridge connector ID that owns this shadow.
+ * * `platform_handle` — External platform handle (e.g., `"@user#1234"`).
+ * * `bridge_mode` — Bridge mode: `"relay"`, `"puppet"`, `"api"`, or
+ * `"cooperative"`.
+ * * `context_id` — Context the shadow is being created in.
+ *
+ * # Returns
+ *
+ * A `ShadowIdentityResult` with the shadow identity details.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Validation` if `bridge_mode` is not recognized, or
+ * `ScpError::Context` if shadow creation fails.
+ *
+ * See spec section 12 (Bridge System) and ADR-023.
+ */
+public func bridgeCreateShadow(bridgeId: String, platformHandle: String, bridgeMode: String, contextId: String)throws  -> ShadowIdentityResult  {
+    return try  FfiConverterTypeShadowIdentityResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_bridge_create_shadow(
+        FfiConverterString.lower(bridgeId),
+        FfiConverterString.lower(platformHandle),
+        FfiConverterString.lower(bridgeMode),
+        FfiConverterString.lower(contextId),$0
+    )
+})
+}
+/**
+ * Evaluates the trust level for an action based on bridge provenance.
+ *
+ * Returns an integer (0-3) representing the trust tier.
+ */
+public func bridgeEvaluateTrust(isBridged: Bool, isNativeTransport: Bool, shadowStatus: String)throws  -> UInt8  {
+    return try  FfiConverterUInt8.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_bridge_evaluate_trust(
+        FfiConverterBool.lower(isBridged),
+        FfiConverterBool.lower(isNativeTransport),
+        FfiConverterString.lower(shadowStatus),$0
+    )
+})
+}
+/**
+ * Registers a new bridge connector with a context.
+ *
+ * Creates a bridge registration, submits a registration request, and
+ * immediately approves it (for FFI / testing purposes).
+ *
+ * # Arguments
+ *
+ * * `context_id` — Context to register the bridge in.
+ * * `operator_did` — DID of the human operator accountable for the bridge.
+ * * `platform` — External platform name (e.g., `"discord"`, `"slack"`).
+ * * `mode` — Bridge mode: `"relay"`, `"puppet"`, `"api"`, or `"cooperative"`.
+ *
+ * # Returns
+ *
+ * A `BridgeRegistrationResult` with the registration details.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Validation` if `mode` is not recognized, or
+ * `ScpError::Context` if registration fails.
+ *
+ * See spec section 12 (Bridge System) and ADR-023.
+ */
+public func bridgeRegister(contextId: String, operatorDid: String, platform: String, mode: String)throws  -> BridgeRegistrationResult  {
+    return try  FfiConverterTypeBridgeRegistrationResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_bridge_register(
+        FfiConverterString.lower(contextId),
+        FfiConverterString.lower(operatorDid),
+        FfiConverterString.lower(platform),
+        FfiConverterString.lower(mode),$0
+    )
+})
+}
+/**
  * Returns the broadcast admission policy for a context.
  *
  * Returns the policy as a string: `"Open"` or `"Gated"`.
@@ -5706,18 +6453,28 @@ public func broadcastIsSubscriber(handle: ContextHandle, did: String)async  -> B
 /**
  * Publishes a message to a broadcast context.
  *
- * The payload is encrypted with the author's broadcast key.
+ * The payload is encrypted with the author's broadcast key. The author's
+ * identity must have been previously created via `identity_create` so
+ * that the key custody provider and signing key handle are available.
+ *
+ * # Arguments
+ *
+ * * `handle` — The context to publish to.
+ * * `identity` — The identity of the author publishing the message.
+ * * `payload` — The raw message payload bytes to encrypt and publish.
  *
  * # Errors
  *
  * Returns `ScpError::Context` if the context is not active, not broadcast,
  * or the sender is not an author.
+ * Returns `ScpError::Crypto` if custody signing fails.
+ * Returns `ScpError::Permission` if no custody provider is available.
  */
-public func broadcastPublish(handle: ContextHandle, authorDid: String, payload: Data)async throws   {
+public func broadcastPublish(handle: ContextHandle, identity: Identity, payload: Data)async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_broadcast_publish(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(authorDid),FfiConverterData.lower(payload)
+                uniffi_scp_ffi_uniffi_fn_func_broadcast_publish(FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity),FfiConverterData.lower(payload)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
@@ -5859,6 +6616,43 @@ public func contextCreate(identity: Identity, params: ContextParams)async throws
         )
 }
 /**
+ * Discovers contexts from a DID string or `scp://` URI.
+ *
+ * Detects whether the query is a DID or an `scp://` URI and delegates to
+ * the appropriate core discovery function.
+ *
+ * Returns a JSON string containing an array of discovery results, each
+ * with: `context_id`, `relay_urls`, `publisher_did`, `discovery_source`,
+ * `mode`, `metadata_summary`.
+ *
+ * # Arguments
+ *
+ * * `query` — A DID string (e.g., `"did:dht:z6Mk..."`) or an `scp://`
+ * URI (e.g., `"scp://context/a1b2c3?relay=wss%3A%2F%2Frelay.example.com"`).
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Context` if DID resolution or URI parsing fails.
+ * Returns `ScpError::Validation` if the query is neither a DID nor an
+ * `scp://` URI.
+ *
+ * See §5.14.11, §18.2.2, §18.4.
+ */
+public func contextDiscover(query: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_context_discover(FfiConverterString.lower(query)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
  * Drains all pending events from the context's receive buffer.
  *
  * Returns a list of event descriptions as JSON strings. Returns empty
@@ -5877,6 +6671,31 @@ public func contextDrainEvents(handle: ContextHandle)async  -> [String]  {
             liftFunc: FfiConverterSequenceString.lift,
             errorHandler: nil
             
+        )
+}
+/**
+ * Exports a context's full state as serialized `MessagePack` bytes.
+ *
+ * Returns the serialized bytes of a `StoredValue<ContextExport>` envelope
+ * (§17.5), suitable for backup, migration, or transfer to another node.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Context` if the context does not exist, export fails,
+ * or serialization fails.
+ */
+public func contextExport(handle: ContextHandle)async throws  -> Data  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_context_export(FfiConverterTypeContextHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterData.lift,
+            errorHandler: FfiConverterTypeScpError_lift
         )
 }
 /**
@@ -5899,6 +6718,33 @@ public func contextHandleTtlExpiry(handle: ContextHandle)async throws   {
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
             liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Imports a context from serialized `MessagePack` bytes.
+ *
+ * The bytes must be a `StoredValue<ContextExport>` envelope (§17.5), as
+ * produced by [`context_export`].
+ *
+ * Returns the context ID of the imported context.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Context` if deserialization, validation, or import
+ * fails.
+ */
+public func contextImport(data: Data)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_context_import(FfiConverterData.lower(data)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
 }
@@ -6139,6 +6985,42 @@ public func contextSubscribe(handle: ContextHandle, listener: MessageListener)as
         )
 }
 /**
+ * Creates a discovery query as a JSON string.
+ */
+public func discoveryCreateQuery(capabilities: [String]?, keywords: [String]?, minHistorySecs: UInt64?)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_discovery_create_query(
+        FfiConverterOptionSequenceString.lower(capabilities),
+        FfiConverterOptionSequenceString.lower(keywords),
+        FfiConverterOptionUInt64.lower(minHistorySecs),$0
+    )
+})
+}
+/**
+ * Normalizes an address string per SCP addressing rules.
+ *
+ * Lowercases and trims whitespace.
+ */
+public func discoveryNormalizeAddress(address: String) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_func_discovery_normalize_address(
+        FfiConverterString.lower(address),$0
+    )
+})
+}
+/**
+ * Parses an SCP address string into its components.
+ *
+ * Returns a JSON string with the parsed address type and fields.
+ */
+public func discoveryParseAddress(address: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_discovery_parse_address(
+        FfiConverterString.lower(address),$0
+    )
+})
+}
+/**
  * Evaluates the provenance quality tier for data with the given parameters.
  *
  * Returns an integer (0-3) representing the quality tier:
@@ -6163,6 +7045,45 @@ public func evaluateProvenanceQuality(sourceContext: String?, sourceType: String
         FfiConverterSequenceString.lower(counterparties),$0
     )
 })
+}
+/**
+ * Generates a signed consistency checkpoint from the current event log state.
+ *
+ * Creates a snapshot of the event log's Merkle root and event count, signs it
+ * with the caller's identity key, and returns the checkpoint. Checkpoints
+ * enable equivocation detection: members exchange signed Merkle roots and
+ * compare them to detect relay misbehavior.
+ *
+ * # Arguments
+ *
+ * * `handle` — The context whose event log to checkpoint.
+ * * `identity` — The identity generating the checkpoint (used for signing).
+ * * `epoch` — The current MLS epoch (pass 0 for Broadcast contexts).
+ *
+ * # Returns
+ *
+ * A [`Checkpoint`] containing the signed checkpoint data.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Context` if the context is not found in the UCAN
+ * registry. Returns `ScpError::Permission` if key custody is not available.
+ *
+ * See ADR-011 acceptance criterion 8 and ADR-030.
+ */
+public func eventLogCheckpoint(handle: ContextHandle, identity: Identity, epoch: UInt64)async throws  -> Checkpoint  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_event_log_checkpoint(FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity),FfiConverterUInt64.lower(epoch)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeCheckpoint_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
 }
 /**
  * Queries the context event log with optional filter criteria.
@@ -6266,31 +7187,42 @@ public func governanceExecute(handle: ContextHandle, proposalJson: String)async 
         )
 }
 /**
- * Creates a new DID identity with the specified custody method.
+ * Generates a device attestation token for an identity.
+ *
+ * Uses [`InMemoryDeviceAttestation`] to produce a synthetic attestation token,
+ * then attaches it to the identity's DID document.
  *
  * # Arguments
  *
- * * `custody` — The custody type string. Accepted values depend on the build
- * configuration:
- * - `"platform"` — always accepted; requires a wired `KeyCustodyProvider`.
- * - `"software"` — always accepted; requires a wired `KeyCustodyProvider`.
- * - `"in_memory"` — **only** accepted when the `allow_in_memory_custody`
- * feature is enabled at compile time. Returns `ScpError::Identity` with
- * code `SCP-IDENT-1008` otherwise. Stores key material in unprotected heap
- * memory; suitable for testing and development but NOT for production use
- * on mobile devices.
+ * * `identity` — The identity to attest (must have been created with
+ * `identity_create`, not `identity_load`).
  *
  * # Returns
  *
- * An `Identity` handle with the new DID and custody type.
+ * The attestation token as a base64-encoded string.
  *
  * # Errors
  *
- * Returns `ScpError::Identity` if key generation or DID creation fails.
- * Returns `ScpError::Identity` with code `SCP-IDENT-1008` if `"in_memory"` is
- * requested but the `allow_in_memory_custody` feature is not enabled.
- * Returns `ScpError::Validation` if the custody string is not recognized.
+ * Returns `ScpError::Identity` if the identity was externally loaded (no
+ * retained crypto state) or if attestation generation fails.
  *
+ * See §9.3, issue #362, #419.
+ */
+public func identityAttestDevice(identity: Identity)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_identity_attest_device(FfiConverterTypeIdentity_lower(identity)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
  * # In-memory custody (feature-gated)
  *
  * When `custody` is `"in_memory"` and the `allow_in_memory_custody` feature
@@ -6308,6 +7240,80 @@ public func identityCreate(custody: String)async throws  -> Identity  {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_func_identity_create(FfiConverterString.lower(custody)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeIdentity_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Creates a new SCP identity with an agent signing key.
+ *
+ * Same as `identity_create` but also generates an `#agent` verification
+ * method keypair in the DID document (ADR-039). The returned `Identity`
+ * has `has_agent_key() == true`.
+ *
+ * Only available with `"in_memory"` custody when the
+ * `allow_in_memory_custody` feature is enabled. Production mobile builds
+ * must use `identity_create_with_custody` + `add_agent_key`.
+ *
+ * # Arguments
+ *
+ * * `custody` — Custody method string (`"in_memory"`).
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Identity` if the custody method is unsupported or
+ * key generation/DHT publish fails.
+ *
+ * See ADR-039 acceptance criterion 4 and SCP-AB-016.
+ */
+public func identityCreateWithAgentKey(custody: String)async throws  -> Identity  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_identity_create_with_agent_key(FfiConverterString.lower(custody)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeIdentity_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Creates a new SCP identity using an injected platform custody provider.
+ *
+ * This is the production-grade identity creation path for mobile platforms.
+ * The `provider` callback handles all cryptographic operations (signing,
+ * key generation, pseudonym derivation) inside the platform's TEE (Secure
+ * Enclave on iOS, Android Keystore on Android). Private key material never
+ * crosses the FFI boundary (ADR-006).
+ *
+ * # Arguments
+ *
+ * * `provider` — A [`KeyCustodyProvider`](crate::KeyCustodyProvider) callback
+ * implementation injected from Swift or Kotlin.
+ *
+ * # Returns
+ *
+ * An `Identity` handle with `custody_type` set to `"platform"`.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Identity` if DID creation or DHT publish fails.
+ *
+ * See SCP-214 acceptance criteria 2-3.
+ */
+public func identityCreateWithCustody(provider: KeyCustodyProvider)async throws  -> Identity  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_identity_create_with_custody(FfiConverterCallbackInterfaceKeyCustodyProvider_lower(provider)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
@@ -6348,6 +7354,43 @@ public func identityLoad(did: String)async throws  -> Identity  {
         )
 }
 /**
+ * Migrates an identity to a new DID (Layer 2 DID rotation).
+ *
+ * Generates a new keypair, creates a new DID, and links the old DID to
+ * the new one via `alsoKnownAs` in the old DID document.
+ *
+ * # Arguments
+ *
+ * * `identity` — The identity to migrate. Must have retained crypto state
+ * (created via `identity_create` or `identity_create_with_agent_key`,
+ * not via `identity_load`).
+ *
+ * # Returns
+ *
+ * A new `Identity` handle with the migrated DID.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Identity` if the identity has no retained crypto
+ * state, key generation fails, or DHT publish fails.
+ *
+ * See ADR-003 acceptance criterion 4b.
+ */
+public func identityMigrate(identity: Identity)async throws  -> Identity  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_identity_migrate(FfiConverterTypeIdentity_lower(identity)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeIdentity_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
  * Resolves a DID to its document.
  *
  * # Arguments
@@ -6378,6 +7421,42 @@ public func identityResolve(did: String)async throws  -> DidDocument  {
         )
 }
 /**
+ * Verifies a device attestation token.
+ *
+ * Uses [`InMemoryDeviceAttestation`] to check the token format.
+ *
+ * # Arguments
+ *
+ * * `did` — The DID string (unused in verification but kept for API
+ * consistency).
+ * * `token_base64` — The base64-encoded attestation token to verify.
+ *
+ * # Returns
+ *
+ * `true` if the token is valid, `false` otherwise.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Identity` if base64 decoding fails or if verification
+ * encounters an error.
+ *
+ * See §9.3, issue #362, #419.
+ */
+public func identityVerifyDeviceAttestation(did: String, tokenBase64: String)async throws  -> Bool  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_identity_verify_device_attestation(FfiConverterString.lower(did),FfiConverterString.lower(tokenBase64)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
  * Returns `true` if the given DID is registered as locally controlled.
  */
 public func isLocalDid(did: String)async  -> Bool  {
@@ -6394,6 +7473,36 @@ public func isLocalDid(did: String)async  -> Bool  {
             errorHandler: nil
             
         )
+}
+/**
+ * Attaches provenance metadata when data crosses a context boundary.
+ *
+ * Returns a JSON string with the attached provenance record.
+ *
+ * See ADR-019 acceptance criteria 2-3, 6.
+ */
+public func provenanceAttach(sourceContextId: String, sourceType: String, memoryScopeStr: String, members: [String], targetContextId: String, existingChainDepth: UInt8?)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_provenance_attach(
+        FfiConverterString.lower(sourceContextId),
+        FfiConverterString.lower(sourceType),
+        FfiConverterString.lower(memoryScopeStr),
+        FfiConverterSequenceString.lower(members),
+        FfiConverterString.lower(targetContextId),
+        FfiConverterOptionUInt8.lower(existingChainDepth),$0
+    )
+})
+}
+/**
+ * Checks whether the provenance chain depth is within the allowed limit.
+ */
+public func provenanceCheckChainDepth(chainDepth: UInt8, maxDepth: UInt8?) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_func_provenance_check_chain_depth(
+        FfiConverterUInt8.lower(chainDepth),
+        FfiConverterOptionUInt8.lower(maxDepth),$0
+    )
+})
 }
 /**
  * Registers a DID as locally controlled by this node/SDK.
@@ -6450,6 +7559,48 @@ public func scpShutdown(timeoutSecs: UInt64)  {try! rustCall() {
 }
 }
 /**
+ * Classifies an offline duration into the appropriate recovery tier.
+ *
+ * Returns `"short"`, `"extended"`, or `"long"`.
+ */
+public func syncClassifyOffline(lastRelayContact: UInt64, now: UInt64) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_func_sync_classify_offline(
+        FfiConverterUInt64.lower(lastRelayContact),
+        FfiConverterUInt64.lower(now),$0
+    )
+})
+}
+/**
+ * Classifies an offline duration using custom policy thresholds.
+ *
+ * Returns `"short"`, `"extended"`, or `"long"`.
+ */
+public func syncClassifyOfflineCustom(lastRelayContact: UInt64, now: UInt64, tier1ThresholdSecs: UInt64, tier2ThresholdSecs: UInt64) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_func_sync_classify_offline_custom(
+        FfiConverterUInt64.lower(lastRelayContact),
+        FfiConverterUInt64.lower(now),
+        FfiConverterUInt64.lower(tier1ThresholdSecs),
+        FfiConverterUInt64.lower(tier2ThresholdSecs),$0
+    )
+})
+}
+/**
+ * Returns the default sync policy parameters.
+ *
+ * Returns a `SyncPolicyResult` record with all default values from
+ * `SyncPolicy::default()`.
+ *
+ * See ADR-029 in `.docs/adrs/phase-6.md`.
+ */
+public func syncGetPolicy() -> SyncPolicyResult  {
+    return try!  FfiConverterTypeSyncPolicyResult_lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_func_sync_get_policy($0
+    )
+})
+}
+/**
  * Invokes a tool within an SCP context.
  *
  * # Arguments
@@ -6458,6 +7609,13 @@ public func scpShutdown(timeoutSecs: UInt64)  {try! rustCall() {
  * * `tool_id` — The ID of the tool to invoke.
  * * `input_json` — Tool input parameters as a JSON string.
  * * `identity` — The identity of the invoker (used for capability checking).
+ * * `ucan_token` — Optional JWT-encoded UCAN token authorizing the invocation.
+ * Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability. When
+ * present, the full 11-step ADR-016 validation pipeline is executed before
+ * tool dispatch. See spec §6.2, §8, ADR-016, and issue #319.
+ * * `proof_tokens` — Optional list of encoded parent UCAN tokens for
+ * delegation chain traversal (ADR-016 step 3). Only relevant when
+ * `ucan_token` is `Some`.
  *
  * # Returns
  *
@@ -6467,12 +7625,14 @@ public func scpShutdown(timeoutSecs: UInt64)  {try! rustCall() {
  *
  * Returns `ScpError::Tool` if the tool is not found, invocation fails,
  * input fails schema validation, or the invoker lacks capability.
+ * Returns `ScpError::Permission` if the UCAN token is invalid, expired,
+ * revoked, or lacks the required tool invocation capability.
  */
-public func toolInvoke(handle: ContextHandle, toolId: String, inputJson: String, identity: Identity)async throws  -> String  {
+public func toolInvoke(handle: ContextHandle, toolId: String, inputJson: String, identity: Identity, ucanToken: String?, proofTokens: [String]?)async throws  -> String  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_invoke(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(toolId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity)
+                uniffi_scp_ffi_uniffi_fn_func_tool_invoke(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(toolId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterOptionString.lower(ucanToken),FfiConverterOptionSequenceString.lower(proofTokens)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
@@ -6485,7 +7645,8 @@ public func toolInvoke(handle: ContextHandle, toolId: String, inputJson: String,
 /**
  * Invokes a tool across context boundaries.
  *
- * Validates chain depth per spec section 6.2 (max 3 hops).
+ * Validates UCAN authorization against the target context and chain depth
+ * per spec section 6.2 (max 3 hops).
  *
  * # Arguments
  *
@@ -6494,17 +7655,24 @@ public func toolInvoke(handle: ContextHandle, toolId: String, inputJson: String,
  * * `tool_id` — The tool to invoke.
  * * `input_json` — Tool input as a JSON string.
  * * `identity` — The invoker's identity.
+ * * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
+ * Validated against the TARGET context's ceiling using the full 11-step
+ * ADR-016 pipeline.
  * * `chain_depth` — Current chain depth (0 for first hop).
+ * * `proof_tokens` — Optional list of encoded parent UCAN tokens for
+ * delegation chain traversal.
  *
  * # Errors
  *
+ * Returns `ScpError::Permission` if the UCAN token is invalid, expired,
+ * revoked, or lacks the required tool invocation capability.
  * Returns `ScpError::Tool` if chain depth exceeded or contexts not active.
  */
-public func toolInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: ContextHandle, toolId: String, inputJson: String, identity: Identity, chainDepth: UInt8)async throws  -> String  {
+public func toolInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: ContextHandle, toolId: String, inputJson: String, identity: Identity, ucanToken: String, chainDepth: UInt8, proofTokens: [String]?)async throws  -> String  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_invoke_cross_context(FfiConverterTypeContextHandle_lower(sourceHandle),FfiConverterTypeContextHandle_lower(targetHandle),FfiConverterString.lower(toolId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterUInt8.lower(chainDepth)
+                uniffi_scp_ffi_uniffi_fn_func_tool_invoke_cross_context(FfiConverterTypeContextHandle_lower(sourceHandle),FfiConverterTypeContextHandle_lower(targetHandle),FfiConverterString.lower(toolId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(ucanToken),FfiConverterUInt8.lower(chainDepth),FfiConverterOptionSequenceString.lower(proofTokens)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
@@ -6591,18 +7759,30 @@ public func toolSessionCreate(handle: ContextHandle, toolId: String, sourceConte
 /**
  * Invokes a tool within an active session.
  *
- * Each call is individually governed. Session state is carried forward
- * and the call count is incremented on success.
+ * Each call is individually governed: the invoker must present a valid
+ * UCAN token. Session state is carried forward and the call count is
+ * incremented on success.
+ *
+ * # Arguments
+ *
+ * * `handle` — The context containing the tool session.
+ * * `session_id` — The session to invoke within.
+ * * `input_json` — Tool input parameters as a JSON string.
+ * * `identity` — The identity of the invoker.
+ * * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
+ * Validated using the full 11-step ADR-016 pipeline.
+ * * `proof_tokens` — Optional list of encoded parent UCAN tokens for
+ * delegation chain traversal.
  *
  * # Returns
  *
  * The tool output as a JSON string.
  */
-public func toolSessionInvoke(handle: ContextHandle, sessionId: String, inputJson: String, identity: Identity)async throws  -> String  {
+public func toolSessionInvoke(handle: ContextHandle, sessionId: String, inputJson: String, identity: Identity, ucanToken: String, proofTokens: [String]?)async throws  -> String  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_session_invoke(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(sessionId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity)
+                uniffi_scp_ffi_uniffi_fn_func_tool_session_invoke(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(sessionId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(ucanToken),FfiConverterOptionSequenceString.lower(proofTokens)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
@@ -6745,6 +7925,48 @@ public func trustVerifyResponse(challengeJson: String, responseJson: String)thro
 })
 }
 /**
+ * Delegates a UCAN token to another member.
+ *
+ * Creates a delegated UCAN from an existing parent token, signed with the
+ * delegator's Ed25519 key via the retained [`KeyCustody`] provider.
+ * Delegation enforces attenuation (capabilities can only narrow, never widen).
+ *
+ * # Arguments
+ *
+ * * `handle` — The context the token belongs to.
+ * * `delegator_did` — The DID of the entity delegating (must match parent
+ * token's audience).
+ * * `delegatee_did` — The DID of the entity receiving the delegation.
+ * * `parent_token` — The encoded parent UCAN token (JWT format).
+ * * `capabilities` — List of capability URI strings to delegate (must be
+ * subset of parent's capabilities).
+ *
+ * # Returns
+ *
+ * A `UcanToken` handle with the delegated token's metadata.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Permission` if delegation fails: delegator not matching
+ * parent audience, capabilities wider than parent, signing failure, etc.
+ *
+ * See ADR-016 criterion 4.
+ */
+public func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid: String, parentToken: String, capabilities: [String])async throws  -> UcanToken  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_ucan_delegate(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(delegatorDid),FfiConverterString.lower(delegateeDid),FfiConverterString.lower(parentToken),FfiConverterSequenceString.lower(capabilities)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeUcanToken_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
  * Mints a new UCAN token for a context member with real Ed25519 signing.
  *
  * Uses the context creator's key custody and active signing key
@@ -6862,6 +8084,27 @@ public func ucanValidate(handle: ContextHandle, token: String, capability: Strin
             errorHandler: FfiConverterTypeScpError_lift
         )
 }
+/**
+ * Verifies participation profiles against admission requirements.
+ *
+ * Both inputs are JSON strings:
+ * - `profile_json`: JSON array of [`ParticipationProfile`] objects.
+ * - `requirements_json`: JSON array of [`RequireParticipation`] objects.
+ *
+ * Uses the current system time for freshness checks. Returns `true` if all
+ * requirements are satisfied, throws `ScpError` with a diagnostic message
+ * if any requirement fails or if the JSON is malformed.
+ *
+ * See §7.3.2.1.
+ */
+public func verifyParticipationRequirements(profileJson: String, requirementsJson: String)throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_verify_participation_requirements(
+        FfiConverterString.lower(profileJson),
+        FfiConverterString.lower(requirementsJson),$0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -6878,6 +8121,15 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_func_bridge_create_shadow() != 47104) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_bridge_evaluate_trust() != 16710) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_bridge_register() != 22617) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_admission() != 35635) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6890,7 +8142,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_is_subscriber() != 6475) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_publish() != 38105) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_publish() != 54635) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_subscribe() != 51819) {
@@ -6908,10 +8160,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_context_create() != 28748) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_discover() != 49364) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_func_context_drain_events() != 18382) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_export() != 47555) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_func_context_handle_ttl_expiry() != 13868) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_import() != 61429) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_context_is_member() != 64785) {
@@ -6944,7 +8205,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_context_subscribe() != 40434) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_func_discovery_create_query() != 11036) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_discovery_normalize_address() != 56447) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_discovery_parse_address() != 10962) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_func_evaluate_provenance_quality() != 60373) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_event_log_checkpoint() != 26287) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_event_log_query() != 3128) {
@@ -6956,16 +8229,37 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_governance_execute() != 62327) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_create() != 17470) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_identity_attest_device() != 13846) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_identity_create() != 29652) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_identity_create_with_agent_key() != 42821) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_identity_create_with_custody() != 22246) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_identity_load() != 36247) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_func_identity_migrate() != 37096) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_func_identity_resolve() != 4675) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_func_identity_verify_device_attestation() != 17513) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_func_is_local_did() != 887) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_provenance_attach() != 1075) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_provenance_check_chain_depth() != 15774) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_register_local_did() != 587) {
@@ -6974,10 +8268,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_scp_shutdown() != 6072) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_invoke() != 54094) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_sync_classify_offline() != 59370) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_invoke_cross_context() != 8649) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_sync_classify_offline_custom() != 16672) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_sync_get_policy() != 57484) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_tool_invoke() != 50361) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_tool_invoke_cross_context() != 26371) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_tool_register() != 20572) {
@@ -6989,7 +8292,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_tool_session_create() != 34176) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_session_invoke() != 35068) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_tool_session_invoke() != 57907) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_tool_verify() != 15916) {
@@ -7013,6 +8316,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_trust_verify_response() != 47639) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_func_ucan_delegate() != 6417) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_func_ucan_mint() != 26230) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7020,6 +8326,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_ucan_validate() != 61065) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_verify_participation_requirements() != 53046) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_context_id() != 2375) {
@@ -7052,7 +8361,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_rotate_agent_key() != 65044) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_identity_rotate_key() != 49701) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_identity_rotate_key() != 21897) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_is_connected() != 6252) {

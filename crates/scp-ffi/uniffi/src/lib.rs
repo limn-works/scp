@@ -753,41 +753,35 @@ mod tests {
     /// Conformance (shutdown ordering): `HANDLE_COUNT` must reflect live
     /// handles accurately so `scp_shutdown` can block until safe to teardown.
     ///
-    /// Note: This test uses a local baseline rather than asserting an absolute
-    /// zero, because other tests may run concurrently and hold handles.
+    /// Tests one handle at a time to avoid interference from concurrent tests
+    /// that also modify the global counter.
     /// Requires the `allow_in_memory_custody` feature (needs in-memory identity).
     #[test]
     #[cfg(feature = "allow_in_memory_custody")]
     fn handle_count_tracks_live_opaque_objects() {
         let rt = runtime();
 
-        // Record the baseline before we allocate anything in this test.
-        let baseline = HANDLE_COUNT.load(Ordering::SeqCst);
-
-        // Allocate two Identity handles.
-        let id1 = rt
+        // Measure create → drop for a single handle. The delta across a single
+        // create/drop is guaranteed regardless of concurrent test activity.
+        let before_create = HANDLE_COUNT.load(Ordering::SeqCst);
+        let id = rt
             .block_on(identity_create("in_memory".to_owned()))
-            .expect("first identity_create failed");
-        let id2 = rt
-            .block_on(identity_create("in_memory".to_owned()))
-            .expect("second identity_create failed");
+            .expect("identity_create failed");
+        let after_create = HANDLE_COUNT.load(Ordering::SeqCst);
 
-        let after_alloc = HANDLE_COUNT.load(Ordering::SeqCst);
         assert!(
-            after_alloc >= baseline + 2,
-            "HANDLE_COUNT should increase by at least 2 after allocating two identities \
-             (baseline={baseline}, after={after_alloc})"
+            after_create > before_create,
+            "HANDLE_COUNT must increase after identity_create \
+             (before={before_create}, after={after_create})"
         );
 
-        // Drop both handles — each Drop impl decrements the counter.
-        drop(id1);
-        drop(id2);
-
+        drop(id);
         let after_drop = HANDLE_COUNT.load(Ordering::SeqCst);
+
         assert!(
-            after_drop <= after_alloc - 2,
-            "HANDLE_COUNT should decrease by at least 2 after dropping both identities \
-             (after_alloc={after_alloc}, after_drop={after_drop})"
+            after_drop < after_create,
+            "HANDLE_COUNT must decrease after dropping identity handle \
+             (after_create={after_create}, after_drop={after_drop})"
         );
     }
 

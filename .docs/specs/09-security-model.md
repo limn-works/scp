@@ -31,7 +31,7 @@
 
 **Agent slot rental.** Someone with a trusted identity operating agents on another's instructions. Mitigation: one agent per context limits the value; earned capacity means new identities can't immediately scale; fleet coherence signals may detect behavior inconsistent with a single human's intent. Partially mitigated, not fully solved.
 
-**Malicious bridge operator.** A bridge operator (§12) who fabricates shadow messages, drops messages, injects false attestations, or correlates activity across contexts. Mitigation: bridges are not MLS group members — they cannot read native-to-native messages (§12.6.1); bridge provenance (§12.5) makes bridge-originated content distinguishable; bridge registration is per-context (§12.6) limiting correlation; context governance can revoke a bridge at any time (§12.2); attestation freshness checks (§7.4.4) limit false attestation lifetime. See §12.6.2 for the complete bridge threat model.
+**Malicious bridge operator.** A bridge operator (§12) who fabricates shadow messages, drops messages, injects false attestations, or correlates activity across contexts. Note: bridge connectors (translation infrastructure) are not MLS group members, but the bridge operator's DID IS an MLS group member admitted through context governance (§12.6.1) — the operator can read all MLS-encrypted messages. This is an inherent property of bidirectional bridging, which is why bridge admission is a governance decision visible in context metadata (§5.7). Mitigation: bridge provenance (§12.5) makes bridge-originated content distinguishable; bridge registration is per-context (§12.6) limiting correlation; context governance can revoke a bridge at any time (§12.2); attestation freshness checks (§7.4.4) limit false attestation lifetime. See §12.6.2 for the complete bridge threat model.
 
 ### 9.2.1 Tool Interface Abuse Vectors and Mitigations
 
@@ -804,25 +804,28 @@ Pad plaintext to the next bucket boundary before encryption to prevent message s
 
 Messages larger than 256KB are chunked. Padding happens below the application layer and above the transport layer — the SDK handles it transparently. Application developers never see it. Relay operators see uniform bucket-sized blobs.
 
-**Chunking protocol.** When a padded message exceeds the relay's `max_blob_size` (or 256KB if the relay does not advertise a limit), the SDK splits it into chunks before encryption:
+**Chunking protocol.** When a message payload exceeds the largest bucket size (256KB minus the 4-byte length suffix used by bucket padding), the SDK splits it into chunks before encryption:
 
 ```
 ChunkEnvelope {
-  chunk_id:      [u8; 16]   // random, unique per logical message
-  sequence:      u32         // 0-indexed chunk position
+  message_id:    [u8; 32]   // SHA-256("SCP-CHUNK-MSG-ID-V1:" || len(payload) || payload || len(sender_did) || sender_did || timestamp_be), unique per logical message
+  chunk_index:   u32         // 0-indexed chunk position
   total_chunks:  u32         // total number of chunks in this message
-  payload:       Vec<u8>     // chunk payload (plaintext fragment)
+  payload_hash:  [u8; 32]   // SHA-256 of the complete pre-chunked payload
+  data:          Vec<u8>     // chunk payload (plaintext fragment)
 }
 ```
 
-1. **Splitting.** The SDK generates a random 16-byte `chunk_id` per logical message. The padded plaintext is split into fragments whose size does not exceed the relay's `max_blob_size`. Each fragment is wrapped in a `ChunkEnvelope` with its `sequence` index and the `total_chunks` count.
+_Rationale: `message_id` uses deterministic SHA-256 derivation (32 bytes) rather than random 16-byte generation. Deterministic derivation requires no coordination, enables idempotent retransmission detection, and 32 bytes provides full collision resistance. The `payload_hash` field enables the receiver to verify integrity of the reassembled payload without relying on application-layer checks. Field names (`message_id`, `chunk_index`, `data`) were chosen for clarity over the original (`chunk_id`, `sequence`, `payload`)._
+
+1. **Splitting.** The SDK derives `message_id = SHA-256("SCP-CHUNK-MSG-ID-V1:" || BE32(len(payload)) || payload || BE32(len(sender_did_bytes)) || sender_did_bytes || timestamp_be_bytes)` and `payload_hash = SHA-256(payload)`. The domain separator `"SCP-CHUNK-MSG-ID-V1:"` prevents cross-protocol hash collisions, and the BE32 length prefixes on variable-length fields (`payload`, `sender_did_bytes`) prevent ambiguous concatenation. The plaintext payload is split into fragments of at most `MAX_CHUNK_PAYLOAD_SIZE` bytes (largest bucket size minus 4-byte length suffix = 262,140 bytes). Each fragment is wrapped in a `ChunkEnvelope` with its `chunk_index` and the `total_chunks` count.
 2. **Individual encryption.** Each `ChunkEnvelope` is independently encrypted as a separate MLS application message (in encrypted contexts) or a separate sender-key-encrypted message (in broadcast contexts). This means each chunk is individually authenticated (inner signature + MLS membership_tag or sender key AEAD) and individually padded to the nearest bucket boundary (§9.10.3). Individual encryption ensures that a relay cannot correlate chunks by ciphertext similarity — each chunk is an opaque, independently-sized blob.
 3. **Transmission.** Chunks are published as separate relay blobs. The relay treats each chunk as an independent message. Chunks MAY be published to different relays in the context's relay set for redundancy.
-4. **Reassembly.** The recipient decrypts each chunk individually, then reassembles by `chunk_id` + `sequence` ordering. The recipient maintains a per-`chunk_id` reassembly buffer.
-5. **Reassembly timeout.** The recipient MUST discard incomplete chunk sets (not all `total_chunks` received) after 60 seconds from receipt of the first chunk in the set. This prevents resource exhaustion from partial chunk deliveries.
-6. **Maximum chunks per message.** A single logical message MUST NOT exceed 256 chunks. Messages requiring more than 256 chunks MUST use out-of-band blob storage with an in-band reference (§10.6). This bounds the reassembly buffer to 256 entries per in-flight message.
-7. **Maximum chunk payload size.** Each chunk's `payload` size MUST NOT exceed the relay's advertised `max_blob_size` (from `.well-known/scp` relay_config, §10.5.1). If the relay does not advertise a limit, the default maximum chunk payload size is 256KB.
-8. **Chunk authentication.** Because each chunk is a separate MLS/sender-key message, chunk forgery and chunk replay are prevented by the same mechanisms as regular messages (§9.8.1, §9.8.2). A chunk with a mismatched `total_chunks` (e.g., an attacker injects a chunk claiming `total_chunks: 1` with a valid `chunk_id`) is detected because the reassembled plaintext will fail application-layer integrity checks (the original message includes a content hash in the envelope metadata).
+4. **Reassembly.** The recipient decrypts each chunk individually, then reassembles by `message_id` + `chunk_index` ordering. The recipient maintains a per-`message_id` reassembly buffer. After concatenation, the receiver verifies `SHA-256(reassembled_payload) == payload_hash`; mismatches indicate corruption or tampering and MUST cause the message to be discarded.
+5. **Reassembly timeout.** The SDK MUST discard incomplete chunk sets (not all `total_chunks` received) after 60 seconds from receipt of the first chunk in the set. This prevents resource exhaustion from partial chunk deliveries. The timeout is enforced by the SDK session layer that manages reassembly buffers, not by the `ChunkEnvelope` type itself.
+6. **Maximum chunks per message.** `MAX_TOTAL_CHUNKS = 262,144`. A single logical message MUST NOT exceed 262,144 chunks, bounding total reassembled message size to approximately 64 GB (`MAX_CHUNK_PAYLOAD_SIZE` * 262,144). _Rationale: the original limit of 256 chunks (64 MB max) was overly restrictive for large file transfers and media streaming. The 262,144 limit allows payloads up to ~64 GB while still bounding reassembly buffer metadata (each buffer entry is a small index + data pointer). For relay-constrained scenarios, relay-advertised `max_blob_size` independently limits per-chunk size._
+7. **Maximum chunk payload size.** Each chunk's `data` MUST NOT exceed `MAX_CHUNK_PAYLOAD_SIZE` (262,140 bytes = 256KB minus 4-byte length suffix). This ensures each chunk, after padding, fits in the largest bucket (256KB). If the relay advertises a smaller `max_blob_size` (from `.well-known/scp` relay_config, §10.5.1), the SDK MUST use the smaller limit.
+8. **Chunk authentication.** Because each chunk is a separate MLS/sender-key message, chunk forgery and chunk replay are prevented by the same mechanisms as regular messages (§9.8.1, §9.8.2). Additionally, the `payload_hash` field provides end-to-end integrity verification of the reassembled payload — a tampered or injected chunk will cause the hash check to fail at reassembly time.
 
 ### 9.10.4 Per-Context Pseudonyms
 
@@ -1150,18 +1153,18 @@ This suite matches the MLS ciphersuite (§9.5) and the DID-to-DID HPKE suite, mi
 **`info` parameter (domain separation):**
 
 ```
-info = "scp-sender-key-v1" || context_id || sender_did || epoch_bytes
+info = "scp-sender-key-v1" || BE32(len(context_id)) || context_id || BE32(len(sender_did)) || sender_did || epoch_bytes
 ```
 
-Where `context_id` and `sender_did` are UTF-8 bytes (no length prefix — the `info` string is not parsed, only compared) and `epoch_bytes` is the 8-byte big-endian encoding of the sender key epoch. The `info` string binds the HPKE encryption to a specific context, sender, and epoch. Using a different `info` on open produces a different derived key, causing AEAD decryption to fail.
+Where `context_id` and `sender_did` are UTF-8 bytes with 4-byte big-endian length prefixes (preventing boundary-shift collisions between variable-length fields) and `epoch_bytes` is the 8-byte big-endian encoding of the sender key epoch. The `info` string binds the HPKE encryption to a specific context, sender, and epoch. Using a different `info` on open produces a different derived key, causing AEAD decryption to fail.
 
 **`aad` parameter (additional authenticated data):**
 
 ```
-aad = context_id || sender_did || epoch_bytes
+aad = BE32(len(context_id)) || context_id || BE32(len(sender_did)) || sender_did || epoch_bytes
 ```
 
-Where fields use the same encoding as `info` (without the domain separator prefix). The AAD binds the ciphertext to the context and sender, preventing cross-context and cross-sender key substitution attacks. Tampering with any field in the wire format causes AEAD verification to fail.
+Where fields use the same length-prefixed encoding as `info` (without the domain separator prefix). The AAD binds the ciphertext to the context and sender, preventing cross-context and cross-sender key substitution attacks. Tampering with any field in the wire format causes AEAD verification to fail.
 
 **Nonce:** The AEAD nonce is managed internally by the HPKE context (RFC 9180 §5.2 `ComputeNonce`). Implementations MUST NOT generate or supply an external nonce — HPKE derives it from the key schedule. Since each `SenderKeyResponse` creates a fresh HPKE context (fresh ephemeral keypair), the internal sequence counter starts at 0 and only one `Seal`/`Open` call is made per context.
 
@@ -1391,3 +1394,193 @@ The content access key layer interacts with forward secrecy as follows:
 | Storage overhead | 40 bytes per recipient per message | Wrapped CEK = 32-byte CEK + 8-byte KW check value |
 
 For a context with 100 members, each message adds ~4KB of wrapped CEKs (100 × 40 bytes). For broadcast contexts with thousands of subscribers, the wrapped CEK map scales linearly but remains small relative to content size. Contexts with >10,000 members SHOULD use batched CEK wrapping (wrap once per batch of messages, not per message) to amortize the per-recipient cost.
+
+## 9.18 Protocol Constants Registry
+
+This section consolidates all protocol-level constants that independent implementations must agree on. Using different values for any of these constants will cause interoperability failures. Constants are grouped by subsystem with source references for traceability.
+
+### 9.18.1 Cryptographic Primitives
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Signature algorithm | Ed25519 (RFC 8032) | All DID keys, envelope signatures, UCAN, MLS leaf credentials | §9.5 |
+| MLS ciphersuite | MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 | RFC 9420 §17.1 | §9.5 |
+| HPKE suite (DID-to-DID) | DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM | RFC 9180 Base mode | §9.5 |
+| Key distribution HPKE | DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM | Same suite for sender key, access key, broadcast key | §9.5 |
+| Merkle tree hash | SHA-256 | RFC 6962 §2 construction | §9.5 |
+| Merkle leaf prefix | `0x00` | `SHA-256(0x00 \|\| event_data)` | §9.5 |
+| Merkle interior prefix | `0x01` | `SHA-256(0x01 \|\| left \|\| right)` | §9.5 |
+| Empty tree root | `SHA-256("")` = `e3b0c442...7852b855` | Hash of empty string | §9.5 |
+| CEK size | 32 bytes | AES-256 key for content encryption | §9.17 |
+| CEK wrapped overhead | 8 bytes | AES-256-KW check value | §9.17.7 |
+| HPKE nonce size | 12 bytes | Managed internally by RFC 9180 | §9.5 |
+| Ed25519 signature size | 64 bytes | Fixed | §9.5 |
+| Ed25519 public key size | 32 bytes | Fixed | §9.5 |
+| X25519 public key size | 32 bytes | Fixed | §9.5 |
+
+### 9.18.2 Domain Separators
+
+All domain separators are UTF-8 strings used as prefixes in canonical hash constructions (§9.5.1). Each separator identifies the struct type being hashed to prevent cross-protocol hash confusion.
+
+| Domain Separator | Used For | Spec Reference |
+|------------------|----------|----------------|
+| `"SCP-INNER-ENVELOPE-V1:"` | InnerEnvelope signing | §9.5.2 |
+| `"SCP-BROADCAST-ENVELOPE-V1:"` | BroadcastEnvelope signing | §9.5.2 |
+| `"SCP-EPOCH-ADVANCE-V1:"` | SenderKeyEpochAdvance signing | §9.5.2 |
+| `"SCP-KEY-REQUEST-V1:"` | SenderKeyRequest signing | §9.5.2 |
+| `"SCP-ATTESTATION-V1:"` | Attestation signing | §9.5.2 |
+| `"SCP-PARTICIPATION-V1:"` | ParticipationProfile signing | §9.5.2 |
+| `"SCP-PARTICIPATION-PROFILE-V1:"` | ParticipationProfile canonical hash | §9.5.2 |
+| `"SCP-BLOCK-NOTIFICATION-V1:"` | BlockNotification signing | §9.5.2 |
+| `"SCP-ACCESS-KEY-REQUEST-V1:"` | AccessKeyRequest signing | §9.5.2 |
+| `"SCP-VOTE-V1:"` | Governance vote signing | §6.4 |
+| `"SCP-PROPOSAL-V1:"` | Governance proposal ID computation | §6.4 |
+| `"SCP-MIGRATION-V1:"` | DID migration proof | §9.12 |
+| `"SCP-RESET-REQUEST-V1:"` | Sync reset request signing | §23.5.2 |
+| `"SCP-KEY-CONTINUITY-V1:"` | Key continuity fingerprint hash | §9.11 |
+| `"SCP-ABSENT-AGENT-KEY"` | Sentinel for absent `#agent` key in continuity fingerprint — `SHA-256("SCP-ABSENT-AGENT-KEY")` | §9.11 |
+| `"SCP-CHECKPOINT-V1:"` | Event log checkpoint hash | §11 |
+| `"SCP-EVENT-V1:"` | Event log entry hash | §11 |
+| `"SCP-EXPORT-ENTRY-V1:"` | Context export chain hash | §5.13 |
+| `"SCP-TOOL-REGISTRATION-V1:"` | Tool registration integrity hash | §6.2 |
+| `"SCP-KEY-DESTRUCTION-V1:"` | Key destruction proof | §9.15 |
+| `"SCP-CLAIM-V1:"` | Shadow identity claim validation | §12.3 |
+| `"SCP-RECEIPT-V1:"` | Payment receipt signing | §19.15.5 |
+| `"SCP-HANDLE-TOOL-V1:"` | Handle tool request signing | §22.3.1 |
+| `"SCP-CHUNK-V1:"` | Chunk envelope message ID derivation | §9.5.3 |
+| `"SCP-ATTESTATION-ID-V1:"` | Identity attestation ID computation | §3.5 |
+| `"SCP-IDENTITY-LINK-ATTESTATION-V1:"` | Identity link attestation canonical hash for signing | §3.5 |
+| `"SCP-PSEUDONYM-V1:"` | Context-scoped pseudonym derivation | §9.10.4 |
+| `"SCP-OFFER-ID-V1:"` | Tool interface offer ID computation | §6.2 |
+| `"SCP-PRIVATE-LOG-V1:"` | Private state event hash chain | §3.4 |
+| `"SCP-CHALLENGE-REQ-V1:"` | Challenge request canonical bytes for signing | §10.5 |
+| `"SCP-CHALLENGE-RESP-V1:"` | Challenge response canonical bytes for signing | §10.5 |
+| `"SCP-CHALLENGE-VERIFY-V1:"` | Challenge verification canonical bytes for signing | §10.5 |
+
+### 9.18.3 HPKE Info Strings
+
+HPKE `info` strings provide domain separation for key encapsulation operations. Each key distribution protocol uses a distinct prefix to prevent cross-protocol key confusion.
+
+| Info Prefix | Used For | Full Format | Spec Reference |
+|-------------|----------|-------------|----------------|
+| `"scp-sender-key-v1"` | Sender key HPKE encapsulation | `"scp-sender-key-v1" \|\| BE32(len(context_id)) \|\| context_id \|\| BE32(len(sender_did)) \|\| sender_did \|\| epoch_BE` | §9.16.2 |
+| `"scp-access-key-v1"` | Access key HPKE encapsulation | `"scp-access-key-v1" \|\| BE32(len(context_id)) \|\| context_id \|\| BE32(len(member_did)) \|\| member_did \|\| epoch_bytes` | §9.17.1 |
+
+### 9.18.4 Key and Nonce Sizes
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Access key nonce size | 16 bytes | CSPRNG, prevents replay in access key requests | §9.17 |
+| Sender key request nonce size | 16 bytes | CSPRNG, prevents replay in key requests | §9.16.2 |
+| Member ID size | 8 bytes | Truncated SHA-256 of member DID | §9.17 |
+| AES-GCM nonce size | 12 bytes | For sender key and access key AEAD | §9.16, §9.17 |
+| Sender key size | 32 bytes | AES-256-GCM key | §9.16 |
+| Access key size | 32 bytes | AES-256 wrapping key | §9.17 |
+
+### 9.18.5 Envelope and Padding
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Padding bucket sizes | `[256, 1024, 4096, 16384, 65536, 262144]` | Payloads padded to next bucket boundary | §9.10 |
+| Max chunk payload size | 262140 bytes | Largest bucket (262144) minus 4-byte length suffix | §9.10 |
+| Length suffix size | 4 bytes | BE u32, appended before padding | §9.10 |
+
+### 9.18.6 Context and Governance
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Max nesting depth | 3 | Maximum parent-child context nesting levels | §5.13.8 |
+| Max tool interfaces per context | 256 | Hard cap on registered tool interfaces | §6.2 |
+| Ceiling change notification period | 86,400s (24h) | Members notified before ceiling change takes effect | §5.6 |
+| Freeze timeout | 172,800s (48h) | Frozen context auto-unfreezes after this period | §5.6 |
+| Default context verification window | 300s (5 min) | Grace period for context close verification | §5.6 |
+| Default session cap per caller | 5 | Max concurrent tool sessions per source context | §6.2 |
+| Tool lifecycle default timeout | 30,000ms (30s) | Default tool invocation timeout | §6.2 |
+| Tool lifecycle max timeout | 300,000ms (5 min) | Hard protocol maximum for tool invocation timeout | §6.2 |
+| Min active voters for fallback | 2 | Minimum voters for governance timeout fallback | §6.4 |
+
+### 9.18.7 MLS and UCAN
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Max grace epochs | 100 | Maximum MLS epochs retained for grace-period decryption | §9.7 |
+| Grace window duration | 30s | Time window for accepting messages from prior epochs | §9.7 |
+| UCAN max expiry | 86,400s (24h) | Maximum UCAN token lifetime; matches nonce dedup cache | §9.8.2 |
+| UCAN nonce freshness tolerance | 300,000ms (5 min) | Clock skew tolerance for UCAN nonce timestamps | §9.8.2 |
+| UCAN nonce prune expiry grace | 300s (5 min) | Grace period before expired nonces are garbage collected | §9.8.2 |
+| Default UCAN revocation TTL | 30s | Default TTL for revocation propagation confirmation | §9.8.2 |
+| CID version | CIDv1 (prefix `0x01`) | For UCAN token identification | §9.5 |
+| CID hash algorithm | SHA-256 (multihash `0x12`) | 32-byte digest | §9.5 |
+| CID content codec | DAG-CBOR (`0x71`) | Canonical CBOR encoding | §9.5 |
+| CID multibase encoding | base32lower (prefix `b`) | For display; raw bytes on wire | §9.5 |
+
+### 9.18.8 Sender Key Protocol
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Sender key grace period | 30s | Window for accepting messages with pre-rotation keys | §9.16 |
+| Sender key timeout | 60s | Timeout for sender key request/response exchange | §9.16.2 |
+
+### 9.18.9 Sync and Offline Recovery
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Tier 1 threshold (minutes offline) | 14,400s (4h) | Below: sequential commit replay | §23 |
+| Tier 2 threshold (days offline) | 604,800s (7d) | Below: snapshot + delta; above: full reset | §23 |
+| Max sequential commits | 100 epochs | Maximum epochs replayed sequentially in Tier 1 | §23 |
+| Commit process timeout | 5s | Timeout for individual commit processing | §23 |
+| Reconnection dedup window | 30s | Deduplication window for reconnection messages | §23 |
+| Gap timeout | 30s | Timeout waiting for missing epochs before escalating | §23 |
+| Default snapshot interval | 14,400s (4h) | How often Tier 2 snapshots are generated | §23 |
+| Reset welcome timeout | 60s | Timeout for receiving MLS Welcome after reset request | §23.5 |
+| Max epoch drift (Tier 3) | 1,000 epochs | Maximum epoch gap before requiring full reset | §23.5 |
+| Reset request nonce cache | 10,000 entries | Anti-replay cache for reset request nonces | §23.5 |
+| Max inflight reset queue | 500 | Maximum concurrent pending reset requests | §23.5 |
+
+### 9.18.10 Event Log
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Checkpoint event interval | 50 events | Events between automatic checkpoints | §11 |
+| Checkpoint time interval | 600s (10 min) | Time between automatic checkpoints | §11 |
+| Hot tier age threshold | 604,800s (7d) | Events older than this move to cold tier | §11 |
+| Max hot events | 10,000 | Maximum events retained in hot tier | §11 |
+| Max hot bytes | 52,428,800 (50 MiB) | Maximum bytes retained in hot tier | §11 |
+| Min retention (prune) | 2,592,000s (30d) | Minimum event retention before pruning is allowed | §11 |
+
+### 9.18.11 Transport and Relay
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Default blob TTL | 3,600s (1h) | Default time-to-live for stored blobs | §10.5 |
+| Min blob TTL | 1s | Minimum allowable blob TTL | §10.5 |
+| Max blob TTL | 604,800s (7d) | Maximum allowable blob TTL | §10.5 |
+| Max ref ID length | 64 bytes | Maximum length of message reference IDs | §10.5 |
+| Default query limit | 100 messages | Default message batch size for queries | §10.5 |
+| Max query limit | 1,000 messages | Maximum message batch size for queries | §10.5 |
+| Ping interval | 30s | Client-to-relay keepalive interval | §10.5 |
+| Max reconnect attempts | 6 | Maximum consecutive reconnection attempts | §10.5 |
+| Reconnect overlap | 5s | Overlap window during relay reconnection for gap-filling | §10.5 |
+| Relay timestamp deviation threshold | 60s | Maximum acceptable clock skew between client and relay | §10.5 |
+
+### 9.18.12 Bridge
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Max shadows per bridge | 10,000 | Maximum shadow identities per bridge connector | §12.3 |
+
+### 9.18.13 Discovery and Addressing
+
+| Constant | Value | Notes | Spec Reference |
+|----------|-------|-------|----------------|
+| Handle max length | 64 characters | Maximum `local-part` length for handles | §22.2 |
+| Handle charset | `[a-z0-9._-]` | Allowed characters in handle local-part | §22.2 |
+| Domain handle cache TTL | 3,600s (1h) | Resolution cache lifetime for domain handles | §22.8.4 |
+| Discovery handle cache TTL | 900s (15 min) | Resolution cache lifetime for discovery context handles | §22.8.4 |
+| Petname cache TTL | 31,536,000s (1 year) | Resolution cache lifetime for petnames | §22.8.4 |
+| Attestation handle cache TTL | 86,400s (24h) | Resolution cache lifetime for attestation handles | §22.8.4 |
+| Discovery cache default capacity | 10,000 entries | Default capacity for the resolution cache | §22.8.4 |
+| Max discovery context writers | 500 | Maximum writer members in a discovery context | §22.3 |
+| Push platform tag: APNS | `0x01` | Platform tag byte for Apple Push Notification Service | §10.7.1 |
+| Push platform tag: FCM | `0x02` | Platform tag byte for Firebase Cloud Messaging | §10.7.1 |
+| Push platform tag: WebPush | `0x03` | Platform tag byte for Web Push API | §10.7.1 |

@@ -37,7 +37,8 @@ pub const GENESIS_PREV_HASH: [u8; 32] = [0u8; 32];
 /// 3. Verifies the event signature against `event.actor_did`.
 /// 4. Serializes the event and computes `leaf_hash = SHA-256(0x00 || serialize(event))`
 ///    (RFC 6962 Section 2.1 leaf domain separation).
-/// 5. Appends the leaf hash and recomputes affected interior nodes.
+/// 5. Appends the leaf hash and incrementally updates affected interior
+///    nodes — O(log n) per append.
 /// 6. Inserts into the sorted leaf index.
 /// 7. Returns the leaf index (position in the log).
 ///
@@ -84,10 +85,10 @@ pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
     hasher.update(&serialized);
     let leaf_hash: [u8; 32] = hasher.finalize().into();
 
-    // 5. Append leaf and recompute tree.
+    // 5. Append leaf and incrementally update tree — O(log n).
     let leaf_index = log.leaves.len() as u64;
     log.leaves.push(leaf_hash);
-    recompute_tree(log);
+    incremental_update(log);
 
     // 6. Insert into sorted index.
     log.sorted_leaves.insert((leaf_hash, leaf_index));
@@ -193,10 +194,10 @@ pub fn append_unsigned_event(log: &mut EventLog, event: &Event) -> Result<u64, E
     hasher.update(&serialized);
     let leaf_hash: [u8; 32] = hasher.finalize().into();
 
-    // 4. Append leaf and recompute tree.
+    // 4. Append leaf and incrementally update tree — O(log n).
     let leaf_index = log.leaves.len() as u64;
     log.leaves.push(leaf_hash);
-    recompute_tree(log);
+    incremental_update(log);
 
     // 5. Insert into sorted index.
     log.sorted_leaves.insert((leaf_hash, leaf_index));
@@ -441,11 +442,101 @@ fn extract_public_key_from_did(did: &str) -> Result<[u8; 32], String> {
     Err(format!("unsupported DID format: {did}"))
 }
 
+/// Incrementally updates the interior tree after a single leaf append.
+///
+/// Only recomputes the nodes along the path from the new leaf to the root
+/// — O(log n) per append instead of rebuilding the entire tree O(n).
+///
+/// RFC 6962 structure: odd nodes are promoted (not duplicated).
+///
+/// Algorithm ported from `WasmEventLog::incremental_update` in
+/// `crates/scp-ffi/wasm/src/runtime.rs` (M1 performance fix).
+fn incremental_update(log: &mut EventLog) {
+    let n = log.leaves.len();
+
+    if n <= 1 {
+        log.tree.clear();
+        return;
+    }
+
+    // For the very first pair (n == 2), bootstrap the tree.
+    if n == 2 {
+        log.tree.clear();
+        log.tree
+            .push(vec![hash_pair(&log.leaves[0], &log.leaves[1])]);
+        return;
+    }
+
+    // Index of the new leaf in the leaf layer.
+    let mut idx = n - 1;
+
+    // Layer 0: pairs from the leaf layer.
+    let layer_0_parent_count = n.div_ceil(2);
+
+    // Ensure tree layer 0 exists and has enough capacity.
+    if log.tree.is_empty() {
+        log.tree.push(Vec::new());
+    }
+    let layer_0 = &mut log.tree[0];
+    layer_0.resize(layer_0_parent_count, [0u8; 32]);
+
+    // Recompute the affected parent at idx/2.
+    let parent_idx = idx / 2;
+    let left_child = parent_idx * 2;
+    if left_child + 1 < n {
+        layer_0[parent_idx] = hash_pair(&log.leaves[left_child], &log.leaves[left_child + 1]);
+    } else {
+        // Odd node: promoted per RFC 6962.
+        layer_0[parent_idx] = log.leaves[left_child];
+    }
+
+    idx = parent_idx;
+
+    // Walk up the remaining layers, recomputing only the affected node.
+    let mut level = 0;
+    loop {
+        let current_layer_len = log.tree[level].len();
+        if current_layer_len <= 1 {
+            // This layer is the root; trim any layers above it.
+            log.tree.truncate(level + 1);
+            break;
+        }
+
+        let next_layer_len = current_layer_len.div_ceil(2);
+        let next_level = level + 1;
+
+        // Ensure the next layer exists and has the right size.
+        if next_level >= log.tree.len() {
+            log.tree.push(vec![[0u8; 32]; next_layer_len]);
+        } else {
+            log.tree[next_level].resize(next_layer_len, [0u8; 32]);
+        }
+
+        let parent_idx = idx / 2;
+        let left_child = parent_idx * 2;
+
+        // Compute the parent from its two children in tree[level].
+        if left_child + 1 < current_layer_len {
+            let hash = hash_pair(
+                &log.tree[level][left_child],
+                &log.tree[level][left_child + 1],
+            );
+            log.tree[next_level][parent_idx] = hash;
+        } else {
+            // Odd node: promoted.
+            log.tree[next_level][parent_idx] = log.tree[level][left_child];
+        }
+
+        idx = parent_idx;
+        level = next_level;
+    }
+}
+
 /// Recomputes the entire interior tree from the leaf layer.
 ///
-/// This is called after every append. For a production implementation,
-/// incremental recomputation would be preferred, but for Phase 2's in-memory
-/// storage this full recomputation is acceptable and simpler to reason about.
+/// Used by `recompute_raw` for bulk reconstruction (e.g.,
+/// `TruncatedEventLog::push_leaf_raw`). Single-leaf appends use
+/// [`incremental_update`] instead for O(log n) performance.
 ///
 /// RFC 6962 structure: if a layer has an odd number of nodes, the last node
 /// is promoted directly to the next level (not hashed with itself).

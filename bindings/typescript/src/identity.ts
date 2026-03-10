@@ -8,10 +8,10 @@
  * See ADR-022 in `.docs/adrs/phase-4.md` and `.docs/scaffold/typescript.md`.
  */
 
-import { mapBridgeError } from "./errors.js";
-import type { BridgeIdentityHandle } from "./internal/bridge.js";
-import { getBridge } from "./internal/bridge.js";
-import type { DIDDocument } from "./types.js";
+import { mapBridgeError } from "./errors";
+import type { BridgeIdentityHandle } from "./internal/bridge";
+import { getBridge } from "./internal/bridge";
+import type { DIDDocument } from "./types";
 
 // ---------------------------------------------------------------------------
 // CustodyType
@@ -131,6 +131,126 @@ export class Identity {
       const bridge = await getBridge();
       const handle = await bridge.identityRotateKey(this._handle);
       return new Identity(handle.did, handle.custodyType, handle);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Creates a new identity with an agent signing key (ADR-039).
+   *
+   * Creates a DID identity with both the standard signing key and an
+   * `#agent` verification method in the DID document.
+   *
+   * @param options - Creation options.
+   * @param options.custody - The custody method. Defaults to `"platform"`.
+   * @returns A new `Identity` with an agent key.
+   * @throws {IdentityError} If creation fails.
+   */
+  static async createWithAgentKey(options: { custody?: CustodyType } = {}): Promise<Identity> {
+    const custody = options.custody ?? "platform";
+    try {
+      const bridge = await getBridge();
+      const handle = await bridge.identityCreateWithAgentKey(custody);
+      return new Identity(handle.did, handle.custodyType, handle);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Adds an agent signing key to this identity (ADR-039).
+   *
+   * @returns A new `Identity` with the agent key added.
+   * @throws {IdentityError} If this identity already has an agent key.
+   */
+  async addAgentKey(): Promise<Identity> {
+    try {
+      const bridge = await getBridge();
+      const handle = await bridge.identityAddAgentKey(this._handle);
+      return new Identity(handle.did, handle.custodyType, handle);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Rotates the agent signing key for this identity (ADR-039).
+   *
+   * @returns A new `Identity` with the rotated agent key.
+   * @throws {IdentityError} If this identity has no agent key.
+   */
+  async rotateAgentKey(): Promise<Identity> {
+    try {
+      const bridge = await getBridge();
+      const handle = await bridge.identityRotateAgentKey(this._handle);
+      return new Identity(handle.did, handle.custodyType, handle);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Removes the agent signing key from this identity (ADR-039).
+   *
+   * @returns A new `Identity` with the agent key removed.
+   * @throws {IdentityError} If this identity has no agent key.
+   */
+  async removeAgentKey(): Promise<Identity> {
+    try {
+      const bridge = await getBridge();
+      const handle = await bridge.identityRemoveAgentKey(this._handle);
+      return new Identity(handle.did, handle.custodyType, handle);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Migrates this identity to a new DID (Layer 2 rotation).
+   *
+   * Creates a new DID using the pre-rotation key. The old DID document
+   * is updated with an `alsoKnownAs` pointing to the new DID.
+   *
+   * @returns A new `Identity` with the new DID.
+   * @throws {IdentityError} If migration fails.
+   */
+  async migrate(): Promise<Identity> {
+    try {
+      const bridge = await getBridge();
+      const handle = await bridge.identityMigrate(this._handle);
+      return new Identity(handle.did, handle.custodyType, handle);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Generates a device attestation token for this identity.
+   *
+   * @returns The attestation token as a base64-encoded string.
+   * @throws {IdentityError} If attestation generation fails.
+   */
+  async attestDevice(): Promise<string> {
+    try {
+      const bridge = await getBridge();
+      return await bridge.identityAttestDevice(this.did);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Verifies a device attestation token.
+   *
+   * @param tokenBase64 - The base64-encoded attestation token.
+   * @returns `true` if valid, `false` otherwise.
+   * @throws {IdentityError} If verification fails.
+   */
+  async verifyDeviceAttestation(tokenBase64: string): Promise<boolean> {
+    try {
+      const bridge = await getBridge();
+      return await bridge.identityVerifyDeviceAttestation(this.did, tokenBase64);
     } catch (error) {
       throw mapBridgeError(error);
     }

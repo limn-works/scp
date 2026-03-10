@@ -16,7 +16,7 @@ import type {
   ToolDefinition,
   TransportStatus,
   UcanToken,
-} from "../src/types.js";
+} from "../src/types";
 
 describe("type definitions", () => {
   it("ContextParams has required ceiling field", () => {

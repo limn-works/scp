@@ -1,7 +1,8 @@
 """Shared types for the SCP Python SDK.
 
 Contains dataclasses and enums used across multiple SDK modules:
-``Message``, ``Provenance``, ``Capability``, ``ContextMode``,
+``Message``, ``Provenance``, ``Capability``, ``CustodyType``,
+``BridgeMode``, ``ShadowStatus``, ``ContextMode``,
 ``CeilingPolicy``, ``PromotionPolicy``, ``MemoryScope``,
 ``SourceType``, ``DiscoveryMethod``, and ``ProvenanceQuality``.
 
@@ -19,6 +20,55 @@ from dataclasses import dataclass, field
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
+
+
+class CustodyType(enum.Enum):
+    """Key custody method for identity key management (spec section 3.2).
+
+    Determines where cryptographic keys are stored and managed.
+    Mirrors ``scp_core::identity::CustodyType``.
+    """
+
+    #: Platform-native secure storage (Keychain on macOS/iOS, Keystore
+    #: on Android, credential manager on Windows/Linux).  Default.
+    PLATFORM = "platform"
+    #: Ephemeral in-memory key store, suitable for testing or short-lived
+    #: agents.  Keys are lost on process exit.
+    IN_MEMORY = "in_memory"
+    #: Software-backed file-based key store with passphrase protection.
+    SOFTWARE = "software"
+
+
+class BridgeMode(enum.Enum):
+    """Bridge operating mode (spec section 12.2).
+
+    Determines how a bridge connector relays messages between an
+    external platform and an SCP context.
+    Mirrors ``scp_core::bridge::BridgeMode``.
+    """
+
+    #: Messages forwarded verbatim.  Bridge is a transparent pipe.
+    RELAY = "relay"
+    #: Bridge controls external-side identity and can act on behalf
+    #: of participants.
+    PUPPET = "puppet"
+    #: Bridge exposes a programmatic API rather than a chat interface.
+    API = "api"
+    #: Both SCP and external participants have equal agency.
+    COOPERATIVE = "cooperative"
+
+
+class ShadowStatus(enum.Enum):
+    """Shadow identity provenance status (spec section 12.2).
+
+    Indicates how a bridged participant's identity was established.
+    Used for trust evaluation.
+    """
+
+    #: Identity is a shadow -- no verified link to external identity.
+    SHADOW = "shadow"
+    #: External participant has completed an identity claim verification.
+    CLAIMED = "claimed"
 
 
 class ContextMode(enum.Enum):
@@ -117,6 +167,38 @@ class ProvenanceQuality(enum.Enum):
     SUMMARY_VERIFIED = 2
     #: Source persistent and active; independently verifiable.
     PERSISTENT_VERIFIABLE = 3
+
+
+class MemberRole(enum.Enum):
+    """Role assigned to a member within a context (spec section 5.5).
+
+    Mirrors ``scp_core::context::roles::Role``.
+    """
+
+    #: Context administrator with full governance capabilities.
+    ADMIN = "Admin"
+    #: Moderator with messaging, moderation, and governance proposal capabilities.
+    MODERATOR = "Moderator"
+    #: Regular participant with standard capabilities.
+    MEMBER = "Member"
+    #: Read-only observer with no write capabilities.
+    OBSERVER = "Observer"
+    #: Custom role defined by context governance.
+    CUSTOM = "Custom"
+
+    @classmethod
+    def from_bridge(cls, raw: str) -> MemberRole:
+        """Parse a bridge-layer role string into a :class:`MemberRole`.
+
+        The bridge returns a Rust debug representation. This method
+        normalises known variants and falls back to :attr:`CUSTOM` for
+        unrecognised strings.
+        """
+        normalised = raw.strip().strip('"')
+        for member in cls:
+            if normalised == member.value or normalised.lower() == member.value.lower():
+                return member
+        return cls.CUSTOM
 
 
 class Capability(enum.Enum):
@@ -227,14 +309,18 @@ class Message:
 
 
 __all__ = [
+    "BridgeMode",
     "Capability",
     "CeilingPolicy",
     "ContextMode",
+    "CustodyType",
     "DiscoveryMethod",
+    "MemberRole",
     "MemoryScope",
     "Message",
     "PromotionPolicy",
     "Provenance",
     "ProvenanceQuality",
+    "ShadowStatus",
     "SourceType",
 ]

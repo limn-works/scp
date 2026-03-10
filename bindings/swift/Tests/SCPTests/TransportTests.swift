@@ -1,7 +1,6 @@
 import Foundation
-import Testing
-
 @testable import SCP
+import Testing
 
 // MARK: - Transport Tests
 
@@ -17,9 +16,7 @@ import Testing
 /// pattern works end-to-end without a real UniFFI binary.
 ///
 /// See ADR-032 (Transport), ADR-026 (Swift SDK), and story SCP-221.
-@Suite("Transport Tests")
 struct TransportTests {
-
     // MARK: - TransportConfig type shape
 
     @Test("TransportConfig stores explicit relay URLs")
@@ -42,18 +39,18 @@ struct TransportTests {
     @Test("TransportConfig uses defaults for dedup parameters")
     func configDefaultDedupParams() {
         let config = TransportConfig()
-        #expect(config.dedupCacheSize == 10_000)
-        #expect(config.dedupCacheTtlSecs == 3_600)
+        #expect(config.dedupCacheSize == 10000)
+        #expect(config.dedupCacheTtlSecs == 3600)
     }
 
     @Test("TransportConfig custom dedup parameters")
     func configCustomDedupParams() {
         let config = TransportConfig(
-            dedupCacheSize: 50_000,
-            dedupCacheTtlSecs: 7_200
+            dedupCacheSize: 50000,
+            dedupCacheTtlSecs: 7200
         )
-        #expect(config.dedupCacheSize == 50_000)
-        #expect(config.dedupCacheTtlSecs == 7_200)
+        #expect(config.dedupCacheSize == 50000)
+        #expect(config.dedupCacheTtlSecs == 7200)
     }
 
     @Test("TransportConfig.withRelayUrls convenience factory")
@@ -61,7 +58,7 @@ struct TransportTests {
         let config = TransportConfig.withRelayUrls(["wss://relay.example.com/scp/v1"])
         #expect(config.relayUrls.count == 1)
         #expect(config.bootstrapDomain == nil)
-        #expect(config.dedupCacheSize == 10_000)
+        #expect(config.dedupCacheSize == 10000)
     }
 
     @Test("TransportConfig.withBootstrapDomain convenience factory")
@@ -69,11 +66,11 @@ struct TransportTests {
         let config = TransportConfig.withBootstrapDomain("scp.example.org")
         #expect(config.bootstrapDomain == "scp.example.org")
         #expect(config.relayUrls.isEmpty)
-        #expect(config.dedupCacheTtlSecs == 3_600)
+        #expect(config.dedupCacheTtlSecs == 3600)
     }
 
     @Test("TransportConfig is Sendable")
-    func configIsSendable() async {
+    func configIsSendable() {
         let config: any Sendable = TransportConfig(relayUrls: ["wss://test"])
         #expect(config is TransportConfig)
     }
@@ -105,7 +102,7 @@ struct TransportTests {
     }
 
     @Test("TransportStatus is Sendable")
-    func statusIsSendable() async {
+    func statusIsSendable() {
         let status: any Sendable = TransportStatus(connected: true, relayUrl: nil, latencyMs: nil)
         #expect(status is TransportStatus)
     }
@@ -136,7 +133,7 @@ struct TransportTests {
             _ = try await connectTransport(config: config)
             Issue.record("Expected connectTransport to throw")
         } catch let error as ScpError {
-            if case .Transport(_, let code) = error {
+            if case let .Transport(_, code) = error {
                 #expect(code == "SCP-TRANS-5001")
             } else {
                 Issue.record("Expected ScpError.Transport, got \(error)")
@@ -158,7 +155,7 @@ struct TransportTests {
         )
 
         let mockStatus: TransportBridge.StatusFn = { _ in
-            return expectedStatus
+            expectedStatus
         }
 
         let result = try await queryTransportStatus(
@@ -222,12 +219,11 @@ struct TransportTests {
             closeFn: closeFn
         )
 
-        let stream = await context.messages
+        let stream = try await context.messages
         for await _ in stream {}
 
         #expect(subscribed)
     }
-
 } // end TransportTests
 
 // MARK: - Mock ContextHandle for Transport Tests
@@ -240,10 +236,18 @@ private final class MockTransportContextHandle: ContextHandleProtocol, @unchecke
     init(id: String, creator: String = "did:dht:z6MkCreator", state: String = "active") {
         self.id = id
         self.creator = creator
-        self.initialState = state
+        initialState = state
     }
 
-    func contextId() -> String { id }
-    func creatorDid() -> String { creator }
-    func state() throws -> String { initialState }
+    func contextId() -> String {
+        id
+    }
+
+    func creatorDid() -> String {
+        creator
+    }
+
+    func state() throws -> String {
+        initialState
+    }
 }

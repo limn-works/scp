@@ -32,7 +32,7 @@ Functions: `ensure_registered`, `with_context`, `remove_context`.
 | Module | Functions |
 |--------|-----------|
 | `identity.rs` | `identity_create`, `identity_create_with_agent_key`, `identity_load`, `identity_resolve` |
-| `context.rs` | `context_create`, `context_join`, `context_leave`, `context_close`, `context_send`, `context_subscribe`, `context_member_count`, `context_is_member`, `context_member_dids`, `context_member_role`, `context_drain_events`, `context_broadcast_subscriber_count`, `context_is_broadcast_subscriber`, `context_broadcast_admission`, `context_execute_governance_action`, `context_handle_ttl_expiry`, `context_propose_ttl_extension`, `context_reset_ttl_timer` |
+| `context.rs` | `context_create`, `context_join`, `context_leave`, `context_close`, `context_send`, `context_subscribe`, `context_member_count`, `context_is_member`, `context_member_dids`, `context_member_role`, `context_drain_events`, `context_broadcast_subscriber_count`, `context_is_broadcast_subscriber`, `context_broadcast_admission`, `broadcast_subscribe`, `broadcast_unsubscribe`, `broadcast_publish`, `broadcast_block_subscriber`, `broadcast_handle_key_request`, `context_execute_governance_action`, `context_handle_ttl_expiry`, `context_propose_ttl_extension`, `context_reset_ttl_timer`, `context_export`, `context_import` |
 | `tools.rs` | `tool_register`, `tool_invoke`, `tool_verify` |
 | `ucan.rs` | `ucan_validate`, `ucan_mint`, `ucan_revoke` |
 | `event_log.rs` | `event_log_query`, `event_log_verify` |

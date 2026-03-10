@@ -1,25 +1,23 @@
 import Foundation
-import Testing
-
 @testable import SCP
+import Testing
 
 // MARK: - Tools Tests
 
-/// Tests for tool definition, invocation, registration, and test vector
-/// verification via the ``Context`` actor's tool extensions.
-///
-/// UniFFI ToolDefinition fields: name, description, inputSchemaJson, outputSchemaJson,
-///     operatorDid, testVectorsJson (String?), implementationHash (Data?)
-/// UniFFI ToolVerificationResult fields: toolId (String), passed (Bool), failures ([String])
-///
-/// These tests validate the Swift ergonomics layer, type shapes, and async
-/// bridging through injectable bridge closures.
-///
-/// See ADR-026 (Swift SDK), `.docs/scaffold/shared.md` conformance testing,
-/// and story SCP-221.
-@Suite("Tools Tests")
+// Tests for tool definition, invocation, registration, and test vector
+// verification via the ``Context`` actor's tool extensions.
+//
+// UniFFI ToolDefinition fields: name, description, inputSchemaJson, outputSchemaJson,
+//     operatorDid, testVectorsJson (String?), implementationHash (Data?)
+// UniFFI ToolVerificationResult fields: toolId (String), passed (Bool), failures ([String])
+//
+// These tests validate the Swift ergonomics layer, type shapes, and async
+// bridging through injectable bridge closures.
+//
+// See ADR-026 (Swift SDK), `.docs/scaffold/shared.md` conformance testing,
+// and story SCP-221.
+// swiftlint:disable:next type_body_length
 struct ToolsTests {
-
     // MARK: - Helpers
 
     /// Creates a mock ``Context`` with injectable bridge functions for testing.
@@ -83,7 +81,7 @@ struct ToolsTests {
     }
 
     @Test("ToolDefinition is Sendable")
-    func toolDefinitionIsSendable() async {
+    func toolDefinitionIsSendable() {
         let definition: any Sendable = ToolDefinition(
             name: "sendable-tool",
             description: "Test",
@@ -99,7 +97,7 @@ struct ToolsTests {
     // MARK: - TestVector type shape (hand-written, not UniFFI)
 
     @Test("TestVector stores input and expected output")
-    func testVectorFields() {
+    func vectorFields() {
         let vector = TestVector(
             input: #"{"operands": [2, 3]}"#,
             expectedOutput: #"{"sum": 5}"#
@@ -109,7 +107,7 @@ struct ToolsTests {
     }
 
     @Test("TestVector is Sendable")
-    func testVectorIsSendable() async {
+    func vectorIsSendable() {
         let vector: any Sendable = TestVector(input: "{}", expectedOutput: "{}")
         #expect(vector is TestVector)
     }
@@ -168,13 +166,16 @@ struct ToolsTests {
 
         let context = Context(
             handle: handle,
+            contextId: "test-ctx",
+            creatorDid: "did:dht:z6MkTest",
+            initialState: .active,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
             closeFn: closeFn
         )
 
-        let mockInvoke: ToolBridge.InvokeFn = { _, toolId, inputJson, _ in
+        let mockInvoke: ToolBridge.InvokeFn = { _, toolId, inputJson, _, _, _ in
             #expect(toolId == "calculator")
             #expect(inputJson == "{}")
             return #"{"result": 42}"#
@@ -183,6 +184,8 @@ struct ToolsTests {
         let result = try await context.invokeTool(
             "calculator",
             input: Data("{}".utf8),
+            identity: Identity(noPointer: .init()),
+            invokerDid: "did:dht:z6MkTest",
             invokeFn: mockInvoke
         )
         #expect(result.output == Data(#"{"result": 42}"#.utf8))
@@ -195,10 +198,10 @@ struct ToolsTests {
         try await context.close()
 
         do {
-            _ = try await context.invokeTool("calculator", input: Data("{}".utf8))
+            _ = try await context.invokeTool("calculator", input: Data("{}".utf8), identity: Identity(noPointer: .init()))
             Issue.record("Expected invokeTool to throw on closed context")
         } catch let error as ScpError {
-            if case .Context(_, let code) = error {
+            if case let .Context(_, code) = error {
                 #expect(code == "SCP-CTX-2001")
             } else {
                 Issue.record("Expected ScpError.Context, got \(error)")
@@ -220,6 +223,9 @@ struct ToolsTests {
 
         let context = Context(
             handle: handle,
+            contextId: "test-ctx",
+            creatorDid: "did:dht:z6MkTest",
+            initialState: .active,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
@@ -262,7 +268,7 @@ struct ToolsTests {
             _ = try await context.registerTool(definition)
             Issue.record("Expected registerTool to throw on closed context")
         } catch let error as ScpError {
-            if case .Context(_, let code) = error {
+            if case let .Context(_, code) = error {
                 #expect(code == "SCP-CTX-2001")
             } else {
                 Issue.record("Expected ScpError.Context, got \(error)")
@@ -284,6 +290,9 @@ struct ToolsTests {
 
         let context = Context(
             handle: handle,
+            contextId: "test-ctx",
+            creatorDid: "did:dht:z6MkTest",
+            initialState: .active,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
@@ -309,7 +318,7 @@ struct ToolsTests {
             _ = try await context.verifyTool("calculator")
             Issue.record("Expected verifyTool to throw on closed context")
         } catch let error as ScpError {
-            if case .Context(_, let code) = error {
+            if case let .Context(_, code) = error {
                 #expect(code == "SCP-CTX-2001")
             } else {
                 Issue.record("Expected ScpError.Context, got \(error)")
@@ -322,7 +331,7 @@ struct ToolsTests {
     // MARK: - Test vector verification
 
     @Test("ToolDefinition with test vectors JSON preserves data")
-    func toolDefinitionPreservesTestVectors() {
+    func toolDefinitionPreservesTestVectors() throws {
         let vectorsJson = #"[{"input": {"a": 1, "b": 2}, "expected_output": {"sum": 3}}, {"input": {"a": 10, "b": 20}, "expected_output": {"sum": 30}}]"#
         let definition = ToolDefinition(
             name: "add",
@@ -335,7 +344,7 @@ struct ToolsTests {
         )
 
         #expect(definition.testVectorsJson != nil)
-        #expect(definition.testVectorsJson!.contains("sum"))
+        #expect(try #require(definition.testVectorsJson?.contains("sum")))
     }
 
     // MARK: - ToolSessionResult type shape
@@ -359,6 +368,9 @@ struct ToolsTests {
 
         let sourceContext = Context(
             handle: sourceHandle,
+            contextId: "source-ctx",
+            creatorDid: "did:dht:z6MkTest",
+            initialState: .active,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
@@ -366,6 +378,9 @@ struct ToolsTests {
         )
         let targetContext = Context(
             handle: targetHandle,
+            contextId: "target-ctx",
+            creatorDid: "did:dht:z6MkTest",
+            initialState: .active,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
@@ -373,8 +388,7 @@ struct ToolsTests {
         )
 
         var receivedChainDepth: UInt8?
-        let mockInvokeCrossContext: ToolBridge.InvokeCrossContextFn = {
-            _, _, toolId, inputJson, _, chainDepth in
+        let mockInvokeCrossContext: ToolBridge.InvokeCrossContextFn = { _, _, toolId, inputJson, _, _, chainDepth, _ in
             #expect(toolId == "remote-calc")
             #expect(inputJson == "{\"x\":1}")
             receivedChainDepth = chainDepth
@@ -384,8 +398,11 @@ struct ToolsTests {
         let result = try await sourceContext.invokeToolCrossContext(
             "remote-calc",
             input: Data("{\"x\":1}".utf8),
+            identity: Identity(noPointer: .init()),
             targetContext: targetContext,
+            ucanToken: "test-ucan-token",
             chainDepth: 1,
+            invokerDid: "did:dht:z6MkTest",
             invokeCrossContextFn: mockInvokeCrossContext
         )
 
@@ -403,11 +420,13 @@ struct ToolsTests {
             _ = try await sourceContext.invokeToolCrossContext(
                 "tool",
                 input: Data("{}".utf8),
-                targetContext: targetContext
+                identity: Identity(noPointer: .init()),
+                targetContext: targetContext,
+                ucanToken: "test-token"
             )
             Issue.record("Expected error for closed source context")
         } catch let error as ScpError {
-            if case .Context(_, let code) = error {
+            if case let .Context(_, code) = error {
                 #expect(code == "SCP-CTX-2001")
             } else {
                 Issue.record("Expected ScpError.Context, got \(error)")
@@ -429,6 +448,9 @@ struct ToolsTests {
 
         let context = Context(
             handle: handle,
+            contextId: "test-ctx",
+            creatorDid: "did:dht:z6MkTest",
+            initialState: .active,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
@@ -465,6 +487,9 @@ struct ToolsTests {
 
         let context = Context(
             handle: handle,
+            contextId: "test-ctx",
+            creatorDid: "did:dht:z6MkTest",
+            initialState: .active,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
@@ -472,7 +497,7 @@ struct ToolsTests {
         )
 
         var receivedSessionId: String?
-        let mockSessionInvoke: ToolBridge.SessionInvokeFn = { _, sessionId, inputJson, _ in
+        let mockSessionInvoke: ToolBridge.SessionInvokeFn = { _, sessionId, inputJson, _, _, _ in
             receivedSessionId = sessionId
             #expect(inputJson == "{\"op\":\"add\"}")
             return #"{"sum": 5}"#
@@ -481,6 +506,9 @@ struct ToolsTests {
         let result = try await context.invokeToolSession(
             sessionId: "session-abc-123",
             input: Data("{\"op\":\"add\"}".utf8),
+            identity: Identity(noPointer: .init()),
+            ucanToken: "test-ucan-token",
+            invokerDid: "did:dht:z6MkTest",
             sessionInvokeFn: mockSessionInvoke
         )
 
@@ -498,6 +526,9 @@ struct ToolsTests {
 
         let context = Context(
             handle: handle,
+            contextId: "test-ctx",
+            creatorDid: "did:dht:z6MkTest",
+            initialState: .active,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
@@ -530,7 +561,7 @@ struct ToolsTests {
             )
             Issue.record("Expected error for closed context")
         } catch let error as ScpError {
-            if case .Context(_, let code) = error {
+            if case let .Context(_, code) = error {
                 #expect(code == "SCP-CTX-2001")
             } else {
                 Issue.record("Expected ScpError.Context, got \(error)")
@@ -539,7 +570,6 @@ struct ToolsTests {
             Issue.record("Expected ScpError, got \(type(of: error))")
         }
     }
-
 } // end ToolsTests
 
 // MARK: - Mock ContextHandle for Tool Tests
@@ -553,10 +583,18 @@ private final class MockToolContextHandle: ContextHandleProtocol, @unchecked Sen
     init(id: String = "tool-test-ctx", creator: String = "did:dht:z6MkCreator", state: String = "active") {
         self.id = id
         self.creator = creator
-        self.initialState = state
+        initialState = state
     }
 
-    func contextId() -> String { id }
-    func creatorDid() -> String { creator }
-    func state() throws -> String { initialState }
+    func contextId() -> String {
+        id
+    }
+
+    func creatorDid() -> String {
+        creator
+    }
+
+    func state() throws -> String {
+        initialState
+    }
 }

@@ -14,7 +14,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from scp_sdk.errors import IdentityError
 from scp_sdk.sync import run_sync
+from scp_sdk.types import CustodyType
 
 if TYPE_CHECKING:
     import _scp_core  # noqa: F401
@@ -111,24 +113,38 @@ class Identity:
         return self._handle.did
 
     @property
-    def custody_type(self) -> str:
-        """The custody type used for this identity (e.g. ``"platform"``)."""
-        return self._handle.custody
+    def custody_type(self) -> CustodyType | str:
+        """The custody type used for this identity.
+
+        Returns a :class:`~scp_sdk.types.CustodyType` enum member when
+        the value matches a known variant, otherwise the raw string.
+        """
+        raw = self._handle.custody
+        try:
+            return CustodyType(raw)
+        except ValueError:
+            return raw
 
     # -- Async factory methods -----------------------------------------------
 
     @classmethod
-    async def create(cls, custody: str = "platform") -> Identity:
+    async def create(cls, custody: CustodyType | str = CustodyType.PLATFORM) -> Identity:
         """Create a new SCP identity with the specified key custody method.
 
         Args:
-            custody: Key custody type.  Valid values:
+            custody: Key custody type.  Accepts a
+                :class:`~scp_sdk.types.CustodyType` enum member or a raw
+                string.  Valid values:
 
-                - ``"platform"`` (default) -- platform-native secure
-                  storage (Keychain on macOS/iOS, Keystore on Android,
-                  credential manager on Windows/Linux).
-                - ``"in_memory"`` -- ephemeral in-memory key store,
-                  suitable for testing or short-lived agents.
+                - :attr:`CustodyType.PLATFORM` / ``"platform"``
+                  (default) -- platform-native secure storage (Keychain
+                  on macOS/iOS, Keystore on Android, credential manager
+                  on Windows/Linux).
+                - :attr:`CustodyType.IN_MEMORY` / ``"in_memory"`` --
+                  ephemeral in-memory key store, suitable for testing or
+                  short-lived agents.
+                - :attr:`CustodyType.SOFTWARE` / ``"software"`` --
+                  software-backed file-based key store.
 
         Returns:
             A new :class:`Identity` instance.
@@ -140,7 +156,8 @@ class Identity:
         """
         import _scp_core
 
-        handle = _scp_core.py_identity_create(custody)
+        custody_str = custody.value if isinstance(custody, CustodyType) else custody
+        handle = _scp_core.py_identity_create(custody_str)
         return cls(handle)
 
     @classmethod
@@ -165,7 +182,7 @@ class Identity:
     # -- Sync convenience wrappers -------------------------------------------
 
     @classmethod
-    def create_sync(cls, custody: str = "platform") -> Identity:
+    def create_sync(cls, custody: CustodyType | str = CustodyType.PLATFORM) -> Identity:
         """Synchronous convenience wrapper for :meth:`create`.
 
         Uses :func:`scp_sdk.sync.run_sync` with a dedicated background
@@ -185,6 +202,146 @@ class Identity:
         return run_sync(cls.load(did))
 
     # -- Async instance methods ----------------------------------------------
+
+    @classmethod
+    async def create_with_agent_key(
+        cls, custody: CustodyType | str = CustodyType.PLATFORM
+    ) -> Identity:
+        """Create a new SCP identity with an agent signing key (ADR-039).
+
+        Creates a DID identity with both the standard signing key and an
+        ``#agent`` verification method in the DID document.
+
+        Args:
+            custody: Key custody type.  Accepts a
+                :class:`~scp_sdk.types.CustodyType` enum member or a
+                raw string (``"platform"``, ``"in_memory"``,
+                ``"software"``).
+
+        Returns:
+            A new :class:`Identity` instance with an agent key.
+
+        Raises:
+            scp_sdk.IdentityError: If key generation or DID creation fails.
+        """
+        import _scp_core
+
+        custody_str = custody.value if isinstance(custody, CustodyType) else custody
+        handle = _scp_core.py_identity_create_with_agent_key(custody_str)
+        return cls(handle)
+
+    async def add_agent_key(self) -> Identity:
+        """Add an agent signing key to this identity (ADR-039).
+
+        Generates a new Ed25519 keypair for the ``#agent`` verification
+        method, updates the DID document, and publishes to the DHT.
+
+        Returns:
+            A new :class:`Identity` with the agent key added.
+
+        Raises:
+            scp_sdk.IdentityError: If the identity already has an agent key
+                or key generation fails.
+        """
+        import _scp_core
+
+        handle = _scp_core.py_identity_add_agent_key(self._handle)
+        return Identity(handle)
+
+    async def rotate_agent_key(self) -> Identity:
+        """Rotate the agent signing key for this identity (ADR-039).
+
+        Generates a new Ed25519 keypair, retires the old ``#agent`` key,
+        and installs the new key as ``#agent``.
+
+        Returns:
+            A new :class:`Identity` with the rotated agent key.
+
+        Raises:
+            scp_sdk.IdentityError: If the identity has no agent key or
+                key generation fails.
+        """
+        import _scp_core
+
+        handle = _scp_core.py_identity_rotate_agent_key(self._handle)
+        return Identity(handle)
+
+    async def remove_agent_key(self) -> Identity:
+        """Remove the agent signing key from this identity (ADR-039).
+
+        Removes the ``#agent`` verification method from the DID document
+        and publishes the update.
+
+        Returns:
+            A new :class:`Identity` with the agent key removed.
+
+        Raises:
+            scp_sdk.IdentityError: If the identity has no agent key.
+        """
+        import _scp_core
+
+        handle = _scp_core.py_identity_remove_agent_key(self._handle)
+        return Identity(handle)
+
+    async def migrate(self) -> Identity:
+        """Migrate this identity to a new DID (Layer 2 rotation).
+
+        Creates a new DID using the pre-rotation key as the new
+        Identity Key. The old DID document is updated with an
+        ``alsoKnownAs`` pointing to the new DID.
+
+        Returns:
+            A new :class:`Identity` with the new DID string.
+
+        Raises:
+            scp_sdk.IdentityError: If the identity is not in the
+                registry or migration fails.
+        """
+        import _scp_core
+
+        handle = _scp_core.py_identity_migrate(self._handle)
+        return Identity(handle)
+
+    async def attest_device(self) -> str:
+        """Generate a device attestation token for this identity.
+
+        Returns:
+            The attestation token as a base64-encoded string.
+
+        Raises:
+            scp_sdk.IdentityError: If attestation generation fails or the
+                ``allow_in_memory_custody`` feature is not compiled in.
+        """
+        import _scp_core
+
+        if not hasattr(_scp_core, "py_identity_attest_device"):
+            raise IdentityError(
+                "Device attestation requires the 'allow_in_memory_custody' feature",
+                "SCP-IDENT-1050",
+            )
+        return _scp_core.py_identity_attest_device(self.did)
+
+    async def verify_device_attestation(self, token_base64: str) -> bool:
+        """Verify a device attestation token.
+
+        Args:
+            token_base64: The base64-encoded attestation token to verify.
+
+        Returns:
+            ``True`` if the token is valid, ``False`` otherwise.
+
+        Raises:
+            scp_sdk.IdentityError: If verification fails or the
+                ``allow_in_memory_custody`` feature is not compiled in.
+        """
+        import _scp_core
+
+        if not hasattr(_scp_core, "py_identity_verify_device_attestation"):
+            raise IdentityError(
+                "Device attestation verification requires the 'allow_in_memory_custody' feature",
+                "SCP-IDENT-1051",
+            )
+        return _scp_core.py_identity_verify_device_attestation(self.did, token_base64)
 
     async def rotate_key(self) -> Identity:
         """Rotate this identity's active signing key.

@@ -11,13 +11,11 @@
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use scp_core::bridge::provenance::{
-    evaluate_trust_level, mark_bridge_provenance, BridgeTrustLevel,
-};
+use scp_core::bridge::provenance::{evaluate_trust_level, mark_bridge_provenance};
 use scp_core::bridge::registration::{
-    approve_registration, register_bridge, BridgeRegistrationRequest, BridgeRegistry,
+    BridgeRegistrationRequest, BridgeRegistry, approve_registration, register_bridge,
 };
-use scp_core::bridge::shadow::{create_shadow, ShadowRegistry};
+use scp_core::bridge::shadow::{CreateShadowParams, ShadowRegistry, create_shadow};
 use scp_core::bridge::{
     BridgeConnector, BridgeMode, BridgeStatus, ShadowIdentity, ShadowProvenanceStatus,
 };
@@ -63,7 +61,10 @@ pub fn py_bridge_register(
 
     let mut registry = BridgeRegistry::new(context_id.to_string());
 
-    let bridge_id = format!("bridge-{platform}-{}", context_id.chars().take(8).collect::<String>());
+    let bridge_id = format!(
+        "bridge-{platform}-{}",
+        context_id.chars().take(8).collect::<String>()
+    );
     let request = BridgeRegistrationRequest {
         bridge_id: bridge_id.clone(),
         operator_did: operator_did.into(),
@@ -74,11 +75,9 @@ pub fn py_bridge_register(
         self_hosted: false,
     };
 
-    let _event = register_bridge(&mut registry, request).map_err(|e| {
-        ScpPyError::ContextError {
-            message: format!("bridge registration failed: {e}"),
-            code: "SCP-CTX-2100".to_string(),
-        }
+    let _event = register_bridge(&mut registry, request).map_err(|e| ScpPyError::ContextError {
+        message: format!("bridge registration failed: {e}"),
+        code: "SCP-CTX-2100".to_string(),
     })?;
 
     let governance_did: scp_identity::DID = operator_did.into();
@@ -213,19 +212,20 @@ pub fn py_bridge_create_shadow(
     let shadow_id = format!("shadow-{bridge_id}-{}", platform_handle.replace('@', ""));
     let mut shadow_registry = ShadowRegistry::new(context_id.to_string());
 
-    let (shadow, _event) = create_shadow(
-        &mut shadow_registry,
-        &shadow_id,
+    let params = CreateShadowParams {
+        shadow_id: &shadow_id,
         bridge_id,
-        mode,
+        bridge_mode: mode,
         platform_handle,
-        &[], // no existing context member DIDs for collision check
-        0,   // timestamp
-    )
-    .map_err(|e| ScpPyError::ContextError {
-        message: format!("shadow creation failed: {e}"),
-        code: "SCP-CTX-2102".to_string(),
-    })?;
+        context_member_dids: &[], // no existing context member DIDs for collision check
+        timestamp: 0,
+    };
+    let mut sender_key_store = scp_core::crypto::sender_keys::SenderKeyStore::new();
+    let (shadow, _event) = create_shadow(&mut shadow_registry, &mut sender_key_store, &params)
+        .map_err(|e| ScpPyError::ContextError {
+            message: format!("shadow creation failed: {e}"),
+            code: "SCP-CTX-2102".to_string(),
+        })?;
 
     let dict = PyDict::new(py);
     dict.set_item("shadow_id", &shadow.shadow_id)?;
@@ -264,9 +264,7 @@ fn parse_shadow_status(s: &str) -> PyResult<ShadowProvenanceStatus> {
         "shadow" => Ok(ShadowProvenanceStatus::Shadow),
         "claimed" => Ok(ShadowProvenanceStatus::Claimed),
         other => Err(ScpPyError::ValidationError {
-            message: format!(
-                "invalid shadow_status '{other}': expected 'shadow' or 'claimed'"
-            ),
+            message: format!("invalid shadow_status '{other}': expected 'shadow' or 'claimed'"),
             code: "SCP-VALID-7051".to_string(),
         }
         .into()),
@@ -297,6 +295,7 @@ pub fn register_bridge_connector(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use scp_core::bridge::provenance::BridgeTrustLevel;
 
     #[test]
     fn parse_bridge_mode_valid() {

@@ -425,9 +425,15 @@ pub fn context_drain_events(handle: &WasmContextHandle) -> String {
 /// Delegates to `WasmContextManager::execute_governance_action`.
 /// All 24 `GovernanceAction` variants are dispatchable.
 ///
+/// Authorization is enforced: the `initiator_did` must be a member with
+/// the capability required for the specific governance action. For example,
+/// `RemoveMember` requires `member_remove:*` (admin-only by default),
+/// `ChangeRole` requires `role_assign:*`, etc.
+///
 /// # Arguments
 ///
 /// * `handle` — The context handle.
+/// * `initiator_did` — DID of the member requesting the governance action.
 /// * `proposal_id` — Unique proposal ID for replay protection.
 /// * `action_json` — JSON-encoded governance action (see `WasmGovernanceAction`).
 ///
@@ -437,9 +443,13 @@ pub fn context_drain_events(handle: &WasmContextHandle) -> String {
 #[wasm_bindgen]
 pub fn context_execute_governance(
     handle: &WasmContextHandle,
+    initiator_did: String,
     proposal_id: String,
     action_json: String,
 ) -> Promise {
+    if let Err(e) = validate_did(&initiator_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
     let context_id = handle.context_id();
 
     future_to_promise(async move {
@@ -451,9 +461,10 @@ pub fn context_execute_governance(
             .into_js()
         })?;
 
-        let result =
-            with_manager(|mgr| mgr.execute_governance_action(&context_id, &proposal_id, &action))
-                .map_err(ScpWasmError::into_js)?;
+        let result = with_manager(|mgr| {
+            mgr.execute_governance_action(&context_id, &initiator_did, &proposal_id, &action)
+        })
+        .map_err(ScpWasmError::into_js)?;
 
         let json_str = serde_json::to_string(&result).map_err(|e| {
             ScpWasmError::Context {
@@ -528,6 +539,108 @@ pub fn broadcast_block(handle: &WasmContextHandle, subscriber_did: String) -> Pr
         with_manager(|mgr| mgr.block_broadcast_subscriber(&context_id, &subscriber_did))
             .map_err(ScpWasmError::into_js)?;
         Ok(JsValue::UNDEFINED)
+    })
+}
+
+/// Returns the number of subscribers in a broadcast context.
+///
+/// Returns `null` if the context is not a broadcast context.
+#[wasm_bindgen]
+pub fn broadcast_subscriber_count(handle: &WasmContextHandle) -> Option<u32> {
+    let context_id = handle.context_id();
+    with_manager(|mgr| {
+        Ok(mgr
+            .broadcast_subscriber_count(&context_id)
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX)))
+    })
+    .ok()
+    .flatten()
+}
+
+/// Returns `true` if the given DID is a subscriber in a broadcast context.
+#[wasm_bindgen]
+pub fn broadcast_is_subscriber(handle: &WasmContextHandle, did: String) -> bool {
+    let context_id = handle.context_id();
+    with_manager(|mgr| Ok(mgr.is_broadcast_subscriber(&context_id, &did))).unwrap_or(false)
+}
+
+/// Returns the admission policy for a broadcast context as a JSON string.
+///
+/// Returns `null` if the context is not a broadcast context.
+#[wasm_bindgen]
+pub fn broadcast_admission(handle: &WasmContextHandle) -> Option<String> {
+    let context_id = handle.context_id();
+    with_manager(|mgr| Ok(mgr.broadcast_admission(&context_id)))
+        .ok()
+        .flatten()
+}
+
+/// Handles a broadcast key request and returns a grant/deny decision as JSON.
+///
+/// Returns a JSON string: `{"decision": "grant"}` or `{"decision": "deny", "reason": "..."}`.
+#[wasm_bindgen]
+pub fn broadcast_handle_key_request(
+    handle: &WasmContextHandle,
+    author_did: String,
+    requester_did: String,
+) -> Promise {
+    let context_id = handle.context_id();
+
+    future_to_promise(async move {
+        let result = with_manager(|mgr| {
+            mgr.handle_broadcast_key_request(&context_id, &author_did, &requester_did)
+        })
+        .map_err(ScpWasmError::into_js)?;
+
+        Ok(JsValue::from_str(&result))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Context export/import bridge functions (#424)
+// ---------------------------------------------------------------------------
+
+/// Exports a context's full state as serialized JSON bytes.
+///
+/// Returns a `Promise<Uint8Array>` containing a versioned JSON envelope with
+/// the context snapshot. The bytes are suitable for backup, migration, or
+/// transfer to another WASM node.
+///
+/// Delegates to `WasmContextManager::export_context`.
+#[wasm_bindgen]
+pub fn context_export(handle: &WasmContextHandle) -> Promise {
+    let context_id = handle.context_id();
+    let exporter_did = handle.creator_did();
+
+    future_to_promise(async move {
+        let bytes = with_manager(|mgr| mgr.export_context(&context_id, &exporter_did))
+            .map_err(ScpWasmError::into_js)?;
+
+        let len = u32::try_from(bytes.len()).map_err(|_| {
+            ScpWasmError::Context {
+                message: "export data exceeds 4 GiB — too large for WASM Uint8Array".to_owned(),
+                code: "SCP-CTX-2030".to_owned(),
+            }
+            .into_js()
+        })?;
+        let array = js_sys::Uint8Array::new_with_length(len);
+        array.copy_from(&bytes);
+        Ok(array.into())
+    })
+}
+
+/// Imports a context from serialized JSON bytes produced by [`context_export`].
+///
+/// Returns a `Promise<string>` resolving to the context ID of the imported
+/// context. The context becomes active and available for operations.
+///
+/// Delegates to `WasmContextManager::import_context`.
+#[wasm_bindgen]
+pub fn context_import(data: Vec<u8>) -> Promise {
+    future_to_promise(async move {
+        let context_id =
+            with_manager(|mgr| mgr.import_context(&data)).map_err(ScpWasmError::into_js)?;
+        Ok(JsValue::from_str(&context_id))
     })
 }
 

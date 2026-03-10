@@ -147,7 +147,10 @@ Every agent MAY publish structured capabilities in their DID document's `service
   "id": "#scp-capabilities",
   "type": "SCPCapabilities",
   "serviceEndpoint": {
-    "capabilities": ["translation", "japanese", "english"],
+    "capabilities": [
+      "scp:capability:translation/v1",
+      "did:dht:abc123:capability:japanese-translation/v1"
+    ],
     "version": "scp/1.0"
   }
 }
@@ -163,12 +166,15 @@ Discovery contexts are standard SCP contexts with open join policies and standar
 
 ```
 agent_search(query) → results
-  input:  { capability: string?, keywords: [string]?, min_history: int? }
+  input:  { capability_uri: string?, keywords: [string]?, min_history: int? }
   output: { results: [{ did: DID, capabilities: [string], participation_summary: object }] }
+  // capability_uri: structured URI per §4.4.1 (e.g., "scp:capability:translation/v1")
+  // keywords: free-text search terms (not capability URIs)
 
 agent_register(did, capabilities, metadata) → confirmation
   input:  { did: DID, capabilities: [string], metadata: { description: string?, tags: [string]? } }
   output: { registered: bool, entry_id: string }
+  // capabilities: array of structured capability URIs per §4.4.1
 
 agent_deregister(did) → removal
   input:  { did: DID }

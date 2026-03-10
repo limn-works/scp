@@ -9,10 +9,10 @@
  * See ADR-005 (Transport Abstraction) and ADR-022 in `.docs/adrs/phase-4.md`.
  */
 
-import { mapBridgeError, ValidationError } from "./errors.js";
-import type { BridgeTransportHandle } from "./internal/bridge.js";
-import { getBridge } from "./internal/bridge.js";
-import type { TransportConfig, TransportStatus } from "./types.js";
+import { mapBridgeError, ValidationError } from "./errors";
+import type { BridgeTransportHandle } from "./internal/bridge";
+import { getBridge } from "./internal/bridge";
+import type { TransportConfig, TransportStatus } from "./types";
 
 // ---------------------------------------------------------------------------
 // Transport

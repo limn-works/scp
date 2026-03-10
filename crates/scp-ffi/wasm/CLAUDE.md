@@ -15,7 +15,7 @@ All re-implementations must be algorithm-identical to scp-core. When scp-core ch
 | Module | Responsibility |
 |--------|---------------|
 | `runtime.rs` | WASM-local runtime registry: `WasmContextRuntime`, `ToolRegistry`, `WasmEventLog`, Merkle proof functions, schema validation, `with_context` |
-| `context.rs` | Context lifecycle: create, join, leave, close, send, subscribe |
+| `context.rs` | Context lifecycle: create, join, leave, close, send, subscribe, export, import |
 | `tools.rs` | Tool registration, invocation, verification |
 | `ucan.rs` | UCAN token management: validate, mint, revoke |
 | `event_log.rs` | Event log query, Merkle inclusion/absence proofs |
@@ -47,7 +47,7 @@ WASM is single-threaded. The context registry uses `thread_local! { static CONTE
 6. Capability match with trailing-slash prefix-collision protection (RED-105)
 7. Attenuation enforcement (child <= parent)
 8. Capability ceiling check
-9. Nonce replay detection (per-context `HashSet<String>`)
+9. Nonce format validation + freshness window + replay detection (matches native `NonceTracker`)
 10. Revocation check (CID in revocation set)
 11. Time bounds (exp, nbf, 24h max lifetime)
 

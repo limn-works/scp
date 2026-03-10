@@ -131,6 +131,27 @@ class ConformanceStubBindings : NativeBindings {
 
     override fun contextUnsubscribe(subscriptionHandle: Long) = Unit
 
+    // MembershipBindings
+    override fun contextMemberCount(contextHandle: Long): Long? = 1L
+    override fun contextIsMember(contextHandle: Long, did: String): Boolean = true
+    override fun contextMemberDids(contextHandle: Long): List<String> = listOf("did:dht:stub")
+    override fun contextMemberRole(contextHandle: Long, did: String): String? = "admin"
+
+    // GovernanceBindings
+    override fun governanceExecute(contextHandle: Long, proposalJson: String): String =
+        """{"status":"executed"}"""
+
+    // BroadcastBindings
+    override fun broadcastSubscribe(contextHandle: Long, subscriberDid: String) = Unit
+    override fun broadcastUnsubscribe(contextHandle: Long, subscriberDid: String, rotateKeys: Boolean) = Unit
+    override fun broadcastPublish(contextHandle: Long, authorDid: String, payload: ByteArray) = Unit
+    override fun broadcastBlockSubscriber(contextHandle: Long, subscriberDid: String, blockerDid: String) = Unit
+    override fun broadcastHandleKeyRequest(contextHandle: Long, authorDid: String, requesterDid: String): String =
+        """{"key":"stub"}"""
+    override fun broadcastSubscriberCount(contextHandle: Long): Long? = 0L
+    override fun broadcastIsSubscriber(contextHandle: Long, did: String): Boolean = false
+    override fun broadcastAdmission(contextHandle: Long): String? = "Open"
+
     override fun toolRegister(
         contextHandle: Long,
         definitionJson: String,

@@ -28,6 +28,7 @@ from scp_sdk.types import (
     Capability,
     CeilingPolicy,
     ContextMode,
+    MemberRole,
     MemoryScope,
     Message,
     PromotionPolicy,
@@ -434,6 +435,289 @@ class Context:
             invoker_did,
         )
         return result
+
+    # -- Membership queries -------------------------------------------------
+
+    async def member_count(self) -> int | None:
+        """Return the number of members in this context.
+
+        Returns:
+            The member count, or ``None`` if the context is not registered.
+
+        Raises:
+            ContextError: If the bridge is unavailable.
+        """
+        try:
+            import _scp_core
+        except ImportError as exc:
+            raise ContextError(
+                "failed to import _scp_core -- is the Rust extension built?",
+                code="SCP-CTX-2001",
+            ) from exc
+
+        result = _scp_core.py_context_member_count(self._handle)
+        return int(result) if result is not None else None
+
+    async def is_member(self, did: str) -> bool:
+        """Check whether a DID is a member of this context.
+
+        Args:
+            did: The DID to check.
+
+        Returns:
+            ``True`` if the DID is a member.
+
+        Raises:
+            ContextError: If the bridge is unavailable.
+        """
+        try:
+            import _scp_core
+        except ImportError as exc:
+            raise ContextError(
+                "failed to import _scp_core -- is the Rust extension built?",
+                code="SCP-CTX-2001",
+            ) from exc
+
+        return _scp_core.py_context_is_member(self._handle, did)
+
+    async def member_dids(self) -> list[str]:
+        """Return all member DIDs in this context.
+
+        Returns:
+            A list of DID strings.
+
+        Raises:
+            ContextError: If the bridge is unavailable.
+        """
+        try:
+            import _scp_core
+        except ImportError as exc:
+            raise ContextError(
+                "failed to import _scp_core -- is the Rust extension built?",
+                code="SCP-CTX-2001",
+            ) from exc
+
+        return _scp_core.py_context_member_dids(self._handle)
+
+    async def member_role(self, did: str) -> MemberRole | None:
+        """Return the role of a member in this context.
+
+        Args:
+            did: The DID of the member.
+
+        Returns:
+            A :class:`MemberRole` enum member, or ``None`` if the
+            member is not found.
+
+        Raises:
+            ContextError: If the bridge is unavailable.
+        """
+        try:
+            import _scp_core
+        except ImportError as exc:
+            raise ContextError(
+                "failed to import _scp_core -- is the Rust extension built?",
+                code="SCP-CTX-2001",
+            ) from exc
+
+        raw = _scp_core.py_context_member_role(self._handle, did)
+        if raw is None:
+            return None
+        return MemberRole.from_bridge(raw)
+
+    # -- Broadcast operations -----------------------------------------------
+
+    async def broadcast_subscribe(self, subscriber_did: str) -> None:
+        """Subscribe a DID to this broadcast context.
+
+        For open broadcast contexts, any DID can subscribe. For gated
+        contexts, a valid ``messagesRead`` UCAN is required.
+
+        Args:
+            subscriber_did: The DID subscribing to broadcasts.
+
+        Raises:
+            ContextError: If the context is not active or not broadcast.
+        """
+        try:
+            import _scp_core
+        except ImportError as exc:
+            raise ContextError(
+                "failed to import _scp_core -- is the Rust extension built?",
+                code="SCP-CTX-2001",
+            ) from exc
+
+        _scp_core.py_broadcast_subscribe(self._handle, subscriber_did)
+
+    async def broadcast_unsubscribe(
+        self,
+        subscriber_did: str,
+        *,
+        rotate_keys: bool = False,
+    ) -> None:
+        """Unsubscribe a DID from this broadcast context.
+
+        Args:
+            subscriber_did: The DID to unsubscribe.
+            rotate_keys: When ``True``, all authors rotate their
+                broadcast keys after unsubscription.
+
+        Raises:
+            ContextError: If the context is not active or not broadcast.
+        """
+        try:
+            import _scp_core
+        except ImportError as exc:
+            raise ContextError(
+                "failed to import _scp_core -- is the Rust extension built?",
+                code="SCP-CTX-2001",
+            ) from exc
+
+        _scp_core.py_broadcast_unsubscribe(self._handle, subscriber_did, rotate_keys)
+
+    async def broadcast_publish(
+        self,
+        payload: bytes,
+        identity: Identity | None = None,
+    ) -> None:
+        """Publish a message to this broadcast context.
+
+        The payload is encrypted with the author's broadcast key.
+
+        Args:
+            payload: The raw message payload.
+            identity: The publishing identity. Defaults to the context
+                creator if not specified.
+
+        Raises:
+            ContextError: If the context is not active or not broadcast.
+        """
+        try:
+            import _scp_core
+        except ImportError as exc:
+            raise ContextError(
+                "failed to import _scp_core -- is the Rust extension built?",
+                code="SCP-CTX-2001",
+            ) from exc
+
+        author_did = identity.did if identity is not None else self._creator_did
+        _scp_core.py_broadcast_publish(self._handle, author_did, payload)
+
+    async def broadcast_block_subscriber(
+        self,
+        subscriber_did: str,
+        blocker_did: str | None = None,
+    ) -> None:
+        """Block a subscriber's read access in this broadcast context.
+
+        Args:
+            subscriber_did: The DID of the subscriber to block.
+            blocker_did: The DID of the blocker. Defaults to the
+                context creator if not specified.
+
+        Raises:
+            ContextError: If the operation fails.
+        """
+        try:
+            import _scp_core
+        except ImportError as exc:
+            raise ContextError(
+                "failed to import _scp_core -- is the Rust extension built?",
+                code="SCP-CTX-2001",
+            ) from exc
+
+        blocker = blocker_did if blocker_did is not None else self._creator_did
+        _scp_core.py_broadcast_block_subscriber(self._handle, subscriber_did, blocker)
+
+    async def broadcast_handle_key_request(
+        self,
+        author_did: str,
+        requester_did: str,
+    ) -> str:
+        """Handle a broadcast key request from a subscriber.
+
+        Args:
+            author_did: The DID of the author handling the request.
+            requester_did: The DID of the requester.
+
+        Returns:
+            A string describing the key request decision.
+
+        Raises:
+            ContextError: If the operation fails.
+        """
+        try:
+            import _scp_core
+        except ImportError as exc:
+            raise ContextError(
+                "failed to import _scp_core -- is the Rust extension built?",
+                code="SCP-CTX-2001",
+            ) from exc
+
+        return _scp_core.py_broadcast_handle_key_request(self._handle, author_did, requester_did)
+
+    async def broadcast_subscriber_count(self) -> int | None:
+        """Return the number of broadcast subscribers for this context.
+
+        Returns:
+            The subscriber count, or ``None`` if the context is not
+            a broadcast context.
+
+        Raises:
+            ContextError: If the bridge is unavailable.
+        """
+        try:
+            import _scp_core
+        except ImportError as exc:
+            raise ContextError(
+                "failed to import _scp_core -- is the Rust extension built?",
+                code="SCP-CTX-2001",
+            ) from exc
+
+        result = _scp_core.py_broadcast_subscriber_count(self._handle)
+        return int(result) if result is not None else None
+
+    async def broadcast_is_subscriber(self, did: str) -> bool:
+        """Check whether a DID is a broadcast subscriber.
+
+        Args:
+            did: The DID to check.
+
+        Returns:
+            ``True`` if the DID is a subscriber.
+
+        Raises:
+            ContextError: If the bridge is unavailable.
+        """
+        try:
+            import _scp_core
+        except ImportError as exc:
+            raise ContextError(
+                "failed to import _scp_core -- is the Rust extension built?",
+                code="SCP-CTX-2001",
+            ) from exc
+
+        return _scp_core.py_broadcast_is_subscriber(self._handle, did)
+
+    async def broadcast_admission(self) -> str | None:
+        """Return the broadcast admission policy for this context.
+
+        Returns:
+            The policy as a string (``'Open'`` or ``'Gated'``), or
+            ``None`` if not a broadcast context.
+
+        Raises:
+            ContextError: If the bridge is unavailable.
+        """
+        try:
+            import _scp_core
+        except ImportError as exc:
+            raise ContextError(
+                "failed to import _scp_core -- is the Rust extension built?",
+                code="SCP-CTX-2001",
+            ) from exc
+
+        return _scp_core.py_broadcast_admission(self._handle)
 
     # -- Configuration ------------------------------------------------------
 

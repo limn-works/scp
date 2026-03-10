@@ -70,39 +70,43 @@ public nonisolated struct ToolSessionResult: Sendable {
 /// injected for testability; defaults call through to ScpBindings.
 ///
 /// See ADR-026 for the flat delegation pattern and ADR-011 for tool spec.
-internal enum ToolBridge {
+public enum ToolBridge {
     /// Invoke a tool. Maps to ``toolInvoke`` in ScpBindings.
-    internal typealias InvokeFn = @Sendable (
+    public typealias InvokeFn = @Sendable (
         _ handle: ContextHandle,
         _ toolId: String,
         _ inputJson: String,
-        _ identity: Identity
+        _ identity: Identity,
+        _ ucanToken: String?,
+        _ proofTokens: [String]?
     ) async throws -> String
 
     /// Register a tool. Maps to ``toolRegister`` in ScpBindings.
-    internal typealias RegisterFn = @Sendable (
+    public typealias RegisterFn = @Sendable (
         _ handle: ContextHandle,
         _ definition: ToolDefinition
     ) async throws -> String
 
     /// Verify a tool. Maps to ``toolVerify`` in ScpBindings.
-    internal typealias VerifyFn = @Sendable (
+    public typealias VerifyFn = @Sendable (
         _ handle: ContextHandle,
         _ toolId: String
     ) async throws -> ToolVerificationResult
 
     /// Invoke a tool across context boundaries (spec section 6.2).
-    internal typealias InvokeCrossContextFn = @Sendable (
+    public typealias InvokeCrossContextFn = @Sendable (
         _ sourceHandle: ContextHandle,
         _ targetHandle: ContextHandle,
         _ toolId: String,
         _ inputJson: String,
         _ identity: Identity,
-        _ chainDepth: UInt8
+        _ ucanToken: String,
+        _ chainDepth: UInt8,
+        _ proofTokens: [String]?
     ) async throws -> String
 
     /// Create a stateful tool session (spec section 6.2.1).
-    internal typealias SessionCreateFn = @Sendable (
+    public typealias SessionCreateFn = @Sendable (
         _ handle: ContextHandle,
         _ toolId: String,
         _ sourceContextId: String,
@@ -110,50 +114,52 @@ internal enum ToolBridge {
     ) async throws -> String
 
     /// Invoke a tool within an active session.
-    internal typealias SessionInvokeFn = @Sendable (
+    public typealias SessionInvokeFn = @Sendable (
         _ handle: ContextHandle,
         _ sessionId: String,
         _ inputJson: String,
-        _ identity: Identity
+        _ identity: Identity,
+        _ ucanToken: String,
+        _ proofTokens: [String]?
     ) async throws -> String
 
     /// Close a stateful tool session.
-    internal typealias SessionCloseFn = @Sendable (
+    public typealias SessionCloseFn = @Sendable (
         _ handle: ContextHandle,
         _ sessionId: String
     ) async throws -> Void
 
     /// Default invoke function that delegates to the UniFFI-generated binding.
-    internal static let defaultInvoke: InvokeFn = { handle, toolId, inputJson, identity in
-        try await toolInvoke(handle: handle, toolId: toolId, inputJson: inputJson, identity: identity)
+    public static let defaultInvoke: InvokeFn = { handle, toolId, inputJson, identity, ucanToken, proofTokens in
+        try await toolInvoke(handle: handle, toolId: toolId, inputJson: inputJson, identity: identity, ucanToken: ucanToken, proofTokens: proofTokens)
     }
 
     /// Default register function that delegates to the UniFFI-generated binding.
-    internal static let defaultRegister: RegisterFn = { handle, definition in
+    public static let defaultRegister: RegisterFn = { handle, definition in
         try await toolRegister(handle: handle, definition: definition)
     }
 
     /// Default verify function that delegates to the UniFFI-generated binding.
-    internal static let defaultVerify: VerifyFn = { handle, toolId in
+    public static let defaultVerify: VerifyFn = { handle, toolId in
         try await toolVerify(handle: handle, toolId: toolId)
     }
 
     /// Default cross-context invoke function — delegates to UniFFI.
-    internal static let defaultInvokeCrossContext: InvokeCrossContextFn = {
-        sourceHandle, targetHandle, toolId, inputJson, identity, chainDepth in
+    public static let defaultInvokeCrossContext: InvokeCrossContextFn = { sourceHandle, targetHandle, toolId, inputJson, identity, ucanToken, chainDepth, proofTokens in
         try await toolInvokeCrossContext(
             sourceHandle: sourceHandle,
             targetHandle: targetHandle,
             toolId: toolId,
             inputJson: inputJson,
             identity: identity,
-            chainDepth: chainDepth
+            ucanToken: ucanToken,
+            chainDepth: chainDepth,
+            proofTokens: proofTokens
         )
     }
 
     /// Default session create function — delegates to UniFFI.
-    internal static let defaultSessionCreate: SessionCreateFn = {
-        handle, toolId, sourceContextId, ttlSeconds in
+    public static let defaultSessionCreate: SessionCreateFn = { handle, toolId, sourceContextId, ttlSeconds in
         try await toolSessionCreate(
             handle: handle,
             toolId: toolId,
@@ -163,18 +169,19 @@ internal enum ToolBridge {
     }
 
     /// Default session invoke function — delegates to UniFFI.
-    internal static let defaultSessionInvoke: SessionInvokeFn = {
-        handle, sessionId, inputJson, identity in
+    public static let defaultSessionInvoke: SessionInvokeFn = { handle, sessionId, inputJson, identity, ucanToken, proofTokens in
         try await toolSessionInvoke(
             handle: handle,
             sessionId: sessionId,
             inputJson: inputJson,
-            identity: identity
+            identity: identity,
+            ucanToken: ucanToken,
+            proofTokens: proofTokens
         )
     }
 
     /// Default session close function — delegates to UniFFI.
-    internal static let defaultSessionClose: SessionCloseFn = { handle, sessionId in
+    public static let defaultSessionClose: SessionCloseFn = { handle, sessionId in
         try await toolSessionClose(handle: handle, sessionId: sessionId)
     }
 }
@@ -182,8 +189,7 @@ internal enum ToolBridge {
 // MARK: - Context Tool Extensions
 
 /// Tool invocation and management extensions for ``Context``.
-extension Context {
-
+public extension Context {
     /// Invokes a registered tool in this context.
     ///
     /// Delegates to the UniFFI ``toolInvoke`` bridge function. The input Data
@@ -193,6 +199,7 @@ extension Context {
     /// - Parameters:
     ///   - tool: The name of the tool to invoke.
     ///   - input: The tool input as serialized JSON data.
+    ///   - identity: The ``Identity`` of the invoking agent.
     ///   - invokeFn: Bridge function override for testing.
     /// - Returns: A ``ToolInvocationResult`` containing the tool's output and
     ///   provenance metadata.
@@ -205,9 +212,13 @@ extension Context {
     /// - ADR-011 (Event Log) in `.docs/adrs/phase-2.md`
     /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
     /// - Story SCP-221
-    public func invokeTool(
+    func invokeTool(
         _ tool: String,
         input: Data,
+        identity: Identity,
+        ucanToken: String? = nil,
+        proofTokens: [String]? = nil,
+        invokerDid: String? = nil,
         invokeFn: ToolBridge.InvokeFn = ToolBridge.defaultInvoke
     ) async throws -> ToolInvocationResult {
         guard state == .active else {
@@ -222,14 +233,18 @@ extension Context {
                 code: "SCP-CTX-2002"
             )
         }
-        let inputJson = String(data: input, encoding: .utf8) ?? "{}"
-        let identity = Identity(noPointer: .init())
-        let outputJson = try await invokeFn(contextHandle, tool, inputJson, identity)
+        guard let inputJson = String(data: input, encoding: .utf8) else {
+            throw ScpError.Tool(
+                message: "Tool input is not valid UTF-8",
+                code: "SCP-TOOL-6001"
+            )
+        }
+        let outputJson = try await invokeFn(contextHandle, tool, inputJson, identity, ucanToken, proofTokens)
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
-            invokerDid: contextHandle.creatorDid(),
+            invokerDid: invokerDid ?? identity.did(),
             contextId: contextId,
-            timestamp: UInt64(Date().timeIntervalSince1970 * 1_000)
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000)
         )
     }
 
@@ -248,7 +263,7 @@ extension Context {
     ///
     /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
     /// - Story SCP-221
-    public func registerTool(
+    func registerTool(
         _ definition: ToolDefinition,
         registerFn: ToolBridge.RegisterFn = ToolBridge.defaultRegister
     ) async throws -> String {
@@ -283,7 +298,7 @@ extension Context {
     ///
     /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
     /// - Story SCP-221
-    public func verifyTool(
+    func verifyTool(
         _ tool: String,
         verifyFn: ToolBridge.VerifyFn = ToolBridge.defaultVerify
     ) async throws -> ToolVerificationResult {
@@ -312,6 +327,7 @@ extension Context {
     /// - Parameters:
     ///   - tool: The tool ID to invoke in the target context.
     ///   - input: The tool input as serialized JSON data.
+    ///   - identity: The ``Identity`` of the invoking agent.
     ///   - targetContext: The ``Context`` containing the target tool.
     ///   - chainDepth: Current chain depth (0 for direct invocation).
     ///   - invokeCrossContextFn: Bridge function override for testing.
@@ -325,11 +341,15 @@ extension Context {
     ///
     /// - Spec section 6.2 (Cross-Context Tool Interfaces)
     /// - Story #322
-    public func invokeToolCrossContext(
+    func invokeToolCrossContext(
         _ tool: String,
         input: Data,
+        identity: Identity,
         targetContext: Context,
+        ucanToken: String,
         chainDepth: UInt8 = 0,
+        proofTokens: [String]? = nil,
+        invokerDid: String? = nil,
         invokeCrossContextFn: ToolBridge.InvokeCrossContextFn = ToolBridge.defaultInvokeCrossContext
     ) async throws -> ToolInvocationResult {
         guard state == .active else {
@@ -350,16 +370,20 @@ extension Context {
                 code: "SCP-CTX-2002"
             )
         }
-        let inputJson = String(data: input, encoding: .utf8) ?? "{}"
-        let identity = Identity(noPointer: .init())
+        guard let inputJson = String(data: input, encoding: .utf8) else {
+            throw ScpError.Tool(
+                message: "Tool input is not valid UTF-8",
+                code: "SCP-TOOL-6001"
+            )
+        }
         let outputJson = try await invokeCrossContextFn(
-            sourceHandle, targetHandle, tool, inputJson, identity, chainDepth
+            sourceHandle, targetHandle, tool, inputJson, identity, ucanToken, chainDepth, proofTokens
         )
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
-            invokerDid: sourceHandle.creatorDid(),
+            invokerDid: invokerDid ?? identity.did(),
             contextId: contextId,
-            timestamp: UInt64(Date().timeIntervalSince1970 * 1_000)
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000)
         )
     }
 
@@ -381,7 +405,7 @@ extension Context {
     ///
     /// - Spec section 6.2.1 (Stateful Tool Sessions)
     /// - Story #322
-    public func createToolSession(
+    func createToolSession(
         toolId: String,
         sourceContextId: String,
         ttlSeconds: UInt64,
@@ -414,6 +438,7 @@ extension Context {
     /// - Parameters:
     ///   - sessionId: The session ID from ``createToolSession``.
     ///   - input: The tool input as serialized JSON data.
+    ///   - identity: The ``Identity`` of the invoking agent.
     ///   - sessionInvokeFn: Bridge function override for testing.
     /// - Returns: A ``ToolInvocationResult`` containing the tool's output.
     /// - Throws: ``ScpError/Tool(message:code:)`` if the session is expired
@@ -424,9 +449,13 @@ extension Context {
     ///
     /// - Spec section 6.2.1 (Stateful Tool Sessions)
     /// - Story #322
-    public func invokeToolSession(
+    func invokeToolSession(
         sessionId: String,
         input: Data,
+        identity: Identity,
+        ucanToken: String,
+        proofTokens: [String]? = nil,
+        invokerDid: String? = nil,
         sessionInvokeFn: ToolBridge.SessionInvokeFn = ToolBridge.defaultSessionInvoke
     ) async throws -> ToolInvocationResult {
         guard state == .active else {
@@ -441,16 +470,20 @@ extension Context {
                 code: "SCP-CTX-2002"
             )
         }
-        let inputJson = String(data: input, encoding: .utf8) ?? "{}"
-        let identity = Identity(noPointer: .init())
+        guard let inputJson = String(data: input, encoding: .utf8) else {
+            throw ScpError.Tool(
+                message: "Tool input is not valid UTF-8",
+                code: "SCP-TOOL-6001"
+            )
+        }
         let outputJson = try await sessionInvokeFn(
-            contextHandle, sessionId, inputJson, identity
+            contextHandle, sessionId, inputJson, identity, ucanToken, proofTokens
         )
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
-            invokerDid: contextHandle.creatorDid(),
+            invokerDid: invokerDid ?? identity.did(),
             contextId: contextId,
-            timestamp: UInt64(Date().timeIntervalSince1970 * 1_000)
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000)
         )
     }
 
@@ -470,7 +503,7 @@ extension Context {
     ///
     /// - Spec section 6.2.1 (Stateful Tool Sessions)
     /// - Story #322
-    public func closeToolSession(
+    func closeToolSession(
         sessionId: String,
         sessionCloseFn: ToolBridge.SessionCloseFn = ToolBridge.defaultSessionClose
     ) async throws {

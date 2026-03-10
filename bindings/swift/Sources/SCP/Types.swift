@@ -4,6 +4,76 @@ import Foundation
 // ScpBindings.swift. This file provides additional Swift-idiomatic convenience
 // types that do NOT conflict with UniFFI-generated types.
 
+// MARK: - CustodyType
+
+/// Key custody method for identity key management (spec section 3.2).
+///
+/// Determines where cryptographic keys are stored and managed.
+/// The `rawValue` matches the wire-format string expected by the FFI bridge.
+///
+/// This type is a pure Swift convenience type. It does not conflict with any
+/// UniFFI-generated type.
+///
+/// ## Provenance
+///
+/// - Spec section 3.2 (Key Custody)
+public nonisolated enum CustodyType: String, Sendable, CaseIterable {
+    /// Platform-native secure storage (Keychain on macOS/iOS, Keystore
+    /// on Android, credential manager on Windows/Linux). Default.
+    case platform
+    /// Ephemeral in-memory key store, suitable for testing or short-lived
+    /// agents. Keys are lost on process exit.
+    case inMemory = "in_memory"
+    /// Software-backed file-based key store with passphrase protection.
+    case software
+}
+
+// MARK: - BridgeMode
+
+/// Bridge operating mode (spec section 12.2).
+///
+/// Determines how a bridge connector relays messages between an external
+/// platform and an SCP context.
+///
+/// This type is a pure Swift convenience type. It does not conflict with any
+/// UniFFI-generated type.
+///
+/// ## Provenance
+///
+/// - Spec section 12.2 (Bridge Connectors)
+/// - ADR-023 (Bridge Connector)
+public nonisolated enum BridgeMode: String, Sendable, CaseIterable {
+    /// Messages forwarded verbatim. Bridge is a transparent pipe.
+    case relay
+    /// Bridge controls external-side identity and can act on behalf
+    /// of participants.
+    case puppet
+    /// Bridge exposes a programmatic API rather than a chat interface.
+    case api
+    /// Both SCP and external participants have equal agency.
+    case cooperative
+}
+
+// MARK: - ShadowStatus
+
+/// Shadow identity provenance status (spec section 12.2).
+///
+/// Indicates how a bridged participant's identity was established.
+/// Used for trust evaluation.
+///
+/// This type is a pure Swift convenience type. It does not conflict with any
+/// UniFFI-generated type.
+///
+/// ## Provenance
+///
+/// - Spec section 12.2 (Bridge Connectors)
+public nonisolated enum ShadowStatus: String, Sendable, CaseIterable {
+    /// Identity is a shadow -- no verified link to external identity.
+    case shadow
+    /// External participant has completed identity claim verification.
+    case claimed
+}
+
 // MARK: - Capability
 
 /// A named capability with a declared ceiling, used for UCAN-based authorization.

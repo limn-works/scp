@@ -183,7 +183,7 @@ pub enum ClaimError {
 | `claiming.rs` | `ClaimRequest`, `ClaimError`, attestation verification, retroattribution |
 | `provenance.rs` | `BridgeProvenance`, provenance marking for bridged content |
 
-Per-platform implementations (`scp-bridge/x/`, `scp-bridge/bluesky/`) are separate crates built on these primitives.
+Per-platform bridge adapter implementations are built on these primitives.
 
 **Estimated functions:** ~15 public functions, ~10 internal helpers.
 
@@ -658,10 +658,10 @@ bindings/swift/
       Ucan.swift                      # UCAN validate(), mint(), revoke() (nonisolated free functions)
       Mcp.swift                       # serveMcp(), McpClient
       Platform/
-        AppleKeyCustody.swift         # KeyCustodyProvider implementation (Keychain + Secure Enclave)
+        AppleKeyCustody.swift         # KeyCustodyProvider implementation (Keychain, not Secure Enclave — see ADR-025)
         AppleDeviceAttestation.swift  # DeviceAttestationProvider (DCAppAttestService)
         ApplePushProvider.swift       # PushProvider (APNs)
-        AppleStorage.swift            # StorageProvider (Core Data / file-based)
+        AppleStorage.swift            # StorageProvider (SQLCipher + Keychain key — see ADR-025)
         PlatformAdapter.swift         # ApplePlatformAdapter.make() factory
       Internal/
         ScpBindings.swift             # UniFFI-generated bindings (auto-generated, do not edit)
@@ -1251,7 +1251,7 @@ private func makeMessageStream(handle: ContextHandle) -> AsyncStream<Message> {
 | `Sources/SCP/Platform/AppleKeyCustody.swift` | `KeyCustodyProvider` — Keychain + DCAppAttestService |
 | `Sources/SCP/Platform/AppleDeviceAttestation.swift` | `DeviceAttestationProvider` — DCAppAttestService |
 | `Sources/SCP/Platform/ApplePushProvider.swift` | `PushProvider` — APNs |
-| `Sources/SCP/Platform/AppleStorage.swift` | `StorageProvider` — file-based + Core Data |
+| `Sources/SCP/Platform/AppleStorage.swift` | `StorageProvider` — SQLCipher + Keychain key (ADR-025) |
 | `Sources/SCP/Internal/ScpBindings.swift` | UniFFI-generated bindings (auto-generated, never edit manually) |
 
 **Estimated functions:** ~35 public functions/methods, ~12 public types (actors + structs + enums), ~8 internal helpers.

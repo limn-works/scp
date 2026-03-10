@@ -6,6 +6,7 @@
 //! - [`trust_verify_attestation`] — Verify an attestation (throws — requires `WebCrypto`).
 //! - [`trust_create_challenge`] — Create a challenge request.
 //! - [`trust_verify_response`] — Verify a challenge response (throws — requires `WebCrypto`).
+//! - [`verify_participation_requirements`] — Verify a DID meets participation requirements.
 //!
 //! # WASM constraints
 //!
@@ -130,16 +131,37 @@ pub fn trust_verify_attestation(attestation_json: String) -> Promise {
 /// challenge metadata. The challenge is not signed (signing requires
 /// `WebCrypto` Ed25519 from the TypeScript wrapper).
 ///
+/// # Arguments
+///
+/// - `challenger_did` — DID of the entity issuing the challenge.
+/// - `target_did` — DID of the entity being challenged.
+///
 /// # JS usage
 ///
 /// ```js
-/// const resultJson = await trust_create_challenge("did:key:target");
+/// const resultJson = await trust_create_challenge("did:key:challenger", "did:key:target");
 /// const result = JSON.parse(resultJson);
 /// console.log(result.challenge_id);
 /// ```
 #[wasm_bindgen]
-pub fn trust_create_challenge(target_did: String) -> Promise {
+pub fn trust_create_challenge(challenger_did: String, target_did: String) -> Promise {
     future_to_promise(async move {
+        if challenger_did.is_empty() {
+            return Err(ScpWasmError::validation("challenger DID must not be empty"));
+        }
+        if !challenger_did.starts_with("did:") {
+            return Err(ScpWasmError::validation(
+                "challenger DID must start with 'did:'",
+            ));
+        }
+        if challenger_did
+            .chars()
+            .any(|c| c < '\u{0020}' || c == '\u{007F}')
+        {
+            return Err(ScpWasmError::validation(
+                "challenger DID must not contain control characters",
+            ));
+        }
         if target_did.is_empty() {
             return Err(ScpWasmError::validation("target DID must not be empty"));
         }
@@ -151,7 +173,7 @@ pub fn trust_create_challenge(target_did: String) -> Promise {
             "challenge_json": serde_json::json!({
                 "challenge_id": challenge_id,
                 "challenge_type": "SchemaValidation",
-                "challenger_did": "did:key:ephemeral-challenger",
+                "challenger_did": challenger_did,
                 "subject_did": target_did,
                 "capability_uri": "scp:capability:schema-validation",
                 "parameters": {},
@@ -218,5 +240,128 @@ pub fn trust_verify_response(challenge_json: String, response_json: String) -> P
         }
         .into_js()
         .into())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// verify_participation_requirements
+// ---------------------------------------------------------------------------
+
+/// Verifies that a DID's participation profile meets minimum requirements.
+///
+/// Accepts a JSON participation profile and a JSON requirements object,
+/// then checks each requirement threshold against the profile.
+///
+/// # Arguments
+///
+/// - `profile_json` — JSON object with fields: `message_count` (number),
+///   `governance_count` (number), `contexts` (number), `age_secs` (number).
+/// - `requirements_json` — JSON object with optional threshold fields:
+///   `min_message_count`, `min_governance_count`, `min_contexts`, `max_age_secs`.
+///
+/// Returns a JSON string with `{ "met": bool, "violations": [...] }`.
+///
+/// # JS usage
+///
+/// ```js
+/// const result = await verify_participation_requirements(
+///     '{"message_count": 5, "governance_count": 2, "contexts": 1, "age_secs": 86400}',
+///     '{"min_message_count": 10}'
+/// );
+/// const obj = JSON.parse(result);
+/// console.log(obj.met);        // false
+/// console.log(obj.violations); // ["message_count: 5 < required 10"]
+/// ```
+#[wasm_bindgen]
+pub fn verify_participation_requirements(
+    profile_json: String,
+    requirements_json: String,
+) -> Promise {
+    future_to_promise(async move {
+        if profile_json.is_empty() {
+            return Err(ScpWasmError::validation("profile JSON must not be empty"));
+        }
+        if requirements_json.is_empty() {
+            return Err(ScpWasmError::validation(
+                "requirements JSON must not be empty",
+            ));
+        }
+
+        let profile: serde_json::Value = serde_json::from_str(&profile_json).map_err(|e| {
+            JsValue::from_str(&format!(
+                "[SCP-VALID-7018] failed to parse profile JSON: {e}"
+            ))
+        })?;
+        let requirements: serde_json::Value =
+            serde_json::from_str(&requirements_json).map_err(|e| {
+                JsValue::from_str(&format!(
+                    "[SCP-VALID-7019] failed to parse requirements JSON: {e}"
+                ))
+            })?;
+
+        let mut violations = Vec::new();
+
+        // Check min_message_count
+        if let Some(min) = requirements
+            .get("min_message_count")
+            .and_then(serde_json::Value::as_u64)
+        {
+            let actual = profile
+                .get("message_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if actual < min {
+                violations.push(format!("message_count: {actual} < required {min}"));
+            }
+        }
+
+        // Check min_governance_count
+        if let Some(min) = requirements
+            .get("min_governance_count")
+            .and_then(serde_json::Value::as_u64)
+        {
+            let actual = profile
+                .get("governance_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if actual < min {
+                violations.push(format!("governance_count: {actual} < required {min}"));
+            }
+        }
+
+        // Check min_contexts
+        if let Some(min) = requirements
+            .get("min_contexts")
+            .and_then(serde_json::Value::as_u64)
+        {
+            let actual = profile
+                .get("contexts")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if actual < min {
+                violations.push(format!("contexts: {actual} < required {min}"));
+            }
+        }
+
+        // Check max_age_secs
+        if let Some(max) = requirements
+            .get("max_age_secs")
+            .and_then(serde_json::Value::as_u64)
+        {
+            let actual = profile
+                .get("age_secs")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if actual > max {
+                violations.push(format!("age_secs: {actual} > maximum {max}"));
+            }
+        }
+
+        let result = serde_json::json!({
+            "met": violations.is_empty(),
+            "violations": violations,
+        });
+
+        Ok(JsValue::from_str(&result.to_string()))
     })
 }

@@ -10,13 +10,11 @@
 
 use napi_derive::napi;
 
-use scp_core::bridge::provenance::{
-    evaluate_trust_level, mark_bridge_provenance, BridgeTrustLevel,
-};
+use scp_core::bridge::provenance::{evaluate_trust_level, mark_bridge_provenance};
 use scp_core::bridge::registration::{
-    approve_registration, register_bridge, BridgeRegistrationRequest, BridgeRegistry,
+    BridgeRegistrationRequest, BridgeRegistry, approve_registration, register_bridge,
 };
-use scp_core::bridge::shadow::{create_shadow, ShadowRegistry};
+use scp_core::bridge::shadow::{CreateShadowParams, ShadowRegistry, create_shadow};
 use scp_core::bridge::{
     BridgeConnector, BridgeMode, BridgeStatus, ShadowIdentity, ShadowProvenanceStatus,
 };
@@ -157,9 +155,10 @@ pub fn bridge_register(
         })
     })?;
 
-    let governance_did: scp_identity::DID = operator_did.clone().into();
+    // The approver must differ from the operator (governance rule).
+    let approver_did: scp_identity::DID = format!("{operator_did}:approver").into();
     let (connector, _approval_event) =
-        approve_registration(&mut registry, &bridge_id, &governance_did, 0).map_err(|e| {
+        approve_registration(&mut registry, &bridge_id, &approver_did, 0).map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: format!("bridge approval failed: {e}"),
                 code: "SCP-VALID-7013".to_owned(),
@@ -191,21 +190,22 @@ pub fn bridge_create_shadow(
     let shadow_id = format!("shadow-{bridge_id}-{}", platform_handle.replace('@', ""));
     let mut shadow_registry = ShadowRegistry::new(ctx_id);
 
-    let (shadow, _event) = create_shadow(
-        &mut shadow_registry,
-        &shadow_id,
-        &bridge_id,
-        mode,
-        &platform_handle,
-        &[], // no existing context member DIDs for collision check
-        0,   // timestamp
-    )
-    .map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("shadow creation failed: {e}"),
-            code: "SCP-VALID-7014".to_owned(),
-        })
-    })?;
+    let params = CreateShadowParams {
+        shadow_id: &shadow_id,
+        bridge_id: &bridge_id,
+        bridge_mode: mode,
+        platform_handle: &platform_handle,
+        context_member_dids: &[],
+        timestamp: 0,
+    };
+    let mut sender_key_store = scp_core::crypto::sender_keys::SenderKeyStore::new();
+    let (shadow, _event) = create_shadow(&mut shadow_registry, &mut sender_key_store, &params)
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!("shadow creation failed: {e}"),
+                code: "SCP-VALID-7014".to_owned(),
+            })
+        })?;
 
     Ok(NapiShadowIdentity {
         shadow_id: shadow.shadow_id,
@@ -241,9 +241,7 @@ fn parse_shadow_status(s: &str) -> napi::Result<ShadowProvenanceStatus> {
         "shadow" => Ok(ShadowProvenanceStatus::Shadow),
         "claimed" => Ok(ShadowProvenanceStatus::Claimed),
         other => Err(ScpNapiError::Validation {
-            message: format!(
-                "invalid shadow_status '{other}': expected 'shadow' or 'claimed'"
-            ),
+            message: format!("invalid shadow_status '{other}': expected 'shadow' or 'claimed'"),
             code: "SCP-VALID-7011".to_owned(),
         }
         .into()),
@@ -258,25 +256,23 @@ fn parse_shadow_status(s: &str) -> napi::Result<ShadowProvenanceStatus> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use scp_core::bridge::provenance::BridgeTrustLevel;
 
     #[test]
     fn evaluate_trust_native_native() {
-        let result =
-            bridge_evaluate_trust(false, true, "shadow".to_owned()).unwrap();
+        let result = bridge_evaluate_trust(false, true, "shadow".to_owned()).unwrap();
         assert_eq!(result, BridgeTrustLevel::NativeNative as u32);
     }
 
     #[test]
     fn evaluate_trust_shadow_bridged() {
-        let result =
-            bridge_evaluate_trust(true, false, "shadow".to_owned()).unwrap();
+        let result = bridge_evaluate_trust(true, false, "shadow".to_owned()).unwrap();
         assert_eq!(result, BridgeTrustLevel::ShadowBridged as u32);
     }
 
     #[test]
     fn evaluate_trust_claimed_bridged() {
-        let result =
-            bridge_evaluate_trust(true, false, "claimed".to_owned()).unwrap();
+        let result = bridge_evaluate_trust(true, false, "claimed".to_owned()).unwrap();
         assert_eq!(result, BridgeTrustLevel::ClaimedBridged as u32);
     }
 

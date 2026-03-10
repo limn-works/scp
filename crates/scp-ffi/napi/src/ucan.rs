@@ -389,6 +389,181 @@ pub async fn ucan_mint(
     }
 }
 
+/// Delegates a UCAN token to another member.
+///
+/// Creates a delegated UCAN from an existing parent token, signed with the
+/// delegator's Ed25519 key via the retained [`InMemoryKeyCustody`].
+/// Delegation enforces attenuation (capabilities can only narrow, never widen).
+///
+/// # Arguments
+///
+/// * `handle` — The context the token belongs to.
+/// * `delegator_did` — The DID of the entity delegating (must match parent
+///   token's audience).
+/// * `delegatee_did` — The DID of the entity receiving the delegation.
+/// * `parent_token` — The encoded parent UCAN token (JWT format).
+/// * `capabilities` — List of capability URI strings to delegate (must be
+///   subset of parent's capabilities).
+///
+/// # Returns
+///
+/// A `Promise<NapiUcanToken>` with the delegated token's metadata.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-PERM-3023` if the context does not have key custody.
+/// - Rejects with `SCP-PERM-3023` if delegation fails.
+///
+/// See ADR-016 criterion 4.
+#[napi]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Vec
+pub async fn ucan_delegate(
+    handle: &NapiContextHandle,
+    delegator_did: String,
+    delegatee_did: String,
+    parent_token: String,
+    capabilities: Vec<String>,
+) -> napi::Result<NapiUcanToken> {
+    validate_did(&delegator_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_did(&delegatee_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_ucan_token(&parent_token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    for cap in &capabilities {
+        validate_capability_uri(cap).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    }
+
+    #[cfg(not(feature = "allow_in_memory_custody"))]
+    {
+        let _ = (
+            &handle,
+            &delegator_did,
+            &delegatee_did,
+            &parent_token,
+            &capabilities,
+        );
+        return Err(napi::Error::from(ScpNapiError::Permission {
+            message: "UCAN delegation requires key custody -- the in_memory custody path \
+                       is not available in this build. Enable allow_in_memory_custody \
+                       for dev/desktop use."
+                .to_owned(),
+            code: "SCP-PERM-3023".to_owned(),
+        }));
+    }
+
+    #[cfg(feature = "allow_in_memory_custody")]
+    {
+        use scp_core::crypto::ucan::Attenuation;
+        use scp_core::crypto::ucan::mint::{DelegateParams, delegate_ucan};
+        use scp_core::crypto::ucan::validate::parse_ucan;
+
+        let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
+            napi::Error::from(ScpNapiError::Permission {
+                message: "UCAN delegation requires key custody — create the context with an \
+                      in_memory identity (identity_create(\"in_memory\"))"
+                    .to_owned(),
+                code: "SCP-PERM-3023".to_owned(),
+            })
+        })?;
+        let signing_key = handle.signing_key.ok_or_else(|| {
+            napi::Error::from(ScpNapiError::Permission {
+                message: "UCAN delegation requires a signing key — the context creator identity \
+                      must have an active signing key"
+                    .to_owned(),
+                code: "SCP-PERM-3023".to_owned(),
+            })
+        })?;
+
+        let context_id = handle.context_id();
+
+        // Parse the parent token.
+        let parsed_parent = parse_ucan(&parent_token).map_err(ScpNapiError::from)?;
+
+        // Defense-in-depth: verify delegator DID matches parent token's audience.
+        // The delegator must be the audience of the parent token to form a valid
+        // delegation chain (iss/aud linkage). scp-core enforces this too, but
+        // catching it at the bridge level provides clearer error messages and
+        // matches the WASM bridge's defense-in-depth check.
+        if delegator_did != parsed_parent.payload.aud {
+            return Err(napi::Error::from(ScpNapiError::Permission {
+                message: format!(
+                    "delegator DID '{}' does not match parent token audience '{}'",
+                    delegator_did, parsed_parent.payload.aud
+                ),
+                code: "SCP-PERM-3023".to_owned(),
+            }));
+        }
+
+        // Build attenuated capabilities from the capability URI strings.
+        // Use CapabilityUri::from_str for validated parsing instead of ad-hoc
+        // string splitting.
+        let attenuations: Vec<Attenuation> = capabilities
+            .iter()
+            .map(|cap| {
+                let cap_uri_str = if cap.starts_with("scp:ctx:") {
+                    cap.clone()
+                } else {
+                    format!("scp:ctx:{context_id}/{cap}")
+                };
+                let parsed: CapabilityUri =
+                    cap_uri_str
+                        .parse()
+                        .map_err(|e: CoreUcanError| ScpNapiError::Permission {
+                            message: format!("invalid capability URI '{cap_uri_str}': {e}"),
+                            code: "SCP-PERM-3023".to_owned(),
+                        })?;
+                Ok(Attenuation {
+                    with: cap_uri_str,
+                    can: parsed.action().to_owned(),
+                })
+            })
+            .collect::<Result<Vec<_>, ScpNapiError>>()
+            .map_err(napi::Error::from)?;
+
+        // Get ceiling from the context handle for delegation-time enforcement (#339).
+        let ceiling_strings: std::collections::HashSet<String> =
+            handle.ceiling().into_iter().collect();
+        let ceiling = if ceiling_strings.is_empty() {
+            None
+        } else {
+            Some(ceiling_strings)
+        };
+
+        let params = DelegateParams {
+            parent_token: &parsed_parent,
+            delegator_did: &delegator_did,
+            delegator_key: &signing_key,
+            delegatee_did: &delegatee_did,
+            attenuated_capabilities: &attenuations,
+            lifetime_secs: 3600,
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling,
+        };
+
+        let token = delegate_ucan(&params, &custody.0).await.map_err(|e| {
+            napi::Error::from(ScpNapiError::Permission {
+                message: format!("UCAN delegation failed: {e}"),
+                code: "SCP-PERM-3023".to_owned(),
+            })
+        })?;
+
+        let data = NapiUcanTokenData {
+            token_id: token.payload.nnc.clone(),
+            issuer: token.payload.iss.clone(),
+            audience: token.payload.aud.clone(),
+            capabilities: token.payload.att.iter().map(|a| a.with.clone()).collect(),
+            #[allow(clippy::cast_precision_loss)]
+            expires_at: Some(token.payload.exp as f64),
+        };
+
+        increment_handle_count();
+        Ok(NapiUcanToken {
+            data,
+            encoded: token.encoded,
+        })
+    }
+}
+
 /// Revokes a UCAN token.
 ///
 /// Adds the token to the context's persistent revocation list. Revoked tokens

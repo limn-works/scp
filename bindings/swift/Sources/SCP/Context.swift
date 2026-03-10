@@ -14,34 +14,45 @@ import Foundation
 ///
 /// See ADR-021 for the bridge function surface and ADR-026 for the delegation
 /// pattern (every Swift SDK method calls exactly one bridge function).
-internal enum ContextBridge {
+public enum ContextBridge {
     /// The closure type for context creation. Injected for testability.
-    internal typealias CreateFn = @Sendable (
+    public typealias CreateFn = @Sendable (
         _ contextId: String,
         _ ceiling: [String]
     ) async throws -> any ContextHandleProtocol
 
     /// The closure type for sending a message. Injected for testability.
-    internal typealias SendFn = @Sendable (
+    public typealias SendFn = @Sendable (
         _ handle: any ContextHandleProtocol,
         _ payload: Data
     ) async throws -> Void
 
     /// The closure type for subscribing to messages. Injected for testability.
-    internal typealias SubscribeFn = @Sendable (
+    public typealias SubscribeFn = @Sendable (
         _ handle: any ContextHandleProtocol,
         _ listener: any MessageListener
     ) -> Void
 
     /// The closure type for leaving a context. Injected for testability.
-    internal typealias LeaveFn = @Sendable (
+    public typealias LeaveFn = @Sendable (
         _ handle: any ContextHandleProtocol
     ) async throws -> Void
 
     /// The closure type for closing a context. Injected for testability.
-    internal typealias CloseFn = @Sendable (
+    public typealias CloseFn = @Sendable (
         _ handle: any ContextHandleProtocol
     ) async throws -> Void
+
+    /// The closure type for joining an existing context. Injected for testability.
+    public typealias JoinFn = @Sendable (
+        _ handle: ContextHandle,
+        _ identity: Identity
+    ) async throws -> Void
+
+    /// Default join function — delegates to UniFFI ``contextJoin``.
+    public static let defaultJoin: JoinFn = { handle, identity in
+        try await contextJoin(handle: handle, identity: identity)
+    }
 }
 
 // MARK: - MessageListenerAdapter
@@ -71,7 +82,7 @@ private final class MessageListenerAdapter: MessageListener, @unchecked Sendable
         continuation.yield(message)
     }
 
-    func onError(error: ScpError) {
+    func onError(error _: ScpError) {
         // Finish the stream on error. Consumers detect end-of-stream via
         // the `for await` loop terminating. The specific error is not
         // propagated through AsyncStream (which has no error channel);
@@ -123,8 +134,11 @@ public actor Context {
     /// The unique identifier of this context.
     public let contextId: String
 
+    /// The DID of the context creator, cached from the handle at init time.
+    public let creatorDid: String
+
     /// The current lifecycle state of this context.
-    public private(set) var state: ContextState
+    public internal(set) var state: ContextState
 
     // MARK: - Internal state
 
@@ -132,11 +146,18 @@ public actor Context {
     ///
     /// Internal visibility so that extensions in other files (Tools.swift,
     /// etc.) can cast to ``ContextHandle`` for UniFFI bridge calls.
-    internal let handle: any ContextHandleProtocol
+    let handle: any ContextHandleProtocol
 
     /// The continuation for the active message stream, if any.
     /// Retained so that ``close()`` and ``leave()`` can finish the stream.
     private var streamContinuation: AsyncStream<Message>.Continuation?
+
+    /// Whether ``close()`` or ``leave()`` has already been called.
+    /// Checked in `deinit` to avoid redundant cleanup. Marked
+    /// `nonisolated(unsafe)` because `deinit` cannot access actor-isolated
+    /// storage — the flag is only read in `deinit` after all actor-isolated
+    /// methods have finished.
+    nonisolated(unsafe) var didClose = false
 
     // MARK: - Bridge function references (injected for testability)
 
@@ -154,28 +175,50 @@ public actor Context {
     ///
     /// - Parameters:
     ///   - handle: The opaque UniFFI context handle.
+    ///   - contextId: Optional override for the context ID. When `nil`,
+    ///     the ID is read from the handle. Pass explicitly in tests where
+    ///     the handle has no backing FFI pointer.
+    ///   - initialState: Optional override for the initial state. When
+    ///     `nil`, the state is read from the handle (defaulting to
+    ///     ``ContextState/active`` if the handle throws).
     ///   - sendFn: Bridge function for sending messages.
     ///   - subscribeFn: Bridge function for subscribing to messages.
     ///   - leaveFn: Bridge function for leaving the context.
     ///   - closeFn: Bridge function for closing the context.
-    internal init(
+    init(
         handle: any ContextHandleProtocol,
+        contextId: String? = nil,
+        creatorDid: String? = nil,
+        initialState: ContextState? = nil,
         sendFn: @escaping ContextBridge.SendFn,
         subscribeFn: @escaping ContextBridge.SubscribeFn,
         leaveFn: @escaping ContextBridge.LeaveFn,
         closeFn: @escaping ContextBridge.CloseFn
     ) {
         self.handle = handle
-        self.contextId = handle.contextId()
-        // UniFFI ContextHandleProtocol.state() throws, so use try? with a fallback.
-        let stateString = (try? handle.state()) ?? "active"
-        switch stateString {
-        case "creating": self.state = .creating
-        case "active": self.state = .active
-        case "closing": self.state = .closing
-        case "closed": self.state = .closed
-        case "expired": self.state = .expired
-        default: self.state = .active
+        if let contextId {
+            self.contextId = contextId
+        } else {
+            self.contextId = handle.contextId()
+        }
+        if let creatorDid {
+            self.creatorDid = creatorDid
+        } else {
+            self.creatorDid = handle.creatorDid()
+        }
+        if let initialState {
+            state = initialState
+        } else {
+            // UniFFI ContextHandleProtocol.state() throws, so use try? with a fallback.
+            let stateString = (try? handle.state()) ?? "active"
+            switch stateString {
+            case "creating": state = .creating
+            case "active": state = .active
+            case "closing": state = .closing
+            case "closed": state = .closed
+            case "expired": state = .expired
+            default: state = .active
+            }
         }
         self.sendFn = sendFn
         self.subscribeFn = subscribeFn
@@ -190,10 +233,11 @@ public actor Context {
         // `try?` intentionally suppresses errors in the deinit path. The detached
         // task captures only the handle and closeFn (both Sendable) — it does not
         // capture `self`, which would be invalid in deinit.
+        streamContinuation?.finish()
+        guard !didClose else { return }
         let capturedHandle = handle
         let capturedCloseFn = closeFn
-        streamContinuation?.finish()
-        Task {
+        Task.detached {
             try? await capturedCloseFn(capturedHandle)
         }
     }
@@ -218,7 +262,7 @@ public actor Context {
     ///   - closeFn: Bridge function for closing the context.
     /// - Returns: A new `Context` in the ``ContextState/active`` state.
     /// - Throws: ``ScpError/Context(message:code:)`` if context creation fails.
-    internal static func create(
+    static func create( // swiftlint:disable:this function_parameter_count
         contextId: String,
         ceiling: [String],
         createFn: ContextBridge.CreateFn,
@@ -266,7 +310,7 @@ public actor Context {
     ///
     /// Only one active message stream per context is supported. Accessing this
     /// property while a previous stream is still active throws
-    /// ``ScpError/Context(message:code:)`` with code `"SCP-CTX-2002"`.
+    /// ``ScpError/Context(message:code:)`` with code `"SCP-CTX-2003"`.
     /// To create a new stream, first ``close()`` or ``leave()`` the context
     /// (which finishes the existing stream), or consume the existing stream
     /// to completion.
@@ -279,24 +323,43 @@ public actor Context {
     /// }
     /// ```
     ///
-    /// - Throws: ``ScpError/Context(message:code:)`` with code `"SCP-CTX-2002"`
-    ///   if a message stream is already active on this context.
+    /// - Throws: ``ScpError/Context(message:code:)`` with code `"SCP-CTX-2001"`
+    ///   if the context is not active, or `"SCP-CTX-2003"` if a message stream
+    ///   is already active on this context.
     public var messages: AsyncStream<Message> {
         get throws {
+            guard state == .active else {
+                throw ScpError.Context(
+                    message: "Context is not active",
+                    code: "SCP-CTX-2001"
+                )
+            }
             guard streamContinuation == nil else {
                 throw ScpError.Context(
                     message: "A message stream is already active on this context. "
                         + "Consume or close the existing stream before creating a new one.",
-                    code: "SCP-CTX-2002"
+                    code: "SCP-CTX-2003"
                 )
             }
 
             let (stream, continuation) = AsyncStream<Message>.makeStream()
-            self.streamContinuation = continuation
+            streamContinuation = continuation
+            continuation.onTermination = { [weak self] _ in
+                // Clear the continuation when the stream finishes naturally so
+                // a new stream can be created on re-subscribe.
+                guard let self else { return }
+                Task { await self.clearStreamContinuation() }
+            }
             let listener = MessageListenerAdapter(continuation: continuation)
             subscribeFn(handle, listener)
             return stream
         }
+    }
+
+    /// Clears the stream continuation reference. Called from `onTermination`
+    /// to allow a new message stream after the previous one finishes.
+    private func clearStreamContinuation() {
+        streamContinuation = nil
     }
 
     /// Leaves this context gracefully.
@@ -316,6 +379,7 @@ public actor Context {
         }
         try await leaveFn(handle)
         state = .closed
+        didClose = true
         streamContinuation?.finish()
         streamContinuation = nil
     }
@@ -339,7 +403,35 @@ public actor Context {
         }
         try await closeFn(handle)
         state = .closed
+        didClose = true
         streamContinuation?.finish()
         streamContinuation = nil
     }
+}
+
+// MARK: - Context Join (free function)
+
+/// Joins an existing SCP context.
+///
+/// Delegates to the UniFFI ``contextJoin`` bridge function. The identity
+/// provides the key package for MLS group admission.
+///
+/// - Parameters:
+///   - handle: The ``ContextHandle`` for the context to join.
+///   - identity: The ``Identity`` joining the context.
+///   - joinFn: Bridge function override for testing.
+/// - Throws: ``ScpError/Context(message:code:)`` if the context is not
+///   in active state or the join operation fails.
+///
+/// ## Provenance
+///
+/// - ADR-021 (UniFFI Bridge)
+/// - ADR-026 (Swift SDK)
+/// - Spec section 5 (Context Lifecycle)
+public func joinContext(
+    handle: ContextHandle,
+    identity: Identity,
+    joinFn: ContextBridge.JoinFn = ContextBridge.defaultJoin
+) async throws {
+    try await joinFn(handle, identity)
 }

@@ -11,26 +11,29 @@
  * See ADR-022 in `.docs/adrs/phase-4.md`.
  */
 
-import { TransportError } from "../errors.js";
+import type { BridgeMode, ShadowStatus } from "../bridge";
+import { TransportError } from "../errors";
 import type {
+  BroadcastAdmissionPolicy,
   Checkpoint,
   DIDDocument,
   Event,
   EventClaim,
   EventFilter,
+  MemberRole,
   Proof,
   ToolDefinition,
   ToolVerificationResult,
   TransportStatus,
   UcanToken,
-} from "../types.js";
+} from "../types";
 import type {
   Bridge,
   BridgeContextHandle,
   BridgeIdentityHandle,
   BridgeTransportHandle,
   MessageCallback,
-} from "./bridge.js";
+} from "./bridge";
 
 // ---------------------------------------------------------------------------
 // WASM module types
@@ -116,6 +119,137 @@ interface WasmModule {
     encoded: string;
   }>;
   ucan_revoke: (handle: BridgeContextHandle, token: string) => Promise<void>;
+  // Bridge Connector
+  bridge_register: (
+    contextId: string,
+    operatorDid: string,
+    platform: string,
+    mode: BridgeMode,
+  ) => ReturnType<Bridge["bridgeRegister"]>;
+  bridge_evaluate_trust: (
+    isBridged: boolean,
+    isNativeTransport: boolean,
+    shadowStatus: ShadowStatus,
+  ) => number;
+  bridge_create_shadow: (
+    bridgeId: string,
+    platformHandle: string,
+    bridgeMode: BridgeMode,
+    contextId: string,
+  ) => ReturnType<Bridge["bridgeCreateShadow"]>;
+  // Discovery
+  discovery_parse_address: (address: string) => string;
+  discovery_create_query: (
+    capabilitiesJson: string | undefined,
+    keywordsJson: string | undefined,
+    minHistorySecs: number | undefined,
+  ) => string;
+  discovery_normalize_address: (address: string) => string;
+  context_discover: (query: string) => Promise<string>;
+  // Provenance
+  evaluate_provenance_quality: (
+    sourceContext: string | undefined,
+    sourceType: string,
+    contextState: string,
+    counterpartiesJson: string | undefined,
+  ) => number;
+  provenance_attach: (
+    sourceContextId: string,
+    sourceType: string,
+    memoryScope: string,
+    membersJson: string,
+    targetContextId: string,
+    existingChainDepth: number | undefined,
+  ) => string;
+  provenance_check_chain_depth: (chainDepth: number, maxDepth: number | undefined) => boolean;
+  // Sync
+  sync_classify_offline: (lastRelayContact: number, now: number) => string;
+  sync_get_policy: () => ReturnType<Bridge["syncGetPolicy"]>;
+  // Identity Advanced
+  identity_create_with_agent_key: (
+    custody: string,
+  ) => Promise<{ did: string; custodyType: string }>;
+  identity_add_agent_key: (identity: { did: string; custodyType: string }) => {
+    did: string;
+    custodyType: string;
+  };
+  identity_rotate_agent_key: (identity: { did: string; custodyType: string }) => {
+    did: string;
+    custodyType: string;
+  };
+  identity_remove_agent_key: (identity: { did: string; custodyType: string }) => {
+    did: string;
+    custodyType: string;
+  };
+  identity_migrate: (identity: {
+    did: string;
+    custodyType: string;
+  }) => Promise<{ did: string; custodyType: string }>;
+  identity_attest_device: (did: string) => Promise<string>;
+  identity_verify_device_attestation: (did: string, tokenBase64: string) => Promise<boolean>;
+  // Membership queries
+  context_member_count: (handle: BridgeContextHandle) => number | null;
+  context_is_member: (handle: BridgeContextHandle, did: string) => boolean;
+  context_member_dids: (handle: BridgeContextHandle) => string;
+  context_member_role: (handle: BridgeContextHandle, did: string) => string | null;
+  // Broadcast operations
+  broadcast_subscribe: (handle: BridgeContextHandle, subscriberDid: string) => Promise<void>;
+  broadcast_unsubscribe: (handle: BridgeContextHandle, subscriberDid: string) => Promise<void>;
+  broadcast_publish: (
+    handle: BridgeContextHandle,
+    authorDid: string,
+    payloadBase64: string,
+  ) => Promise<void>;
+  broadcast_block: (handle: BridgeContextHandle, subscriberDid: string) => Promise<void>;
+  broadcast_subscriber_count: (handle: BridgeContextHandle) => number | null;
+  broadcast_is_subscriber: (handle: BridgeContextHandle, did: string) => boolean;
+  broadcast_admission: (handle: BridgeContextHandle) => string | null;
+  broadcast_handle_key_request: (
+    handle: BridgeContextHandle,
+    authorDid: string,
+    requesterDid: string,
+  ) => Promise<string>;
+  // Identity key rotation
+  identity_rotate_key: (identity: { did: string; custodyType: string }) => {
+    did: string;
+    custodyType: string;
+  };
+  // Governance
+  context_execute_governance: (
+    handle: BridgeContextHandle,
+    initiatorDid: string,
+    proposalId: string,
+    actionJson: string,
+  ) => Promise<string>;
+  // Event log checkpoint
+  event_log_checkpoint: (
+    handle: BridgeContextHandle,
+    identityDid: string,
+    epoch: number,
+  ) => Promise<{
+    contextId: string;
+    senderDid: string;
+    eventCount: number;
+    merkleRoot: string;
+    epoch: number | null;
+    timestamp: number;
+    signingPayloadHash: string;
+  }>;
+  // Context drain/export/import
+  context_drain_events: (handle: BridgeContextHandle) => string;
+  context_export: (handle: BridgeContextHandle) => Promise<Uint8Array>;
+  context_import: (data: Uint8Array) => Promise<string>;
+  // TTL
+  context_ttl_remaining: (handle: BridgeContextHandle) => number | null;
+  context_extend_ttl: (handle: BridgeContextHandle, additionalSecs: number) => Promise<void>;
+  // UCAN delegate
+  ucan_delegate: (
+    handle: BridgeContextHandle,
+    delegatorDid: string,
+    delegateeDid: string,
+    parentToken: string,
+    capabilitiesJson: string,
+  ) => Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -246,12 +380,13 @@ export function createWasmBridge(): Bridge {
       };
     },
 
-    async identityRotateKey(_handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
-      throw new TransportError(
-        "Key rotation in the browser requires WebCrypto orchestration -- " +
-          "this operation is not yet supported in the WASM bridge",
-        "SCP-TRANS-5004",
-      );
+    async identityRotateKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      const wasm = getWasm();
+      const result = wasm.identity_rotate_key({
+        did: handle.did,
+        custodyType: handle.custodyType,
+      });
+      return { did: result.did, custodyType: result.custodyType };
     },
 
     // Context
@@ -314,6 +449,123 @@ export function createWasmBridge(): Bridge {
           callback.onComplete();
         },
       });
+    },
+
+    // Membership queries — delegate to WASM runtime
+    async contextMemberCount(handle: BridgeContextHandle): Promise<number | null> {
+      const wasm = getWasm();
+      const count = wasm.context_member_count(handle);
+      return count ?? null;
+    },
+
+    async contextIsMember(handle: BridgeContextHandle, did: string): Promise<boolean> {
+      const wasm = getWasm();
+      return wasm.context_is_member(handle, did);
+    },
+
+    async contextMemberDids(handle: BridgeContextHandle): Promise<readonly string[]> {
+      const wasm = getWasm();
+      const json = wasm.context_member_dids(handle);
+      return JSON.parse(json) as string[];
+    },
+
+    async contextMemberRole(handle: BridgeContextHandle, did: string): Promise<MemberRole | null> {
+      const wasm = getWasm();
+      const role = wasm.context_member_role(handle, did);
+      return (role as MemberRole | null) ?? null;
+    },
+
+    // Broadcast operations — delegate to WASM runtime
+    async broadcastSubscribe(handle: BridgeContextHandle, subscriberDid: string): Promise<void> {
+      const wasm = getWasm();
+      await wasm.broadcast_subscribe(handle, subscriberDid);
+    },
+
+    async broadcastUnsubscribe(
+      handle: BridgeContextHandle,
+      subscriberDid: string,
+      rotateKeys?: boolean,
+    ): Promise<void> {
+      if (rotateKeys === true) {
+        throw new TransportError(
+          "WASM bridge does not support key rotation on broadcastUnsubscribe. " +
+            "Use the native (napi-rs) bridge for rotateKeys support.",
+          "SCP-TRANS-5003",
+        );
+      }
+      const wasm = getWasm();
+      await wasm.broadcast_unsubscribe(handle, subscriberDid);
+    },
+
+    async broadcastPublish(
+      handle: BridgeContextHandle,
+      authorDid: string,
+      payload: Uint8Array,
+    ): Promise<void> {
+      const wasm = getWasm();
+      const payloadBase64 = uint8ToBase64(payload);
+      await wasm.broadcast_publish(handle, authorDid, payloadBase64);
+    },
+
+    async broadcastBlockSubscriber(
+      handle: BridgeContextHandle,
+      subscriberDid: string,
+      _blockerDid: string,
+    ): Promise<void> {
+      const wasm = getWasm();
+      // WASM bridge only takes the subscriber DID; blockerDid is ignored.
+      await wasm.broadcast_block(handle, subscriberDid);
+    },
+
+    async broadcastHandleKeyRequest(
+      handle: BridgeContextHandle,
+      authorDid: string,
+      requesterDid: string,
+    ): Promise<string> {
+      const wasm = getWasm();
+      return await wasm.broadcast_handle_key_request(handle, authorDid, requesterDid);
+    },
+
+    async broadcastSubscriberCount(handle: BridgeContextHandle): Promise<number | null> {
+      const wasm = getWasm();
+      const count = wasm.broadcast_subscriber_count(handle);
+      return count ?? null;
+    },
+
+    async broadcastIsSubscriber(handle: BridgeContextHandle, did: string): Promise<boolean> {
+      const wasm = getWasm();
+      return wasm.broadcast_is_subscriber(handle, did);
+    },
+
+    async broadcastAdmission(
+      handle: BridgeContextHandle,
+    ): Promise<BroadcastAdmissionPolicy | null> {
+      const wasm = getWasm();
+      const admission = wasm.broadcast_admission(handle);
+      if (admission == null) return null;
+      return admission as BroadcastAdmissionPolicy;
+    },
+
+    // Governance — delegate to WASM runtime
+    async contextExecuteGovernanceAction(
+      handle: BridgeContextHandle,
+      proposalJson: string,
+    ): Promise<string> {
+      const wasm = getWasm();
+      // The Bridge interface passes a single proposalJson containing initiatorDid,
+      // proposalId, and action. Parse and forward to the WASM export which takes
+      // them as separate parameters.
+      const proposal = JSON.parse(proposalJson) as {
+        initiatorDid: string;
+        proposalId: string;
+        action: unknown;
+      };
+      return await wasm.context_execute_governance(
+        handle,
+        proposal.initiatorDid,
+        proposal.proposalId,
+        JSON.stringify(proposal.action),
+      );
     },
 
     // Tools -- delegates to WASM runtime registry
@@ -443,15 +695,169 @@ export function createWasmBridge(): Bridge {
       };
     },
 
-    async eventLogCheckpoint(_handle: BridgeContextHandle): Promise<Checkpoint> {
-      // Checkpoint requires access to the Merkle root — this is not directly
-      // exposed via a dedicated WASM export yet. Return a minimal checkpoint
-      // from available data. The WASM bridge stores the Merkle tree internally;
-      // the root is accessible via event_log_verify with a known leaf.
-      throw new TransportError(
-        "Event log checkpoint in the WASM bridge requires a dedicated export",
-        "SCP-CTX-2027",
+    async eventLogCheckpoint(
+      handle: BridgeContextHandle,
+      identityDid: string,
+      epoch: number,
+    ): Promise<Checkpoint> {
+      const wasm = getWasm();
+      const result = await wasm.event_log_checkpoint(handle, identityDid, epoch);
+      return {
+        root: result.merkleRoot,
+        eventCount: result.eventCount,
+        timestamp: result.timestamp,
+      };
+    },
+
+    // Bridge Connector
+    bridgeRegister(contextId: string, operatorDid: string, platform: string, mode: BridgeMode) {
+      const wasm = getWasm();
+      return wasm.bridge_register(contextId, operatorDid, platform, mode);
+    },
+
+    bridgeEvaluateTrust(
+      isBridged: boolean,
+      isNativeTransport: boolean,
+      shadowStatus: ShadowStatus,
+    ) {
+      const wasm = getWasm();
+      return wasm.bridge_evaluate_trust(isBridged, isNativeTransport, shadowStatus);
+    },
+
+    bridgeCreateShadow(
+      bridgeId: string,
+      platformHandle: string,
+      bridgeMode: BridgeMode,
+      contextId: string | undefined,
+    ) {
+      const wasm = getWasm();
+      return wasm.bridge_create_shadow(
+        bridgeId,
+        platformHandle,
+        bridgeMode,
+        contextId ?? "ctx-shadow",
       );
+    },
+
+    // Discovery
+    discoveryParseAddress(address: string) {
+      const wasm = getWasm();
+      return wasm.discovery_parse_address(address);
+    },
+
+    discoveryCreateQuery(
+      capabilities: string[] | undefined,
+      keywords: string[] | undefined,
+      minHistorySecs: number | undefined,
+    ) {
+      const wasm = getWasm();
+      return wasm.discovery_create_query(
+        capabilities ? JSON.stringify(capabilities) : undefined,
+        keywords ? JSON.stringify(keywords) : undefined,
+        minHistorySecs,
+      );
+    },
+
+    discoveryNormalizeAddress(address: string) {
+      const wasm = getWasm();
+      return wasm.discovery_normalize_address(address);
+    },
+
+    async contextDiscover(query: string): Promise<string> {
+      const wasm = getWasm();
+      return await wasm.context_discover(query);
+    },
+
+    // Provenance
+    async evaluateProvenanceQuality(
+      sourceContext: string | undefined,
+      sourceType: string,
+      contextState: string,
+      counterparties: string[] | undefined,
+    ): Promise<number> {
+      const wasm = getWasm();
+      return wasm.evaluate_provenance_quality(
+        sourceContext,
+        sourceType,
+        contextState,
+        counterparties ? JSON.stringify(counterparties) : undefined,
+      );
+    },
+
+    provenanceAttach(
+      sourceContextId: string,
+      sourceType: string,
+      memoryScope: string,
+      members: string[],
+      targetContextId: string,
+      existingChainDepth: number | undefined,
+    ) {
+      const wasm = getWasm();
+      return wasm.provenance_attach(
+        sourceContextId,
+        sourceType,
+        memoryScope,
+        JSON.stringify(members),
+        targetContextId,
+        existingChainDepth,
+      );
+    },
+
+    provenanceCheckChainDepth(chainDepth: number, maxDepth: number | undefined) {
+      const wasm = getWasm();
+      return wasm.provenance_check_chain_depth(chainDepth, maxDepth);
+    },
+
+    // Sync
+    syncClassifyOffline(lastRelayContact: number, now: number) {
+      const wasm = getWasm();
+      return wasm.sync_classify_offline(lastRelayContact, now);
+    },
+
+    syncGetPolicy() {
+      const wasm = getWasm();
+      return wasm.sync_get_policy();
+    },
+
+    // Identity Advanced
+    async identityCreateWithAgentKey(custody: string): Promise<BridgeIdentityHandle> {
+      const wasm = getWasm();
+      const handle = await wasm.identity_create_with_agent_key(custody);
+      return { did: handle.did, custodyType: handle.custodyType };
+    },
+
+    async identityAddAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      const wasm = getWasm();
+      const updated = wasm.identity_add_agent_key(handle);
+      return { did: updated.did, custodyType: updated.custodyType };
+    },
+
+    async identityRotateAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      const wasm = getWasm();
+      const updated = wasm.identity_rotate_agent_key(handle);
+      return { did: updated.did, custodyType: updated.custodyType };
+    },
+
+    async identityRemoveAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      const wasm = getWasm();
+      const updated = wasm.identity_remove_agent_key(handle);
+      return { did: updated.did, custodyType: updated.custodyType };
+    },
+
+    async identityMigrate(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      const wasm = getWasm();
+      const updated = await wasm.identity_migrate(handle);
+      return { did: updated.did, custodyType: updated.custodyType };
+    },
+
+    async identityAttestDevice(did: string): Promise<string> {
+      const wasm = getWasm();
+      return await wasm.identity_attest_device(did);
+    },
+
+    async identityVerifyDeviceAttestation(did: string, tokenBase64: string): Promise<boolean> {
+      const wasm = getWasm();
+      return await wasm.identity_verify_device_attestation(did, tokenBase64);
     },
 
     // Lifecycle

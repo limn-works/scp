@@ -300,6 +300,31 @@ pub enum ToolError {
         reason: String,
     },
 
+    /// The invoker is not in the outbound policy's `allowed_callers` list (§6.2.0.1).
+    #[error("invoker \"{did}\" not in outbound policy allowed_callers for interface")]
+    InterfaceCallerNotAllowed {
+        /// The DID that was not in the allowed callers list.
+        did: String,
+    },
+
+    /// The request payload exceeds the outbound policy's `max_payload_bytes` (§6.2.0.1).
+    #[error("request payload size {actual} exceeds outbound policy limit {max} bytes")]
+    InterfacePayloadTooLarge {
+        /// Actual payload size in bytes.
+        actual: usize,
+        /// Maximum allowed by outbound policy.
+        max: u32,
+    },
+
+    /// The response payload exceeds the inbound policy's `max_response_bytes` (§6.2.0.1).
+    #[error("response payload size {actual} exceeds inbound policy limit {max} bytes")]
+    InterfaceResponseTooLarge {
+        /// Actual response size in bytes.
+        actual: usize,
+        /// Maximum allowed by inbound policy.
+        max: u32,
+    },
+
     /// The system clock is unavailable or before the Unix epoch.
     #[error("clock error: {0}")]
     ClockError(#[from] crate::time::ClockError),

@@ -296,18 +296,18 @@ pub enum MemoryScope {
 
 ### Context
 
-SCP enforces a zero-trust capability model at Layer 1 (spec section 7.2): every action requires a valid UCAN capability token, verified mechanically. No action proceeds on identity or reputation alone. The capability ceiling is declared at context creation and is immutable (spec section 5.3) — it bounds the maximum set of operations possible in the context. Roles (spec section 5.5) define subsets of the ceiling that specific agents can exercise.
+SCP enforces a zero-trust capability model at Layer 1 (spec section 7.2): every action requires a valid UCAN capability token, verified mechanically. No action proceeds on identity or reputation alone. The capability ceiling is declared at context creation and is governed by the context's `CeilingPolicy` (ADR-008, spec section 5.3) — if `Immutable` (the default), the ceiling cannot change; if `Governed`, the ceiling can be modified through the context's governance model. The ceiling policy itself is immutable. Roles (spec section 5.5) define subsets of the ceiling that specific agents can exercise.
 
 UCAN (User Controlled Authorization Networks) tokens provide the mechanism: per-agent, per-context, per-capability tokens with cryptographic delegation chains and independent revocability (spec section 7.2). The protocol validates UCAN signature chains, capability scoping, nonce uniqueness (spec section 9.5), and revocation status on every action.
 
 ### Decision
 
-Implement UCAN-based capability enforcement in `scp-core/context/` and `scp-core/crypto/`. Every context operation — message send, tool invocation, member management, role change, governance action — requires a valid UCAN token. Tokens are issued at role assignment, scoped to the context and the role's permission set, and validated on every call. The ceiling is set at context creation and is immutable for the lifetime of the context.
+Implement UCAN-based capability enforcement in `scp-core/context/` and `scp-core/crypto/`. Every context operation — message send, tool invocation, member management, role change, governance action — requires a valid UCAN token. Tokens are issued at role assignment, scoped to the context and the role's permission set, and validated on every call. The ceiling is set at context creation; its mutability is determined by the `CeilingPolicy` declared at creation (ADR-008): `Immutable` (default, cannot change) or `Governed` (modifiable through governance). The ceiling policy itself is immutable.
 
 ### Rationale
 
 - **UCAN over ACLs:** UCAN tokens are bearer tokens with cryptographic delegation chains. They are self-contained (no server roundtrip to check permissions), independently verifiable (any party can validate the chain), and independently revocable. ACLs require a central authority to check — UCAN requires only the token and the public keys in the chain.
-- **Immutable ceiling:** The capability ceiling is part of the opt-in contract (spec section 5.7). Members see the ceiling before joining. Making it immutable prevents bait-and-switch: a context cannot expand its capabilities after members have joined. If a broader ceiling is needed, create a new context. This is a hard security boundary.
+- **Ceiling policy at creation:** The capability ceiling is part of the opt-in contract (spec section 5.7). Members see the ceiling and its mutability policy before joining. When `CeilingPolicy::Immutable` (the default for all well-known templates), the ceiling cannot change — preventing bait-and-switch. When `CeilingPolicy::Governed`, changes go through governance and members are notified before expansion takes effect (ADR-008). The ceiling policy itself is immutable — it cannot be changed after creation.
 - **Per-action validation:** UCAN is validated on EVERY action, not just at context join. A token revoked mid-session takes effect immediately — the next action fails. This prevents permission drift and makes revocation instant.
 - **Nonce uniqueness (spec section 9.5):** Every UCAN token includes a mandatory nonce. The SDK tracks seen nonces and rejects duplicates. This prevents token replay — a captured UCAN cannot be reused.
 - **Role as token template:** Roles define which capabilities a member gets. When a member is assigned a role, the Context Manager mints UCAN tokens for each capability in the role's permission set, delegated from the context creator's authority. Role change = revoke old tokens + mint new tokens.
@@ -357,7 +357,7 @@ pub enum Capability {
    **Mode-agnostic capabilities.** `MessagesRead` and `MessagesWrite` apply to both Encrypted and Broadcast modes. The abstract capability to read/write in a context is independent of the encryption pipeline — `ContextMode` determines processing, not authorization. No new capability variants are needed for broadcast mode.
 
    - Ceiling is set at context creation via `ContextParams.ceiling`.
-   - Ceiling is immutable. Any attempt to modify returns `ContextError::CeilingImmutable`.
+   - Ceiling mutability is determined by `ContextParams.ceiling_policy` (ADR-008): `Immutable` (default) returns `ContextError::CeilingImmutable` on modification; `Governed` allows modification through the context's governance model.
    - Role permission sets are validated against the ceiling at role definition time. A role cannot grant capabilities outside the ceiling.
 
 2. **`RoleDefinition` and built-in roles:**

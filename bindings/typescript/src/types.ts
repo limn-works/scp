@@ -36,6 +36,68 @@ export interface ContextParams {
 }
 
 // ---------------------------------------------------------------------------
+// Membership
+// ---------------------------------------------------------------------------
+
+/**
+ * Role assigned to a member within a context (spec section 5.5).
+ *
+ * Mirrors `scp_core::context::roles::Role`.
+ */
+export type MemberRole = "Admin" | "Moderator" | "Member" | "Observer" | "Custom";
+
+// ---------------------------------------------------------------------------
+// Broadcast
+// ---------------------------------------------------------------------------
+
+/**
+ * Admission policy for a broadcast context.
+ *
+ * - `"Open"` — any DID can subscribe without authorization.
+ * - `"Gated"` — subscription requires a valid `messagesRead` UCAN.
+ */
+export type BroadcastAdmissionPolicy = "Open" | "Gated";
+
+// ---------------------------------------------------------------------------
+// Governance
+// ---------------------------------------------------------------------------
+
+/**
+ * Result of executing a governance action (ADR-031).
+ *
+ * Each variant corresponds to one of the 28 governance action outcomes.
+ */
+export type GovernanceActionResult =
+  | "MemberAdded"
+  | "MemberRemoved"
+  | "RoleChanged"
+  | "ToolRegistered"
+  | "ToolRemoved"
+  | "CeilingModified"
+  | "ContextClosed"
+  | "TtlExtended"
+  | "PruningPolicyModified"
+  | "AdminTransferred"
+  | "SignerAdded"
+  | "SignerRemoved"
+  | "ThresholdModified"
+  | "ChildContextCreated"
+  | "ToolInterfaceEstablished"
+  | "MemberReset"
+  | "ConflictResolved"
+  | "ContextPromoted"
+  | "ReadAccessRevoked"
+  | "ReadAccessRestored"
+  | "WriteAccessRevoked"
+  | "WriteAccessRestored"
+  | "ContentKeysRotated"
+  | "GovernanceReconfigured"
+  | "AuthorBlocked"
+  | "SubscriberBanned"
+  | "SubscriberUnbanned"
+  | "Executed";
+
+// ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
 
@@ -301,6 +363,48 @@ export interface AttestationSummary {
   readonly valid: boolean;
   /** Whether the attestation has been revoked. */
   readonly revoked: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Participation (spec section 9.3, SCP-BA-004)
+// ---------------------------------------------------------------------------
+
+/** A verified participation fact used in admission evaluation. */
+export interface ParticipationFact {
+  /** Type of participation fact (e.g., `"context_membership"`). */
+  readonly factType: string;
+  /** DID of the participant this fact pertains to. */
+  readonly participantDid: string;
+  /** Context ID where the fact was observed. */
+  readonly contextId: string;
+  /** Numeric value of the fact (e.g., participation count). */
+  readonly value: number;
+}
+
+/** A threshold requirement for context admission. */
+export interface ParticipationThreshold {
+  /** The fact type this threshold applies to. */
+  readonly factType: string;
+  /** Minimum value required to satisfy the threshold. */
+  readonly minimum: number;
+  /** Optional maximum value constraint. */
+  readonly maximum?: number;
+}
+
+/** A participant's aggregated participation profile. */
+export interface ParticipationProfile {
+  /** DID of the participant. */
+  readonly participantDid: string;
+  /** Verified participation facts. */
+  readonly facts: readonly ParticipationFact[];
+}
+
+/** Participation-based admission requirement for a context. */
+export interface RequireParticipation {
+  /** Thresholds that must be met for admission. */
+  readonly thresholds: readonly ParticipationThreshold[];
+  /** Whether ALL thresholds must be met (true) or ANY (false). */
+  readonly requireAll: boolean;
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,30 @@
+# SwiftLint configuration for SCP Swift SDK
+# See .docs/standards/swift.md for rationale
+
+excluded:
+  # UniFFI-generated bindings — auto-generated, do not lint
+  - Sources/SCP/Internal
+  # Build artifacts
+  - .build
+  - .build-xcframework
+  - ScpFFI.xcframework
+
+# Rules matching .docs/standards/swift.md § Safety
+opt_in_rules:
+  - force_unwrapping
+  - implicitly_unwrapped_optional
+
+disabled_rules:
+  # Line length is handled by SwiftFormat
+  - line_length
+  # Generated code triggers this
+  - file_length
+
+# Test files grow as wrapper functions are added — allow larger bodies
+type_body_length:
+  warning: 300
+  error: 500
+
+# Force cast and force try are already enabled by default
+# force_cast: error
+# force_try: error

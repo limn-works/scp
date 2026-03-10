@@ -167,6 +167,26 @@ private class TestNativeBindings : NativeBindings {
     override fun contextSend(contextHandle: Long, payload: ByteArray) { /* no-op */ }
     override fun contextSubscribe(contextHandle: Long, callback: MessageCallback): Long = 0L
     override fun contextUnsubscribe(subscriptionHandle: Long) { /* no-op */ }
+
+    // MembershipBindings
+    override fun contextMemberCount(contextHandle: Long): Long? = 0L
+    override fun contextIsMember(contextHandle: Long, did: String): Boolean = false
+    override fun contextMemberDids(contextHandle: Long): List<String> = emptyList()
+    override fun contextMemberRole(contextHandle: Long, did: String): String? = null
+
+    // GovernanceBindings
+    override fun governanceExecute(contextHandle: Long, proposalJson: String): String = "{}"
+
+    // BroadcastBindings
+    override fun broadcastSubscribe(contextHandle: Long, subscriberDid: String) = Unit
+    override fun broadcastUnsubscribe(contextHandle: Long, subscriberDid: String, rotateKeys: Boolean) = Unit
+    override fun broadcastPublish(contextHandle: Long, authorDid: String, payload: ByteArray) = Unit
+    override fun broadcastBlockSubscriber(contextHandle: Long, subscriberDid: String, blockerDid: String) = Unit
+    override fun broadcastHandleKeyRequest(contextHandle: Long, authorDid: String, requesterDid: String): String = "{}"
+    override fun broadcastSubscriberCount(contextHandle: Long): Long? = 0L
+    override fun broadcastIsSubscriber(contextHandle: Long, did: String): Boolean = false
+    override fun broadcastAdmission(contextHandle: Long): String? = null
+
     override fun toolRegister(contextHandle: Long, definitionJson: String): String = ""
     override fun toolInvoke(contextHandle: Long, toolId: String, inputJson: String): String = ""
     override fun toolVerify(toolId: String, inputJson: String, outputJson: String): Boolean = false

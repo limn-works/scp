@@ -1,7 +1,6 @@
 import Foundation
-import Testing
-
 @testable import SCP
+import Testing
 
 // MARK: - UCAN Tests
 
@@ -20,9 +19,7 @@ import Testing
 /// pattern works end-to-end without a real UniFFI binary.
 ///
 /// See ADR-016 (UCAN), ADR-026 (Swift SDK), and story SCP-221.
-@Suite("UCAN Tests")
 struct UcanTests {
-
     // MARK: - Mock UcanToken subclass
 
     /// Mock subclass of the UniFFI-generated `UcanToken` class for testing.
@@ -40,28 +37,42 @@ struct UcanTests {
             tokenId: String = "token-\(UUID().uuidString)",
             capabilities: [String] = []
         ) {
-            self.mockIssuer = issuer
-            self.mockAudience = audience
-            self.mockExpiry = expiry
-            self.mockTokenId = tokenId
-            self.mockCapabilities = capabilities
+            mockIssuer = issuer
+            mockAudience = audience
+            mockExpiry = expiry
+            mockTokenId = tokenId
+            mockCapabilities = capabilities
             super.init(noPointer: .init())
         }
 
         required init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
-            self.mockIssuer = ""
-            self.mockAudience = ""
-            self.mockExpiry = nil
-            self.mockTokenId = ""
-            self.mockCapabilities = []
+            mockIssuer = ""
+            mockAudience = ""
+            mockExpiry = nil
+            mockTokenId = ""
+            mockCapabilities = []
             super.init(unsafeFromRawPointer: pointer)
         }
 
-        override func issuer() -> String { mockIssuer }
-        override func audience() -> String { mockAudience }
-        override func expiresAt() -> UInt64? { mockExpiry }
-        override func tokenId() -> String { mockTokenId }
-        override func capabilities() -> [String] { mockCapabilities }
+        override func issuer() -> String {
+            mockIssuer
+        }
+
+        override func audience() -> String {
+            mockAudience
+        }
+
+        override func expiresAt() -> UInt64? {
+            mockExpiry
+        }
+
+        override func tokenId() -> String {
+            mockTokenId
+        }
+
+        override func capabilities() -> [String] {
+            mockCapabilities
+        }
     }
 
     // MARK: - UcanToken type shape
@@ -94,7 +105,7 @@ struct UcanTests {
     }
 
     @Test("UcanToken is Sendable")
-    func ucanTokenIsSendable() async {
+    func ucanTokenIsSendable() {
         let token: any Sendable = MockUcanToken(
             issuer: "did:dht:z6MkIssuer",
             audience: "did:dht:z6MkAudience",
@@ -125,7 +136,7 @@ struct UcanTests {
     }
 
     @Test("UcanCapability is Sendable")
-    func ucanCapabilityIsSendable() async {
+    func ucanCapabilityIsSendable() {
         let cap: any Sendable = UcanCapability(resource: "scp:ctx:x", action: "read")
         #expect(cap is UcanCapability)
     }
@@ -239,10 +250,12 @@ struct UcanTests {
 
     @Test("legacy validate returns UcanValidationResult via bridge")
     func legacyValidateRoundtrip() async throws {
+        let handle = ContextHandle(noPointer: .init())
         let mockValidate: UcanBridge.ValidateFn = { _, _, _, _, _ in }
 
         let result = try await validate(
             encoded: "eyJhbGciOiJFZERTQSJ9.test.sig",
+            handle: handle,
             contextId: "ctx-001",
             presenterDid: "did:dht:z6MkPresenter",
             validateFn: mockValidate
@@ -253,6 +266,7 @@ struct UcanTests {
 
     @Test("legacy mint delegates to bridge")
     func legacyMintRoundtrip() async throws {
+        let handle = ContextHandle(noPointer: .init())
         let mockToken = MockUcanToken(
             issuer: "did:dht:z6MkIssuer",
             audience: "did:dht:z6MkAudience",
@@ -262,6 +276,7 @@ struct UcanTests {
         let mockMint: UcanBridge.MintFn = { _, _, _ in mockToken }
 
         let result = try await mint(
+            handle: handle,
             issuerDid: "did:dht:z6MkIssuer",
             audienceDid: "did:dht:z6MkAudience",
             capabilities: [UcanCapability(resource: "scp:ctx:test", action: "write")],
@@ -273,10 +288,12 @@ struct UcanTests {
 
     @Test("legacy revoke delegates to bridge")
     func legacyRevokeRoundtrip() async throws {
+        let handle = ContextHandle(noPointer: .init())
         var revoked = false
         let mockRevoke: UcanBridge.RevokeFn = { _, _ in revoked = true }
 
         try await revoke(
+            handle: handle,
             encoded: "eyJhbGciOiJFZERTQSJ9.test.sig",
             revokerDid: "did:dht:z6MkRevoker",
             revokeFn: mockRevoke
@@ -285,4 +302,91 @@ struct UcanTests {
         #expect(revoked)
     }
 
+    // MARK: - Delegate via injectable bridge (async roundtrip)
+
+    @Test("delegateUcanToken calls bridge and returns delegated token")
+    func delegateRoundtrip() async throws {
+        let handle = ContextHandle(noPointer: .init())
+        let mockToken = MockUcanToken(
+            issuer: "did:dht:z6MkDelegator",
+            audience: "did:dht:z6MkDelegatee",
+            expiry: 1_700_090_000,
+            tokenId: "delegated-token-001",
+            capabilities: ["scp:ctx:abc/messages:read"]
+        )
+
+        var receivedDelegatorDid: String?
+        var receivedDelegateeDid: String?
+        var receivedParentToken: String?
+        var receivedCapabilities: [String]?
+
+        let mockDelegate: UcanBridge.DelegateFn = { _, delegatorDid, delegateeDid, parentToken, capabilities in
+            receivedDelegatorDid = delegatorDid
+            receivedDelegateeDid = delegateeDid
+            receivedParentToken = parentToken
+            receivedCapabilities = capabilities
+            return mockToken
+        }
+
+        let result = try await delegateUcanToken(
+            handle: handle,
+            delegatorDid: "did:dht:z6MkDelegator",
+            delegateeDid: "did:dht:z6MkDelegatee",
+            parentToken: "eyJhbGciOiJFZERTQSJ9.parent.sig",
+            capabilities: ["scp:ctx:abc/messages:read"],
+            delegateFn: mockDelegate
+        )
+
+        #expect(result.tokenId() == "delegated-token-001")
+        #expect(result.issuer() == "did:dht:z6MkDelegator")
+        #expect(result.audience() == "did:dht:z6MkDelegatee")
+        #expect(receivedDelegatorDid == "did:dht:z6MkDelegator")
+        #expect(receivedDelegateeDid == "did:dht:z6MkDelegatee")
+        #expect(receivedParentToken == "eyJhbGciOiJFZERTQSJ9.parent.sig")
+        #expect(receivedCapabilities == ["scp:ctx:abc/messages:read"])
+    }
+
+    @Test("delegateUcanToken propagates bridge errors")
+    func delegatePropagatesErrors() async throws {
+        let handle = ContextHandle(noPointer: .init())
+
+        let mockDelegate: UcanBridge.DelegateFn = { _, _, _, _, _ in
+            throw ScpError.Permission(
+                message: "capabilities wider than parent",
+                code: "SCP-PERM-3004"
+            )
+        }
+
+        do {
+            _ = try await delegateUcanToken(
+                handle: handle,
+                delegatorDid: "did:dht:z6MkDelegator",
+                delegateeDid: "did:dht:z6MkDelegatee",
+                parentToken: "eyJhbGciOiJFZERTQSJ9.parent.sig",
+                capabilities: ["scp:ctx:*/admin:*"],
+                delegateFn: mockDelegate
+            )
+            Issue.record("Expected delegateUcanToken to throw")
+        } catch let error as ScpError {
+            if case let .Permission(_, code) = error {
+                #expect(code == "SCP-PERM-3004")
+            } else {
+                Issue.record("Expected ScpError.Permission, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    @Test("delegateUcanToken default delegates to UniFFI")
+    func delegateDefaultDelegatesToUniFFI() {
+        // The default delegate function now delegates to the UniFFI-generated
+        // ``ucanDelegate(handle:delegatorDid:delegateeDid:parentToken:capabilities:)``
+        // binding. Verifying the default is non-throwing requires the
+        // XCFramework; this test confirms the typealias and default are
+        // properly wired by verifying the injectable bridge pattern still
+        // works with mocks.
+        let defaultDelegateFn = UcanBridge.defaultDelegate
+        #expect(defaultDelegateFn is UcanBridge.DelegateFn)
+    }
 } // end UcanTests

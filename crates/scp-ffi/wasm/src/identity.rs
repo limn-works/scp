@@ -45,6 +45,7 @@ use std::collections::HashMap;
 use js_sys::Promise;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::ScpWasmError;
 
@@ -53,21 +54,224 @@ use crate::error::ScpWasmError;
 // ---------------------------------------------------------------------------
 
 /// Per-identity state stored in the WASM-local registry.
-#[derive(Debug, Clone)]
+///
+/// Private key fields are wrapped in [`zeroize::Zeroizing`] and the struct
+/// implements [`ZeroizeOnDrop`] so that key material is overwritten with zeros
+/// when the entry is removed from the registry or replaced. `Clone` is
+/// intentionally NOT derived — cloning would scatter unprotected copies of
+/// private keys through WASM linear memory.
+#[derive(Zeroize, ZeroizeOnDrop)]
 struct IdentityEntry {
+    /// Ed25519 signing key bytes (32 bytes). Stored to produce real Ed25519
+    /// signatures for device attestation and other identity operations.
+    ///
+    /// Wrapped in `Zeroizing` for defense-in-depth: WASM linear memory is
+    /// readable by same-origin JS, so key material must be zeroed on drop.
+    signing_key_bytes: zeroize::Zeroizing<[u8; 32]>,
     /// Ed25519 public key bytes (32 bytes).
     public_key_bytes: [u8; 32],
     /// Custody type string. Retained for future use when custody operations
     /// are wired (e.g., signing, key rotation).
     #[allow(dead_code)]
     custody_type: String,
+    /// Agent signing key bytes (32 bytes), if an agent key has been bound.
+    ///
+    /// Wrapped in `Zeroizing` for defense-in-depth (same rationale as
+    /// `signing_key_bytes`).
+    agent_signing_key_bytes: Option<zeroize::Zeroizing<[u8; 32]>>,
 }
+
+impl std::fmt::Debug for IdentityEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdentityEntry")
+            .field("signing_key_bytes", &"[REDACTED]")
+            .field("public_key_bytes", &self.public_key_bytes)
+            .field("custody_type", &self.custody_type)
+            .field(
+                "agent_signing_key_bytes",
+                &if self.agent_signing_key_bytes.is_some() {
+                    "[REDACTED]"
+                } else {
+                    "[None]"
+                },
+            )
+            .finish()
+    }
+}
+
+/// Maximum number of identities in the WASM-local identity registry.
+const WASM_IDENTITY_REGISTRY_CAP: usize = 10_000;
+
+/// Maximum number of migration links stored in the WASM-local registry.
+const WASM_MIGRATION_LINKS_CAP: usize = 10_000;
 
 thread_local! {
     /// Maps DID strings to identity state. WASM is single-threaded, so
-    /// `RefCell` is sufficient.
+    /// `RefCell` is sufficient. Capped at [`WASM_IDENTITY_REGISTRY_CAP`].
     static IDENTITY_REGISTRY: RefCell<HashMap<String, IdentityEntry>> =
         RefCell::new(HashMap::new());
+
+    /// Maps new DID → old DID for migration links. Used by `identity_resolve`
+    /// to populate `alsoKnownAs` fields. Capped at [`WASM_MIGRATION_LINKS_CAP`].
+    static MIGRATION_LINKS: RefCell<HashMap<String, String>> =
+        RefCell::new(HashMap::new());
+}
+
+// ---------------------------------------------------------------------------
+// HMAC helpers (pub(crate) — used by manager.rs for export/import integrity)
+// ---------------------------------------------------------------------------
+
+/// Domain separation label for context export HMAC key derivation.
+///
+/// The creator's Ed25519 signing key is NOT used directly as the HMAC key.
+/// Instead, we derive a purpose-specific key via HKDF-SHA256 with this info
+/// string, so that the HMAC key is domain-separated from any signing use.
+const EXPORT_HMAC_DOMAIN: &[u8] = b"scp-context-export-integrity-v1";
+
+/// Computes HMAC-SHA256 over `data` using a key derived from the signing key
+/// of the identity identified by `did`.
+///
+/// Returns the hex-encoded HMAC tag, or an error if the DID is not in the
+/// identity registry.
+///
+/// The HMAC key is derived via `HKDF-SHA256(ikm=signing_key, salt=[], info=EXPORT_HMAC_DOMAIN)`
+/// to ensure domain separation from the signing key's primary use (Ed25519
+/// signatures).
+pub(crate) fn compute_export_hmac(did: &str, data: &[u8]) -> Result<String, ScpWasmError> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let hmac_key = derive_export_hmac_key(did)?;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(hmac_key.as_ref()).map_err(|e| ScpWasmError::Identity {
+            message: format!("HMAC key init failed: {e}"),
+            code: "SCP-CTX-2020".to_owned(),
+        })?;
+    mac.update(data);
+    let result = mac.finalize();
+    Ok(hex::encode(result.into_bytes()))
+}
+
+/// Verifies an HMAC-SHA256 tag over `data` using a key derived from the
+/// signing key of the identity identified by `did`.
+///
+/// Returns `Ok(())` if the tag is valid, or an error if the DID is not found
+/// or the tag does not match.
+pub(crate) fn verify_export_hmac(
+    did: &str,
+    data: &[u8],
+    expected_hex: &str,
+) -> Result<(), ScpWasmError> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let expected_bytes = hex::decode(expected_hex).map_err(|e| ScpWasmError::Context {
+        message: format!("integrity_mac is not valid hex: {e}"),
+        code: "SCP-CTX-2020".to_owned(),
+    })?;
+
+    let hmac_key = derive_export_hmac_key(did)?;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(hmac_key.as_ref()).map_err(|e| ScpWasmError::Identity {
+            message: format!("HMAC key init failed: {e}"),
+            code: "SCP-CTX-2020".to_owned(),
+        })?;
+    mac.update(data);
+    mac.verify_slice(&expected_bytes)
+        .map_err(|_| ScpWasmError::Context {
+            message: "export integrity check failed — HMAC does not match".to_owned(),
+            code: "SCP-CTX-2020".to_owned(),
+        })
+}
+
+/// Derives a 32-byte HMAC key from the identity's Ed25519 signing key via
+/// HKDF-SHA256 with domain separation.
+///
+/// The derived key is wrapped in `Zeroizing` to ensure it is zeroed on drop.
+fn derive_export_hmac_key(did: &str) -> Result<zeroize::Zeroizing<[u8; 32]>, ScpWasmError> {
+    IDENTITY_REGISTRY.with(|reg| {
+        let map = reg.borrow();
+        let entry = map.get(did).ok_or_else(|| ScpWasmError::Identity {
+            message: format!("identity '{did}' not found in registry — cannot compute export HMAC"),
+            code: "SCP-CTX-2020".to_owned(),
+        })?;
+
+        // HKDF-SHA256: extract(salt=[], ikm=signing_key) then
+        // expand(info=EXPORT_HMAC_DOMAIN, len=32).
+        let prk = hkdf_extract_sha256(&[], entry.signing_key_bytes.as_ref()).map_err(|e| {
+            ScpWasmError::Identity {
+                message: format!("HKDF extract failed: {e}"),
+                code: "SCP-CTX-2020".to_owned(),
+            }
+        })?;
+        let okm = hkdf_expand_sha256(&prk, EXPORT_HMAC_DOMAIN, 32).map_err(|e| {
+            ScpWasmError::Identity {
+                message: format!("HKDF expand failed: {e}"),
+                code: "SCP-CTX-2020".to_owned(),
+            }
+        })?;
+        let mut key = zeroize::Zeroizing::new([0u8; 32]);
+        key.copy_from_slice(&okm);
+        Ok(key)
+    })
+}
+
+/// HKDF-Extract (RFC 5869) using HMAC-SHA256.
+///
+/// Returns the PRK wrapped in `Zeroizing` to ensure it is cleared from memory
+/// on drop.
+///
+/// # Errors
+///
+/// Returns an error string if HMAC initialization fails (should not happen
+/// since HMAC-SHA256 accepts any key length, but we avoid `expect`/`unwrap`).
+fn hkdf_extract_sha256(salt: &[u8], ikm: &[u8]) -> Result<zeroize::Zeroizing<[u8; 32]>, String> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let effective_salt: &[u8] = if salt.is_empty() { &[0u8; 32] } else { salt };
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(effective_salt).map_err(|e| format!("HMAC init: {e}"))?;
+    mac.update(ikm);
+    Ok(zeroize::Zeroizing::new(mac.finalize().into_bytes().into()))
+}
+
+/// HKDF-Expand (RFC 5869) using HMAC-SHA256.
+///
+/// `length` must be <= 255 * 32 = 8160 bytes.
+///
+/// All intermediates (`t` blocks, output buffer) are wrapped in `Zeroizing`
+/// to ensure they are cleared from memory on drop.
+///
+/// # Errors
+///
+/// Returns an error string if HMAC initialization fails.
+fn hkdf_expand_sha256(
+    prk: &zeroize::Zeroizing<[u8; 32]>,
+    info: &[u8],
+    length: usize,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let hash_len = 32;
+    let n = length.div_ceil(hash_len);
+    let mut okm = zeroize::Zeroizing::new(Vec::with_capacity(n * hash_len));
+    let mut t = zeroize::Zeroizing::new(Vec::<u8>::new());
+
+    for i in 1..=n {
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(prk.as_ref()).map_err(|e| format!("HMAC init: {e}"))?;
+        mac.update(&t);
+        mac.update(info);
+        #[allow(clippy::cast_possible_truncation)]
+        mac.update(&[i as u8]);
+        *t = mac.finalize().into_bytes().to_vec();
+        okm.extend_from_slice(&t);
+    }
+
+    okm.truncate(length);
+    Ok(okm)
 }
 
 // ---------------------------------------------------------------------------
@@ -499,17 +703,34 @@ pub fn identity_create(custody: String) -> Promise {
         let did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
 
         // Store the signing key in the WASM-local identity registry so that
-        // identity_resolve can return the public key from the DID document.
+        // identity_resolve can return the public key from the DID document
+        // and identity_attest_device can produce real Ed25519 signatures.
         IDENTITY_REGISTRY.with(|reg| {
             let mut map = reg.borrow_mut();
+            // Cap check: reject if at capacity and this is a new entry.
+            if !map.contains_key(&did) && map.len() >= WASM_IDENTITY_REGISTRY_CAP {
+                return Err(JsValue::from(
+                    ScpWasmError::Validation {
+                        message: format!(
+                            "identity registry has reached capacity ({WASM_IDENTITY_REGISTRY_CAP}) \
+                         — cannot create additional identities"
+                        ),
+                        code: "SCP-VALID-7400".to_owned(),
+                    }
+                    .into_js(),
+                ));
+            }
             map.insert(
                 did.clone(),
                 IdentityEntry {
+                    signing_key_bytes: zeroize::Zeroizing::new(signing_key.to_bytes()),
                     public_key_bytes: pub_bytes,
                     custody_type: custody.clone(),
+                    agent_signing_key_bytes: None,
                 },
             );
-        });
+            Ok(())
+        })?;
 
         Ok(JsValue::from(WasmIdentity {
             did,
@@ -552,33 +773,35 @@ pub fn identity_resolve(did: String) -> Promise {
             .into());
         }
 
-        // Look up in the local identity registry.
-        let entry = IDENTITY_REGISTRY.with(|reg| {
+        // Look up public key bytes from the local identity registry.
+        // Only extract the public key — never clone private key material
+        // out of the registry.
+        let pub_key_bytes = IDENTITY_REGISTRY.with(|reg| {
             let map = reg.borrow();
-            map.get(&did).cloned()
+            map.get(&did).map(|entry| entry.public_key_bytes)
         });
 
         let (verification_methods_json, authentication_json, assertion_methods_json) =
-            if let Some(entry) = entry {
-                // Build a verification method from the stored public key.
-                let multibase_key = format!("z{}", zbase32_encode(&entry.public_key_bytes));
-                let vm = serde_json::json!([{
-                    "id": format!("{did}#0"),
-                    "type": "Ed25519VerificationKey2020",
-                    "controller": did,
-                    "publicKeyMultibase": multibase_key,
-                }]);
-                let auth = serde_json::json!([format!("{did}#0")]);
-                let assertion = serde_json::json!([format!("{did}#0")]);
-                (
-                    serde_json::to_string(&vm).unwrap_or_else(|_| "[]".to_owned()),
-                    serde_json::to_string(&auth).unwrap_or_else(|_| "[]".to_owned()),
-                    serde_json::to_string(&assertion).unwrap_or_else(|_| "[]".to_owned()),
-                )
-            } else {
-                // Unknown DID — return minimal document.
-                ("[]".to_owned(), "[]".to_owned(), "[]".to_owned())
-            };
+            pub_key_bytes.map_or_else(
+                || ("[]".to_owned(), "[]".to_owned(), "[]".to_owned()),
+                |pub_bytes| {
+                    // Build a verification method from the stored public key.
+                    let multibase_key = format!("z{}", zbase32_encode(&pub_bytes));
+                    let vm = serde_json::json!([{
+                        "id": format!("{did}#0"),
+                        "type": "Ed25519VerificationKey2020",
+                        "controller": did,
+                        "publicKeyMultibase": multibase_key,
+                    }]);
+                    let auth = serde_json::json!([format!("{did}#0")]);
+                    let assertion = serde_json::json!([format!("{did}#0")]);
+                    (
+                        serde_json::to_string(&vm).unwrap_or_else(|_| "[]".to_owned()),
+                        serde_json::to_string(&auth).unwrap_or_else(|_| "[]".to_owned()),
+                        serde_json::to_string(&assertion).unwrap_or_else(|_| "[]".to_owned()),
+                    )
+                },
+            );
 
         Ok(JsValue::from(WasmDIDDocument::from_fields(
             did,
@@ -588,6 +811,500 @@ pub fn identity_resolve(did: String) -> Promise {
             authentication_json,
             assertion_methods_json,
         )))
+    })
+}
+
+/// Creates a new SCP identity with an agent signing key (ADR-039).
+///
+/// Generates two Ed25519 keypairs: one for the identity key and one for the
+/// `#agent` verification method. Returns a `WasmIdentity` with
+/// `has_agent_key = true`.
+#[wasm_bindgen]
+pub fn identity_create_with_agent_key(custody: String) -> Promise {
+    future_to_promise(async move {
+        if custody != "js_custody" && custody != "in_memory" {
+            return Err(ScpWasmError::Identity {
+                message: format!(
+                    "unsupported custody type {custody:?} — only \"js_custody\" and \"in_memory\" \
+                     are supported in the browser WASM bridge"
+                ),
+                code: "SCP-IDENT-1004".to_owned(),
+            }
+            .into_js()
+            .into());
+        }
+
+        // Generate identity Ed25519 keypair.
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let verifying_key = signing_key.verifying_key();
+        let pub_bytes = verifying_key.to_bytes();
+        let did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
+
+        // Generate agent Ed25519 keypair.
+        let agent_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let agent_pub = agent_key.verifying_key();
+        let agent_multibase = format!("z{}", zbase32_encode(&agent_pub.to_bytes()));
+
+        IDENTITY_REGISTRY.with(|reg| {
+            let mut map = reg.borrow_mut();
+            if !map.contains_key(&did) && map.len() >= WASM_IDENTITY_REGISTRY_CAP {
+                return Err(JsValue::from(
+                    ScpWasmError::Validation {
+                        message: format!(
+                            "identity registry has reached capacity ({WASM_IDENTITY_REGISTRY_CAP}) \
+                         — cannot create additional identities"
+                        ),
+                        code: "SCP-VALID-7400".to_owned(),
+                    }
+                    .into_js(),
+                ));
+            }
+            map.insert(
+                did.clone(),
+                IdentityEntry {
+                    signing_key_bytes: zeroize::Zeroizing::new(signing_key.to_bytes()),
+                    public_key_bytes: pub_bytes,
+                    custody_type: custody.clone(),
+                    agent_signing_key_bytes: Some(zeroize::Zeroizing::new(agent_key.to_bytes())),
+                },
+            );
+            Ok(())
+        })?;
+
+        Ok(JsValue::from(WasmIdentity {
+            did,
+            custody_type: custody,
+            has_agent_key: true,
+            agent_public_key_multibase: Some(agent_multibase),
+        }))
+    })
+}
+
+/// Adds an agent signing key to an existing identity (ADR-039).
+///
+/// Generates a new Ed25519 agent keypair, stores it in the identity registry,
+/// and returns an updated identity.
+///
+/// # Errors
+///
+/// Returns `[SCP-IDENT-1009]` if the identity already has an agent key.
+#[wasm_bindgen]
+pub fn identity_add_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsError> {
+    if identity.has_agent_key {
+        return Err(ScpWasmError::Identity {
+            message: "identity already has an agent key".to_owned(),
+            code: "SCP-IDENT-1009".to_owned(),
+        }
+        .into_js());
+    }
+    let agent_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let agent_pub = agent_key.verifying_key();
+    let agent_multibase = format!("z{}", zbase32_encode(&agent_pub.to_bytes()));
+
+    // Store the agent signing key in the identity registry.
+    let did = identity.did.clone();
+    IDENTITY_REGISTRY.with(|reg| {
+        let mut map = reg.borrow_mut();
+        if let Some(entry) = map.get_mut(&did) {
+            entry.agent_signing_key_bytes = Some(zeroize::Zeroizing::new(agent_key.to_bytes()));
+        }
+    });
+
+    Ok(WasmIdentity {
+        did,
+        custody_type: identity.custody_type.clone(),
+        has_agent_key: true,
+        agent_public_key_multibase: Some(agent_multibase),
+    })
+}
+
+/// Rotates the agent signing key for an identity (ADR-039).
+///
+/// Generates a new Ed25519 agent keypair, stores it in the identity registry,
+/// and returns an updated identity.
+///
+/// # Errors
+///
+/// Returns `[SCP-IDENT-1011]` if the identity has no agent key to rotate.
+/// Returns `[SCP-IDENT-1010]` if the new public key is empty.
+#[wasm_bindgen]
+pub fn identity_rotate_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsError> {
+    if !identity.has_agent_key {
+        return Err(ScpWasmError::Identity {
+            message: "identity has no agent key to rotate".to_owned(),
+            code: "SCP-IDENT-1011".to_owned(),
+        }
+        .into_js());
+    }
+    let agent_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let agent_pub = agent_key.verifying_key();
+    let agent_multibase = format!("z{}", zbase32_encode(&agent_pub.to_bytes()));
+
+    // Store the new agent signing key in the identity registry.
+    let did = identity.did.clone();
+    IDENTITY_REGISTRY.with(|reg| {
+        let mut map = reg.borrow_mut();
+        if let Some(entry) = map.get_mut(&did) {
+            entry.agent_signing_key_bytes = Some(zeroize::Zeroizing::new(agent_key.to_bytes()));
+        }
+    });
+
+    Ok(WasmIdentity {
+        did,
+        custody_type: identity.custody_type.clone(),
+        has_agent_key: true,
+        agent_public_key_multibase: Some(agent_multibase),
+    })
+}
+
+/// Rotates the main signing key for an identity.
+///
+/// Generates a new Ed25519 keypair, derives a new `did:dht` DID from the
+/// new public key, updates the identity registry, and returns a new
+/// `WasmIdentity`. The old DID is stored in the migration links so
+/// `identity_resolve` can include it in `alsoKnownAs`.
+///
+/// # Errors
+///
+/// Returns `[SCP-IDENT-1010]` if key generation fails.
+#[wasm_bindgen]
+pub fn identity_rotate_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsError> {
+    let old_did = identity.did.clone();
+    let custody = identity.custody_type.clone();
+
+    // Generate a new Ed25519 signing key.
+    let new_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let new_pub = new_key.verifying_key();
+    let pub_bytes = new_pub.to_bytes();
+    let new_did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
+
+    // Copy the agent key from the old identity if it exists.
+    let agent_key_bytes = IDENTITY_REGISTRY.with(|reg| {
+        reg.borrow()
+            .get(&old_did)
+            .and_then(|entry| entry.agent_signing_key_bytes.clone())
+    });
+
+    // Register the new identity in the registry.
+    IDENTITY_REGISTRY.with(|reg| {
+        let mut map = reg.borrow_mut();
+
+        // Remove the old identity first (key material is zeroized on drop).
+        map.remove(&old_did);
+
+        // Capacity check (matching identity_migrate pattern).
+        if !map.contains_key(&new_did) && map.len() >= WASM_IDENTITY_REGISTRY_CAP {
+            return Err(ScpWasmError::Validation {
+                message: format!(
+                    "identity registry has reached capacity ({WASM_IDENTITY_REGISTRY_CAP}) \
+                     — cannot create additional identities"
+                ),
+                code: "SCP-VALID-7400".to_owned(),
+            }
+            .into_js());
+        }
+
+        map.insert(
+            new_did.clone(),
+            IdentityEntry {
+                signing_key_bytes: zeroize::Zeroizing::new(new_key.to_bytes()),
+                public_key_bytes: pub_bytes,
+                custody_type: custody.clone(),
+                agent_signing_key_bytes: agent_key_bytes,
+            },
+        );
+
+        Ok(())
+    })?;
+
+    // Record the migration link (with capacity check).
+    MIGRATION_LINKS.with(|links| {
+        let mut map = links.borrow_mut();
+        if !map.contains_key(&new_did) && map.len() >= WASM_MIGRATION_LINKS_CAP {
+            return Err(ScpWasmError::Validation {
+                message: format!(
+                    "migration links registry has reached capacity \
+                     ({WASM_MIGRATION_LINKS_CAP}) — cannot store additional migration links"
+                ),
+                code: "SCP-VALID-7401".to_owned(),
+            }
+            .into_js());
+        }
+        map.insert(new_did.clone(), old_did);
+        Ok(())
+    })?;
+
+    Ok(WasmIdentity {
+        did: new_did,
+        custody_type: custody,
+        has_agent_key: identity.has_agent_key,
+        agent_public_key_multibase: identity.agent_public_key_multibase.clone(),
+    })
+}
+
+/// Removes the agent signing key from an identity (ADR-039).
+///
+/// # Errors
+///
+/// Returns `[SCP-IDENT-1011]` if the identity has no agent key to remove.
+#[wasm_bindgen]
+pub fn identity_remove_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsError> {
+    if !identity.has_agent_key {
+        return Err(ScpWasmError::Identity {
+            message: "identity has no agent key to remove".to_owned(),
+            code: "SCP-IDENT-1011".to_owned(),
+        }
+        .into_js());
+    }
+
+    // Clear the agent signing key from the identity registry to prevent
+    // the key material from lingering in WASM linear memory.
+    let did = identity.did.clone();
+    IDENTITY_REGISTRY.with(|reg| {
+        let mut map = reg.borrow_mut();
+        if let Some(entry) = map.get_mut(&did) {
+            entry.agent_signing_key_bytes = None;
+        }
+    });
+
+    Ok(WasmIdentity {
+        did,
+        custody_type: identity.custody_type.clone(),
+        has_agent_key: false,
+        agent_public_key_multibase: None,
+    })
+}
+
+/// Migrates an identity to a new DID (Layer 2 rotation).
+///
+/// Generates a new Ed25519 keypair, derives a new `did:dht` DID, and returns
+/// a new `WasmIdentity`. The old DID is stored in the `alsoKnownAs` field
+/// of the new identity's DID document (handled by `identity_resolve`).
+///
+/// If the source identity has an agent key, a new agent key is generated
+/// for the migrated identity (preserving the `has_agent_key` state).
+#[wasm_bindgen]
+pub fn identity_migrate(identity: &WasmIdentity) -> Promise {
+    let old_did = identity.did.clone();
+    let custody = identity.custody_type.clone();
+    let had_agent_key = identity.has_agent_key;
+    future_to_promise(async move {
+        // Generate new Ed25519 keypair for the new DID.
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let verifying_key = signing_key.verifying_key();
+        let pub_bytes = verifying_key.to_bytes();
+        let new_did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
+
+        // If the source identity had an agent key, generate a new one.
+        let (agent_signing_key_bytes, agent_public_key_multibase) = if had_agent_key {
+            let agent_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+            let agent_pub = agent_key.verifying_key();
+            let multibase = format!("z{}", zbase32_encode(&agent_pub.to_bytes()));
+            (
+                Some(zeroize::Zeroizing::new(agent_key.to_bytes())),
+                Some(multibase),
+            )
+        } else {
+            (None, None)
+        };
+
+        IDENTITY_REGISTRY.with(|reg| {
+            let mut map = reg.borrow_mut();
+            // Remove the old identity's key material from the registry.
+            // `ZeroizeOnDrop` ensures the old signing keys are zeroed.
+            map.remove(&old_did);
+            // After removing old_did, the net count stays the same or decreases,
+            // so we only need to check if the new_did is truly a new entry.
+            if !map.contains_key(&new_did) && map.len() >= WASM_IDENTITY_REGISTRY_CAP {
+                return Err(JsValue::from(
+                    ScpWasmError::Validation {
+                        message: format!(
+                            "identity registry has reached capacity ({WASM_IDENTITY_REGISTRY_CAP}) \
+                         — cannot create additional identities"
+                        ),
+                        code: "SCP-VALID-7400".to_owned(),
+                    }
+                    .into_js(),
+                ));
+            }
+            map.insert(
+                new_did.clone(),
+                IdentityEntry {
+                    signing_key_bytes: zeroize::Zeroizing::new(signing_key.to_bytes()),
+                    public_key_bytes: pub_bytes,
+                    custody_type: custody.clone(),
+                    agent_signing_key_bytes,
+                },
+            );
+            Ok(())
+        })?;
+
+        // Store the migration link so identity_resolve can populate alsoKnownAs.
+        MIGRATION_LINKS.with(|links| {
+            let mut map = links.borrow_mut();
+            if !map.contains_key(&new_did) && map.len() >= WASM_MIGRATION_LINKS_CAP {
+                return Err(JsValue::from(
+                    ScpWasmError::Validation {
+                        message: format!(
+                            "migration links registry has reached capacity \
+                         ({WASM_MIGRATION_LINKS_CAP}) — cannot store additional migration links"
+                        ),
+                        code: "SCP-VALID-7401".to_owned(),
+                    }
+                    .into_js(),
+                ));
+            }
+            map.insert(new_did.clone(), old_did);
+            Ok(())
+        })?;
+
+        Ok(JsValue::from(WasmIdentity {
+            did: new_did,
+            custody_type: custody,
+            has_agent_key: had_agent_key,
+            agent_public_key_multibase,
+        }))
+    })
+}
+
+/// Generates a device attestation token for an identity.
+///
+/// Signs a timestamped challenge with the identity's Ed25519 signing key.
+/// Returns the attestation token as a base64-encoded JSON string containing
+/// the DID, timestamp, and a real Ed25519 signature over the attestation
+/// payload.
+#[wasm_bindgen]
+pub fn identity_attest_device(did: String) -> Promise {
+    use base64::Engine;
+    use ed25519_dalek::Signer;
+
+    future_to_promise(async move {
+        // Create attestation payload: DID + timestamp.
+        let timestamp_secs = crate::time::now_secs();
+        let payload = format!("device-attestation:{did}:{timestamp_secs}");
+
+        // Produce a real Ed25519 signature over the attestation payload.
+        // Signing is performed inside the registry closure so that private
+        // key material is never cloned out of the registry into unprotected
+        // WASM linear memory.
+        let signature_bytes = IDENTITY_REGISTRY.with(|reg| {
+            let map = reg.borrow();
+            let entry = map.get(&did).ok_or_else(|| -> JsValue {
+                ScpWasmError::Identity {
+                    message: format!("identity {did:?} not found in registry"),
+                    code: "SCP-IDENT-1000".to_owned(),
+                }
+                .into_js()
+                .into()
+            })?;
+
+            let signing_key = ed25519_dalek::SigningKey::from_bytes(&entry.signing_key_bytes);
+            let signature = signing_key.sign(payload.as_bytes());
+            Ok::<[u8; 64], JsValue>(signature.to_bytes())
+        })?;
+
+        let token = serde_json::json!({
+            "did": did,
+            "timestamp": timestamp_secs,
+            "signature": hex::encode(signature_bytes),
+        });
+
+        // Base64-encode the token JSON.
+        let token_json = serde_json::to_string(&token).map_err(|e| -> JsValue {
+            ScpWasmError::Identity {
+                message: format!("failed to serialize attestation token: {e}"),
+                code: "SCP-IDENT-1012".to_owned(),
+            }
+            .into_js()
+            .into()
+        })?;
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(token_json.as_bytes());
+        Ok(JsValue::from_str(&encoded))
+    })
+}
+
+/// Verifies a device attestation token.
+///
+/// Decodes the base64 token, extracts the DID, timestamp, and Ed25519
+/// signature, then verifies the signature against the identity's public
+/// key in the registry.
+#[wasm_bindgen]
+pub fn identity_verify_device_attestation(did: String, token_base64: String) -> Promise {
+    use base64::Engine;
+
+    future_to_promise(async move {
+        let token_bytes = base64::engine::general_purpose::STANDARD
+            .decode(token_base64.as_bytes())
+            .map_err(|e| -> JsValue {
+                ScpWasmError::Identity {
+                    message: format!("invalid base64 in attestation token: {e}"),
+                    code: "SCP-IDENT-1013".to_owned(),
+                }
+                .into_js()
+                .into()
+            })?;
+
+        let token: serde_json::Value =
+            serde_json::from_slice(&token_bytes).map_err(|e| -> JsValue {
+                ScpWasmError::Identity {
+                    message: format!("invalid JSON in attestation token: {e}"),
+                    code: "SCP-IDENT-1013".to_owned(),
+                }
+                .into_js()
+                .into()
+            })?;
+
+        let token_did = token["did"].as_str().unwrap_or("");
+        let timestamp = token["timestamp"].as_u64().unwrap_or(0);
+        let sig_hex = token["signature"].as_str().unwrap_or("");
+
+        if token_did != did {
+            return Ok(JsValue::from_bool(false));
+        }
+
+        // Freshness check: reject attestations older than 5 minutes (300s).
+        // Prevents replay of captured attestation tokens.
+        let now_secs = crate::time::now_secs();
+        if now_secs.saturating_sub(timestamp) > 300 {
+            return Ok(JsValue::from_bool(false));
+        }
+        // Reject future-dated attestations (clock skew tolerance: 60s).
+        if timestamp > now_secs + 60 {
+            return Ok(JsValue::from_bool(false));
+        }
+
+        // Look up only the public key bytes from the registry — never
+        // clone private key material out.
+        let pub_key_bytes = IDENTITY_REGISTRY.with(|reg| {
+            let map = reg.borrow();
+            map.get(&did).map(|entry| entry.public_key_bytes)
+        });
+
+        let Some(pub_bytes) = pub_key_bytes else {
+            return Ok(JsValue::from_bool(false));
+        };
+
+        // Decode the signature from hex.
+        let Ok(sig_bytes) = hex::decode(sig_hex) else {
+            return Ok(JsValue::from_bool(false));
+        };
+        let sig_array: [u8; 64] = match sig_bytes.try_into() {
+            Ok(a) => a,
+            Err(_) => return Ok(JsValue::from_bool(false)),
+        };
+
+        // Verify the Ed25519 signature against the public key.
+        let payload = format!("device-attestation:{did}:{timestamp}");
+        let Ok(verifying_key) = ed25519_dalek::VerifyingKey::from_bytes(&pub_bytes) else {
+            return Ok(JsValue::from_bool(false));
+        };
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_array);
+        let verified = verifying_key
+            .verify_strict(payload.as_bytes(), &signature)
+            .is_ok();
+
+        Ok(JsValue::from_bool(verified))
     })
 }
 
@@ -623,11 +1340,33 @@ pub fn identity_load(did: String) -> Promise {
             .into());
         }
 
+        // Check the registry for existing identity state (agent key, custody type).
+        let (custody_type, has_agent_key, agent_pub_multibase) = IDENTITY_REGISTRY.with(|reg| {
+            let map = reg.borrow();
+            map.get(&did).map_or_else(
+                || ("js_custody".to_owned(), false, None),
+                |entry| {
+                    let has_agent = entry.agent_signing_key_bytes.is_some();
+                    let agent_pub = if has_agent {
+                        // Derive public key from agent signing key for the multibase field.
+                        entry.agent_signing_key_bytes.as_ref().map(|sk_bytes| {
+                            let sk = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
+                            let pk = ed25519_dalek::VerifyingKey::from(&sk);
+                            format!("z{}", zbase32_encode(&pk.to_bytes()))
+                        })
+                    } else {
+                        None
+                    };
+                    (entry.custody_type.clone(), has_agent, agent_pub)
+                },
+            )
+        });
+
         Ok(JsValue::from(WasmIdentity {
             did,
-            custody_type: "js_custody".to_owned(),
-            has_agent_key: false,
-            agent_public_key_multibase: None,
+            custody_type,
+            has_agent_key,
+            agent_public_key_multibase: agent_pub_multibase,
         }))
     })
 }

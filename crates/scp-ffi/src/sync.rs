@@ -33,6 +33,7 @@ use scp_core::sync::{OfflineTier, SyncPolicy, classify_offline_duration};
 /// A string: `"short"`, `"extended"`, or `"long"`.
 #[pyfunction]
 #[pyo3(name = "sync_classify_offline")]
+#[must_use]
 pub fn py_sync_classify_offline(last_relay_contact: u64, now: u64) -> String {
     match classify_offline_duration(last_relay_contact, now) {
         OfflineTier::Short => "short".to_string(),
@@ -94,6 +95,7 @@ pub fn py_sync_get_policy(py: Python<'_>) -> PyResult<Py<PyDict>> {
 /// A string: `"short"`, `"extended"`, or `"long"`.
 #[pyfunction]
 #[pyo3(name = "sync_classify_offline_custom")]
+#[must_use]
 pub fn py_sync_classify_offline_custom(
     last_relay_contact: u64,
     now: u64,
