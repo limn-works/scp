@@ -964,6 +964,16 @@ impl ContextManager {
         }
     }
 
+    /// Returns `true` if a persistence provider is configured.
+    ///
+    /// Use this to guard snapshot creation so that expensive deep-clones
+    /// of `PerContextState` are skipped when no persistence provider
+    /// exists (the common case for most bridges).
+    #[inline]
+    fn has_persistence(&self) -> bool {
+        self.persistence.is_some()
+    }
+
     /// Persists a context snapshot if a persistence provider is configured.
     ///
     /// Best-effort: logs errors but does not propagate them to callers.
@@ -1384,12 +1394,13 @@ impl ContextManager {
         }
 
         // 7. Persist if persistence is configured.
-        let snapshot_for_persist = {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
-            contexts.get(&context_id).map(Self::snapshot_context)
-        };
-        if let Some(snap) = snapshot_for_persist {
-            self.persist_context_snapshot(&context_id, &snap);
+            if let Some(ctx) = contexts.get(&context_id) {
+                let snap = Self::snapshot_context(ctx);
+                drop(contexts);
+                self.persist_context_snapshot(&context_id, &snap);
+            }
         }
 
         // 8. Re-spawn TTL timer if there was remaining TTL.
@@ -1485,7 +1496,9 @@ impl ContextManager {
             bc.add_author(&creator_did)
                 .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
             // Persist initial broadcast state for crash recovery.
-            self.persist_broadcast_snapshot(&context_id, &bc.to_snapshot());
+            if self.has_persistence() {
+                self.persist_broadcast_snapshot(&context_id, &bc.to_snapshot());
+            }
             Some(bc)
         } else {
             None
@@ -1537,7 +1550,7 @@ impl ContextManager {
         }
 
         // Persist context + broadcast state after creation (best-effort).
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(&context_id) {
                 let snapshot = Self::snapshot_context(ctx);
@@ -1655,7 +1668,9 @@ impl ContextManager {
                 .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
             bc.add_author(&creator_did)
                 .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
-            self.persist_broadcast_snapshot(&context_id, &bc.to_snapshot());
+            if self.has_persistence() {
+                self.persist_broadcast_snapshot(&context_id, &bc.to_snapshot());
+            }
             Some(bc)
         } else {
             None
@@ -1684,7 +1699,7 @@ impl ContextManager {
         }
 
         // Persist context + broadcast state after creation (best-effort).
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(&context_id) {
                 let snapshot = Self::snapshot_context(ctx);
@@ -1882,7 +1897,7 @@ impl ContextManager {
             .append_context_event(&context_id_bytes, "MemberJoined")?;
 
         // Persist context state after join (best-effort).
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(&context_id) {
                 let snapshot = Self::snapshot_context(ctx);
@@ -2002,7 +2017,7 @@ impl ContextManager {
             .append_context_event(&context_id_bytes, "MemberLeft")?;
 
         // Persist context state after leave (best-effort).
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(&context_id) {
                 let snapshot = Self::snapshot_context(ctx);
@@ -2159,7 +2174,9 @@ impl ContextManager {
             .append_context_event(&context_id_bytes, "MessageSent")?;
 
         // Persist context state after send (best-effort).
-        {
+        // Guarded: skip mutex re-acquisition and deep-clone when no
+        // persistence provider is configured (the common case for bridges).
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(&context_id) {
                 let snapshot = Self::snapshot_context(ctx);
@@ -2291,8 +2308,13 @@ impl ContextManager {
 
             let result = bc.subscribe(subscriber_did, ucan, timestamp, validation_ctx)?;
 
-            // Take snapshot for persistence before dropping lock.
-            let snapshot = bc.to_snapshot();
+            // Take snapshot for persistence before dropping lock (skip if
+            // no persistence provider is configured).
+            let snapshot = if self.has_persistence() {
+                Some(bc.to_snapshot())
+            } else {
+                None
+            };
 
             // Add subscriber to membership tracking (role = "subscriber").
             ctx.membership
@@ -2306,10 +2328,12 @@ impl ContextManager {
         // Lock dropped.
 
         // Persist broadcast state for crash recovery.
-        self.persist_broadcast_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_broadcast_snapshot(context_id, snapshot);
+        }
 
         // Persist context state after subscribe (best-effort).
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(context_id) {
                 let ctx_snapshot = Self::snapshot_context(ctx);
@@ -2359,8 +2383,13 @@ impl ContextManager {
 
             let result = bc.unsubscribe(subscriber_did, rotate_keys)?;
 
-            // Take snapshot for persistence before dropping lock.
-            let snapshot = bc.to_snapshot();
+            // Take snapshot for persistence before dropping lock (skip if
+            // no persistence provider is configured).
+            let snapshot = if self.has_persistence() {
+                Some(bc.to_snapshot())
+            } else {
+                None
+            };
 
             // Remove from membership tracking.
             ctx.membership.remove_member(subscriber_did);
@@ -2375,10 +2404,12 @@ impl ContextManager {
         // Lock dropped.
 
         // Persist broadcast state for crash recovery.
-        self.persist_broadcast_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_broadcast_snapshot(context_id, snapshot);
+        }
 
         // Persist context state after unsubscribe (best-effort).
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(context_id) {
                 let ctx_snapshot = Self::snapshot_context(ctx);
@@ -2538,8 +2569,13 @@ impl ContextManager {
 
             let result = bc.block_subscriber(author_did, subscriber_did)?;
 
-            // Take snapshot for persistence before dropping lock.
-            let snapshot = bc.to_snapshot();
+            // Take snapshot for persistence before dropping lock (skip if
+            // no persistence provider is configured).
+            let snapshot = if self.has_persistence() {
+                Some(bc.to_snapshot())
+            } else {
+                None
+            };
 
             // Emit block event to receive buffer.
             ctx.receive_buffer.push(ContextEvent::MemberBlocked {
@@ -2552,7 +2588,9 @@ impl ContextManager {
         // Lock dropped.
 
         // Persist broadcast state for crash recovery.
-        self.persist_broadcast_snapshot(context_id, &snapshot);
+        if let Some(ref snapshot) = snapshot {
+            self.persist_broadcast_snapshot(context_id, snapshot);
+        }
 
         self.event_log
             .append_context_event(&context_id_bytes, "MemberBlocked")?;
@@ -2690,9 +2728,11 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(context_id) {
                 ctx.approved_proposals.remove(&proposal.proposal_id);
-                let snapshot = Self::snapshot_context(ctx);
-                drop(contexts);
-                self.persist_context_snapshot(context_id, &snapshot);
+                if self.has_persistence() {
+                    let snapshot = Self::snapshot_context(ctx);
+                    drop(contexts);
+                    self.persist_context_snapshot(context_id, &snapshot);
+                }
             }
         }
 
@@ -3212,7 +3252,7 @@ impl ContextManager {
         };
 
         // Persist context state after proposal creation.
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(context_id) {
                 let snapshot = Self::snapshot_context(ctx);
@@ -3347,7 +3387,7 @@ impl ContextManager {
         }
 
         // Persist context state after vote.
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(context_id) {
                 let snapshot = Self::snapshot_context(ctx);
@@ -3594,7 +3634,7 @@ impl ContextManager {
         }
 
         // Persist context state after withdrawal.
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(context_id) {
                 let snapshot = Self::snapshot_context(ctx);
@@ -5344,7 +5384,7 @@ impl ContextManager {
         }
 
         // Persist context state after close (best-effort).
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(&context_id) {
                 let snapshot = Self::snapshot_context(ctx);
@@ -5421,7 +5461,7 @@ impl ContextManager {
         }
 
         // Persist context state after TTL expiry (best-effort).
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(&context_id) {
                 let snapshot = Self::snapshot_context(ctx);
@@ -5472,9 +5512,11 @@ impl ContextManager {
         let unanimous = extension.is_unanimous();
 
         // Persist context state after proposal consent (best-effort).
-        let ctx_snapshot = Self::snapshot_context(ctx);
-        drop(contexts);
-        self.persist_context_snapshot(context_id, &ctx_snapshot);
+        if self.has_persistence() {
+            let ctx_snapshot = Self::snapshot_context(ctx);
+            drop(contexts);
+            self.persist_context_snapshot(context_id, &ctx_snapshot);
+        }
 
         Ok(unanimous)
     }
@@ -5501,7 +5543,7 @@ impl ContextManager {
         self.spawn_ttl_timer(context_id, new_duration, handle).await;
 
         // Persist context state after TTL reset (best-effort).
-        {
+        if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(context_id) {
                 let snapshot = Self::snapshot_context(ctx);
