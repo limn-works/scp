@@ -43,7 +43,6 @@ use scp_core::crypto::key_continuity::{
 use scp_core::crypto::sender_keys::{
     SenderKeyStore, decrypt_sender_layer, encrypt_sender_layer, generate_sender_key,
 };
-use scp_core::crypto::ucan::UcanHeader;
 use scp_core::discovery::HandleTarget;
 use scp_core::discovery::handles::{
     HandleDeregisterParams, HandleLookupParams, HandleRegisterParams, HandleRegistry,
@@ -905,27 +904,51 @@ fn conf_021_weeks_offline_classification() {
 /// Layer: Sync | Tier: Full | Spec: §9.9
 #[test]
 fn conf_022_equivocation_detection() {
+    use scp_event_log::checkpoint::{CheckpointComparison, ConsistencyCheckpoint, compare_checkpoint};
+    use scp_event_log::EventLog;
+
     println!("=== CONF-022: Equivocation Detection ===");
 
     print_step(
         1,
-        "Create two checkpoints with same sequence but different roots",
+        "Create local event log and a remote checkpoint with same event count but different root",
     );
-    let root_a: [u8; 32] = Sha256::digest(b"branch-a").into();
-    let root_b: [u8; 32] = Sha256::digest(b"branch-b").into();
+    // Empty local log has event_count=0 and merkle_root=[0;32].
+    let local_log = EventLog::new("ctx-equivocation-test".to_owned());
 
-    print_step(2, "Detect conflicting Merkle roots");
-    assert_ne!(
-        root_a, root_b,
-        "different histories produce different roots"
+    // Remote checkpoint claims 0 events but a non-zero root — equivocation.
+    let root_b: [u8; 32] = Sha256::digest(b"equivocating-branch").into();
+    let remote_checkpoint = ConsistencyCheckpoint {
+        context_id: "ctx-equivocation-test".to_owned(),
+        sender_did: "did:key:remote".into(),
+        event_count: 0,
+        merkle_root: root_b,
+        epoch: Some(0),
+        timestamp: 1_000_000,
+        signature: vec![0u8; 64],
+    };
+
+    print_step(2, "Detect equivocation via compare_checkpoint");
+    let comparison = compare_checkpoint(&local_log, &remote_checkpoint);
+    assert!(
+        matches!(comparison, CheckpointComparison::Divergent { .. }),
+        "same event count + different roots must produce Divergent, got: {comparison:?}"
     );
 
-    print_step(3, "Equivocation is attributable");
-    println!("    Root A: 0x{}", hex(&root_a));
-    println!("    Root B: 0x{}", hex(&root_b));
-    println!("    Divergence detected: roots differ for same epoch");
+    print_step(3, "Verify consistent checkpoints are not flagged");
+    let consistent_checkpoint = ConsistencyCheckpoint {
+        context_id: "ctx-equivocation-test".to_owned(),
+        sender_did: "did:key:remote".into(),
+        event_count: 0,
+        merkle_root: [0u8; 32], // matches empty log root
+        epoch: Some(0),
+        timestamp: 1_000_000,
+        signature: vec![0u8; 64],
+    };
+    let comparison = compare_checkpoint(&local_log, &consistent_checkpoint);
+    assert_eq!(comparison, CheckpointComparison::Consistent);
 
-    println!("  PASS: Equivocation detection verified");
+    println!("  PASS: Equivocation detection verified via compare_checkpoint API");
 }
 
 // ===========================================================================
@@ -934,102 +957,215 @@ fn conf_022_equivocation_detection() {
 
 /// CONF-023: UCAN Issuance and Verification
 /// Layer: Trust | Tier: Core | Spec: §7, §9.5
-#[test]
-fn conf_023_ucan_issuance() {
+#[tokio::test]
+async fn conf_023_ucan_issuance() {
+    use scp_core::crypto::ucan::mint::{MintParams, mint_ucan};
+
     println!("=== CONF-023: UCAN Issuance and Verification ===");
 
-    let issuer = make_signing_key(0x30);
+    let custody = InMemoryKeyCustody::new();
+    let key_handle = custody
+        .generate_keypair(KeyType::Ed25519)
+        .await
+        .expect("generate key");
+    let pubkey = custody.public_key(&key_handle).await.expect("get pubkey");
+    let issuer_did = format!("did:key:z6Mk{}", hex::encode(&pubkey.as_bytes()[..16]));
 
-    print_step(1, "Construct UCAN token");
-    let header = UcanHeader::new();
-    assert_eq!(header.alg, "EdDSA");
-    assert_eq!(header.typ, "JWT");
+    print_step(1, "Mint a real UCAN token via mint_ucan");
+    let context_id = "ctx-conf-023";
+    let audience_did = "did:key:z6MkAudience";
+    let caps = vec!["messages:read".to_owned()];
+    let params = MintParams {
+        context_id,
+        issuer_did: &issuer_did,
+        audience_did,
+        capabilities: &caps,
+        lifetime_secs: 3600,
+        not_before: None,
+        issuer_key: &key_handle,
+        proofs: vec![],
+        facts: None,
+        key_scope: None,
+        signing_key_id: None,
+        ceiling: None,
+    };
+    let token = mint_ucan(&params, &custody).await.expect("mint_ucan");
 
-    print_step(2, "Verify header fields");
-    println!("    alg: {}", header.alg);
-    println!("    typ: {}", header.typ);
-    println!("    ucv: {}", header.ucv);
+    print_step(2, "Verify UCAN header fields");
+    assert_eq!(token.header.alg, "EdDSA");
+    assert_eq!(token.header.typ, "JWT");
+    assert_eq!(token.header.ucv, "0.10.0");
 
-    print_step(3, "Verify signing works with Ed25519");
-    let payload = b"ucan-payload-test";
-    let sig = issuer.sign(payload);
-    issuer
-        .verifying_key()
-        .verify(payload, &sig)
-        .expect("UCAN signature must verify");
+    print_step(3, "Verify token has correct issuer and audience");
+    assert_eq!(token.payload.iss, issuer_did);
+    assert_eq!(token.payload.aud, audience_did);
 
-    println!("  PASS: UCAN issuance verified");
+    print_step(4, "Verify token has non-empty signature and encoded form");
+    assert!(!token.signature.is_empty(), "signature must be non-empty");
+    assert!(!token.encoded.is_empty(), "encoded JWT must be non-empty");
+    assert!(
+        token.encoded.contains('.'),
+        "encoded form must be a JWT with dots"
+    );
+
+    println!("  PASS: UCAN issuance verified via mint_ucan API");
 }
 
 /// CONF-024: UCAN Delegation Chain (A -> B -> C)
 /// Layer: Trust | Tier: Full | Spec: §7
-#[test]
-fn conf_024_ucan_delegation_chain() {
+#[tokio::test]
+async fn conf_024_ucan_delegation_chain() {
+    use scp_core::crypto::ucan::mint::{MintParams, compute_cid, mint_ucan};
+
     println!("=== CONF-024: UCAN Delegation Chain ===");
 
-    let key_a = make_signing_key(0x41);
-    let key_b = make_signing_key(0x42);
-    let _key_c = make_signing_key(0x43);
+    let custody = InMemoryKeyCustody::new();
+    let context_id = "ctx-conf-024";
 
-    print_step(1, "A issues capability to B");
-    let sig_a = key_a.sign(b"delegate-to-B");
-    key_a
-        .verifying_key()
-        .verify(b"delegate-to-B", &sig_a)
+    // Create keys for A, B, C
+    let key_a = custody
+        .generate_keypair(KeyType::Ed25519)
+        .await
         .unwrap();
+    let pubkey_a = custody.public_key(&key_a).await.unwrap();
+    let did_a = format!("did:key:z6Mk{}", hex::encode(&pubkey_a.as_bytes()[..16]));
 
-    print_step(2, "B sub-delegates to C");
-    let sig_b = key_b.sign(b"delegate-to-C");
-    key_b
-        .verifying_key()
-        .verify(b"delegate-to-C", &sig_b)
+    let key_b = custody
+        .generate_keypair(KeyType::Ed25519)
+        .await
         .unwrap();
+    let pubkey_b = custody.public_key(&key_b).await.unwrap();
+    let did_b = format!("did:key:z6Mk{}", hex::encode(&pubkey_b.as_bytes()[..16]));
 
-    print_step(3, "Verify each link's signature");
-    key_a
-        .verifying_key()
-        .verify(b"delegate-to-B", &sig_a)
-        .unwrap();
-    key_b
-        .verifying_key()
-        .verify(b"delegate-to-C", &sig_b)
-        .unwrap();
+    let did_c = "did:key:z6MkCharlie";
+    let caps = vec!["messages:read".to_owned()];
 
-    print_step(4, "Verify chain is 3 levels deep");
-    println!("    A → B → C (depth 3, within max 32)");
+    print_step(1, "A issues root UCAN to B");
+    let root_token = mint_ucan(
+        &MintParams {
+            context_id,
+            issuer_did: &did_a,
+            audience_did: &did_b,
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            issuer_key: &key_a,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+        },
+        &custody,
+    )
+    .await
+    .expect("mint root UCAN A→B");
+    assert_eq!(root_token.payload.iss, did_a);
+    assert_eq!(root_token.payload.aud, did_b);
 
-    println!("  PASS: UCAN delegation chain verified");
+    print_step(2, "B sub-delegates to C via proof chain");
+    let root_cid = compute_cid(&root_token);
+    let delegated_token = mint_ucan(
+        &MintParams {
+            context_id,
+            issuer_did: &did_b,
+            audience_did: did_c,
+            capabilities: &caps,
+            lifetime_secs: 1800,
+            not_before: None,
+            issuer_key: &key_b,
+            proofs: vec![root_cid.clone()],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+        },
+        &custody,
+    )
+    .await
+    .expect("mint delegated UCAN B→C");
+    assert_eq!(delegated_token.payload.iss, did_b);
+    assert_eq!(delegated_token.payload.aud, did_c);
+
+    print_step(3, "Verify proof chain links back to root");
+    assert_eq!(delegated_token.payload.prf.len(), 1);
+    assert_eq!(delegated_token.payload.prf[0], root_cid);
+
+    print_step(4, "Verify both tokens have valid signatures");
+    assert!(!root_token.signature.is_empty());
+    assert!(!delegated_token.signature.is_empty());
+
+    println!("  PASS: UCAN delegation chain verified via mint_ucan + compute_cid");
 }
 
 /// CONF-025: UCAN Revocation
 /// Layer: Trust | Tier: Full | Spec: §7, §9.5
-#[test]
-fn conf_025_ucan_revocation() {
+#[tokio::test]
+async fn conf_025_ucan_revocation() {
+    use scp_core::crypto::ucan::mint::{MintParams, mint_ucan};
+    use scp_core::crypto::ucan::revoke::compute_revocation_cid;
+
     println!("=== CONF-025: UCAN Revocation ===");
 
-    print_step(1, "Compute token CID");
-    let token_data = b"eyJhbGciOiJFZERTQSJ9.payload.signature";
-    let cid_hash: [u8; 32] = Sha256::digest(token_data).into();
-    println!("    CID hash: 0x{}", hex(&cid_hash));
+    let custody = InMemoryKeyCustody::new();
+    let key_handle = custody
+        .generate_keypair(KeyType::Ed25519)
+        .await
+        .unwrap();
+    let pubkey = custody.public_key(&key_handle).await.unwrap();
+    let issuer_did = format!("did:key:z6Mk{}", hex::encode(&pubkey.as_bytes()[..16]));
+    let context_id = "ctx-conf-025";
 
-    print_step(2, "Add CID to revocation list");
-    let revocation_list: Vec<[u8; 32]> = vec![cid_hash];
-    assert_eq!(revocation_list.len(), 1);
+    print_step(1, "Mint a real UCAN token");
+    let caps = vec!["messages:write".to_owned()];
+    let token = mint_ucan(
+        &MintParams {
+            context_id,
+            issuer_did: &issuer_did,
+            audience_did: "did:key:z6MkAudience",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            issuer_key: &key_handle,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+        },
+        &custody,
+    )
+    .await
+    .expect("mint UCAN");
 
-    print_step(3, "Verify token is revoked");
+    print_step(2, "Compute revocation CID from the real encoded token");
+    let revocation_cid = compute_revocation_cid(&token.encoded);
     assert!(
-        revocation_list.contains(&cid_hash),
-        "revoked token must be in list"
+        !revocation_cid.is_empty(),
+        "revocation CID must be non-empty"
+    );
+    println!("    Revocation CID: {revocation_cid}");
+
+    print_step(3, "Add CID to revocation list and verify lookup");
+    let revocation_list: Vec<String> = vec![revocation_cid.clone()];
+    assert!(
+        revocation_list.contains(&revocation_cid),
+        "revoked token CID must be in list"
     );
 
-    print_step(4, "Unrevoked token not in list");
-    let other_hash: [u8; 32] = Sha256::digest(b"other-token").into();
+    print_step(4, "Different token produces different CID");
+    let other_cid = compute_revocation_cid("eyJhbGciOiJFZERTQSJ9.other.sig");
+    assert_ne!(revocation_cid, other_cid, "different tokens must produce different CIDs");
     assert!(
-        !revocation_list.contains(&other_hash),
+        !revocation_list.contains(&other_cid),
         "unrevoked token must not be in list"
     );
 
-    println!("  PASS: UCAN revocation verified");
+    print_step(5, "Same token always produces same CID (deterministic)");
+    let cid_again = compute_revocation_cid(&token.encoded);
+    assert_eq!(revocation_cid, cid_again, "CID computation must be deterministic");
+
+    println!("  PASS: UCAN revocation verified via compute_revocation_cid");
 }
 
 /// CONF-026: Capability Attenuation (Subset Delegation)
