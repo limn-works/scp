@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SCP Chat</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,system-ui,'Helvetica Neue',sans-serif;background:#000;color:#fff;height:100vh;display:flex;flex-direction:column;-webkit-font-smoothing:antialiased}
+.hdr{padding:16px 20px;border-bottom:1px solid #222;display:flex;align-items:baseline;gap:12px;flex-shrink:0}
+.hdr h1{font-size:15px;font-weight:500;letter-spacing:.02em}
+.hdr .st{font-size:12px;color:#666;margin-left:auto}
+.hdr .st.ok{color:#4a4} .hdr .st.err{color:#a44}
+.hdr .user{font-size:12px;color:#888}
+.join{flex:1;display:flex;align-items:center;justify-content:center}
+.join-box{width:300px;text-align:center}
+.join-box h2{font-size:24px;font-weight:300;margin-bottom:6px;letter-spacing:-.01em}
+.join-box p{font-size:13px;color:#666;margin-bottom:28px;line-height:1.6}
+input,button{font-family:inherit;font-size:14px;border-radius:0;outline:none}
+.join-box input,.ib input{width:100%;padding:12px 0;background:transparent;border:none;border-bottom:1px solid #333;color:#fff}
+.join-box input::placeholder,.ib input::placeholder{color:#555}
+.join-box input:focus,.ib input:focus{border-bottom-color:#fff}
+.join-box input{margin-bottom:24px}
+.join-box button{width:100%;padding:12px;background:#fff;color:#000;border:none;font-weight:500;cursor:pointer;letter-spacing:.02em}
+.join-box button:hover{background:#ddd}
+.join-box button:disabled{opacity:.3;cursor:not-allowed}
+.btn-secondary{background:transparent!important;color:#fff!important;border:1px solid #333!important;margin-top:8px}
+.btn-secondary:hover{border-color:#666!important;background:transparent!important}
+.btn-divider{display:none;margin:16px 0 8px;font-size:11px;color:#444;text-transform:uppercase;letter-spacing:.1em}
+.chat{flex:1;display:none;flex-direction:column}
+.msgs{flex:1;overflow-y:auto;padding:20px}
+.m{margin-bottom:12px;line-height:1.6;font-size:14px}
+.m .s{font-weight:500;margin-right:8px}
+.m .s.me{color:#888}
+.m .ts{font-size:11px;color:#444;margin-right:8px;font-variant-numeric:tabular-nums}
+.m.sys{color:#444;font-size:12px;font-style:italic;padding:4px 0}
+.ib{padding:16px 20px;border-top:1px solid #222;display:flex;gap:12px;flex-shrink:0}
+.ib input{flex:1;font-size:14px}
+.ib button{padding:10px 20px;background:#fff;color:#000;border:none;font-weight:500;cursor:pointer}
+.ib button:hover{background:#ddd}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <h1>SCP</h1>
+  <span id="user-label" class="user"></span>
+  <div id="st" class="st"></div>
+</div>
+<div id="join" class="join">
+  <div class="join-box">
+    <h2>Join</h2>
+    <p>End-to-end encrypted via MLS.<br>Powered by Shared Context Protocol.</p>
+    <input type="text" id="name" placeholder="Name" maxlength="32" autofocus>
+    <button id="join-btn" onclick="doJoin()">Join</button>
+    <div id="passkey-divider" class="btn-divider">or</div>
+    <button id="signin-btn" class="btn-secondary" onclick="doPasskeySignIn()" style="display:none">Sign in with passkey</button>
+  </div>
+</div>
+<div id="chat" class="chat">
+  <div class="msgs" id="msgs"></div>
+  <div class="ib">
+    <input type="text" id="msg" placeholder="Message" maxlength="4096">
+    <button onclick="doSend()">Send</button>
+  </div>
+</div>
+<script>
+function fmtTime(ts){
+  if(!ts)ts=Math.floor(Date.now()/1000);
+  const d=new Date(ts*1000);
+  return d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0');
+}
+
+let S={ws:null,did:'',name:'',ctx:'',rid:null,members:[],ping:null};
+const $=id=>document.getElementById(id);
+const hex=h=>{const b=new Uint8Array(h.length/2);for(let i=0;i<h.length;i+=2)b[i/2]=parseInt(h.substring(i,i+2),16);return b};
+const toHex=b=>Array.from(b).map(x=>x.toString(16).padStart(2,'0')).join('');
+async function sha256hex(bytes){return toHex(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)))}
+
+function addMsg(sender,text,self,ts){
+  const d=document.createElement('div');d.className='m';
+  const t=document.createElement('span');t.className='ts';t.textContent=fmtTime(ts);d.appendChild(t);
+  const s=document.createElement('span');s.className='s'+(self?' me':'');s.textContent=sender;
+  d.appendChild(s);d.appendChild(document.createTextNode(text));
+  $('msgs').appendChild(d);$('msgs').scrollTop=$('msgs').scrollHeight;
+}
+function sysMsg(t){const d=document.createElement('div');d.className='m sys';d.textContent=t;$('msgs').appendChild(d);$('msgs').scrollTop=$('msgs').scrollHeight}
+function status(t,c){const e=$('st');e.textContent=t;e.className='st '+(c||'')}
+
+async function getOrCreateSecret(){
+  const saved=localStorage.getItem('scp_chat_secret');
+  if(saved)return saved;
+  const secret=toHex(crypto.getRandomValues(new Uint8Array(32)));
+  localStorage.setItem('scp_chat_secret',secret);
+  return secret;
+}
+
+function checkSavedSession(){
+  const secret=localStorage.getItem('scp_chat_secret');
+  const name=localStorage.getItem('scp_chat_name');
+  if(secret&&name)return{secret,name};
+  return null;
+}
+
+function saveSession(did,name){
+  localStorage.setItem('scp_chat_did',did);
+  localStorage.setItem('scp_chat_name',name);
+}
+
+function clearSession(){
+  localStorage.removeItem('scp_chat_secret');
+  localStorage.removeItem('scp_chat_did');
+  localStorage.removeItem('scp_chat_name');
+}
+
+function b64url(buf){
+  const bytes=buf instanceof ArrayBuffer?new Uint8Array(buf):buf;
+  let s='';for(const b of bytes)s+=String.fromCharCode(b);
+  return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+function b64urlDecode(s){
+  s=s.replace(/-/g,'+').replace(/_/g,'/');
+  while(s.length%4)s+='=';
+  const bin=atob(s);const bytes=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++)bytes[i]=bin.charCodeAt(i);
+  return bytes;
+}
+
+async function hasPasskeySupport(){
+  if(!window.PublicKeyCredential)return false;
+  try{if(PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable)return await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()}catch{}
+  return false;
+}
+
+async function fetchChallenge(){
+  const r=await fetch('/api/passkey-challenge');
+  if(!r.ok)throw new Error('Failed to get challenge');
+  return(await r.json()).challenge;
+}
+
+async function createPasskey(name,challengeB64){
+  if(!window.PublicKeyCredential)return null;
+  try{
+    const cred=await navigator.credentials.create({publicKey:{
+      rp:{name:'SCP Chat',id:location.hostname},
+      user:{id:crypto.getRandomValues(new Uint8Array(32)),name,displayName:name},
+      pubKeyCredParams:[{type:'public-key',alg:-7}],
+      authenticatorSelection:{residentKey:'required',requireResidentKey:true,userVerification:'preferred'},
+      attestation:'none',challenge:b64urlDecode(challengeB64),timeout:120000
+    }});
+    if(!cred)return null;
+    const spki=cred.response.getPublicKey();if(!spki)return null;
+    const spkiBytes=new Uint8Array(spki);
+    return{credential_id:b64url(cred.rawId),public_key:b64url(spkiBytes.slice(spkiBytes.length-65))};
+  }catch{return null}
+}
+
+async function authenticateWithPasskey(challengeB64){
+  if(!window.PublicKeyCredential)return null;
+  try{
+    const a=await navigator.credentials.get({publicKey:{rpId:location.hostname,challenge:b64urlDecode(challengeB64),userVerification:'preferred',timeout:120000}});
+    if(!a)return null;
+    return{credential_id:b64url(a.rawId),authenticator_data:b64url(a.response.authenticatorData),client_data_json:b64url(a.response.clientDataJSON),signature:b64url(a.response.signature)};
+  }catch{return null}
+}
+
+async function enterChat(d){
+  S.did=d.did;S.name=d.name;S.ctx=d.context_id;S.members=d.members;
+  $('join').style.display='none';$('chat').style.display='flex';
+  $('user-label').textContent=S.name;
+  try{
+    const r=await fetch('/api/history');
+    if(r.ok){const data=await r.json();if(data.messages)for(const m of data.messages)addMsg(m.sender_name,m.text,m.sender_did===S.did,m.timestamp)}
+  }catch{}
+  connectChat();
+}
+
+async function doJoin(){
+  const name=$('name').value.trim();if(!name){$('name').focus();return}
+  const btn=$('join-btn');btn.disabled=true;btn.textContent='Joining...';
+  try{
+    const secret=await getOrCreateSecret();
+    const clientId=await sha256hex(hex(secret));
+    const body={name,client_id:clientId};
+    try{const ch=await fetchChallenge();const pk=await createPasskey(name,ch);if(pk){body.credential_id=pk.credential_id;body.public_key=pk.public_key}}catch{}
+    const resp=await fetch('/api/join',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!resp.ok){const e=await resp.json().catch(()=>({}));throw new Error(e.error||`HTTP ${resp.status}`)}
+    const d=await resp.json();
+    saveSession(d.did,d.name);
+    await enterChat(d);
+  }catch(e){status(e.message,'err');btn.disabled=false;btn.textContent='Join'}
+}
+
+async function doRejoin(saved){
+  status('Reconnecting...','');
+  try{
+    const resp=await fetch('/api/rejoin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client_secret:saved.secret})});
+    if(!resp.ok){clearSession();status('Session expired','err');return}
+    const d=await resp.json();saveSession(d.did,d.name);await enterChat(d);
+  }catch(e){status(e.message,'err');clearSession()}
+}
+
+async function doPasskeySignIn(){
+  const btn=$('signin-btn');btn.disabled=true;btn.textContent='Authenticating...';
+  try{
+    const ch=await fetchChallenge();const auth=await authenticateWithPasskey(ch);
+    if(!auth){btn.disabled=false;btn.textContent='Sign in with passkey';return}
+    const resp=await fetch('/api/passkey-auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(auth)});
+    if(!resp.ok){const e=await resp.json().catch(()=>({}));throw new Error(e.error||'Auth failed')}
+    const d=await resp.json();saveSession(d.did,d.name);await enterChat(d);
+  }catch(e){status(e.message,'err');btn.disabled=false;btn.textContent='Sign in with passkey'}
+}
+
+function connectChat(){
+  const proto=location.protocol==='https:'?'wss:':'ws:';
+  const url=`${proto}//${location.host}/ws/chat`;
+  status('Connecting...','');
+  let ws;
+  try{ws=new WebSocket(url);S.ws=ws}catch{status('Failed','err');return}
+  ws.onopen=()=>{status('Connected','ok');S.ping=setInterval(()=>{if(ws.readyState===1)ws.send('ping')},25000)};
+  ws.onmessage=ev=>{try{const m=JSON.parse(ev.data);if(m.sender_did!==S.did)addMsg(m.sender_name,m.text,false,m.timestamp)}catch{}};
+  ws.onclose=()=>{status('Reconnecting...','err');if(S.ping){clearInterval(S.ping);S.ping=null}setTimeout(connectChat,2000)};
+  ws.onerror=()=>{};
+}
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&S.ws&&S.ws.readyState!==1)connectChat()});
+
+async function doSend(){
+  const text=$('msg').value.trim();if(!text||!S.did)return;
+  const ts=Math.floor(Date.now()/1000);
+  try{
+    const r=await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sender_did:S.did,sender_name:S.name,text})});
+    if(!r.ok){const e=await r.json().catch(()=>({}));sysMsg(e.error||'Send failed');return}
+    addMsg(S.name,text,true,ts);$('msg').value='';
+  }catch(e){sysMsg(e.message)}
+  $('msg').focus();
+}
+
+$('name').addEventListener('keydown',e=>{if(e.key==='Enter')doJoin()});
+$('msg').addEventListener('keydown',e=>{if(e.key==='Enter')doSend()});
+
+(async function(){
+  if(await hasPasskeySupport()){$('signin-btn').style.display='block';$('passkey-divider').style.display='block'}
+  const saved=checkSavedSession();
+  if(saved){$('join').style.display='none';await doRejoin(saved);if(!S.did)$('join').style.display='flex'}
+})();
+</script>
+</body>
+</html>

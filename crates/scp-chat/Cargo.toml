@@ -1,0 +1,36 @@
+[package]
+name = "scp-chat"
+version = "0.1.0"
+description = "SCP-powered real-time encrypted chat with terminal and web clients"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "scp-chat"
+path = "src/main.rs"
+
+[dependencies]
+scp-core = { path = "../scp-core" }
+scp-identity = { path = "../scp-identity" }
+scp-node = { path = "../scp-node" }
+scp-platform = { path = "../scp-platform", features = ["testing", "file", "filesystem"] }
+scp-transport = { path = "../scp-transport", features = ["upnp"] }
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+axum = { workspace = true, features = ["ws"] }
+futures = "0.3"
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio-tungstenite = { version = "0.24", features = ["connect"] }
+dirs = "5"
+libc = "0.2"
+p256 = { version = "0.13", features = ["ecdsa"] }
+rand = { workspace = true }
+base64 = { workspace = true }
+
+[lints]
+workspace = true
