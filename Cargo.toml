@@ -12,8 +12,6 @@ members = [
     "crates/scp-media",
     "crates/scp-node",
     "crates/scp-relay",
-    "crates/scp-demo",
-    "crates/scp-chat",
     "crates/scp-ffi",
     "crates/scp-ffi/common",
     "crates/scp-ffi/uniffi",
