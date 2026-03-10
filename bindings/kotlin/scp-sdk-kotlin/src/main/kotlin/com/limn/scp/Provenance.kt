@@ -26,7 +26,7 @@ data class ProvenanceAttachParams(
     val memoryScope: String,
     val members: List<String>,
     val targetContextId: String,
-    val existingChainDepth: Byte? = null,
+    val existingChainDepth: UByte? = null,
 )
 
 /**
@@ -71,8 +71,8 @@ interface ProvenanceBindings {
      * @return true if the chain depth is within the limit.
      */
     fun provenanceCheckChainDepth(
-        chainDepth: Byte,
-        maxDepth: Byte?,
+        chainDepth: UByte,
+        maxDepth: UByte?,
     ): Boolean
 }
 
@@ -127,8 +127,8 @@ class ProvenanceBridge internal constructor(
      * @return true if the chain depth is within the limit.
      */
     suspend fun checkChainDepth(
-        chainDepth: Byte,
-        maxDepth: Byte? = null,
+        chainDepth: UByte,
+        maxDepth: UByte? = null,
     ): Boolean =
         bridge.ffiCall {
             bindings.provenanceCheckChainDepth(chainDepth, maxDepth)
