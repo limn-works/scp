@@ -308,18 +308,21 @@ async fn behavior_deletion_noncompliant() {
 
 #[tokio::test]
 async fn behavior_composite() {
-    // Composite: Suppressing(drop_nth=3) + Replaying(replay_count=1)
+    // Composite applies the first delivery-affecting mode it finds.
+    // Non-delivery modes (DeletionNonCompliant, Delayed) still take
+    // effect but don't change delivery count.
+
+    // Suppressing + DeletionNonCompliant: Suppressing is first
+    // delivery-affecting mode; DeletionNonCompliant affects deletion.
     let mut relay = InMemoryRelay::with_behavior(BehaviorMode::Composite(vec![
         BehaviorMode::Suppressing(SuppressionConfig { drop_nth: 3 }),
-        BehaviorMode::Replaying(ReplayConfig { replay_count: 1 }),
+        BehaviorMode::DeletionNonCompliant,
     ]));
     let routing_id = [14u8; 32];
 
     let (_sub_id, mut rx) = relay.subscribe(routing_id);
 
-    // Store 3 messages. Message counter goes 1, 2, 3.
-    // Suppressing(3): delivers 1 and 2, drops 3.
-    // Replaying(1): delivers each of 1, 2, 3 twice.
+    // Store 3 messages. Suppressing(3) drops every 3rd.
     for i in 0..3u8 {
         relay.store(routing_id, vec![i], None, u64::from(i));
     }
@@ -328,11 +331,17 @@ async fn behavior_composite() {
     while rx.try_recv().is_ok() {
         count += 1;
     }
+    // msg1 (ok), msg2 (ok), msg3 (dropped by suppression) = 2
+    assert_eq!(count, 2);
 
-    // Suppressing delivers: msg1 (ok), msg2 (ok), msg3 (dropped) = 2 messages
-    // Replaying delivers: msg1 (2x), msg2 (2x), msg3 (2x) = 6 messages
-    // Total = 2 + 6 = 8
-    assert_eq!(count, 8);
+    // DeletionNonCompliant still applies: delete should be a no-op.
+    relay.store(routing_id, vec![99], None, 99);
+    let stored = relay.query(&routing_id);
+    let blob_id = stored.last().unwrap().blob_id;
+    relay.delete(&blob_id);
+    // Blob should still be there (DeletionNonCompliant).
+    let after_delete = relay.query(&routing_id);
+    assert!(after_delete.iter().any(|b| b.blob_id == blob_id));
 }
 
 // ===========================================================================

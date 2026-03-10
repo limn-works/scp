@@ -904,8 +904,10 @@ fn conf_021_weeks_offline_classification() {
 /// Layer: Sync | Tier: Full | Spec: §9.9
 #[test]
 fn conf_022_equivocation_detection() {
-    use scp_event_log::checkpoint::{CheckpointComparison, ConsistencyCheckpoint, compare_checkpoint};
     use scp_event_log::EventLog;
+    use scp_event_log::checkpoint::{
+        CheckpointComparison, ConsistencyCheckpoint, compare_checkpoint,
+    };
 
     println!("=== CONF-022: Equivocation Detection ===");
 
@@ -1023,17 +1025,11 @@ async fn conf_024_ucan_delegation_chain() {
     let context_id = "ctx-conf-024";
 
     // Create keys for A, B, C
-    let key_a = custody
-        .generate_keypair(KeyType::Ed25519)
-        .await
-        .unwrap();
+    let key_a = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
     let pubkey_a = custody.public_key(&key_a).await.unwrap();
     let did_a = format!("did:key:z6Mk{}", hex::encode(&pubkey_a.as_bytes()[..16]));
 
-    let key_b = custody
-        .generate_keypair(KeyType::Ed25519)
-        .await
-        .unwrap();
+    let key_b = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
     let pubkey_b = custody.public_key(&key_b).await.unwrap();
     let did_b = format!("did:key:z6Mk{}", hex::encode(&pubkey_b.as_bytes()[..16]));
 
@@ -1108,10 +1104,7 @@ async fn conf_025_ucan_revocation() {
     println!("=== CONF-025: UCAN Revocation ===");
 
     let custody = InMemoryKeyCustody::new();
-    let key_handle = custody
-        .generate_keypair(KeyType::Ed25519)
-        .await
-        .unwrap();
+    let key_handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
     let pubkey = custody.public_key(&key_handle).await.unwrap();
     let issuer_did = format!("did:key:z6Mk{}", hex::encode(&pubkey.as_bytes()[..16]));
     let context_id = "ctx-conf-025";
@@ -1155,7 +1148,10 @@ async fn conf_025_ucan_revocation() {
 
     print_step(4, "Different token produces different CID");
     let other_cid = compute_revocation_cid("eyJhbGciOiJFZERTQSJ9.other.sig");
-    assert_ne!(revocation_cid, other_cid, "different tokens must produce different CIDs");
+    assert_ne!(
+        revocation_cid, other_cid,
+        "different tokens must produce different CIDs"
+    );
     assert!(
         !revocation_list.contains(&other_cid),
         "unrevoked token must not be in list"
@@ -1163,7 +1159,10 @@ async fn conf_025_ucan_revocation() {
 
     print_step(5, "Same token always produces same CID (deterministic)");
     let cid_again = compute_revocation_cid(&token.encoded);
-    assert_eq!(revocation_cid, cid_again, "CID computation must be deterministic");
+    assert_eq!(
+        revocation_cid, cid_again,
+        "CID computation must be deterministic"
+    );
 
     println!("  PASS: UCAN revocation verified via compute_revocation_cid");
 }

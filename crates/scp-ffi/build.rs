@@ -1,7 +1,7 @@
 /// Emits the Python shared library directory so that `cargo test` works
 /// without manually setting `DYLD_LIBRARY_PATH`.
 ///
-/// PyO3 handles finding Python at compile time, but on macOS the dynamic
+/// `PyO3` handles finding Python at compile time, but on macOS the dynamic
 /// linker (`dyld`) needs the library path at *runtime* too. This build
 /// script queries the Python interpreter for its `LIBDIR` and emits
 /// `cargo:rustc-link-search=native=...` so the test binaries can find
@@ -20,16 +20,16 @@ fn main() {
         ])
         .output();
 
-    if let Ok(output) = output {
-        if output.status.success() {
-            let libdir = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !libdir.is_empty() {
-                println!("cargo:rustc-link-search=native={libdir}");
-                // Note: DYLD_LIBRARY_PATH must still be set externally for
-                // test binary execution. cargo:rustc-env only makes the
-                // value available via env!() at compile time, not as a
-                // process environment variable at runtime.
-            }
+    if let Ok(output) = output
+        && output.status.success()
+    {
+        let libdir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !libdir.is_empty() {
+            println!("cargo:rustc-link-search=native={libdir}");
+            // Note: DYLD_LIBRARY_PATH must still be set externally for
+            // test binary execution. cargo:rustc-env only makes the
+            // value available via env!() at compile time, not as a
+            // process environment variable at runtime.
         }
     }
 
