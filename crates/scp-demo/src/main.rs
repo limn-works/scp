@@ -28,6 +28,7 @@
 
 use std::io::Write as _;
 use std::net::SocketAddr;
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -171,7 +172,7 @@ async fn run_creator(name: &str) {
         sender_key_hex: hex::encode(my_sender_key.as_bytes()),
         relay_url: relay_url.clone(),
     };
-    std::fs::write(INVITE_PATH, serde_json::to_string_pretty(&invite).unwrap())
+    write_restricted(INVITE_PATH, &serde_json::to_string_pretty(&invite).unwrap())
         .expect("failed to write invite file");
     println!("{DIM}  Invite written to {INVITE_PATH}{RESET}");
 
@@ -269,7 +270,7 @@ async fn run_joiner(name: &str) {
         joiner_name: name.to_owned(),
         sender_key_hex: hex::encode(my_sender_key.as_bytes()),
     };
-    std::fs::write(JOINED_PATH, serde_json::to_string_pretty(&joined).unwrap())
+    write_restricted(JOINED_PATH, &serde_json::to_string_pretty(&joined).unwrap())
         .expect("failed to write joined file");
     println!("{DIM}  Join response written to {JOINED_PATH}{RESET}");
 
@@ -500,6 +501,18 @@ fn try_decrypt_any_seq(
         }
     }
     None
+}
+
+/// Write `contents` to `path` with UNIX mode 0600 (owner read/write only).
+/// Prevents sender-key material from being world-readable under default umask.
+fn write_restricted(path: &str, contents: &str) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents.as_bytes())
 }
 
 fn truncate_did(did: &str) -> String {
