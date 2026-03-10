@@ -166,6 +166,9 @@ struct ToolsTests {
 
         let context = Context(
             handle: handle,
+            contextId: "test-ctx",
+            creatorDid: "did:dht:z6MkTest",
+            initialState: .active,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
@@ -219,6 +222,9 @@ struct ToolsTests {
 
         let context = Context(
             handle: handle,
+            contextId: "test-ctx",
+            creatorDid: "did:dht:z6MkTest",
+            initialState: .active,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
@@ -283,6 +289,9 @@ struct ToolsTests {
 
         let context = Context(
             handle: handle,
+            contextId: "test-ctx",
+            creatorDid: "did:dht:z6MkTest",
+            initialState: .active,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
@@ -358,6 +367,9 @@ struct ToolsTests {
 
         let sourceContext = Context(
             handle: sourceHandle,
+            contextId: "source-ctx",
+            creatorDid: "did:dht:z6MkTest",
+            initialState: .active,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
@@ -365,6 +377,9 @@ struct ToolsTests {
         )
         let targetContext = Context(
             handle: targetHandle,
+            contextId: "target-ctx",
+            creatorDid: "did:dht:z6MkTest",
+            initialState: .active,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
@@ -431,6 +446,9 @@ struct ToolsTests {
 
         let context = Context(
             handle: handle,
+            contextId: "test-ctx",
+            creatorDid: "did:dht:z6MkTest",
+            initialState: .active,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
@@ -467,6 +485,9 @@ struct ToolsTests {
 
         let context = Context(
             handle: handle,
+            contextId: "test-ctx",
+            creatorDid: "did:dht:z6MkTest",
+            initialState: .active,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
@@ -502,6 +523,9 @@ struct ToolsTests {
 
         let context = Context(
             handle: handle,
+            contextId: "test-ctx",
+            creatorDid: "did:dht:z6MkTest",
+            initialState: .active,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,

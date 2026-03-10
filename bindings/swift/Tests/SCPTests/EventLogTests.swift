@@ -157,7 +157,7 @@ struct EventLogTests {
     @Test("EventLog query calls bridge and returns events")
     func queryRoundtrip() async throws {
         let contextHandle = ContextHandle(noPointer: .init())
-        let handle = EventLogHandle(contextHandle: contextHandle)
+        let handle = EventLogHandle(contextHandle: contextHandle, contextId: "ctx-query")
 
         let mockEvents = [
             Event(
@@ -214,7 +214,7 @@ struct EventLogTests {
     @Test("EventLog proveInclusion calls bridge and returns proof")
     func proveInclusionRoundtrip() async throws {
         let contextHandle = ContextHandle(noPointer: .init())
-        let handle = EventLogHandle(contextHandle: contextHandle)
+        let handle = EventLogHandle(contextHandle: contextHandle, contextId: "ctx-prove")
 
         let mockProof = Proof(
             verified: true,

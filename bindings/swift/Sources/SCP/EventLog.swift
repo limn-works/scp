@@ -38,8 +38,14 @@ final class EventLogHandle: Sendable {
     }
 
     /// Creates an ``EventLogHandle`` backed by a UniFFI context handle.
-    init(contextHandle: ContextHandle) {
-        contextId = contextHandle.contextId()
+    ///
+    /// - Parameters:
+    ///   - contextHandle: The UniFFI context handle.
+    ///   - contextId: Optional override for the context ID. When `nil`,
+    ///     the ID is read from the handle. Pass explicitly in tests where
+    ///     the handle has no backing FFI pointer.
+    init(contextHandle: ContextHandle, contextId: String? = nil) {
+        self.contextId = contextId ?? contextHandle.contextId()
         self.contextHandle = contextHandle
     }
 }

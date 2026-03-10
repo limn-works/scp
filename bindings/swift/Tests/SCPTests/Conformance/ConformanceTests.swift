@@ -62,12 +62,21 @@ struct ConformanceTests {
             let contextId = input["context_id"] ?? ""
             let presenterDid = input["presenter_did"] ?? ""
             let handle = ContextHandle(noPointer: .init())
+            // Inject a mock validateFn to avoid calling the real UniFFI bridge
+            // (which would crash on the nil-pointer handle).
+            let mockValidate: UcanBridge.ValidateFn = { _, _, _, _, _ in
+                throw ScpError.Validation(
+                    message: "Conformance stub: no real Rust runtime",
+                    code: "SCP-VALID-9999"
+                )
+            }
             do {
                 let result = try await validate(
                     encoded: encoded,
                     handle: handle,
                     contextId: contextId,
-                    presenterDid: presenterDid
+                    presenterDid: presenterDid,
+                    validateFn: mockValidate
                 )
                 return [
                     "is_valid": String(result.isValid),
@@ -83,12 +92,19 @@ struct ConformanceTests {
             let issuer = input["issuer_did"] ?? ""
             let audience = input["audience_did"] ?? ""
             let handle = ContextHandle(noPointer: .init())
+            let mockMint: UcanBridge.MintFn = { _, _, _ in
+                throw ScpError.Validation(
+                    message: "Conformance stub: no real Rust runtime",
+                    code: "SCP-VALID-9999"
+                )
+            }
             do {
                 let token = try await mint(
                     handle: handle,
                     issuerDid: issuer,
                     audienceDid: audience,
-                    capabilities: []
+                    capabilities: [],
+                    mintFn: mockMint
                 )
                 return [
                     "issuer": token.issuer(),
@@ -104,8 +120,19 @@ struct ConformanceTests {
             let encoded = input["encoded"] ?? ""
             let revoker = input["revoker_did"] ?? ""
             let handle = ContextHandle(noPointer: .init())
+            let mockRevoke: UcanBridge.RevokeFn = { _, _ in
+                throw ScpError.Validation(
+                    message: "Conformance stub: no real Rust runtime",
+                    code: "SCP-VALID-9999"
+                )
+            }
             do {
-                try await revoke(handle: handle, encoded: encoded, revokerDid: revoker)
+                try await revoke(
+                    handle: handle,
+                    encoded: encoded,
+                    revokerDid: revoker,
+                    revokeFn: mockRevoke
+                )
                 return ["status": "revoked"]
             } catch let error as ScpError {
                 return ["error": errorCode(error)]
@@ -116,8 +143,14 @@ struct ConformanceTests {
         case "transport_connect":
             let relayUrl = input["relay_url"] ?? ""
             let config = TransportConfig(relayUrls: relayUrl.isEmpty ? [] : [relayUrl])
+            let mockConnect: TransportBridge.ConnectFn = { _ in
+                throw ScpError.Transport(
+                    message: "Conformance stub: no real Rust runtime",
+                    code: "SCP-TRANS-9999"
+                )
+            }
             do {
-                try await connectTransport(config: config)
+                try await connectTransport(config: config, connectFn: mockConnect)
                 return ["status": "connected"]
             } catch let error as ScpError {
                 return ["error": errorCode(error)]
@@ -126,8 +159,17 @@ struct ConformanceTests {
             }
 
         case "transport_status":
+            let mockStatus: TransportBridge.StatusFn = { _ in
+                throw ScpError.Transport(
+                    message: "Conformance stub: no real Rust runtime",
+                    code: "SCP-TRANS-9999"
+                )
+            }
             do {
-                let status = try await transportStatus(manager: TransportManager(noPointer: .init()))
+                let status = try await queryTransportStatus(
+                    manager: TransportManager(noPointer: .init()),
+                    statusFn: mockStatus
+                )
                 // TransportStatus is a struct with connected, relayUrl, latencyMs
                 return ["connected": String(status.connected)]
             } catch let error as ScpError {
@@ -260,7 +302,8 @@ struct ConformanceTests {
                 "presenter_did": "did:dht:z6MkPresenter"
             ]
         )
-        #expect(result["error"] == "SCP-PERM-3001")
+        // validate() catches errors internally and returns is_valid: false
+        #expect(result["is_valid"] == "false")
     }
 
     @Test("Conformance runner dispatches ucan_mint operation")
@@ -272,7 +315,8 @@ struct ConformanceTests {
                 "audience_did": "did:dht:z6MkAudience"
             ]
         )
-        #expect(result["error"] == "SCP-PERM-3002")
+        // Mock bridge throws SCP-VALID-9999 (no real Rust runtime)
+        #expect(result["error"] == "SCP-VALID-9999")
     }
 
     @Test("Conformance runner dispatches ucan_revoke operation")
@@ -284,7 +328,8 @@ struct ConformanceTests {
                 "revoker_did": "did:dht:z6MkRevoker"
             ]
         )
-        #expect(result["error"] == "SCP-PERM-3003")
+        // Mock bridge throws SCP-VALID-9999 (no real Rust runtime)
+        #expect(result["error"] == "SCP-VALID-9999")
     }
 
     @Test("Conformance runner dispatches transport_connect operation")
@@ -293,7 +338,8 @@ struct ConformanceTests {
             operation: "transport_connect",
             input: ["relay_url": "wss://relay.test/scp/v1"]
         )
-        #expect(result["error"] == "SCP-TRANS-5001")
+        // Mock bridge throws SCP-TRANS-9999 (no real Rust runtime)
+        #expect(result["error"] == "SCP-TRANS-9999")
     }
 
     @Test("Conformance runner dispatches transport_status operation")
@@ -302,7 +348,8 @@ struct ConformanceTests {
             operation: "transport_status",
             input: [:]
         )
-        #expect(result["error"] == "SCP-TRANS-5002")
+        // Mock bridge throws SCP-TRANS-9999 (no real Rust runtime)
+        #expect(result["error"] == "SCP-TRANS-9999")
     }
 
     @Test("Conformance runner dispatches event_log_query operation")
@@ -329,7 +376,8 @@ struct ConformanceTests {
             operation: "event_log_verify",
             input: [:]
         )
-        #expect(result["error"] == "SCP-CTX-2032")
+        // verifyInclusion is a pure function — returns is_valid, not an error
+        #expect(result["is_valid"] == "false")
     }
 
     @Test("Conformance runner returns error for unsupported operation")
@@ -340,7 +388,11 @@ struct ConformanceTests {
         )
         #expect(result["error"] == "unsupported_operation")
     }
+} // end ConformanceTests
 
+// MARK: - Fixture Loading & Model Tests
+
+extension ConformanceTests {
     @Test("Conformance fixture loader handles missing directory gracefully")
     func fixtureLoaderHandlesMissingDirectory() {
         let fixtures = loadFixtures()
@@ -371,18 +423,19 @@ struct ConformanceTests {
     func resultComparisonMatchesExpected() async {
         // When the bridge is live, the dispatcher should return results
         // that match the fixture's expected values. With stubs, we verify
-        // the error code matches what we'd document in fixtures.
+        // the mock behavior matches what we expect.
         let fixture = ConformanceFixture(
             testId: "ucan-validate-stub-001",
             category: "ucan",
-            description: "Stub returns bridge-unavailable error",
+            description: "Stub returns validation failure (mock bridge)",
             operation: "ucan_validate",
             input: [
                 "encoded": "test.token.sig",
                 "context_id": "ctx-1",
                 "presenter_did": "did:dht:z6MkPresenter"
             ],
-            expected: ["error": "SCP-PERM-3001"]
+            // validate() catches errors internally → returns is_valid: false
+            expected: ["is_valid": "false"]
         )
 
         let result = await dispatch(operation: fixture.operation, input: fixture.input)
@@ -395,4 +448,4 @@ struct ConformanceTests {
             )
         }
     }
-} // end ConformanceTests
+}

@@ -134,6 +134,9 @@ public actor Context {
     /// The unique identifier of this context.
     public let contextId: String
 
+    /// The DID of the context creator, cached from the handle at init time.
+    public let creatorDid: String
+
     /// The current lifecycle state of this context.
     public internal(set) var state: ContextState
 
@@ -165,28 +168,50 @@ public actor Context {
     ///
     /// - Parameters:
     ///   - handle: The opaque UniFFI context handle.
+    ///   - contextId: Optional override for the context ID. When `nil`,
+    ///     the ID is read from the handle. Pass explicitly in tests where
+    ///     the handle has no backing FFI pointer.
+    ///   - initialState: Optional override for the initial state. When
+    ///     `nil`, the state is read from the handle (defaulting to
+    ///     ``ContextState/active`` if the handle throws).
     ///   - sendFn: Bridge function for sending messages.
     ///   - subscribeFn: Bridge function for subscribing to messages.
     ///   - leaveFn: Bridge function for leaving the context.
     ///   - closeFn: Bridge function for closing the context.
     init(
         handle: any ContextHandleProtocol,
+        contextId: String? = nil,
+        creatorDid: String? = nil,
+        initialState: ContextState? = nil,
         sendFn: @escaping ContextBridge.SendFn,
         subscribeFn: @escaping ContextBridge.SubscribeFn,
         leaveFn: @escaping ContextBridge.LeaveFn,
         closeFn: @escaping ContextBridge.CloseFn
     ) {
         self.handle = handle
-        contextId = handle.contextId()
-        // UniFFI ContextHandleProtocol.state() throws, so use try? with a fallback.
-        let stateString = (try? handle.state()) ?? "active"
-        switch stateString {
-        case "creating": state = .creating
-        case "active": state = .active
-        case "closing": state = .closing
-        case "closed": state = .closed
-        case "expired": state = .expired
-        default: state = .active
+        if let contextId {
+            self.contextId = contextId
+        } else {
+            self.contextId = handle.contextId()
+        }
+        if let creatorDid {
+            self.creatorDid = creatorDid
+        } else {
+            self.creatorDid = handle.creatorDid()
+        }
+        if let initialState {
+            state = initialState
+        } else {
+            // UniFFI ContextHandleProtocol.state() throws, so use try? with a fallback.
+            let stateString = (try? handle.state()) ?? "active"
+            switch stateString {
+            case "creating": state = .creating
+            case "active": state = .active
+            case "closing": state = .closing
+            case "closed": state = .closed
+            case "expired": state = .expired
+            default: state = .active
+            }
         }
         self.sendFn = sendFn
         self.subscribeFn = subscribeFn

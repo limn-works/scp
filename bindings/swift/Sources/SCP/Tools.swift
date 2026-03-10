@@ -241,7 +241,7 @@ public extension Context {
         let outputJson = try await invokeFn(contextHandle, tool, inputJson, identity, ucanToken, proofTokens)
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
-            invokerDid: contextHandle.creatorDid(),
+            invokerDid: creatorDid,
             contextId: contextId,
             timestamp: UInt64(Date().timeIntervalSince1970 * 1000)
         )
@@ -379,7 +379,7 @@ public extension Context {
         )
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
-            invokerDid: sourceHandle.creatorDid(),
+            invokerDid: creatorDid,
             contextId: contextId,
             timestamp: UInt64(Date().timeIntervalSince1970 * 1000)
         )
@@ -478,7 +478,7 @@ public extension Context {
         )
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
-            invokerDid: contextHandle.creatorDid(),
+            invokerDid: creatorDid,
             contextId: contextId,
             timestamp: UInt64(Date().timeIntervalSince1970 * 1000)
         )

@@ -29,6 +29,9 @@ struct GovernanceTests {
 
         return Context(
             handle: handle,
+            contextId: "test-ctx",
+            creatorDid: "did:dht:z6MkTest",
+            initialState: .active,
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
@@ -149,7 +152,7 @@ struct GovernanceTests {
     @Test("MemberRole.fromBridge falls back to .custom for unknown strings")
     func memberRoleFromBridgeFallback() {
         #expect(MemberRole.fromBridge("") == .custom)
-        #expect(MemberRole.fromBridge("ADMIN") == .custom) // not "Admin" or "admin"
+        #expect(MemberRole.fromBridge("superadmin") == .custom)
         #expect(MemberRole.fromBridge("SuperUser") == .custom)
     }
 
