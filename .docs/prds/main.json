@@ -6938,9 +6938,9 @@
       "files": [
         "crates/scp-core/sync/conflict_resolution.rs"
       ],
-      "description": "Implement conflict resolution for concurrent offline operations. When two admins are both offline and both propose conflicting role changes or governance modifications, the protocol must resolve the conflict deterministically. Expected approach: first-writer-wins for metadata, Merkle tree for event ordering, governance deadlock = context fork.",
+      "description": "Implement conflict resolution for concurrent offline operations. When two admins are both offline and both propose conflicting role changes or governance modifications, the protocol must resolve the conflict deterministically. Expected approach: first-writer-wins for metadata (lower Merkle leaf index wins per §23.6.1), Merkle tree for event ordering, governance deadlock = context fork.",
       "acceptanceCriteria": [
-        "Concurrent offline metadata changes resolved via first-writer-wins",
+        "Concurrent offline metadata changes resolved via first-writer-wins (lower Merkle leaf index wins)",
         "Event ordering determined by Merkle tree position, not wall-clock time",
         "Concurrent governance proposals from multiple offline admins resolved deterministically",
         "Governance deadlock detected and triggers context fork",
@@ -6948,7 +6948,7 @@
         "Tests verify conflict resolution for all concurrent offline scenarios"
       ],
       "actionItems": [
-        "Implement first-writer-wins resolution for concurrent metadata changes",
+        "Implement first-writer-wins resolution for concurrent metadata changes (lower Merkle leaf index wins per §23.6.1)",
         "Implement Merkle tree-based event ordering for conflict resolution",
         "Define governance deadlock detection criteria",
         "Implement context fork mechanism for irreconcilable governance deadlocks",
@@ -6970,7 +6970,7 @@
       "details": {
         "stubADR": true,
         "note": "ADR not yet fully written — story derived from expected approach and known constraints",
-        "approachDirection": "First-writer-wins for metadata, Merkle tree for event ordering, governance deadlock = context fork",
+        "approachDirection": "Last-writer-wins for metadata, Merkle tree for event ordering, governance deadlock = context fork",
         "openQuestions": [
           "Conflict resolution for concurrent offline governance changes (two admins both offline, both propose role changes)"
         ],

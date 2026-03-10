@@ -236,7 +236,10 @@ impl GovernanceEngine for ThresholdEngine {
             ));
         }
 
-        // Serialize action for ID computation.
+        // Canonical JSON serialization for cross-implementation deterministic
+        // proposal ID computation (§9.5.2). JSON (not MessagePack) because
+        // GovernanceAction is a complex enum that must hash identically across
+        // all SDK languages. See compute_proposal_id() doc comment.
         let action_bytes = serde_json::to_vec(&action)
             .map_err(|e| GovernanceError::SerializationFailed(e.to_string()))?;
 
