@@ -13,7 +13,7 @@
 //!
 //! # Resolution strategies
 //!
-//! - **Metadata conflicts:** Last-writer-wins, where "last" is determined by
+//! - **Metadata conflicts:** First-writer-wins, where "first" is determined by
 //!   Merkle tree leaf index (lower index = earlier = wins).
 //! - **Governance conflicts:** The proposal with the lower event log sequence
 //!   number wins. The losing proposal is invalidated.
@@ -50,7 +50,7 @@ pub type MerkleRoot = [u8; 32];
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConflictType {
     /// Two concurrent metadata changes to the same field (e.g., context
-    /// settings). Resolved via last-writer-wins by Merkle position.
+    /// settings). Resolved via first-writer-wins by Merkle position.
     MetadataConflict,
     /// Two concurrent governance proposals that are incompatible (e.g.,
     /// conflicting role changes, mutual removal). Resolved by Merkle log
@@ -74,9 +74,9 @@ pub enum ConflictType {
 /// strategies are deterministic and clock-independent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConflictResolutionStrategy {
-    /// Last-writer-wins based on Merkle tree leaf index. The operation with
+    /// First-writer-wins based on Merkle tree leaf index. The operation with
     /// the lower leaf index (committed first) wins.
-    LastWriterWins {
+    FirstWriterWins {
         /// Leaf index of the winning operation.
         winner_leaf_index: u64,
         /// Leaf index of the losing operation.
@@ -272,7 +272,7 @@ pub fn actions_conflict(
 // Metadata conflict resolution
 // ---------------------------------------------------------------------------
 
-/// Resolves a metadata conflict using last-writer-wins by Merkle position.
+/// Resolves a metadata conflict using first-writer-wins by Merkle position.
 ///
 /// When two offline members concurrently modify the same metadata field,
 /// the operation committed first to the Merkle event log wins. "First"
@@ -283,7 +283,7 @@ pub fn actions_conflict(
 ///
 /// # Returns
 ///
-/// - `LastWriterWins` with the winner and loser leaf indices.
+/// - `FirstWriterWins` with the winner and loser leaf indices.
 /// - `Merged` if the operations modify different fields (no conflict).
 ///
 /// See ADR-029 section 5c.
@@ -296,12 +296,12 @@ pub fn resolve_metadata_conflict(a: &MetadataOp, b: &MetadataOp) -> ConflictReso
 
     // Same field — lower leaf index wins.
     if a.leaf_index <= b.leaf_index {
-        ConflictResolutionStrategy::LastWriterWins {
+        ConflictResolutionStrategy::FirstWriterWins {
             winner_leaf_index: a.leaf_index,
             loser_leaf_index: b.leaf_index,
         }
     } else {
-        ConflictResolutionStrategy::LastWriterWins {
+        ConflictResolutionStrategy::FirstWriterWins {
             winner_leaf_index: b.leaf_index,
             loser_leaf_index: a.leaf_index,
         }
@@ -960,7 +960,7 @@ mod tests {
         let b = metadata_op("did:dht:bob", "description", b"second", 7);
         assert_eq!(
             resolve_metadata_conflict(&a, &b),
-            ConflictResolutionStrategy::LastWriterWins {
+            ConflictResolutionStrategy::FirstWriterWins {
                 winner_leaf_index: 3,
                 loser_leaf_index: 7,
             },
@@ -973,7 +973,7 @@ mod tests {
         let b = metadata_op("did:dht:bob", "description", b"first", 2);
         assert_eq!(
             resolve_metadata_conflict(&a, &b),
-            ConflictResolutionStrategy::LastWriterWins {
+            ConflictResolutionStrategy::FirstWriterWins {
                 winner_leaf_index: 2,
                 loser_leaf_index: 10,
             },
@@ -987,7 +987,7 @@ mod tests {
         let b = metadata_op("did:dht:bob", "description", b"tied-b", 5);
         assert_eq!(
             resolve_metadata_conflict(&a, &b),
-            ConflictResolutionStrategy::LastWriterWins {
+            ConflictResolutionStrategy::FirstWriterWins {
                 winner_leaf_index: 5,
                 loser_leaf_index: 5,
             },
@@ -1417,7 +1417,7 @@ mod tests {
     #[test]
     fn resolution_strategies_are_serializable() {
         let strategies = vec![
-            ConflictResolutionStrategy::LastWriterWins {
+            ConflictResolutionStrategy::FirstWriterWins {
                 winner_leaf_index: 3,
                 loser_leaf_index: 7,
             },
@@ -1471,7 +1471,7 @@ mod tests {
         let result = resolve_metadata_conflict(&early_clock_late_log, &late_clock_early_log);
         assert_eq!(
             result,
-            ConflictResolutionStrategy::LastWriterWins {
+            ConflictResolutionStrategy::FirstWriterWins {
                 winner_leaf_index: 2,
                 loser_leaf_index: 10,
             },

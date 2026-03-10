@@ -48,7 +48,7 @@ interface SyncBindings {
 data class SyncPolicy(
     val tier1ThresholdSecs: Long = DEFAULT_TIER_1_THRESHOLD_SECS,
     val tier2ThresholdSecs: Long = DEFAULT_TIER_2_THRESHOLD_SECS,
-    val conflictResolution: String = "last_writer_wins",
+    val conflictResolution: String = "first_writer_wins",
     val maxRetries: Int = DEFAULT_MAX_RETRIES,
 ) {
     companion object {
