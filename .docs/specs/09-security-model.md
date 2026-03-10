@@ -400,10 +400,10 @@ Note: the `claim` field uses compact JSON with no whitespace (equivalent to Pyth
 |-------|-------|----------|
 | 1 | `context_id` | 4-byte BE length + UTF-8 bytes |
 | 2 | `proposer_did` | 4-byte BE length + UTF-8 bytes |
-| 3 | `action_bytes` | 4-byte BE length + MessagePack serialization of `GovernanceAction` |
+| 3 | `action_bytes` | 4-byte BE length + canonical JSON serialization of `GovernanceAction` (compact, no whitespace) |
 | 4 | `timestamp` | 8-byte BE u64 |
 
-Note: The `ProposalId` is the SHA-256 output (32 bytes). It is deterministic for identical inputs and collision-resistant across contexts. The `action_bytes` field uses MessagePack serialization of the `GovernanceAction` enum (externally tagged, serde named fields).
+Note: The `ProposalId` is the SHA-256 output (32 bytes). It is deterministic for identical inputs and collision-resistant across contexts. The `action_bytes` field uses **canonical JSON** serialization of the `GovernanceAction` enum (externally tagged, compact format with no whitespace — equivalent to `json.dumps(separators=(',', ':'))` in Python). JSON is used rather than MessagePack because `GovernanceAction` is a complex 28-variant enum whose serialized form must be byte-identical across all SDK implementations. MessagePack has no canonical form standard and field ordering varies by library; JSON serialization is more predictable across languages and has RFC 8785 (JCS) as a formal canonicalization standard. This is consistent with all other cross-implementation canonical hashing in the protocol: handle tool signing (§22), app declarations (§8.4), DID documents (§18.1), and governance config hashing for multi-parent contexts (§5.13).
 
 **SignedVote** — domain: `"SCP-VOTE-V1:"`
 
