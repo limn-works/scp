@@ -1174,6 +1174,48 @@ async fn handle_passkey_auth(
             .into_response();
     };
 
+    // Authenticator data: [0..32] = SHA-256(rpId), [32] = flags.
+    // Verify RP ID hash matches the expected relying party identifier
+    // (location.hostname on the client, which is the server's host_ip).
+    if auth_data.len() < 33 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "authenticator data too short"})),
+        )
+            .into_response();
+    }
+
+    let expected_rp_ids: Vec<&str> = room
+        .expected_origins
+        .iter()
+        .filter_map(|o| {
+            // Extract hostname from "https://host:port".
+            o.strip_prefix("https://")
+                .and_then(|rest| rest.split(':').next())
+        })
+        .collect();
+    let rp_id_matched = expected_rp_ids.iter().any(|rp_id| {
+        let expected_hash = Sha256::digest(rp_id.as_bytes());
+        auth_data[..32] == *expected_hash
+    });
+    if !rp_id_matched {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "RP ID hash mismatch in authenticator data"})),
+        )
+            .into_response();
+    }
+
+    // Verify User Presence (UP) flag — bit 0 of the flags byte.
+    let flags = auth_data[32];
+    if flags & 0x01 == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "user presence flag not set in authenticator data"})),
+        )
+            .into_response();
+    }
+
     // `WebAuthn` signature is over: `authenticator_data` || SHA-256(`client_data_json`)
     let client_data_hash = Sha256::digest(&client_data_json);
     let mut signed_data = Vec::with_capacity(auth_data.len() + 32);
