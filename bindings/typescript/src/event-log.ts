@@ -88,7 +88,10 @@ export class EventLog {
   async checkpoint(): Promise<Checkpoint> {
     try {
       const bridge = await getBridge();
-      return await bridge.eventLogCheckpoint(this._ctx._handle);
+      // The NAPI Rust function requires (handle, identityDid, epoch).
+      // Use the context creator DID and epoch 0 as synthetic defaults
+      // (matching the WASM bridge approach).
+      return await bridge.eventLogCheckpoint(this._ctx._handle, this._ctx._handle.creatorDid, 0);
     } catch (error) {
       throw mapBridgeError(error);
     }

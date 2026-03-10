@@ -446,29 +446,86 @@ export function createNativeBridge(): Bridge {
       handle: BridgeContextHandle,
       filter: EventFilter | undefined,
     ): Promise<readonly Event[]> {
-      const filterJson = filter !== undefined ? JSON.stringify(filter) : undefined;
-      const events = await (
+      // Convert camelCase filter keys to snake_case for the Rust bridge.
+      let filterJson: string | undefined;
+      if (filter !== undefined) {
+        const snakeFilter: Record<string, unknown> = {};
+        if (filter.eventType !== undefined) snakeFilter.event_type = filter.eventType;
+        if (filter.actorDid !== undefined) snakeFilter.actor_did = filter.actorDid;
+        if (filter.afterSequence !== undefined) snakeFilter.after_sequence = filter.afterSequence;
+        if (filter.beforeSequence !== undefined)
+          snakeFilter.before_sequence = filter.beforeSequence;
+        if (filter.limit !== undefined) snakeFilter.limit = filter.limit;
+        filterJson = JSON.stringify(snakeFilter);
+      }
+      const raw = await (
         addon.eventLogQuery as (
           h: BridgeContextHandle,
           f: string | undefined,
-        ) => Promise<readonly Event[]>
+        ) => Promise<
+          readonly {
+            eventType: string;
+            actorDid: string;
+            timestamp: number;
+            payloadJson: string;
+            sequence: number;
+          }[]
+        >
       )(handle, filterJson);
-      return events;
+      // NAPI #[napi(object)] returns camelCase keys, but payloadJson is a JSON
+      // string that needs to be parsed into the `payload` object.
+      return raw.map((e) => ({
+        eventType: e.eventType,
+        actorDid: e.actorDid,
+        timestamp: e.timestamp,
+        payload: JSON.parse(e.payloadJson) as Readonly<Record<string, unknown>>,
+        sequence: e.sequence,
+      }));
     },
 
     async eventLogVerify(handle: BridgeContextHandle, claim: EventClaim): Promise<Proof> {
-      const claimJson = JSON.stringify(claim);
-      const proof = await (
-        addon.eventLogVerify as (h: BridgeContextHandle, c: string) => Promise<Proof>
+      // Convert camelCase claim keys to snake_case for the Rust bridge.
+      const snakeClaim: Record<string, unknown> = { type: claim.type };
+      if (claim.leafIndex !== undefined) snakeClaim.leaf_index = claim.leafIndex;
+      if (claim.eventHash !== undefined) snakeClaim.event_hash = claim.eventHash;
+      const claimJson = JSON.stringify(snakeClaim);
+      const raw = await (
+        addon.eventLogVerify as (
+          h: BridgeContextHandle,
+          c: string,
+        ) => Promise<{ verified: boolean; proofType: string; detailsJson: string }>
       )(handle, claimJson);
-      return proof;
+      // NAPI returns detailsJson as a JSON string; parse into the details object.
+      return {
+        verified: raw.verified,
+        proofType: raw.proofType as "inclusion" | "absence",
+        details: JSON.parse(raw.detailsJson) as Readonly<Record<string, unknown>>,
+      };
     },
 
-    async eventLogCheckpoint(handle: BridgeContextHandle): Promise<Checkpoint> {
-      const checkpoint = await (
-        addon.eventLogCheckpoint as (h: BridgeContextHandle) => Promise<Checkpoint>
-      )(handle);
-      return checkpoint;
+    async eventLogCheckpoint(
+      handle: BridgeContextHandle,
+      identityDid: string,
+      epoch: number,
+    ): Promise<Checkpoint> {
+      // The NAPI Rust function requires (handle, identity, epoch).
+      // identity is passed as an object matching the NapiIdentity shape.
+      const raw = await (
+        addon.eventLogCheckpoint as (
+          h: BridgeContextHandle,
+          identity: { did: string; custodyType: string },
+          epoch: number,
+        ) => Promise<{
+          merkleRoot: string;
+          eventCount: number;
+          timestamp: number;
+        }>
+      )(handle, { did: identityDid, custodyType: "in_memory" }, epoch);
+      return {
+        root: raw.merkleRoot,
+        eventCount: raw.eventCount,
+        timestamp: raw.timestamp,
+      };
     },
 
     // Bridge Connector

@@ -147,7 +147,11 @@ export interface Bridge {
     filter: EventFilter | undefined,
   ): Promise<readonly Event[]>;
   eventLogVerify(handle: BridgeContextHandle, claim: EventClaim): Promise<Proof>;
-  eventLogCheckpoint(handle: BridgeContextHandle): Promise<Checkpoint>;
+  eventLogCheckpoint(
+    handle: BridgeContextHandle,
+    identityDid: string,
+    epoch: number,
+  ): Promise<Checkpoint>;
 
   // Bridge Connector
   bridgeRegister(
