@@ -365,6 +365,9 @@ struct ChatRoom {
     message_tx: broadcast::Sender<String>,
     /// Time-limited challenge store for `WebAuthn` passkey authentication.
     challenges: PasskeyChallengeStore,
+    /// Accepted `WebAuthn` origins (e.g. `https://192.168.1.5:3000`). The
+    /// `origin` field in `clientDataJSON` must match one of these.
+    expected_origins: Vec<String>,
 }
 
 impl ChatRoom {
@@ -798,6 +801,17 @@ async fn main() {
         challenges: PasskeyChallengeStore {
             challenges: std::sync::Mutex::new(HashMap::new()),
         },
+        expected_origins: {
+            let mut origins = vec![
+                format!("https://{host_ip}:{PORT}"),
+                format!("https://localhost:{PORT}"),
+                format!("https://127.0.0.1:{PORT}"),
+            ];
+            if let Some(addr) = &public_addr {
+                origins.push(format!("https://{}:{}", addr.ip(), PORT));
+            }
+            origins
+        },
     });
 
     // Application routes.
@@ -1099,6 +1113,19 @@ async fn handle_passkey_auth(
             Json(serde_json::json!({"error": "client_data_json type must be 'webauthn.get'"})),
         )
             .into_response();
+    }
+
+    // Verify origin matches one of the server's expected origins.
+    let origin = client_data.get("origin").and_then(|v| v.as_str());
+    match origin {
+        Some(o) if room.expected_origins.iter().any(|e| e == o) => {}
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "origin mismatch in client_data_json"})),
+            )
+                .into_response();
+        }
     }
 
     // Look up member by credential_id in app-level metadata.
