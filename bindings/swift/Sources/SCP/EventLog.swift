@@ -1,63 +1,21 @@
 import Foundation
 
-// Event and Proof are now defined by UniFFI in ScpBindings.swift.
+// Event, Proof, and Checkpoint are defined by UniFFI in ScpBindings.swift.
 //
 // UniFFI Event fields: eventType, actorDid, timestamp, payloadJson (String), sequence
 // UniFFI Proof fields: verified (Bool), proofType (String), detailsJson (String)
+// UniFFI Checkpoint fields: contextId, senderDid, eventCount, merkleRoot (hex),
+//   epoch (optional), timestamp, signature (hex)
 //
-// Checkpoint and EventLog are pure Swift types. EventLogHandle is replaced by
-// ContextHandle from UniFFI for bridge calls.
+// EventLog is a pure Swift type. EventLogHandle is replaced by ContextHandle
+// from UniFFI for bridge calls.
 
-// MARK: - Checkpoint
-
-/// A signed consistency checkpoint for equivocation detection.
-///
-/// Members periodically exchange signed Merkle roots. If two members have
-/// different roots for the same event count, the relay is equivocating
-/// (showing different histories to different members).
-///
-/// See ADR-011 acceptance criterion 8 in `.docs/adrs/phase-2.md`.
-public nonisolated struct Checkpoint: Sendable {
-    /// The context this checkpoint belongs to.
-    public let contextId: String
-
-    /// The DID of the member who generated this checkpoint.
-    public let senderDid: String
-
-    /// The number of events in the log at checkpoint time.
-    public let eventCount: UInt64
-
-    /// The Merkle root hash at checkpoint time (32 bytes).
-    public let merkleRoot: Data
-
-    /// Current MLS epoch, if applicable. `nil` for broadcast contexts.
-    public let epoch: UInt64?
-
-    /// Unix timestamp (seconds since epoch) when the checkpoint was generated.
-    public let timestamp: UInt64
-
-    /// Ed25519 signature over the checkpoint content (64 bytes).
-    public let signature: Data
-
-    /// Memberwise initializer.
-    public init(
-        contextId: String,
-        senderDid: String,
-        eventCount: UInt64,
-        merkleRoot: Data,
-        epoch: UInt64?,
-        timestamp: UInt64,
-        signature: Data
-    ) {
-        self.contextId = contextId
-        self.senderDid = senderDid
-        self.eventCount = eventCount
-        self.merkleRoot = merkleRoot
-        self.epoch = epoch
-        self.timestamp = timestamp
-        self.signature = signature
-    }
-}
+// Checkpoint is defined by UniFFI in ScpBindings.swift as a public struct with
+// fields: contextId (String), senderDid (String), eventCount (UInt64),
+// merkleRoot (String, hex-encoded), epoch (UInt64?), timestamp (UInt64),
+// signature (String, hex-encoded).
+//
+// See ADR-011 acceptance criterion 8 in `.docs/adrs/phase-2.md`.
 
 // MARK: - EventLogHandle
 
@@ -123,18 +81,10 @@ enum EventLogBridge {
         _ epoch: UInt64
     ) async throws -> Checkpoint
 
-    /// Default checkpoint function.
-    ///
-    /// ``eventLogCheckpoint`` is not yet available in the UniFFI-generated
-    /// bindings (ScpBindings.swift). The default throws a descriptive error.
-    /// Inject a real closure in production once the UniFFI bridge is
-    /// regenerated, or in tests via the injectable parameter.
-    static let defaultCheckpoint: CheckpointFn = { _, _, _ in
-        throw ScpError.Context(
-            message: "eventLogCheckpoint is not yet available in the UniFFI-generated "
-                + "bindings. Regenerate ScpBindings.swift or inject a bridge function.",
-            code: "SCP-CTX-2032"
-        )
+    /// Default checkpoint function — delegates to UniFFI
+    /// ``eventLogCheckpoint(handle:identity:epoch:)``.
+    static let defaultCheckpoint: CheckpointFn = { handle, identity, epoch in
+        try await eventLogCheckpoint(handle: handle, identity: identity, epoch: epoch)
     }
 }
 

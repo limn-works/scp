@@ -3,20 +3,21 @@ import Testing
 
 // MARK: - Identity Tests
 
-/// Tests for the ``Identity`` type verifying Sendable conformance,
-/// public API shape, DID format validation, and CheckedContinuation-based
-/// async bridging.
-///
-/// UniFFI generates Identity as an open class with methods:
-///   - did() -> String
-///   - custodyType() -> String
-///   - rotateKey() async throws -> Identity
-///
-/// Tests that need mock Identity instances use subclasses with `noPointer:`.
-/// Tests that exercise factory methods (create/load/rotateKey) verify bridge
-/// stub error propagation through CheckedContinuation.
-///
-/// See ADR-026 (Swift SDK) and story SCP-102.
+// Tests for the Identity type verifying Sendable conformance, public API
+// shape, DID format validation, and CheckedContinuation-based async bridging.
+//
+// UniFFI generates Identity as an open class with methods:
+//   - did() -> String
+//   - custodyType() -> String
+//   - rotateKey() async throws -> Identity
+//
+// Tests that need mock Identity instances use subclasses with `noPointer:`.
+// Tests that exercise factory methods (create/load/rotateKey) verify bridge
+// stub error propagation through CheckedContinuation.
+//
+// See ADR-026 (Swift SDK) and story SCP-102.
+
+// swiftlint:disable:next type_body_length
 struct IdentityTests {
     // MARK: - Mock Identity subclass
 
@@ -352,6 +353,128 @@ struct IdentityTests {
         } catch let error as ScpError {
             if case let .Identity(_, code) = error {
                 #expect(code == "SCP-IDENT-1006")
+            } else {
+                Issue.record("Expected ScpError.Identity, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    // MARK: - Create Identity With Agent Key
+
+    @Test("createIdentityWithAgentKey calls bridge and returns identity")
+    func createIdentityWithAgentKeyRoundtrip() async throws {
+        let mockIdentity = MockIdentity(did: "did:dht:z6MkAgent", custodyType: "in_memory")
+        var receivedCustody: String?
+
+        let mockCreate: IdentityBridge.CreateWithAgentKeyFn = { custody in
+            receivedCustody = custody
+            return mockIdentity
+        }
+
+        let result = try await createIdentityWithAgentKey(
+            custody: "in_memory",
+            createWithAgentKeyFn: mockCreate
+        )
+        #expect(result.did() == "did:dht:z6MkAgent")
+        #expect(receivedCustody == "in_memory")
+    }
+
+    @Test("createIdentityWithAgentKey propagates bridge errors")
+    func createIdentityWithAgentKeyPropagatesErrors() async throws {
+        let mockCreate: IdentityBridge.CreateWithAgentKeyFn = { _ in
+            throw ScpError.Identity(
+                message: "agent key creation failed",
+                code: "SCP-IDENT-1020"
+            )
+        }
+
+        do {
+            _ = try await createIdentityWithAgentKey(custody: "in_memory", createWithAgentKeyFn: mockCreate)
+            Issue.record("Expected createIdentityWithAgentKey to throw")
+        } catch let error as ScpError {
+            if case let .Identity(_, code) = error {
+                #expect(code == "SCP-IDENT-1020")
+            } else {
+                Issue.record("Expected ScpError.Identity, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    @Test("createIdentityWithAgentKey default throws descriptive error")
+    func createIdentityWithAgentKeyDefaultThrows() async throws {
+        do {
+            _ = try await createIdentityWithAgentKey(custody: "in_memory")
+            Issue.record("Expected default to throw")
+        } catch let error as ScpError {
+            if case let .Identity(message, code) = error {
+                #expect(code == "SCP-IDENT-1020")
+                #expect(message.contains("not yet available"))
+            } else {
+                Issue.record("Expected ScpError.Identity, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    // MARK: - Migrate Identity
+
+    @Test("migrateIdentity calls bridge and returns migrated identity")
+    func migrateIdentityRoundtrip() async throws {
+        let original = MockIdentity(did: "did:dht:z6MkOriginal", custodyType: "in_memory")
+        let migrated = MockIdentity(did: "did:dht:z6MkMigrated", custodyType: "in_memory")
+        var receivedIdentity: Identity?
+
+        let mockMigrate: IdentityBridge.MigrateFn = { identity in
+            receivedIdentity = identity
+            return migrated
+        }
+
+        let result = try await migrateIdentity(original, migrateFn: mockMigrate)
+        #expect(result.did() == "did:dht:z6MkMigrated")
+        #expect(receivedIdentity?.did() == "did:dht:z6MkOriginal")
+    }
+
+    @Test("migrateIdentity propagates bridge errors")
+    func migrateIdentityPropagatesErrors() async throws {
+        let identity = MockIdentity(did: "did:dht:z6MkFail", custodyType: "in_memory")
+
+        let mockMigrate: IdentityBridge.MigrateFn = { _ in
+            throw ScpError.Identity(
+                message: "identity not in registry",
+                code: "SCP-IDENT-1021"
+            )
+        }
+
+        do {
+            _ = try await migrateIdentity(identity, migrateFn: mockMigrate)
+            Issue.record("Expected migrateIdentity to throw")
+        } catch let error as ScpError {
+            if case let .Identity(_, code) = error {
+                #expect(code == "SCP-IDENT-1021")
+            } else {
+                Issue.record("Expected ScpError.Identity, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
+    @Test("migrateIdentity default throws descriptive error")
+    func migrateIdentityDefaultThrows() async throws {
+        let identity = MockIdentity(did: "did:dht:z6MkDefault", custodyType: "in_memory")
+
+        do {
+            _ = try await migrateIdentity(identity)
+            Issue.record("Expected default to throw")
+        } catch let error as ScpError {
+            if case let .Identity(message, code) = error {
+                #expect(code == "SCP-IDENT-1021")
+                #expect(message.contains("not yet available"))
             } else {
                 Issue.record("Expected ScpError.Identity, got \(error)")
             }

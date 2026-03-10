@@ -4,21 +4,20 @@ import Testing
 
 // MARK: - Conformance Tests
 
-// Cross-language conformance test runner for the Swift SDK.
-//
-// Loads JSON fixtures from `tests/conformance/` and validates SDK operations
-// against expected output. Each fixture specifies an operation, input, and
-// expected result. The runner maps operation strings to Swift SDK function
-// calls and compares actual output with deep equality (with tolerance for
-// timestamps and nonces).
-//
-// When the `tests/conformance/` fixture directory does not yet exist, these
-// tests validate the conformance runner infrastructure itself by exercising
-// the operation dispatcher and fixture model with inline test data.
-//
-// See `.docs/scaffold/shared.md` section "Conformance Testing" and story
-// SCP-102.
-// swiftlint:disable:next type_body_length
+/// Cross-language conformance test runner for the Swift SDK.
+///
+/// Loads JSON fixtures from `tests/conformance/` and validates SDK operations
+/// against expected output. Each fixture specifies an operation, input, and
+/// expected result. The runner maps operation strings to Swift SDK function
+/// calls and compares actual output with deep equality (with tolerance for
+/// timestamps and nonces).
+///
+/// When the `tests/conformance/` fixture directory does not yet exist, these
+/// tests validate the conformance runner infrastructure itself by exercising
+/// the operation dispatcher and fixture model with inline test data.
+///
+/// See `.docs/scaffold/shared.md` section "Conformance Testing" and story
+/// SCP-102.
 struct ConformanceTests {
     // MARK: - ConformanceFixture model
 

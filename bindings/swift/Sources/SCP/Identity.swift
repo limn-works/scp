@@ -15,9 +15,13 @@ import Foundation
 //
 // Standalone UniFFI functions:
 //   - identityCreate(_ custody: String) async throws -> Identity
-//   - identityCreateWithCustody(_ custody: String) async throws -> Identity
+//   - identityCreateWithCustody(_ provider: KeyCustodyProvider) async throws -> Identity
 //   - identityLoad(_ did: String) async throws -> Identity
-//   - identityResolve(_ did: String) async throws -> String
+//   - identityResolve(_ did: String) async throws -> DidDocument
+//
+// Not yet exported from UniFFI (descriptive error defaults):
+//   - identityCreateWithAgentKey (create with #agent VM)
+//   - identityMigrate (Layer 2 DID rotation)
 //
 // Tests should use Identity(noPointer: .init()) for mock instances.
 
@@ -116,6 +120,46 @@ enum IdentityBridge {
     /// ``Identity.rotateAgentKey()``.
     static let defaultRotateAgentKey: RotateAgentKeyFn = { identity in
         try await identity.rotateAgentKey()
+    }
+
+    /// Create a new identity with an agent key.
+    typealias CreateWithAgentKeyFn = @Sendable (
+        _ custody: String
+    ) async throws -> Identity
+
+    /// Migrate an identity to a new DID.
+    typealias MigrateFn = @Sendable (
+        _ identity: Identity
+    ) async throws -> Identity
+
+    /// Default create with agent key function.
+    ///
+    /// ``identityCreateWithAgentKey`` is not yet exported from the UniFFI
+    /// bridge (ScpBindings.swift). The default throws a descriptive error.
+    /// Inject a real closure in production once the UniFFI bridge exports
+    /// this function, or in tests via the injectable parameter.
+    static let defaultCreateWithAgentKey: CreateWithAgentKeyFn = { _ in
+        throw ScpError.Identity(
+            message: "identityCreateWithAgentKey is not yet available in the UniFFI-generated "
+                + "bindings. Export the function from the Rust bridge and regenerate "
+                + "ScpBindings.swift, or inject a bridge function.",
+            code: "SCP-IDENT-1020"
+        )
+    }
+
+    /// Default migrate function.
+    ///
+    /// ``identityMigrate`` is not yet exported from the UniFFI bridge
+    /// (ScpBindings.swift). The default throws a descriptive error.
+    /// Inject a real closure in production once the UniFFI bridge exports
+    /// this function, or in tests via the injectable parameter.
+    static let defaultMigrate: MigrateFn = { _ in
+        throw ScpError.Identity(
+            message: "identityMigrate is not yet available in the UniFFI-generated "
+                + "bindings. Export the function from the Rust bridge and regenerate "
+                + "ScpBindings.swift, or inject a bridge function.",
+            code: "SCP-IDENT-1021"
+        )
     }
 
     /// Generate a device attestation token for an identity.
@@ -375,4 +419,50 @@ public func resolveIdentity(
     resolveFn: IdentityBridge.ResolveFn = IdentityBridge.defaultResolve
 ) async throws -> DidDocument {
     try await resolveFn(did)
+}
+
+/// Creates a new SCP identity with an agent signing key (ADR-039).
+///
+/// Creates a DID identity with both the standard signing key and an
+/// `#agent` verification method in the DID document. The agent key
+/// allows agent-bound operations without exposing the primary identity key.
+///
+/// - Parameters:
+///   - custody: The custody method string (`"in_memory"` or `"platform"`).
+///   - createWithAgentKeyFn: Bridge function override for testing.
+/// - Returns: A new ``Identity`` instance with an agent key.
+/// - Throws: ``ScpError/Identity(message:code:)`` if creation fails.
+///
+/// ## Provenance
+///
+/// - ADR-039 (Agent Key Binding)
+/// - Spec section 9 (Identity)
+public func createIdentityWithAgentKey(
+    custody: String,
+    createWithAgentKeyFn: IdentityBridge.CreateWithAgentKeyFn = IdentityBridge.defaultCreateWithAgentKey
+) async throws -> Identity {
+    try await createWithAgentKeyFn(custody)
+}
+
+/// Migrates an identity to a new DID (Layer 2 rotation).
+///
+/// Creates a new DID using the pre-rotation key as the new Identity Key.
+/// The old DID document is updated with an `alsoKnownAs` entry pointing
+/// to the new DID, creating a verifiable migration chain.
+///
+/// - Parameters:
+///   - identity: The identity to migrate.
+///   - migrateFn: Bridge function override for testing.
+/// - Returns: A new ``Identity`` with the migrated DID.
+/// - Throws: ``ScpError/Identity(message:code:)`` if the identity is
+///   not in the registry or migration fails.
+///
+/// ## Provenance
+///
+/// - Spec section 3 (Identity), section 9.2 (Key Rotation)
+public func migrateIdentity(
+    _ identity: Identity,
+    migrateFn: IdentityBridge.MigrateFn = IdentityBridge.defaultMigrate
+) async throws -> Identity {
+    try await migrateFn(identity)
 }

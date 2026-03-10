@@ -108,18 +108,10 @@ enum UcanBridge {
         _ capabilities: [String]
     ) async throws -> UcanToken
 
-    /// Default delegate function.
-    ///
-    /// ``ucanDelegate`` is not yet available in the UniFFI-generated bindings
-    /// (ScpBindings.swift). The default throws a descriptive error. Inject a
-    /// real closure in production once the UniFFI bridge is regenerated, or in
-    /// tests via the injectable parameter.
-    static let defaultDelegate: DelegateFn = { _, _, _, _, _ in
-        throw ScpError.Permission(
-            message: "ucanDelegate is not yet available in the UniFFI-generated "
-                + "bindings. Regenerate ScpBindings.swift or inject a bridge function.",
-            code: "SCP-PERM-3010"
-        )
+    /// Default delegate function — delegates to UniFFI
+    /// ``ucanDelegate(handle:delegatorDid:delegateeDid:parentToken:capabilities:)``.
+    static let defaultDelegate: DelegateFn = { handle, delegatorDid, delegateeDid, parentToken, capabilities in
+        try await ucanDelegate(handle: handle, delegatorDid: delegatorDid, delegateeDid: delegateeDid, parentToken: parentToken, capabilities: capabilities)
     }
 }
 

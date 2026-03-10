@@ -4,19 +4,18 @@ import Testing
 
 // MARK: - Trust Tests
 
-// Tests for trust evaluation: TrustEvaluation type shape, BehavioralRecord,
-// TrustInput mapping, and async bridge roundtrip.
-//
-// UniFFI TrustInput fields: subjectDid, contextId, verifiedAttestationCount,
-//   participationCount, triggeredConsequences, evaluatedAt
-//
-// No single UniFFI bridge function exists for trust evaluation. The Swift
-// layer composes trust data from TrustInput and structures it into the
-// four-layer trust model. The injectable bridge pattern allows testing
-// with mock inputs.
-//
-// See ADR-017 (Trust Model), ADR-026 (Swift SDK), and story SCP-221.
-// swiftlint:disable:next type_body_length
+/// Tests for trust evaluation: TrustEvaluation type shape, BehavioralRecord,
+/// TrustInput mapping, and async bridge roundtrip.
+///
+/// UniFFI TrustInput fields: subjectDid, contextId, verifiedAttestationCount,
+///   participationCount, triggeredConsequences, evaluatedAt
+///
+/// No single UniFFI bridge function exists for trust evaluation. The Swift
+/// layer composes trust data from TrustInput and structures it into the
+/// four-layer trust model. The injectable bridge pattern allows testing
+/// with mock inputs.
+///
+/// See ADR-017 (Trust Model), ADR-026 (Swift SDK), and story SCP-221.
 struct TrustTests {
     // MARK: - TrustEvaluation type shape
 
