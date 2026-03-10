@@ -98,8 +98,10 @@ pub struct ChunkEnvelope {
 /// Splits a large payload into [`ChunkEnvelope`]s.
 ///
 /// Each chunk carries at most [`MAX_CHUNK_PAYLOAD_SIZE`] bytes of payload data.
-/// The `message_id` is derived as `SHA-256(payload || sender_did || timestamp)`
-/// to provide a unique, deterministic identifier without coordination.
+/// The `message_id` is derived as
+/// `SHA-256("SCP-CHUNK-V1:" || LE32(payload.len) || payload || LE32(did.len) || sender_did || BE64(timestamp))`
+/// using length-prefixed, domain-separated hashing to provide a unique,
+/// deterministic identifier without coordination or field-collision ambiguity.
 ///
 /// # Arguments
 ///
