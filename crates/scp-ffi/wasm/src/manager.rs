@@ -1427,21 +1427,79 @@ impl WasmContextManager {
     // Governance
     // -----------------------------------------------------------------------
 
+    /// Returns the required capability string for a governance action.
+    ///
+    /// Maps each `WasmGovernanceAction` variant to the capability that
+    /// the initiator must hold. Uses the WASM ceiling format
+    /// (`"{resource}_{action}:*"`), matching `member_has_capability`.
+    fn required_capability_for_action(action: &WasmGovernanceAction) -> &'static str {
+        match action {
+            WasmGovernanceAction::AddMember { .. }
+            | WasmGovernanceAction::RestoreWriteAccess { .. }
+            | WasmGovernanceAction::RestoreReadAccess { .. } => "member_invite:*",
+
+            WasmGovernanceAction::RemoveMember { .. }
+            | WasmGovernanceAction::RevokeWriteAccess { .. }
+            | WasmGovernanceAction::BlockAuthor { .. }
+            | WasmGovernanceAction::RevokeReadAccess { .. }
+            | WasmGovernanceAction::ResetMember { .. } => "member_remove:*",
+
+            WasmGovernanceAction::ChangeRole { .. } => "role_assign:*",
+
+            WasmGovernanceAction::RegisterTool { .. }
+            | WasmGovernanceAction::RemoveTool { .. }
+            | WasmGovernanceAction::EstablishToolInterface { .. } => "tool_register:*",
+
+            WasmGovernanceAction::CloseContext { .. } => "context_close:*",
+
+            WasmGovernanceAction::ModifyCeiling { .. }
+            | WasmGovernanceAction::ExtendTtl { .. }
+            | WasmGovernanceAction::TransferAdmin { .. }
+            | WasmGovernanceAction::PromoteContext
+            | WasmGovernanceAction::CreateChildContext { .. }
+            | WasmGovernanceAction::ModifyPruningPolicy { .. }
+            | WasmGovernanceAction::AddSigner { .. }
+            | WasmGovernanceAction::RemoveSigner { .. }
+            | WasmGovernanceAction::ModifyThreshold { .. }
+            | WasmGovernanceAction::ResolveConflict { .. }
+            | WasmGovernanceAction::RotateContentKeys { .. }
+            | WasmGovernanceAction::ReconfigureGovernance { .. } => "governance_propose:*",
+        }
+    }
+
     /// Executes a governance action. Mirrors `ContextManager::execute_governance_action`.
     ///
-    /// Validates that the proposal is not a replay, dispatches to the
+    /// Validates that the initiator has the required capability for the
+    /// action, that the proposal is not a replay, dispatches to the
     /// appropriate action handler, and records the proposal as executed.
     ///
     /// # Errors
     ///
-    /// Returns an error if the context is not active, the proposal was
-    /// already executed, or the action fails.
+    /// Returns an error if the context is not active, the initiator lacks
+    /// the required capability, the proposal was already executed, or the
+    /// action fails.
     pub fn execute_governance_action(
         &mut self,
         context_id: &str,
+        initiator_did: &str,
         proposal_id: &str,
         action: &WasmGovernanceAction,
     ) -> Result<serde_json::Value, ScpWasmError> {
+        // Authorization: check that initiator has the required capability
+        // for this governance action. Matches close_context's pattern.
+        {
+            let ctx = self.require_active_context_mut(context_id)?;
+            let required = Self::required_capability_for_action(action);
+            if !ctx.member_has_capability(initiator_did, required) {
+                return Err(ScpWasmError::Permission {
+                    message: format!(
+                        "member {initiator_did} does not have '{required}' capability required for this governance action"
+                    ),
+                    code: "SCP-PERM-3000".to_owned(),
+                });
+            }
+        }
+
         // Replay protection: check+mark atomically.
         {
             let ctx = self.require_active_context_mut(context_id)?;

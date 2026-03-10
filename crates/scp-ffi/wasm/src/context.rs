@@ -425,9 +425,15 @@ pub fn context_drain_events(handle: &WasmContextHandle) -> String {
 /// Delegates to `WasmContextManager::execute_governance_action`.
 /// All 24 `GovernanceAction` variants are dispatchable.
 ///
+/// Authorization is enforced: the `initiator_did` must be a member with
+/// the capability required for the specific governance action. For example,
+/// `RemoveMember` requires `member_remove:*` (admin-only by default),
+/// `ChangeRole` requires `role_assign:*`, etc.
+///
 /// # Arguments
 ///
 /// * `handle` — The context handle.
+/// * `initiator_did` — DID of the member requesting the governance action.
 /// * `proposal_id` — Unique proposal ID for replay protection.
 /// * `action_json` — JSON-encoded governance action (see `WasmGovernanceAction`).
 ///
@@ -437,9 +443,13 @@ pub fn context_drain_events(handle: &WasmContextHandle) -> String {
 #[wasm_bindgen]
 pub fn context_execute_governance(
     handle: &WasmContextHandle,
+    initiator_did: String,
     proposal_id: String,
     action_json: String,
 ) -> Promise {
+    if let Err(e) = validate_did(&initiator_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
     let context_id = handle.context_id();
 
     future_to_promise(async move {
@@ -451,9 +461,10 @@ pub fn context_execute_governance(
             .into_js()
         })?;
 
-        let result =
-            with_manager(|mgr| mgr.execute_governance_action(&context_id, &proposal_id, &action))
-                .map_err(ScpWasmError::into_js)?;
+        let result = with_manager(|mgr| {
+            mgr.execute_governance_action(&context_id, &initiator_did, &proposal_id, &action)
+        })
+        .map_err(ScpWasmError::into_js)?;
 
         let json_str = serde_json::to_string(&result).map_err(|e| {
             ScpWasmError::Context {
