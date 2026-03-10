@@ -274,16 +274,18 @@ struct PerContextState {
     tool_handlers: ToolHandlerMap,
     /// Event log (Merkle tree).
     event_log: WasmEventLog,
-    /// UCAN revocation set (token CIDs).
+    /// UCAN revocation set (token CIDs). Capped at [`WASM_REVOKED_TOKENS_CAP`].
     revoked_tokens: HashSet<String>,
-    /// UCAN nonce replay tracker.
-    seen_nonces: HashSet<String>,
+    /// UCAN nonce replay tracker. Stores `(nonce, insertion_timestamp_ms)`.
+    /// Evicts entries older than [`WASM_NONCE_TTL_MS`] when exceeding [`WASM_NONCE_CAP`].
+    seen_nonces: HashMap<String, f64>,
     /// Members indexed by DID.
     members: HashMap<String, MemberEntry>,
-    /// Receive buffer for events.
+    /// Receive buffer for events. Capped at [`WASM_EVENT_BUFFER_CAP`] (FIFO overflow).
     event_buffer: Vec<WasmContextEvent>,
-    /// Executed proposal IDs (replay protection).
-    executed_proposals: HashSet<String>,
+    /// Executed proposal IDs with insertion timestamps (replay protection).
+    /// Evicts entries older than [`WASM_PROPOSAL_TTL_MS`] when exceeding [`WASM_PROPOSAL_CAP`].
+    executed_proposals: HashMap<String, f64>,
     /// Write-revoked member DIDs (§9.17, ADR-038).
     write_revoked_members: HashSet<String>,
     /// Read-revoked member DIDs (ADR-038, §9.17).
@@ -330,7 +332,36 @@ impl WasmToolSession {
 /// Maximum concurrent sessions per calling context (spec section 6.2.1).
 const WASM_SESSION_CAP_PER_CALLER: usize = 5;
 
+/// Maximum concurrent sessions across all callers (global cap).
+const WASM_SESSION_GLOBAL_CAP: usize = 100;
+
+/// Maximum number of nonces tracked per context before triggering eviction.
+const WASM_NONCE_CAP: usize = 10_000;
+
+/// Nonce TTL in milliseconds (24 hours — UCAN max lifetime per ADR-016 step 11).
+const WASM_NONCE_TTL_MS: f64 = 24.0 * 60.0 * 60.0 * 1000.0;
+
+/// Maximum number of revoked token CIDs per context.
+const WASM_REVOKED_TOKENS_CAP: usize = 100_000;
+
+/// Maximum number of executed proposals tracked per context before triggering eviction.
+const WASM_PROPOSAL_CAP: usize = 10_000;
+
+/// Executed proposal TTL in milliseconds (24 hours).
+const WASM_PROPOSAL_TTL_MS: f64 = 24.0 * 60.0 * 60.0 * 1000.0;
+
+/// Maximum events in the receive buffer. Matches `PyO3` channel capacity.
+const WASM_EVENT_BUFFER_CAP: usize = 1000;
+
 impl PerContextState {
+    /// Pushes an event to the receive buffer, evicting the oldest if at capacity.
+    fn push_event(&mut self, event: WasmContextEvent) {
+        if self.event_buffer.len() >= WASM_EVENT_BUFFER_CAP {
+            self.event_buffer.remove(0);
+        }
+        self.event_buffer.push(event);
+    }
+
     /// Returns `true` if the member has the given capability string.
     ///
     /// Mirrors `ContextRoleState::member_has_capability` in scp-core. In the
@@ -549,10 +580,10 @@ impl WasmContextManager {
             tool_handlers: HashMap::new(),
             event_log: WasmEventLog::new(context_id.to_owned()),
             revoked_tokens: HashSet::new(),
-            seen_nonces: HashSet::new(),
+            seen_nonces: HashMap::new(),
             members,
             event_buffer: Vec::new(),
-            executed_proposals: HashSet::new(),
+            executed_proposals: HashMap::new(),
             write_revoked_members: HashSet::new(),
             read_revoked_members: HashSet::new(),
             read_exclusion_list: HashSet::new(),
@@ -596,7 +627,7 @@ impl WasmContextManager {
             },
         );
 
-        ctx.event_buffer.push(WasmContextEvent::MemberJoined {
+        ctx.push_event(WasmContextEvent::MemberJoined {
             member_did: member_did.to_owned(),
             role_name: "member".to_owned(),
         });
@@ -631,7 +662,7 @@ impl WasmContextManager {
             bc.subscribers.remove(member_did);
         }
 
-        ctx.event_buffer.push(WasmContextEvent::MemberLeft {
+        ctx.push_event(WasmContextEvent::MemberLeft {
             member_did: member_did.to_owned(),
         });
 
@@ -680,7 +711,7 @@ impl WasmContextManager {
         let seq = member.sequence_number;
         member.sequence_number += 1;
 
-        ctx.event_buffer.push(WasmContextEvent::MessageSent {
+        ctx.push_event(WasmContextEvent::MessageSent {
             sender_did: sender_did.to_owned(),
             sequence_number: seq,
             payload_base64: payload_base64.to_owned(),
@@ -720,7 +751,7 @@ impl WasmContextManager {
         "closed".clone_into(&mut ctx.state);
         ctx.broadcast = None;
 
-        ctx.event_buffer.push(WasmContextEvent::SystemClose {
+        ctx.push_event(WasmContextEvent::SystemClose {
             initiator_did: initiator_did.to_owned(),
         });
 
@@ -1044,6 +1075,20 @@ impl WasmContextManager {
     ) -> Result<String, ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
+        // Evict expired sessions before checking caps.
+        ctx.sessions.retain(|_, s| !s.is_expired());
+
+        // Enforce global cap.
+        if ctx.sessions.len() >= WASM_SESSION_GLOBAL_CAP {
+            return Err(ScpWasmError::Tool {
+                message: format!(
+                    "global session cap exceeded: {} active (max {WASM_SESSION_GLOBAL_CAP})",
+                    ctx.sessions.len()
+                ),
+                code: "SCP-TOOL-6015".to_owned(),
+            });
+        }
+
         // Enforce per-caller cap.
         let current = ctx
             .sessions
@@ -1304,34 +1349,62 @@ impl WasmContextManager {
         Ok((
             ctx.ceiling_strings.clone(),
             ctx.creator_did.clone(),
-            ctx.seen_nonces.clone(),
+            ctx.seen_nonces.keys().cloned().collect(),
             ctx.revoked_tokens.clone(),
         ))
     }
 
     /// Records a nonce as seen (for replay prevention).
     ///
+    /// When the nonce map exceeds [`WASM_NONCE_CAP`], evicts entries older than
+    /// [`WASM_NONCE_TTL_MS`] (24 hours — UCAN max lifetime per ADR-016 step 11).
+    ///
     /// # Errors
     ///
     /// Returns [`ScpWasmError::Permission`] if the nonce was already seen.
     pub fn ucan_record_nonce(&mut self, context_id: &str, nonce: &str) -> Result<(), ScpWasmError> {
         let ctx = self.require_context_mut(context_id)?;
-        if !ctx.seen_nonces.insert(nonce.to_owned()) {
+        let now = js_sys::Date::now();
+
+        if ctx.seen_nonces.contains_key(nonce) {
             return Err(ScpWasmError::Permission {
                 message: format!("nonce reused: {nonce}"),
                 code: "SCP-PERM-3000".to_owned(),
             });
         }
+
+        // Evict expired nonces when over capacity.
+        if ctx.seen_nonces.len() >= WASM_NONCE_CAP {
+            let cutoff = now - WASM_NONCE_TTL_MS;
+            ctx.seen_nonces.retain(|_, ts| *ts > cutoff);
+        }
+
+        ctx.seen_nonces.insert(nonce.to_owned(), now);
         Ok(())
     }
 
     /// Revokes a UCAN token by CID.
     ///
+    /// Revocation is permanent (no TTL). The set is capped at
+    /// [`WASM_REVOKED_TOKENS_CAP`] entries — overflow returns an error.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the context is not active.
+    /// Returns an error if the context is not active or the revocation set
+    /// has reached capacity.
     pub fn ucan_revoke(&mut self, context_id: &str, token_cid: &str) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
+
+        if ctx.revoked_tokens.len() >= WASM_REVOKED_TOKENS_CAP {
+            return Err(ScpWasmError::Validation {
+                message: format!(
+                    "revoked token set has reached capacity ({WASM_REVOKED_TOKENS_CAP}) — \
+                     cannot revoke additional tokens"
+                ),
+                code: "SCP-VALID-7300".to_owned(),
+            });
+        }
+
         ctx.revoked_tokens.insert(token_cid.to_owned());
 
         let leaf_hash = compute_event_hash("UcanRevoked", context_id);
@@ -1372,13 +1445,22 @@ impl WasmContextManager {
         // Replay protection: check+mark atomically.
         {
             let ctx = self.require_active_context_mut(context_id)?;
-            if ctx.executed_proposals.contains(proposal_id) {
+            let now = js_sys::Date::now();
+
+            if ctx.executed_proposals.contains_key(proposal_id) {
                 return Err(ScpWasmError::Permission {
                     message: "governance proposal has already been executed".to_owned(),
                     code: "SCP-PERM-3000".to_owned(),
                 });
             }
-            ctx.executed_proposals.insert(proposal_id.to_owned());
+
+            // Evict expired proposals when over capacity.
+            if ctx.executed_proposals.len() >= WASM_PROPOSAL_CAP {
+                let cutoff = now - WASM_PROPOSAL_TTL_MS;
+                ctx.executed_proposals.retain(|_, ts| *ts > cutoff);
+            }
+
+            ctx.executed_proposals.insert(proposal_id.to_owned(), now);
         }
 
         let result = self.dispatch_governance_action(context_id, action);
@@ -1402,7 +1484,7 @@ impl WasmContextManager {
                 },
                 |(t, _)| t.trim().to_owned(),
             );
-            ctx.event_buffer.push(WasmContextEvent::GovernanceExecuted {
+            ctx.push_event(WasmContextEvent::GovernanceExecuted {
                 action_type,
                 proposal_id: proposal_id.to_owned(),
             });
@@ -1432,7 +1514,7 @@ impl WasmContextManager {
                         sequence_number: 0,
                     },
                 );
-                ctx.event_buffer.push(WasmContextEvent::MemberJoined {
+                ctx.push_event(WasmContextEvent::MemberJoined {
                     member_did: did.clone(),
                     role_name: role.clone(),
                 });
@@ -1446,7 +1528,7 @@ impl WasmContextManager {
                         code: "SCP-CTX-2015".to_owned(),
                     });
                 }
-                ctx.event_buffer.push(WasmContextEvent::MemberLeft {
+                ctx.push_event(WasmContextEvent::MemberLeft {
                     member_did: did.clone(),
                 });
                 Ok(serde_json::json!({"action": "RemoveMember", "did": did}))
@@ -1703,7 +1785,7 @@ impl WasmContextManager {
         let seq = member.sequence_number;
         member.sequence_number += 1;
 
-        ctx.event_buffer.push(WasmContextEvent::MessageSent {
+        ctx.push_event(WasmContextEvent::MessageSent {
             sender_did: author_did.to_owned(),
             sequence_number: seq,
             payload_base64: payload_base64.to_owned(),
@@ -1737,7 +1819,7 @@ impl WasmContextManager {
 
         bc.subscribers.remove(subscriber_did);
 
-        ctx.event_buffer.push(WasmContextEvent::MemberLeft {
+        ctx.push_event(WasmContextEvent::MemberLeft {
             member_did: subscriber_did.to_owned(),
         });
 
@@ -1818,7 +1900,7 @@ impl WasmContextManager {
     pub fn handle_ttl_expiry(&mut self, context_id: &str) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
         "expired".clone_into(&mut ctx.state);
-        ctx.event_buffer.push(WasmContextEvent::Expired);
+        ctx.push_event(WasmContextEvent::Expired);
 
         let leaf_hash = compute_event_hash("ContextExpired", context_id);
         ctx.event_log.append_leaf(leaf_hash);
@@ -1991,7 +2073,7 @@ impl WasmContextManager {
             read_exclusion_list: ctx.read_exclusion_list.iter().cloned().collect(),
             broadcast,
             revoked_tokens: ctx.revoked_tokens.iter().cloned().collect(),
-            seen_nonces: ctx.seen_nonces.iter().cloned().collect(),
+            seen_nonces: ctx.seen_nonces.keys().cloned().collect(),
         };
 
         let now_ms = js_sys::Date::now();
@@ -2110,10 +2192,13 @@ impl WasmContextManager {
             tool_handlers: HashMap::new(),
             event_log: WasmEventLog::new(context_id.clone()),
             revoked_tokens: snap.revoked_tokens.iter().cloned().collect(),
-            seen_nonces: snap.seen_nonces.iter().cloned().collect(),
+            seen_nonces: {
+                let now = js_sys::Date::now();
+                snap.seen_nonces.iter().map(|n| (n.clone(), now)).collect()
+            },
             members,
             event_buffer: Vec::new(),
-            executed_proposals: HashSet::new(),
+            executed_proposals: HashMap::new(),
             write_revoked_members: snap.write_revoked_members.iter().cloned().collect(),
             read_revoked_members: snap.read_revoked_members.iter().cloned().collect(),
             read_exclusion_list: snap.read_exclusion_list.iter().cloned().collect(),

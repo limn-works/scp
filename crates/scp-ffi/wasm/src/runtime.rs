@@ -153,12 +153,14 @@ impl WasmEventLog {
         self.leaves.len()
     }
 
-    /// Appends a pre-computed leaf hash to the log and rebuilds the tree.
+    /// Appends a pre-computed leaf hash to the log and incrementally updates
+    /// the tree. Only the affected path from the new leaf to the root is
+    /// recomputed — O(log n) per append instead of O(n).
     pub fn append_leaf(&mut self, leaf_hash: [u8; 32]) {
         let leaf_index = self.leaves.len() as u64;
         self.leaves.push(leaf_hash);
         self.sorted_leaves.insert((leaf_hash, leaf_index));
-        self.recompute_tree();
+        self.incremental_update();
     }
 
     /// Returns the current Merkle root hash.
@@ -204,42 +206,90 @@ impl WasmEventLog {
         &self.sorted_leaves
     }
 
-    /// Recomputes the entire interior tree from the leaf layer.
+    /// Incrementally updates the interior tree after a single leaf append.
     ///
-    /// RFC 6962 structure: odd nodes are promoted by hashing with themselves.
-    fn recompute_tree(&mut self) {
-        self.tree.clear();
+    /// Only recomputes the nodes along the path from the new leaf to the
+    /// root — O(log n) per append instead of rebuilding the entire tree.
+    ///
+    /// RFC 6962 structure: odd nodes are promoted (not duplicated).
+    fn incremental_update(&mut self) {
+        let n = self.leaves.len();
 
-        if self.leaves.len() <= 1 {
+        if n <= 1 {
+            self.tree.clear();
             return;
         }
 
-        let mut current_layer: &[[u8; 32]] = &self.leaves;
-        let mut owned_layer: Vec<[u8; 32]>;
+        // For the very first pair (n == 2), bootstrap the tree.
+        if n == 2 {
+            self.tree.clear();
+            self.tree
+                .push(vec![hash_pair(&self.leaves[0], &self.leaves[1])]);
+            return;
+        }
 
+        // Index of the new leaf in the leaf layer.
+        let mut idx = n - 1;
+
+        // Layer 0: pairs from the leaf layer.
+        let layer_0_parent_count = n.div_ceil(2);
+
+        // Ensure tree layer 0 exists and has enough capacity.
+        if self.tree.is_empty() {
+            self.tree.push(Vec::new());
+        }
+        let layer_0 = &mut self.tree[0];
+        layer_0.resize(layer_0_parent_count, [0u8; 32]);
+
+        // Recompute the affected parent at idx/2.
+        let parent_idx = idx / 2;
+        let left_child = parent_idx * 2;
+        if left_child + 1 < n {
+            layer_0[parent_idx] = hash_pair(&self.leaves[left_child], &self.leaves[left_child + 1]);
+        } else {
+            // Odd node: promoted per RFC 6962.
+            layer_0[parent_idx] = self.leaves[left_child];
+        }
+
+        idx = parent_idx;
+
+        // Walk up the remaining layers, recomputing only the affected node.
+        let mut level = 0;
         loop {
-            let parent_count = current_layer.len().div_ceil(2);
-            let mut parents = Vec::with_capacity(parent_count);
-
-            let mut i = 0;
-            while i < current_layer.len() {
-                if i + 1 < current_layer.len() {
-                    parents.push(hash_pair(&current_layer[i], &current_layer[i + 1]));
-                } else {
-                    // RFC 6962: odd node is promoted, not duplicated.
-                    parents.push(current_layer[i]);
-                }
-                i += 2;
-            }
-
-            self.tree.push(parents.clone());
-
-            if parents.len() == 1 {
+            let current_layer_len = self.tree[level].len();
+            if current_layer_len <= 1 {
+                // This layer is the root; trim any layers above it.
+                self.tree.truncate(level + 1);
                 break;
             }
 
-            owned_layer = parents;
-            current_layer = &owned_layer;
+            let next_layer_len = current_layer_len.div_ceil(2);
+            let next_level = level + 1;
+
+            // Ensure the next layer exists and has the right size.
+            if next_level >= self.tree.len() {
+                self.tree.push(vec![[0u8; 32]; next_layer_len]);
+            } else {
+                self.tree[next_level].resize(next_layer_len, [0u8; 32]);
+            }
+
+            let parent_idx = idx / 2;
+            let left_child = parent_idx * 2;
+
+            // Compute the parent from its two children in tree[level].
+            if left_child + 1 < current_layer_len {
+                let hash = hash_pair(
+                    &self.tree[level][left_child],
+                    &self.tree[level][left_child + 1],
+                );
+                self.tree[next_level][parent_idx] = hash;
+            } else {
+                // Odd node: promoted.
+                self.tree[next_level][parent_idx] = self.tree[level][left_child];
+            }
+
+            idx = parent_idx;
+            level = next_level;
         }
     }
 }

@@ -68,14 +68,20 @@ struct IdentityEntry {
     agent_signing_key_bytes: Option<[u8; 32]>,
 }
 
+/// Maximum number of identities in the WASM-local identity registry.
+const WASM_IDENTITY_REGISTRY_CAP: usize = 10_000;
+
+/// Maximum number of migration links stored in the WASM-local registry.
+const WASM_MIGRATION_LINKS_CAP: usize = 10_000;
+
 thread_local! {
     /// Maps DID strings to identity state. WASM is single-threaded, so
-    /// `RefCell` is sufficient.
+    /// `RefCell` is sufficient. Capped at [`WASM_IDENTITY_REGISTRY_CAP`].
     static IDENTITY_REGISTRY: RefCell<HashMap<String, IdentityEntry>> =
         RefCell::new(HashMap::new());
 
     /// Maps new DID → old DID for migration links. Used by `identity_resolve`
-    /// to populate `alsoKnownAs` fields.
+    /// to populate `alsoKnownAs` fields. Capped at [`WASM_MIGRATION_LINKS_CAP`].
     static MIGRATION_LINKS: RefCell<HashMap<String, String>> =
         RefCell::new(HashMap::new());
 }
@@ -513,6 +519,19 @@ pub fn identity_create(custody: String) -> Promise {
         // and identity_attest_device can produce real Ed25519 signatures.
         IDENTITY_REGISTRY.with(|reg| {
             let mut map = reg.borrow_mut();
+            // Cap check: reject if at capacity and this is a new entry.
+            if !map.contains_key(&did) && map.len() >= WASM_IDENTITY_REGISTRY_CAP {
+                return Err(JsValue::from(
+                    ScpWasmError::Validation {
+                        message: format!(
+                            "identity registry has reached capacity ({WASM_IDENTITY_REGISTRY_CAP}) \
+                         — cannot create additional identities"
+                        ),
+                        code: "SCP-VALID-7400".to_owned(),
+                    }
+                    .into_js(),
+                ));
+            }
             map.insert(
                 did.clone(),
                 IdentityEntry {
@@ -522,7 +541,8 @@ pub fn identity_create(custody: String) -> Promise {
                     agent_signing_key_bytes: None,
                 },
             );
-        });
+            Ok(())
+        })?;
 
         Ok(JsValue::from(WasmIdentity {
             did,
@@ -637,6 +657,18 @@ pub fn identity_create_with_agent_key(custody: String) -> Promise {
 
         IDENTITY_REGISTRY.with(|reg| {
             let mut map = reg.borrow_mut();
+            if !map.contains_key(&did) && map.len() >= WASM_IDENTITY_REGISTRY_CAP {
+                return Err(JsValue::from(
+                    ScpWasmError::Validation {
+                        message: format!(
+                            "identity registry has reached capacity ({WASM_IDENTITY_REGISTRY_CAP}) \
+                         — cannot create additional identities"
+                        ),
+                        code: "SCP-VALID-7400".to_owned(),
+                    }
+                    .into_js(),
+                ));
+            }
             map.insert(
                 did.clone(),
                 IdentityEntry {
@@ -646,7 +678,8 @@ pub fn identity_create_with_agent_key(custody: String) -> Promise {
                     agent_signing_key_bytes: Some(agent_key.to_bytes()),
                 },
             );
-        });
+            Ok(())
+        })?;
 
         Ok(JsValue::from(WasmIdentity {
             did,
@@ -802,6 +835,20 @@ pub fn identity_migrate(identity: &WasmIdentity) -> Promise {
             // Remove the old identity's key material from the registry to
             // prevent stale signing keys from lingering in WASM linear memory.
             map.remove(&old_did);
+            // After removing old_did, the net count stays the same or decreases,
+            // so we only need to check if the new_did is truly a new entry.
+            if !map.contains_key(&new_did) && map.len() >= WASM_IDENTITY_REGISTRY_CAP {
+                return Err(JsValue::from(
+                    ScpWasmError::Validation {
+                        message: format!(
+                            "identity registry has reached capacity ({WASM_IDENTITY_REGISTRY_CAP}) \
+                         — cannot create additional identities"
+                        ),
+                        code: "SCP-VALID-7400".to_owned(),
+                    }
+                    .into_js(),
+                ));
+            }
             map.insert(
                 new_did.clone(),
                 IdentityEntry {
@@ -811,13 +858,27 @@ pub fn identity_migrate(identity: &WasmIdentity) -> Promise {
                     agent_signing_key_bytes,
                 },
             );
-        });
+            Ok(())
+        })?;
 
         // Store the migration link so identity_resolve can populate alsoKnownAs.
         MIGRATION_LINKS.with(|links| {
             let mut map = links.borrow_mut();
+            if !map.contains_key(&new_did) && map.len() >= WASM_MIGRATION_LINKS_CAP {
+                return Err(JsValue::from(
+                    ScpWasmError::Validation {
+                        message: format!(
+                            "migration links registry has reached capacity \
+                         ({WASM_MIGRATION_LINKS_CAP}) — cannot store additional migration links"
+                        ),
+                        code: "SCP-VALID-7401".to_owned(),
+                    }
+                    .into_js(),
+                ));
+            }
             map.insert(new_did.clone(), old_did);
-        });
+            Ok(())
+        })?;
 
         Ok(JsValue::from(WasmIdentity {
             did: new_did,
