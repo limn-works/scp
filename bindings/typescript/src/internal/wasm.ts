@@ -555,23 +555,59 @@ export function createWasmBridge(): Bridge {
     // Governance — delegate to WASM runtime
     async contextExecuteGovernanceAction(
       handle: BridgeContextHandle,
-      proposalJson: string,
+      actionJson: string,
+      proposerDid: string,
     ): Promise<string> {
       const wasm = getWasm();
-      // The Bridge interface passes a single proposalJson containing initiatorDid,
-      // proposalId, and action. Parse and forward to the WASM export which takes
-      // them as separate parameters.
-      const proposal = JSON.parse(proposalJson) as {
-        initiatorDid: string;
-        proposalId: string;
-        action: unknown;
-      };
       return await wasm.context_execute_governance(
         handle,
-        proposal.initiatorDid,
-        proposal.proposalId,
-        JSON.stringify(proposal.action),
+        proposerDid,
+        "",
+        actionJson,
       );
+    },
+
+    // TTL operations
+    async contextHandleTtlExpiry(handle: BridgeContextHandle): Promise<void> {
+      const wasm = getWasm();
+      await wasm.context_handle_ttl_expiry(handle);
+    },
+
+    async contextProposeTtlExtension(
+      handle: BridgeContextHandle,
+      proposerDid: string,
+      extensionSecs: number,
+    ): Promise<boolean> {
+      const wasm = getWasm();
+      return await wasm.context_propose_ttl_extension(handle, proposerDid, extensionSecs);
+    },
+
+    async contextResetTtlTimer(
+      handle: BridgeContextHandle,
+      newDurationSecs: number,
+    ): Promise<void> {
+      const wasm = getWasm();
+      await wasm.context_reset_ttl_timer(handle, newDurationSecs);
+    },
+
+    // Context export/import
+    async contextExport(handle: BridgeContextHandle): Promise<Uint8Array> {
+      const wasm = getWasm();
+      const base64 = await wasm.context_export(handle);
+      return base64ToUint8(base64);
+    },
+
+    async contextImport(data: Uint8Array): Promise<string> {
+      const wasm = getWasm();
+      const base64 = uint8ToBase64(data);
+      return await wasm.context_import(base64);
+    },
+
+    // Drain events
+    async contextDrainEvents(handle: BridgeContextHandle): Promise<readonly string[]> {
+      const wasm = getWasm();
+      const json = await wasm.context_drain_events(handle);
+      return JSON.parse(json) as string[];
     },
 
     // Tools -- delegates to WASM runtime registry
@@ -664,6 +700,35 @@ export function createWasmBridge(): Bridge {
     async ucanRevoke(handle: BridgeContextHandle, token: string): Promise<void> {
       const wasm = getWasm();
       await wasm.ucan_revoke(handle, token);
+    },
+
+    async ucanDelegate(
+      handle: BridgeContextHandle,
+      delegatorDid: string,
+      delegateeDid: string,
+      parentToken: string,
+      capabilities: readonly string[],
+    ): Promise<UcanToken> {
+      const wasm = getWasm();
+      const capabilitiesJson = JSON.stringify(capabilities);
+      const result = await wasm.ucan_delegate(
+        handle,
+        delegatorDid,
+        delegateeDid,
+        parentToken,
+        capabilitiesJson,
+      );
+      const token: UcanToken = {
+        id: result.tokenId,
+        encoded: result.encoded,
+        issuer: result.issuer,
+        audience: result.audience,
+        capabilities: JSON.parse(result.capabilitiesJson) as string[],
+      };
+      if (result.expiresAt != null) {
+        return { ...token, expiresAt: result.expiresAt };
+      }
+      return token;
     },
 
     // Event Log -- delegates to WASM-local Merkle tree

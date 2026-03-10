@@ -484,7 +484,11 @@ export class Context implements AsyncDisposable {
     this.assertActive();
     try {
       const bridge = await getBridge();
-      const raw = await bridge.contextExecuteGovernanceAction(this._handle, proposalJson);
+      const raw = await bridge.contextExecuteGovernanceAction(
+        this._handle,
+        proposalJson,
+        this._identityDid,
+      );
       return raw as GovernanceActionResult;
     } catch (error) {
       throw mapBridgeError(error);
