@@ -151,7 +151,31 @@ async function createPasskey(name,challengeB64){
     if(!cred)return null;
     const spki=cred.response.getPublicKey();if(!spki)return null;
     const spkiBytes=new Uint8Array(spki);
-    return{credential_id:b64url(cred.rawId),public_key:b64url(spkiBytes.slice(spkiBytes.length-65))};
+    // Parse ASN.1 SPKI to extract the SEC1 public key (uncompressed P-256 point).
+    // SPKI structure: SEQUENCE { SEQUENCE { OID, OID }, BIT STRING { 0x00, 0x04 || X || Y } }
+    // Walk the outer SEQUENCE, skip the AlgorithmIdentifier SEQUENCE, then read
+    // the BIT STRING contents. The BIT STRING has a leading "unused bits" byte
+    // (0x00) followed by the 65-byte uncompressed point.
+    let sec1=null;
+    try{
+      let off=0;
+      function readTag(){const t=spkiBytes[off++];let len=spkiBytes[off++];if(len&0x80){const n=len&0x7f;len=0;for(let i=0;i<n;i++)len=(len<<8)|spkiBytes[off++]}return{tag:t,len,start:off}}
+      const outer=readTag(); // outer SEQUENCE
+      if((outer.tag&0x1f)!==0x10)throw new Error('not a SEQUENCE');
+      const algId=readTag(); // AlgorithmIdentifier SEQUENCE — skip it
+      off=algId.start+algId.len;
+      const bs=readTag(); // BIT STRING
+      if((bs.tag&0x1f)!==0x03)throw new Error('not a BIT STRING');
+      const unusedBits=spkiBytes[off]; off++;
+      if(unusedBits!==0)throw new Error('unexpected unused bits');
+      sec1=spkiBytes.slice(off,off+bs.len-1);
+    }catch{
+      // Fallback: take the last 65 bytes (common for P-256 SPKI).
+      sec1=spkiBytes.slice(spkiBytes.length-65);
+    }
+    // Validate: uncompressed P-256 point must be exactly 65 bytes starting with 0x04.
+    if(sec1.length!==65||sec1[0]!==0x04)return null;
+    return{credential_id:b64url(cred.rawId),public_key:b64url(sec1)};
   }catch{return null}
 }
 
