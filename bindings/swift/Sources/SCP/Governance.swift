@@ -47,6 +47,8 @@ public enum GovernanceActionResult: String, Sendable {
 public enum MemberRole: String, Sendable {
     /// Context administrator with full governance capabilities.
     case admin = "Admin"
+    /// Moderator with messaging, moderation, and governance proposal capabilities.
+    case moderator = "Moderator"
     /// Regular participant with standard capabilities.
     case member = "Member"
     /// Read-only observer with no write capabilities.

@@ -116,6 +116,7 @@ struct GovernanceTests {
     @Test("MemberRole has correct raw values")
     func memberRoleRawValues() {
         #expect(MemberRole.admin.rawValue == "Admin")
+        #expect(MemberRole.moderator.rawValue == "Moderator")
         #expect(MemberRole.member.rawValue == "Member")
         #expect(MemberRole.observer.rawValue == "Observer")
         #expect(MemberRole.custom.rawValue == "Custom")
@@ -124,6 +125,7 @@ struct GovernanceTests {
     @Test("MemberRole.fromBridge parses known roles")
     func memberRoleFromBridgeKnown() {
         #expect(MemberRole.fromBridge("Admin") == .admin)
+        #expect(MemberRole.fromBridge("Moderator") == .moderator)
         #expect(MemberRole.fromBridge("Member") == .member)
         #expect(MemberRole.fromBridge("Observer") == .observer)
         #expect(MemberRole.fromBridge("Custom") == .custom)
@@ -132,6 +134,7 @@ struct GovernanceTests {
     @Test("MemberRole.fromBridge handles capitalization")
     func memberRoleFromBridgeCapitalization() {
         #expect(MemberRole.fromBridge("admin") == .admin)
+        #expect(MemberRole.fromBridge("moderator") == .moderator)
         #expect(MemberRole.fromBridge("member") == .member)
         #expect(MemberRole.fromBridge("observer") == .observer)
     }
@@ -145,9 +148,9 @@ struct GovernanceTests {
 
     @Test("MemberRole.fromBridge falls back to .custom for unknown strings")
     func memberRoleFromBridgeFallback() {
-        #expect(MemberRole.fromBridge("Moderator") == .custom)
         #expect(MemberRole.fromBridge("") == .custom)
         #expect(MemberRole.fromBridge("ADMIN") == .custom) // not "Admin" or "admin"
+        #expect(MemberRole.fromBridge("SuperUser") == .custom)
     }
 
     @Test("MemberRole is Sendable")
