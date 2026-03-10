@@ -965,9 +965,10 @@ async fn handle_join(
     let (identity, _doc) = match did_method.create(custody.as_ref()).await {
         Ok(id) => id,
         Err(e) => {
+            tracing::error!("DID creation failed: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
+                Json(serde_json::json!({"error": "failed to create identity"})),
             )
                 .into_response();
         }
@@ -976,9 +977,13 @@ async fn handle_join(
     // Add the member to the ContextManager's protocol-level membership.
     let kp = KeyPackage::mock(DID(identity.did.clone()));
     if let Err(e) = room.manager.join_context(&room.handle, kp).await {
+        tracing::error!(
+            "join_context failed for {}: {e}",
+            truncate_did(&identity.did)
+        );
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("failed to join context: {e}")})),
+            Json(serde_json::json!({"error": "failed to join context"})),
         )
             .into_response();
     }
