@@ -484,10 +484,16 @@ export function createWasmBridge(): Bridge {
     async broadcastUnsubscribe(
       handle: BridgeContextHandle,
       subscriberDid: string,
-      _rotateKeys?: boolean,
+      rotateKeys?: boolean,
     ): Promise<void> {
+      if (rotateKeys === true) {
+        throw new TransportError(
+          "WASM bridge does not support key rotation on broadcastUnsubscribe. " +
+            "Use the native (napi-rs) bridge for rotateKeys support.",
+          "SCP-TRANS-5003",
+        );
+      }
       const wasm = getWasm();
-      // WASM bridge does not support key rotation on unsubscribe; rotateKeys is ignored.
       await wasm.broadcast_unsubscribe(handle, subscriberDid);
     },
 
@@ -689,12 +695,13 @@ export function createWasmBridge(): Bridge {
       };
     },
 
-    async eventLogCheckpoint(handle: BridgeContextHandle): Promise<Checkpoint> {
+    async eventLogCheckpoint(
+      handle: BridgeContextHandle,
+      identityDid: string,
+      epoch: number,
+    ): Promise<Checkpoint> {
       const wasm = getWasm();
-      // The WASM export requires an identity DID and epoch. Use the context
-      // creator DID and epoch 0 (suitable for broadcast contexts; MLS contexts
-      // should pass the real epoch via a dedicated method if needed).
-      const result = await wasm.event_log_checkpoint(handle, handle.creatorDid, 0);
+      const result = await wasm.event_log_checkpoint(handle, identityDid, epoch);
       return {
         root: result.merkleRoot,
         eventCount: result.eventCount,
