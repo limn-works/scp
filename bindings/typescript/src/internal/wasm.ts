@@ -243,11 +243,21 @@ interface WasmModule {
   }>;
   // Context drain/export/import
   context_drain_events: (handle: BridgeContextHandle) => string;
-  context_export: (handle: BridgeContextHandle) => Promise<Uint8Array>;
-  context_import: (data: Uint8Array) => Promise<string>;
+  context_export: (handle: BridgeContextHandle) => Promise<string>;
+  context_import: (data: string) => Promise<string>;
   // TTL
   context_ttl_remaining: (handle: BridgeContextHandle) => number | null;
   context_extend_ttl: (handle: BridgeContextHandle, additionalSecs: number) => Promise<void>;
+  context_handle_ttl_expiry: (handle: BridgeContextHandle) => Promise<void>;
+  context_propose_ttl_extension: (
+    handle: BridgeContextHandle,
+    proposerDid: string,
+    extensionSecs: number,
+  ) => Promise<boolean>;
+  context_reset_ttl_timer: (
+    handle: BridgeContextHandle,
+    newDurationSecs: number,
+  ) => Promise<void>;
   // UCAN delegate
   ucan_delegate: (
     handle: BridgeContextHandle,
@@ -255,7 +265,14 @@ interface WasmModule {
     delegateeDid: string,
     parentToken: string,
     capabilitiesJson: string,
-  ) => Promise<void>;
+  ) => Promise<{
+    tokenId: string;
+    issuer: string;
+    audience: string;
+    capabilitiesJson: string;
+    expiresAt: number | null;
+    encoded: string;
+  }>;
 }
 
 // ---------------------------------------------------------------------------
