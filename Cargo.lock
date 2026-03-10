@@ -111,7 +111,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -122,7 +122,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1523,27 +1523,6 @@ checksum = "285743a676ccb6b3e116bc14cc69319b957867930ae9c4822f8e0f54509d7243"
 dependencies = [
  "block-buffer 0.12.0",
  "crypto-common 0.2.1",
-]
-
-[[package]]
-name = "dirs"
-version = "5.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44c45a9d03d6676652bcb5e724c7e988de1acad23a711b5217ab9cbecbec2225"
-dependencies = [
- "dirs-sys",
-]
-
-[[package]]
-name = "dirs-sys"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "520f05a5cbd335fae5a99ff7a6ab8627577660ee5cfd6a94a6a929b52ff0321c"
-dependencies = [
- "libc",
- "option-ext",
- "redox_users",
- "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -3860,12 +3839,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "option-ext"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
-
-[[package]]
 name = "outref"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4479,17 +4452,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "redox_users"
-version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba009ff324d1fc1b900bd1fdb31564febe58a8ccc8a6fdbb93b543d33b13ca43"
-dependencies = [
- "getrandom 0.2.17",
- "libredox",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "ref-cast"
 version = "1.0.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4942,7 +4904,6 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64",
- "dirs",
  "futures",
  "hex",
  "libc",
@@ -5304,36 +5265,21 @@ dependencies = [
 name = "scp-testing"
 version = "0.1.0"
 dependencies = [
- "axum",
- "base64",
  "bytes",
  "ed25519-dalek 2.2.0",
  "futures",
  "hex",
- "http-body-util",
- "hyper 1.8.1",
  "openmls",
- "openmls_basic_credential",
- "openmls_rust_crypto 0.5.1",
  "openmls_traits 0.5.0",
- "rand 0.8.5",
  "rmp-serde",
  "scp-core",
- "scp-event-log",
  "scp-identity",
- "scp-node",
  "scp-platform",
- "scp-primitives",
  "scp-transport",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
- "thiserror 2.0.18",
- "tls_codec",
  "tokio",
- "tokio-stream",
- "tokio-tungstenite 0.24.0",
- "tower",
 ]
 
 [[package]]
