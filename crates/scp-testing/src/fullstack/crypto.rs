@@ -1,0 +1,566 @@
+//! End-to-end [`ContextCryptoProvider`] with real MLS and sender keys.
+//!
+//! Unlike `MlsCryptoProvider`, this provider captures Welcome messages and
+//! sender keys in a shared [`KeyExchange`] so a second node's provider can
+//! pick them up — enabling true two-party (or multi-party) E2E tests through
+//! `ContextManager`.
+//!
+//! # What's real
+//!
+//! - `OpenMLS` groups (create, add, remove, encrypt, decrypt)
+//! - AES-256-GCM sender key encryption with AAD binding
+//! - Key package generation, Welcome processing
+//!
+//! # What's test infrastructure
+//!
+//! - `KeyExchange` side channel (bridges Welcome + sender key material)
+//! - `join_from_welcome()` extra method (not part of trait)
+//! - `decrypt_message()` extra method (not part of trait)
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use scp_core::context::ContextError;
+use scp_core::context::builder::{ContextCreationError, ContextCryptoProvider};
+use scp_core::crypto::mls::credential::ScpCredential;
+use scp_core::crypto::mls::encrypt::{decrypt, encrypt, serialize_ciphertext};
+use scp_core::crypto::mls::epoch_grace::EpochGraceStore;
+use scp_core::crypto::mls::group::{
+    ScpMlsGroup, add_member, create_group, destroy_group, generate_key_package, join_group,
+};
+use scp_core::crypto::mls::ratchet::{process_commit, serialize_commit};
+use scp_core::crypto::sender_keys::encrypt::{decrypt_sender_layer, encrypt_sender_layer};
+use scp_core::crypto::sender_keys::{SenderKey, SenderKeyStore, generate_sender_key};
+use scp_identity::SigningKeyId;
+
+use super::exchange::{KeyExchange, PendingWelcome};
+
+/// End-to-end crypto provider backed by real MLS groups and sender keys.
+///
+/// Each node (Alice, Bob, etc.) gets its own `E2eCryptoProvider` instance.
+/// They share a `KeyExchange` (via `Arc<Mutex<>>`) to coordinate Welcome
+/// messages and sender keys.
+///
+/// # Thread safety
+///
+/// Uses `std::sync::Mutex` (not `tokio::sync::Mutex`) because
+/// `ContextCryptoProvider` trait methods are synchronous.
+pub struct E2eCryptoProvider {
+    /// This node's DID.
+    local_did: String,
+    /// Per-context MLS groups, keyed by context ID bytes.
+    groups: Mutex<HashMap<[u8; 32], ScpMlsGroup>>,
+    /// Sender key store (`context_id_hex` + `sender_did` -> sender key).
+    sender_keys: Mutex<SenderKeyStore>,
+    /// Broadcast keys (not used in E2E tests, but required by trait).
+    broadcast_keys: Mutex<HashMap<[u8; 32], SenderKey>>,
+    /// Shared key exchange for Welcome messages and sender keys.
+    exchange: std::sync::Arc<Mutex<KeyExchange>>,
+    /// Tracks which members have been added to each context (for sender key
+    /// distribution targeting).
+    members: Mutex<HashMap<[u8; 32], Vec<String>>>,
+}
+
+#[allow(clippy::significant_drop_tightening)]
+impl E2eCryptoProvider {
+    /// Creates a new E2E crypto provider for the given DID.
+    ///
+    /// The `exchange` is shared between all providers in a `FullStackNetwork`.
+    #[must_use]
+    pub fn new(local_did: String, exchange: std::sync::Arc<Mutex<KeyExchange>>) -> Self {
+        Self {
+            local_did,
+            groups: Mutex::new(HashMap::new()),
+            sender_keys: Mutex::new(SenderKeyStore::new()),
+            broadcast_keys: Mutex::new(HashMap::new()),
+            exchange,
+            members: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns the local DID.
+    #[must_use]
+    pub fn local_did(&self) -> &str {
+        &self.local_did
+    }
+
+    /// Converts a context ID to the hex string used as sender key store key.
+    fn context_id_hex(context_id: &[u8; 32]) -> String {
+        hex::encode(context_id)
+    }
+
+    /// Helper: build an `ScpCredential` for the local DID.
+    fn credential(&self) -> Result<ScpCredential, ContextCreationError> {
+        ScpCredential::new(self.local_did.clone(), None, SigningKeyId::Active)
+            .map_err(|e| ContextCreationError::CryptoFailed(e.to_string()))
+    }
+
+    // -- Extra methods (not part of ContextCryptoProvider trait) ---------------
+
+    /// Joins a context by retrieving the Welcome message from the shared
+    /// `KeyExchange` and forming the local MLS group state.
+    ///
+    /// Also picks up any sender keys deposited for this node.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ContextError` if no Welcome is available or MLS join fails.
+    pub fn join_from_welcome(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
+        let pending = {
+            let mut exchange = self
+                .exchange
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            exchange
+                .take_welcome(context_id, &self.local_did)
+                .ok_or_else(|| {
+                    ContextError::CryptoFailed(format!(
+                        "no Welcome available for {} in context {}",
+                        self.local_did,
+                        hex::encode(context_id)
+                    ))
+                })?
+        };
+
+        let group = join_group(&pending.welcome, pending.provider, pending.signer)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        {
+            let mut groups = self
+                .groups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            groups.insert(*context_id, group);
+        }
+
+        // Pick up any sender keys deposited for us.
+        let ctx_hex = Self::context_id_hex(context_id);
+        let sender_keys = {
+            let mut exchange = self
+                .exchange
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            exchange.take_sender_keys(&ctx_hex, &self.local_did)
+        };
+        if !sender_keys.is_empty() {
+            let mut store = self
+                .sender_keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (sender_did, key) in sender_keys {
+                store.set(&ctx_hex, &sender_did, key);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Processes any pending MLS commits for this node in the given context.
+    ///
+    /// When another member adds a third party, the MLS group epoch advances.
+    /// Existing members must process the Commit to stay in sync. This method
+    /// retrieves and processes all pending commits from the `KeyExchange`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ContextError` if commit processing fails.
+    pub fn process_pending_commits(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
+        let commits = {
+            let mut exchange = self
+                .exchange
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            exchange.take_commits(context_id, &self.local_did)
+        };
+
+        if commits.is_empty() {
+            return Ok(());
+        }
+
+        let mut groups = self
+            .groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let group = groups
+            .get_mut(context_id)
+            .ok_or_else(|| ContextError::CryptoFailed("no MLS group for context".into()))?;
+
+        // Use a temporary grace store — we don't need epoch grace tracking
+        // in tests, only the commit processing side effect (epoch advance).
+        let mut grace_store = EpochGraceStore::new();
+
+        for commit_bytes in &commits {
+            process_commit(group, commit_bytes, &mut grace_store)
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        }
+
+        Ok(())
+    }
+
+    /// Decrypts a message that was encrypted by `encrypt_message`.
+    ///
+    /// Performs the reverse: MLS decrypt → sender key decrypt.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` - The 32-byte context identifier.
+    /// * `ciphertext` - The double-encrypted payload (sender key + MLS).
+    /// * `sender_did` - The DID of the sender (for sender key lookup).
+    /// * `epoch` - The sender key epoch (AAD).
+    /// * `sequence` - The sequence number (AAD).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ContextError` if MLS decryption or sender key decryption fails.
+    pub fn decrypt_message(
+        &self,
+        context_id: &[u8; 32],
+        ciphertext: &[u8],
+        sender_did: &str,
+        epoch: u64,
+        sequence: u64,
+    ) -> Result<Vec<u8>, ContextError> {
+        let ctx_hex = Self::context_id_hex(context_id);
+
+        // Step 1: MLS decrypt.
+        let mls_decrypted = {
+            let mut groups = self
+                .groups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let group = groups
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::CryptoFailed("no MLS group for context".into()))?;
+            decrypt(group, ciphertext).map_err(|e| ContextError::CryptoFailed(e.to_string()))?
+        };
+
+        // Step 2: Sender key decrypt.
+        let sender_key = {
+            let store = self
+                .sender_keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            store.get(&ctx_hex, sender_did).cloned().ok_or_else(|| {
+                ContextError::CryptoFailed(format!(
+                    "no sender key for {sender_did} in context {ctx_hex}"
+                ))
+            })?
+        };
+
+        decrypt_sender_layer(
+            &sender_key,
+            &mls_decrypted,
+            &ctx_hex,
+            sender_did,
+            epoch,
+            sequence,
+        )
+        .map_err(|e| ContextError::CryptoFailed(e.to_string()))
+    }
+}
+
+// Nursery lint — false-positives on lock guards across block boundaries.
+#[allow(clippy::significant_drop_tightening)]
+impl ContextCryptoProvider for E2eCryptoProvider {
+    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+        let _ = self.credential()?;
+        Ok(())
+    }
+
+    fn create_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        let credential = self.credential()?;
+        let group = create_group(&credential)
+            .map_err(|e| ContextCreationError::CryptoFailed(e.to_string()))?;
+
+        let mut groups = self
+            .groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        groups.insert(*context_id, group);
+        Ok(())
+    }
+
+    fn generate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        let key = generate_sender_key();
+        let ctx_hex = Self::context_id_hex(context_id);
+
+        let mut store = self
+            .sender_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.set(&ctx_hex, &self.local_did, key);
+        Ok(())
+    }
+
+    fn init_broadcast_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        let key = generate_sender_key();
+        let mut broadcast_keys = self
+            .broadcast_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        broadcast_keys.insert(*context_id, key);
+        Ok(())
+    }
+
+    fn destroy_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        let mut groups = self
+            .groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(mut group) = groups.remove(context_id) {
+            let _ = destroy_group(&mut group);
+        }
+        Ok(())
+    }
+
+    fn destroy_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        let ctx_hex = Self::context_id_hex(context_id);
+        let mut store = self
+            .sender_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = store.remove(&ctx_hex, &self.local_did);
+
+        let mut broadcast_keys = self
+            .broadcast_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        broadcast_keys.remove(context_id);
+        Ok(())
+    }
+
+    fn validate_key_package(
+        &self,
+        owner_did: &str,
+        _key_package_bytes: Option<&[u8]>,
+    ) -> Result<(), ContextError> {
+        if owner_did.is_empty() {
+            return Err(ContextError::InvalidKeyPackage("owner DID is empty".into()));
+        }
+        if !owner_did.starts_with("did:") {
+            return Err(ContextError::InvalidKeyPackage(
+                "owner DID does not start with did:".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn add_member(
+        &self,
+        context_id: &[u8; 32],
+        member_did: &str,
+        _key_package_bytes: Option<&[u8]>,
+    ) -> Result<(), ContextError> {
+        // Generate a key package for the new member.
+        let member_credential =
+            ScpCredential::new(member_did.to_owned(), None, SigningKeyId::Active)
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        let (kp_bundle, signer, provider) = generate_key_package(&member_credential)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        let kp_in: openmls::prelude::KeyPackageIn = kp_bundle.key_package().clone().into();
+
+        // Add to MLS group.
+        let result = {
+            let mut groups = self
+                .groups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let group = groups
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::CryptoFailed("no MLS group for context".into()))?;
+            add_member(group, kp_in).map_err(|e| ContextError::CryptoFailed(e.to_string()))?
+        };
+
+        // Serialize the commit for distribution to existing members.
+        let commit_bytes = serialize_commit(&result.commit)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        // Read existing members before locking exchange (avoid nested locks).
+        let existing_members: Vec<String> = {
+            let members = self
+                .members
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            members.get(context_id).cloned().unwrap_or_default()
+        };
+
+        // CAPTURE: Deposit Welcome + signer + provider in the exchange
+        // so the joiner can retrieve them via join_from_welcome().
+        // Also deposit the Commit for existing members so their MLS groups
+        // advance to the new epoch.
+        {
+            let mut exchange = self
+                .exchange
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            exchange.deposit_welcome(
+                *context_id,
+                member_did,
+                PendingWelcome {
+                    welcome: result.welcome,
+                    signer,
+                    provider,
+                },
+            );
+
+            // Deposit the commit for all existing members (not the new joiner).
+            for did in &existing_members {
+                exchange.deposit_commit(*context_id, did, commit_bytes.clone());
+            }
+        }
+
+        // Track the member for sender key distribution.
+        {
+            let mut members = self
+                .members
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            members
+                .entry(*context_id)
+                .or_default()
+                .push(member_did.to_owned());
+        }
+
+        Ok(())
+    }
+
+    fn remove_member(&self, context_id: &[u8; 32], member_did: &str) -> Result<(), ContextError> {
+        use scp_core::crypto::mls::group::remove_member as mls_remove_member;
+
+        if member_did == self.local_did {
+            return Err(ContextError::CryptoFailed(
+                "cannot remove self from MLS group".to_string(),
+            ));
+        }
+
+        let mut groups = self
+            .groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let group = groups
+            .get_mut(context_id)
+            .ok_or_else(|| ContextError::CryptoFailed("no MLS group for context".into()))?;
+
+        let members = group
+            .members()
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        let mut target_index = None;
+        for member in &members {
+            let credential_bytes = member.credential.serialized_content();
+            if let Ok(cred) = ScpCredential::from_bytes(credential_bytes)
+                && cred.did == member_did
+            {
+                target_index = Some(member.index);
+                break;
+            }
+        }
+
+        let leaf_index = target_index.ok_or_else(|| {
+            ContextError::MemberNotFound(format!("member {member_did} not in MLS group"))
+        })?;
+
+        let _result = mls_remove_member(group, leaf_index)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        Ok(())
+    }
+
+    fn distribute_sender_key(
+        &self,
+        context_id: &[u8; 32],
+        member_did: &str,
+    ) -> Result<(), ContextError> {
+        let ctx_hex = Self::context_id_hex(context_id);
+
+        // Get the local sender key.
+        let key = {
+            let store = self
+                .sender_keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            store
+                .get(&ctx_hex, &self.local_did)
+                .cloned()
+                .ok_or_else(|| {
+                    ContextError::CryptoFailed(
+                        "no sender key for local DID in this context".to_string(),
+                    )
+                })?
+        };
+
+        // CAPTURE: Deposit the sender key in the exchange for the target member.
+        {
+            let mut exchange = self
+                .exchange
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            exchange.deposit_sender_key(&ctx_hex, &self.local_did, member_did, key);
+        }
+
+        Ok(())
+    }
+
+    fn remove_member_sender_key(
+        &self,
+        context_id: &[u8; 32],
+        member_did: &str,
+    ) -> Result<(), ContextError> {
+        let ctx_hex = Self::context_id_hex(context_id);
+        let mut store = self
+            .sender_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = store.remove(&ctx_hex, member_did);
+        Ok(())
+    }
+
+    fn encrypt_message(
+        &self,
+        context_id: &[u8; 32],
+        _sender_did: &str,
+        payload: &[u8],
+        epoch: u64,
+        sequence: u64,
+    ) -> Result<Vec<u8>, ContextError> {
+        let ctx_hex = Self::context_id_hex(context_id);
+
+        // Step 1: Encrypt with sender key (AES-256-GCM, ADR-007).
+        let sender_encrypted = {
+            let store = self
+                .sender_keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let sender_key = store.get(&ctx_hex, &self.local_did).ok_or_else(|| {
+                ContextError::CryptoFailed(
+                    "no sender key for local DID in this context".to_string(),
+                )
+            })?;
+            encrypt_sender_layer(
+                sender_key,
+                payload,
+                &ctx_hex,
+                &self.local_did,
+                epoch,
+                sequence,
+            )
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?
+        };
+
+        // Step 2: Encrypt via MLS (ADR-001).
+        let mut groups = self
+            .groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let group = groups
+            .get_mut(context_id)
+            .ok_or_else(|| ContextError::CryptoFailed("no MLS group for context".into()))?;
+
+        let ciphertext = encrypt(group, &sender_encrypted)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        serialize_ciphertext(&ciphertext).map_err(|e| ContextError::CryptoFailed(e.to_string()))
+    }
+}
