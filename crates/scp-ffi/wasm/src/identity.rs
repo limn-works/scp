@@ -45,6 +45,7 @@ use std::collections::HashMap;
 use js_sys::Promise;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::ScpWasmError;
 
@@ -53,11 +54,20 @@ use crate::error::ScpWasmError;
 // ---------------------------------------------------------------------------
 
 /// Per-identity state stored in the WASM-local registry.
-#[derive(Debug, Clone)]
+///
+/// Private key fields are wrapped in [`zeroize::Zeroizing`] and the struct
+/// implements [`ZeroizeOnDrop`] so that key material is overwritten with zeros
+/// when the entry is removed from the registry or replaced. `Clone` is
+/// intentionally NOT derived — cloning would scatter unprotected copies of
+/// private keys through WASM linear memory.
+#[derive(Debug, Zeroize, ZeroizeOnDrop)]
 struct IdentityEntry {
     /// Ed25519 signing key bytes (32 bytes). Stored to produce real Ed25519
     /// signatures for device attestation and other identity operations.
-    signing_key_bytes: [u8; 32],
+    ///
+    /// Wrapped in `Zeroizing` for defense-in-depth: WASM linear memory is
+    /// readable by same-origin JS, so key material must be zeroed on drop.
+    signing_key_bytes: zeroize::Zeroizing<[u8; 32]>,
     /// Ed25519 public key bytes (32 bytes).
     public_key_bytes: [u8; 32],
     /// Custody type string. Retained for future use when custody operations
@@ -65,7 +75,10 @@ struct IdentityEntry {
     #[allow(dead_code)]
     custody_type: String,
     /// Agent signing key bytes (32 bytes), if an agent key has been bound.
-    agent_signing_key_bytes: Option<[u8; 32]>,
+    ///
+    /// Wrapped in `Zeroizing` for defense-in-depth (same rationale as
+    /// `signing_key_bytes`).
+    agent_signing_key_bytes: Option<zeroize::Zeroizing<[u8; 32]>>,
 }
 
 /// Maximum number of identities in the WASM-local identity registry.
@@ -535,7 +548,7 @@ pub fn identity_create(custody: String) -> Promise {
             map.insert(
                 did.clone(),
                 IdentityEntry {
-                    signing_key_bytes: signing_key.to_bytes(),
+                    signing_key_bytes: zeroize::Zeroizing::new(signing_key.to_bytes()),
                     public_key_bytes: pub_bytes,
                     custody_type: custody.clone(),
                     agent_signing_key_bytes: None,
@@ -585,33 +598,35 @@ pub fn identity_resolve(did: String) -> Promise {
             .into());
         }
 
-        // Look up in the local identity registry.
-        let entry = IDENTITY_REGISTRY.with(|reg| {
+        // Look up public key bytes from the local identity registry.
+        // Only extract the public key — never clone private key material
+        // out of the registry.
+        let pub_key_bytes = IDENTITY_REGISTRY.with(|reg| {
             let map = reg.borrow();
-            map.get(&did).cloned()
+            map.get(&did).map(|entry| entry.public_key_bytes)
         });
 
         let (verification_methods_json, authentication_json, assertion_methods_json) =
-            if let Some(entry) = entry {
-                // Build a verification method from the stored public key.
-                let multibase_key = format!("z{}", zbase32_encode(&entry.public_key_bytes));
-                let vm = serde_json::json!([{
-                    "id": format!("{did}#0"),
-                    "type": "Ed25519VerificationKey2020",
-                    "controller": did,
-                    "publicKeyMultibase": multibase_key,
-                }]);
-                let auth = serde_json::json!([format!("{did}#0")]);
-                let assertion = serde_json::json!([format!("{did}#0")]);
-                (
-                    serde_json::to_string(&vm).unwrap_or_else(|_| "[]".to_owned()),
-                    serde_json::to_string(&auth).unwrap_or_else(|_| "[]".to_owned()),
-                    serde_json::to_string(&assertion).unwrap_or_else(|_| "[]".to_owned()),
-                )
-            } else {
-                // Unknown DID — return minimal document.
-                ("[]".to_owned(), "[]".to_owned(), "[]".to_owned())
-            };
+            pub_key_bytes.map_or_else(
+                || ("[]".to_owned(), "[]".to_owned(), "[]".to_owned()),
+                |pub_bytes| {
+                    // Build a verification method from the stored public key.
+                    let multibase_key = format!("z{}", zbase32_encode(&pub_bytes));
+                    let vm = serde_json::json!([{
+                        "id": format!("{did}#0"),
+                        "type": "Ed25519VerificationKey2020",
+                        "controller": did,
+                        "publicKeyMultibase": multibase_key,
+                    }]);
+                    let auth = serde_json::json!([format!("{did}#0")]);
+                    let assertion = serde_json::json!([format!("{did}#0")]);
+                    (
+                        serde_json::to_string(&vm).unwrap_or_else(|_| "[]".to_owned()),
+                        serde_json::to_string(&auth).unwrap_or_else(|_| "[]".to_owned()),
+                        serde_json::to_string(&assertion).unwrap_or_else(|_| "[]".to_owned()),
+                    )
+                },
+            );
 
         Ok(JsValue::from(WasmDIDDocument::from_fields(
             did,
@@ -672,10 +687,10 @@ pub fn identity_create_with_agent_key(custody: String) -> Promise {
             map.insert(
                 did.clone(),
                 IdentityEntry {
-                    signing_key_bytes: signing_key.to_bytes(),
+                    signing_key_bytes: zeroize::Zeroizing::new(signing_key.to_bytes()),
                     public_key_bytes: pub_bytes,
                     custody_type: custody.clone(),
-                    agent_signing_key_bytes: Some(agent_key.to_bytes()),
+                    agent_signing_key_bytes: Some(zeroize::Zeroizing::new(agent_key.to_bytes())),
                 },
             );
             Ok(())
@@ -716,7 +731,7 @@ pub fn identity_add_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, J
     IDENTITY_REGISTRY.with(|reg| {
         let mut map = reg.borrow_mut();
         if let Some(entry) = map.get_mut(&did) {
-            entry.agent_signing_key_bytes = Some(agent_key.to_bytes());
+            entry.agent_signing_key_bytes = Some(zeroize::Zeroizing::new(agent_key.to_bytes()));
         }
     });
 
@@ -755,7 +770,7 @@ pub fn identity_rotate_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
     IDENTITY_REGISTRY.with(|reg| {
         let mut map = reg.borrow_mut();
         if let Some(entry) = map.get_mut(&did) {
-            entry.agent_signing_key_bytes = Some(agent_key.to_bytes());
+            entry.agent_signing_key_bytes = Some(zeroize::Zeroizing::new(agent_key.to_bytes()));
         }
     });
 
@@ -825,15 +840,18 @@ pub fn identity_migrate(identity: &WasmIdentity) -> Promise {
             let agent_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
             let agent_pub = agent_key.verifying_key();
             let multibase = format!("z{}", zbase32_encode(&agent_pub.to_bytes()));
-            (Some(agent_key.to_bytes()), Some(multibase))
+            (
+                Some(zeroize::Zeroizing::new(agent_key.to_bytes())),
+                Some(multibase),
+            )
         } else {
             (None, None)
         };
 
         IDENTITY_REGISTRY.with(|reg| {
             let mut map = reg.borrow_mut();
-            // Remove the old identity's key material from the registry to
-            // prevent stale signing keys from lingering in WASM linear memory.
+            // Remove the old identity's key material from the registry.
+            // `ZeroizeOnDrop` ensures the old signing keys are zeroed.
             map.remove(&old_did);
             // After removing old_did, the net count stays the same or decreases,
             // so we only need to check if the new_did is truly a new entry.
@@ -852,7 +870,7 @@ pub fn identity_migrate(identity: &WasmIdentity) -> Promise {
             map.insert(
                 new_did.clone(),
                 IdentityEntry {
-                    signing_key_bytes: signing_key.to_bytes(),
+                    signing_key_bytes: zeroize::Zeroizing::new(signing_key.to_bytes()),
                     public_key_bytes: pub_bytes,
                     custody_type: custody.clone(),
                     agent_signing_key_bytes,
@@ -901,21 +919,6 @@ pub fn identity_attest_device(did: String) -> Promise {
     use ed25519_dalek::Signer;
 
     future_to_promise(async move {
-        // Look up signing key from identity registry.
-        let entry = IDENTITY_REGISTRY.with(|reg| {
-            let map = reg.borrow();
-            map.get(&did).cloned()
-        });
-
-        let entry = entry.ok_or_else(|| -> JsValue {
-            ScpWasmError::Identity {
-                message: format!("identity {did:?} not found in registry"),
-                code: "SCP-IDENT-1000".to_owned(),
-            }
-            .into_js()
-            .into()
-        })?;
-
         // Create attestation payload: DID + timestamp.
         let timestamp_ms = js_sys::Date::now();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -923,13 +926,29 @@ pub fn identity_attest_device(did: String) -> Promise {
         let payload = format!("device-attestation:{did}:{timestamp_secs}");
 
         // Produce a real Ed25519 signature over the attestation payload.
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&entry.signing_key_bytes);
-        let signature = signing_key.sign(payload.as_bytes());
+        // Signing is performed inside the registry closure so that private
+        // key material is never cloned out of the registry into unprotected
+        // WASM linear memory.
+        let signature_bytes = IDENTITY_REGISTRY.with(|reg| {
+            let map = reg.borrow();
+            let entry = map.get(&did).ok_or_else(|| -> JsValue {
+                ScpWasmError::Identity {
+                    message: format!("identity {did:?} not found in registry"),
+                    code: "SCP-IDENT-1000".to_owned(),
+                }
+                .into_js()
+                .into()
+            })?;
+
+            let signing_key = ed25519_dalek::SigningKey::from_bytes(&entry.signing_key_bytes);
+            let signature = signing_key.sign(payload.as_bytes());
+            Ok::<[u8; 64], JsValue>(signature.to_bytes())
+        })?;
 
         let token = serde_json::json!({
             "did": did,
             "timestamp": timestamp_secs,
-            "signature": hex::encode(signature.to_bytes()),
+            "signature": hex::encode(signature_bytes),
         });
 
         // Base64-encode the token JSON.
@@ -987,13 +1006,14 @@ pub fn identity_verify_device_attestation(did: String, token_base64: String) -> 
             return Ok(JsValue::from_bool(false));
         }
 
-        // Look up public key from registry.
-        let entry = IDENTITY_REGISTRY.with(|reg| {
+        // Look up only the public key bytes from the registry — never
+        // clone private key material out.
+        let pub_key_bytes = IDENTITY_REGISTRY.with(|reg| {
             let map = reg.borrow();
-            map.get(&did).cloned()
+            map.get(&did).map(|entry| entry.public_key_bytes)
         });
 
-        let Some(entry) = entry else {
+        let Some(pub_bytes) = pub_key_bytes else {
             return Ok(JsValue::from_bool(false));
         };
 
@@ -1008,8 +1028,7 @@ pub fn identity_verify_device_attestation(did: String, token_base64: String) -> 
 
         // Verify the Ed25519 signature against the public key.
         let payload = format!("device-attestation:{did}:{timestamp}");
-        let Ok(verifying_key) = ed25519_dalek::VerifyingKey::from_bytes(&entry.public_key_bytes)
-        else {
+        let Ok(verifying_key) = ed25519_dalek::VerifyingKey::from_bytes(&pub_bytes) else {
             return Ok(JsValue::from_bool(false));
         };
         let signature = ed25519_dalek::Signature::from_bytes(&sig_array);
