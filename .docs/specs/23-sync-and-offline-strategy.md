@@ -342,6 +342,8 @@ Sent as MLS application message when relay backfill does not contain all Commits
 | `requester_did` | string | DID of the requesting member |
 | `signature` | bytes (64) | Ed25519 signature for authentication |
 
+**Signature construction:** Domain separator `"SCP-COMMIT-RANGE-REQ-V1:"` (§9.18.2). Canonical hash per §9.5.1: `SHA-256("SCP-COMMIT-RANGE-REQ-V1:" || BE32(len(context_id)) || context_id || from_epoch (8-byte BE u64) || to_epoch (8-byte BE u64) || BE32(len(requester_did)) || requester_did)`. The signature authenticates the requester and prevents request forgery.
+
 ### 23.16.3 CommitRangeResponse
 
 Response to CommitRangeRequest, sent as MLS application message (§23.4.1, source 2).
@@ -352,6 +354,8 @@ Response to CommitRangeRequest, sent as MLS application message (§23.4.1, sourc
 | `commits` | array of bytes | Serialized MLS Commit messages, strictly ascending epoch order |
 | `responder_did` | string | DID of the responding member |
 | `signature` | bytes (64) | Ed25519 signature for authentication |
+
+**Signature construction:** Domain separator `"SCP-COMMIT-RANGE-RESP-V1:"` (§9.18.2). Canonical hash per §9.5.1: `SHA-256("SCP-COMMIT-RANGE-RESP-V1:" || BE32(len(context_id)) || context_id || BE32(len(commits_concat)) || commits_concat || BE32(len(responder_did)) || responder_did)`, where `commits_concat` is each commit entry prefixed by its own `BE32(len())` and then concatenated. The signature authenticates the responder and prevents response tampering.
 
 Each entry in `commits` is an opaque serialized MLS Commit message as produced by the MLS library. Ordering MUST be strictly ascending by epoch.
 
@@ -373,6 +377,8 @@ Self-contained context state at a point in time. Used for Tier 2 delta sync reco
 | `creator_did` | string | DID of snapshot creator |
 | `signature` | bytes (64) | Ed25519 signature over all fields except `signature` |
 | `sequence` | u64 | Monotonically increasing snapshot sequence per context |
+
+**Signature construction:** Domain separator `"SCP-CONTEXT-SNAPSHOT-V1:"` (§9.18.2). Canonical hash per §9.5.1: `SHA-256("SCP-CONTEXT-SNAPSHOT-V1:" || BE32(len(context_id)) || context_id || timestamp (8-byte BE u64) || mls_epoch_flag (1 byte: 0x01 if present, 0x00 if null) || mls_epoch (8-byte BE u64, omitted if null) || event_log_merkle_root (32 bytes) || event_count (8-byte BE u64) || members_hash (32 bytes) || role_definitions_hash (32 bytes) || params_hash (32 bytes) || tool_names_hash (32 bytes) || BE32(len(creator_did)) || creator_did || sequence (8-byte BE u64))`. The `members_hash` is `SHA-256` of BTreeMap entries serialized in key order: for each `(did, entry)`, emit `BE32(len(did)) || did || BE32(len(role_name)) || role_name || sequence_number (8-byte BE u64)`. The `role_definitions_hash` is `SHA-256` of entries in key order: for each `(role, caps)`, emit `BE32(len(role)) || role || BE32(count) || [BE32(len(cap)) || cap ...]`. The `tool_names_hash` is `SHA-256` of `BE32(count) || [BE32(len(name)) || name ...]` in array order. The `mls_epoch` field uses a presence flag matching ConsistencyCheckpoint (§23.16.1). The signature is Ed25519 over this hash, signed by `creator_did`'s `#active` or `#agent` verification method key (ADR-039).
 
 **MembershipEntry:**
 

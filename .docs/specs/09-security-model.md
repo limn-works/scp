@@ -1175,18 +1175,18 @@ This suite matches the MLS ciphersuite (§9.5) and the DID-to-DID HPKE suite, mi
 **`info` parameter (domain separation):**
 
 ```
-info = "scp-sender-key-v1" || context_id || sender_did || epoch_bytes
+info = "scp-sender-key-v1" || BE32(len(context_id)) || context_id || BE32(len(sender_did)) || sender_did || epoch_bytes
 ```
 
-Where `context_id` and `sender_did` are UTF-8 bytes (no length prefix — the `info` string is not parsed, only compared) and `epoch_bytes` is the 8-byte big-endian encoding of the sender key epoch. The `info` string binds the HPKE encryption to a specific context, sender, and epoch. Using a different `info` on open produces a different derived key, causing AEAD decryption to fail.
+Where `context_id` and `sender_did` are UTF-8 bytes with 4-byte big-endian length prefixes (preventing boundary-shift collisions per §9.5.1) and `epoch_bytes` is the 8-byte big-endian encoding of the sender key epoch. The `info` string binds the HPKE encryption to a specific context, sender, and epoch. Using a different `info` on open produces a different derived key, causing AEAD decryption to fail.
 
 **`aad` parameter (additional authenticated data):**
 
 ```
-aad = context_id || sender_did || epoch_bytes
+aad = BE32(len(context_id)) || context_id || BE32(len(sender_did)) || sender_did || epoch_bytes
 ```
 
-Where fields use the same encoding as `info` (without the domain separator prefix). The AAD binds the ciphertext to the context and sender, preventing cross-context and cross-sender key substitution attacks. Tampering with any field in the wire format causes AEAD verification to fail.
+Where fields use the same encoding as `info` (with `BE32(len())` length prefixes, without the domain separator prefix). The AAD binds the ciphertext to the context and sender, preventing cross-context and cross-sender key substitution attacks. Tampering with any field in the wire format causes AEAD verification to fail.
 
 **Nonce:** The AEAD nonce is managed internally by the HPKE context (RFC 9180 §5.2 `ComputeNonce`). Implementations MUST NOT generate or supply an external nonce — HPKE derives it from the key schedule. Since each `SenderKeyResponse` creates a fresh HPKE context (fresh ephemeral keypair), the internal sequence counter starts at 0 and only one `Seal`/`Open` call is made per context.
 
@@ -1477,6 +1477,9 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash const
 | `"SCP-PUSH-REGISTER-V1:"` | Push notification registration signing | §22.11.4 |
 | `"SCP-PUSH-DEREGISTER-V1:"` | Push notification deregistration signing | §22.11.4 |
 | `"SCP-CHUNK-MSG-ID-V1:"` | Chunked message ID derivation | §9.10.3 |
+| `"SCP-COMMIT-RANGE-REQ-V1:"` | Commit range request signing | §23.16.2 |
+| `"SCP-COMMIT-RANGE-RESP-V1:"` | Commit range response signing | §23.16.3 |
+| `"SCP-CONTEXT-SNAPSHOT-V1:"` | Context snapshot signing | §23.16.4 |
 
 ### 9.18.3 Key Derivation and HPKE Labels
 

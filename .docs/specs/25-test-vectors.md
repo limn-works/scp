@@ -204,7 +204,7 @@ Canonical hash input (per §23.5.2, field order from code):
 
 Total: 21 + 21 + 20 + 8 + 11 + 16 + 8 = 105 bytes
 
-Expected: SHA-256 of 102 bytes. Sign with Ed25519.
+Expected: SHA-256 of 105 bytes. Sign with Ed25519.
 ```
 
 ## 25.7 Envelope Padding Vectors (§9.10)
