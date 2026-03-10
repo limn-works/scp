@@ -163,6 +163,14 @@ impl ScenarioBuilder {
             }
         }
 
+        // Check for cross-namespace collisions (relay name = identity label).
+        let relay_names: HashSet<&str> = self.relays.iter().map(|s| s.name.as_str()).collect();
+        for label in &self.identity_labels {
+            if relay_names.contains(label.as_str()) {
+                return Err(BuilderError::DuplicateLabel(label.clone()));
+            }
+        }
+
         // Create clock.
         let clock = Arc::new(SimulatedClock::new(self.clock_start_secs));
 
@@ -271,6 +279,15 @@ mod tests {
             .identity("alice")
             .build();
         assert!(matches!(result, Err(BuilderError::DuplicateLabel(_))));
+    }
+
+    #[test]
+    fn build_fails_on_cross_namespace_collision() {
+        let result = ScenarioBuilder::new()
+            .relay("node-1")
+            .identity("node-1")
+            .build();
+        assert!(matches!(result, Err(BuilderError::DuplicateLabel(ref s)) if s == "node-1"));
     }
 
     #[test]
