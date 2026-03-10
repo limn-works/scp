@@ -19,7 +19,7 @@ import {
   TransportError,
   UcanPermissionError,
   ValidationError,
-} from "../src/errors.js";
+} from "../src/errors";
 
 describe("ScpError hierarchy", () => {
   it("ScpError is the root error class", () => {

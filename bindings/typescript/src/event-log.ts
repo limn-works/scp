@@ -7,10 +7,10 @@
  * See ADR-011 (Event Log) and ADR-022 in `.docs/adrs/phase-4.md`.
  */
 
-import type { Context } from "./context.js";
-import { mapBridgeError } from "./errors.js";
-import { getBridge } from "./internal/bridge.js";
-import type { Checkpoint, Event, EventClaim, EventFilter, Proof } from "./types.js";
+import type { Context } from "./context";
+import { mapBridgeError } from "./errors";
+import { getBridge } from "./internal/bridge";
+import type { Checkpoint, Event, EventClaim, EventFilter, Proof } from "./types";
 
 // ---------------------------------------------------------------------------
 // EventLog

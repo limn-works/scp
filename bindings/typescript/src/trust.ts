@@ -9,16 +9,16 @@
  * See ADR-017 (Trust Engine) and ADR-022 in `.docs/adrs/phase-4.md`.
  */
 
-import type { Context } from "./context.js";
-import { mapBridgeError } from "./errors.js";
-import { getBridge } from "./internal/bridge.js";
+import type { Context } from "./context";
+import { mapBridgeError } from "./errors";
+import { getBridge } from "./internal/bridge";
 import type {
   AttestationSummary,
   BehavioralRecord,
   ParticipationProfile,
   RequireParticipation,
   TrustEvaluation,
-} from "./types.js";
+} from "./types";
 
 // ---------------------------------------------------------------------------
 // Trust evaluation

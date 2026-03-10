@@ -17,7 +17,7 @@ import {
   InMemorySqliteStorage,
   prefixSuccessor,
   type StorageInterface,
-} from "../src/storage/index.js";
+} from "../src/storage/index";
 
 describe("StorageInterface conformance", () => {
   let storage: StorageInterface;

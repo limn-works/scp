@@ -5,8 +5,8 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { ValidationError } from "../src/errors.js";
-import { Transport } from "../src/transport.js";
+import { ValidationError } from "../src/errors";
+import { Transport } from "../src/transport";
 
 describe("Transport", () => {
   it("rejects plaintext ws:// relay URLs", async () => {

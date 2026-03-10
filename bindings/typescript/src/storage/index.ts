@@ -14,4 +14,4 @@ export {
   type StorageInterface,
   type VfsType,
   WasmSqliteStorage,
-} from "./wasm-sqlite.js";
+} from "./wasm-sqlite";

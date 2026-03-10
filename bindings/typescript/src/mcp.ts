@@ -13,10 +13,10 @@
  * See ADR-015 in `.docs/adrs/phase-3.md` and `crates/scp-mcp/`.
  */
 
-import type { Context } from "./context.js";
-import { mapBridgeError, TransportError } from "./errors.js";
-import { BRIDGE_TARGET } from "./internal/bridge.js";
-import type { McpClientConfig, McpServerConfig, ToolDefinition } from "./types.js";
+import type { Context } from "./context";
+import { mapBridgeError, TransportError } from "./errors";
+import { BRIDGE_TARGET } from "./internal/bridge";
+import type { McpClientConfig, McpServerConfig, ToolDefinition } from "./types";
 
 // ---------------------------------------------------------------------------
 // Native addon MCP handle types (from napi-rs)

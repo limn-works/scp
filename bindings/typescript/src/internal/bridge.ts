@@ -18,7 +18,7 @@
  * See ADR-022 in `.docs/adrs/phase-4.md`.
  */
 
-import type { BridgeMode, ShadowStatus } from "../bridge.js";
+import type { BridgeMode, ShadowStatus } from "../bridge";
 import type {
   BroadcastAdmissionPolicy,
   Checkpoint,
@@ -33,7 +33,7 @@ import type {
   ToolVerificationResult,
   TransportStatus,
   UcanToken,
-} from "../types.js";
+} from "../types";
 
 // ---------------------------------------------------------------------------
 // Bridge interface — the contract both native and WASM bridges implement

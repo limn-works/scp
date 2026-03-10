@@ -15,7 +15,7 @@ import type {
   BridgeIdentityHandle,
   BridgeTransportHandle,
   MessageCallback,
-} from "../src/internal/bridge.js";
+} from "../src/internal/bridge";
 import type {
   Checkpoint,
   DIDDocument,
@@ -27,7 +27,7 @@ import type {
   ToolVerificationResult,
   TransportStatus,
   UcanToken,
-} from "../src/types.js";
+} from "../src/types";
 
 // ---------------------------------------------------------------------------
 // In-memory state stores

@@ -8,8 +8,8 @@
  * See spec section 12 (Bridge System) and ADR-023.
  */
 
-import { mapBridgeError } from "./errors.js";
-import { getBridge } from "./internal/bridge.js";
+import { mapBridgeError } from "./errors";
+import { getBridge } from "./internal/bridge";
 
 // ---------------------------------------------------------------------------
 // Types

@@ -8,10 +8,10 @@
  * See ADR-022 in `.docs/adrs/phase-4.md` and `.docs/scaffold/typescript.md`.
  */
 
-import { mapBridgeError } from "./errors.js";
-import type { BridgeIdentityHandle } from "./internal/bridge.js";
-import { getBridge } from "./internal/bridge.js";
-import type { DIDDocument } from "./types.js";
+import { mapBridgeError } from "./errors";
+import type { BridgeIdentityHandle } from "./internal/bridge";
+import { getBridge } from "./internal/bridge";
+import type { DIDDocument } from "./types";
 
 // ---------------------------------------------------------------------------
 // CustodyType

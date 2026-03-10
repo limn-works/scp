@@ -9,8 +9,8 @@
  * See ADR-010 (Tool Registry) and ADR-022 in `.docs/adrs/phase-4.md`.
  */
 
-import { ValidationError } from "./errors.js";
-import type { TestVector, ToolDefinition } from "./types.js";
+import { ValidationError } from "./errors";
+import type { TestVector, ToolDefinition } from "./types";
 
 // ---------------------------------------------------------------------------
 // Tool definition builder

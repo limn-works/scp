@@ -7,8 +7,8 @@
  * See spec section 24 (Provenance System) and ADR-019.
  */
 
-import { mapBridgeError } from "./errors.js";
-import { getBridge } from "./internal/bridge.js";
+import { mapBridgeError } from "./errors";
+import { getBridge } from "./internal/bridge";
 
 // ---------------------------------------------------------------------------
 // Types

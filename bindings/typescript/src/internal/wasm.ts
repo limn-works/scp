@@ -11,8 +11,8 @@
  * See ADR-022 in `.docs/adrs/phase-4.md`.
  */
 
-import type { BridgeMode, ShadowStatus } from "../bridge.js";
-import { ScpError, TransportError } from "../errors.js";
+import type { BridgeMode, ShadowStatus } from "../bridge";
+import { ScpError, TransportError } from "../errors";
 import type {
   BroadcastAdmissionPolicy,
   Checkpoint,
@@ -26,14 +26,14 @@ import type {
   ToolVerificationResult,
   TransportStatus,
   UcanToken,
-} from "../types.js";
+} from "../types";
 import type {
   Bridge,
   BridgeContextHandle,
   BridgeIdentityHandle,
   BridgeTransportHandle,
   MessageCallback,
-} from "./bridge.js";
+} from "./bridge";
 
 // ---------------------------------------------------------------------------
 // WASM module types

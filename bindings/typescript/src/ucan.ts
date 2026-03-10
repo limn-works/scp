@@ -8,10 +8,10 @@
  * See ADR-016 (UCAN Enforcement) and ADR-022 in `.docs/adrs/phase-4.md`.
  */
 
-import type { Context } from "./context.js";
-import { mapBridgeError } from "./errors.js";
-import { getBridge } from "./internal/bridge.js";
-import type { UcanToken } from "./types.js";
+import type { Context } from "./context";
+import { mapBridgeError } from "./errors";
+import { getBridge } from "./internal/bridge";
+import type { UcanToken } from "./types";
 
 // ---------------------------------------------------------------------------
 // UCAN operations

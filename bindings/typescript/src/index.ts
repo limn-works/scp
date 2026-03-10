@@ -32,83 +32,83 @@
 // Identity
 // ---------------------------------------------------------------------------
 
-export type { CustodyType } from "./identity.js";
-export { Identity } from "./identity.js";
+export type { CustodyType } from "./identity";
+export { Identity } from "./identity";
 
 // ---------------------------------------------------------------------------
 // Context
 // ---------------------------------------------------------------------------
 
-export { Context } from "./context.js";
+export { Context } from "./context";
 
 // ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
 
-export { defineToolDefinition } from "./tools.js";
+export { defineToolDefinition } from "./tools";
 
 // ---------------------------------------------------------------------------
 // Trust
 // ---------------------------------------------------------------------------
 
-export { evaluateTrust, verifyParticipationRequirements } from "./trust.js";
+export { evaluateTrust, verifyParticipationRequirements } from "./trust";
 
 // ---------------------------------------------------------------------------
 // Event Log
 // ---------------------------------------------------------------------------
 
-export { EventLog } from "./event-log.js";
+export { EventLog } from "./event-log";
 
 // ---------------------------------------------------------------------------
 // Transport
 // ---------------------------------------------------------------------------
 
-export { Transport } from "./transport.js";
+export { Transport } from "./transport";
 
 // ---------------------------------------------------------------------------
 // UCAN
 // ---------------------------------------------------------------------------
 
-export { delegateUcan, mintUcan, revokeUcan, validateUcan } from "./ucan.js";
+export { delegateUcan, mintUcan, revokeUcan, validateUcan } from "./ucan";
 
 // ---------------------------------------------------------------------------
 // MCP
 // ---------------------------------------------------------------------------
 
-export type { McpClient, McpServer } from "./mcp.js";
-export { connectMcp, connectMcpStdio, serveMcp } from "./mcp.js";
+export type { McpClient, McpServer } from "./mcp";
+export { connectMcp, connectMcpStdio, serveMcp } from "./mcp";
 
 // ---------------------------------------------------------------------------
 // Bridge Connector
 // ---------------------------------------------------------------------------
 
-export type { BridgeMode, BridgeRegistration, ShadowIdentity, ShadowStatus } from "./bridge.js";
-export { bridgeCreateShadow, bridgeEvaluateTrust, bridgeRegister } from "./bridge.js";
+export type { BridgeMode, BridgeRegistration, ShadowIdentity, ShadowStatus } from "./bridge";
+export { bridgeCreateShadow, bridgeEvaluateTrust, bridgeRegister } from "./bridge";
 
 // ---------------------------------------------------------------------------
 // Discovery
 // ---------------------------------------------------------------------------
 
-export type { DiscoveryResult, ParsedAddress } from "./discovery.js";
-export { createQuery, discoverContexts, normalizeAddress, parseAddress } from "./discovery.js";
+export type { DiscoveryResult, ParsedAddress } from "./discovery";
+export { createQuery, discoverContexts, normalizeAddress, parseAddress } from "./discovery";
 
 // ---------------------------------------------------------------------------
 // Provenance
 // ---------------------------------------------------------------------------
 
-export type { ProvenanceRecord } from "./provenance.js";
+export type { ProvenanceRecord } from "./provenance";
 export {
   evaluateProvenanceQuality,
   provenanceAttach,
   provenanceCheckChainDepth,
-} from "./provenance.js";
+} from "./provenance";
 
 // ---------------------------------------------------------------------------
 // Sync
 // ---------------------------------------------------------------------------
 
-export type { SyncPolicy } from "./sync.js";
-export { classifyOffline, getSyncPolicy } from "./sync.js";
+export type { SyncPolicy } from "./sync";
+export { classifyOffline, getSyncPolicy } from "./sync";
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -128,7 +128,7 @@ export {
   TransportError,
   UcanPermissionError,
   ValidationError,
-} from "./errors.js";
+} from "./errors";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -164,18 +164,18 @@ export type {
   TrustEvaluation,
   UcanToken,
   VerificationMethod,
-} from "./types.js";
+} from "./types";
 
 // ---------------------------------------------------------------------------
 // Storage
 // ---------------------------------------------------------------------------
 
-export type { StorageInterface, VfsType } from "./storage/index.js";
-export { InMemorySqliteStorage, prefixSuccessor, WasmSqliteStorage } from "./storage/index.js";
+export type { StorageInterface, VfsType } from "./storage/index";
+export { InMemorySqliteStorage, prefixSuccessor, WasmSqliteStorage } from "./storage/index";
 
 // ---------------------------------------------------------------------------
 // Internal — bridge target detection (read-only, for diagnostics)
 // ---------------------------------------------------------------------------
 
-export type { BridgeTarget } from "./internal/bridge.js";
-export { BRIDGE_TARGET } from "./internal/bridge.js";
+export type { BridgeTarget } from "./internal/bridge";
+export { BRIDGE_TARGET } from "./internal/bridge";

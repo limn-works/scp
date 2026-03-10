@@ -7,8 +7,8 @@
  * See ADR-020 in `.docs/adrs/phase-4.md` and spec section 22 (Addressing).
  */
 
-import { mapBridgeError } from "./errors.js";
-import { getBridge } from "./internal/bridge.js";
+import { mapBridgeError } from "./errors";
+import { getBridge } from "./internal/bridge";
 
 // ---------------------------------------------------------------------------
 // Types

@@ -10,11 +10,11 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { ValidationError } from "../src/errors.js";
-import { _resetBridge } from "../src/internal/bridge.js";
-import { defineToolDefinition } from "../src/tools.js";
-import { Transport } from "../src/transport.js";
-import { createMockBridge } from "./mock-bridge.js";
+import { ValidationError } from "../src/errors";
+import { _resetBridge } from "../src/internal/bridge";
+import { defineToolDefinition } from "../src/tools";
+import { Transport } from "../src/transport";
+import { createMockBridge } from "./mock-bridge";
 
 // ---------------------------------------------------------------------------
 // Test setup — inject mock bridge

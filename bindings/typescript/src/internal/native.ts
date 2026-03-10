@@ -13,8 +13,8 @@
 
 import { createRequire } from "node:module";
 
-import type { BridgeMode, ShadowStatus } from "../bridge.js";
-import { TransportError } from "../errors.js";
+import type { BridgeMode, ShadowStatus } from "../bridge";
+import { TransportError } from "../errors";
 import type {
   BroadcastAdmissionPolicy,
   Checkpoint,
@@ -29,14 +29,14 @@ import type {
   ToolVerificationResult,
   TransportStatus,
   UcanToken,
-} from "../types.js";
+} from "../types";
 import type {
   Bridge,
   BridgeContextHandle,
   BridgeIdentityHandle,
   BridgeTransportHandle,
   MessageCallback,
-} from "./bridge.js";
+} from "./bridge";
 
 // ---------------------------------------------------------------------------
 // Platform detection

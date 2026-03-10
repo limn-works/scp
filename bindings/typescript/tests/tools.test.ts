@@ -5,8 +5,8 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { ValidationError } from "../src/errors.js";
-import { defineToolDefinition } from "../src/tools.js";
+import { ValidationError } from "../src/errors";
+import { defineToolDefinition } from "../src/tools";
 
 describe("defineToolDefinition", () => {
   it("creates a valid tool definition", () => {

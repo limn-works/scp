@@ -11,10 +11,10 @@
  * See ADR-022 in `.docs/adrs/phase-4.md` and `.docs/scaffold/typescript.md`.
  */
 
-import { ContextError, mapBridgeError } from "./errors.js";
-import type { Identity } from "./identity.js";
-import type { BridgeContextHandle } from "./internal/bridge.js";
-import { getBridge } from "./internal/bridge.js";
+import { ContextError, mapBridgeError } from "./errors";
+import type { Identity } from "./identity";
+import type { BridgeContextHandle } from "./internal/bridge";
+import { getBridge } from "./internal/bridge";
 import type {
   BroadcastAdmissionPolicy,
   ContextParams,
@@ -23,7 +23,7 @@ import type {
   Message,
   ToolDefinition,
   ToolVerificationResult,
-} from "./types.js";
+} from "./types";
 
 // ---------------------------------------------------------------------------
 // Context
