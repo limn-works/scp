@@ -57,8 +57,44 @@ const YELLOW: &str = "\x1b[33m";
 
 const PORT: u16 = 3000;
 const CTX_ID: &str = "scp-chat";
-const PASSPHRASE: &str = "scp-chat-dev";
 const MAX_HISTORY: usize = 200;
+const SALT_FILE_NAME: &str = ".passphrase_salt";
+
+/// Derives a passphrase for `FileKeyCustody` from machine-specific entropy.
+///
+/// Priority:
+/// 1. `SCP_CHAT_PASSPHRASE` environment variable (if set).
+/// 2. SHA-256 of the canonical data-directory path concatenated with a random
+///    salt stored in `<data_dir>/.passphrase_salt`. The salt is generated once
+///    on first run and persisted alongside the identity.
+fn derive_passphrase(data_dir: &std::path::Path) -> String {
+    // Allow explicit override via environment variable.
+    if let Ok(val) = std::env::var("SCP_CHAT_PASSPHRASE") {
+        if !val.is_empty() {
+            return val;
+        }
+    }
+
+    let salt_path = data_dir.join(SALT_FILE_NAME);
+    let salt = if salt_path.exists() {
+        std::fs::read(&salt_path).expect("failed to read passphrase salt file")
+    } else {
+        use rand::RngCore;
+        let mut salt = vec![0u8; 32];
+        rand::thread_rng().fill_bytes(&mut salt);
+        std::fs::write(&salt_path, &salt).expect("failed to write passphrase salt file");
+        salt
+    };
+
+    // Derive: SHA-256(canonical_path || salt).
+    let canonical = data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| data_dir.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    hasher.update(&salt);
+    hex::encode(hasher.finalize())
+}
 
 /// Storage key for app-level member metadata (name, `client_id`, credentials).
 /// Protocol-level membership (DIDs, roles) is managed by `ContextManager`.
@@ -558,9 +594,10 @@ async fn main() {
     // storage. Key handles index into the FileKeyCustody keyring which is
     // persisted in keys.enc. On first run, create a new identity and persist it.
     let keys_path = dir.join("keys.enc");
+    let passphrase = derive_passphrase(&dir);
 
     let custody = Arc::new(
-        FileKeyCustody::new(&keys_path, PASSPHRASE)
+        FileKeyCustody::new(&keys_path, &passphrase)
             .expect("failed to open/create key file (wrong passphrase?)"),
     );
 
