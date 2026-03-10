@@ -1070,11 +1070,33 @@ pub fn identity_load(did: String) -> Promise {
             .into());
         }
 
+        // Check the registry for existing identity state (agent key, custody type).
+        let (custody_type, has_agent_key, agent_pub_multibase) = IDENTITY_REGISTRY.with(|reg| {
+            let map = reg.borrow();
+            map.get(&did).map_or_else(
+                || ("js_custody".to_owned(), false, None),
+                |entry| {
+                    let has_agent = entry.agent_signing_key_bytes.is_some();
+                    let agent_pub = if has_agent {
+                        // Derive public key from agent signing key for the multibase field.
+                        entry.agent_signing_key_bytes.as_ref().map(|sk_bytes| {
+                            let sk = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
+                            let pk = ed25519_dalek::VerifyingKey::from(&sk);
+                            format!("z{}", zbase32_encode(&pk.to_bytes()))
+                        })
+                    } else {
+                        None
+                    };
+                    (entry.custody_type.clone(), has_agent, agent_pub)
+                },
+            )
+        });
+
         Ok(JsValue::from(WasmIdentity {
             did,
-            custody_type: "js_custody".to_owned(),
-            has_agent_key: false,
-            agent_public_key_multibase: None,
+            custody_type,
+            has_agent_key,
+            agent_public_key_multibase: agent_pub_multibase,
         }))
     })
 }

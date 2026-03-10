@@ -26,7 +26,7 @@
 //! See ADR-034 in `.docs/adrs/phase-4.md` for the full rationale.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use sha2::{Digest, Sha256};
 
@@ -282,7 +282,8 @@ struct PerContextState {
     /// Members indexed by DID.
     members: HashMap<String, MemberEntry>,
     /// Receive buffer for events. Capped at [`WASM_EVENT_BUFFER_CAP`] (FIFO overflow).
-    event_buffer: Vec<WasmContextEvent>,
+    /// Uses `VecDeque` for O(1) `pop_front` instead of `Vec::remove(0)` O(n) shift.
+    event_buffer: VecDeque<WasmContextEvent>,
     /// Executed proposal IDs with insertion timestamps (replay protection).
     /// Evicts entries older than [`WASM_PROPOSAL_TTL_MS`] when exceeding [`WASM_PROPOSAL_CAP`].
     executed_proposals: HashMap<String, f64>,
@@ -357,9 +358,9 @@ impl PerContextState {
     /// Pushes an event to the receive buffer, evicting the oldest if at capacity.
     fn push_event(&mut self, event: WasmContextEvent) {
         if self.event_buffer.len() >= WASM_EVENT_BUFFER_CAP {
-            self.event_buffer.remove(0);
+            self.event_buffer.pop_front();
         }
-        self.event_buffer.push(event);
+        self.event_buffer.push_back(event);
     }
 
     /// Returns `true` if the member has the given capability string.
@@ -582,7 +583,7 @@ impl WasmContextManager {
             revoked_tokens: HashSet::new(),
             seen_nonces: HashMap::new(),
             members,
-            event_buffer: Vec::new(),
+            event_buffer: VecDeque::new(),
             executed_proposals: HashMap::new(),
             write_revoked_members: HashSet::new(),
             read_revoked_members: HashSet::new(),
@@ -805,7 +806,7 @@ impl WasmContextManager {
     pub fn drain_events(&mut self, context_id: &str) -> Vec<WasmContextEvent> {
         self.contexts
             .get_mut(context_id)
-            .map(|ctx| std::mem::take(&mut ctx.event_buffer))
+            .map(|ctx| std::mem::take(&mut ctx.event_buffer).into())
             .unwrap_or_default()
     }
 
@@ -1340,16 +1341,14 @@ impl WasmContextManager {
     /// # Errors
     ///
     /// Returns an error if the context is not found.
-    #[allow(clippy::type_complexity)]
     pub fn ucan_context_state(
         &self,
         context_id: &str,
-    ) -> Result<(HashSet<String>, String, HashSet<String>, HashSet<String>), ScpWasmError> {
+    ) -> Result<(HashSet<String>, String, HashSet<String>), ScpWasmError> {
         let ctx = self.require_context(context_id)?;
         Ok((
             ctx.ceiling_strings.clone(),
             ctx.creator_did.clone(),
-            ctx.seen_nonces.keys().cloned().collect(),
             ctx.revoked_tokens.clone(),
         ))
     }
@@ -1687,8 +1686,7 @@ impl WasmContextManager {
                     bc.authors.remove(did);
                 }
                 ctx.write_revoked_members.insert(did.clone());
-                ctx.event_buffer
-                    .push(WasmContextEvent::WriteAccessRevoked { did: did.clone() });
+                ctx.push_event(WasmContextEvent::WriteAccessRevoked { did: did.clone() });
                 Ok(serde_json::json!({"action": "WriteAccessRevoked", "did": did, "scope": "Full"}))
             }
             WasmGovernanceAction::RevokeReadAccess { did } => {
@@ -2255,7 +2253,7 @@ impl WasmContextManager {
                 snap.seen_nonces.iter().map(|n| (n.clone(), now)).collect()
             },
             members,
-            event_buffer: Vec::new(),
+            event_buffer: VecDeque::new(),
             executed_proposals: HashMap::new(),
             write_revoked_members: snap.write_revoked_members.iter().cloned().collect(),
             read_revoked_members: snap.read_revoked_members.iter().cloned().collect(),

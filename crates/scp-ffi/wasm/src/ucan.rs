@@ -707,7 +707,7 @@ pub fn ucan_validate(
         };
 
         // Read ceiling, creator_did, and revoked CIDs from WasmContextManager.
-        let (ceiling, creator_did, _seen_nonces, revoked_cids) =
+        let (ceiling, creator_did, revoked_cids) =
             with_manager(|mgr| mgr.ucan_context_state(&context_id)).map_err(|e| {
                 ScpWasmError::Permission {
                     message: e.to_string(),
@@ -1000,7 +1000,7 @@ pub fn validate_tool_ucan_wasm(
     let required_capability = format!("scp:ctx:{context_id}/tool_invoke:{tool_id}");
 
     // Read ceiling, creator_did, and revoked CIDs from WasmContextManager.
-    let (ceiling, creator_did, _seen_nonces, revoked_cids) =
+    let (ceiling, creator_did, revoked_cids) =
         with_manager(|mgr| mgr.ucan_context_state(context_id))
             .map_err(|e| format!("failed to get UCAN context state: {e}"))?;
 
