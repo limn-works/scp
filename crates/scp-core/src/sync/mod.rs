@@ -43,6 +43,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::crypto::canonical::{CanonicalField, canonical_hash};
 use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
@@ -242,6 +243,9 @@ pub fn classify_offline_duration(last_relay_contact: u64, now: u64) -> OfflineTi
 // ConsistencyCheckpoint (§9.9.3)
 // ---------------------------------------------------------------------------
 
+/// Domain separator for `ConsistencyCheckpoint` canonical hash (§9.18.2, §23.16.1).
+pub const CONSISTENCY_CHECKPOINT_DOMAIN_SEPARATOR: &str = "SCP-CHECKPOINT-V1:";
+
 /// A signed consistency checkpoint used by the Relay Consistency Protocol.
 ///
 /// At regular intervals (recommended: every 50 events or every 10 minutes,
@@ -269,6 +273,35 @@ pub struct ConsistencyCheckpoint {
     /// `#active` or `#agent` verification method key (ADR-039).
     #[serde(with = "serde_bytes")]
     pub signature: Ed25519Signature,
+}
+
+impl ConsistencyCheckpoint {
+    /// Computes the canonical hash for signing/verification (§23.16.1).
+    ///
+    /// Field order matches `scp-event-log` `compute_checkpoint_canonical_hash`:
+    /// `context_id`, `sender_did`, `event_count`, `merkle_root`, `epoch` (with
+    /// presence flag), `timestamp`.
+    /// Domain separator: `"SCP-CHECKPOINT-V1:"`.
+    #[must_use]
+    pub fn canonical_hash(&self) -> [u8; 32] {
+        let mut fields: Vec<CanonicalField<'_>> = Vec::with_capacity(8);
+        fields.push(CanonicalField::VarBytes(self.context_id.as_bytes()));
+        fields.push(CanonicalField::VarBytes(self.sender_did.as_bytes()));
+        fields.push(CanonicalField::U64(self.event_count));
+        fields.push(CanonicalField::Fixed32(&self.merkle_root));
+        match self.epoch {
+            Some(epoch) => {
+                fields.push(CanonicalField::U8(0x01));
+                fields.push(CanonicalField::U64(epoch));
+            }
+            None => {
+                fields.push(CanonicalField::U8(0x00));
+            }
+        }
+        fields.push(CanonicalField::U64(self.timestamp));
+
+        canonical_hash(CONSISTENCY_CHECKPOINT_DOMAIN_SEPARATOR, &fields)
+    }
 }
 
 // ---------------------------------------------------------------------------

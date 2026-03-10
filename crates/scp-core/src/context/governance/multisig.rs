@@ -236,8 +236,8 @@ impl GovernanceEngine for ThresholdEngine {
             ));
         }
 
-        // Serialize action for ID computation.
-        let action_bytes = serde_json::to_vec(&action)
+        // Serialize action for ID computation (MessagePack per §9.5.2).
+        let action_bytes = rmp_serde::to_vec_named(&action)
             .map_err(|e| GovernanceError::SerializationFailed(e.to_string()))?;
 
         let proposal_id =

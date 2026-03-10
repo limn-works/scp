@@ -189,7 +189,7 @@ Input:
   context_id:       "sync-test-context"
   member_did:       "did:dht:z6MkSync"
   last_known_epoch: 42
-  reason:           "offline" (ResetReason::Offline → Display string)
+  reason:           "extended offline (8 days)" (ResetReason::ExtendedOffline { offline_duration_secs: 691200 } → Display string)
   nonce:            0x0102030405060708091011121314151617 (16 bytes)
   timestamp:        1700000000
 
@@ -198,13 +198,13 @@ Canonical hash input (per §23.5.2, field order from code):
   || BE32(17) || "sync-test-context"           (4 + 17 = 21 bytes)
   || BE32(16) || "did:dht:z6MkSync"           (4 + 16 = 20 bytes)
   || BE64(42)                                  (8 bytes — last_known_epoch)
-  || BE32(7)  || "offline"                     (4 + 7 = 11 bytes — reason)
+  || BE32(25) || "extended offline (8 days)"   (4 + 25 = 29 bytes — reason)
   || nonce                                     (16 bytes, fixed-length, no length prefix)
   || BE64(1700000000)                          (8 bytes)
 
-Total: 21 + 21 + 20 + 8 + 11 + 16 + 8 = 105 bytes
+Total: 21 + 21 + 20 + 8 + 29 + 16 + 8 = 123 bytes
 
-Expected: SHA-256 of 105 bytes. Sign with Ed25519.
+Expected: SHA-256 of 123 bytes. Sign with Ed25519.
 ```
 
 ## 25.7 Envelope Padding Vectors (§9.10)
