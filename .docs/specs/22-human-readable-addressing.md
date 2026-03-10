@@ -837,7 +837,9 @@ These types are the tool call schemas for the standard discovery context tools d
 | `token` | `Vec<u8>` (serde_bytes) | Yes | Platform-specific device token. |
 | `contexts` | `Vec<String>` | Yes | Context IDs to receive notifications for. |
 | `timestamp` | `u64` | Yes | Unix timestamp (seconds). |
-| `signature` | `Vec<u8>` (64 bytes) | Yes | Ed25519 signature over: `did \|\| platform_tag(1 byte) \|\| token \|\| contexts \|\| timestamp`. |
+| `signature` | `Vec<u8>` (64 bytes) | Yes | Ed25519 signature — see construction below. |
+
+**Signature construction.** Per §9.5.1 canonical signed structure format, the signed bytes are the concatenation: `"SCP-PUSH-REGISTER-V1:" || BE32(len(did_bytes)) || did_bytes || platform_tag (1 byte) || BE32(len(token_bytes)) || token_bytes || contexts_encoded || timestamp (8-byte BE u64)`, where `contexts_encoded` is each context ID string prefixed by its 4-byte big-endian length. All variable-length fields use `BE32(len())` prefixes to prevent boundary-shift collisions (§9.5.1). Registrations are idempotent; re-registering with the same token replaces the previous registration for the same DID + platform combination.
 
 **`PushDeregistration`** — Removes push notification registration.
 
@@ -846,7 +848,9 @@ These types are the tool call schemas for the standard discovery context tools d
 | `did` | `String` (DID) | Yes | Registrant's DID. |
 | `platform` | `PushPlatform` | Yes | Platform to deregister from. |
 | `timestamp` | `u64` | Yes | Unix timestamp (seconds). |
-| `signature` | `Vec<u8>` (64 bytes) | Yes | Ed25519 signature over: `did \|\| platform_tag(1 byte) \|\| timestamp`. |
+| `signature` | `Vec<u8>` (64 bytes) | Yes | Ed25519 signature — see construction below. |
+
+**Signature construction.** Per §9.5.1 canonical signed structure format, the signed bytes are the concatenation: `"SCP-PUSH-DEREGISTER-V1:" || BE32(len(did_bytes)) || did_bytes || platform_tag (1 byte) || timestamp (8-byte BE u64)`. All variable-length fields use `BE32(len())` prefixes to prevent boundary-shift collisions (§9.5.1). The domain separator prevents replay of registration signatures as deregistrations and vice versa.
 
 ### 22.11.5 Petname Events (Identity Private State)
 

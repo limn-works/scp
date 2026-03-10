@@ -36,9 +36,12 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use sha2::{Digest, Sha256};
+
 use super::{
     ContextId, Ed25519Signature, EquivocationAlert, SyncError, SyncEvent, SyncOutcome, SyncPolicy,
 };
+use crate::crypto::canonical::{CanonicalField, canonical_hash};
 use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
@@ -53,6 +56,9 @@ use scp_identity::DID;
 ///
 /// For policy-aware code, use [`SyncPolicy::max_sequential_commits`] instead.
 pub const MAX_EPOCH_GAP_FOR_SEQUENTIAL: u64 = super::MAX_SEQUENTIAL_COMMITS;
+
+/// Domain separator for `ContextSnapshot` canonical hash (§9.18.2, §23.16.4).
+pub const CONTEXT_SNAPSHOT_DOMAIN_SEPARATOR: &str = "SCP-CONTEXT-SNAPSHOT-V1:";
 
 /// Default snapshot interval in seconds (4 hours).
 ///
@@ -133,6 +139,110 @@ pub struct ContextSnapshot {
 
     /// Snapshot sequence number. Monotonically increasing per context.
     pub sequence: u64,
+}
+
+impl ContextSnapshot {
+    /// Computes the canonical hash for signing/verification (§23.16.4).
+    ///
+    /// Field order per §23.16.4: `context_id`, `timestamp`, `mls_epoch` (with
+    /// presence flag), `event_log_merkle_root`, `event_count`, `members_hash`,
+    /// `role_definitions_hash`, `params_hash`, `tool_names_hash`, `creator_did`,
+    /// `sequence`.
+    ///
+    /// Composite fields (`members`, `role_definitions`, `tool_names`) are first
+    /// hashed deterministically, then included as `Fixed32` fields.
+    /// Domain separator: `"SCP-CONTEXT-SNAPSHOT-V1:"`.
+    #[must_use]
+    pub fn canonical_hash(&self) -> [u8; 32] {
+        let members_hash = self.hash_members();
+        let role_defs_hash = self.hash_role_definitions();
+        let tool_names_hash = self.hash_tool_names();
+
+        let mut fields: Vec<CanonicalField<'_>> = Vec::with_capacity(12);
+        fields.push(CanonicalField::VarBytes(self.context_id.as_bytes()));
+        fields.push(CanonicalField::U64(self.timestamp));
+        // mls_epoch uses presence flag: 0x01 + epoch_BE or 0x00.
+        match self.mls_epoch {
+            Some(epoch) => {
+                fields.push(CanonicalField::U8(0x01));
+                fields.push(CanonicalField::U64(epoch));
+            }
+            None => {
+                fields.push(CanonicalField::U8(0x00));
+            }
+        }
+        fields.push(CanonicalField::Fixed32(&self.event_log_merkle_root));
+        fields.push(CanonicalField::U64(self.event_count));
+        fields.push(CanonicalField::Fixed32(&members_hash));
+        fields.push(CanonicalField::Fixed32(&role_defs_hash));
+        fields.push(CanonicalField::Fixed32(&self.params_hash));
+        fields.push(CanonicalField::Fixed32(&tool_names_hash));
+        fields.push(CanonicalField::VarBytes(self.creator_did.as_bytes()));
+        fields.push(CanonicalField::U64(self.sequence));
+
+        canonical_hash(CONTEXT_SNAPSHOT_DOMAIN_SEPARATOR, &fields)
+    }
+
+    /// Deterministic hash of the members `BTreeMap`.
+    ///
+    /// For each `(did, entry)` in key order:
+    /// `BE32(len(did)) || did || BE32(len(role_name)) || role_name || sequence_number (8-byte BE u64)`
+    fn hash_members(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        for (did, entry) in &self.members {
+            #[allow(clippy::cast_possible_truncation)]
+            let did_len = did.len() as u32;
+            hasher.update(did_len.to_be_bytes());
+            hasher.update(did.as_bytes());
+            #[allow(clippy::cast_possible_truncation)]
+            let role_len = entry.role_name.len() as u32;
+            hasher.update(role_len.to_be_bytes());
+            hasher.update(entry.role_name.as_bytes());
+            hasher.update(entry.sequence_number.to_be_bytes());
+        }
+        hasher.finalize().into()
+    }
+
+    /// Deterministic hash of `role_definitions` `BTreeMap`.
+    ///
+    /// For each `(role, caps)` in key order:
+    /// `BE32(len(role)) || role || BE32(count) || [BE32(len(cap)) || cap ...]`
+    fn hash_role_definitions(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        for (role, caps) in &self.role_definitions {
+            #[allow(clippy::cast_possible_truncation)]
+            let role_len = role.len() as u32;
+            hasher.update(role_len.to_be_bytes());
+            hasher.update(role.as_bytes());
+            #[allow(clippy::cast_possible_truncation)]
+            let count = caps.len() as u32;
+            hasher.update(count.to_be_bytes());
+            for cap in caps {
+                #[allow(clippy::cast_possible_truncation)]
+                let cap_len = cap.len() as u32;
+                hasher.update(cap_len.to_be_bytes());
+                hasher.update(cap.as_bytes());
+            }
+        }
+        hasher.finalize().into()
+    }
+
+    /// Deterministic hash of `tool_names` array.
+    ///
+    /// `BE32(count) || [BE32(len(name)) || name ...]`
+    fn hash_tool_names(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        #[allow(clippy::cast_possible_truncation)]
+        let count = self.tool_names.len() as u32;
+        hasher.update(count.to_be_bytes());
+        for name in &self.tool_names {
+            #[allow(clippy::cast_possible_truncation)]
+            let name_len = name.len() as u32;
+            hasher.update(name_len.to_be_bytes());
+            hasher.update(name.as_bytes());
+        }
+        hasher.finalize().into()
+    }
 }
 
 // ---------------------------------------------------------------------------
