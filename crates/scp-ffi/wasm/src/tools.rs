@@ -217,11 +217,17 @@ pub fn tool_invoke(
 
         // WASM operates in echo mode — no external handler dispatch.
         // Returns a validated-status result.
+        let parsed_input: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("input_json is not valid JSON: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            }
+            .into_js()
+        })?;
         let result = serde_json::json!({
             "status": "validated",
             "tool_id": tool_id,
-            "input": serde_json::from_str::<serde_json::Value>(&input_json)
-                .unwrap_or(serde_json::Value::String(input_json)),
+            "input": parsed_input,
         });
 
         let json_str = serde_json::to_string(&result).map_err(|e| {
@@ -250,7 +256,13 @@ pub fn tool_verify(context: &WasmContextHandle, tool_id: String) -> Promise {
         let (passed, failures) = with_manager(|mgr| mgr.verify_tool(&context_id, &tool_id))
             .map_err(ScpWasmError::into_js)?;
 
-        let failures_json = serde_json::to_string(&failures).unwrap_or_else(|_| "[]".to_owned());
+        let failures_json = serde_json::to_string(&failures).map_err(|e| {
+            ScpWasmError::Tool {
+                message: format!("failed to serialize verification failures: {e}"),
+                code: "SCP-TOOL-6003".to_owned(),
+            }
+            .into_js()
+        })?;
 
         Ok(JsValue::from(WasmToolVerificationResult {
             tool_id,

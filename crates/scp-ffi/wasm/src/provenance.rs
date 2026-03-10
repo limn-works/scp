@@ -320,7 +320,11 @@ pub fn provenance_attach(
         let new_depth = prev_depth.saturating_add(1);
 
         let mut path: Vec<String> =
-            serde_json::from_str(&existing_chain_path_json).unwrap_or_default();
+            serde_json::from_str(&existing_chain_path_json).map_err(|e| {
+                JsError::new(&format!(
+                    "[SCP-VALID-7215] existing_chain_path_json is not valid JSON: {e}"
+                ))
+            })?;
         path.push(source_context_id.clone());
 
         (new_depth, serde_json::json!(path))
