@@ -25,8 +25,10 @@ fn main() {
             let libdir = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !libdir.is_empty() {
                 println!("cargo:rustc-link-search=native={libdir}");
-                // Also set DYLD_LIBRARY_PATH for test binaries at runtime.
-                println!("cargo:rustc-env=DYLD_LIBRARY_PATH={libdir}");
+                // Note: DYLD_LIBRARY_PATH must still be set externally for
+                // test binary execution. cargo:rustc-env only makes the
+                // value available via env!() at compile time, not as a
+                // process environment variable at runtime.
             }
         }
     }
