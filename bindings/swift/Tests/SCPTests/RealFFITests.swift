@@ -422,52 +422,52 @@ struct RealFFITests {
     func ffiBridgeEvaluateTrustNativeNative() throws {
         try requireFFI()
 
-        // Not bridged + native transport = native-native (tier 0)
+        // Not bridged + native transport = native-native (tier 3, strongest)
         let tier = try evaluateBridgeTrust(
             isBridged: false,
             isNativeTransport: true,
             shadowStatus: "shadow"
         )
-        #expect(tier == 0)
+        #expect(tier == 3)
     }
 
     @Test("FFI: bridgeEvaluateTrust shadow-bridged lowest trust")
     func ffiBridgeEvaluateTrustShadowBridged() throws {
         try requireFFI()
 
-        // Bridged + not native transport + shadow = shadow-bridged (tier 3)
+        // Bridged + not native transport + shadow = shadow-bridged (tier 0, weakest)
         let tier = try evaluateBridgeTrust(
             isBridged: true,
             isNativeTransport: false,
             shadowStatus: "shadow"
         )
-        #expect(tier == 3)
+        #expect(tier == 0)
     }
 
     @Test("FFI: bridgeEvaluateTrust claimed-bridged")
     func ffiBridgeEvaluateTrustClaimedBridged() throws {
         try requireFFI()
 
-        // Bridged + not native transport + claimed = claimed-bridged (tier 2)
+        // Bridged + not native transport + claimed = claimed-bridged (tier 1)
         let tier = try evaluateBridgeTrust(
             isBridged: true,
             isNativeTransport: false,
             shadowStatus: "claimed"
         )
-        #expect(tier == 2)
+        #expect(tier == 1)
     }
 
     @Test("FFI: bridgeEvaluateTrust native-bridged")
     func ffiBridgeEvaluateTrustNativeBridged() throws {
         try requireFFI()
 
-        // Bridged + native transport = native-bridged (tier 1)
+        // Bridged + native transport = native-bridged (tier 2)
         let tier = try evaluateBridgeTrust(
             isBridged: true,
             isNativeTransport: true,
             shadowStatus: "shadow"
         )
-        #expect(tier == 1)
+        #expect(tier == 2)
     }
 
     @Test("FFI: bridgeEvaluateTrust typed ShadowStatus overload")
@@ -479,7 +479,7 @@ struct RealFFITests {
             isNativeTransport: false,
             shadowStatus: ShadowStatus.claimed
         )
-        #expect(tier == 2)
+        #expect(tier == 1)
     }
 
     @Test("FFI: bridgeEvaluateTrust trust tiers are monotonically ordered")
@@ -499,10 +499,10 @@ struct RealFFITests {
             isBridged: true, isNativeTransport: false, shadowStatus: "shadow"
         )
 
-        // Tiers should be 0 <= 1 <= 2 <= 3
-        #expect(nativeNative <= nativeBridged)
-        #expect(nativeBridged <= claimedBridged)
-        #expect(claimedBridged <= shadowBridged)
+        // Tiers: ShadowBridged(0) <= ClaimedBridged(1) <= NativeBridged(2) <= NativeNative(3)
+        #expect(shadowBridged <= claimedBridged)
+        #expect(claimedBridged <= nativeBridged)
+        #expect(nativeBridged <= nativeNative)
     }
 
     // =========================================================================
