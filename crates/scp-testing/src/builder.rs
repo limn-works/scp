@@ -85,8 +85,7 @@ impl ScenarioBuilder {
     }
 
     /// Sets the simulated clock start time in seconds.
-    #[must_use]
-    pub const fn clock_start(mut self, secs: u64) -> Self {
+    pub const fn clock_start(&mut self, secs: u64) -> &mut Self {
         self.clock_start_secs = secs;
         self
     }
