@@ -295,6 +295,7 @@ struct UcanTests {
 
         #expect(revoked)
     }
+
     // MARK: - Delegate via injectable bridge (async roundtrip)
 
     @Test("delegateUcanToken calls bridge and returns delegated token")

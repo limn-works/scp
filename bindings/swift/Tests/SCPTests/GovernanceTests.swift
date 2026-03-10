@@ -830,7 +830,7 @@ struct GovernanceTests {
         let context = makeActiveContext()
 
         let mockMemberCount: MembershipBridge.MemberCountFn = { _ in
-            throw ScpError.Context(message: "Internal error", code: "SCP-CTX-9999")
+            throw ScpError.Context(message: "Internal error", code: "SCP-CTX-2099")
         }
 
         do {
@@ -838,7 +838,7 @@ struct GovernanceTests {
             Issue.record("Expected bridge error to propagate")
         } catch let error as ScpError {
             if case let .Context(_, code) = error {
-                #expect(code == "SCP-CTX-9999")
+                #expect(code == "SCP-CTX-2099")
             } else {
                 Issue.record("Expected ScpError.Context, got \(error)")
             }

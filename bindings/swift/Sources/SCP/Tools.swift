@@ -223,7 +223,7 @@ public extension Context {
         guard let inputJson = String(data: input, encoding: .utf8) else {
             throw ScpError.Tool(
                 message: "Tool input is not valid UTF-8",
-                code: "SCP-TOOL-3001"
+                code: "SCP-TOOL-6001"
             )
         }
         let outputJson = try await invokeFn(contextHandle, tool, inputJson, identity)
@@ -357,7 +357,7 @@ public extension Context {
         guard let inputJson = String(data: input, encoding: .utf8) else {
             throw ScpError.Tool(
                 message: "Tool input is not valid UTF-8",
-                code: "SCP-TOOL-3001"
+                code: "SCP-TOOL-6001"
             )
         }
         let outputJson = try await invokeCrossContextFn(
@@ -454,7 +454,7 @@ public extension Context {
         guard let inputJson = String(data: input, encoding: .utf8) else {
             throw ScpError.Tool(
                 message: "Tool input is not valid UTF-8",
-                code: "SCP-TOOL-3001"
+                code: "SCP-TOOL-6001"
             )
         }
         let outputJson = try await sessionInvokeFn(

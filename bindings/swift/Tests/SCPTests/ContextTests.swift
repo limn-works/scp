@@ -549,6 +549,7 @@ struct ContextTests {
         let result = await task.value
         #expect(result == .active)
     }
+
     // MARK: - Join context tests
 
     @Test("joinContext calls bridge with handle and identity")

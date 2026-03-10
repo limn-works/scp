@@ -260,7 +260,7 @@ struct EventLogTests {
     // MARK: - Verify proof (pure function, no bridge)
 
     @Test("EventLog verifyInclusion returns proof.verified")
-    func verifyInclusionReturnsVerified() async throws {
+    func verifyInclusionReturnsVerified() {
         let validProof = Proof(verified: true, proofType: "inclusion", detailsJson: "{}")
         let invalidProof = Proof(verified: false, proofType: "inclusion", detailsJson: "{}")
 
@@ -270,6 +270,7 @@ struct EventLogTests {
         #expect(validResult == true)
         #expect(invalidResult == false)
     }
+
     // MARK: - Checkpoint generation via injectable bridge (async roundtrip)
 
     @Test("generateEventLogCheckpoint calls bridge and returns checkpoint")
