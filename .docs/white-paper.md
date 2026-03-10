@@ -9,9 +9,16 @@ March 2026 — Preprint v0.1
 
 ## Abstract
 
-As software generation becomes trivial — frontier language models producing applications from prompts, agent frameworks composing workflows from modular tools — the bottleneck shifts from building software to connecting it. Identity, trust, and relationships remain siloed inside each application, and every independently generated application is an island.
+Software authorship is shifting to agents. Companies, engineers, and hobbyists are generating more code, with more speed and success, than ever before — and as the cost of producing software continues to fall, we are entering an age of personal, ephemeral software: generated on the fly, disposed of, replaced, or modified at a moment's notice. Without connective tissue, each application's identity, data, and interactions remain siloed; every client an island.
 
-This paper presents the Shared Context Protocol (SCP), an open protocol providing cryptographic identity (DID [10]), governed interaction spaces (contexts), end-to-end encryption as access control (MLS [2]), capability-based authorization (UCAN [12]), and verifiable provenance. All interaction occurs within contexts — bounded, encrypted, governed spaces where membership is enforced by cryptography. The protocol is designed for a world where autonomous agents are the primary actors: every agent traces to a human identity through cryptographic binding, agents are isolated per context at the protocol level, and behavioral records replace reputation scores as the primary trust input.
+Today's infrastructure has two fundamental shortcomings:
+
+1. It is not designed for agents — neither as users nor as builders.
+2. It is proprietary and monetized — neither simple nor open enough for universal adoption.
+
+The first must be addressed directly. The second may resolve itself incidentally: agents reduce the cost of managing complexity, eroding the value proposition of services that charge for it — provided agents have the right tools.
+
+This paper presents the Shared Context Protocol (SCP), an open protocol for an agentic Internet. SCP provides cryptographic identity (DID [10]), governed interaction spaces (contexts), end-to-end encryption as access control (MLS [2]), capability-based authorization (UCAN [12]), and verifiable provenance. All interaction occurs within contexts — bounded, encrypted, governed spaces where membership is enforced by cryptography. The protocol is designed for a world where autonomous agents are the primary actors: every agent traces to a human identity through cryptographic binding, agents are isolated per context at the protocol level, and behavioral records replace reputation scores as the primary trust input.
 
 Key properties: no operator dependency (the protocol functions if its creators disappear), transport independence (17 adapter specifications across 3 tiers), human accountability for all autonomous agents, and context isolation as the security boundary. The protocol is designed to be complementary to existing platforms and tool-level protocols — bridge connectors, transport adapters, and identity attestations enable harmonious interoperation with established distribution networks. The reference implementation is in Rust with bindings for Python, Swift, Kotlin, TypeScript, and WebAssembly. The specification is published under CC-BY 4.0; the SDK is published under Apache 2.0.
 
