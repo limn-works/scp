@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from scp_sdk.errors import IdentityError
 from scp_sdk.sync import run_sync
 from scp_sdk.types import CustodyType
 
@@ -308,10 +309,16 @@ class Identity:
             The attestation token as a base64-encoded string.
 
         Raises:
-            scp_sdk.IdentityError: If attestation generation fails.
+            scp_sdk.IdentityError: If attestation generation fails or the
+                ``allow_in_memory_custody`` feature is not compiled in.
         """
         import _scp_core
 
+        if not hasattr(_scp_core, "py_identity_attest_device"):
+            raise IdentityError(
+                "Device attestation requires the 'allow_in_memory_custody' feature",
+                "SCP-IDENT-1050",
+            )
         return _scp_core.py_identity_attest_device(self.did)
 
     async def verify_device_attestation(self, token_base64: str) -> bool:
@@ -324,10 +331,16 @@ class Identity:
             ``True`` if the token is valid, ``False`` otherwise.
 
         Raises:
-            scp_sdk.IdentityError: If verification fails.
+            scp_sdk.IdentityError: If verification fails or the
+                ``allow_in_memory_custody`` feature is not compiled in.
         """
         import _scp_core
 
+        if not hasattr(_scp_core, "py_identity_verify_device_attestation"):
+            raise IdentityError(
+                "Device attestation verification requires the 'allow_in_memory_custody' feature",
+                "SCP-IDENT-1051",
+            )
         return _scp_core.py_identity_verify_device_attestation(self.did, token_base64)
 
     async def rotate_key(self) -> Identity:
