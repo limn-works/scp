@@ -67,6 +67,9 @@ const SALT_FILE_NAME: &str = ".passphrase_salt";
 const MAX_NAME_LEN: usize = 64;
 /// Maximum length for message text (bytes).
 const MAX_TEXT_LEN: usize = 4096;
+/// Maximum number of members allowed in the chat room. Each join creates a
+/// new DID (CPU-intensive crypto), so this caps resource consumption.
+const MAX_MEMBERS: usize = 50;
 
 /// Derives a passphrase for `FileKeyCustody` from machine-specific entropy.
 ///
@@ -925,6 +928,20 @@ async fn handle_join(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": format!("name must be 1-{MAX_NAME_LEN} characters")})),
+        )
+            .into_response();
+    }
+
+    // Enforce member cap before doing any CPU-intensive DID generation.
+    let current_members = room
+        .manager
+        .member_count(&room.context_id)
+        .await
+        .unwrap_or(0);
+    if current_members >= MAX_MEMBERS {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": format!("room is full ({MAX_MEMBERS} members max)")})),
         )
             .into_response();
     }
