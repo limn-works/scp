@@ -342,6 +342,10 @@ const WASM_NONCE_CAP: usize = 10_000;
 /// Nonce TTL in milliseconds (24 hours — UCAN max lifetime per ADR-016 step 11).
 const WASM_NONCE_TTL_MS: f64 = 24.0 * 60.0 * 60.0 * 1000.0;
 
+/// Nonce freshness tolerance: 5 minutes in milliseconds (spec section 9.14).
+/// Matches native `NonceTracker::NONCE_FRESHNESS_TOLERANCE_MS`.
+const WASM_NONCE_FRESHNESS_TOLERANCE_MS: f64 = 5.0 * 60.0 * 1000.0;
+
 /// Maximum number of revoked token CIDs per context.
 const WASM_REVOKED_TOKENS_CAP: usize = 100_000;
 
@@ -1357,15 +1361,59 @@ impl WasmContextManager {
 
     /// Records a nonce as seen (for replay prevention).
     ///
+    /// Performs the same validation as native `NonceTracker::check_and_record`:
+    /// 1. **Format** — nonce must match `{unix_millis}-{32_hex_chars}`.
+    /// 2. **Freshness** — timestamp must be within +/- 5 minutes of now
+    ///    (matching spec section 9.14 clock skew tolerance).
+    /// 3. **Uniqueness** — nonce must not have been seen before.
+    ///
     /// When the nonce map exceeds [`WASM_NONCE_CAP`], evicts entries older than
     /// [`WASM_NONCE_TTL_MS`] (24 hours — UCAN max lifetime per ADR-016 step 11).
     ///
     /// # Errors
     ///
-    /// Returns [`ScpWasmError::Permission`] if the nonce was already seen.
+    /// Returns [`ScpWasmError::Permission`] if format is invalid, nonce is
+    /// stale/future, or was already seen.
     pub fn ucan_record_nonce(&mut self, context_id: &str, nonce: &str) -> Result<(), ScpWasmError> {
-        let ctx = self.require_context_mut(context_id)?;
+        // 1. Validate nonce format: {unix_millis}-{32_hex_chars}
+        let (ts_part, hex_part) = nonce.split_once('-').ok_or_else(|| ScpWasmError::Permission {
+            message: format!("nonce format invalid: missing '-' separator in nonce: {nonce}"),
+            code: "SCP-PERM-3000".to_owned(),
+        })?;
+
+        let nonce_millis: f64 = ts_part.parse().map_err(|_| ScpWasmError::Permission {
+            message: format!("nonce format invalid: non-numeric timestamp in nonce: {ts_part}"),
+            code: "SCP-PERM-3000".to_owned(),
+        })?;
+
+        if hex_part.len() != 32 || !hex_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ScpWasmError::Permission {
+                message: format!(
+                    "nonce format invalid: expected 32 hex chars suffix, got: {hex_part}"
+                ),
+                code: "SCP-PERM-3000".to_owned(),
+            });
+        }
+
+        // 2. Freshness check: timestamp within now +/- 5 minutes.
         let now = crate::time::now_ms();
+
+        if nonce_millis + WASM_NONCE_FRESHNESS_TOLERANCE_MS < now {
+            return Err(ScpWasmError::Permission {
+                message: format!("nonce too old: {nonce}"),
+                code: "SCP-PERM-3000".to_owned(),
+            });
+        }
+
+        if nonce_millis > now + WASM_NONCE_FRESHNESS_TOLERANCE_MS {
+            return Err(ScpWasmError::Permission {
+                message: format!("nonce too far in the future: {nonce}"),
+                code: "SCP-PERM-3000".to_owned(),
+            });
+        }
+
+        // 3. Replay check.
+        let ctx = self.require_context_mut(context_id)?;
 
         if ctx.seen_nonces.contains_key(nonce) {
             return Err(ScpWasmError::Permission {
@@ -2300,6 +2348,12 @@ const WASM_EXPORT_VERSION: u32 = 1;
 ///
 /// Serialized as JSON bytes. The version field enables forward-compatible
 /// deserialization: import rejects exports with version > `WASM_EXPORT_VERSION`.
+///
+/// Integrity protection: `integrity_mac` contains an HMAC-SHA256 tag computed
+/// over the canonical JSON serialization of the `snapshot` field, keyed by an
+/// HKDF-derived key from the context creator's Ed25519 signing key. This
+/// prevents an attacker from crafting import payloads that grant themselves
+/// admin over a context.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct WasmContextExportEnvelope {
     /// Export format version.
@@ -2308,6 +2362,11 @@ struct WasmContextExportEnvelope {
     exported_at: u64,
     /// DID of the identity that performed the export.
     exporter_did: String,
+    /// HMAC-SHA256 tag (hex-encoded) over the canonical JSON serialization of
+    /// the `snapshot` field. Keyed by HKDF(creator_signing_key,
+    /// info="scp-context-export-integrity-v1"). Verified on import to prevent
+    /// tampering with membership, roles, or governance state.
+    integrity_mac: String,
     /// The context state snapshot.
     snapshot: WasmContextExportSnapshot,
 }

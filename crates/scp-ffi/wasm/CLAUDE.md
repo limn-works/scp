@@ -47,7 +47,7 @@ WASM is single-threaded. The context registry uses `thread_local! { static CONTE
 6. Capability match with trailing-slash prefix-collision protection (RED-105)
 7. Attenuation enforcement (child <= parent)
 8. Capability ceiling check
-9. Nonce replay detection (per-context `HashSet<String>`)
+9. Nonce format validation + freshness window + replay detection (matches native `NonceTracker`)
 10. Revocation check (CID in revocation set)
 11. Time bounds (exp, nbf, 24h max lifetime)
 
