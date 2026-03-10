@@ -76,7 +76,9 @@ public enum ToolBridge {
         _ handle: ContextHandle,
         _ toolId: String,
         _ inputJson: String,
-        _ identity: Identity
+        _ identity: Identity,
+        _ ucanToken: String?,
+        _ proofTokens: [String]?
     ) async throws -> String
 
     /// Register a tool. Maps to ``toolRegister`` in ScpBindings.
@@ -98,7 +100,9 @@ public enum ToolBridge {
         _ toolId: String,
         _ inputJson: String,
         _ identity: Identity,
-        _ chainDepth: UInt8
+        _ ucanToken: String,
+        _ chainDepth: UInt8,
+        _ proofTokens: [String]?
     ) async throws -> String
 
     /// Create a stateful tool session (spec section 6.2.1).
@@ -114,7 +118,9 @@ public enum ToolBridge {
         _ handle: ContextHandle,
         _ sessionId: String,
         _ inputJson: String,
-        _ identity: Identity
+        _ identity: Identity,
+        _ ucanToken: String,
+        _ proofTokens: [String]?
     ) async throws -> String
 
     /// Close a stateful tool session.
@@ -124,8 +130,8 @@ public enum ToolBridge {
     ) async throws -> Void
 
     /// Default invoke function that delegates to the UniFFI-generated binding.
-    public static let defaultInvoke: InvokeFn = { handle, toolId, inputJson, identity in
-        try await toolInvoke(handle: handle, toolId: toolId, inputJson: inputJson, identity: identity)
+    public static let defaultInvoke: InvokeFn = { handle, toolId, inputJson, identity, ucanToken, proofTokens in
+        try await toolInvoke(handle: handle, toolId: toolId, inputJson: inputJson, identity: identity, ucanToken: ucanToken, proofTokens: proofTokens)
     }
 
     /// Default register function that delegates to the UniFFI-generated binding.
@@ -139,14 +145,16 @@ public enum ToolBridge {
     }
 
     /// Default cross-context invoke function — delegates to UniFFI.
-    public static let defaultInvokeCrossContext: InvokeCrossContextFn = { sourceHandle, targetHandle, toolId, inputJson, identity, chainDepth in
+    public static let defaultInvokeCrossContext: InvokeCrossContextFn = { sourceHandle, targetHandle, toolId, inputJson, identity, ucanToken, chainDepth, proofTokens in
         try await toolInvokeCrossContext(
             sourceHandle: sourceHandle,
             targetHandle: targetHandle,
             toolId: toolId,
             inputJson: inputJson,
             identity: identity,
-            chainDepth: chainDepth
+            ucanToken: ucanToken,
+            chainDepth: chainDepth,
+            proofTokens: proofTokens
         )
     }
 
@@ -161,12 +169,14 @@ public enum ToolBridge {
     }
 
     /// Default session invoke function — delegates to UniFFI.
-    public static let defaultSessionInvoke: SessionInvokeFn = { handle, sessionId, inputJson, identity in
+    public static let defaultSessionInvoke: SessionInvokeFn = { handle, sessionId, inputJson, identity, ucanToken, proofTokens in
         try await toolSessionInvoke(
             handle: handle,
             sessionId: sessionId,
             inputJson: inputJson,
-            identity: identity
+            identity: identity,
+            ucanToken: ucanToken,
+            proofTokens: proofTokens
         )
     }
 
@@ -206,6 +216,8 @@ public extension Context {
         _ tool: String,
         input: Data,
         identity: Identity,
+        ucanToken: String? = nil,
+        proofTokens: [String]? = nil,
         invokeFn: ToolBridge.InvokeFn = ToolBridge.defaultInvoke
     ) async throws -> ToolInvocationResult {
         guard state == .active else {
@@ -226,7 +238,7 @@ public extension Context {
                 code: "SCP-TOOL-6001"
             )
         }
-        let outputJson = try await invokeFn(contextHandle, tool, inputJson, identity)
+        let outputJson = try await invokeFn(contextHandle, tool, inputJson, identity, ucanToken, proofTokens)
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
             invokerDid: contextHandle.creatorDid(),
@@ -333,7 +345,9 @@ public extension Context {
         input: Data,
         identity: Identity,
         targetContext: Context,
+        ucanToken: String,
         chainDepth: UInt8 = 0,
+        proofTokens: [String]? = nil,
         invokeCrossContextFn: ToolBridge.InvokeCrossContextFn = ToolBridge.defaultInvokeCrossContext
     ) async throws -> ToolInvocationResult {
         guard state == .active else {
@@ -361,7 +375,7 @@ public extension Context {
             )
         }
         let outputJson = try await invokeCrossContextFn(
-            sourceHandle, targetHandle, tool, inputJson, identity, chainDepth
+            sourceHandle, targetHandle, tool, inputJson, identity, ucanToken, chainDepth, proofTokens
         )
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
@@ -437,6 +451,8 @@ public extension Context {
         sessionId: String,
         input: Data,
         identity: Identity,
+        ucanToken: String,
+        proofTokens: [String]? = nil,
         sessionInvokeFn: ToolBridge.SessionInvokeFn = ToolBridge.defaultSessionInvoke
     ) async throws -> ToolInvocationResult {
         guard state == .active else {
@@ -458,7 +474,7 @@ public extension Context {
             )
         }
         let outputJson = try await sessionInvokeFn(
-            contextHandle, sessionId, inputJson, identity
+            contextHandle, sessionId, inputJson, identity, ucanToken, proofTokens
         )
         return ToolInvocationResult(
             output: Data(outputJson.utf8),

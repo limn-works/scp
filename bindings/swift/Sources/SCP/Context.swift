@@ -135,7 +135,7 @@ public actor Context {
     public let contextId: String
 
     /// The current lifecycle state of this context.
-    public private(set) var state: ContextState
+    public internal(set) var state: ContextState
 
     // MARK: - Internal state
 

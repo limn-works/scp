@@ -562,24 +562,25 @@ struct GovernanceTests {
         }
     }
 
-    @Test("broadcastPublish calls bridge with author DID and payload")
+    @Test("broadcastPublish calls bridge with identity and payload")
     func broadcastPublishRoundtrip() async throws {
         let context = makeActiveContext()
 
-        var receivedAuthor: String?
+        var receivedIdentity: Identity?
         var receivedPayload: Data?
-        let mockPublish: BroadcastBridge.PublishFn = { _, author, payload in
-            receivedAuthor = author
+        let mockPublish: BroadcastBridge.PublishFn = { _, identity, payload in
+            receivedIdentity = identity
             receivedPayload = payload
         }
 
         let payload = Data("broadcast message".utf8)
+        let identity = Identity(noPointer: .init())
         try await context.broadcastPublish(
-            authorDid: "did:dht:z6MkAuthor",
+            identity: identity,
             payload: payload,
             publishFn: mockPublish
         )
-        #expect(receivedAuthor == "did:dht:z6MkAuthor")
+        #expect(receivedIdentity != nil)
         #expect(receivedPayload == payload)
     }
 
@@ -589,7 +590,7 @@ struct GovernanceTests {
 
         do {
             try await context.broadcastPublish(
-                authorDid: "did:dht:z6MkAuthor",
+                identity: Identity(noPointer: .init()),
                 payload: Data("msg".utf8)
             )
             Issue.record("Expected broadcastPublish to throw on closed context")
@@ -860,7 +861,7 @@ struct GovernanceTests {
 
         do {
             try await context.broadcastPublish(
-                authorDid: "did:dht:z6MkUnauthorized",
+                identity: Identity(noPointer: .init()),
                 payload: Data("msg".utf8),
                 publishFn: mockPublish
             )
@@ -931,7 +932,8 @@ struct GovernanceTests {
 
         try await context.handleTtlExpiry(handleTtlExpiryFn: mockExpiry)
         #expect(called)
-        #expect(context.state == .expired)
+        let currentState = await context.state
+        #expect(currentState == .expired)
     }
 
     @Test("handleTtlExpiry throws SCP-CTX-2001 when context is closed")

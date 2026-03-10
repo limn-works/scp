@@ -172,7 +172,7 @@ struct ToolsTests {
             closeFn: closeFn
         )
 
-        let mockInvoke: ToolBridge.InvokeFn = { _, toolId, inputJson, _ in
+        let mockInvoke: ToolBridge.InvokeFn = { _, toolId, inputJson, _, _, _ in
             #expect(toolId == "calculator")
             #expect(inputJson == "{}")
             return #"{"result": 42}"#
@@ -372,7 +372,7 @@ struct ToolsTests {
         )
 
         var receivedChainDepth: UInt8?
-        let mockInvokeCrossContext: ToolBridge.InvokeCrossContextFn = { _, _, toolId, inputJson, _, chainDepth in
+        let mockInvokeCrossContext: ToolBridge.InvokeCrossContextFn = { _, _, toolId, inputJson, _, _, chainDepth, _ in
             #expect(toolId == "remote-calc")
             #expect(inputJson == "{\"x\":1}")
             receivedChainDepth = chainDepth
@@ -384,6 +384,7 @@ struct ToolsTests {
             input: Data("{\"x\":1}".utf8),
             identity: Identity(noPointer: .init()),
             targetContext: targetContext,
+            ucanToken: "test-ucan-token",
             chainDepth: 1,
             invokeCrossContextFn: mockInvokeCrossContext
         )
@@ -403,7 +404,8 @@ struct ToolsTests {
                 "tool",
                 input: Data("{}".utf8),
                 identity: Identity(noPointer: .init()),
-                targetContext: targetContext
+                targetContext: targetContext,
+                ucanToken: "test-token"
             )
             Issue.record("Expected error for closed source context")
         } catch let error as ScpError {
@@ -472,7 +474,7 @@ struct ToolsTests {
         )
 
         var receivedSessionId: String?
-        let mockSessionInvoke: ToolBridge.SessionInvokeFn = { _, sessionId, inputJson, _ in
+        let mockSessionInvoke: ToolBridge.SessionInvokeFn = { _, sessionId, inputJson, _, _, _ in
             receivedSessionId = sessionId
             #expect(inputJson == "{\"op\":\"add\"}")
             return #"{"sum": 5}"#
@@ -482,6 +484,7 @@ struct ToolsTests {
             sessionId: "session-abc-123",
             input: Data("{\"op\":\"add\"}".utf8),
             identity: Identity(noPointer: .init()),
+            ucanToken: "test-ucan-token",
             sessionInvokeFn: mockSessionInvoke
         )
 

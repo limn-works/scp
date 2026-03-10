@@ -7223,31 +7223,6 @@ public func identityAttestDevice(identity: Identity)async throws  -> String  {
         )
 }
 /**
- * Creates a new DID identity with the specified custody method.
- *
- * # Arguments
- *
- * * `custody` — The custody type string. Accepted values depend on the build
- * configuration:
- * - `"platform"` — always accepted; requires a wired `KeyCustodyProvider`.
- * - `"software"` — always accepted; requires a wired `KeyCustodyProvider`.
- * - `"in_memory"` — **only** accepted when the `allow_in_memory_custody`
- * feature is enabled at compile time. Returns `ScpError::Identity` with
- * code `SCP-IDENT-1008` otherwise. Stores key material in unprotected heap
- * memory; suitable for testing and development but NOT for production use
- * on mobile devices.
- *
- * # Returns
- *
- * An `Identity` handle with the new DID and custody type.
- *
- * # Errors
- *
- * Returns `ScpError::Identity` if key generation or DID creation fails.
- * Returns `ScpError::Identity` with code `SCP-IDENT-1008` if `"in_memory"` is
- * requested but the `allow_in_memory_custody` feature is not enabled.
- * Returns `ScpError::Validation` if the custody string is not recognized.
- *
  * # In-memory custody (feature-gated)
  *
  * When `custody` is `"in_memory"` and the `allow_in_memory_custody` feature
@@ -8257,7 +8232,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_identity_attest_device() != 13846) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_create() != 17470) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_identity_create() != 29652) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_identity_create_with_agent_key() != 42821) {

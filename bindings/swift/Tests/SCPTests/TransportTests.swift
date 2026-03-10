@@ -199,7 +199,7 @@ struct TransportTests {
     // MARK: - Subscribe (via Context messages)
 
     @Test("Context messages stream subscribes via bridge function")
-    func contextMessagesSubscribes() async {
+    func contextMessagesSubscribes() async throws {
         var subscribed = false
         let handle = MockTransportContextHandle(id: "subscribe-ctx", state: "active")
 
@@ -219,7 +219,7 @@ struct TransportTests {
             closeFn: closeFn
         )
 
-        let stream = await context.messages
+        let stream = try await context.messages
         for await _ in stream {}
 
         #expect(subscribed)

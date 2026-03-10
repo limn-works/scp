@@ -210,7 +210,7 @@ public enum McpBridge {
 /// This placeholder mirrors the handle type that UniFFI will generate from
 /// the Rust `McpClient` struct. When the XCFramework build pipeline ships
 /// (SCP-103), this definition is replaced by the auto-generated type.
-final class McpClientHandle: Sendable {
+public final class McpClientHandle: Sendable {
     /// Whether the MCP handshake has completed.
     let initialized: Bool
 

@@ -127,7 +127,7 @@ struct ConformanceTests {
 
         case "transport_status":
             do {
-                let status = try await transportStatus()
+                let status = try await transportStatus(manager: TransportManager(noPointer: .init()))
                 // TransportStatus is a struct with connected, relayUrl, latencyMs
                 return ["connected": String(status.connected)]
             } catch let error as ScpError {
