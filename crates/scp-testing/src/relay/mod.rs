@@ -223,11 +223,20 @@ impl InMemoryRelay {
                 self.subscriptions.deliver(routing_id, message);
             }
             BehaviorMode::Composite(modes) => {
-                // Apply all behaviors in order. Each one may deliver the
-                // message in its own way.
-                for sub_mode in modes {
-                    self.apply_behavior(sub_mode, routing_id, message, msg_num);
-                }
+                // Apply the first delivery-affecting mode. Non-delivery modes
+                // (DeletionNonCompliant, Delayed) are noted but don't trigger
+                // extra deliveries. This prevents Composite from delivering
+                // the same message multiple times.
+                let delivery_mode = modes
+                    .iter()
+                    .find(|m| {
+                        !matches!(
+                            m,
+                            BehaviorMode::DeletionNonCompliant | BehaviorMode::Delayed(_)
+                        )
+                    })
+                    .unwrap_or(&BehaviorMode::Normal);
+                self.apply_behavior(delivery_mode, routing_id, message, msg_num);
             }
         }
     }
