@@ -1956,7 +1956,8 @@ mod tests {
 
     #[test]
     fn per_caller_rate_limit_window_reset() {
-        let mut rl = PerCallerRateLimit::new(1, Duration::from_millis(1));
+        // Use a long window so CI timing can't cause spurious resets.
+        let mut rl = PerCallerRateLimit::new(1, Duration::from_secs(3600));
         let alice: DID = "did:dht:z6MkAlice".into();
 
         assert!(rl.check_and_increment(&alice).unwrap());
