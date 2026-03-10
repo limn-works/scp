@@ -40,6 +40,41 @@ use scp_identity::cache::SystemClock;
 /// Global shared `ContextManager` instance.
 static CONTEXT_MANAGER: OnceLock<Arc<ContextManager>> = OnceLock::new();
 
+/// Global production DID resolver that delegates to `scp_identity::resolver::DidResolver`
+/// for full DID document validation (BEP44 signature verification, self-certification,
+/// sequence number comparison, caching).
+///
+/// Initialized by [`init_did_resolver`] when the identity layer is first set up.
+/// Used by UCAN validation when available; falls back to
+/// [`scp_ffi_common::BridgeDidResolver`] (string-only) via `DispatchDidResolver`
+/// when `None`.
+///
+/// See #311 for the unification design.
+static DID_RESOLVER: OnceLock<Arc<scp_ffi_common::IdentityBackedDidResolver>> = OnceLock::new();
+
+/// Returns the global production DID resolver, if initialized.
+#[must_use]
+pub fn did_resolver() -> Option<&'static Arc<scp_ffi_common::IdentityBackedDidResolver>> {
+    DID_RESOLVER.get()
+}
+
+/// Initializes the global production DID resolver.
+///
+/// Wraps any `scp_identity::resolver::DidResolver` implementation in an
+/// [`IdentityBackedDidResolver`] and stores it as the process-global resolver
+/// for UCAN validation.
+///
+/// Called once during identity system setup. Subsequent calls are no-ops
+/// (the resolver is initialized via `OnceLock`).
+pub fn init_did_resolver<R>(resolver: Arc<R>, handle: tokio::runtime::Handle)
+where
+    R: scp_identity::resolver::DidResolver + 'static,
+{
+    let _ = DID_RESOLVER.set(Arc::new(scp_ffi_common::IdentityBackedDidResolver::new(
+        resolver, handle,
+    )));
+}
+
 /// Returns a no-op key resolver for bridge-layer `ContextManager` initialization.
 ///
 /// Governance vote signature verification is not yet wired at the `UniFFI` layer —

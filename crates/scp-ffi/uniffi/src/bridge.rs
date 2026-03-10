@@ -27,7 +27,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-#[cfg(feature = "allow_in_memory_custody")]
+use scp_identity::resolver::{DualLayerResolver, NoOpRelayQuerier};
 use scp_identity::{DidCache, IdentityError, InMemoryDhtClient};
 use scp_identity::{DidDht, DidDocument as CoreDidDocument, DidMethod, ScpIdentity};
 use scp_platform::error::PlatformError;
@@ -1627,6 +1627,33 @@ impl Drop for TransportManager {
 /// requested but the `allow_in_memory_custody` feature is not enabled.
 /// Returns `ScpError::Validation` if the custody string is not recognized.
 ///
+/// Ensures the global production DID resolver is initialized.
+///
+/// Creates a `DualLayerResolver` backed by `InMemoryDhtClient` and
+/// `NoOpRelayQuerier`. The resolver is shared across all UCAN validation
+/// calls. Idempotent: subsequent calls are no-ops.
+///
+/// See #311 for the DID resolver unification design.
+fn ensure_did_resolver_initialized(handle: tokio::runtime::Handle) {
+    if crate::runtime::did_resolver().is_some() {
+        return;
+    }
+
+    let dht_client = Arc::new(InMemoryDhtClient::new());
+    let relay_querier = Arc::new(NoOpRelayQuerier);
+    let cache = Arc::new(DidCache::new());
+    let bootstrap_relays = Vec::new();
+
+    let resolver = Arc::new(DualLayerResolver::new(
+        relay_querier,
+        dht_client,
+        cache,
+        bootstrap_relays,
+    ));
+
+    crate::runtime::init_did_resolver(resolver, handle);
+}
+
 /// # In-memory custody (feature-gated)
 ///
 /// When `custody` is `"in_memory"` and the `allow_in_memory_custody` feature
@@ -1678,6 +1705,10 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
                         let dht = DidDht::new();
                         let (identity, document) =
                             dht.create(&key_custody.0).await.map_err(ScpError::from)?;
+
+                        // Initialize the production DID resolver for UCAN
+                        // validation (H4 — matching PyO3/NAPI behavior).
+                        ensure_did_resolver_initialized(tokio::runtime::Handle::current());
 
                         let handle = Arc::new(Identity {
                             did: identity.did.clone(),
@@ -1762,6 +1793,9 @@ pub async fn identity_create_with_custody(
                 .create(callback_custody.as_ref())
                 .await
                 .map_err(ScpError::from)?;
+
+            // Initialize the production DID resolver for UCAN validation.
+            ensure_did_resolver_initialized(tokio::runtime::Handle::current());
 
             let handle = Arc::new(Identity {
                 did: identity.did.clone(),
@@ -2833,7 +2867,9 @@ fn validate_tool_ucan_uniffi(
     );
 
     crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
-        let did_resolver = scp_ffi_common::BridgeDidResolver;
+        let production_resolver = crate::runtime::did_resolver();
+        let did_resolver =
+            scp_ffi_common::DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
         let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
             revocation_list: &ucan_state.revocation_list,
         };
@@ -3468,7 +3504,9 @@ pub async fn ucan_validate(
             // Execute the full 11-step validation pipeline via per-context state.
             let validation_result =
                 crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
-                    let did_resolver = scp_ffi_common::BridgeDidResolver;
+                    let production_resolver = crate::runtime::did_resolver();
+        let did_resolver =
+            scp_ffi_common::DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
                     let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
                         revocation_list: &ucan_state.revocation_list,
                     };
@@ -5778,6 +5816,9 @@ pub async fn identity_create_with_agent_key(custody: String) -> Result<Arc<Ident
                             .create_with_agent_key(&key_custody.0)
                             .await
                             .map_err(ScpError::from)?;
+
+                        // Initialize the production DID resolver for UCAN validation.
+                        ensure_did_resolver_initialized(tokio::runtime::Handle::current());
 
                         let handle = Arc::new(Identity {
                             did: identity.did.clone(),
