@@ -325,7 +325,7 @@ struct WasmToolSession {
 impl WasmToolSession {
     /// Returns `true` if this session has expired.
     fn is_expired(&self) -> bool {
-        let now = js_sys::Date::now();
+        let now = crate::time::now_ms();
         (now - self.created_at_ms) >= self.ttl_ms
     }
 }
@@ -1108,7 +1108,7 @@ impl WasmContextManager {
         }
 
         let session_id = uuid::Uuid::new_v4().to_string();
-        let now = js_sys::Date::now();
+        let now = crate::time::now_ms();
 
         let session = WasmToolSession {
             session_id: session_id.clone(),
@@ -1365,7 +1365,7 @@ impl WasmContextManager {
     /// Returns [`ScpWasmError::Permission`] if the nonce was already seen.
     pub fn ucan_record_nonce(&mut self, context_id: &str, nonce: &str) -> Result<(), ScpWasmError> {
         let ctx = self.require_context_mut(context_id)?;
-        let now = js_sys::Date::now();
+        let now = crate::time::now_ms();
 
         if ctx.seen_nonces.contains_key(nonce) {
             return Err(ScpWasmError::Permission {
@@ -1505,7 +1505,7 @@ impl WasmContextManager {
         // Replay protection: check+mark atomically.
         {
             let ctx = self.require_active_context_mut(context_id)?;
-            let now = js_sys::Date::now();
+            let now = crate::time::now_ms();
 
             if ctx.executed_proposals.contains_key(proposal_id) {
                 return Err(ScpWasmError::Permission {
@@ -2135,7 +2135,7 @@ impl WasmContextManager {
             seen_nonces: ctx.seen_nonces.keys().cloned().collect(),
         };
 
-        let now_ms = js_sys::Date::now();
+        let now_ms = crate::time::now_ms();
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let exported_at = (now_ms / 1000.0) as u64;
 
@@ -2252,7 +2252,7 @@ impl WasmContextManager {
             event_log: WasmEventLog::new(context_id.clone()),
             revoked_tokens: snap.revoked_tokens.iter().cloned().collect(),
             seen_nonces: {
-                let now = js_sys::Date::now();
+                let now = crate::time::now_ms();
                 snap.seen_nonces.iter().map(|n| (n.clone(), now)).collect()
             },
             members,
@@ -2376,8 +2376,8 @@ fn compute_event_hash(event_type: &str, context_id: &str) -> [u8; 32] {
     hasher.update([0x00]); // RFC 6962 leaf prefix.
     hasher.update(event_type.as_bytes());
     hasher.update(context_id.as_bytes());
-    // Include a timestamp-like value for uniqueness. In WASM, use js_sys::Date::now().
-    let now_ms = js_sys::Date::now();
+    // Include a timestamp-like value for uniqueness. In WASM, use crate::time::now_ms().
+    let now_ms = crate::time::now_ms();
     hasher.update(now_ms.to_bits().to_le_bytes());
     hasher.finalize().into()
 }

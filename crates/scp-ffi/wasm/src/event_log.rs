@@ -319,9 +319,7 @@ pub fn event_log_checkpoint(
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let epoch_u64 = epoch as u64;
 
-        let now = js_sys::Date::now();
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let timestamp_secs = (now / 1000.0) as u64;
+        let timestamp_secs = crate::time::now_secs();
 
         // Build canonical checkpoint payload for signing, matching native Rust's
         // compute_checkpoint_canonical_hash in scp-event-log/src/checkpoint.rs.

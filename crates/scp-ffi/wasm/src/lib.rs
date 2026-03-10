@@ -83,6 +83,7 @@ pub mod provenance;
 pub mod runtime;
 pub mod storage;
 pub mod sync;
+pub mod time;
 pub mod tools;
 pub mod transport;
 pub mod trust;

@@ -920,9 +920,7 @@ pub fn identity_attest_device(did: String) -> Promise {
 
     future_to_promise(async move {
         // Create attestation payload: DID + timestamp.
-        let timestamp_ms = js_sys::Date::now();
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let timestamp_secs = (timestamp_ms / 1000.0) as u64;
+        let timestamp_secs = crate::time::now_secs();
         let payload = format!("device-attestation:{did}:{timestamp_secs}");
 
         // Produce a real Ed25519 signature over the attestation payload.
@@ -1008,8 +1006,7 @@ pub fn identity_verify_device_attestation(did: String, token_base64: String) -> 
 
         // Freshness check: reject attestations older than 5 minutes (300s).
         // Prevents replay of captured attestation tokens.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let now_secs = (js_sys::Date::now() / 1000.0) as u64;
+        let now_secs = crate::time::now_secs();
         if now_secs.saturating_sub(timestamp) > 300 {
             return Ok(JsValue::from_bool(false));
         }

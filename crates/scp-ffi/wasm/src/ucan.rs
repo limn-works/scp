@@ -598,11 +598,7 @@ fn compute_token_cid(encoded: &str) -> String {
 }
 
 fn now_secs() -> u64 {
-    let now = js_sys::Date::now();
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    {
-        (now / 1000.0) as u64
-    }
+    crate::time::now_secs()
 }
 
 // ---------------------------------------------------------------------------
