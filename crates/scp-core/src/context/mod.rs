@@ -163,7 +163,7 @@ pub use governance::{
 pub use broadcast::{
     AuthorBlockResult, AuthorState, AuthorStateSnapshot, BlockResult, BroadcastAdmission,
     BroadcastContext, BroadcastContextSnapshot, KeyRequestDecision, SubscriberRecord,
-    SubscriberRegistration, SubscriptionResult, UnsubscribeResult,
+    SubscriberRegistration, SubscriptionResult, UnblockResult, UnsubscribeResult,
 };
 
 // Re-export context export/import types (issue #363).

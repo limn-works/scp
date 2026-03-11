@@ -629,6 +629,36 @@ class Context:
         blocker = blocker_did if blocker_did is not None else self._creator_did
         _scp_core.py_broadcast_block_subscriber(self._handle, subscriber_did, blocker)
 
+    async def broadcast_unblock_subscriber(
+        self,
+        subscriber_did: str,
+        unblocker_did: str | None = None,
+    ) -> None:
+        """Unblock a previously blocked subscriber in this broadcast context.
+
+        Forward-only restoration (section 9.16.8): the unblocked subscriber
+        can request the current key on next pull but cannot decrypt content
+        from the block period.
+
+        Args:
+            subscriber_did: The DID of the subscriber to unblock.
+            unblocker_did: The DID of the author performing the unblock.
+                Defaults to the context creator if not specified.
+
+        Raises:
+            ContextError: If the operation fails.
+        """
+        try:
+            import _scp_core
+        except ImportError as exc:
+            raise ContextError(
+                "failed to import _scp_core -- is the Rust extension built?",
+                code="SCP-CTX-2001",
+            ) from exc
+
+        unblocker = unblocker_did if unblocker_did is not None else self._creator_did
+        _scp_core.py_broadcast_unblock_subscriber(self._handle, subscriber_did, unblocker)
+
     async def broadcast_handle_key_request(
         self,
         author_did: str,

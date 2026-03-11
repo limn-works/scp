@@ -288,6 +288,25 @@ pub struct BlockResult {
 }
 
 // ---------------------------------------------------------------------------
+// UnblockResult
+// ---------------------------------------------------------------------------
+
+/// Result returned by [`BroadcastContext::unblock_subscriber`].
+///
+/// Contains the author DID and the full block list after the unblock operation
+/// so the caller can persist the updated block state via
+/// `ProtocolStore::store_broadcast_block_list`. Unlike [`BlockResult`], this
+/// does NOT contain a new key or epoch — unblocking does not rotate keys
+/// (§9.16.8).
+#[derive(Debug)]
+pub struct UnblockResult {
+    /// The author DID whose block list was modified.
+    pub author_did: String,
+    /// The full block list after the unblock operation, for persistence.
+    pub block_list: HashSet<String>,
+}
+
+// ---------------------------------------------------------------------------
 // UnsubscribeResult
 // ---------------------------------------------------------------------------
 
@@ -828,6 +847,50 @@ impl BroadcastContext {
         Ok(BlockResult {
             new_key,
             new_epoch,
+            author_did: result_author_did,
+            block_list: result_block_list,
+        })
+    }
+
+    /// Unblocks a previously blocked subscriber for a specific author
+    /// (§9.16.8 — forward-only restoration).
+    ///
+    /// Removes the subscriber DID from the author's block list. Per §9.16.8,
+    /// the author does NOT rotate their sender key — the current key remains
+    /// valid. When the previously-blocked subscriber sends a
+    /// `SenderKeyRequest`, the author's SDK checks the updated block list and
+    /// responds with the current sender key.
+    ///
+    /// **Forward-only guarantee:** content encrypted during the block period
+    /// used sender key epochs that the blocked subscriber never received and
+    /// cannot retroactively obtain. Historical access is permanently lost.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::MemberNotFound`] if the author DID is not registered.
+    /// - [`ContextError::InvalidState`] if the subscriber is not blocked.
+    pub fn unblock_subscriber(
+        &mut self,
+        author_did: &str,
+        unblocked_did: &str,
+    ) -> Result<UnblockResult, ContextError> {
+        let author = self.authors.get_mut(author_did).ok_or_else(|| {
+            ContextError::MemberNotFound(format!("author not found: {author_did}"))
+        })?;
+
+        if !author.block_list.remove(unblocked_did) {
+            return Err(ContextError::InvalidState(format!(
+                "subscriber not blocked: {unblocked_did}"
+            )));
+        }
+
+        // Per §9.16.8: NO key rotation on unblock. The current key remains
+        // valid. The unblocked subscriber will receive it on next pull.
+
+        let result_author_did = author.author_did.clone();
+        let result_block_list = author.block_list.clone();
+
+        Ok(UnblockResult {
             author_did: result_author_did,
             block_list: result_block_list,
         })
@@ -2714,6 +2777,117 @@ mod tests {
         assert_eq!(
             result.new_epoch, 1,
             "single group block = single epoch bump"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // unblock_subscriber — §9.16.8 forward-only restoration (#617)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unblock_subscriber_removes_from_block_list() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        subscribe_open(&mut ctx, "did:example:dave", None, 1000).unwrap();
+        ctx.block_subscriber("did:example:alice", "did:example:dave")
+            .unwrap();
+        assert!(ctx.is_blocked("did:example:alice", "did:example:dave"));
+
+        let result = ctx
+            .unblock_subscriber("did:example:alice", "did:example:dave")
+            .unwrap();
+
+        assert!(!ctx.is_blocked("did:example:alice", "did:example:dave"));
+        assert_eq!(result.author_did, "did:example:alice");
+        assert!(
+            !result.block_list.contains("did:example:dave"),
+            "dave should be removed from the block list"
+        );
+    }
+
+    #[test]
+    fn unblock_subscriber_does_not_rotate_key() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        subscribe_open(&mut ctx, "did:example:dave", None, 1000).unwrap();
+
+        // Block rotates key and increments epoch.
+        let block_result = ctx
+            .block_subscriber("did:example:alice", "did:example:dave")
+            .unwrap();
+        let epoch_after_block = block_result.new_epoch;
+        let key_after_block = block_result.new_key;
+
+        // Unblock should NOT rotate key or change epoch.
+        ctx.unblock_subscriber("did:example:alice", "did:example:dave")
+            .unwrap();
+
+        let author = ctx.authors.get("did:example:alice").unwrap();
+        assert_eq!(
+            author.epoch, epoch_after_block,
+            "epoch must not change on unblock (§9.16.8)"
+        );
+        assert_eq!(
+            author.broadcast_key.as_bytes(),
+            key_after_block.as_bytes(),
+            "key must not change on unblock (§9.16.8)"
+        );
+    }
+
+    #[test]
+    fn unblock_subscriber_unknown_author_returns_error() {
+        let mut ctx = make_open_ctx();
+        let result = ctx.unblock_subscriber("did:example:unknown", "did:example:dave");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unblock_subscriber_not_blocked_returns_error() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        subscribe_open(&mut ctx, "did:example:dave", None, 1000).unwrap();
+
+        // dave is not blocked — unblock should fail.
+        let result = ctx.unblock_subscriber("did:example:alice", "did:example:dave");
+        assert!(
+            result.is_err(),
+            "unblocking a non-blocked subscriber should fail"
+        );
+    }
+
+    #[test]
+    fn unblock_subscriber_idempotent_after_first_unblock_fails() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        subscribe_open(&mut ctx, "did:example:dave", None, 1000).unwrap();
+        ctx.block_subscriber("did:example:alice", "did:example:dave")
+            .unwrap();
+
+        // First unblock succeeds.
+        ctx.unblock_subscriber("did:example:alice", "did:example:dave")
+            .unwrap();
+        // Second unblock fails (already unblocked).
+        let result = ctx.unblock_subscriber("did:example:alice", "did:example:dave");
+        assert!(result.is_err(), "second unblock should fail");
+    }
+
+    #[test]
+    fn unblock_subscriber_then_key_request_succeeds() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        subscribe_open(&mut ctx, "did:example:dave", None, 1000).unwrap();
+
+        // Block then unblock.
+        ctx.block_subscriber("did:example:alice", "did:example:dave")
+            .unwrap();
+        ctx.unblock_subscriber("did:example:alice", "did:example:dave")
+            .unwrap();
+
+        // Key request should now succeed (not blocked).
+        let decision = ctx.handle_key_request("did:example:alice", "did:example:dave");
+        assert!(
+            !matches!(decision, KeyRequestDecision::Deny { .. }),
+            "unblocked subscriber should be able to request keys"
         );
     }
 

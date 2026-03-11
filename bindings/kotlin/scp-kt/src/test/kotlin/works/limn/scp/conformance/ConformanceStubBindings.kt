@@ -148,6 +148,7 @@ class ConformanceStubBindings : NativeBindings {
     override fun broadcastUnsubscribe(contextHandle: Long, subscriberDid: String, rotateKeys: Boolean) = Unit
     override fun broadcastPublish(contextHandle: Long, authorDid: String, payload: ByteArray) = Unit
     override fun broadcastBlockSubscriber(contextHandle: Long, subscriberDid: String, blockerDid: String) = Unit
+    override fun broadcastUnblockSubscriber(contextHandle: Long, subscriberDid: String, unblockerDid: String) = Unit
     override fun broadcastHandleKeyRequest(contextHandle: Long, authorDid: String, requesterDid: String): String =
         """{"key":"stub"}"""
     override fun broadcastSubscriberCount(contextHandle: Long): Long? = 0L

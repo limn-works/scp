@@ -314,6 +314,20 @@ export function createNativeBridge(): Bridge {
       )(handle, subscriberDid, blockerDid);
     },
 
+    async broadcastUnblockSubscriber(
+      handle: BridgeContextHandle,
+      subscriberDid: string,
+      unblockerDid: string,
+    ): Promise<void> {
+      await (
+        addon.broadcastUnblockSubscriber as (
+          h: BridgeContextHandle,
+          s: string,
+          u: string,
+        ) => Promise<void>
+      )(handle, subscriberDid, unblockerDid);
+    },
+
     async broadcastHandleKeyRequest(
       handle: BridgeContextHandle,
       authorDid: string,

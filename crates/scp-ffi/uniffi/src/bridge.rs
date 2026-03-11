@@ -4818,6 +4818,40 @@ pub async fn broadcast_block_subscriber(
         })?
 }
 
+/// Unblocks a previously blocked subscriber in a broadcast context (§9.16.8).
+///
+/// Forward-only: the unblocked subscriber can request the current key on
+/// next pull but cannot decrypt content from the block period.
+///
+/// # Errors
+///
+/// - [`ScpError::Context`] with `SCP-CTX-2037` if the tokio task fails.
+/// - [`ScpError::Context`] if the subscriber is not blocked or the
+///   author is not registered.
+#[uniffi::export]
+pub async fn broadcast_unblock_subscriber(
+    handle: Arc<ContextHandle>,
+    subscriber_did: String,
+    unblocker_did: String,
+) -> Result<(), ScpError> {
+    runtime()
+        .spawn(async move {
+            let manager = crate::runtime::context_manager();
+            let subscriber: scp_identity::DID = subscriber_did.into();
+            let unblocker: scp_identity::DID = unblocker_did.into();
+            manager
+                .unblock_broadcast_subscriber(&handle.context_id, &unblocker, &subscriber)
+                .await
+                .map_err(ScpError::from)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| ScpError::Context {
+            message: format!("tokio task join error during broadcast unblock: {e}"),
+            code: "SCP-CTX-2037".to_owned(),
+        })?
+}
+
 /// Handles a broadcast key request from a subscriber.
 ///
 /// Validates the author DID is locally controlled and processes the key
