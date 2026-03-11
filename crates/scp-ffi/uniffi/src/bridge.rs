@@ -5577,25 +5577,23 @@ pub fn set_economic_policy(
     handle: Arc<ContextHandle>,
     policy_json: String,
 ) -> Result<(), ScpError> {
+    // Hold the mutex for the entire check-validate-store sequence to prevent
+    // TOCTOU races (another thread bypassing the lock between check and store).
+    let mut guard = handle.economic_policy.lock().map_err(|_| ScpError::Context {
+        message: "economic_policy lock is poisoned".to_owned(),
+        code: "SCP-CTX-2012".to_owned(),
+    })?;
+
     // Check whether the existing policy is locked (§19.3).
+    if let Some(ref existing_json) = *guard
+        && let Ok(existing) =
+            serde_json::from_str::<scp_core::economy::types::EconomicPolicy>(existing_json)
+        && existing.locked
     {
-        let guard = handle
-            .economic_policy
-            .lock()
-            .map_err(|_| ScpError::Context {
-                message: "economic_policy lock is poisoned".to_owned(),
-                code: "SCP-CTX-2012".to_owned(),
-            })?;
-        if let Some(ref existing_json) = *guard
-            && let Ok(existing) =
-                serde_json::from_str::<scp_core::economy::types::EconomicPolicy>(existing_json)
-            && existing.locked
-        {
-            return Err(ScpError::Permission {
-                message: "economic policy is locked and cannot be changed".to_owned(),
-                code: "SCP-CTX-2013".to_owned(),
-            });
-        }
+        return Err(ScpError::Permission {
+            message: "economic policy is locked and cannot be changed".to_owned(),
+            code: "SCP-CTX-2013".to_owned(),
+        });
     }
 
     let _policy: scp_core::economy::types::EconomicPolicy = serde_json::from_str(&policy_json)
@@ -5604,13 +5602,6 @@ pub fn set_economic_policy(
             code: "SCP-VALID-7001".to_owned(),
         })?;
 
-    let mut guard = handle
-        .economic_policy
-        .lock()
-        .map_err(|_| ScpError::Context {
-            message: "economic_policy lock is poisoned".to_owned(),
-            code: "SCP-CTX-2012".to_owned(),
-        })?;
     *guard = Some(policy_json);
     Ok(())
 }
