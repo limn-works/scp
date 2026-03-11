@@ -644,6 +644,17 @@ export function createNativeBridge(): Bridge {
       return (addon.syncClassifyOffline as (l: number, n: number) => string)(lastRelayContact, now);
     },
 
+    syncClassifyOfflineCustom(
+      lastRelayContact: number,
+      now: number,
+      tier1ThresholdSecs: number,
+      tier2ThresholdSecs: number,
+    ) {
+      return (
+        addon.syncClassifyOfflineCustom as (l: number, n: number, t1: number, t2: number) => string
+      )(lastRelayContact, now, tier1ThresholdSecs, tier2ThresholdSecs);
+    },
+
     syncGetPolicy() {
       return (addon.syncGetPolicy as () => ReturnType<Bridge["syncGetPolicy"]>)();
     },

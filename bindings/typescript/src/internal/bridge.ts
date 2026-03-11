@@ -214,6 +214,12 @@ export interface Bridge {
 
   // Sync
   syncClassifyOffline(lastRelayContact: number, now: number): string;
+  syncClassifyOfflineCustom(
+    lastRelayContact: number,
+    now: number,
+    tier1ThresholdSecs: number,
+    tier2ThresholdSecs: number,
+  ): string;
   syncGetPolicy(): {
     tier_1_threshold_secs: number;
     tier_2_threshold_secs: number;
