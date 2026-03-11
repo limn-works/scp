@@ -308,25 +308,35 @@ impl ResetRequestNonceTracker {
         Self::new(RESET_REQUEST_NONCE_TTL_SECS)
     }
 
-    /// Checks if a `(member_did, nonce)` pair has been seen before and records
-    /// it if new.
+    /// Atomically checks and tentatively records a `(member_did, nonce)` pair.
     ///
-    /// Returns `true` if the pair is new (not a replay).
-    /// Returns `false` if the pair has been seen within the TTL window.
+    /// Returns `Some(NonceGuard)` if the pair is new (not a replay) — the
+    /// nonce is recorded in the same lock acquisition, eliminating the TOCTOU
+    /// window that exists with separate check-then-record calls.
+    ///
+    /// Returns `None` if the pair has been seen within the TTL window (replay).
+    ///
+    /// The returned [`NonceGuard`] **must** be committed via
+    /// [`NonceGuard::commit`] after signature verification succeeds. If the
+    /// guard is dropped without being committed (e.g., signature verification
+    /// fails, or a panic occurs), the nonce is automatically rolled back so
+    /// the legitimate request can still succeed.
     ///
     /// Lazily evicts expired entries on each call. After insertion, if the
     /// cache exceeds [`MAX_NONCE_CACHE_ENTRIES`], the oldest entry (by
     /// timestamp) is evicted.
-    ///
-    /// **Note:** For new code, prefer [`check_nonce`] + [`record_nonce`] to
-    /// avoid recording a nonce before signature verification passes.
     ///
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned (another thread panicked
     /// while holding the lock). This is unrecoverable.
     #[must_use = "ignoring nonce check result is a security bug"]
-    pub fn check_and_record(&self, member_did: &str, nonce: &[u8; 16], now: u64) -> bool {
+    pub fn check_and_tentatively_record(
+        &self,
+        member_did: &str,
+        nonce: &[u8; 16],
+        now: u64,
+    ) -> Option<NonceGuard<'_>> {
         #[allow(clippy::expect_used)]
         let mut seen = self.seen.lock().expect("nonce tracker lock poisoned");
 
@@ -337,7 +347,7 @@ impl ResetRequestNonceTracker {
 
         // Check for replay.
         if seen.contains_key(&key) {
-            return false;
+            return None;
         }
 
         // Record the entry.
@@ -353,57 +363,76 @@ impl ResetRequestNonceTracker {
             seen.remove(&oldest_key);
         }
 
-        true
+        drop(seen);
+
+        Some(NonceGuard {
+            tracker: self,
+            member_did: member_did.to_owned(),
+            nonce: *nonce,
+            committed: false,
+        })
     }
 
-    /// Checks whether a `(member_did, nonce)` pair has been seen before,
-    /// **without recording it**.
+    /// Rolls back a tentatively recorded `(member_did, nonce)` pair.
     ///
-    /// Returns `true` if the pair is new (not a replay).
-    /// Returns `false` if the pair has been seen within the TTL window.
+    /// Called automatically by [`NonceGuard::drop`] when the guard is not
+    /// committed. Not part of the public API — use `NonceGuard::commit` and
+    /// drop semantics instead.
     ///
-    /// Use this before signature verification. After signature verification
-    /// passes, call [`record_nonce`] to record the nonce. This prevents an
-    /// attacker from poisoning the nonce cache with forged requests.
+    /// No-op if the entry does not exist (e.g., already expired or evicted).
     ///
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned.
-    #[must_use = "ignoring nonce check result is a security bug"]
-    pub fn check_nonce(&self, member_did: &str, nonce: &[u8; 16], now: u64) -> bool {
+    fn rollback_nonce(&self, member_did: &str, nonce: &[u8; 16]) {
         #[allow(clippy::expect_used)]
         let mut seen = self.seen.lock().expect("nonce tracker lock poisoned");
 
-        // Lazy eviction of expired entries.
-        seen.retain(|_, first_seen| now.saturating_sub(*first_seen) < self.ttl_secs);
-
         let key = (member_did.to_owned(), *nonce);
-        !seen.contains_key(&key)
+        seen.remove(&key);
     }
+}
 
-    /// Records a `(member_did, nonce)` pair as seen.
-    ///
-    /// Call this **only after** signature verification passes. The nonce is
-    /// recorded with the given timestamp for TTL-based eviction.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
-    pub fn record_nonce(&self, member_did: &str, nonce: &[u8; 16], now: u64) {
-        #[allow(clippy::expect_used)]
-        let mut seen = self.seen.lock().expect("nonce tracker lock poisoned");
+/// RAII guard for a tentatively recorded nonce.
+///
+/// Returned by [`ResetRequestNonceTracker::check_and_tentatively_record`].
+/// The nonce is automatically rolled back when the guard is dropped unless
+/// [`commit`](NonceGuard::commit) has been called. This makes the
+/// tentative-record + rollback pattern fail-safe: panics, early returns,
+/// and logic errors all trigger automatic rollback.
+///
+/// # Usage
+///
+/// ```ignore
+/// let guard = tracker.check_and_tentatively_record(did, &nonce, now)
+///     .ok_or(WeeksOfflineError::ReplayedResetRequest { .. })?;
+/// // ... verify signature ...
+/// guard.commit(); // nonce stays recorded on success
+/// // if we never reach commit(), drop rolls back the nonce
+/// ```
+#[derive(Debug)]
+pub struct NonceGuard<'a> {
+    tracker: &'a ResetRequestNonceTracker,
+    member_did: String,
+    nonce: [u8; 16],
+    committed: bool,
+}
 
-        let key = (member_did.to_owned(), *nonce);
-        seen.insert(key, now);
+impl NonceGuard<'_> {
+    /// Commits the tentatively recorded nonce, preventing rollback on drop.
+    ///
+    /// Call this after signature verification succeeds. Once committed, the
+    /// nonce remains in the tracker for the duration of its TTL, blocking
+    /// replay attempts.
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
 
-        // Capacity bound: evict oldest entry if over limit.
-        if seen.len() > MAX_NONCE_CACHE_ENTRIES
-            && let Some(oldest_key) = seen
-                .iter()
-                .min_by_key(|(_, ts)| **ts)
-                .map(|(k, _)| k.clone())
-        {
-            seen.remove(&oldest_key);
+impl Drop for NonceGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.tracker.rollback_nonce(&self.member_did, &self.nonce);
         }
     }
 }
@@ -421,13 +450,20 @@ impl Default for ResetRequestNonceTracker {
 /// Validation result for a `ResetRequest`.
 ///
 /// Returned by [`validate_reset_request`] when anti-replay checks pass.
-/// The caller is responsible for verifying the Ed25519 signature over
-/// [`ResetRequest::canonical_hash`] using the member's DID verification
-/// method (`#active` or `#agent`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValidatedResetRequest {
-    /// The canonical hash that was validated.
+/// Contains both the canonical hash for signature verification and a
+/// [`NonceGuard`] that must be committed after signature verification
+/// succeeds. If the guard is dropped without being committed, the nonce
+/// is automatically rolled back.
+#[derive(Debug)]
+pub struct ValidatedResetRequest<'a> {
+    /// The canonical hash that was validated. Verify the Ed25519 signature
+    /// over this hash using the member's DID verification method
+    /// (`#active` or `#agent`).
     pub canonical_hash: [u8; 32],
+    /// RAII guard for the tentatively recorded nonce. Call
+    /// [`NonceGuard::commit`] after signature verification succeeds.
+    /// Automatically rolls back on drop if not committed.
+    pub nonce_guard: NonceGuard<'a>,
 }
 
 /// Validates a `ResetRequest` for anti-replay (freshness + nonce dedup).
@@ -437,34 +473,31 @@ pub struct ValidatedResetRequest {
 /// 1. **Freshness:** Rejects requests where `|now - request.timestamp|` exceeds
 ///    [`RESET_REQUEST_FRESHNESS_SECS`] (30 seconds). Both past and future
 ///    timestamps are checked.
-/// 2. **Nonce dedup:** Rejects requests whose nonce has already been seen
-///    within the tracker's TTL window (60 seconds). The nonce is **not**
-///    recorded by this function — the caller MUST call
-///    [`ResetRequestNonceTracker::record_nonce`] after signature verification
-///    passes. This prevents an attacker from poisoning the nonce cache with
-///    forged (unsigned or mis-signed) requests.
+/// 2. **Nonce dedup:** Atomically checks and tentatively records the nonce via
+///    [`ResetRequestNonceTracker::check_and_tentatively_record`]. This
+///    eliminates the TOCTOU race condition that existed with the previous
+///    separate check-then-record pattern.
 ///
-/// Signature verification is NOT performed here — the caller must:
-/// 1. Call this function to get the `canonical_hash`.
-/// 2. Verify the Ed25519 signature over `canonical_hash` using the member's
+/// On success, returns a [`ValidatedResetRequest`] containing both the
+/// canonical hash and a [`NonceGuard`]. The caller must:
+/// 1. Verify the Ed25519 signature over `canonical_hash` using the member's
 ///    DID verification method (`#active` or `#agent`).
-/// 3. Only after signature verification passes, call
-///    `nonce_tracker.record_nonce(member_did, nonce, now)` to mark the nonce
-///    as consumed.
+/// 2. Call [`NonceGuard::commit`] on `nonce_guard` if signature verification
+///    succeeds.
 ///
-/// This separation prevents nonce-poisoning attacks where an attacker sends
-/// forged requests to exhaust legitimate nonces before the real request
-/// arrives.
+/// If signature verification fails (or any other error occurs), simply drop
+/// the `ValidatedResetRequest` — the `NonceGuard` will automatically roll
+/// back the nonce so the legitimate request can still succeed.
 ///
 /// # Errors
 ///
 /// Returns [`WeeksOfflineError::StaleResetRequest`] if the request is too old.
 /// Returns [`WeeksOfflineError::ReplayedResetRequest`] if the nonce was seen.
-pub fn validate_reset_request(
+pub fn validate_reset_request<'a>(
     request: &ResetRequest,
     now: u64,
-    nonce_tracker: &ResetRequestNonceTracker,
-) -> Result<ValidatedResetRequest, WeeksOfflineError> {
+    nonce_tracker: &'a ResetRequestNonceTracker,
+) -> Result<ValidatedResetRequest<'a>, WeeksOfflineError> {
     // Check 1: freshness — absolute difference (§23.5.2 requires
     // |relay_clock - timestamp| <= 30s, rejecting both past and future).
     let diff = now.abs_diff(request.timestamp);
@@ -476,18 +509,20 @@ pub fn validate_reset_request(
         });
     }
 
-    // Check 2: nonce dedup (read-only check — no recording).
-    // Recording happens after the caller verifies the signature, to prevent
-    // nonce-poisoning by forged requests.
-    if !nonce_tracker.check_nonce(request.member_did.as_ref(), &request.nonce, now) {
-        return Err(WeeksOfflineError::ReplayedResetRequest {
+    // Check 2: nonce dedup — atomic check + tentative record.
+    // The nonce is recorded in the same lock acquisition as the check,
+    // eliminating the TOCTOU window. The returned NonceGuard auto-rolls-back
+    // on drop if not committed.
+    let nonce_guard = nonce_tracker
+        .check_and_tentatively_record(request.member_did.as_ref(), &request.nonce, now)
+        .ok_or_else(|| WeeksOfflineError::ReplayedResetRequest {
             context_id: request.context_id.clone(),
             nonce: request.nonce,
-        });
-    }
+        })?;
 
     Ok(ValidatedResetRequest {
         canonical_hash: request.canonical_hash(),
+        nonce_guard,
     })
 }
 
@@ -1931,7 +1966,10 @@ mod tests {
     fn nonce_tracker_accepts_new_nonce() {
         let tracker = ResetRequestNonceTracker::with_default_ttl();
         let nonce = [0x01; 16];
-        assert!(tracker.check_and_record("did:dht:z6MkAlice", &nonce, BASE_TIMESTAMP));
+        let guard =
+            tracker.check_and_tentatively_record("did:dht:z6MkAlice", &nonce, BASE_TIMESTAMP);
+        assert!(guard.is_some());
+        guard.unwrap().commit();
     }
 
     #[test]
@@ -1939,8 +1977,14 @@ mod tests {
         let tracker = ResetRequestNonceTracker::with_default_ttl();
         let nonce = [0x01; 16];
         let did = "did:dht:z6MkAlice";
-        assert!(tracker.check_and_record(did, &nonce, BASE_TIMESTAMP));
-        assert!(!tracker.check_and_record(did, &nonce, BASE_TIMESTAMP + 1));
+        let guard = tracker.check_and_tentatively_record(did, &nonce, BASE_TIMESTAMP);
+        assert!(guard.is_some());
+        guard.unwrap().commit();
+        assert!(
+            tracker
+                .check_and_tentatively_record(did, &nonce, BASE_TIMESTAMP + 1)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1948,8 +1992,12 @@ mod tests {
         let tracker = ResetRequestNonceTracker::with_default_ttl();
         let nonce = [0x01; 16];
         // Same nonce from different DIDs should both be accepted.
-        assert!(tracker.check_and_record("did:dht:z6MkAlice", &nonce, BASE_TIMESTAMP));
-        assert!(tracker.check_and_record("did:dht:z6MkBob", &nonce, BASE_TIMESTAMP));
+        let g1 = tracker.check_and_tentatively_record("did:dht:z6MkAlice", &nonce, BASE_TIMESTAMP);
+        assert!(g1.is_some());
+        g1.unwrap().commit();
+        let g2 = tracker.check_and_tentatively_record("did:dht:z6MkBob", &nonce, BASE_TIMESTAMP);
+        assert!(g2.is_some());
+        g2.unwrap().commit();
     }
 
     #[test]
@@ -1957,9 +2005,13 @@ mod tests {
         let tracker = ResetRequestNonceTracker::new(60);
         let nonce = [0x01; 16];
         let did = "did:dht:z6MkAlice";
-        assert!(tracker.check_and_record(did, &nonce, BASE_TIMESTAMP));
+        let guard = tracker.check_and_tentatively_record(did, &nonce, BASE_TIMESTAMP);
+        assert!(guard.is_some());
+        guard.unwrap().commit();
         // 61 seconds later — TTL expired, nonce evicted.
-        assert!(tracker.check_and_record(did, &nonce, BASE_TIMESTAMP + 61));
+        let guard = tracker.check_and_tentatively_record(did, &nonce, BASE_TIMESTAMP + 61);
+        assert!(guard.is_some());
+        guard.unwrap().commit();
     }
 
     #[test]
@@ -1968,8 +2020,12 @@ mod tests {
         let did = "did:dht:z6MkAlice";
         let nonce_a = [0xAA; 16];
         let nonce_b = [0xBB; 16];
-        assert!(tracker.check_and_record(did, &nonce_a, BASE_TIMESTAMP));
-        assert!(tracker.check_and_record(did, &nonce_b, BASE_TIMESTAMP));
+        let g1 = tracker.check_and_tentatively_record(did, &nonce_a, BASE_TIMESTAMP);
+        assert!(g1.is_some());
+        g1.unwrap().commit();
+        let g2 = tracker.check_and_tentatively_record(did, &nonce_b, BASE_TIMESTAMP);
+        assert!(g2.is_some());
+        g2.unwrap().commit();
     }
 
     #[test]
@@ -1981,25 +2037,32 @@ mod tests {
         for i in 0..MAX_NONCE_CACHE_ENTRIES {
             let mut nonce = [0u8; 16];
             nonce[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            assert!(tracker.check_and_record(did, &nonce, BASE_TIMESTAMP + i as u64));
+            let guard =
+                tracker.check_and_tentatively_record(did, &nonce, BASE_TIMESTAMP + i as u64);
+            assert!(guard.is_some());
+            guard.unwrap().commit();
         }
 
         // Insert one more — should trigger eviction of the oldest (i=0).
         let overflow_nonce = [0xFF; 16];
-        assert!(tracker.check_and_record(
+        let guard = tracker.check_and_tentatively_record(
             did,
             &overflow_nonce,
-            BASE_TIMESTAMP + MAX_NONCE_CACHE_ENTRIES as u64
-        ));
+            BASE_TIMESTAMP + MAX_NONCE_CACHE_ENTRIES as u64,
+        );
+        assert!(guard.is_some());
+        guard.unwrap().commit();
 
         // The oldest entry (i=0, nonce=[0x00;16] with first 8 bytes = 0u64)
         // should have been evicted, so re-inserting it should succeed.
         let oldest_nonce = [0u8; 16]; // i=0 → all zeros
-        assert!(tracker.check_and_record(
+        let guard = tracker.check_and_tentatively_record(
             did,
             &oldest_nonce,
-            BASE_TIMESTAMP + MAX_NONCE_CACHE_ENTRIES as u64 + 1
-        ));
+            BASE_TIMESTAMP + MAX_NONCE_CACHE_ENTRIES as u64 + 1,
+        );
+        assert!(guard.is_some());
+        guard.unwrap().commit();
     }
 
     // -----------------------------------------------------------------------
@@ -2028,6 +2091,7 @@ mod tests {
         assert!(result.is_ok());
         let validated = result.unwrap();
         assert_eq!(validated.canonical_hash, request.canonical_hash());
+        validated.nonce_guard.commit();
     }
 
     #[test]
@@ -2057,6 +2121,7 @@ mod tests {
         // Exactly 30 seconds — NOT exceeded (must be strictly >).
         let result = validate_reset_request(&request, BASE_TIMESTAMP + 30, &tracker);
         assert!(result.is_ok());
+        result.unwrap().nonce_guard.commit();
     }
 
     #[test]
@@ -2065,18 +2130,12 @@ mod tests {
         let nonce = [0x42; 16];
         let request = make_test_request(nonce, BASE_TIMESTAMP);
 
-        // First submission succeeds (validate checks nonce without recording).
+        // First submission succeeds — nonce is tentatively recorded atomically.
         let result = validate_reset_request(&request, BASE_TIMESTAMP + 1, &tracker);
         assert!(result.is_ok());
+        result.unwrap().nonce_guard.commit();
 
-        // Simulate caller recording nonce after signature verification passes.
-        tracker.record_nonce(
-            request.member_did.as_ref(),
-            &request.nonce,
-            BASE_TIMESTAMP + 1,
-        );
-
-        // Second submission with same nonce is rejected.
+        // Second submission with same nonce is rejected — no TOCTOU window.
         let result = validate_reset_request(&request, BASE_TIMESTAMP + 2, &tracker);
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2133,36 +2192,51 @@ mod tests {
         let request = make_test_request([0xFD; 16], future_ts);
         let result = validate_reset_request(&request, BASE_TIMESTAMP, &tracker);
         assert!(result.is_ok());
+        result.unwrap().nonce_guard.commit();
     }
 
     #[test]
-    fn validate_does_not_record_nonce() {
-        // validate_reset_request must NOT record the nonce — only check it.
-        // This prevents nonce-poisoning by forged (unsigned) requests.
+    fn validate_tentatively_records_nonce() {
+        // validate_reset_request atomically records the nonce to prevent
+        // TOCTOU replay. Second call with same nonce must be rejected.
         let tracker = ResetRequestNonceTracker::with_default_ttl();
         let nonce = [0xCC; 16];
         let request = make_test_request(nonce, BASE_TIMESTAMP);
 
-        // First validation succeeds.
+        // First validation succeeds — nonce tentatively recorded.
         let result = validate_reset_request(&request, BASE_TIMESTAMP + 1, &tracker);
         assert!(result.is_ok());
+        result.unwrap().nonce_guard.commit();
 
-        // Second validation with same nonce also succeeds (because the first
-        // did not record the nonce).
+        // Second validation with same nonce is rejected (nonce already recorded).
         let result = validate_reset_request(&request, BASE_TIMESTAMP + 2, &tracker);
-        assert!(result.is_ok());
-
-        // After explicit recording, the nonce is rejected.
-        tracker.record_nonce(
-            request.member_did.as_ref(),
-            &request.nonce,
-            BASE_TIMESTAMP + 2,
-        );
-        let result = validate_reset_request(&request, BASE_TIMESTAMP + 3, &tracker);
         assert!(matches!(
             result,
             Err(WeeksOfflineError::ReplayedResetRequest { .. })
         ));
+    }
+
+    #[test]
+    fn validate_rollback_allows_retry() {
+        // If signature verification fails, dropping the ValidatedResetRequest
+        // (which drops the NonceGuard) auto-rolls-back the nonce so the
+        // legitimate request can still succeed.
+        let tracker = ResetRequestNonceTracker::with_default_ttl();
+        let nonce = [0xCC; 16];
+        let request = make_test_request(nonce, BASE_TIMESTAMP);
+
+        // First validation succeeds — nonce tentatively recorded.
+        let result = validate_reset_request(&request, BASE_TIMESTAMP + 1, &tracker);
+        assert!(result.is_ok());
+
+        // Simulate signature verification failure — drop without committing.
+        // The NonceGuard's Drop impl rolls back the nonce automatically.
+        drop(result);
+
+        // Same nonce can now be accepted again (legitimate request).
+        let result = validate_reset_request(&request, BASE_TIMESTAMP + 2, &tracker);
+        assert!(result.is_ok());
+        result.unwrap().nonce_guard.commit();
     }
 
     #[test]
@@ -2197,18 +2271,62 @@ mod tests {
     }
 
     #[test]
-    fn check_nonce_does_not_record() {
+    fn tentative_record_blocks_concurrent_replay() {
         let tracker = ResetRequestNonceTracker::with_default_ttl();
         let nonce = [0xDD; 16];
         let did = "did:dht:z6MkAlice";
 
-        // check_nonce returns true (new) but does not record.
-        assert!(tracker.check_nonce(did, &nonce, BASE_TIMESTAMP));
-        assert!(tracker.check_nonce(did, &nonce, BASE_TIMESTAMP + 1));
+        // First call succeeds and records the nonce atomically.
+        let guard = tracker.check_and_tentatively_record(did, &nonce, BASE_TIMESTAMP);
+        assert!(guard.is_some());
 
-        // record_nonce makes subsequent checks return false.
-        tracker.record_nonce(did, &nonce, BASE_TIMESTAMP + 1);
-        assert!(!tracker.check_nonce(did, &nonce, BASE_TIMESTAMP + 2));
+        // Second call with same nonce is rejected — no TOCTOU window.
+        // (guard is still alive, nonce is tentatively recorded)
+        assert!(
+            tracker
+                .check_and_tentatively_record(did, &nonce, BASE_TIMESTAMP + 1)
+                .is_none()
+        );
+
+        guard.unwrap().commit();
+    }
+
+    #[test]
+    fn guard_drop_rolls_back_nonce() {
+        // NonceGuard's Drop impl rolls back the nonce when not committed.
+        let tracker = ResetRequestNonceTracker::with_default_ttl();
+        let nonce = [0xDD; 16];
+        let did = "did:dht:z6MkAlice";
+
+        // Tentatively record, then drop without committing.
+        let guard = tracker.check_and_tentatively_record(did, &nonce, BASE_TIMESTAMP);
+        assert!(guard.is_some());
+        drop(guard); // triggers rollback
+
+        // Nonce slot is available again.
+        let guard = tracker.check_and_tentatively_record(did, &nonce, BASE_TIMESTAMP + 1);
+        assert!(guard.is_some());
+        guard.unwrap().commit();
+    }
+
+    #[test]
+    fn guard_commit_prevents_rollback() {
+        // Committing a NonceGuard prevents rollback on drop.
+        let tracker = ResetRequestNonceTracker::with_default_ttl();
+        let nonce = [0xDD; 16];
+        let did = "did:dht:z6MkAlice";
+
+        // Tentatively record and commit.
+        let guard = tracker.check_and_tentatively_record(did, &nonce, BASE_TIMESTAMP);
+        assert!(guard.is_some());
+        guard.unwrap().commit(); // nonce stays recorded
+
+        // Nonce is still recorded — second attempt is rejected.
+        assert!(
+            tracker
+                .check_and_tentatively_record(did, &nonce, BASE_TIMESTAMP + 1)
+                .is_none()
+        );
     }
 
     // -----------------------------------------------------------------------
