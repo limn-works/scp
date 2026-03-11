@@ -168,9 +168,22 @@ pub struct ProtocolStore<S: Storage> {
     storage: S,
 }
 
-impl<S: Storage> ProtocolStore<S> {
+/// Production constructor — requires EncryptedStorage (sealed marker trait).
+/// Only storage backends that encrypt at rest satisfy this bound.
+impl<S: EncryptedStorage> ProtocolStore<S> {
     pub fn new(storage: S) -> Self;
+}
 
+/// Testing constructor — accepts any Storage without encryption.
+/// Available under #[cfg(test)] and behind the `allow_unencrypted_storage`
+/// feature flag. Production code must use `new()` with an EncryptedStorage
+/// backend (e.g., SqliteStorage, EncryptingAdapter<InMemoryStorage>).
+#[cfg(any(test, feature = "allow_unencrypted_storage"))]
+impl<S: Storage> ProtocolStore<S> {
+    pub fn new_for_testing(storage: S) -> Self;
+}
+
+impl<S: Storage> ProtocolStore<S> {
     // --- Context state ---
     pub async fn store_context_state(&self, context_id: &ContextId, state: &ContextState) -> Result<(), StoreError>;
     pub async fn load_context_state(&self, context_id: &ContextId) -> Result<Option<ContextState>, StoreError>;
@@ -318,7 +331,77 @@ pub struct StoredValue<T> {
 
 Every value written by `ProtocolStore` is wrapped in `StoredValue`. On read, `version` is checked before deserializing `data`. This enables lazy migration (section 17.10) without requiring schema-level versioning in the storage backend.
 
-**Encryption at rest** is a platform concern, not a storage layer concern. The `Storage` trait operates on opaque bytes. Encryption happens below:
+**Encryption at rest** is a platform concern enforced at compile time by the sealed `EncryptedStorage` marker trait.
+
+### EncryptedStorage — Compile-Time Encryption Enforcement
+
+`EncryptedStorage` (defined in `scp-platform/src/encrypted.rs`) is a sealed marker trait — only implementable inside the `scp-platform` crate. External crates can see and require the trait but cannot implement it for their own types. This prevents unencrypted backends from satisfying the bound.
+
+```rust
+/// scp-platform/src/encrypted.rs
+
+pub(crate) mod private {
+    pub trait Sealed {}
+}
+
+pub trait EncryptedStorage: Storage + private::Sealed {}
+```
+
+The seal mechanism uses a `pub(crate)` supertrait (`Sealed`) that external code cannot access. Any attempt to implement `EncryptedStorage` outside `scp-platform` fails at compile time. This ensures the encryption invariant is enforced by the type system, not by documentation or convention.
+
+**Production constructors require `EncryptedStorage`.** `ProtocolStore::new()` is bounded on `EncryptedStorage` (see §17.4). The testing constructor `ProtocolStore::new_for_testing()` accepts any `Storage` but is gated behind `#[cfg(test)]` and the `allow_unencrypted_storage` feature flag, preventing accidental use in production builds.
+
+**Implementations:**
+
+| Type | Mechanism | Notes |
+|------|-----------|-------|
+| `SqliteStorage` | Direct impl | SQLCipher provides full-database AES-256 encryption |
+| `AppleStorage` | Direct impl | iOS/macOS SQLCipher with Keychain-managed keys |
+| `EncryptingAdapter<S>` | Wraps any `Storage` | Per-value AES-256-GCM — for backends without native encryption |
+| `Arc<T: EncryptedStorage>` | Blanket impl | Enables shared ownership via `Arc` |
+
+### EncryptingAdapter — Per-Value AES-256-GCM Wrapper
+
+`EncryptingAdapter<S: Storage>` (defined in `scp-platform/src/encrypting_adapter.rs`) wraps any `Storage` implementation with per-value AES-256-GCM encryption, making it satisfy the sealed `EncryptedStorage` bound without requiring the inner backend to encrypt natively.
+
+**Key management:** The adapter is initialized with a 32-byte AES-256 key wrapped in `Zeroizing<[u8; 32]>` (cleared on drop). For ephemeral/FFI usage, the key is generated via `OsRng`. For persistent usage, the key should be derived from identity key material (see §17.6 SQLCipher key derivation).
+
+**Wire format:** Each stored value is:
+
+```
+nonce (12 bytes) || ciphertext || tag (16 bytes)
+```
+
+- **Nonce:** 12-byte random nonce generated via `OsRng` for each `store()` call (96-bit, AES-256-GCM standard).
+- **AAD (Additional Authenticated Data):** The storage key string (UTF-8 bytes). This binds each encrypted value to its key path, preventing relocation attacks (moving a ciphertext from one key to another causes decryption failure).
+- **Tag:** 128-bit GCM authentication tag, appended after the ciphertext.
+
+**Key names are NOT encrypted** — they pass through to the inner backend unmodified. The `ProtocolStore` key convention is deterministic and not secret. Only values are encrypted.
+
+**Usage pattern (matching `scp-node` ephemeral mode):**
+
+```rust
+use scp_platform::encrypting_adapter::EncryptingAdapter;
+use scp_platform::testing::InMemoryStorage;
+use zeroize::Zeroizing;
+
+let mut key = Zeroizing::new([0u8; 32]);
+OsRng.fill_bytes(&mut *key);
+let encrypted = EncryptingAdapter::new(InMemoryStorage::new(), key);
+// `encrypted` implements EncryptedStorage — pass to ProtocolStore::new().
+```
+
+### `allow_unencrypted_storage` Feature Gate
+
+The `allow_unencrypted_storage` feature flag in `scp-core` exposes `ProtocolStore::new_for_testing()`, which accepts any `Storage` without the `EncryptedStorage` bound. This is intended for:
+
+- **Unit tests** (`#[cfg(test)]`) — crate-internal tests get it automatically.
+- **Integration test crates** — enable the feature flag in `[dev-dependencies]`.
+- **CI** — test harnesses that need raw `InMemoryStorage` without encryption overhead.
+
+Production code (FFI bridges, application nodes, SDK wrappers) must NOT enable this feature. If a production backend does not natively encrypt, wrap it in `EncryptingAdapter` instead.
+
+The `Storage` trait operates on opaque bytes. Platform-specific encryption happens below:
 
 | Platform | Mechanism | Notes |
 |----------|-----------|-------|

@@ -4889,6 +4889,7 @@ dependencies = [
  "tracing",
  "uuid",
  "z-base-32",
+ "zeroize",
 ]
 
 [[package]]
