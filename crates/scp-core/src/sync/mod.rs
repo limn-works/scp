@@ -577,7 +577,7 @@ pub enum SyncError {
     /// reconciliation (§23.13). The event was rejected and not added to the
     /// local log.
     #[error(
-        "event signature failure in context {context_id} at sequence {event_sequence}: {reason}"
+        "event signature failure in context {context_id} at sequence {event_sequence} from {expected_signer}: {reason}"
     )]
     EventSignatureFailure {
         /// The context where the signature failure occurred.
@@ -592,7 +592,7 @@ pub enum SyncError {
     /// A gap in event sequence numbers could not be filled during
     /// reconciliation (§23.13 criterion 3-4).
     #[error(
-        "event gap detected in context {context_id}: missing sequences {missing_start}-{missing_end}"
+        "event gap detected in context {context_id}: missing sequences {missing_start}-{missing_end} (peer: {peer_did})"
     )]
     EventGapDetected {
         /// The context where the gap was detected.
@@ -1037,6 +1037,7 @@ mod tests {
         let s = err.to_string();
         assert!(s.contains("ctx-3"));
         assert!(s.contains("42"));
+        assert!(s.contains("did:dht:zAlice"));
         assert!(s.contains("invalid signature"));
     }
 
@@ -1051,6 +1052,7 @@ mod tests {
         let s = err.to_string();
         assert!(s.contains("ctx-4"));
         assert!(s.contains("6-7"));
+        assert!(s.contains("did:dht:zBob"));
     }
 
     #[test]
