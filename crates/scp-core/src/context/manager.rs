@@ -62,12 +62,14 @@ const MAX_TOOL_INTERFACES: usize = 256;
 /// Maximum number of governance threshold signers per context.
 const MAX_THRESHOLD_SIGNERS: usize = 64;
 
-/// Default ceiling change notification period in seconds (M7, §5.3).
+/// Default ceiling change notification period in seconds (M7, §5.3.2).
 ///
 /// When a governed context's ceiling is modified, the change is pending
 /// for this duration before taking effect. Members joined under the previous
 /// ceiling are notified and may leave before the expansion applies.
-const CEILING_CHANGE_NOTIFICATION_PERIOD_SECS: u64 = 86400; // 24 hours
+///
+/// Spec §5.3.2: "A mandatory notification period of 72 hours begins."
+const CEILING_CHANGE_NOTIFICATION_PERIOD_SECS: u64 = 259_200; // 72 hours
 
 // ---------------------------------------------------------------------------
 // PendingCeilingModification (M7)
