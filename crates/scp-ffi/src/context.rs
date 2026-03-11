@@ -1444,15 +1444,38 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
 /// Sets the economic policy for a context (§19.3).
 ///
 /// Accepts the economic policy as a JSON string. Validates the JSON against
-/// the `EconomicPolicy` schema before storing.
+/// the `EconomicPolicy` schema before storing. If the existing policy has
+/// `locked: true`, the mutation is rejected — matching the
+/// `ContextManager::execute_set_economic_policy` behaviour in scp-core.
+///
+/// # Warning
+///
+/// This is a low-level FFI function that directly overwrites the economic
+/// policy on the context handle. It does **not** go through governance —
+/// there is no event logging, no 24-hour notification period, and no
+/// proposal flow. Governance enforcement is the SDK / application layer's
+/// responsibility. See spec §19.3 and ADR-033 for the full governance
+/// requirements around economic policy changes.
 ///
 /// # Errors
 ///
 /// - `ValueError` if the JSON is invalid or does not parse as `EconomicPolicy`.
+/// - `PermissionError` if the existing economic policy is locked.
 /// - `ScpContextError` if the context handle is not valid.
 #[pyfunction]
 #[pyo3(signature = (handle, policy_json))]
 fn py_set_economic_policy(handle: &mut PyContextHandle, policy_json: &str) -> PyResult<()> {
+    // Check whether the existing policy is locked (§19.3).
+    if let Some(ref existing_json) = handle.params.economic_policy
+        && let Ok(existing) =
+            serde_json::from_str::<scp_core::economy::types::EconomicPolicy>(existing_json)
+        && existing.locked
+    {
+        return Err(pyo3::exceptions::PyPermissionError::new_err(
+            "economic policy is locked and cannot be changed",
+        ));
+    }
+
     let _policy: scp_core::economy::types::EconomicPolicy = serde_json::from_str(policy_json)
         .map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("invalid economic policy JSON: {e}"))
@@ -2737,5 +2760,41 @@ mod tests {
         );
         let result = py_get_economic_policy(&handle);
         assert_eq!(result.as_deref(), Some(json));
+    }
+
+    #[test]
+    fn set_economic_policy_rejects_when_locked() {
+        let locked_json = r#"{"locked":true,"cost_schedule":{"currency":[85,83,68,0],"per_message":1,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
+        let mut handle = PyContextHandle::new(
+            "ctx-econ-locked".to_owned(),
+            "did:test:creator".to_owned(),
+            PyContextParams {
+                economic_policy: Some(locked_json.to_owned()),
+                ..default_params()
+            },
+        );
+
+        let new_json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":2,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
+        let result = py_set_economic_policy(&mut handle, new_json);
+        assert!(result.is_err());
+        // Original locked policy should be unchanged.
+        assert_eq!(handle.params.economic_policy.as_deref(), Some(locked_json));
+    }
+
+    #[test]
+    fn set_economic_policy_allows_when_unlocked() {
+        let unlocked_json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":1,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
+        let mut handle = PyContextHandle::new(
+            "ctx-econ-unlocked".to_owned(),
+            "did:test:creator".to_owned(),
+            PyContextParams {
+                economic_policy: Some(unlocked_json.to_owned()),
+                ..default_params()
+            },
+        );
+
+        let new_json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":2,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
+        py_set_economic_policy(&mut handle, new_json).unwrap();
+        assert_eq!(handle.params.economic_policy.as_deref(), Some(new_json));
     }
 }

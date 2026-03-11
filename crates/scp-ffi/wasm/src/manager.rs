@@ -2662,17 +2662,41 @@ impl WasmContextManager {
     /// Sets the economic policy for a context by direct mutation.
     ///
     /// This is the standalone setter matching the `PyO3` bridge pattern.
-    /// Does not go through governance actions.
+    /// Does not go through governance actions. If the existing policy has
+    /// `locked: true`, the mutation is rejected — matching the
+    /// `ContextManager::execute_set_economic_policy` behaviour in scp-core.
+    ///
+    /// # Warning
+    ///
+    /// This function directly overwrites the policy without governance
+    /// checks. No event logging, no 24-hour notification period, no
+    /// proposal flow. Governance enforcement is the SDK / application
+    /// layer's responsibility.
     ///
     /// # Errors
     ///
-    /// Returns an error if the context is not active.
+    /// Returns an error if the context is not active or the existing policy
+    /// is locked.
     pub fn set_economic_policy(
         &mut self,
         context_id: &str,
         policy_json: String,
     ) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
+
+        // Check whether the existing policy is locked (§19.3).
+        // Best-effort parse: WASM cannot import scp-core's EconomicPolicy
+        // (ADR-034), so we check the `locked` field via generic JSON.
+        if let Some(ref existing_json) = ctx.economic_policy
+            && let Ok(obj) = serde_json::from_str::<serde_json::Value>(existing_json)
+            && obj.get("locked") == Some(&serde_json::Value::Bool(true))
+        {
+            return Err(ScpWasmError::Context {
+                message: "economic policy is locked and cannot be changed".to_owned(),
+                code: "SCP-CTX-2013".to_owned(),
+            });
+        }
+
         ctx.economic_policy = Some(policy_json);
         Ok(())
     }
