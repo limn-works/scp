@@ -5006,10 +5006,7 @@ mod tests {
         let bytes = rmp_serde::to_vec_named(&envelope).unwrap();
 
         let storage = Arc::new(InMemoryStorage::new());
-        storage
-            .store(IDENTITY_STORAGE_KEY, &bytes)
-            .await
-            .unwrap();
+        storage.store(IDENTITY_STORAGE_KEY, &bytes).await.unwrap();
 
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
