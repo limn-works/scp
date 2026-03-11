@@ -191,7 +191,12 @@ export declare class Context {
 
   send(payload: Uint8Array | string): Promise<void>;
   receive(): AsyncIterable<Message>;
-  invokeTool(toolId: string, input: Record<string, unknown>): Promise<ToolResult>;
+  invokeTool(
+    toolId: string,
+    input: Record<string, unknown>,
+    identity: Identity,
+    options?: { readonly ucanToken?: string },
+  ): Promise<ToolResult>;
   leave(): Promise<void>;
   close(): Promise<void>;
 }

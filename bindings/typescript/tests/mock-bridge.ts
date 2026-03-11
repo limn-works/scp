@@ -342,6 +342,7 @@ export function createMockBridge(): Bridge & {
       toolId: string,
       inputJson: string,
       identityDid: string,
+      ucanToken?: string,
     ): Promise<string> {
       const ctx = getContext(handle);
       const tool = ctx.tools.get(toolId) as
@@ -349,6 +350,16 @@ export function createMockBridge(): Bridge & {
         | undefined;
       if (tool === undefined) {
         throw new Error(`[SCP-TOOL-6001] Tool not found: ${toolId}`);
+      }
+
+      // Validate UCAN token is provided (mirrors WASM bridge behavior)
+      if (ucanToken === undefined || ucanToken === "") {
+        throw new Error("[SCP-VALID-7000] ucan_token is required for tool invocation");
+      }
+
+      // Check token is not revoked
+      if (ctx.revokedTokens.has(ucanToken)) {
+        throw new Error("[SCP-PERM-3001] Token has been revoked");
       }
 
       const input = JSON.parse(inputJson) as unknown;
@@ -365,7 +376,7 @@ export function createMockBridge(): Bridge & {
         eventType: "ToolInvoked",
         actorDid: identityDid,
         timestamp: Math.floor(Date.now() / 1000),
-        payload: { toolId, toolName: tool.name },
+        payload: { toolId, toolName: tool.name, ucanProvided: true },
         sequence: ctx.events.length,
       });
 

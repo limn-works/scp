@@ -240,14 +240,96 @@ describe("Tool runtime (mock bridge)", () => {
       return { sum: a + b };
     });
 
+    // Mint a UCAN token for tool invocation
+    const ucan = await mockBridge.ucanMint(ctx, identity.did, ["tool_invoke:*"]);
+
     const resultJson = await mockBridge.toolInvoke(
       ctx,
       toolId,
       JSON.stringify({ a: 3, b: 4 }),
       identity.did,
+      ucan.encoded,
     );
     const result = JSON.parse(resultJson) as { sum: number };
     expect(result.sum).toBe(7);
+  });
+
+  it("rejects tool invocation without a UCAN token", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const ctx = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({
+        ceiling: ["tools:register", "tools:invoke"],
+      }),
+    );
+
+    const def = defineToolDefinition({
+      name: "noop-tool",
+      description: "Does nothing",
+      inputSchema: { type: "object" },
+      outputSchema: { type: "object" },
+      operator: identity.did,
+    });
+
+    const toolId = await mockBridge.toolRegister(ctx, def);
+
+    await expect(mockBridge.toolInvoke(ctx, toolId, "{}", identity.did)).rejects.toThrow(
+      /SCP-VALID-7000/,
+    );
+  });
+
+  it("rejects tool invocation with an empty UCAN token", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const ctx = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({
+        ceiling: ["tools:register", "tools:invoke"],
+      }),
+    );
+
+    const def = defineToolDefinition({
+      name: "noop-tool-2",
+      description: "Does nothing",
+      inputSchema: { type: "object" },
+      outputSchema: { type: "object" },
+      operator: identity.did,
+    });
+
+    const toolId = await mockBridge.toolRegister(ctx, def);
+
+    await expect(mockBridge.toolInvoke(ctx, toolId, "{}", identity.did, "")).rejects.toThrow(
+      /SCP-VALID-7000/,
+    );
+  });
+
+  it("rejects tool invocation with a revoked UCAN token", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const ctx = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({
+        ceiling: ["tools:register", "tools:invoke"],
+      }),
+    );
+
+    const def = defineToolDefinition({
+      name: "revoked-test-tool",
+      description: "Test revocation",
+      inputSchema: { type: "object" },
+      outputSchema: { type: "object" },
+      operator: identity.did,
+    });
+
+    const toolId = await mockBridge.toolRegister(ctx, def);
+
+    const ucan = await mockBridge.ucanMint(ctx, identity.did, ["tool_invoke:*"]);
+
+    // Revoke the token
+    await mockBridge.ucanRevoke(ctx, ucan.encoded);
+
+    // Invocation should fail
+    await expect(
+      mockBridge.toolInvoke(ctx, toolId, "{}", identity.did, ucan.encoded),
+    ).rejects.toThrow(/SCP-PERM-3001/);
   });
 
   it("verifies a tool with test vectors — pass", async () => {
@@ -319,8 +401,10 @@ describe("Tool runtime (mock bridge)", () => {
       }),
     );
 
+    const ucan = await mockBridge.ucanMint(ctx, identity.did, ["tool_invoke:*"]);
+
     await expect(
-      mockBridge.toolInvoke(ctx, "tool-nonexistent", "{}", identity.did),
+      mockBridge.toolInvoke(ctx, "tool-nonexistent", "{}", identity.did, ucan.encoded),
     ).rejects.toThrow(/SCP-TOOL-6001/);
   });
 });
@@ -617,8 +701,11 @@ describe("Trust evaluation runtime (mock bridge)", () => {
     const toolId = await mockBridge.toolRegister(ctx, def);
     mockBridge._registerToolHandler(ctx.contextId, toolId, (input) => input);
 
-    await mockBridge.toolInvoke(ctx, toolId, JSON.stringify({ x: 1 }), identity.did);
-    await mockBridge.toolInvoke(ctx, toolId, JSON.stringify({ x: 2 }), identity.did);
+    // Mint a UCAN token for tool invocation
+    const ucan = await mockBridge.ucanMint(ctx, identity.did, ["tool_invoke:*"]);
+
+    await mockBridge.toolInvoke(ctx, toolId, JSON.stringify({ x: 1 }), identity.did, ucan.encoded);
+    await mockBridge.toolInvoke(ctx, toolId, JSON.stringify({ x: 2 }), identity.did, ucan.encoded);
 
     // Query events for the identity (simulating what evaluateTrust does)
     const events = await mockBridge.eventLogQuery(ctx, {

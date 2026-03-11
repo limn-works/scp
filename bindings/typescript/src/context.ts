@@ -221,13 +221,21 @@ export class Context implements AsyncDisposable {
    * @param toolId - The ID of the tool to invoke.
    * @param input - Tool input parameters.
    * @param identity - The invoking identity.
+   * @param options - Optional parameters for tool invocation.
+   * @param options.ucanToken - JWT-encoded UCAN token authorizing the invocation.
+   *   Must contain `tool_invoke:{toolId}` or `tool_invoke:*` capability scoped
+   *   to this context. Required by the WASM bridge; the native bridge also
+   *   validates it when provided. See spec section 6.2, section 8, and ADR-016.
    * @returns The tool output as a parsed JSON object.
    * @throws {ToolError} If invocation fails or the tool is not found.
+   * @throws {UcanPermissionError} If the UCAN token is invalid, expired,
+   *   revoked, or lacks the required tool invocation capability.
    */
   async invokeTool(
     toolId: string,
     input: Readonly<Record<string, unknown>>,
     identity: Identity,
+    options?: { readonly ucanToken?: string },
   ): Promise<unknown> {
     this.assertActive();
     try {
@@ -237,6 +245,7 @@ export class Context implements AsyncDisposable {
         toolId,
         JSON.stringify(input),
         identity.did,
+        options?.ucanToken,
       );
       return safeJsonParse(resultJson, "toolInvoke") as unknown;
     } catch (error) {
