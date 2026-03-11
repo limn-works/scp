@@ -32,14 +32,34 @@ pub fn now_ms() -> f64 {
     captured_date_now()
 }
 
+/// Returns the current time in milliseconds since Unix epoch as `u64`.
+///
+/// Converts the `f64` value from `Date.now()` to `u64`. Negative values
+/// (clock misconfiguration) are clamped to `0`. The `f64` representation
+/// is exact for integers up to 2^53, and Unix millis in 2026 (~1.8e12) is
+/// well within that range.
+///
+/// Used by nonce freshness validation, which needs millisecond precision
+/// with integer arithmetic to match scp-core's `NonceTracker`.
+#[must_use]
+pub fn now_ms_u64() -> u64 {
+    let ms = now_ms();
+    if ms < 0.0 {
+        return 0;
+    }
+    // f64 -> u64: sign loss is guarded above; truncation is safe because
+    // Unix millis (~1.8e12) is far below u64::MAX (~1.8e19).
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    {
+        ms as u64
+    }
+}
+
 /// Returns the current time in seconds since Unix epoch (truncated).
 ///
 /// Convenience wrapper for UCAN time validation and other second-precision
 /// checks.
 #[must_use]
 pub fn now_secs() -> u64 {
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    {
-        (now_ms() / 1000.0) as u64
-    }
+    now_ms_u64() / 1000
 }

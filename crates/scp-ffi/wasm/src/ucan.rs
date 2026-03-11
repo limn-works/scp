@@ -608,22 +608,6 @@ fn now_secs() -> u64 {
     crate::time::now_secs()
 }
 
-/// Returns the current time in milliseconds (from captured `Date.now`).
-fn now_ms_u64() -> u64 {
-    // `crate::time::now_ms()` returns `f64` from `Date.now()`.
-    // Convert to `u64` for precise integer comparison matching scp-core.
-    let ms = crate::time::now_ms();
-    if ms < 0.0 {
-        return 0;
-    }
-    // f64 can represent integers up to 2^53 exactly. Unix millis in 2026
-    // is ~1.8×10^12, well within that range, so this conversion is lossless.
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    {
-        ms as u64
-    }
-}
-
 /// Validates UCAN nonce format and freshness, matching scp-core's
 /// `NonceTracker::check_and_record` (steps 1–2).
 ///
@@ -652,7 +636,7 @@ fn validate_nonce_format_and_freshness(nonce: &str) -> Result<(), String> {
     }
 
     // 2. Freshness: timestamp within now +/- 5 minutes.
-    let now = now_ms_u64();
+    let now = crate::time::now_ms_u64();
 
     if nonce_millis.saturating_add(NONCE_FRESHNESS_TOLERANCE_MS) < now {
         return Err(format!("nonce too old: {nonce}"));
