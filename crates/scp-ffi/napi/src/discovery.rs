@@ -128,14 +128,14 @@ fn discovery_result_to_json(
     let (source_str, trust_level_kind, resolution_layer, resolution_source, resolution_source_id) =
         match &result.discovery_source {
             scp_core::discovery::ContextDiscoverySource::DhtDidDocument => {
-                ("dht_did_document", "domain_verified", "domain", "dht", None)
+                ("dht_did_document", "DomainVerified", "domain", "dht", None)
             }
             scp_core::discovery::ContextDiscoverySource::WellKnown => {
-                ("well_known", "domain_verified", "domain", "well-known", None)
+                ("well_known", "DomainVerified", "domain", "well-known", None)
             }
             scp_core::discovery::ContextDiscoverySource::DiscoveryContext { context_id } => (
                 "discovery_context",
-                "discovery_context_verified",
+                "DiscoveryContextVerified",
                 "discovery_context",
                 "discovery_context",
                 Some(context_id.as_str()),
@@ -143,9 +143,13 @@ fn discovery_result_to_json(
             // §22.7: An scp:// URI is shared out-of-band, so the trust level is
             // DirectExchange and the resolution layer is "domain" (closest match
             // for URI-based resolution — no discovery context is involved).
-            scp_core::discovery::ContextDiscoverySource::ContextUri => {
-                ("context_uri", "direct_exchange", "domain", "context_uri", None)
-            }
+            scp_core::discovery::ContextDiscoverySource::ContextUri => (
+                "context_uri",
+                "DirectExchange",
+                "domain",
+                "context_uri",
+                None,
+            ),
         };
 
     let now_secs = std::time::SystemTime::now()
@@ -313,7 +317,7 @@ mod tests {
         assert_eq!(json["mode"], "broadcast");
         // §22.7: trust_level is a discriminated union object; resolution_path
         // uses spec snake_case layer values.
-        assert_eq!(json["trust_level"]["kind"], "domain_verified");
+        assert_eq!(json["trust_level"]["kind"], "DomainVerified");
         assert_eq!(json["resolution_path"]["layer"], "domain");
         assert_eq!(json["resolution_path"]["source"], "dht");
         assert!(json["resolution_path"]["resolved_at"].as_u64().unwrap() > 0);
@@ -333,7 +337,7 @@ mod tests {
         };
 
         let json = discovery_result_to_json(&result);
-        assert_eq!(json["trust_level"]["kind"], "discovery_context_verified");
+        assert_eq!(json["trust_level"]["kind"], "DiscoveryContextVerified");
         assert_eq!(json["resolution_path"]["layer"], "discovery_context");
         assert_eq!(json["resolution_path"]["source"], "discovery_context");
         assert_eq!(json["resolution_path"]["source_id"], "disc-ctx-1");

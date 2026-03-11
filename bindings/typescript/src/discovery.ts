@@ -62,23 +62,33 @@ function parseResolutionPath(raw: Record<string, unknown>): ResolutionPath {
 /**
  * Parses a trust level from the bridge JSON. The NAPI bridge emits trust
  * levels as `{ "kind": "..." }` objects (discriminated unions per §22.7).
- * The `multi_layer_corroborated` variant additionally carries `sources`.
+ * The `MultiLayerCorroborated` variant additionally carries `sources`.
+ *
+ * Also handles legacy string values (e.g. `"DomainVerified"`) by wrapping
+ * them into the discriminated union shape.
  */
 function parseTrustLevel(raw: unknown): TrustLevel {
   if (raw != null && typeof raw === "object" && "kind" in raw) {
     const obj = raw as Record<string, unknown>;
     const kind = obj.kind as string;
-    if (kind === "multi_layer_corroborated") {
+    if (kind === "MultiLayerCorroborated") {
       const rawSources = (obj.sources ?? []) as Array<Record<string, unknown>>;
       return {
-        kind: "multi_layer_corroborated",
+        kind: "MultiLayerCorroborated",
         sources: rawSources.map(parseResolutionPath),
       };
     }
     return { kind } as TrustLevel;
   }
+  // Handle plain string trust levels from the bridge.
+  if (typeof raw === "string") {
+    if (raw === "MultiLayerCorroborated") {
+      return { kind: "MultiLayerCorroborated", sources: [] };
+    }
+    return { kind: raw } as TrustLevel;
+  }
   // Fallback for unexpected input.
-  return { kind: "unverified" };
+  return { kind: "DiscoveryContextVerified" };
 }
 
 /**

@@ -136,26 +136,25 @@ describe("type definitions", () => {
 
   it("TrustLevel accepts all simple variants", () => {
     const levels: TrustLevel[] = [
-      { kind: "unverified" },
-      { kind: "petname_only" },
-      { kind: "discovery_context_verified" },
-      { kind: "domain_verified" },
-      { kind: "attestation_verified" },
-      { kind: "direct_exchange" },
+      { kind: "DirectExchange" },
+      { kind: "LocalPetname" },
+      { kind: "DomainVerified" },
+      { kind: "AttestationVerified" },
+      { kind: "DiscoveryContextVerified" },
     ];
-    expect(levels).toHaveLength(6);
+    expect(levels).toHaveLength(5);
   });
 
-  it("TrustLevel multi_layer_corroborated carries sources", () => {
+  it("TrustLevel MultiLayerCorroborated carries sources", () => {
     const level: TrustLevel = {
-      kind: "multi_layer_corroborated",
+      kind: "MultiLayerCorroborated",
       sources: [
         { layer: "petname", source: "local", sourceId: null, resolvedAt: 1700000000 },
         { layer: "domain", source: "example.com", sourceId: null, resolvedAt: 1700000000 },
       ],
     };
-    expect(level.kind).toBe("multi_layer_corroborated");
-    if (level.kind === "multi_layer_corroborated") {
+    expect(level.kind).toBe("MultiLayerCorroborated");
+    if (level.kind === "MultiLayerCorroborated") {
       expect(level.sources).toHaveLength(2);
     }
   });
@@ -187,7 +186,7 @@ describe("type definitions", () => {
     const resolution: AddressResolution = {
       type: "Identity",
       did: "did:dht:z6MkAlice",
-      trustLevel: { kind: "discovery_context_verified" },
+      trustLevel: { kind: "DiscoveryContextVerified" },
       resolutionPath: {
         layer: "discovery_context",
         source: "cooking-community",
@@ -198,7 +197,7 @@ describe("type definitions", () => {
     expect(resolution.type).toBe("Identity");
     if (resolution.type === "Identity") {
       expect(resolution.did).toBe("did:dht:z6MkAlice");
-      expect(resolution.trustLevel.kind).toBe("discovery_context_verified");
+      expect(resolution.trustLevel.kind).toBe("DiscoveryContextVerified");
       expect(resolution.resolutionPath.layer).toBe("discovery_context");
     }
   });
@@ -209,7 +208,7 @@ describe("type definitions", () => {
       contextId: "a1b2c3d4e5f6",
       relayUrls: ["wss://relay.example.com/scp/v1"],
       mode: "broadcast",
-      trustLevel: { kind: "domain_verified" },
+      trustLevel: { kind: "DomainVerified" },
       resolutionPath: {
         layer: "domain",
         source: "dht",
@@ -222,7 +221,7 @@ describe("type definitions", () => {
       expect(resolution.contextId).toBe("a1b2c3d4e5f6");
       expect(resolution.relayUrls).toEqual(["wss://relay.example.com/scp/v1"]);
       expect(resolution.mode).toBe("broadcast");
-      expect(resolution.trustLevel.kind).toBe("domain_verified");
+      expect(resolution.trustLevel.kind).toBe("DomainVerified");
       expect(resolution.resolutionPath.layer).toBe("domain");
     }
   });
@@ -233,7 +232,7 @@ describe("type definitions", () => {
       contextId: "deadbeef",
       relayUrls: [],
       mode: null,
-      trustLevel: { kind: "discovery_context_verified" },
+      trustLevel: { kind: "DiscoveryContextVerified" },
       resolutionPath: {
         layer: "discovery_context",
         source: "discovery_context",

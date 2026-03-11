@@ -429,19 +429,20 @@ export interface RequireParticipation {
  * context-dependent. The SDK exposes them to consumers; consumers decide
  * what is sufficient.
  *
- * Modeled as a discriminated union so that `multi_layer_corroborated` can
+ * Modeled as a discriminated union so that `MultiLayerCorroborated` can
  * carry its required `sources` field (§22.7).
+ *
+ * Variant names use PascalCase matching the spec definitions.
  *
  * See §22.7 Trust Levels.
  */
 export type TrustLevel =
-  | { readonly kind: "unverified" }
-  | { readonly kind: "petname_only" }
-  | { readonly kind: "discovery_context_verified" }
-  | { readonly kind: "domain_verified" }
-  | { readonly kind: "attestation_verified" }
-  | { readonly kind: "direct_exchange" }
-  | { readonly kind: "multi_layer_corroborated"; readonly sources: readonly ResolutionPath[] };
+  | { readonly kind: "DirectExchange" }
+  | { readonly kind: "LocalPetname" }
+  | { readonly kind: "DomainVerified" }
+  | { readonly kind: "AttestationVerified" }
+  | { readonly kind: "DiscoveryContextVerified" }
+  | { readonly kind: "MultiLayerCorroborated"; readonly sources: readonly ResolutionPath[] };
 
 /**
  * The resolution layer that produced an address resolution result.
