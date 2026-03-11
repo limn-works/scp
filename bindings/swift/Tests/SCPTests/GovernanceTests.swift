@@ -652,6 +652,47 @@ struct GovernanceTests {
         }
     }
 
+    @Test("broadcastUnblockSubscriber calls bridge with subscriber and unblocker DIDs")
+    func broadcastUnblockSubscriberRoundtrip() async throws {
+        let context = makeActiveContext()
+
+        var receivedSubscriber: String?
+        var receivedUnblocker: String?
+        let mockUnblock: BroadcastBridge.UnblockSubscriberFn = { _, subscriber, unblocker in
+            receivedSubscriber = subscriber
+            receivedUnblocker = unblocker
+        }
+
+        try await context.broadcastUnblockSubscriber(
+            subscriberDid: "did:dht:z6MkBadActor",
+            unblockerDid: "did:dht:z6MkAdmin",
+            unblockSubscriberFn: mockUnblock
+        )
+        #expect(receivedSubscriber == "did:dht:z6MkBadActor")
+        #expect(receivedUnblocker == "did:dht:z6MkAdmin")
+    }
+
+    @Test("broadcastUnblockSubscriber throws SCP-CTX-2001 when context is closed")
+    func broadcastUnblockSubscriberThrowsWhenClosed() async throws {
+        let context = try await makeClosedContext()
+
+        do {
+            try await context.broadcastUnblockSubscriber(
+                subscriberDid: "did:dht:z6MkBad",
+                unblockerDid: "did:dht:z6MkAdmin"
+            )
+            Issue.record("Expected broadcastUnblockSubscriber to throw on closed context")
+        } catch let error as ScpError {
+            if case let .Context(_, code) = error {
+                #expect(code == "SCP-CTX-2001")
+            } else {
+                Issue.record("Expected ScpError.Context, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected ScpError, got \(type(of: error))")
+        }
+    }
+
     @Test("broadcastHandleKeyRequest calls bridge and returns decision")
     func broadcastHandleKeyRequestRoundtrip() async throws {
         let context = makeActiveContext()

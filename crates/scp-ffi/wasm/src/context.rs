@@ -533,6 +533,9 @@ pub fn broadcast_unsubscribe(handle: &WasmContextHandle, subscriber_did: String)
 /// Delegates to `WasmContextManager::block_broadcast_subscriber`.
 #[wasm_bindgen]
 pub fn broadcast_block(handle: &WasmContextHandle, subscriber_did: String) -> Promise {
+    if let Err(e) = validate_did(&subscriber_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
     let context_id = handle.context_id();
 
     future_to_promise(async move {
@@ -550,6 +553,9 @@ pub fn broadcast_block(handle: &WasmContextHandle, subscriber_did: String) -> Pr
 /// Delegates to `WasmContextManager::unblock_broadcast_subscriber`.
 #[wasm_bindgen]
 pub fn broadcast_unblock(handle: &WasmContextHandle, subscriber_did: String) -> Promise {
+    if let Err(e) = validate_did(&subscriber_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
     let context_id = handle.context_id();
 
     future_to_promise(async move {

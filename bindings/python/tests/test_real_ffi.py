@@ -441,6 +441,47 @@ class TestBroadcast:
         _scp_core.py_broadcast_unsubscribe(handle, bob.did, False)
         assert not _scp_core.py_broadcast_is_subscriber(handle, bob.did)
 
+    async def test_block_and_unblock(self):
+        alice = await Identity.create(CustodyType.IN_MEMORY)
+        handle = _scp_core.py_context_create(
+            alice.did,
+            {
+                "ceiling": ["messages:read", "messages:write"],
+                "memory_scope": "full",
+                "governance": "single_admin",
+                "mode": "broadcast",
+            },
+        )
+        bob = await Identity.create(CustodyType.IN_MEMORY)
+
+        _scp_core.py_broadcast_subscribe(handle, bob.did)
+        assert _scp_core.py_broadcast_is_subscriber(handle, bob.did)
+
+        # Block bob.
+        _scp_core.py_broadcast_block_subscriber(handle, bob.did, alice.did)
+        assert not _scp_core.py_broadcast_is_subscriber(handle, bob.did)
+
+        # Unblock bob — subscriber status should be restored.
+        _scp_core.py_broadcast_unblock_subscriber(handle, bob.did, alice.did)
+
+    async def test_unblock_not_blocked_raises(self):
+        alice = await Identity.create(CustodyType.IN_MEMORY)
+        handle = _scp_core.py_context_create(
+            alice.did,
+            {
+                "ceiling": ["messages:read", "messages:write"],
+                "memory_scope": "full",
+                "governance": "single_admin",
+                "mode": "broadcast",
+            },
+        )
+        bob = await Identity.create(CustodyType.IN_MEMORY)
+
+        _scp_core.py_broadcast_subscribe(handle, bob.did)
+
+        with pytest.raises(RuntimeError):
+            _scp_core.py_broadcast_unblock_subscriber(handle, bob.did, alice.did)
+
 
 # ---------------------------------------------------------------------------
 # Bridge Connector

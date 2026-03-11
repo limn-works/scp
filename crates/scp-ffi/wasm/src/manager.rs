@@ -212,6 +212,14 @@ pub enum WasmContextEvent {
         sequence_number: u64,
         payload_base64: String,
     },
+    MemberBlocked {
+        blocked_did: String,
+        author_did: String,
+    },
+    MemberUnblocked {
+        unblocked_did: String,
+        author_did: String,
+    },
     WriteAccessRevoked {
         did: String,
     },
@@ -2410,16 +2418,25 @@ impl WasmContextManager {
     ) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
-        let bc = ctx
-            .broadcast
-            .as_mut()
-            .ok_or_else(|| ScpWasmError::Context {
-                message: "not a broadcast context".to_owned(),
-                code: "SCP-CTX-2001".to_owned(),
-            })?;
+        let author_did = ctx.creator_did.clone();
 
-        bc.subscribers.remove(subscriber_did);
-        bc.blocked_subscribers.insert(subscriber_did.to_owned());
+        {
+            let bc = ctx
+                .broadcast
+                .as_mut()
+                .ok_or_else(|| ScpWasmError::Context {
+                    message: "not a broadcast context".to_owned(),
+                    code: "SCP-CTX-2001".to_owned(),
+                })?;
+
+            bc.subscribers.remove(subscriber_did);
+            bc.blocked_subscribers.insert(subscriber_did.to_owned());
+        }
+
+        ctx.push_event(WasmContextEvent::MemberBlocked {
+            blocked_did: subscriber_did.to_owned(),
+            author_did,
+        });
 
         Ok(())
     }
@@ -2443,20 +2460,34 @@ impl WasmContextManager {
     ) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
-        let bc = ctx
-            .broadcast
-            .as_mut()
-            .ok_or_else(|| ScpWasmError::Context {
-                message: "not a broadcast context".to_owned(),
-                code: "SCP-CTX-2001".to_owned(),
-            })?;
+        let author_did = ctx.creator_did.clone();
 
-        if !bc.blocked_subscribers.remove(subscriber_did) {
-            return Err(ScpWasmError::Context {
-                message: format!("subscriber not blocked: {subscriber_did}"),
-                code: "SCP-CTX-2001".to_owned(),
-            });
+        {
+            let bc = ctx
+                .broadcast
+                .as_mut()
+                .ok_or_else(|| ScpWasmError::Context {
+                    message: "not a broadcast context".to_owned(),
+                    code: "SCP-CTX-2001".to_owned(),
+                })?;
+
+            if !bc.blocked_subscribers.remove(subscriber_did) {
+                return Err(ScpWasmError::Context {
+                    message: format!("subscriber not blocked: {subscriber_did}"),
+                    code: "SCP-CTX-2001".to_owned(),
+                });
+            }
+
+            // Re-add to subscribers so handle_broadcast_key_request recognises
+            // the DID. Without this the subscriber is in neither set after
+            // block+unblock.
+            bc.subscribers.insert(subscriber_did.to_owned());
         }
+
+        ctx.push_event(WasmContextEvent::MemberUnblocked {
+            unblocked_did: subscriber_did.to_owned(),
+            author_did,
+        });
 
         Ok(())
     }

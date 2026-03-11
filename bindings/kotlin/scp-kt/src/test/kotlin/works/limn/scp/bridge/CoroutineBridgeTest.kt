@@ -404,6 +404,45 @@ class CoroutineBridgeTest {
     }
 
     // -------------------------------------------------------------------
+    // Broadcast block/unblock tests
+    // -------------------------------------------------------------------
+
+    @Nested
+    inner class BroadcastBlockUnblock {
+        @Test
+        fun `broadcastUnblockSubscriber dispatches on IO with correct args`() =
+            runTest(ioDispatcher) {
+                bridge.broadcast.unblockSubscriber(1L, "did:dht:z6MkSub", "did:dht:z6MkAdmin")
+                assertTrue(stubBindings.broadcastUnblockCalled)
+                assertEquals("did:dht:z6MkSub", stubBindings.lastUnblockSubscriberDid)
+                assertEquals("did:dht:z6MkAdmin", stubBindings.lastUnblockUnblockerDid)
+            }
+
+        @Test
+        fun `broadcastBlockSubscriber dispatches on IO with correct args`() =
+            runTest(ioDispatcher) {
+                bridge.broadcast.blockSubscriber(1L, "did:dht:z6MkBad", "did:dht:z6MkBlocker")
+                assertTrue(stubBindings.broadcastBlockCalled)
+                assertEquals("did:dht:z6MkBad", stubBindings.lastBlockSubscriberDid)
+                assertEquals("did:dht:z6MkBlocker", stubBindings.lastBlockBlockerDid)
+            }
+
+        @Test
+        fun `broadcastUnblockSubscriber propagates BridgeException`() =
+            runTest(ioDispatcher) {
+                stubBindings.broadcastUnblockThrows =
+                    BridgeException("subscriber not blocked", "SCP-CTX-2001")
+
+                val exception =
+                    assertFailsWith<BridgeException> {
+                        bridge.broadcast.unblockSubscriber(1L, "did:dht:z6MkSub", "did:dht:z6MkAdmin")
+                    }
+
+                assertEquals("SCP-CTX-2001", exception.code)
+            }
+    }
+
+    // -------------------------------------------------------------------
     // Error handling tests
     // -------------------------------------------------------------------
 
@@ -547,11 +586,27 @@ class StubNativeBindings : NativeBindings {
         """{"status":"executed"}"""
 
     // BroadcastBindings
+    var broadcastBlockCalled = false
+    var broadcastUnblockCalled = false
+    var lastBlockSubscriberDid: String? = null
+    var lastBlockBlockerDid: String? = null
+    var lastUnblockSubscriberDid: String? = null
+    var lastUnblockUnblockerDid: String? = null
+    var broadcastUnblockThrows: Exception? = null
     override fun broadcastSubscribe(contextHandle: Long, subscriberDid: String) = Unit
     override fun broadcastUnsubscribe(contextHandle: Long, subscriberDid: String, rotateKeys: Boolean) = Unit
     override fun broadcastPublish(contextHandle: Long, authorDid: String, payload: ByteArray) = Unit
-    override fun broadcastBlockSubscriber(contextHandle: Long, subscriberDid: String, blockerDid: String) = Unit
-    override fun broadcastUnblockSubscriber(contextHandle: Long, subscriberDid: String, unblockerDid: String) = Unit
+    override fun broadcastBlockSubscriber(contextHandle: Long, subscriberDid: String, blockerDid: String) {
+        broadcastBlockCalled = true
+        lastBlockSubscriberDid = subscriberDid
+        lastBlockBlockerDid = blockerDid
+    }
+    override fun broadcastUnblockSubscriber(contextHandle: Long, subscriberDid: String, unblockerDid: String) {
+        broadcastUnblockCalled = true
+        lastUnblockSubscriberDid = subscriberDid
+        lastUnblockUnblockerDid = unblockerDid
+        broadcastUnblockThrows?.let { throw it }
+    }
     override fun broadcastHandleKeyRequest(contextHandle: Long, authorDid: String, requesterDid: String): String =
         """{"key":"stub"}"""
     override fun broadcastSubscriberCount(contextHandle: Long): Long? = 0L

@@ -2845,7 +2845,7 @@ impl ContextManager {
     ///   or is not a broadcast context.
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::MemberNotFound`] if the author DID is not registered.
-    /// - [`ContextError::PermissionDenied`] if the subscriber is not blocked.
+    /// - [`ContextError::InvalidState`] if the subscriber is not blocked.
     pub async fn unblock_broadcast_subscriber(
         &self,
         context_id: &str,

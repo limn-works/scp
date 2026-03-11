@@ -868,7 +868,7 @@ impl BroadcastContext {
     /// # Errors
     ///
     /// - [`ContextError::MemberNotFound`] if the author DID is not registered.
-    /// - [`ContextError::PermissionDenied`] if the subscriber is not blocked.
+    /// - [`ContextError::InvalidState`] if the subscriber is not blocked.
     pub fn unblock_subscriber(
         &mut self,
         author_did: &str,
@@ -879,7 +879,7 @@ impl BroadcastContext {
         })?;
 
         if !author.block_list.remove(unblocked_did) {
-            return Err(ContextError::PermissionDenied(format!(
+            return Err(ContextError::InvalidState(format!(
                 "subscriber not blocked: {unblocked_did}"
             )));
         }

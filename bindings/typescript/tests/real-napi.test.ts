@@ -1000,6 +1000,45 @@ if (bridge === null) {
       expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(false);
     });
 
+    test("unblock restores subscriber after block", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const subscriber = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read"],
+          mode: "Broadcast",
+        }),
+      );
+
+      await napi.broadcastSubscribe(ctx, subscriber.did);
+      expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(true);
+
+      // Block then unblock.
+      await napi.broadcastBlockSubscriber(ctx, subscriber.did, identity.did);
+      expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(false);
+
+      await napi.broadcastUnblockSubscriber(ctx, subscriber.did, identity.did);
+    });
+
+    test("unblock non-blocked subscriber throws", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const subscriber = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read"],
+          mode: "Broadcast",
+        }),
+      );
+
+      await napi.broadcastSubscribe(ctx, subscriber.did);
+
+      await expect(
+        napi.broadcastUnblockSubscriber(ctx, subscriber.did, identity.did),
+      ).rejects.toThrow();
+    });
+
     test("handle key request returns a decision", async () => {
       const identity = await napi.identityCreate("in_memory");
       const subscriber = await napi.identityCreate("in_memory");
