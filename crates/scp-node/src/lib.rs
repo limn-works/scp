@@ -523,6 +523,26 @@ pub fn builder() -> ApplicationNodeBuilder {
 }
 
 // ---------------------------------------------------------------------------
+// Identity persistence
+// ---------------------------------------------------------------------------
+
+/// Storage key used by [`ApplicationNodeBuilder::identity_with_storage`] to
+/// persist and reload the node's identity across restarts.
+///
+/// The value stored under this key is a JSON-serialized [`PersistedIdentity`].
+const IDENTITY_STORAGE_KEY: &str = "scp/identity";
+
+/// Serializable snapshot of an [`ScpIdentity`] and its [`DidDocument`].
+///
+/// Used by [`ApplicationNodeBuilder::identity_with_storage`] to persist a newly
+/// created identity so that subsequent restarts produce the same DID.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedIdentity {
+    identity: ScpIdentity,
+    document: DidDocument,
+}
+
+// ---------------------------------------------------------------------------
 // IdentitySource
 // ---------------------------------------------------------------------------
 
@@ -1152,15 +1172,18 @@ fn spawn_tier_reevaluation(
 /// Uses a type-state pattern to enforce required fields at compile time.
 /// The builder starts with `Dom = NoDomain, Id = NoIdentity`. Calling
 /// [`domain`](Self::domain) transitions `Dom` to [`HasDomain`], and calling
-/// [`generate_identity_with`](Self::generate_identity_with) or
-/// [`identity`](Self::identity) transitions `Id` to [`HasIdentity`].
-/// [`build`](Self::build) is only available when both are set.
+/// [`generate_identity_with`](Self::generate_identity_with),
+/// [`identity`](Self::identity), or
+/// [`identity_with_storage`](Self::identity_with_storage) transitions `Id`
+/// to [`HasIdentity`]. [`build`](Self::build) is only available when both
+/// are set.
 ///
 /// # Required fields
 ///
 /// - [`domain`](Self::domain) -- the domain this node serves.
-/// - Identity -- either [`generate_identity_with`](Self::generate_identity_with)
-///   or [`identity`](Self::identity).
+/// - Identity -- one of [`generate_identity_with`](Self::generate_identity_with),
+///   [`identity`](Self::identity), or
+///   [`identity_with_storage`](Self::identity_with_storage).
 ///
 /// # Optional fields
 ///
@@ -1210,6 +1233,10 @@ pub struct ApplicationNodeBuilder<
     /// HTTP/3 configuration (spec §10.15.1). `None` = HTTP/3 disabled.
     #[cfg(feature = "http3")]
     http3_config: Option<scp_transport::http3::Http3Config>,
+    /// When `true`, the builder will check storage for an existing identity
+    /// before generating a new one, and persist newly created identities.
+    /// Set by [`identity_with_storage`](Self::identity_with_storage).
+    persist_identity: bool,
     _domain_state: PhantomData<Dom>,
     _identity_state: PhantomData<Id>,
 }
@@ -1241,6 +1268,7 @@ impl ApplicationNodeBuilder {
             projection_rate_limit: None,
             #[cfg(feature = "http3")]
             http3_config: None,
+            persist_identity: false,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -1285,6 +1313,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Id>
             projection_rate_limit: self.projection_rate_limit,
             #[cfg(feature = "http3")]
             http3_config: self.http3_config,
+            persist_identity: self.persist_identity,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -1321,6 +1350,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static, Id>
             projection_rate_limit: self.projection_rate_limit,
             #[cfg(feature = "http3")]
             http3_config: self.http3_config,
+            persist_identity: self.persist_identity,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -1567,6 +1597,7 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, Dom, Id>
             projection_rate_limit: self.projection_rate_limit,
             #[cfg(feature = "http3")]
             http3_config: self.http3_config,
+            persist_identity: self.persist_identity,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -1624,6 +1655,7 @@ impl<S: Storage + 'static, Dom>
             projection_rate_limit: self.projection_rate_limit,
             #[cfg(feature = "http3")]
             http3_config: self.http3_config,
+            persist_identity: self.persist_identity,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -1660,6 +1692,92 @@ impl<S: Storage + 'static, Dom>
             projection_rate_limit: self.projection_rate_limit,
             #[cfg(feature = "http3")]
             http3_config: self.http3_config,
+            persist_identity: self.persist_identity,
+            _domain_state: PhantomData,
+            _identity_state: PhantomData,
+        }
+    }
+
+    /// Configures the builder to automatically persist and reload identity.
+    ///
+    /// This is the recommended way to manage identity for long-lived
+    /// applications. On the first run it behaves like
+    /// [`generate_identity_with`](Self::generate_identity_with): it creates a
+    /// new DID via the provided `key_custody` and `did_method`, then persists
+    /// the resulting [`ScpIdentity`] and [`DidDocument`] to the builder's
+    /// storage backend under the key `"scp/identity"`.
+    ///
+    /// On subsequent runs with the same storage backend, the persisted
+    /// identity is deserialized and reused — no new DID is created. This
+    /// ensures the node keeps the same DID across restarts.
+    ///
+    /// # Lifecycle
+    ///
+    /// 1. At `.build()` time, check storage for key `"scp/identity"`.
+    /// 2. **Found:** Deserialize the stored [`ScpIdentity`] and
+    ///    [`DidDocument`], use the `.identity()` path internally.
+    /// 3. **Not found:** Call `did_method.create(custody)`, persist the
+    ///    result to storage, then continue.
+    ///
+    /// [`KeyHandle`] indices remain valid across restarts because the custody
+    /// backend (e.g., `FileKeyCustody`) reloads the same keyring from disk.
+    ///
+    /// # Requirements
+    ///
+    /// A real storage backend must be set via [`.storage()`](Self::storage)
+    /// before calling `.build()`. The default no-op storage will not persist
+    /// anything.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use std::sync::Arc;
+    /// # use scp_node::ApplicationNodeBuilder;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// // let custody = Arc::new(FileKeyCustody::open("keys.db")?);
+    /// // let did_method = Arc::new(DidDht::new(...));
+    /// // let storage = SqliteStorage::open("node.db")?;
+    /// //
+    /// // let node = ApplicationNodeBuilder::new()
+    /// //     .storage(storage)
+    /// //     .domain("example.com")
+    /// //     .identity_with_storage(custody, did_method)
+    /// //     .build()
+    /// //     .await?;
+    /// // // First run: creates new DID, persists to storage.
+    /// // // Subsequent runs: reloads same DID from storage.
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn identity_with_storage<K2: KeyCustody + 'static, D2: DidMethod + 'static>(
+        self,
+        key_custody: Arc<K2>,
+        did_method: Arc<D2>,
+    ) -> ApplicationNodeBuilder<K2, D2, S, Dom, HasIdentity> {
+        ApplicationNodeBuilder {
+            domain: self.domain,
+            identity_source: Some(IdentitySource::Generate {
+                key_custody,
+                did_method,
+            }),
+            storage: self.storage,
+            blob_storage: self.blob_storage,
+            bind_addr: self.bind_addr,
+            acme_email: self.acme_email,
+            stun_server: self.stun_server,
+            bridge_relay: self.bridge_relay,
+            nat_strategy: self.nat_strategy,
+            port_mapper: self.port_mapper,
+            reachability_probe: self.reachability_probe,
+            tls_provider: self.tls_provider,
+            network_detector: self.network_detector,
+            local_api_addr: self.local_api_addr,
+            http_bind_addr: self.http_bind_addr,
+            cors_origins: self.cors_origins,
+            projection_rate_limit: self.projection_rate_limit,
+            #[cfg(feature = "http3")]
+            http3_config: self.http3_config,
+            persist_identity: true,
             _domain_state: PhantomData,
             _identity_state: PhantomData,
         }
@@ -1672,14 +1790,16 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
     /// Builds the [`ApplicationNode`].
     ///
     /// This method is only available when both [`domain`](Self::domain) and
-    /// identity ([`generate_identity_with`](Self::generate_identity_with) or
-    /// [`identity`](Self::identity)) have been set — the type system enforces
-    /// this at compile time.
+    /// identity ([`generate_identity_with`](Self::generate_identity_with),
+    /// [`identity`](Self::identity), or
+    /// [`identity_with_storage`](Self::identity_with_storage)) have been
+    /// set — the type system enforces this at compile time.
     ///
     /// # Steps
     ///
     /// 1. Initializes storage (uses provided or creates default).
-    /// 2. Loads or generates identity.
+    /// 2. Loads or generates identity (with optional persistence when
+    ///    [`identity_with_storage`](Self::identity_with_storage) was used).
     /// 3. Adds `SCPRelay` service entry to the DID document.
     /// 4. Starts relay server (must be listening before publication).
     /// 5. Publishes DID document to the DHT.
@@ -1699,11 +1819,13 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
         let identity_source = self
             .identity_source
             .ok_or(NodeError::MissingField("identity"))?;
+        let persist = self.persist_identity;
         let protocol_store = Arc::new(ProtocolStore::new(
             self.storage.ok_or(NodeError::MissingField("storage"))?,
         ));
 
-        let (identity, document, did_method) = resolve_identity(identity_source).await?;
+        let (identity, document, did_method) =
+            resolve_identity_persistent(identity_source, persist, protocol_store.storage()).await?;
         let bridge_secret = generate_bridge_secret();
         let bind_addr = self
             .bind_addr
@@ -1820,6 +1942,73 @@ async fn resolve_identity<K: KeyCustody, D: DidMethod>(
             let (identity, document) = did_method.create(&*key_custody).await?;
             Ok((identity, document, did_method))
         }
+        IdentitySource::Explicit(e) => Ok((e.identity, e.document, e.did_method)),
+    }
+}
+
+/// Resolves identity with automatic persistence.
+///
+/// When `persist` is `true` and the identity source is `Generate`:
+///   1. Check storage for [`IDENTITY_STORAGE_KEY`].
+///   2. If found, deserialize the [`PersistedIdentity`] and return the
+///      stored identity + document (skipping generation).
+///   3. If not found, generate via `did_method.create()`, serialize to
+///      storage, then return the new identity.
+///
+/// When `persist` is `false`, delegates to [`resolve_identity`].
+async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: Storage>(
+    source: IdentitySource<K, D>,
+    persist: bool,
+    storage: &S,
+) -> Result<(ScpIdentity, DidDocument, Arc<D>), NodeError> {
+    if !persist {
+        return resolve_identity(source).await;
+    }
+
+    match source {
+        IdentitySource::Generate {
+            key_custody,
+            did_method,
+        } => {
+            // 1. Check storage for an existing identity.
+            let existing = storage.retrieve(IDENTITY_STORAGE_KEY).await.map_err(|e| {
+                NodeError::Storage(format!("failed to read persisted identity: {e}"))
+            })?;
+
+            if let Some(bytes) = existing {
+                // 2. Deserialize and reuse the persisted identity.
+                let persisted: PersistedIdentity = serde_json::from_slice(&bytes).map_err(|e| {
+                    NodeError::Storage(format!("failed to deserialize persisted identity: {e}"))
+                })?;
+                tracing::info!(
+                    did = %persisted.identity.did,
+                    "reloaded persisted identity from storage"
+                );
+                Ok((persisted.identity, persisted.document, did_method))
+            } else {
+                // 3. Generate a new identity and persist it.
+                let (identity, document) = did_method.create(&*key_custody).await?;
+                let persisted = PersistedIdentity {
+                    identity: identity.clone(),
+                    document: document.clone(),
+                };
+                let bytes = serde_json::to_vec(&persisted).map_err(|e| {
+                    NodeError::Storage(format!("failed to serialize identity for persistence: {e}"))
+                })?;
+                storage
+                    .store(IDENTITY_STORAGE_KEY, &bytes)
+                    .await
+                    .map_err(|e| {
+                        NodeError::Storage(format!("failed to persist identity to storage: {e}"))
+                    })?;
+                tracing::info!(
+                    did = %identity.did,
+                    "created and persisted new identity to storage"
+                );
+                Ok((identity, document, did_method))
+            }
+        }
+        // Explicit identities are never persisted — caller already manages them.
         IdentitySource::Explicit(e) => Ok((e.identity, e.document, e.did_method)),
     }
 }
@@ -2265,11 +2454,13 @@ impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
         let identity_source = self
             .identity_source
             .ok_or(NodeError::MissingField("identity"))?;
+        let persist = self.persist_identity;
 
         let protocol_store = Arc::new(ProtocolStore::new(
             self.storage.ok_or(NodeError::MissingField("storage"))?,
         ));
-        let (identity, document, did_method) = resolve_identity(identity_source).await?;
+        let (identity, document, did_method) =
+            resolve_identity_persistent(identity_source, persist, protocol_store.storage()).await?;
 
         // 3. Start relay server.
         let bind_addr = self
@@ -4488,5 +4679,165 @@ mod tests {
         );
 
         node.shutdown();
+    }
+
+    // -----------------------------------------------------------------------
+    // identity_with_storage tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn identity_with_storage_creates_and_persists_on_first_run() {
+        // First build: no identity in storage → creates new DID and persists it.
+        let storage = Arc::new(InMemoryStorage::new());
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+
+        let node = ApplicationNodeBuilder::new()
+            .storage(Arc::clone(&storage))
+            .domain("persist.example.com")
+            .tls_provider(Arc::new(SucceedingTlsProvider {
+                domain: "persist.example.com".to_owned(),
+            }))
+            .identity_with_storage(custody, did_method)
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build()
+            .await
+            .unwrap();
+
+        let did = node.identity().did().to_owned();
+        assert!(
+            did.starts_with("did:dht:"),
+            "DID should start with did:dht:"
+        );
+
+        // Verify the identity was persisted to storage.
+        let stored = storage
+            .retrieve(IDENTITY_STORAGE_KEY)
+            .await
+            .unwrap()
+            .expect("identity should be persisted to storage");
+        let persisted: PersistedIdentity = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(persisted.identity.did, did);
+        assert_eq!(persisted.document.id, did);
+
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn identity_with_storage_reloads_on_subsequent_run() {
+        // First run: create identity and persist.
+        let storage = Arc::new(InMemoryStorage::new());
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+
+        let node1 = ApplicationNodeBuilder::new()
+            .storage(Arc::clone(&storage))
+            .domain("reload.example.com")
+            .tls_provider(Arc::new(SucceedingTlsProvider {
+                domain: "reload.example.com".to_owned(),
+            }))
+            .identity_with_storage(Arc::clone(&custody), Arc::clone(&did_method))
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build()
+            .await
+            .unwrap();
+
+        let first_did = node1.identity().did().to_owned();
+        node1.shutdown();
+
+        // Second run: same storage → should reload the same DID (no new creation).
+        let node2 = ApplicationNodeBuilder::new()
+            .storage(Arc::clone(&storage))
+            .domain("reload.example.com")
+            .tls_provider(Arc::new(SucceedingTlsProvider {
+                domain: "reload.example.com".to_owned(),
+            }))
+            .identity_with_storage(custody, did_method)
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            node2.identity().did(),
+            first_did,
+            "second run should produce the same DID"
+        );
+
+        node2.shutdown();
+    }
+
+    #[tokio::test]
+    async fn generate_identity_with_does_not_persist() {
+        // Verify the original generate_identity_with does NOT persist (backward compat).
+        let storage = Arc::new(InMemoryStorage::new());
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+
+        let node = ApplicationNodeBuilder::new()
+            .storage(Arc::clone(&storage))
+            .domain("nopersist.example.com")
+            .tls_provider(Arc::new(SucceedingTlsProvider {
+                domain: "nopersist.example.com".to_owned(),
+            }))
+            .generate_identity_with(custody, did_method)
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build()
+            .await
+            .unwrap();
+
+        assert!(node.identity().did().starts_with("did:dht:"));
+
+        // Storage should NOT contain a persisted identity.
+        let stored = storage.retrieve(IDENTITY_STORAGE_KEY).await.unwrap();
+        assert!(
+            stored.is_none(),
+            "generate_identity_with should NOT persist identity"
+        );
+
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn identity_with_storage_no_domain_mode() {
+        // Verify persistence works in no-domain mode too.
+        let storage = Arc::new(InMemoryStorage::new());
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+
+        let tier = ReachabilityTier::Upnp {
+            external_addr: SocketAddr::from(([1, 2, 3, 4], 9090)),
+        };
+        let node = ApplicationNodeBuilder::new()
+            .storage(Arc::clone(&storage))
+            .no_domain()
+            .nat_strategy(Arc::new(MockNatStrategy { tier: tier.clone() }))
+            .identity_with_storage(Arc::clone(&custody), Arc::clone(&did_method))
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build()
+            .await
+            .unwrap();
+
+        let first_did = node.identity().did().to_owned();
+        node.shutdown();
+
+        // Second run: same storage → same DID.
+        let node2 = ApplicationNodeBuilder::new()
+            .storage(Arc::clone(&storage))
+            .no_domain()
+            .nat_strategy(Arc::new(MockNatStrategy { tier }))
+            .identity_with_storage(custody, did_method)
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            node2.identity().did(),
+            first_did,
+            "no-domain mode should also reload persisted identity"
+        );
+
+        node2.shutdown();
     }
 }
