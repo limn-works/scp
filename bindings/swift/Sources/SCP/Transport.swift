@@ -73,6 +73,11 @@ public enum TransportBridge {
         _ manager: TransportManager
     ) async throws -> TransportStatus
 
+    /// Disconnect from a relay. Maps to ``transportDisconnect`` in ScpBindings.
+    public typealias DisconnectFn = @Sendable (
+        _ manager: TransportManager
+    ) async throws -> Void
+
     /// Default connect function that delegates to the UniFFI-generated binding.
     public static let defaultConnect: ConnectFn = { relayUrl in
         try await transportConnect(relayUrl: relayUrl)
@@ -81,6 +86,11 @@ public enum TransportBridge {
     /// Default status function that delegates to the UniFFI-generated binding.
     public static let defaultStatus: StatusFn = { manager in
         try await transportStatus(manager: manager)
+    }
+
+    /// Default disconnect function that delegates to the UniFFI-generated binding.
+    public static let defaultDisconnect: DisconnectFn = { manager in
+        try await transportDisconnect(manager: manager)
     }
 }
 
@@ -135,4 +145,29 @@ public func queryTransportStatus(
     statusFn: TransportBridge.StatusFn = TransportBridge.defaultStatus
 ) async throws -> TransportStatus {
     try await statusFn(manager)
+}
+
+/// Disconnects the transport layer from the current relay.
+///
+/// Delegates to the UniFFI ``transportDisconnect`` bridge function, which
+/// clears the relay adapter from the ``TransportManager`` and releases the
+/// WebSocket connection.
+///
+/// This is idempotent -- calling it when already disconnected is a no-op.
+///
+/// - Parameters:
+///   - manager: The transport manager to disconnect.
+///   - disconnectFn: Bridge function override for testing.
+/// - Throws: ``ScpError/Transport(message:code:)`` if the disconnect fails.
+///
+/// ## Provenance
+///
+/// - ADR-032 (Transport) in `.docs/adrs/phase-2.md`
+/// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
+/// - GitHub issue #590
+public func disconnectTransport(
+    manager: TransportManager,
+    disconnectFn: TransportBridge.DisconnectFn = TransportBridge.defaultDisconnect
+) async throws {
+    try await disconnectFn(manager)
 }

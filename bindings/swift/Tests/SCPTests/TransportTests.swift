@@ -168,6 +168,45 @@ struct TransportTests {
         #expect(result.latencyMs == 15.0)
     }
 
+    // MARK: - Disconnect via injectable bridge (async roundtrip)
+
+    @Test("disconnectTransport calls bridge disconnect function")
+    func disconnectRoundtrip() async throws {
+        let mockManager = TransportManager(noPointer: .init())
+        var disconnectCalled = false
+
+        let mockDisconnect: TransportBridge.DisconnectFn = { _ in
+            disconnectCalled = true
+        }
+
+        try await disconnectTransport(manager: mockManager, disconnectFn: mockDisconnect)
+
+        #expect(disconnectCalled)
+    }
+
+    @Test("connect then disconnect lifecycle")
+    func connectThenDisconnect() async throws {
+        let mockManager = TransportManager(noPointer: .init())
+        var connectCalled = false
+        var disconnectCalled = false
+
+        let mockConnect: TransportBridge.ConnectFn = { _ in
+            connectCalled = true
+            return mockManager
+        }
+        let mockDisconnect: TransportBridge.DisconnectFn = { _ in
+            disconnectCalled = true
+        }
+
+        let config = TransportConfig(relayUrls: ["wss://relay.test/scp/v1"])
+        let manager = try await connectTransport(config: config, connectFn: mockConnect)
+        #expect(connectCalled)
+        #expect(manager === mockManager)
+
+        try await disconnectTransport(manager: manager, disconnectFn: mockDisconnect)
+        #expect(disconnectCalled)
+    }
+
     // MARK: - Envelope sending (via Context)
 
     @Test("Context send delegates payload to bridge function")

@@ -51,6 +51,7 @@ class ConformanceDispatcher(
         "ucan_delegate" -> dispatchUcanDelegate(input)
         "ucan_revoke" -> dispatchUcanRevoke(input)
         "transport_connect" -> dispatchTransportConnect(input)
+        "transport_disconnect" -> dispatchTransportDisconnect(input)
         "transport_status" -> dispatchTransportStatus(input)
         "event_log_query" -> dispatchEventLogQuery(input)
         "event_log_verify" -> dispatchEventLogVerify(input)
@@ -207,6 +208,14 @@ class ConformanceDispatcher(
         val config = """{"url":"$relayUrl"}"""
         val handle = bridge.infra.transportConnect(config)
         mapOf("handle" to handle.toString(), "status" to "connected")
+    }
+
+    private suspend fun dispatchTransportDisconnect(
+        input: Map<String, String>,
+    ): Map<String, String> = catchBridge {
+        val handle = input["transport_handle"]?.toLongOrNull() ?: 0L
+        bridge.infra.transportDisconnect(handle)
+        mapOf("status" to "disconnected")
     }
 
     private suspend fun dispatchTransportStatus(

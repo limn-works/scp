@@ -522,4 +522,6 @@ class StubInfraBindings : works.limn.scp.bridge.InfraBindings {
     ): Long = transportConnectResult
 
     override fun transportStatus(transportHandle: Long): String = transportStatusResult
+
+    override fun transportDisconnect(transportHandle: Long) { /* no-op */ }
 }

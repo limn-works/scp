@@ -228,6 +228,13 @@ class CoroutineBridgeTest {
                 val result = bridge.infra.transportStatus(99L)
                 assertEquals("""{"connected":true}""", result)
             }
+
+        @Test
+        fun `transportDisconnect dispatches on IO`() =
+            runTest(ioDispatcher) {
+                bridge.infra.transportDisconnect(99L)
+                assertTrue(stubBindings.transportDisconnectCalled)
+            }
     }
 
     // -------------------------------------------------------------------
@@ -681,4 +688,9 @@ class StubNativeBindings : NativeBindings {
     }
 
     override fun transportStatus(transportHandle: Long): String = transportStatusResult
+
+    var transportDisconnectCalled = false
+    override fun transportDisconnect(transportHandle: Long) {
+        transportDisconnectCalled = true
+    }
 }

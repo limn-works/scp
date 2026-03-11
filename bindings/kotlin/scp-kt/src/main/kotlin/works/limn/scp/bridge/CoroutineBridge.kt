@@ -294,6 +294,8 @@ interface InfraBindings {
     ): Long
 
     fun transportStatus(transportHandle: Long): String
+
+    fun transportDisconnect(transportHandle: Long)
 }
 
 /**
@@ -1032,6 +1034,19 @@ class InfraBridge internal constructor(
      * @return JSON-encoded transport status.
      */
     suspend fun transportStatus(handle: Long): String = bridge.ffiCall { bindings.transportStatus(handle) }
+
+    /**
+     * Disconnect from a transport relay.
+     *
+     * Clears the relay adapter from the transport manager. After this call,
+     * the transport reports disconnected status and the WebSocket connection
+     * is released.
+     *
+     * This is idempotent -- calling it when already disconnected is a no-op.
+     *
+     * @param handle Handle from [transportConnect].
+     */
+    suspend fun transportDisconnect(handle: Long): Unit = bridge.ffiCall { bindings.transportDisconnect(handle) }
 }
 
 /**

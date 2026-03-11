@@ -95,6 +95,7 @@ interface WasmModule {
     relayUrl: string | null;
     latencyMs: number | null;
   }>;
+  transport_disconnect: () => Promise<void>;
   event_log_query: (handle: BridgeContextHandle, filterJson: string | undefined) => Promise<string>;
   event_log_verify: (
     handle: BridgeContextHandle,
@@ -707,7 +708,8 @@ export function createWasmBridge(): Bridge {
     },
 
     async transportDisconnect(_handle: BridgeTransportHandle): Promise<void> {
-      // WebSocket disconnect -- handled by the browser runtime.
+      const wasm = getWasm();
+      await wasm.transport_disconnect();
     },
 
     // UCAN -- delegates to WASM 11-step validation pipeline
