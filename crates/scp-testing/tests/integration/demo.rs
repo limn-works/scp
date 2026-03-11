@@ -25,7 +25,9 @@ use scp_core::crypto::sender_keys::{
     generate_sender_key, handle_sender_key_request, open_sender_key_response,
     publish_sender_key_epoch_advance, request_sender_key, verify_epoch_advance,
 };
-use scp_core::envelope::inner::{InnerEnvelopeParams, MessageType, create_inner_envelope};
+use scp_core::envelope::inner::{
+    InnerEnvelopeParams, MessageType, SCP_INNER_ENVELOPE_VERSION, create_inner_envelope,
+};
 use scp_core::envelope::outer::{open_envelope, seal_envelope};
 use scp_core::envelope::padding::strip_padding;
 use scp_core::envelope::pseudonym::derive_pseudonym;
@@ -364,7 +366,7 @@ async fn end_to_end_network_demo() {
             payload: original_msg,
             provenance: None,
             signing_key_id: SigningKeyId::Active,
-            version: 1,
+            version: SCP_INNER_ENVELOPE_VERSION,
         },
         &alice_mls_custody,
         &dummy_handle,

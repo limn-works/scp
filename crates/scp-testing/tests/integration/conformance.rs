@@ -938,11 +938,13 @@ fn conf_022_equivocation_detection() {
     );
 
     print_step(3, "Verify consistent checkpoints are not flagged");
+    // Empty log root is SHA-256(""), NOT [0u8; 32] (which is GENESIS_PREV_HASH).
+    let empty_root: [u8; 32] = Sha256::digest(b"").into();
     let consistent_checkpoint = ConsistencyCheckpoint {
         context_id: "ctx-equivocation-test".to_owned(),
         sender_did: "did:key:remote".into(),
         event_count: 0,
-        merkle_root: [0u8; 32], // matches empty log root
+        merkle_root: empty_root,
         epoch: Some(0),
         timestamp: 1_000_000,
         signature: vec![0u8; 64],
