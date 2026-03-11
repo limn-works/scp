@@ -277,6 +277,9 @@ pub fn context_join(handle: &WasmContextHandle, identity_did: String) -> Promise
 /// Delegates to `WasmContextManager::leave_context`.
 #[wasm_bindgen]
 pub fn context_leave(handle: &WasmContextHandle, identity_did: String) -> Promise {
+    if let Err(e) = validate_did(&identity_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
     let context_id = handle.context_id();
 
     future_to_promise(async move {
