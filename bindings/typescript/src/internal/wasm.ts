@@ -86,6 +86,7 @@ interface WasmModule {
     toolId: string,
     inputJson: string,
     identityDid: string,
+    ucanToken: string | undefined,
   ) => Promise<string>;
   tool_verify: (
     handle: BridgeContextHandle,
@@ -700,9 +701,10 @@ export function createWasmBridge(): Bridge {
       toolId: string,
       inputJson: string,
       identityDid: string,
+      ucanToken?: string,
     ): Promise<string> {
       const wasm = getWasm();
-      return await wasm.tool_invoke(handle, toolId, inputJson, identityDid);
+      return await wasm.tool_invoke(handle, toolId, inputJson, identityDid, ucanToken);
     },
 
     async toolVerify(handle: BridgeContextHandle, toolId: string): Promise<ToolVerificationResult> {
