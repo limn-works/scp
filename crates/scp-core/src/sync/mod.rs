@@ -206,6 +206,9 @@ pub const COMMIT_PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SENDER_KEY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Multi-device reconnection deduplication window.
 pub const RECONNECTION_DEDUP_WINDOW: Duration = Duration::from_secs(30);
+/// Maximum event signature failures from a single peer before aborting
+/// reconciliation with that peer (§23.13 criterion 2, §23.14).
+pub const MAX_PEER_VERIFICATION_FAILURES: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // OfflineTier
@@ -547,6 +550,72 @@ pub enum SyncError {
         context_id: ContextId,
         /// Human-readable description of the inconsistency.
         reason: String,
+    },
+    /// A `ResetRequest` failed anti-replay validation (invalid signature,
+    /// stale timestamp, or replayed nonce). See spec §23.15.
+    #[error("reset request rejected in context {context_id} from {sender_did}: {reason}")]
+    ResetRequestRejected {
+        /// The context where the reset request was rejected.
+        context_id: ContextId,
+        /// The DID of the sender whose reset request failed validation.
+        sender_did: DID,
+        /// Human-readable reason for rejection.
+        reason: String,
+    },
+    /// A received consistency checkpoint failed signature verification
+    /// (§23.12). Indicates potential relay compromise or peer impersonation.
+    #[error("checkpoint signature failure in context {context_id} from {sender_did}: {reason}")]
+    CheckpointSignatureFailure {
+        /// The context where the checkpoint verification failed.
+        context_id: ContextId,
+        /// The DID of the checkpoint's claimed author.
+        sender_did: DID,
+        /// Human-readable reason for the verification failure.
+        reason: String,
+    },
+    /// A received event failed per-event signature verification during
+    /// reconciliation (§23.13). The event was rejected and not added to the
+    /// local log.
+    #[error(
+        "event signature failure in context {context_id} at sequence {event_sequence}: {reason}"
+    )]
+    EventSignatureFailure {
+        /// The context where the signature failure occurred.
+        context_id: ContextId,
+        /// The sequence number of the event that failed verification.
+        event_sequence: u64,
+        /// The DID claimed as the event's signer.
+        expected_signer: DID,
+        /// Human-readable reason for the verification failure.
+        reason: String,
+    },
+    /// A gap in event sequence numbers could not be filled during
+    /// reconciliation (§23.13 criterion 3-4).
+    #[error(
+        "event gap detected in context {context_id}: missing sequences {missing_start}-{missing_end}"
+    )]
+    EventGapDetected {
+        /// The context where the gap was detected.
+        context_id: ContextId,
+        /// Start of the missing sequence range (inclusive).
+        missing_start: u64,
+        /// End of the missing sequence range (inclusive).
+        missing_end: u64,
+        /// The DID of the peer that provided the events surrounding the gap.
+        peer_did: DID,
+    },
+    /// Hash chain continuity was broken during reconciliation, indicating
+    /// tampering or data loss (§23.13 criterion 5-6).
+    #[error("event chain tampered in context {context_id} at sequence {break_sequence}")]
+    EventChainTampered {
+        /// The context where the chain break was detected.
+        context_id: ContextId,
+        /// The sequence number at which the hash chain breaks.
+        break_sequence: u64,
+        /// The expected `prev_hash` (hash of the event at `sequence - 1`).
+        expected_prev_hash: [u8; 32],
+        /// The `prev_hash` value in the received event that does not match.
+        received_prev_hash: [u8; 32],
     },
 }
 
@@ -913,5 +982,126 @@ mod tests {
         });
         assert!(overflow.to_string().contains("QueueOverflow"));
         assert!(overflow.to_string().contains('3'));
+    }
+
+    // -----------------------------------------------------------------------
+    // MAX_PEER_VERIFICATION_FAILURES constant (§23.14)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn max_peer_verification_failures_matches_spec() {
+        assert_eq!(
+            MAX_PEER_VERIFICATION_FAILURES, 3,
+            "§23.14 defines MAX_PEER_VERIFICATION_FAILURES = 3"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // New SyncError variants (§23.15)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sync_error_reset_request_rejected_display() {
+        let err = SyncError::ResetRequestRejected {
+            context_id: "ctx-1".to_owned(),
+            sender_did: DID::from("did:dht:zMallory"),
+            reason: "stale timestamp".to_owned(),
+        };
+        let s = err.to_string();
+        assert!(s.contains("ctx-1"));
+        assert!(s.contains("did:dht:zMallory"));
+        assert!(s.contains("stale timestamp"));
+    }
+
+    #[test]
+    fn sync_error_checkpoint_signature_failure_display() {
+        let err = SyncError::CheckpointSignatureFailure {
+            context_id: "ctx-2".to_owned(),
+            sender_did: DID::from("did:dht:zRelay"),
+            reason: "unknown signing key".to_owned(),
+        };
+        let s = err.to_string();
+        assert!(s.contains("ctx-2"));
+        assert!(s.contains("did:dht:zRelay"));
+        assert!(s.contains("unknown signing key"));
+    }
+
+    #[test]
+    fn sync_error_event_signature_failure_display() {
+        let err = SyncError::EventSignatureFailure {
+            context_id: "ctx-3".to_owned(),
+            event_sequence: 42,
+            expected_signer: DID::from("did:dht:zAlice"),
+            reason: "invalid signature".to_owned(),
+        };
+        let s = err.to_string();
+        assert!(s.contains("ctx-3"));
+        assert!(s.contains("42"));
+        assert!(s.contains("invalid signature"));
+    }
+
+    #[test]
+    fn sync_error_event_gap_detected_display() {
+        let err = SyncError::EventGapDetected {
+            context_id: "ctx-4".to_owned(),
+            missing_start: 6,
+            missing_end: 7,
+            peer_did: DID::from("did:dht:zBob"),
+        };
+        let s = err.to_string();
+        assert!(s.contains("ctx-4"));
+        assert!(s.contains("6-7"));
+    }
+
+    #[test]
+    fn sync_error_event_chain_tampered_display() {
+        let err = SyncError::EventChainTampered {
+            context_id: "ctx-5".to_owned(),
+            break_sequence: 100,
+            expected_prev_hash: [0xAA; 32],
+            received_prev_hash: [0xBB; 32],
+        };
+        let s = err.to_string();
+        assert!(s.contains("ctx-5"));
+        assert!(s.contains("100"));
+    }
+
+    #[test]
+    fn sync_error_new_variants_are_debug_printable() {
+        let errors: Vec<SyncError> = vec![
+            SyncError::ResetRequestRejected {
+                context_id: "ctx-1".to_owned(),
+                sender_did: DID::from("did:dht:z1"),
+                reason: "stale".to_owned(),
+            },
+            SyncError::CheckpointSignatureFailure {
+                context_id: "ctx-2".to_owned(),
+                sender_did: DID::from("did:dht:z2"),
+                reason: "bad sig".to_owned(),
+            },
+            SyncError::EventSignatureFailure {
+                context_id: "ctx-3".to_owned(),
+                event_sequence: 1,
+                expected_signer: DID::from("did:dht:z3"),
+                reason: "invalid".to_owned(),
+            },
+            SyncError::EventGapDetected {
+                context_id: "ctx-4".to_owned(),
+                missing_start: 5,
+                missing_end: 10,
+                peer_did: DID::from("did:dht:z4"),
+            },
+            SyncError::EventChainTampered {
+                context_id: "ctx-5".to_owned(),
+                break_sequence: 50,
+                expected_prev_hash: [0u8; 32],
+                received_prev_hash: [1u8; 32],
+            },
+        ];
+        for err in &errors {
+            // Verify Debug and Display impls don't panic.
+            let _debug = format!("{err:?}");
+            let _display = format!("{err}");
+        }
     }
 }
