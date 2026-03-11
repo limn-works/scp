@@ -22,9 +22,12 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use openmls::prelude::*;
+use openmls_basic_credential::SignatureKeyPair;
+use openmls_traits::OpenMlsProvider;
 use scp_identity::SigningKeyId;
+use serde::{Deserialize, Serialize};
 use tls_codec::Deserialize as TlsDeserializeTrait;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::credential::ScpCredential;
 use super::encrypt::{encrypt, serialize_ciphertext};
@@ -35,6 +38,83 @@ use crate::crypto::sender_keys::{
     NonceDedup, SenderKey, SenderKeyDistributionMessage, SenderKeyResponse, SenderKeyStore,
     generate_sender_key, generate_wrapping_keypair,
 };
+
+// ---------------------------------------------------------------------------
+// MlsCryptoSnapshot — serializable per-context crypto state for persistence
+// ---------------------------------------------------------------------------
+
+/// Serializable snapshot of per-context MLS cryptographic state.
+///
+/// Captures all state needed to resume MLS encryption/decryption after a
+/// process restart: the `OpenMLS` `MemoryStorage` contents (MLS group tree,
+/// epoch secrets, key schedule, etc.), the local sender key, the sender
+/// key store entries, the sender key epoch counter, and per-member X25519
+/// wrapping public keys.
+///
+/// The MLS group state is serialized as the raw key-value pairs from the
+/// `OpenMLS` `MemoryStorage` backing the group. On restore, these are
+/// re-injected into a fresh `MemoryStorage` and the `MlsGroup` is
+/// reconstructed via `MlsGroup::load`.
+///
+/// # Security — Sensitive Key Material
+///
+/// **This struct contains raw private key material:**
+///
+/// - `signer_bytes` — Ed25519 private signing key (MLS credential signer)
+/// - `local_sender_key` — AES-256 sender key (per-context message encryption)
+/// - `wrapping_secret_key` — X25519 secret key (HPKE-sealed sender key decryption)
+/// - `mls_storage_entries` — `OpenMLS` `MemoryStorage` dump, which includes MLS
+///   epoch secrets, HPKE private keys, and the key schedule
+///
+/// **Why self-encryption is not feasible:** Encrypting the snapshot before
+/// returning from `export_crypto_state` creates a circular dependency — the
+/// encryption key would need to be stored outside the snapshot or derived
+/// from material inside it (defeating the purpose). This is the same trust
+/// model used by `OpenMLS` itself, which stores MLS `KeyPackage` private
+/// keys in its `StorageProvider` backend in plaintext.
+///
+/// **Storage layer requirements:** The `Storage` backend that persists this
+/// blob MUST provide encryption at rest (§17.5). Platform implementations
+/// (Keychain on iOS/macOS, Android Keystore, OS-level encrypted storage)
+/// satisfy this. In-memory storage used in tests is acceptable because no
+/// persistence occurs.
+///
+/// **Defense in depth:** `export_crypto_state` and `restore_crypto_state`
+/// zeroize the intermediate `MlsCryptoSnapshot` struct after
+/// serialization/extraction to minimize the window where private keys
+/// exist as a structured, easily-extractable object in memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MlsCryptoSnapshot {
+    /// The raw key-value pairs from the `OpenMLS` `MemoryStorage`.
+    /// Each pair is `(key_bytes, value_bytes)`.
+    mls_storage_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    /// The local member's AES-256 sender key (32 bytes).
+    local_sender_key: SenderKey,
+    /// All sender keys for this context: `(sender_did, key)` pairs.
+    sender_key_entries: Vec<(String, SenderKey)>,
+    /// The sender key epoch counter.
+    sender_key_epoch: u64,
+    /// Remote members' X25519 wrapping public keys: `(did, pubkey)` pairs.
+    member_wrapping_keys: Vec<(String, [u8; 32])>,
+    /// The MLS signer (`SignatureKeyPair`) serialized via serde to bytes.
+    /// `SignatureKeyPair` does not derive `Clone` without the `clonable`
+    /// feature, so we serialize it separately and store the blob here.
+    signer_bytes: Vec<u8>,
+    /// The MLS group ID bytes. Required to call `MlsGroup::load` on restore.
+    group_id: Vec<u8>,
+    /// The provider-level X25519 wrapping public key (§9.16.1).
+    /// Persisted so remote members' HPKE-sealed sender key responses can
+    /// still be decrypted after a restart. Without this, the restored
+    /// provider would generate a fresh keypair whose public key doesn't
+    /// match the one published in the MLS tree's `LeafNode` extension.
+    #[serde(default)]
+    wrapping_public_key: [u8; 32],
+    /// The provider-level X25519 wrapping secret key (§9.16.1).
+    /// Wrapped in a `Vec<u8>` for serde compatibility; the 32-byte key
+    /// is re-wrapped in [`Zeroizing`] on restore.
+    #[serde(default)]
+    wrapping_secret_key: Vec<u8>,
+}
 
 /// Per-context cryptographic state managed by [`MlsCryptoProvider`].
 struct ContextCryptoState {
@@ -81,7 +161,9 @@ pub struct MlsCryptoProvider {
     broadcast_keys: Mutex<HashMap<[u8; 32], SenderKey>>,
     /// X25519 wrapping public key for sender key HPKE (§9.16.1).
     /// Published in the MLS `LeafNode` `scp_wrapping_key` extension.
-    wrapping_public_key: [u8; 32],
+    /// Behind a `Mutex` so it can be restored from a persisted snapshot
+    /// via [`ContextCryptoProvider::restore_crypto_state`] (which takes `&self`).
+    wrapping_public_key: Mutex<[u8; 32]>,
     /// X25519 wrapping secret key for sender key HPKE (§9.16.1).
     /// Used to open HPKE-sealed sender key responses. Wrapped in
     /// [`Zeroizing`] so key material is zeroed on drop.
@@ -102,7 +184,7 @@ impl MlsCryptoProvider {
             local_did,
             contexts: Mutex::new(HashMap::new()),
             broadcast_keys: Mutex::new(HashMap::new()),
-            wrapping_public_key,
+            wrapping_public_key: Mutex::new(wrapping_public_key),
             wrapping_secret_key: Mutex::new(Zeroizing::new(wrapping_secret_key)),
         }
     }
@@ -148,9 +230,12 @@ impl ContextCryptoProvider for MlsCryptoProvider {
 
     fn create_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         let credential = self.make_credential()?;
-        let mls_group =
-            group::create_group_with_wrapping_key(&credential, Some(&self.wrapping_public_key))
-                .map_err(|e| ContextCreationError::CryptoFailed(e.to_string()))?;
+        let wrapping_pk = self
+            .wrapping_public_key
+            .lock()
+            .map_err(|e| ContextCreationError::CryptoFailed(format!("lock poisoned: {e}")))?;
+        let mls_group = group::create_group_with_wrapping_key(&credential, Some(&*wrapping_pk))
+            .map_err(|e| ContextCreationError::CryptoFailed(e.to_string()))?;
 
         let sender_key = generate_sender_key();
         let sender_key_store = SenderKeyStore::new();
@@ -667,6 +752,223 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             Ok(ciphertext)
         })
     }
+
+    fn export_crypto_state(&self, context_id: &[u8; 32]) -> Result<Vec<u8>, ContextError> {
+        let contexts = self
+            .contexts
+            .lock()
+            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+        let Some(state) = contexts.get(context_id) else {
+            return Ok(Vec::new());
+        };
+
+        // Extract the MLS group and signer, both required for restore.
+        let group = state
+            .mls_group
+            .group
+            .as_ref()
+            .ok_or_else(|| ContextError::CryptoFailed("MLS group destroyed".to_string()))?;
+
+        let signer = state
+            .mls_group
+            .signer
+            .as_ref()
+            .ok_or_else(|| ContextError::CryptoFailed("MLS signer destroyed".to_string()))?;
+
+        let group_id = group.group_id().as_slice().to_vec();
+
+        // Serialize the signer via serde (it derives Serialize).
+        let signer_bytes = rmp_serde::to_vec_named(signer)
+            .map_err(|e| ContextError::CryptoFailed(format!("signer serialization: {e}")))?;
+
+        // Extract the raw key-value pairs from the OpenMLS MemoryStorage.
+        let mls_storage_entries = {
+            let values = state
+                .mls_group
+                .provider
+                .storage()
+                .values
+                .read()
+                .map_err(|e| ContextError::CryptoFailed(format!("storage lock poisoned: {e}")))?;
+            values.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+
+        // Collect sender key store entries for this context.
+        let ctx_id_hex = hex::encode(context_id);
+        let sender_key_entries: Vec<(String, SenderKey)> = state
+            .sender_key_store
+            .get_all(&ctx_id_hex)
+            .into_iter()
+            .collect();
+
+        // Read the provider-level wrapping keypair for persistence.
+        let pub_key_guard = self
+            .wrapping_public_key
+            .lock()
+            .map_err(|e| ContextError::CryptoFailed(format!("wrapping key lock poisoned: {e}")))?;
+        let secret_key_guard = self
+            .wrapping_secret_key
+            .lock()
+            .map_err(|e| ContextError::CryptoFailed(format!("wrapping key lock poisoned: {e}")))?;
+
+        let mut snapshot = MlsCryptoSnapshot {
+            mls_storage_entries,
+            local_sender_key: state.sender_key.clone(),
+            sender_key_entries,
+            sender_key_epoch: state.sender_key_epoch,
+            member_wrapping_keys: state
+                .member_wrapping_keys
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
+            signer_bytes,
+            group_id,
+            wrapping_public_key: *pub_key_guard,
+            wrapping_secret_key: secret_key_guard.to_vec(),
+        };
+
+        let result = rmp_serde::to_vec_named(&snapshot)
+            .map_err(|e| ContextError::CryptoFailed(format!("snapshot serialization: {e}")));
+
+        // SECURITY: Zeroize sensitive key material in the intermediate snapshot
+        // to minimize the window where private keys exist as structured data in
+        // memory. The serialized blob is the caller's responsibility (Storage
+        // layer must encrypt at rest per §17.5).
+        snapshot.signer_bytes.zeroize();
+        snapshot.local_sender_key.zeroize();
+        snapshot.wrapping_secret_key.zeroize();
+        for (_, value) in &mut snapshot.mls_storage_entries {
+            value.zeroize();
+        }
+        for (_, key) in &mut snapshot.sender_key_entries {
+            key.zeroize();
+        }
+
+        result
+    }
+
+    fn restore_crypto_state(&self, context_id: &[u8; 32], data: &[u8]) -> Result<(), ContextError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(data)
+            .map_err(|e| ContextError::CryptoFailed(format!("snapshot deserialization: {e}")))?;
+
+        // Reconstruct the InMemoryMlsProvider with the persisted storage entries.
+        let provider = super::storage::InMemoryMlsProvider::default();
+        {
+            let mut values =
+                provider.storage().values.write().map_err(|e| {
+                    ContextError::CryptoFailed(format!("storage lock poisoned: {e}"))
+                })?;
+            // Drain entries so the snapshot no longer holds MLS storage data
+            // (which contains epoch secrets and HPKE private keys).
+            for (k, v) in snapshot.mls_storage_entries.drain(..) {
+                values.insert(k, v);
+            }
+        }
+
+        // Deserialize the signer from the snapshot's raw bytes.
+        let signer: SignatureKeyPair = rmp_serde::from_slice(&snapshot.signer_bytes)
+            .map_err(|e| ContextError::CryptoFailed(format!("signer deserialization: {e}")))?;
+
+        // SECURITY: Zeroize the raw signer bytes now that they've been
+        // deserialized — the Ed25519 private key should not linger in this
+        // intermediate buffer.
+        snapshot.signer_bytes.zeroize();
+
+        // Re-store the signer in the provider's key store so OpenMLS can find it.
+        signer
+            .store(provider.storage())
+            .map_err(|e| ContextError::CryptoFailed(format!("signer store failed: {e}")))?;
+
+        // Reconstruct the MLS group from persisted storage via MlsGroup::load.
+        let group_id = GroupId::from_slice(&snapshot.group_id);
+        let mls_group = MlsGroup::load(provider.storage(), &group_id)
+            .map_err(|e| ContextError::CryptoFailed(format!("MlsGroup::load storage error: {e}")))?
+            .ok_or_else(|| {
+                ContextError::CryptoFailed(
+                    "MlsGroup::load returned None — group not found in restored storage"
+                        .to_string(),
+                )
+            })?;
+
+        // Reconstruct SenderKeyStore. drain() moves keys out and clears the
+        // snapshot's copy.
+        let ctx_id_hex = hex::encode(context_id);
+        let mut sender_key_store = SenderKeyStore::new();
+        for (did, key) in snapshot.sender_key_entries.drain(..) {
+            sender_key_store.set(&ctx_id_hex, &did, key);
+        }
+
+        // Reconstruct member wrapping keys.
+        let member_wrapping_keys: HashMap<String, [u8; 32]> =
+            snapshot.member_wrapping_keys.drain(..).collect();
+
+        let scp_group = ScpMlsGroup {
+            group: Some(mls_group),
+            provider,
+            signer: super::group::ZeroizingSigner::new(signer),
+            destroyed: false,
+        };
+
+        // Take the local_sender_key and leave a zeroed placeholder. SenderKey
+        // implements ZeroizeOnDrop, so the placeholder is cleaned when snapshot
+        // drops, and the original is moved into crypto_state.
+        let local_sender_key = std::mem::replace(
+            &mut snapshot.local_sender_key,
+            SenderKey::from_bytes([0u8; 32]),
+        );
+
+        let crypto_state = ContextCryptoState {
+            mls_group: scp_group,
+            sender_key: local_sender_key,
+            sender_key_store,
+            sender_key_epoch: snapshot.sender_key_epoch,
+            pending_distributions: Vec::new(),
+            nonce_dedup: NonceDedup::new(),
+            member_wrapping_keys,
+        };
+
+        let mut contexts = self
+            .contexts
+            .lock()
+            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+        contexts.insert(*context_id, crypto_state);
+
+        // Restore the provider-level X25519 wrapping keypair so HPKE-sealed
+        // sender key responses targeting the OLD public key can still be
+        // decrypted. Without this, the freshly-generated keypair would not
+        // match the public key published in the MLS tree's LeafNode extension,
+        // causing HPKE decryption failures for all incoming sender key
+        // responses sealed against the original key.
+        //
+        // Legacy snapshots (pre-wrapping-key persistence) have default
+        // [0u8; 32] — skip restore in that case to keep the fresh keypair.
+        if snapshot.wrapping_public_key != [0u8; 32] && snapshot.wrapping_secret_key.len() == 32 {
+            let mut secret = [0u8; 32];
+            secret.copy_from_slice(&snapshot.wrapping_secret_key);
+
+            let mut pub_guard = self.wrapping_public_key.lock().map_err(|e| {
+                ContextError::CryptoFailed(format!("wrapping key lock poisoned: {e}"))
+            })?;
+            *pub_guard = snapshot.wrapping_public_key;
+
+            let mut secret_guard = self.wrapping_secret_key.lock().map_err(|e| {
+                ContextError::CryptoFailed(format!("wrapping key lock poisoned: {e}"))
+            })?;
+            *secret_guard = Zeroizing::new(secret);
+        }
+
+        // SECURITY: Zeroize the wrapping secret key bytes remaining in the
+        // snapshot. The key has been copied into the Zeroizing<[u8; 32]> guard
+        // above (or skipped for legacy snapshots), so this intermediate Vec
+        // should not retain raw X25519 secret key material.
+        snapshot.wrapping_secret_key.zeroize();
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1117,7 +1419,7 @@ mod tests {
             super::super::wrapping_extension::extract_own_wrapping_key(&state.mls_group).unwrap();
         assert_eq!(
             extracted,
-            Some(provider.wrapping_public_key),
+            Some(*provider.wrapping_public_key.lock().unwrap()),
             "own leaf node must contain provider's wrapping public key"
         );
     }
@@ -1225,11 +1527,9 @@ mod tests {
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
 
         let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
-        let (bob_kp_bundle, _bob_signer, _bob_mls) = generate_key_package_with_wrapping_key(
-            &bob_cred,
-            Some(&bob_provider.wrapping_public_key),
-        )
-        .unwrap();
+        let bob_wrapping_pk = *bob_provider.wrapping_public_key.lock().unwrap();
+        let (bob_kp_bundle, _bob_signer, _bob_mls) =
+            generate_key_package_with_wrapping_key(&bob_cred, Some(&bob_wrapping_pk)).unwrap();
         let kp_bytes = bob_kp_bundle
             .key_package()
             .tls_serialize_detached()
@@ -1302,10 +1602,11 @@ mod tests {
         bob_provider.create_mls_group(&ctx_id).unwrap();
 
         let ctx_hex = hex::encode(ctx_id);
+        let bob_wrapping_pk = *bob_provider.wrapping_public_key.lock().unwrap();
         let (sealed_vec, ephemeral_pub) =
             crate::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
                 &[42u8; 32],
-                &bob_provider.wrapping_public_key,
+                &bob_wrapping_pk,
                 &ctx_hex,
                 TEST_DID,
                 0,
@@ -1328,6 +1629,275 @@ mod tests {
         assert!(
             result.is_err(),
             "should reject when sender_did doesn't match transport sender"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // MLS crypto state persistence tests (#645)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn export_crypto_state_returns_empty_for_unknown_context() {
+        let provider = make_provider();
+        let unknown_ctx = [0xFFu8; 32];
+        let exported = provider.export_crypto_state(&unknown_ctx).unwrap();
+        assert!(
+            exported.is_empty(),
+            "should return empty Vec for unknown context"
+        );
+    }
+
+    #[test]
+    fn restore_crypto_state_noop_on_empty_data() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        // restore_crypto_state with empty data should be a no-op.
+        let result = provider.restore_crypto_state(&ctx_id, &[]);
+        assert!(result.is_ok(), "empty data should succeed silently");
+    }
+
+    #[test]
+    fn export_restore_crypto_state_roundtrip() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+
+        // Create a group and generate a sender key.
+        provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
+
+        // Store a sender key for a remote member.
+        {
+            let ctx_id_hex = hex::encode(ctx_id);
+            let mut contexts = provider.contexts.lock().unwrap();
+            let state = contexts.get_mut(&ctx_id).unwrap();
+            state.sender_key_store.set(
+                &ctx_id_hex,
+                "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo",
+                generate_sender_key(),
+            );
+            state.member_wrapping_keys.insert(
+                "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_owned(),
+                [0xAA; 32],
+            );
+            state.sender_key_epoch = 42;
+        }
+
+        // Capture pre-export state for comparison.
+        let (original_sender_key, original_epoch, original_wrapping_key, original_bob_key) = {
+            let contexts = provider.contexts.lock().unwrap();
+            let state = contexts.get(&ctx_id).unwrap();
+            let ctx_id_hex = hex::encode(ctx_id);
+            (
+                state.sender_key.clone(),
+                state.sender_key_epoch,
+                state
+                    .member_wrapping_keys
+                    .get("did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo")
+                    .copied()
+                    .unwrap(),
+                state
+                    .sender_key_store
+                    .get(
+                        &ctx_id_hex,
+                        "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo",
+                    )
+                    .unwrap()
+                    .clone(),
+            )
+        };
+
+        // Export crypto state.
+        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        assert!(!exported.is_empty(), "exported state should be non-empty");
+
+        // Create a fresh provider and restore the state.
+        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
+
+        // Verify context doesn't exist before restore.
+        let encrypted = provider2.encrypt_message(&ctx_id, TEST_DID, b"test", 0, 0);
+        assert!(encrypted.is_err(), "should fail before restore");
+
+        // Restore.
+        provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
+
+        // Verify the MLS group is functional: encrypt should succeed.
+        let encrypted = provider2.encrypt_message(&ctx_id, TEST_DID, b"test after restore", 0, 0);
+        assert!(
+            encrypted.is_ok(),
+            "encrypt should succeed after restore: {encrypted:?}"
+        );
+
+        // Verify sender key state is restored.
+        {
+            let contexts = provider2.contexts.lock().unwrap();
+            let state = contexts.get(&ctx_id).unwrap();
+            let ctx_id_hex = hex::encode(ctx_id);
+
+            // Sender key matches.
+            assert_eq!(
+                state.sender_key.as_bytes(),
+                original_sender_key.as_bytes(),
+                "local sender key should be restored"
+            );
+
+            // Sender key epoch matches.
+            assert_eq!(
+                state.sender_key_epoch, original_epoch,
+                "sender key epoch should be restored"
+            );
+
+            // Bob's sender key is restored.
+            let bob_key = state
+                .sender_key_store
+                .get(
+                    &ctx_id_hex,
+                    "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo",
+                )
+                .expect("Bob's sender key should be restored");
+            assert_eq!(
+                bob_key.as_bytes(),
+                original_bob_key.as_bytes(),
+                "Bob's sender key should match"
+            );
+
+            // Bob's wrapping key is restored.
+            let wk = state
+                .member_wrapping_keys
+                .get("did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo")
+                .expect("Bob's wrapping key should be restored");
+            assert_eq!(*wk, original_wrapping_key, "wrapping key should match");
+
+            // Pending distributions should be empty after restore.
+            assert!(
+                state.pending_distributions.is_empty(),
+                "pending distributions should be empty after restore"
+            );
+        }
+    }
+
+    #[test]
+    fn export_fails_on_destroyed_group() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+
+        provider.create_mls_group(&ctx_id).unwrap();
+        provider.destroy_mls_group(&ctx_id).unwrap();
+
+        // After destroy, export should return empty (context removed).
+        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        assert!(
+            exported.is_empty(),
+            "destroyed group should export empty state"
+        );
+    }
+
+    #[test]
+    fn restore_rejects_corrupt_data() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+
+        let result = provider.restore_crypto_state(&ctx_id, b"not valid msgpack");
+        assert!(result.is_err(), "corrupt data should fail");
+    }
+
+    #[test]
+    fn restore_idempotent_on_same_context() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+
+        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+
+        // Restore into a fresh provider twice — second should overwrite cleanly.
+        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
+        provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
+        provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
+
+        // Should still be functional.
+        let encrypted = provider2.encrypt_message(&ctx_id, TEST_DID, b"test", 0, 0);
+        assert!(
+            encrypted.is_ok(),
+            "second restore should produce working state"
+        );
+    }
+
+    #[test]
+    fn export_restore_preserves_mls_epoch() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+
+        // Get the epoch before export.
+        let epoch_before = {
+            let contexts = provider.contexts.lock().unwrap();
+            let state = contexts.get(&ctx_id).unwrap();
+            state.mls_group.epoch().unwrap()
+        };
+
+        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+
+        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
+        provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
+
+        // Verify epoch is preserved.
+        let epoch_after = {
+            let contexts = provider2.contexts.lock().unwrap();
+            let state = contexts.get(&ctx_id).unwrap();
+            state.mls_group.epoch().unwrap()
+        };
+
+        assert_eq!(
+            epoch_before, epoch_after,
+            "MLS epoch should be preserved across export/restore"
+        );
+    }
+
+    #[test]
+    fn test_wrapping_key_persisted_across_restart() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+
+        // Capture the original wrapping keypair.
+        let original_public = *provider.wrapping_public_key.lock().unwrap();
+        let original_secret: [u8; 32] = **provider.wrapping_secret_key.lock().unwrap();
+
+        // Sanity: the keypair should not be all zeros.
+        assert_ne!(
+            original_public, [0u8; 32],
+            "wrapping public key must not be zero"
+        );
+        assert_ne!(
+            original_secret, [0u8; 32],
+            "wrapping secret key must not be zero"
+        );
+
+        // Export the crypto state.
+        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        assert!(!exported.is_empty());
+
+        // Create a fresh provider (simulates restart — gets a NEW random keypair).
+        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
+        let fresh_public = *provider2.wrapping_public_key.lock().unwrap();
+        assert_ne!(
+            fresh_public, original_public,
+            "fresh provider should have a DIFFERENT wrapping public key"
+        );
+
+        // Restore the exported state into the fresh provider.
+        provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
+
+        // After restore, the wrapping keypair must match the ORIGINAL, not the fresh one.
+        let restored_public = *provider2.wrapping_public_key.lock().unwrap();
+        let restored_secret: [u8; 32] = **provider2.wrapping_secret_key.lock().unwrap();
+
+        assert_eq!(
+            restored_public, original_public,
+            "wrapping public key must be restored from snapshot, not freshly generated"
+        );
+        assert_eq!(
+            restored_secret, original_secret,
+            "wrapping secret key must be restored from snapshot, not freshly generated"
         );
     }
 }

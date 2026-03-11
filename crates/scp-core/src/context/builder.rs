@@ -285,6 +285,52 @@ pub trait ContextCryptoProvider: Send + Sync {
         epoch: u64,
         sequence: u64,
     ) -> Result<Vec<u8>, ContextError>;
+
+    // -- Persistence operations (§23.11, #645) ------------------------------
+
+    /// Exports the per-context cryptographic state as an opaque byte blob
+    /// for persistence alongside the `ContextSnapshot`.
+    ///
+    /// The returned bytes capture all state needed to resume MLS encryption
+    /// and decryption for this context after a process restart: the MLS group
+    /// state (tree, epoch secrets, key schedule), the local sender key, the
+    /// sender key store (all member keys), the sender key epoch, and per-member
+    /// wrapping public keys.
+    ///
+    /// Returns an empty `Vec` if no crypto state exists for the given context
+    /// (e.g., mock providers or broadcast-only contexts).
+    ///
+    /// The default implementation returns an empty `Vec` (no state to persist).
+    /// Production providers that manage MLS groups MUST override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if serialization fails.
+    fn export_crypto_state(&self, _context_id: &[u8; 32]) -> Result<Vec<u8>, ContextError> {
+        Ok(Vec::new())
+    }
+
+    /// Restores per-context cryptographic state from a previously exported
+    /// byte blob (produced by [`export_crypto_state`](Self::export_crypto_state)).
+    ///
+    /// Called during [`ContextManager::restore_context`] to reinstate MLS
+    /// groups and sender keys after a process restart. If `data` is empty,
+    /// this is a no-op (the provider was never persisted or is a mock).
+    ///
+    /// The default implementation is a no-op. Production providers that
+    /// manage MLS groups MUST override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if deserialization fails or
+    /// the data is corrupt.
+    fn restore_crypto_state(
+        &self,
+        _context_id: &[u8; 32],
+        _data: &[u8],
+    ) -> Result<(), ContextError> {
+        Ok(())
+    }
 }
 
 /// Provides transport operations needed during context creation.

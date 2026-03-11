@@ -289,6 +289,7 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         grace_entries: Vec::new(),
         // Reconnection flag is not exported — only meaningful to the local node.
         needs_reconnect: false,
+        mls_crypto_state: Vec::new(),
     }
 }
 
@@ -387,6 +388,7 @@ mod tests {
             mls_epoch: 0,
             grace_entries: Vec::new(),
             needs_reconnect: false,
+            mls_crypto_state: Vec::new(),
         }
     }
 

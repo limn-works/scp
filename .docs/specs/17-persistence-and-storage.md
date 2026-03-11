@@ -532,6 +532,31 @@ The exact sub-prefix structure follows OpenMLS's `StorageProvider` method signat
 - **The bridge is the domain layer.** It constructs namespaced keys, validates context IDs via `sanitize_key_component`, and handles serialization. ProtocolStore wrapper methods would be pure indirection.
 - **Migration is OpenMLS's concern.** MLS state serialization is governed by the OpenMLS version, not SCP's `StoredValue` versioning. Format changes across OpenMLS upgrades follow OpenMLS's own compatibility guarantees.
 
+### 17.9.1 MLS Crypto State Snapshot
+
+`MlsStorageBridge` (§17.9) implements the OpenMLS `StorageProvider` trait for fine-grained per-item persistence under the `mls/{context_id}/...` key prefix, but is **not currently wired into the runtime `MlsCryptoProvider`** — the runtime uses `InMemoryMlsProvider` instead. A complete MLS crypto context also includes state managed by `ContextCryptoProvider` that lives outside the OpenMLS `StorageProvider` contract:
+
+- **Sender keys and sender key store** — per-member symmetric keys for the sender key layer (ADR-001, §23)
+- **X25519 wrapping keypair** — HPKE encapsulation key for sender key distribution
+- **MLS signer** (`SignatureKeyPair`) — Ed25519 signing credential used by OpenMLS
+- **Member wrapping keys** — per-member AES-256 keys for sender key wrapping
+- **Sender key epoch** — monotonic counter tracking sender key rotation
+
+To persist all of this atomically, `ContextCryptoProvider` exposes two methods:
+
+- **`export_crypto_state(context_id) -> Vec<u8>`** — Serializes the full crypto provider state for a context into an opaque `MlsCryptoSnapshot` blob (MessagePack). This includes the OpenMLS in-memory storage entries, the signer, sender keys, wrapping keys, and epoch metadata. Sensitive key material (signer bytes, sender keys, wrapping secret key, MLS storage entries) is zeroized from the intermediate snapshot struct immediately after serialization.
+
+- **`restore_crypto_state(context_id, data) -> Result<()>`** — Deserializes the snapshot blob and reconstructs the full crypto state: rebuilds the `InMemoryMlsProvider` with persisted storage entries, loads the MLS group via `MlsGroup::load`, restores the signer to OpenMLS's key store, reconstructs the sender key store and member wrapping keys, and restores the X25519 wrapping keypair. Intermediate buffers are zeroized after deserialization via `drain()` and explicit `zeroize()` calls.
+
+The snapshot blob is stored in `ContextSnapshot.mls_crypto_state` and persisted alongside the rest of the context state in `context/{context_id}/full_snapshot`. On `restore_context`, the blob is restored before constructing `PerContextState` so that the crypto provider has MLS group and sender keys available for subsequent encrypt/decrypt operations.
+
+**Relationship to `MlsStorageBridge`.** The blob snapshot is the **sole active** persistence mechanism for MLS crypto state in the current implementation. `MlsCryptoProvider` uses an `InMemoryMlsProvider` at runtime; `MlsStorageBridge` (§17.9) is implemented but is **not wired into the runtime crypto provider path**. It exists as infrastructure for future fine-grained persistence if needed.
+
+- **The blob snapshot** (active) captures the complete crypto provider state atomically — both the OpenMLS-managed portion (group state, tree nodes, key schedules) and the SCP-managed portion (sender keys, wrapping keys, signer) — as a single unit. On restore, it re-populates the in-memory structures that OpenMLS operates against.
+- **`MlsStorageBridge`** (not currently instantiated) provides the OpenMLS `StorageProvider` trait implementation for fine-grained, per-item MLS storage. If activated in a future iteration, it would allow OpenMLS to persist individual items incrementally rather than relying on full-state snapshots.
+
+The snapshot approach ensures atomicity: all crypto state is persisted and restored as a single unit. Without it, a crash between persisting MLS state and persisting sender key state would leave the context in an inconsistent state where MLS decryption succeeds but sender key decryption fails (or vice versa).
+
 ## 17.10 Migration Strategy
 
 **Lazy on-read migration.** `ProtocolStore` checks the version envelope on every read:
