@@ -70,7 +70,7 @@ if (bridge === null) {
       expect(loaded.did).toBe(created.did);
     });
 
-    test("resolves a DID to a DID document", async () => {
+    test("resolves a DID to a DID document (no agent key)", async () => {
       const handle = await napi.identityCreate("in_memory");
       const doc = await napi.identityResolve(handle.did);
       expect(doc.id).toBe(handle.did);
@@ -80,8 +80,21 @@ if (bridge === null) {
       expect(doc.verificationMethods.length).toBeGreaterThanOrEqual(1);
       expect(doc.verificationMethods[0].publicKeyMultibase).toBeTruthy();
       expect(doc.verificationMethods[0].publicKeyMultibase.startsWith("z")).toBe(true);
-      // Agent key fields must be present (Finding 0, issue #547).
-      expect(typeof doc.hasAgentKey).toBe("boolean");
+      // Identity created without agent key: hasAgentKey must be false.
+      expect(doc.hasAgentKey).toBe(false);
+      expect(doc.agentPublicKey).toBeUndefined();
+    });
+
+    test("resolves a DID to a DID document (with agent key, ADR-039)", async () => {
+      const handle = await napi.identityCreateWithAgentKey("in_memory");
+      const doc = await napi.identityResolve(handle.did);
+      expect(doc.id).toBe(handle.did);
+      // Identity created with agent key: hasAgentKey must be true.
+      expect(doc.hasAgentKey).toBe(true);
+      expect(doc.agentPublicKey).toBeDefined();
+      expect(typeof doc.agentPublicKey).toBe("string");
+      // Agent public key should be multibase-encoded (starts with 'z' for base58btc).
+      expect(doc.agentPublicKey?.startsWith("z")).toBe(true);
     });
 
     test("rotates an identity key and preserves the DID", async () => {
