@@ -128,25 +128,25 @@ fn discovery_result_to_json(
     let (source_str, trust_level_kind, resolution_layer, resolution_source, resolution_source_id) =
         match &result.discovery_source {
             scp_core::discovery::ContextDiscoverySource::DhtDidDocument => {
-                ("dht_did_document", "DomainVerified", "domain", "dht", None)
+                ("dht_did_document", "DomainVerified", "Domain", "dht", None)
             }
             scp_core::discovery::ContextDiscoverySource::WellKnown => {
-                ("well_known", "DomainVerified", "domain", "well-known", None)
+                ("well_known", "DomainVerified", "Domain", "well-known", None)
             }
             scp_core::discovery::ContextDiscoverySource::DiscoveryContext { context_id } => (
                 "discovery_context",
                 "DiscoveryContextVerified",
-                "discovery_context",
+                "DiscoveryContext",
                 "discovery_context",
                 Some(context_id.as_str()),
             ),
             // §22.7: An scp:// URI is shared out-of-band, so the trust level is
-            // DirectExchange and the resolution layer is "domain" (closest match
+            // DirectExchange and the resolution layer is "Domain" (closest match
             // for URI-based resolution — no discovery context is involved).
             scp_core::discovery::ContextDiscoverySource::ContextUri => (
                 "context_uri",
                 "DirectExchange",
-                "domain",
+                "Domain",
                 "context_uri",
                 None,
             ),
@@ -315,10 +315,10 @@ mod tests {
         assert_eq!(json["context_id"], "abc123");
         assert_eq!(json["discovery_source"], "dht_did_document");
         assert_eq!(json["mode"], "broadcast");
-        // §22.7: trust_level is a discriminated union object; resolution_path
-        // uses spec snake_case layer values.
+        // §22.11.3: trust_level is a discriminated union object; resolution_path
+        // uses spec PascalCase layer values.
         assert_eq!(json["trust_level"]["kind"], "DomainVerified");
-        assert_eq!(json["resolution_path"]["layer"], "domain");
+        assert_eq!(json["resolution_path"]["layer"], "Domain");
         assert_eq!(json["resolution_path"]["source"], "dht");
         assert!(json["resolution_path"]["resolved_at"].as_u64().unwrap() > 0);
     }
@@ -338,7 +338,7 @@ mod tests {
 
         let json = discovery_result_to_json(&result);
         assert_eq!(json["trust_level"]["kind"], "DiscoveryContextVerified");
-        assert_eq!(json["resolution_path"]["layer"], "discovery_context");
+        assert_eq!(json["resolution_path"]["layer"], "DiscoveryContext");
         assert_eq!(json["resolution_path"]["source"], "discovery_context");
         assert_eq!(json["resolution_path"]["source_id"], "disc-ctx-1");
         assert_eq!(json["discovery_context_id"], "disc-ctx-1");

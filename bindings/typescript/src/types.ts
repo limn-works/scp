@@ -447,11 +447,16 @@ export type TrustLevel =
 /**
  * The resolution layer that produced an address resolution result.
  *
- * Exactly four values per §22.7 `ResolutionPath.layer`. Uses spec snake_case.
+ * Five variants per §22.11.3 `ResolutionLayer`. Uses spec PascalCase serde tags.
  *
- * See §22.7 Resolution Path.
+ * See §22.11.3 Address Resolution.
  */
-export type ResolutionLayer = "petname" | "discovery_context" | "attestation" | "domain";
+export type ResolutionLayer =
+  | "Petname"
+  | "DiscoveryContext"
+  | "Attestation"
+  | "Domain"
+  | "MultiLayerCorroborated";
 
 /**
  * Structured metadata recording which layer resolved an address.
