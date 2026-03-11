@@ -119,8 +119,8 @@ fn queue_context_prefix(context_id: &str) -> Result<String, StoreError> {
 /// Builds the storage key for the per-context queue sequence counter.
 ///
 /// Format: `queue/{context_id}/_seq`
-/// The leading underscore ensures this metadata key sorts before any
-/// zero-padded sequence number.
+/// The underscore (`0x5F`) sorts after digits (`0x30`-`0x39`), so this
+/// metadata key sorts after all zero-padded sequence number entries.
 fn queue_seq_key(context_id: &str) -> Result<String, StoreError> {
     let ctx = super::sanitize_key_component(context_id)?;
     Ok(format!("queue/{ctx}/_seq"))
@@ -197,21 +197,25 @@ impl<S: Storage> ProtocolStore<S> {
             .await?;
 
         // Enforce per-context bound.
+        let mut per_ctx_overflow = None;
         let ctx_count = self.queue_context_count(context_id).await?;
         if ctx_count > MAX_QUEUE_PER_CONTEXT {
-            let overflow = self
-                .enforce_per_context_bound(context_id, ctx_count)
-                .await?;
-            return Ok(Some(overflow));
+            per_ctx_overflow = Some(
+                self.enforce_per_context_bound(context_id, ctx_count)
+                    .await?,
+            );
         }
 
-        // Enforce global bound (use new_global_count which we just stored).
-        if new_global_count > MAX_QUEUE_GLOBAL {
+        // Always check the global bound — per-context enforcement may not
+        // have removed enough to satisfy the global cap.  Re-read the global
+        // count because `enforce_per_context_bound` updates it.
+        let current_global = self.queue_global_count().await?;
+        if current_global > MAX_QUEUE_GLOBAL {
             let overflow = self.enforce_global_bound(context_id).await?;
             return Ok(Some(overflow));
         }
 
-        Ok(None)
+        Ok(per_ctx_overflow)
     }
 
     /// Dequeues all messages for a context in queue order.
@@ -435,7 +439,7 @@ impl<S: Storage> ProtocolStore<S> {
     }
 
     /// Enforces the global queue bound by removing the oldest entries across
-    /// all contexts.
+    /// all contexts, ordered by `queued_at` timestamp (spec §23.2).
     ///
     /// Removes entries (oldest first across all contexts) until the global
     /// count is at or below [`MAX_QUEUE_GLOBAL`]. The `triggering_context_id`
@@ -447,18 +451,28 @@ impl<S: Storage> ProtocolStore<S> {
         let global_count = self.queue_global_count().await?;
         let excess = global_count.saturating_sub(MAX_QUEUE_GLOBAL);
 
-        // List all queue keys globally (sorted lexicographically = oldest first
-        // within each context, and contexts sorted alphabetically).
+        // List all queue keys globally.
         let all_keys = self.storage.list_keys(QUEUE_GLOBAL_PREFIX).await?;
 
-        let mut dropped = 0u64;
+        // Load entries with their keys so we can sort by queued_at (oldest
+        // first), not by lexicographic key order (which sorts by context ID).
+        let mut candidates: Vec<(String, u64)> = Vec::new();
         for key in &all_keys {
-            if dropped >= excess {
-                break;
-            }
-            // Skip metadata keys.
             if key.ends_with("/_seq") {
                 continue;
+            }
+            if let Some(entry) = self.load_value::<QueueEntry>(key).await? {
+                candidates.push((key.clone(), entry.queued_at));
+            }
+        }
+
+        // Sort by queued_at ascending — oldest entries first.
+        candidates.sort_by_key(|(_key, queued_at)| *queued_at);
+
+        let mut dropped = 0u64;
+        for (key, _queued_at) in &candidates {
+            if dropped >= excess {
+                break;
             }
             self.storage.delete(key).await?;
             dropped += 1;
