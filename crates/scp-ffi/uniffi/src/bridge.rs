@@ -3387,9 +3387,8 @@ pub async fn tool_session_close(
 ///
 /// Establishes a WebSocket connection to the specified relay URL using
 /// [`NativeRelayAdapter::connect_sourced`] with `Explicit` source
-/// (requires `wss://`). The adapter is stored in both the returned
-/// `TransportManager` handle and the global relay connection state for
-/// use by other bridge functions.
+/// (requires `wss://`). The adapter is stored in the returned
+/// `TransportManager` handle.
 ///
 /// # Arguments
 ///
@@ -3504,6 +3503,7 @@ pub async fn transport_disconnect(manager: Arc<TransportManager>) -> Result<(), 
                 })?;
                 status_guard.connected = false;
                 status_guard.relay_url = None;
+                status_guard.latency_ms = None;
             }
 
             Ok(())
