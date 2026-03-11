@@ -6312,12 +6312,7 @@ impl ContextManager {
                         let recovery_in_progress =
                             ctx.deadlock_detection_state.recovery_in_progress;
 
-                        (
-                            gov_ctx,
-                            departed,
-                            mls_epoch,
-                            recovery_in_progress,
-                        )
+                        (gov_ctx, departed, mls_epoch, recovery_in_progress)
                         // Lock dropped here.
                     };
 
@@ -6327,6 +6322,10 @@ impl ContextManager {
                         let Some(ctx) = contexts_guard.get_mut(&ctx_id) else {
                             return false;
                         };
+
+                        // Snapshot active voters BEFORE processing proposals so
+                        // voters on about-to-resolve proposals are still visible.
+                        let active_voters = collect_active_voters(ctx.governance_engine.as_ref());
 
                         // Process pending proposals for timeout/departures.
                         let result = process_pending_proposals(
@@ -6338,7 +6337,6 @@ impl ContextManager {
 
                         // Update deadlock detection state before detecting
                         // deadlock so missed-window counters reflect this tick.
-                        let active_voters = collect_active_voters(ctx.governance_engine.as_ref());
                         update_detection_state(
                             &mut ctx.deadlock_detection_state,
                             ctx.governance_engine.as_ref(),
