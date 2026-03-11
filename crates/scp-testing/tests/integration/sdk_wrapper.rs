@@ -66,18 +66,15 @@ const SWIFT_GOVERNANCE: &str =
     include_str!("../../../../bindings/swift/Sources/SCP/Governance.swift");
 
 // Kotlin SDK files
-const KT_IDENTITY: &str = include_str!(
-    "../../../../bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Identity.kt"
-);
+const KT_IDENTITY: &str =
+    include_str!("../../../../bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Identity.kt");
 const KT_BRIDGE_CONNECTOR: &str = include_str!(
     "../../../../bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/BridgeConnector.kt"
 );
-const KT_DISCOVERY: &str = include_str!(
-    "../../../../bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Discovery.kt"
-);
-const KT_PROVENANCE: &str = include_str!(
-    "../../../../bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Provenance.kt"
-);
+const KT_DISCOVERY: &str =
+    include_str!("../../../../bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Discovery.kt");
+const KT_PROVENANCE: &str =
+    include_str!("../../../../bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Provenance.kt");
 const KT_SYNC: &str =
     include_str!("../../../../bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Sync.kt");
 const KT_COROUTINE_BRIDGE: &str = include_str!(
