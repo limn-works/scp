@@ -309,3 +309,158 @@ Per-context sync outcomes are reported to the application layer:
 - **Reset** -- member underwent group state reset (Tier 3).
 - **ContextGone** -- context was closed or expired while offline.
 - **Failed** -- sync failed with a reported reason.
+
+## 23.16 Sync Protocol Wire Formats
+
+All sync protocol messages are serialized as MessagePack with named fields (`rmp-serde` with `named` configuration). Types exchanged between implementations as MLS application messages or via relay must use these exact field names and types.
+
+### 23.16.1 ConsistencyCheckpoint
+
+Exchanged between members as MLS application messages during event log reconciliation (§23.7, §9.9.3).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `context_id` | string | Context identifier |
+| `sender_did` | string | DID of the checkpoint sender |
+| `event_count` | u64 | Number of events in sender's local event log |
+| `merkle_root` | bytes (32) | SHA-256 Merkle root of sender's event log |
+| `epoch` | u64 or null | MLS epoch on sender's device; null for Broadcast contexts |
+| `timestamp` | u64 | Unix seconds when generated |
+| `signature` | bytes (64) | Ed25519 signature over canonical hash of all fields above |
+
+**Signature construction:** Domain separator `"SCP-CHECKPOINT-V1:"` (§9.18.2). The canonical hash follows §9.5.1: `SHA-256("SCP-CHECKPOINT-V1:" || BE32(len(context_id)) || context_id || BE32(len(sender_did)) || sender_did || event_count (8-byte BE u64) || merkle_root (32 bytes) || epoch_flag (1 byte: 0x01 if present, 0x00 if null) || epoch (8-byte BE u64, omitted if null) || timestamp (8-byte BE u64))`. All variable-length fields use `BE32(len())` prefixes per §9.5.1. The `sender_did` is included to prevent checkpoint misattribution. The `epoch` field uses a presence flag: `0x01 || epoch_BE` when present, `0x00` when null (Broadcast contexts). The signature is Ed25519 over this hash, signed by the sender's `#active` or `#agent` verification method key (ADR-039).
+
+### 23.16.2 CommitRangeRequest
+
+Sent as MLS application message when relay backfill does not contain all Commits needed for epoch catch-up (§23.4.1, source 2).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `context_id` | string | Context identifier |
+| `from_epoch` | u64 | First epoch to retrieve (inclusive) |
+| `to_epoch` | u64 | Last epoch to retrieve (inclusive) |
+| `requester_did` | string | DID of the requesting member |
+| `signature` | bytes (64) | Ed25519 signature for authentication |
+
+**Signature construction:** Domain separator `"SCP-COMMIT-RANGE-REQ-V1:"` (§9.18.2). Canonical hash per §9.5.1: `SHA-256("SCP-COMMIT-RANGE-REQ-V1:" || BE32(len(context_id)) || context_id || from_epoch (8-byte BE u64) || to_epoch (8-byte BE u64) || BE32(len(requester_did)) || requester_did)`. The signature authenticates the requester and prevents request forgery.
+
+### 23.16.3 CommitRangeResponse
+
+Response to CommitRangeRequest, sent as MLS application message (§23.4.1, source 2).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `context_id` | string | Context identifier |
+| `commits` | array of bytes | Serialized MLS Commit messages, strictly ascending epoch order |
+| `responder_did` | string | DID of the responding member |
+| `signature` | bytes (64) | Ed25519 signature for authentication |
+
+**Signature construction:** Domain separator `"SCP-COMMIT-RANGE-RESP-V1:"` (§9.18.2). Canonical hash per §9.5.1: `SHA-256("SCP-COMMIT-RANGE-RESP-V1:" || BE32(len(context_id)) || context_id || BE32(len(commits_concat)) || commits_concat || BE32(len(responder_did)) || responder_did)`, where `commits_concat` is each commit entry prefixed by its own `BE32(len())` and then concatenated. The signature authenticates the responder and prevents response tampering.
+
+Each entry in `commits` is an opaque serialized MLS Commit message as produced by the MLS library. Ordering MUST be strictly ascending by epoch.
+
+### 23.16.4 ContextSnapshot
+
+Self-contained context state at a point in time. Used for Tier 2 delta sync recovery (§23.5, ADR-029).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `context_id` | string | Context identifier |
+| `timestamp` | u64 | Unix seconds when snapshot was taken |
+| `mls_epoch` | u64 or null | MLS epoch at snapshot time; null for Broadcast contexts |
+| `event_log_merkle_root` | bytes (32) | SHA-256 Merkle root at snapshot time |
+| `event_count` | u64 | Number of events in log at snapshot time |
+| `members` | map<string, MembershipEntry> | DID string → membership entry (BTreeMap for deterministic ordering) |
+| `role_definitions` | map<string, array of string> | Role name → capability names |
+| `params_hash` | bytes (32) | SHA-256 of serialized ContextParams |
+| `tool_names` | array of string | Registered tool names at snapshot time |
+| `creator_did` | string | DID of snapshot creator |
+| `signature` | bytes (64) | Ed25519 signature over all fields except `signature` |
+| `sequence` | u64 | Monotonically increasing snapshot sequence per context |
+
+**Signature construction:** Domain separator `"SCP-CONTEXT-SNAPSHOT-V1:"` (§9.18.2). Canonical hash per §9.5.1: `SHA-256("SCP-CONTEXT-SNAPSHOT-V1:" || BE32(len(context_id)) || context_id || timestamp (8-byte BE u64) || mls_epoch_flag (1 byte: 0x01 if present, 0x00 if null) || mls_epoch (8-byte BE u64, omitted if null) || event_log_merkle_root (32 bytes) || event_count (8-byte BE u64) || members_hash (32 bytes) || role_definitions_hash (32 bytes) || params_hash (32 bytes) || tool_names_hash (32 bytes) || BE32(len(creator_did)) || creator_did || sequence (8-byte BE u64))`. The `members_hash` is `SHA-256` of BTreeMap entries serialized in key order: for each `(did, entry)`, emit `BE32(len(did)) || did || BE32(len(role_name)) || role_name || sequence_number (8-byte BE u64)`. The `role_definitions_hash` is `SHA-256` of entries in key order: for each `(role, caps)`, emit `BE32(len(role)) || role || BE32(count) || [BE32(len(cap)) || cap ...]`. The `tool_names_hash` is `SHA-256` of `BE32(count) || [BE32(len(name)) || name ...]` in array order. The `mls_epoch` field uses a presence flag matching ConsistencyCheckpoint (§23.16.1). The signature is Ed25519 over this hash, signed by `creator_did`'s `#active` or `#agent` verification method key (ADR-039).
+
+**MembershipEntry:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `did` | string | Member's DID |
+| `role_name` | string | Assigned role name (e.g., `"admin"`, `"member"`) |
+| `sequence_number` | u64 | Per-sender monotonic sequence number at snapshot time |
+
+### 23.16.5 SnapshotDelta
+
+Computed difference between two ContextSnapshots for efficient state update (§23.5, Tier 2).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `context_id` | string | Context identifier |
+| `from_sequence` | u64 | Old (stale) snapshot sequence number |
+| `to_sequence` | u64 | New (current) snapshot sequence number |
+| `from_epoch` | u64 or null | MLS epoch at old snapshot |
+| `to_epoch` | u64 or null | MLS epoch at new snapshot |
+| `membership_changes` | array of MembershipChange | Changes between snapshots |
+| `role_definition_changes` | map<string, array of string> | Roles added or modified |
+| `removed_role_definitions` | array of string | Roles removed |
+| `added_tools` | array of string | Tools added |
+| `removed_tools` | array of string | Tools removed |
+| `params_changed` | bool | Whether context parameters hash changed |
+| `events_added` | u64 | Number of events added between snapshots |
+| `old_merkle_root` | bytes (32) | Merkle root from old snapshot |
+| `new_merkle_root` | bytes (32) | Merkle root from new snapshot |
+
+**MembershipChange** (tagged enum):
+
+| Variant | Fields | Description |
+|---------|--------|-------------|
+| `Joined` | `MembershipEntry` | New member joined |
+| `Left` | `did: string` | Member left or was removed |
+| `RoleChanged` | `did: string, old_role: string, new_role: string` | Member's role changed |
+
+### 23.16.6 EquivocationAlert
+
+Raised when relay equivocation is detected (§9.9.3, §23.7). May be recorded in the event log.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `context_id` | string | Context where equivocation was detected |
+| `detector_did` | string | DID of the detecting member |
+| `divergent_did` | string | DID of the member whose checkpoint diverges |
+| `divergent_event_count` | u64 | Event count at which Merkle roots diverge |
+| `local_merkle_root` | bytes (32) | Detector's Merkle root at divergent count |
+| `remote_merkle_root` | bytes (32) | Divergent member's Merkle root |
+| `evidence` | EquivocationEvidence or null | Conflicting checkpoints if available |
+| `detected_at` | u64 | Unix seconds when alert was raised |
+| `local_epoch` | u64 or null | MLS epoch on detector's device |
+
+**EquivocationEvidence:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `local_checkpoint` | ConsistencyCheckpoint | Detector's checkpoint |
+| `remote_checkpoint` | ConsistencyCheckpoint | Divergent member's checkpoint |
+| `divergent_event_count` | u64 | Event count at divergence |
+
+### 23.16.7 ResetRequest
+
+Sent via relay as **plaintext** (not MLS-encrypted) when the member cannot encrypt at the current epoch. Already specified in §23.5.2; field table provided here for completeness.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `context_id` | string | Context identifier |
+| `member_did` | string | DID of the requesting member |
+| `last_known_epoch` | u64 | Last MLS epoch the member has state for |
+| `reason` | ResetReason | Why the reset is needed |
+| `nonce` | bytes (16) | CSPRNG random, anti-replay |
+| `timestamp` | u64 | Unix seconds |
+| `signature` | bytes (64) | Ed25519 signature using domain separator `"SCP-RESET-REQUEST-V1:"` per §9.18.2 |
+
+**ResetReason** (tagged enum):
+
+| Variant | Fields | Description |
+|---------|--------|-------------|
+| `ExtendedOffline` | `offline_duration_secs: u64` | Member was offline for extended period |
+| `CatchUpFailed` | `attempted_sources: array of string` | Epoch catch-up failed despite trying listed sources |
+| `GovernanceAction` | `proposal_id: string` | Governance action triggered the reset |
+
+Canonical hash construction for ResetRequest signature is specified in §23.5.2.

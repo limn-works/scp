@@ -345,14 +345,64 @@ export function createNativeBridge(): Bridge {
     // Governance
     async contextExecuteGovernanceAction(
       handle: BridgeContextHandle,
-      proposalJson: string,
+      actionJson: string,
+      proposerDid: string,
     ): Promise<string> {
       return await (
         addon.contextExecuteGovernanceAction as (
           h: BridgeContextHandle,
+          a: string,
           p: string,
         ) => Promise<string>
-      )(handle, proposalJson);
+      )(handle, actionJson, proposerDid);
+    },
+
+    // TTL operations
+    async contextHandleTtlExpiry(handle: BridgeContextHandle): Promise<void> {
+      await (addon.contextHandleTtlExpiry as (h: BridgeContextHandle) => Promise<void>)(handle);
+    },
+
+    async contextProposeTtlExtension(
+      handle: BridgeContextHandle,
+      proposerDid: string,
+      extensionSecs: number,
+    ): Promise<boolean> {
+      return await (
+        addon.contextProposeTtlExtension as (
+          h: BridgeContextHandle,
+          d: string,
+          s: number,
+        ) => Promise<boolean>
+      )(handle, proposerDid, extensionSecs);
+    },
+
+    async contextResetTtlTimer(
+      handle: BridgeContextHandle,
+      newDurationSecs: number,
+    ): Promise<void> {
+      await (addon.contextResetTtlTimer as (h: BridgeContextHandle, s: number) => Promise<void>)(
+        handle,
+        newDurationSecs,
+      );
+    },
+
+    // Context export/import
+    async contextExport(handle: BridgeContextHandle): Promise<Uint8Array> {
+      const data = await (addon.contextExport as (h: BridgeContextHandle) => Promise<Buffer>)(
+        handle,
+      );
+      return new Uint8Array(data);
+    },
+
+    async contextImport(data: Uint8Array): Promise<string> {
+      return await (addon.contextImport as (d: Uint8Array) => Promise<string>)(data);
+    },
+
+    // Drain events
+    async contextDrainEvents(handle: BridgeContextHandle): Promise<readonly string[]> {
+      return await (
+        addon.contextDrainEvents as (h: BridgeContextHandle) => Promise<readonly string[]>
+      )(handle);
     },
 
     // Tools
@@ -439,6 +489,24 @@ export function createNativeBridge(): Bridge {
         handle,
         token,
       );
+    },
+
+    async ucanDelegate(
+      handle: BridgeContextHandle,
+      delegatorDid: string,
+      delegateeDid: string,
+      parentToken: string,
+      capabilities: readonly string[],
+    ): Promise<UcanToken> {
+      return await (
+        addon.ucanDelegate as (
+          h: BridgeContextHandle,
+          from: string,
+          to: string,
+          parent: string,
+          caps: readonly string[],
+        ) => Promise<UcanToken>
+      )(handle, delegatorDid, delegateeDid, parentToken, capabilities);
     },
 
     // Event Log

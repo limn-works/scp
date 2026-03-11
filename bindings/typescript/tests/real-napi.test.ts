@@ -859,4 +859,428 @@ if (bridge === null) {
       expect(query.keywords).toContain("collaboration");
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // 16. Broadcast operations
+  // ---------------------------------------------------------------------------
+
+  describe("Broadcast operations (real NAPI)", () => {
+    test("subscriber count is 0 on a fresh broadcast context", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read"],
+          mode: "Broadcast",
+        }),
+      );
+      const count = await napi.broadcastSubscriberCount(ctx);
+      // Broadcast context starts with 0 subscribers (creator is an author, not subscriber).
+      expect(count).toBe(0);
+    });
+
+    test("subscribe adds a subscriber", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const subscriber = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read"],
+          mode: "Broadcast",
+        }),
+      );
+
+      // Subscribe.
+      await napi.broadcastSubscribe(ctx, subscriber.did);
+
+      // Verify subscriber is recognized.
+      const isSub = await napi.broadcastIsSubscriber(ctx, subscriber.did);
+      expect(isSub).toBe(true);
+
+      // Verify count.
+      const count = await napi.broadcastSubscriberCount(ctx);
+      expect(count).toBe(1);
+    });
+
+    test("non-subscriber is not a subscriber", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const other = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read"],
+          mode: "Broadcast",
+        }),
+      );
+      const isSub = await napi.broadcastIsSubscriber(ctx, other.did);
+      expect(isSub).toBe(false);
+    });
+
+    test("unsubscribe removes a subscriber", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const subscriber = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read"],
+          mode: "Broadcast",
+        }),
+      );
+
+      await napi.broadcastSubscribe(ctx, subscriber.did);
+      expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(true);
+
+      await napi.broadcastUnsubscribe(ctx, subscriber.did);
+      expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(false);
+    });
+
+    test("broadcast admission returns a policy", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read"],
+          mode: "Broadcast",
+        }),
+      );
+      const admission = await napi.broadcastAdmission(ctx);
+      // Should return a string representation of the admission policy.
+      expect(typeof admission).toBe("string");
+    });
+
+    test("publish sends a broadcast message", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read", "messages:write"],
+          mode: "Broadcast",
+        }),
+      );
+      const payload = new TextEncoder().encode("broadcast hello");
+      // Should not throw.
+      await napi.broadcastPublish(ctx, identity.did, payload);
+    });
+
+    test("block subscriber removes and blocks a subscriber", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const subscriber = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read"],
+          mode: "Broadcast",
+        }),
+      );
+
+      await napi.broadcastSubscribe(ctx, subscriber.did);
+      expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(true);
+
+      // Block the subscriber.
+      await napi.broadcastBlockSubscriber(ctx, subscriber.did, identity.did);
+      expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(false);
+    });
+
+    test("handle key request returns a decision", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const subscriber = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read"],
+          mode: "Broadcast",
+        }),
+      );
+
+      await napi.broadcastSubscribe(ctx, subscriber.did);
+
+      const decision = await napi.broadcastHandleKeyRequest(ctx, identity.did, subscriber.did);
+      expect(typeof decision).toBe("string");
+      expect(decision.length).toBeGreaterThan(0);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 17. Governance operations
+  // ---------------------------------------------------------------------------
+
+  describe("Governance (real NAPI)", () => {
+    test("executes a ChangeRole governance action", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        admin,
+        JSON.stringify({
+          ceiling: ["messages:read", "messages:write"],
+          governance: "single_admin",
+        }),
+      );
+
+      // Add the member first.
+      await napi.contextJoin(ctx, member.did);
+
+      // Execute a ChangeRole governance action.
+      const actionJson = JSON.stringify({
+        ChangeRole: {
+          target_did: member.did,
+          new_role: "Moderator",
+        },
+      });
+      const result = await napi.contextExecuteGovernanceAction(ctx, actionJson, admin.did);
+      expect(typeof result).toBe("string");
+    });
+
+    test("rejects invalid governance action JSON", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        admin,
+        JSON.stringify({
+          ceiling: ["messages:read"],
+          governance: "single_admin",
+        }),
+      );
+
+      await expect(
+        napi.contextExecuteGovernanceAction(ctx, "not-valid-json", admin.did),
+      ).rejects.toThrow();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 18. TTL operations
+  // ---------------------------------------------------------------------------
+
+  describe("TTL operations (real NAPI)", () => {
+    test("handle TTL expiry on a context with TTL", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read"],
+          ttlSeconds: 3600,
+        }),
+      );
+      // Should not throw (handles TTL expiry check).
+      await napi.contextHandleTtlExpiry(ctx);
+    });
+
+    test("propose TTL extension returns a boolean", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read"],
+          ttlSeconds: 3600,
+        }),
+      );
+      const unanimous = await napi.contextProposeTtlExtension(ctx, identity.did, 7200);
+      // With a single member, the extension should be unanimously approved.
+      expect(typeof unanimous).toBe("boolean");
+    });
+
+    test("reset TTL timer does not throw", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read"],
+          ttlSeconds: 3600,
+        }),
+      );
+      // Should not throw.
+      await napi.contextResetTtlTimer(ctx, 7200);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 19. Context export/import
+  // ---------------------------------------------------------------------------
+
+  describe("Context export/import (real NAPI)", () => {
+    test("exports a context to bytes", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read"],
+          memoryScope: "ephemeral",
+        }),
+      );
+
+      const data = await napi.contextExport(ctx);
+      expect(data).toBeInstanceOf(Uint8Array);
+      expect(data.length).toBeGreaterThan(0);
+    });
+
+    test("exports and imports a context round-trip", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read"],
+          memoryScope: "ephemeral",
+        }),
+      );
+
+      // Export.
+      const data = await napi.contextExport(ctx);
+      expect(data.length).toBeGreaterThan(0);
+
+      // Import.
+      const importedContextId = await napi.contextImport(data);
+      expect(typeof importedContextId).toBe("string");
+      expect(importedContextId.length).toBeGreaterThan(0);
+    });
+
+    test("import rejects invalid data", async () => {
+      const invalidData = new Uint8Array([0, 1, 2, 3]);
+      await expect(napi.contextImport(invalidData)).rejects.toThrow();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 20. Drain events
+  // ---------------------------------------------------------------------------
+
+  describe("Drain events (real NAPI)", () => {
+    test("drain events returns an array after context creation", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read"],
+        }),
+      );
+
+      const events = await napi.contextDrainEvents(ctx);
+      expect(Array.isArray(events)).toBe(true);
+    });
+
+    test("drain events is idempotent (second drain returns empty)", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({
+          ceiling: ["messages:read"],
+        }),
+      );
+
+      // First drain consumes any pending events.
+      await napi.contextDrainEvents(ctx);
+
+      // Second drain should return empty (events already consumed).
+      const events = await napi.contextDrainEvents(ctx);
+      expect(events.length).toBe(0);
+    });
+
+    test("drain events captures events from join", async () => {
+      const creator = await napi.identityCreate("in_memory");
+      const joiner = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(creator, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      // Drain creation events.
+      await napi.contextDrainEvents(ctx);
+
+      // Join triggers an event.
+      await napi.contextJoin(ctx, joiner.did);
+      const events = await napi.contextDrainEvents(ctx);
+      expect(events.length).toBeGreaterThanOrEqual(1);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 21. UCAN delegation
+  // ---------------------------------------------------------------------------
+
+  describe("UCAN delegation (real NAPI)", () => {
+    test("delegates a minted token to a third party", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const delegate = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        admin,
+        JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
+      );
+
+      // Mint a token for the member.
+      const parentToken = await napi.ucanMint(ctx, member.did, ["messages:read", "messages:write"]);
+      expect(parentToken.encoded).toBeTruthy();
+
+      // Delegate a subset of capabilities from member to delegate.
+      const delegated = await napi.ucanDelegate(
+        ctx,
+        member.did,
+        delegate.did,
+        parentToken.encoded,
+        ["messages:read"],
+      );
+      expect(delegated.audience).toBe(delegate.did);
+      expect(delegated.capabilities.length).toBe(1);
+    });
+
+    test("delegation rejects invalid delegator DID", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+
+      // Use an invalid DID as delegator.
+      await expect(
+        napi.ucanDelegate(ctx, "not-a-did", member.did, token.encoded, ["messages:read"]),
+      ).rejects.toThrow();
+    });
+
+    test("delegation rejects mismatched delegator (not token audience)", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const other = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      // Mint token for member (audience = member.did).
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+
+      // Try to delegate as "other" who is NOT the token audience.
+      await expect(
+        napi.ucanDelegate(ctx, other.did, admin.did, token.encoded, ["messages:read"]),
+      ).rejects.toThrow();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 22. E2E: Broadcast full lifecycle
+  // ---------------------------------------------------------------------------
+
+  describe("E2E broadcast lifecycle (real NAPI)", () => {
+    test("create -> subscribe -> publish -> check subscriber -> unsubscribe", async () => {
+      const author = await napi.identityCreate("in_memory");
+      const subscriber = await napi.identityCreate("in_memory");
+
+      // Create broadcast context.
+      const ctx = await napi.contextCreate(
+        author,
+        JSON.stringify({
+          ceiling: ["messages:read", "messages:write"],
+          mode: "Broadcast",
+        }),
+      );
+
+      // Initial state.
+      expect(await napi.broadcastSubscriberCount(ctx)).toBe(0);
+
+      // Subscribe.
+      await napi.broadcastSubscribe(ctx, subscriber.did);
+      expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(true);
+      expect(await napi.broadcastSubscriberCount(ctx)).toBe(1);
+
+      // Publish.
+      const payload = new TextEncoder().encode("broadcast message");
+      await napi.broadcastPublish(ctx, author.did, payload);
+
+      // Unsubscribe.
+      await napi.broadcastUnsubscribe(ctx, subscriber.did);
+      expect(await napi.broadcastIsSubscriber(ctx, subscriber.did)).toBe(false);
+      expect(await napi.broadcastSubscriberCount(ctx)).toBe(0);
+    });
+  });
 }

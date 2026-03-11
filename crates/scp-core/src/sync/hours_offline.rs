@@ -32,6 +32,7 @@ use super::{
     CatchUpStatus, ContextId, Ed25519Signature, OfflineTier, SyncError, SyncEvent, SyncOutcome,
     SyncPolicy,
 };
+use crate::crypto::canonical::{CanonicalField, canonical_hash};
 use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
@@ -241,6 +242,12 @@ impl EpochCatchUpState {
 // CommitRangeRequest / CommitRangeResponse
 // ---------------------------------------------------------------------------
 
+/// Domain separator for `CommitRangeRequest` canonical hash (§9.18.2, §23.16.2).
+pub const COMMIT_RANGE_REQUEST_DOMAIN_SEPARATOR: &str = "SCP-COMMIT-RANGE-REQ-V1:";
+
+/// Domain separator for `CommitRangeResponse` canonical hash (§9.18.2, §23.16.3).
+pub const COMMIT_RANGE_RESPONSE_DOMAIN_SEPARATOR: &str = "SCP-COMMIT-RANGE-RESP-V1:";
+
 /// A request for missing MLS Commit messages from peers.
 ///
 /// Sent when the relay backfill does not contain all Commits needed for
@@ -263,6 +270,25 @@ pub struct CommitRangeRequest {
     pub signature: Ed25519Signature,
 }
 
+impl CommitRangeRequest {
+    /// Computes the canonical hash for signing/verification (§23.16.2).
+    ///
+    /// Field order: `context_id`, `from_epoch`, `to_epoch`, `requester_did`.
+    /// Domain separator: `"SCP-COMMIT-RANGE-REQ-V1:"`.
+    #[must_use]
+    pub fn canonical_hash(&self) -> [u8; 32] {
+        canonical_hash(
+            COMMIT_RANGE_REQUEST_DOMAIN_SEPARATOR,
+            &[
+                CanonicalField::VarBytes(self.context_id.as_bytes()),
+                CanonicalField::U64(self.from_epoch),
+                CanonicalField::U64(self.to_epoch),
+                CanonicalField::VarBytes(self.requester_did.as_bytes()),
+            ],
+        )
+    }
+}
+
 /// A response containing missing MLS Commit messages.
 ///
 /// Each entry in `commits` is a serialized MLS Commit message, in epoch
@@ -280,6 +306,41 @@ pub struct CommitRangeResponse {
     /// Signature over the response fields for authentication.
     #[serde(with = "serde_bytes")]
     pub signature: Ed25519Signature,
+}
+
+impl CommitRangeResponse {
+    /// Computes the canonical hash for signing/verification (§23.16.3).
+    ///
+    /// The `commits` array is encoded as each entry with its own `BE32(len)`
+    /// prefix, then the concatenation is wrapped in an outer `BE32(len)` prefix.
+    /// Field order: `context_id`, `commits_concat`, `responder_did`.
+    /// Domain separator: `"SCP-COMMIT-RANGE-RESP-V1:"`.
+    #[must_use]
+    pub fn canonical_hash(&self) -> [u8; 32] {
+        // Build length-prefixed concatenation of commits.
+        let commits_concat = self.encode_commits();
+        canonical_hash(
+            COMMIT_RANGE_RESPONSE_DOMAIN_SEPARATOR,
+            &[
+                CanonicalField::VarBytes(self.context_id.as_bytes()),
+                CanonicalField::VarBytes(&commits_concat),
+                CanonicalField::VarBytes(self.responder_did.as_bytes()),
+            ],
+        )
+    }
+
+    /// Encodes commits as length-prefixed concatenation for canonical hashing.
+    fn encode_commits(&self) -> Vec<u8> {
+        let total_len: usize = self.commits.iter().map(|c| 4 + c.len()).sum();
+        let mut buf = Vec::with_capacity(total_len);
+        for commit in &self.commits {
+            #[allow(clippy::cast_possible_truncation)]
+            let len = commit.len() as u32;
+            buf.extend_from_slice(&len.to_be_bytes());
+            buf.extend_from_slice(commit);
+        }
+        buf
+    }
 }
 
 // ---------------------------------------------------------------------------
