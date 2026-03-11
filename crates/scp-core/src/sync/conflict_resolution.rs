@@ -563,16 +563,22 @@ pub fn fork_context(
 
 /// Generates a deterministic context ID for a fork.
 ///
-/// The fork ID is derived from `SHA-256(original_id || "fork" || merkle_root)`
+/// The fork ID is derived from `canonical_hash("SCP-FORK-ID-V1:", [context_id, merkle_root])`
 /// encoded as a hex string prefixed with "fork-". This ensures all members
 /// independently compute the same fork ID.
+///
+/// Uses the canonical hash infrastructure with a domain separator and
+/// length-prefixed variable-length fields per the post-#371 standard.
 fn generate_fork_id(original_context_id: &str, fork_point: &MerkleRoot) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(original_context_id.as_bytes());
-    hasher.update(b"fork");
-    hasher.update(fork_point);
-    let hash = hasher.finalize();
+    use crate::crypto::canonical::{canonical_hash, CanonicalField};
+
+    let hash = canonical_hash(
+        "SCP-FORK-ID-V1:",
+        &[
+            CanonicalField::VarBytes(original_context_id.as_bytes()),
+            CanonicalField::Fixed32(fork_point),
+        ],
+    );
     let hex: String = hash[..16]
         .iter()
         .fold(String::with_capacity(32), |mut s, b| {
