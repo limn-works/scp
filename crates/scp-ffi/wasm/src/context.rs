@@ -238,8 +238,9 @@ pub fn context_create(identity_did: String, params_json: String) -> Promise {
 
         // Validate minProtocolVersion at the bridge boundary (defense-in-depth).
         // The manager also validates, but catching malformed input here gives
-        // callers a clearer error before any state mutation. Mirrors the NAPI
-        // bridge's explicit parsing in context_create (spec §13.4).
+        // callers a clearer error before any state mutation. Stricter than the
+        // NAPI bridge's lenient parsing — rejects malformed values that NAPI
+        // silently ignores (spec §13.4).
         validate_min_protocol_version(&params).map_err(ScpWasmError::into_js)?;
 
         let context_id = format!("ctx-{}", uuid::Uuid::new_v4().as_hyphenated());
