@@ -997,11 +997,13 @@ mod tests {
         // Total real entries: 1000 + 5 = 1005.
         assert_eq!(store.queue_global_count().await.unwrap(), 1005);
 
-        // Artificially inflate the global count to MAX_QUEUE_GLOBAL so the
-        // next enqueue puts us at MAX_QUEUE_GLOBAL + 1 AND triggers
-        // per-context overflow.
+        // Artificially inflate the global count to MAX_QUEUE_GLOBAL + 5.
+        // After enqueue (+1) and per-context enforcement (-1), the global
+        // count is still above MAX_QUEUE_GLOBAL, so enforce_global_bound
+        // must actually run.  Without the +5 headroom the count lands
+        // exactly at MAX_QUEUE_GLOBAL and the `>` check is never true.
         store
-            .store_value(QUEUE_GLOBAL_COUNT_KEY, &MAX_QUEUE_GLOBAL)
+            .store_value(QUEUE_GLOBAL_COUNT_KEY, &(MAX_QUEUE_GLOBAL + 5))
             .await
             .unwrap();
 
