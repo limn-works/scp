@@ -33,6 +33,7 @@ use super::{
     SyncPolicy,
 };
 use crate::crypto::canonical::{CanonicalField, canonical_hash};
+use crate::store::queue::DEFAULT_QUEUE_TTL_SECS;
 use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
@@ -847,6 +848,54 @@ impl ReconnectionCoordinator {
         result.mls_update_issued = true;
     }
 
+    /// Drains the outbound queue for a context (Phase 6 of the reconnection
+    /// protocol).
+    ///
+    /// 1. Prunes expired entries based on TTL before draining (spec §23.2).
+    /// 2. Dequeues all remaining entries in queue order.
+    /// 3. Returns the entries for the caller to MLS-encrypt with the current
+    ///    epoch's key schedule and send.
+    ///
+    /// If the context no longer exists (closed or expired while offline),
+    /// the caller should discard the returned entries and emit a `ContextGone`
+    /// notification.
+    ///
+    /// # Arguments
+    ///
+    /// * `store` — The protocol store containing the outbound queue.
+    /// * `context_id` — The context to drain.
+    /// * `now` — Current Unix timestamp (seconds).
+    /// * `blob_ttl_secs` — The context's `blob_ttl` in seconds. If `None`,
+    ///   [`DEFAULT_QUEUE_TTL_SECS`] (7 days) is used.
+    ///
+    /// # Returns
+    ///
+    /// A `QueueDrainResult` with the entries to send and the number of
+    /// expired entries that were pruned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if any storage operation fails.
+    pub async fn drain_context_queue<S: scp_platform::traits::Storage>(
+        store: &crate::store::ProtocolStore<S>,
+        context_id: &str,
+        now: u64,
+        blob_ttl_secs: Option<u64>,
+    ) -> Result<QueueDrainResult, crate::store::StoreError> {
+        let ttl = blob_ttl_secs.unwrap_or(DEFAULT_QUEUE_TTL_SECS);
+
+        // Step 1: Prune expired entries.
+        let expired = store.prune_expired_queue(context_id, now, ttl).await?;
+
+        // Step 2: Dequeue remaining entries.
+        let entries = store.dequeue_messages(context_id).await?;
+
+        Ok(QueueDrainResult {
+            entries,
+            expired_pruned: expired,
+        })
+    }
+
     /// Builds a [`ReconnectionReport`] from per-context sync results.
     ///
     /// # Arguments
@@ -869,6 +918,21 @@ impl ReconnectionCoordinator {
             total_duration_ms,
         }
     }
+}
+
+/// Result of draining the outbound queue for a context.
+///
+/// Returned by [`ReconnectionCoordinator::drain_context_queue`]. The caller
+/// is responsible for MLS-encrypting each entry's `inner_envelope` with the
+/// current epoch's key schedule and sending it.
+///
+/// See spec section 23.2, 23.3 Phase 6.
+#[derive(Debug, Clone)]
+pub struct QueueDrainResult {
+    /// Queue entries to MLS-encrypt and send, in queue order.
+    pub entries: Vec<crate::store::queue::QueueEntry>,
+    /// Number of expired entries that were pruned before draining.
+    pub expired_pruned: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,6 +1098,7 @@ impl NetworkSimulator {
 // ===========================================================================
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -1877,5 +1942,109 @@ mod tests {
         assert_eq!(pp.published_count, 2);
         assert!(pp.needs_replenish());
         assert_eq!(pp.replenish_count(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Queue drain integration tests (Phase 6, spec §23.2)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn drain_context_queue_returns_entries_in_order() {
+        let store = crate::store::ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+
+        // Enqueue 3 messages.
+        for i in 0u8..3 {
+            store
+                .enqueue_message("ctx-drain", &[i; 32], 1_000_000 + u64::from(i))
+                .await
+                .unwrap();
+        }
+
+        let result = ReconnectionCoordinator::drain_context_queue(
+            &store,
+            "ctx-drain",
+            1_000_100,
+            Some(86_400), // 1-day TTL
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.entries.len(), 3);
+        assert_eq!(result.expired_pruned, 0);
+        // Verify order.
+        for (i, entry) in result.entries.iter().enumerate() {
+            assert_eq!(entry.queued_at, 1_000_000 + i as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_context_queue_prunes_expired_before_drain() {
+        let store = crate::store::ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+
+        // Enqueue messages at different times.
+        store
+            .enqueue_message("ctx-drain", &[1u8; 16], 100)
+            .await
+            .unwrap();
+        store
+            .enqueue_message("ctx-drain", &[2u8; 16], 200)
+            .await
+            .unwrap();
+        store
+            .enqueue_message("ctx-drain", &[3u8; 16], 900)
+            .await
+            .unwrap();
+
+        // At now=1000, TTL=500: entry at 100 expired (100+500=600 < 1000),
+        // entry at 200 expired (200+500=700 < 1000), entry at 900 is fresh.
+        let result =
+            ReconnectionCoordinator::drain_context_queue(&store, "ctx-drain", 1000, Some(500))
+                .await
+                .unwrap();
+
+        assert_eq!(result.expired_pruned, 2);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].queued_at, 900);
+    }
+
+    #[tokio::test]
+    async fn drain_context_queue_uses_default_ttl_when_none() {
+        let store = crate::store::ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+
+        let now = 1_000_000u64;
+        // Queue a message that is within the default 7-day TTL.
+        store
+            .enqueue_message("ctx-drain", &[1u8; 16], now - 100)
+            .await
+            .unwrap();
+
+        let result = ReconnectionCoordinator::drain_context_queue(
+            &store,
+            "ctx-drain",
+            now,
+            None, // Uses DEFAULT_QUEUE_TTL_SECS (7 days)
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.expired_pruned, 0);
+        assert_eq!(result.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn drain_empty_queue_returns_empty() {
+        let store = crate::store::ProtocolStore::new(scp_platform::testing::InMemoryStorage::new());
+
+        let result = ReconnectionCoordinator::drain_context_queue(
+            &store,
+            "ctx-empty",
+            1_000_000,
+            Some(3600),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.entries.is_empty());
+        assert_eq!(result.expired_pruned, 0);
     }
 }

@@ -24,6 +24,7 @@ pub mod economy;
 pub mod event_log;
 pub mod identity;
 pub mod nonce;
+pub mod queue;
 pub mod tls;
 pub mod tofu;
 pub mod tools;
