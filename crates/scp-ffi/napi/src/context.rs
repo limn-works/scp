@@ -69,8 +69,6 @@ pub struct NapiContextHandle {
     promotion_policy: Option<String>,
     /// Governance model string (e.g. `"single_admin"`).
     governance: String,
-    /// Number of members in the context. Starts at 1 (the creator).
-    member_count: u64,
     /// Optional economic policy string.
     economic_policy: Option<String>,
     /// Retained [`InMemoryKeyCustody`] for UCAN signing (RED-102).
@@ -168,12 +166,21 @@ impl NapiContextHandle {
         self.governance.clone()
     }
 
-    /// Returns the current member count.
+    /// Returns the current member count by querying the [`ContextManager`].
+    ///
+    /// This is a live query — the count always reflects the actual
+    /// membership state, not a cached snapshot.
+    ///
+    /// # Errors
+    ///
+    /// The `Result` return type is required by napi-rs. This getter is infallible.
     #[napi(getter, js_name = "memberCount")]
-    #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // napi getter cannot be const
-    pub fn member_count(&self) -> u64 {
-        self.member_count
+    pub fn member_count(&self) -> napi::Result<u64> {
+        let manager = context_manager();
+        let count = crate::runtime()
+            .block_on(manager.member_count(&self.context_id))
+            .unwrap_or(0);
+        Ok(count as u64)
     }
 
     /// Returns the optional economic policy string.
@@ -396,7 +403,6 @@ pub async fn context_create(
         ttl_seconds,
         promotion_policy,
         governance,
-        member_count: 1,
         economic_policy,
         #[cfg(feature = "allow_in_memory_custody")]
         in_memory_custody,
@@ -654,11 +660,10 @@ pub fn context_subscribe(
 ///
 /// This function is infallible. The `Result` return type is required by napi-rs.
 #[napi(js_name = "contextMemberCount")]
-pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u32> {
+pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u64> {
     let manager = context_manager();
     let count = manager.member_count(&handle.context_id).await.unwrap_or(0);
-    #[allow(clippy::cast_possible_truncation)]
-    Ok(count as u32)
+    Ok(count as u64)
 }
 
 /// Returns whether a DID is a member of the context.
