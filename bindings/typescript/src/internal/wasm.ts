@@ -213,8 +213,16 @@ interface WasmModule {
     authorDid: string,
     payloadBase64: string,
   ) => Promise<void>;
-  broadcast_block: (handle: BridgeContextHandle, subscriberDid: string) => Promise<void>;
-  broadcast_unblock: (handle: BridgeContextHandle, subscriberDid: string) => Promise<void>;
+  broadcast_block: (
+    handle: BridgeContextHandle,
+    subscriberDid: string,
+    blockerDid: string,
+  ) => Promise<void>;
+  broadcast_unblock: (
+    handle: BridgeContextHandle,
+    subscriberDid: string,
+    unblockerDid: string,
+  ) => Promise<void>;
   broadcast_subscriber_count: (handle: BridgeContextHandle) => number | null;
   broadcast_is_subscriber: (handle: BridgeContextHandle, did: string) => boolean;
   broadcast_admission: (handle: BridgeContextHandle) => string | null;
@@ -565,21 +573,19 @@ export function createWasmBridge(): Bridge {
     async broadcastBlockSubscriber(
       handle: BridgeContextHandle,
       subscriberDid: string,
-      _blockerDid: string,
+      blockerDid: string,
     ): Promise<void> {
       const wasm = getWasm();
-      // WASM bridge only takes the subscriber DID; blockerDid is ignored.
-      await wasm.broadcast_block(handle, subscriberDid);
+      await wasm.broadcast_block(handle, subscriberDid, blockerDid);
     },
 
     async broadcastUnblockSubscriber(
       handle: BridgeContextHandle,
       subscriberDid: string,
-      _unblockerDid: string,
+      unblockerDid: string,
     ): Promise<void> {
       const wasm = getWasm();
-      // WASM bridge only takes the subscriber DID; unblockerDid is ignored.
-      await wasm.broadcast_unblock(handle, subscriberDid);
+      await wasm.broadcast_unblock(handle, subscriberDid, unblockerDid);
     },
 
     async broadcastHandleKeyRequest(
