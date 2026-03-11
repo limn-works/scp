@@ -195,7 +195,7 @@ export declare class Context {
     toolId: string,
     input: Record<string, unknown>,
     identity: Identity,
-    options?: { readonly ucanToken?: string },
+    ucanToken: string,
   ): Promise<ToolResult>;
   leave(): Promise<void>;
   close(): Promise<void>;
