@@ -69,8 +69,6 @@ pub struct NapiContextHandle {
     promotion_policy: Option<String>,
     /// Governance model string (e.g. `"single_admin"`).
     governance: String,
-    /// Number of members in the context. Starts at 1 (the creator).
-    member_count: u64,
     /// Optional economic policy string.
     economic_policy: Option<String>,
     /// Retained [`InMemoryKeyCustody`] for UCAN signing (RED-102).
@@ -166,14 +164,6 @@ impl NapiContextHandle {
     #[must_use]
     pub fn governance(&self) -> String {
         self.governance.clone()
-    }
-
-    /// Returns the current member count.
-    #[napi(getter, js_name = "memberCount")]
-    #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // napi getter cannot be const
-    pub fn member_count(&self) -> u64 {
-        self.member_count
     }
 
     /// Returns the optional economic policy string.
@@ -396,7 +386,6 @@ pub async fn context_create(
         ttl_seconds,
         promotion_policy,
         governance,
-        member_count: 1,
         economic_policy,
         #[cfg(feature = "allow_in_memory_custody")]
         in_memory_custody,
@@ -654,11 +643,11 @@ pub fn context_subscribe(
 ///
 /// This function is infallible. The `Result` return type is required by napi-rs.
 #[napi(js_name = "contextMemberCount")]
-pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u32> {
+pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u64> {
     let manager = context_manager();
     let count = manager.member_count(&handle.context_id).await.unwrap_or(0);
     #[allow(clippy::cast_possible_truncation)]
-    Ok(count as u32)
+    Ok(count as u64)
 }
 
 /// Returns whether a DID is a member of the context.
@@ -1248,4 +1237,45 @@ pub async fn context_import(data: Vec<u8>) -> napi::Result<String> {
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     Ok(context_id)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use crate::runtime::context_manager;
+    use scp_core::context::ContextParams;
+    use scp_identity::DID;
+
+    /// Verifies that `ContextManager::member_count` returns the live member
+    /// count — not a hardcoded value.  After creation the count is 1 (the
+    /// creator); after a join it becomes 2.
+    #[tokio::test]
+    async fn member_count_reflects_actual_membership() {
+        let manager = context_manager();
+        let ctx_id = format!("test-member-count-{}", uuid::Uuid::new_v4());
+        let creator = DID("did:key:z6MkCreator".to_owned());
+
+        // Create a context — creator is the first member.
+        let _handle = manager
+            .create_context(ctx_id.clone(), ContextParams::default(), creator)
+            .await
+            .expect("create_context should succeed");
+
+        let count = manager.member_count(&ctx_id).await.unwrap();
+        assert_eq!(count, 1, "newly created context should have exactly 1 member");
+
+        // Join a second member.
+        let joiner = DID("did:key:z6MkJoiner".to_owned());
+        manager
+            .join_context(&ctx_id, joiner)
+            .await
+            .expect("join_context should succeed");
+
+        let count = manager.member_count(&ctx_id).await.unwrap();
+        assert_eq!(count, 2, "after join, context should have 2 members");
+    }
 }
