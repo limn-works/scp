@@ -27,7 +27,7 @@ allow_in_memory_custody = ["scp-platform/testing"]
 [dependencies]
 pyo3 = { version = "0.23", features = ["experimental-async"] }
 tokio = { workspace = true }
-scp-core = { path = "../scp-core" }
+scp-core = { path = "../scp-core", features = ["allow_unencrypted_storage"] }
 scp-identity = { path = "../scp-identity" }
 scp-event-log = { path = "../scp-event-log" }
 scp-ffi-common = { path = "common" }

@@ -27,6 +27,7 @@ use std::time::Duration;
 use scp_core::store::{CURRENT_STORE_VERSION, ProtocolStore, StoredValue};
 use scp_identity::document::DidDocument;
 use scp_identity::{DidMethod, IdentityError, ScpIdentity};
+use scp_platform::EncryptedStorage;
 use scp_platform::traits::{KeyCustody, Storage};
 use scp_transport::nat::{NatTierChange, NetworkChangeDetector};
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer, ShutdownHandle};
@@ -1804,45 +1805,66 @@ impl<S: Storage + 'static, Dom>
     }
 }
 
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: EncryptedStorage + 'static>
     ApplicationNodeBuilder<K, D, S, HasDomain, HasIdentity>
 {
     /// Builds the [`ApplicationNode`].
     ///
-    /// This method is only available when both [`domain`](Self::domain) and
-    /// identity ([`generate_identity_with`](Self::generate_identity_with),
-    /// [`identity`](Self::identity), or
-    /// [`identity_with_storage`](Self::identity_with_storage)) have been
-    /// set — the type system enforces this at compile time.
+    /// Requires `S: EncryptedStorage` — compile-time enforcement that
+    /// the storage backend encrypts data at rest. For testing with
+    /// unencrypted backends, use [`build_for_testing`](Self::build_for_testing).
     ///
-    /// # Steps
-    ///
-    /// 1. Initializes storage (uses provided or creates default).
-    /// 2. Loads or generates identity (with optional persistence when
-    ///    [`identity_with_storage`](Self::identity_with_storage) was used).
-    /// 3. Adds `SCPRelay` service entry to the DID document.
-    /// 4. Starts relay server (must be listening before publication).
-    /// 5. Publishes DID document to the DHT.
-    ///
-    /// DID publication happens once on `.build()`, not continuously
-    /// (spec section 18.6.4).
+    /// See issue #695.
     ///
     /// # Errors
     ///
-    /// Returns [`NodeError::MissingField`] if `.storage()` was not called.
-    /// Returns [`NodeError::Identity`] if identity creation or DID
-    /// publication fails. Returns [`NodeError::Relay`] if the relay server
-    /// fails to start.
+    /// Returns [`NodeError`] if storage, identity, relay, or TLS setup fails.
+    pub async fn build(mut self) -> Result<ApplicationNode<S>, NodeError> {
+        let storage = self
+            .storage
+            .take()
+            .ok_or(NodeError::MissingField("storage"))?;
+        let protocol_store = Arc::new(ProtocolStore::new(storage));
+        self.build_with_store(protocol_store).await
+    }
+}
+
+/// Testing variant of `build()` — accepts any `Storage` backend.
+#[cfg(any(test, feature = "allow_unencrypted_storage"))]
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
+    ApplicationNodeBuilder<K, D, S, HasDomain, HasIdentity>
+{
+    /// Builds the [`ApplicationNode`] without requiring encrypted storage.
+    ///
+    /// **Testing only.** Production code must use [`build`](Self::build).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError`] if storage, identity, relay, or TLS setup fails.
+    pub async fn build_for_testing(mut self) -> Result<ApplicationNode<S>, NodeError> {
+        let storage = self
+            .storage
+            .take()
+            .ok_or(NodeError::MissingField("storage"))?;
+        let protocol_store = Arc::new(ProtocolStore::new_for_testing(storage));
+        self.build_with_store(protocol_store).await
+    }
+}
+
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
+    ApplicationNodeBuilder<K, D, S, HasDomain, HasIdentity>
+{
+    /// Shared build logic after `ProtocolStore` has been constructed.
     #[allow(clippy::too_many_lines)] // builder with many config steps
-    pub async fn build(self) -> Result<ApplicationNode<S>, NodeError> {
+    async fn build_with_store(
+        self,
+        protocol_store: Arc<ProtocolStore<S>>,
+    ) -> Result<ApplicationNode<S>, NodeError> {
         let domain = self.domain.ok_or(NodeError::MissingField("domain"))?;
         let identity_source = self
             .identity_source
             .ok_or(NodeError::MissingField("identity"))?;
         let persist = self.persist_identity;
-        let protocol_store = Arc::new(ProtocolStore::new(
-            self.storage.ok_or(NodeError::MissingField("storage"))?,
-        ));
 
         let (identity, document, did_method) =
             resolve_identity_persistent(identity_source, persist, protocol_store.storage()).await?;
@@ -2550,41 +2572,61 @@ async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + 'static>(
 // Build for HasNoDomain — zero-config NAT-traversed mode (§10.12.8)
 // ---------------------------------------------------------------------------
 
-impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: EncryptedStorage + 'static>
     ApplicationNodeBuilder<K, D, S, HasNoDomain, HasIdentity>
 {
     /// Builds the [`ApplicationNode`] in zero-config no-domain mode (§10.12.8).
     ///
-    /// This method is only available when `.no_domain()` has been called and
-    /// identity has been set — the type system enforces this at compile time.
-    ///
-    /// # Steps
-    ///
-    /// 1. Initializes storage.
-    /// 2. Loads or generates identity.
-    /// 3. Starts relay server.
-    /// 4. Probes NAT type via STUN and selects reachability tier.
-    /// 5. Constructs relay URL based on tier (ws:// for Tiers 1-2, wss:// for Tier 3).
-    /// 6. Adds `SCPRelay` service entry to the DID document.
-    /// 7. Publishes DID document.
-    /// 8. Does NOT serve `.well-known/scp` (no domain to serve from).
+    /// Requires `S: EncryptedStorage`. For testing, use
+    /// [`build_for_testing`](Self::build_for_testing).
     ///
     /// # Errors
     ///
-    /// Returns [`NodeError::MissingField`] if `.storage()` was not called.
-    /// Returns [`NodeError::Nat`] if all reachability tiers fail.
-    /// Returns [`NodeError::Identity`] if identity creation or DID
-    /// publication fails. Returns [`NodeError::Relay`] if the relay server
-    /// fails to start.
-    pub async fn build(self) -> Result<ApplicationNode<S>, NodeError> {
+    /// Returns [`NodeError`] if storage, identity, relay, or NAT setup fails.
+    pub async fn build(mut self) -> Result<ApplicationNode<S>, NodeError> {
+        let storage = self
+            .storage
+            .take()
+            .ok_or(NodeError::MissingField("storage"))?;
+        let protocol_store = Arc::new(ProtocolStore::new(storage));
+        self.build_with_store(protocol_store).await
+    }
+}
+
+/// Testing variant of no-domain `build()`.
+#[cfg(any(test, feature = "allow_unencrypted_storage"))]
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
+    ApplicationNodeBuilder<K, D, S, HasNoDomain, HasIdentity>
+{
+    /// Builds the [`ApplicationNode`] in no-domain mode without requiring
+    /// encrypted storage. **Testing only.**
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError`] if storage, identity, relay, or NAT setup fails.
+    pub async fn build_for_testing(mut self) -> Result<ApplicationNode<S>, NodeError> {
+        let storage = self
+            .storage
+            .take()
+            .ok_or(NodeError::MissingField("storage"))?;
+        let protocol_store = Arc::new(ProtocolStore::new_for_testing(storage));
+        self.build_with_store(protocol_store).await
+    }
+}
+
+impl<K: KeyCustody + 'static, D: DidMethod + 'static, S: Storage + 'static>
+    ApplicationNodeBuilder<K, D, S, HasNoDomain, HasIdentity>
+{
+    /// Shared build logic for no-domain mode after `ProtocolStore` creation.
+    async fn build_with_store(
+        self,
+        protocol_store: Arc<ProtocolStore<S>>,
+    ) -> Result<ApplicationNode<S>, NodeError> {
         let identity_source = self
             .identity_source
             .ok_or(NodeError::MissingField("identity"))?;
         let persist = self.persist_identity;
 
-        let protocol_store = Arc::new(ProtocolStore::new(
-            self.storage.ok_or(NodeError::MissingField("storage"))?,
-        ));
         let (identity, document, did_method) =
             resolve_identity_persistent(identity_source, persist, protocol_store.storage()).await?;
 
@@ -2998,7 +3040,7 @@ mod tests {
     async fn build_with_generate_identity_creates_new_did() {
         let node = test_builder()
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -3037,7 +3079,7 @@ mod tests {
             }))
             .identity(identity, document, did_method)
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -3119,7 +3161,7 @@ mod tests {
             }))
             .generate_identity_with(custody, counting_method)
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -3137,7 +3179,7 @@ mod tests {
 
         let node = test_builder()
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -3163,7 +3205,7 @@ mod tests {
     async fn relay_rejects_connections_without_bridge_token() {
         let node = test_builder()
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -3267,7 +3309,7 @@ mod tests {
             }))
             .generate_identity_with(custody, check_method)
             .bind_addr(bind_addr)
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -3281,7 +3323,7 @@ mod tests {
     async fn builder_domain_sets_relay_url() {
         let node = test_builder()
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -3302,7 +3344,7 @@ mod tests {
             }))
             .generate_identity_with(custody, did_method)
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -3316,7 +3358,7 @@ mod tests {
         let node = test_builder()
             .acme_email("admin@example.com")
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -3421,7 +3463,7 @@ mod tests {
 
         let node = test_no_domain_builder(tier)
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -3463,7 +3505,7 @@ mod tests {
 
         let node = test_no_domain_builder(tier)
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -3492,7 +3534,7 @@ mod tests {
 
         let node = test_no_domain_builder(tier)
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -3514,7 +3556,7 @@ mod tests {
 
         let node = test_no_domain_builder(tier)
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -3529,7 +3571,7 @@ mod tests {
         // AC: When .domain() is set and succeeds, wss:// is used.
         let node = test_builder()
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -3592,7 +3634,7 @@ mod tests {
             }))
             .generate_identity_with(custody, did_method)
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -3650,7 +3692,7 @@ mod tests {
             .nat_strategy(Arc::new(FailingNatStrategy))
             .generate_identity_with(custody, did_method)
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await;
 
         let Err(err) = result else {
@@ -3730,7 +3772,7 @@ mod tests {
             .nat_strategy(Arc::new(MockNatStrategy { tier }))
             .generate_identity_with(custody, counting_method)
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -4142,7 +4184,7 @@ mod tests {
         async fn build_test_node() -> ApplicationNode<InMemoryStorage> {
             test_builder()
                 .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-                .build()
+                .build_for_testing()
                 .await
                 .unwrap()
         }
@@ -4769,7 +4811,7 @@ mod tests {
 
         let node = test_no_domain_builder(tier)
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -4791,7 +4833,7 @@ mod tests {
         // (Tier 4 doesn't need NAT re-eval).
         let node = test_builder()
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -4826,7 +4868,7 @@ mod tests {
             }))
             .identity_with_storage(custody, did_method)
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -4865,7 +4907,7 @@ mod tests {
             }))
             .identity_with_storage(Arc::clone(&custody), Arc::clone(&did_method))
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -4881,7 +4923,7 @@ mod tests {
             }))
             .identity_with_storage(custody, did_method)
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -4909,7 +4951,7 @@ mod tests {
             }))
             .identity_with_storage(custody1, Arc::clone(&did_method))
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -4927,7 +4969,7 @@ mod tests {
             }))
             .identity_with_storage(custody2, did_method2)
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await;
 
         let err = result
@@ -5019,7 +5061,7 @@ mod tests {
             }))
             .identity_with_storage(custody, did_method)
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await;
 
         match result {
@@ -5052,7 +5094,7 @@ mod tests {
             }))
             .generate_identity_with(custody, did_method)
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -5084,7 +5126,7 @@ mod tests {
             .nat_strategy(Arc::new(MockNatStrategy { tier: tier.clone() }))
             .identity_with_storage(Arc::clone(&custody), Arc::clone(&did_method))
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 
@@ -5098,7 +5140,7 @@ mod tests {
             .nat_strategy(Arc::new(MockNatStrategy { tier }))
             .identity_with_storage(custody, did_method)
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .build()
+            .build_for_testing()
             .await
             .unwrap();
 

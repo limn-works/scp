@@ -31,6 +31,9 @@ sqlite = ["dep:rusqlite", "dep:hex"]
 file = ["software_platform", "dep:aes-gcm", "dep:argon2"]
 # Filesystem storage adapter (spec section 17.6).
 filesystem = []
+# EncryptingAdapter — wraps any Storage backend with AES-256-GCM per-value
+# encryption, satisfying the sealed EncryptedStorage bound. See issue #695.
+encrypting = ["dep:aes-gcm", "dep:rand"]
 # SyncableStorage wrapper for P2P state synchronization (SCP-PERSIST-064).
 # Adds mutation tracking via a write-ahead changelog stored in the inner storage.
 sync = ["dep:rmp-serde"]

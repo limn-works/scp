@@ -288,7 +288,7 @@ mod tests {
     use super::*;
 
     fn make_store() -> ProtocolStore<InMemoryStorage> {
-        ProtocolStore::new(InMemoryStorage::new())
+        ProtocolStore::new_for_testing(InMemoryStorage::new())
     }
 
     // -------------------------------------------------------------------

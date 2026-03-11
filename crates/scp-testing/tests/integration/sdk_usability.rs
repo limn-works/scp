@@ -61,7 +61,7 @@ async fn build_no_domain_node() -> scp_node::ApplicationNode<InMemoryStorage> {
         bridge_url: "wss://bridge.test.scp/scp/v1".to_owned(),
     };
     helpers::test_no_domain_builder(tier)
-        .build()
+        .build_for_testing()
         .await
         .expect("no-domain node should build")
 }
@@ -69,7 +69,7 @@ async fn build_no_domain_node() -> scp_node::ApplicationNode<InMemoryStorage> {
 /// Builds a domain-mode `ApplicationNode` with self-signed TLS (no real ACME).
 async fn build_domain_node() -> scp_node::ApplicationNode<InMemoryStorage> {
     helpers::test_builder()
-        .build()
+        .build_for_testing()
         .await
         .expect("domain-mode node should build")
 }

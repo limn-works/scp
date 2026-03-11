@@ -15,11 +15,11 @@ sync = ["scp-platform/sync"]
 combined = ["scp-transport/combined"]
 
 [dependencies]
-scp-core = { path = "../scp-core" }
+scp-core = { path = "../scp-core", features = ["allow_unencrypted_storage"] }
 scp-identity = { path = "../scp-identity" }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
 scp-primitives = { path = "../scp-primitives" }
-scp-node = { path = "../scp-node" }
+scp-node = { path = "../scp-node", features = ["allow_unencrypted_storage"] }
 scp-transport = { path = "../scp-transport" }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }

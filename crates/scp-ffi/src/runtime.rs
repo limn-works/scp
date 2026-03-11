@@ -180,7 +180,7 @@ pub fn init_context_manager_with(
 /// the same store, matching the `ApplicationNode` pattern in `scp-node`.
 fn build_persistence_provider() -> Option<Box<dyn ContextPersistence>> {
     STORAGE_PROVIDER.get().map(|storage| {
-        let protocol_store = Arc::new(ProtocolStore::new(Arc::clone(storage)));
+        let protocol_store = Arc::new(ProtocolStore::new_for_testing(Arc::clone(storage)));
         Box::new(ProtocolStorePersistence::new(protocol_store)) as Box<dyn ContextPersistence>
     })
 }

@@ -16,7 +16,7 @@ use scp_testing::helpers;
 #[tokio::test]
 async fn domain_mode_builder() {
     let node = helpers::test_builder()
-        .build()
+        .build_for_testing()
         .await
         .expect("domain-mode build should succeed");
 
@@ -44,7 +44,7 @@ async fn no_domain_mode_builder() {
         bridge_url: "wss://bridge.example.com/scp/v1".to_owned(),
     };
     let node = helpers::test_no_domain_builder(tier)
-        .build()
+        .build_for_testing()
         .await
         .expect("no-domain-mode build should succeed");
 
@@ -77,7 +77,7 @@ async fn failing_tls_falls_through_to_nat() {
         .tls_provider(Arc::new(helpers::FailingTlsProvider))
         .nat_strategy(Arc::new(helpers::FailingNatStrategy))
         .generate_identity_with(custody, did_method)
-        .build()
+        .build_for_testing()
         .await;
 
     match result {
@@ -110,7 +110,7 @@ async fn failing_nat_strategy() {
         .no_domain()
         .nat_strategy(Arc::new(helpers::FailingNatStrategy))
         .generate_identity_with(custody, did_method)
-        .build()
+        .build_for_testing()
         .await;
 
     match result {
@@ -162,7 +162,7 @@ async fn create_test_identity() {
 #[tokio::test]
 async fn node_relay_url() {
     let node = helpers::test_builder()
-        .build()
+        .build_for_testing()
         .await
         .expect("domain-mode build should succeed");
 
@@ -182,7 +182,7 @@ async fn node_relay_url() {
 #[tokio::test]
 async fn node_storage_access() {
     let node = helpers::test_builder()
-        .build()
+        .build_for_testing()
         .await
         .expect("domain-mode build should succeed");
 
@@ -199,7 +199,7 @@ async fn node_storage_access() {
 #[tokio::test]
 async fn node_shutdown() {
     let node = helpers::test_builder()
-        .build()
+        .build_for_testing()
         .await
         .expect("domain-mode build should succeed");
 
