@@ -751,11 +751,19 @@ pub fn decode_hex_hash(hex_str: &str) -> Result<[u8; 32], String> {
 ///
 /// Returns `(message_count, governance_count)` derived from the context's
 /// event log via [`WasmContextManager`]. Returns `(0, 0)` if context not found.
+///
+/// WASM bridge limitation: the event log is a Merkle tree of hashes only
+/// (no per-DID event attribution). Returns total leaf count as
+/// `message_count`; `governance_count` is always 0. Full per-DID scoring
+/// requires event payload storage (not available in the WASM bridge due
+/// to scp-core dependency constraint per ADR-034).
 #[must_use]
-pub fn query_trust_event_counts(_context_id: &str, _did: &str) -> (u64, u64) {
-    // WASM bridge: event log is a Merkle tree of hashes only (no per-DID
-    // event attribution). Return total leaf count as message_count.
-    // Full per-DID scoring requires event payload storage (not available
-    // in the WASM bridge due to scp-core dependency constraint).
-    (0, 0)
+pub fn query_trust_event_counts(context_id: &str, _did: &str) -> (u64, u64) {
+    crate::manager::with_manager(|mgr| {
+        let total = mgr
+            .event_log_leaf_count(context_id)
+            .map_or(0, |n| u64::try_from(n).unwrap_or(u64::MAX));
+        Ok((total, 0))
+    })
+    .unwrap_or((0, 0))
 }

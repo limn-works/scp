@@ -955,6 +955,14 @@ impl WasmContextManager {
             .map(|m| m.role.clone())
     }
 
+    /// Returns the event log leaf count for a context, or `None` if not found.
+    #[must_use]
+    pub fn event_log_leaf_count(&self, context_id: &str) -> Option<usize> {
+        self.contexts
+            .get(context_id)
+            .map(|ctx| ctx.event_log.leaf_count())
+    }
+
     // -----------------------------------------------------------------------
     // Events
     // -----------------------------------------------------------------------
