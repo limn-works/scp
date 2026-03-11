@@ -17,7 +17,7 @@ struct DiscoveryTests {
 
         let mockParse: DiscoveryBridge.ParseAddressFn = { address in
             receivedAddress = address
-            return #"{"type":"discovery_handle","handle":"alice","community":"cooking"}"#
+            return #"{"type":"DiscoveryHandle","handle":"alice","community":"cooking"}"#
         }
 
         let result = try parseAddress(
@@ -26,7 +26,7 @@ struct DiscoveryTests {
         )
 
         #expect(receivedAddress == "alice@cooking")
-        #expect(result.contains("discovery_handle"))
+        #expect(result.contains("DiscoveryHandle"))
         #expect(result.contains("alice"))
     }
 

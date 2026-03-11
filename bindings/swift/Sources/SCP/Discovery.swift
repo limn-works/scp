@@ -66,8 +66,8 @@ public enum DiscoveryBridge {
 /// Parses an SCP address string into its components.
 ///
 /// Returns a JSON string containing the parsed address type and fields.
-/// Supports four address types: discovery_handle, domain_handle,
-/// attestation_handle, and unscoped.
+/// Supports four address types: DiscoveryHandle, DomainHandle,
+/// AttestationHandle, and Unscoped.
 ///
 /// - Parameters:
 ///   - address: The address string to parse.

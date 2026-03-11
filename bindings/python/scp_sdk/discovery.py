@@ -32,8 +32,8 @@ def _bridge() -> Any:
 def parse_address(address: str) -> dict[str, Any]:
     """Parse an SCP address string into its components.
 
-    Returns a dict with ``type`` (one of ``"discovery_handle"``,
-    ``"domain_handle"``, ``"attestation_handle"``, ``"unscoped"``)
+    Returns a dict with ``type`` (one of ``"DiscoveryHandle"``,
+    ``"DomainHandle"``, ``"AttestationHandle"``, ``"Unscoped"``)
     and type-specific fields.
 
     Args:

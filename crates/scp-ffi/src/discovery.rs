@@ -33,8 +33,8 @@ use crate::error::ScpPyError;
 /// # Returns
 ///
 /// A dict with:
-/// - `type` (str): `"discovery_handle"`, `"domain_handle"`,
-///   `"attestation_handle"`, or `"unscoped"`.
+/// - `type` (str): `"DiscoveryHandle"`, `"DomainHandle"`,
+///   `"AttestationHandle"`, or `"Unscoped"`.
 /// - Additional fields depending on type.
 ///
 /// # Errors
@@ -54,22 +54,22 @@ pub fn py_discovery_parse_address<'py>(
     let dict = PyDict::new(py);
     match parsed {
         ParsedAddress::DiscoveryHandle { local_part, scope } => {
-            dict.set_item("type", "discovery_handle")?;
+            dict.set_item("type", "DiscoveryHandle")?;
             dict.set_item("local_part", local_part)?;
             dict.set_item("scope", scope)?;
         }
         ParsedAddress::DomainHandle { local_part, domain } => {
-            dict.set_item("type", "domain_handle")?;
+            dict.set_item("type", "DomainHandle")?;
             dict.set_item("local_part", local_part)?;
             dict.set_item("domain", domain)?;
         }
         ParsedAddress::AttestationHandle { handle, platform } => {
-            dict.set_item("type", "attestation_handle")?;
+            dict.set_item("type", "AttestationHandle")?;
             dict.set_item("handle", handle)?;
             dict.set_item("platform", platform)?;
         }
         ParsedAddress::Unscoped { name } => {
-            dict.set_item("type", "unscoped")?;
+            dict.set_item("type", "Unscoped")?;
             dict.set_item("name", name)?;
         }
     }

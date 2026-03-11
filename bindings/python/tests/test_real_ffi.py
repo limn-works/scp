@@ -346,11 +346,11 @@ class TestDiscovery:
     async def test_parse_unscoped(self):
         result = _scp_core.discovery_parse_address("alice")
         # Returns a dict directly (not JSON string)
-        assert result["type"] == "unscoped"
+        assert result["type"] == "Unscoped"
 
     async def test_parse_handle(self):
         result = _scp_core.discovery_parse_address("alice@cooking-ctx")
-        assert result["type"] in ("discovery_handle", "domain_handle")
+        assert result["type"] in ("DiscoveryHandle", "DomainHandle")
 
     async def test_parse_domain(self):
         result = _scp_core.discovery_parse_address("alice@example.com")

@@ -219,14 +219,14 @@ class RealFFITest {
         fun `parse unscoped address`() =
             runTest {
                 assumeTrue(nativeAvailable, skipReason)
-                // Parse "alice" -> type == "unscoped"
+                // Parse "alice" -> type == "Unscoped"
             }
 
         @Test
         fun `parse discovery handle`() =
             runTest {
                 assumeTrue(nativeAvailable, skipReason)
-                // Parse "alice@cooking-ctx" -> discovery_handle or domain_handle
+                // Parse "alice@cooking-ctx" -> DiscoveryHandle or DomainHandle
             }
     }
 

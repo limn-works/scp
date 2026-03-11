@@ -5859,28 +5859,28 @@ pub fn discovery_parse_address(address: String) -> Result<String, ScpError> {
     let result = match parsed {
         scp_core::discovery::addressing::ParsedAddress::DiscoveryHandle { local_part, scope } => {
             serde_json::json!({
-                "type": "discovery_handle",
+                "type": "DiscoveryHandle",
                 "local_part": local_part,
                 "scope": scope,
             })
         }
         scp_core::discovery::addressing::ParsedAddress::DomainHandle { local_part, domain } => {
             serde_json::json!({
-                "type": "domain_handle",
+                "type": "DomainHandle",
                 "local_part": local_part,
                 "domain": domain,
             })
         }
         scp_core::discovery::addressing::ParsedAddress::AttestationHandle { handle, platform } => {
             serde_json::json!({
-                "type": "attestation_handle",
+                "type": "AttestationHandle",
                 "handle": handle,
                 "platform": platform,
             })
         }
         scp_core::discovery::addressing::ParsedAddress::Unscoped { name } => {
             serde_json::json!({
-                "type": "unscoped",
+                "type": "Unscoped",
                 "name": name,
             })
         }

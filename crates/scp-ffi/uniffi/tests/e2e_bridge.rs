@@ -504,7 +504,7 @@ async fn discovery_parse_various_address_types() {
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
     let addr_type = parsed["type"].as_str().unwrap();
     assert!(
-        addr_type == "discovery_handle" || addr_type == "domain_handle",
+        addr_type == "DiscoveryHandle" || addr_type == "DomainHandle",
         "Handle should parse as discovery or domain: {result}"
     );
 
@@ -522,8 +522,8 @@ async fn discovery_parse_various_address_types() {
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
     let addr_type = parsed["type"].as_str().unwrap();
     assert!(
-        addr_type == "unscoped" || addr_type == "direct_did",
-        "DID address should parse as unscoped or direct_did: {result}"
+        addr_type == "Unscoped" || addr_type == "DirectDid",
+        "DID address should parse as Unscoped or DirectDid: {result}"
     );
 }
 

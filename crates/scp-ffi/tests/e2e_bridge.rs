@@ -490,7 +490,7 @@ fn discovery_parse_address_discovery_handle() {
         let r = _scp_core::discovery::py_discovery_parse_address(py, "alice@cooking-community")
             .unwrap();
         let t: String = r.get_item("type").unwrap().unwrap().extract().unwrap();
-        assert_eq!(t, "discovery_handle");
+        assert_eq!(t, "DiscoveryHandle");
         let lp: String = r
             .get_item("local_part")
             .unwrap()
@@ -507,7 +507,7 @@ fn discovery_parse_address_domain_handle() {
     Python::with_gil(|py| {
         let r = _scp_core::discovery::py_discovery_parse_address(py, "alice@example.com").unwrap();
         let t: String = r.get_item("type").unwrap().unwrap().extract().unwrap();
-        assert_eq!(t, "domain_handle");
+        assert_eq!(t, "DomainHandle");
     });
 }
 
