@@ -897,6 +897,142 @@ mod tests {
         assert_eq!(store.queue_global_count().await.unwrap(), 100);
     }
 
+    /// Regression test for issue #709: global bound eviction must use
+    /// `queued_at` timestamp ordering, NOT lexicographic context ID ordering.
+    ///
+    /// Uses `enforce_global_bound` directly to test eviction ordering in
+    /// isolation without needing to fill the full 10,000 entry global
+    /// capacity.
+    ///
+    /// Scenario: context "zzz" has the OLDEST messages and context "aaa" has
+    /// the NEWEST. If eviction were lexicographic, "aaa" entries would be
+    /// evicted first despite being newer. The correct behavior is to evict
+    /// "zzz" entries first because they have the oldest timestamps.
+    #[tokio::test]
+    async fn global_bound_evicts_by_timestamp_not_context_id_order() {
+        let store = make_store();
+
+        // Enqueue 3 entries in "zzz" context with OLD timestamps.
+        for i in 0u64..3 {
+            let byte = u8::try_from(i).unwrap();
+            store
+                .enqueue_message("zzz-old", &test_envelope(byte), 100 + i)
+                .await
+                .unwrap();
+        }
+
+        // Enqueue 3 entries in "aaa" context with NEW timestamps.
+        for i in 0u64..3 {
+            let byte = u8::try_from(i + 10).unwrap();
+            store
+                .enqueue_message("aaa-new", &test_envelope(byte), 900 + i)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(store.queue_global_count().await.unwrap(), 6);
+
+        // Artificially set the global count to MAX_QUEUE_GLOBAL + 2 to
+        // simulate an over-limit scenario. This lets us test
+        // `enforce_global_bound` without needing 10,000 real entries.
+        store
+            .store_value(QUEUE_GLOBAL_COUNT_KEY, &(MAX_QUEUE_GLOBAL + 2))
+            .await
+            .unwrap();
+
+        // Enforce global bound. This should evict the 2 oldest entries
+        // by timestamp (from "zzz-old"), NOT the alphabetically-first
+        // entries (from "aaa-new").
+        let overflow = store.enforce_global_bound("trigger").await.unwrap();
+        assert_eq!(overflow.messages_dropped, 2);
+        assert_eq!(overflow.overflow_kind, OverflowKind::Global);
+
+        // "zzz-old" should have lost 2 entries (oldest timestamps: 100, 101).
+        assert_eq!(
+            store.queue_context_count("zzz-old").await.unwrap(),
+            1,
+            "zzz-old (oldest timestamps) should have lost 2 entries"
+        );
+
+        // "aaa-new" should retain all 3 entries (newer timestamps).
+        assert_eq!(
+            store.queue_context_count("aaa-new").await.unwrap(),
+            3,
+            "aaa-new (newer timestamps) should retain all entries"
+        );
+    }
+
+    /// Regression test for issue #709: both per-context and global bounds
+    /// must be enforced consistently. Per-context overflow must NOT skip
+    /// global bound enforcement.
+    ///
+    /// Uses `queue_global_count` manipulation to test the combined overflow
+    /// path without needing 10,000+ real entries.
+    ///
+    /// Scenario: enqueue messages into a context that overflows its per-context
+    /// limit while the global count also exceeds its limit. Both bounds must
+    /// be enforced.
+    #[tokio::test]
+    async fn both_per_context_and_global_bounds_enforced() {
+        let store = make_store();
+
+        // Fill "ctx-target" to capacity (MAX_QUEUE_PER_CONTEXT).
+        for i in 0..MAX_QUEUE_PER_CONTEXT {
+            let byte = u8::try_from(i % 256).unwrap_or(0);
+            store
+                .enqueue_message("ctx-target", &test_envelope(byte), 1_000 + i)
+                .await
+                .unwrap();
+        }
+
+        // Add some entries to another context with older timestamps.
+        for i in 0u64..5 {
+            let byte = u8::try_from(i + 50).unwrap();
+            store
+                .enqueue_message("ctx-other", &test_envelope(byte), 1 + i)
+                .await
+                .unwrap();
+        }
+
+        // Total real entries: 1000 + 5 = 1005.
+        assert_eq!(store.queue_global_count().await.unwrap(), 1005);
+
+        // Artificially inflate the global count to MAX_QUEUE_GLOBAL so the
+        // next enqueue puts us at MAX_QUEUE_GLOBAL + 1 AND triggers
+        // per-context overflow.
+        store
+            .store_value(QUEUE_GLOBAL_COUNT_KEY, &MAX_QUEUE_GLOBAL)
+            .await
+            .unwrap();
+
+        // Enqueue one more to "ctx-target", triggering per-context overflow
+        // (1001 > 1000). After per-context enforcement removes 1, the
+        // global count should ALSO be checked and enforced.
+        let overflow = store
+            .enqueue_message("ctx-target", &test_envelope(0xFF), 500_000)
+            .await
+            .unwrap();
+
+        // Some overflow should have been reported.
+        assert!(overflow.is_some(), "overflow must be reported");
+
+        // Per-context bound should be enforced on ctx-target.
+        assert_eq!(
+            store.queue_context_count("ctx-target").await.unwrap(),
+            MAX_QUEUE_PER_CONTEXT,
+            "per-context bound must be enforced on ctx-target"
+        );
+
+        // Global bound should ALSO be enforced: the global count should not
+        // exceed MAX_QUEUE_GLOBAL. Without the fix (early return on
+        // per-context overflow), global enforcement would be skipped.
+        let global = store.queue_global_count().await.unwrap();
+        assert!(
+            global <= MAX_QUEUE_GLOBAL,
+            "global bound must be enforced even when per-context overflow triggers; got {global}"
+        );
+    }
+
     // -------------------------------------------------------------------
     // QueueEntry serialization
     // -------------------------------------------------------------------
