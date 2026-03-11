@@ -18,18 +18,26 @@ crates/
     Cargo.toml
     src/
       lib.rs
-      clock.rs              # SimulatedClock, SimulatedTimerService
-      relay/                 # InMemoryRelay, BlobStore, BehaviorMode
-        mod.rs
-        blob_store.rs        # BlobStore trait + InMemoryBlobStore
-        behavior.rs          # BehaviorMode enum and fault injection
-        subscription.rs      # SubscriptionRegistry
+      clock.rs              # Clock trait, SystemClock, SimulatedClock, TimerHandle
+      relay/                 # InMemoryRelay, BehaviorMode, SubscriptionRegistry
+        mod.rs               # InMemoryRelay, StoredBlob
+        behavior.rs          # BehaviorMode enum and fault injection configs
+        subscription.rs      # SubscriptionRegistry, SubscriberId, RelayMessage
       transport.rs           # InMemoryTransport (implements TransportAdapter)
       simulator/             # NetworkSimulator, topology, fault injection
         mod.rs
         identity.rs          # SimulatedIdentity
         topology.rs          # NetworkTopology, LinkConfig, partition/heal
       builder.rs             # ScenarioBuilder
+      helpers.rs             # Test utility helpers
+      test_adapter.rs        # Test adapter utilities
+      blob_store_tests.rs    # BlobStore conformance tests
+      fullstack/             # Full-stack integration test harness
+        mod.rs
+        crypto.rs            # Crypto integration tests
+        exchange.rs          # Message exchange tests
+        network.rs           # Network simulation tests
+        node.rs              # Node integration tests
       assertions/            # Distributed invariant checks
         mod.rs
         merkle.rs            # assert_consistent_merkle_roots
@@ -69,66 +77,63 @@ tracing = { workspace = true }
 
 ## 16.3 Clock Trait
 
-Defined in `scp-core`, not `scp-testing`. All time-dependent protocol components accept `Arc<dyn Clock>`.
+Defined in `scp-testing/src/clock.rs`. Both the trait and its two implementations (`SystemClock`, `SimulatedClock`) live in the testing crate. All time-dependent protocol components accept `Arc<dyn Clock>`.
 
 ```rust
-/// scp-core/src/clock.rs
+/// scp-testing/src/clock.rs
 
-/// Monotonic wall clock abstraction.
-/// Production: SystemClock (delegates to std::time).
-/// Testing: SimulatedClock (manual advance, deterministic).
-pub trait Clock: Send + Sync {
-    /// Current wall-clock time as a Unix timestamp (seconds since epoch).
-    fn now(&self) -> u64;
+/// Trait for obtaining the current time and scheduling timer callbacks.
+/// Implementations must be thread-safe. Production code uses SystemClock;
+/// tests use SimulatedClock for deterministic control.
+pub trait Clock: Send + Sync + 'static {
+    /// Current time in seconds since the Unix epoch.
+    fn now_secs(&self) -> u64;
 
-    /// Current wall-clock time with sub-second precision.
+    /// Current time in milliseconds since the Unix epoch.
     fn now_millis(&self) -> u64;
 
-    /// Register a callback to fire when the clock reaches `at` (Unix timestamp seconds).
-    /// Returns a handle that can be used to cancel the timer.
-    fn register_timer(&self, at: u64, callback: Box<dyn FnOnce() + Send>) -> TimerHandle;
+    /// Register a one-shot timer that fires `callback` at `at_millis`
+    /// (milliseconds since epoch). Returns a handle for cancellation.
+    fn register_timer(&self, at_millis: u64, callback: Box<dyn FnOnce() + Send>) -> TimerHandle;
 
     /// Cancel a previously registered timer.
-    fn cancel_timer(&self, handle: TimerHandle);
+    /// Returns `true` if the timer was found and cancelled, `false` if it had
+    /// already fired or was not found.
+    fn cancel_timer(&self, handle: TimerHandle) -> bool;
 }
 
-/// Opaque handle for a registered timer.
+/// Opaque handle returned by Clock::register_timer.
+/// Handles are unique across all clocks within a process (global atomic counter).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TimerHandle(pub u64);
+pub struct TimerHandle(u64);
 ```
 
 ### SystemClock (production)
 
 ```rust
-/// scp-core/src/clock.rs
+/// scp-testing/src/clock.rs
 
+/// Production clock backed by scp_primitives::time.
+/// Timer registration returns a valid handle but callbacks never fire —
+/// production code uses its own real timer infrastructure.
 pub struct SystemClock;
 
 impl Clock for SystemClock {
-    fn now(&self) -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
+    fn now_secs(&self) -> u64 {
+        scp_primitives::time::now_secs().unwrap_or(0)
     }
 
     fn now_millis(&self) -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64
+        scp_primitives::time::now_millis().unwrap_or(0)
     }
 
-    fn register_timer(&self, at: u64, callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
-        // Spawns a tokio::time::sleep_until task.
-        // Production timers are real async tasks.
-        // Implementation detail: uses tokio::spawn internally.
-        todo!()
+    fn register_timer(&self, _at_millis: u64, _callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
+        // No-op: production code uses real timer infrastructure.
+        TimerHandle::next()
     }
 
-    fn cancel_timer(&self, handle: TimerHandle) {
-        // Cancels the tokio task associated with the handle.
-        todo!()
+    fn cancel_timer(&self, _handle: TimerHandle) -> bool {
+        false
     }
 }
 ```
@@ -138,422 +143,381 @@ impl Clock for SystemClock {
 ```rust
 /// scp-testing/src/clock.rs
 
+/// A fully-deterministic clock for testing. Time only advances when
+/// explicitly instructed. All internal state is in milliseconds.
 pub struct SimulatedClock {
-    current: AtomicU64,
+    /// Current time in milliseconds.
     current_millis: AtomicU64,
+    /// Pending timers keyed by fire-time (millis).
     timers: Mutex<BTreeMap<u64, Vec<(TimerHandle, Box<dyn FnOnce() + Send>)>>>,
-    next_handle: AtomicU64,
 }
 
 impl SimulatedClock {
-    /// Create a new simulated clock starting at the given Unix timestamp.
-    pub fn new(start: u64) -> Self;
+    /// Create a new simulated clock starting at `start_secs` (converted to
+    /// milliseconds internally).
+    pub fn new(start_secs: u64) -> Self;
 
-    /// Advance the clock by `delta` seconds.
-    /// Fires all registered timer callbacks whose `at` <= new current time,
-    /// in chronological order. Callbacks registered by other callbacks during
-    /// this advance are fired if their `at` <= new current time.
-    pub fn advance(&self, delta: u64);
+    /// Advance time by `delta_secs` seconds, firing due timers in
+    /// chronological order.
+    pub fn advance(&self, delta_secs: u64);
 
-    /// Advance the clock by `delta` milliseconds.
+    /// Advance time by `delta` milliseconds, firing due timers in
+    /// chronological order.
     pub fn advance_millis(&self, delta: u64);
 
-    /// Advance the clock to exactly the given timestamp.
-    /// Fires all timers between current and target.
-    pub fn advance_to(&self, target: u64);
+    /// Advance to an absolute `target_millis` (must be >= current time).
+    /// Fires all pending timers whose scheduled time is <= `target_millis`
+    /// in chronological order. Callbacks registered by other callbacks during
+    /// this advance also fire if their time <= `target_millis`.
+    pub fn advance_to(&self, target_millis: u64);
 
     /// Return the number of pending (unfired) timers.
     pub fn pending_timers(&self) -> usize;
+
+    /// Set the clock to `millis` without firing any timers.
+    /// Useful for initial setup before the test scenario begins.
+    pub fn set(&self, millis: u64);
 }
 
 impl Clock for SimulatedClock { /* delegates to internal state */ }
 ```
 
+Timer handle IDs are allocated from a global `AtomicU64` counter, ensuring uniqueness across all clock instances in a process.
+
 **Usage.** All time-dependent components — TTL expiry, checkpoint intervals, gap timeouts (§9.8.5), cover traffic scheduling (§9.10.6), heartbeat intervals (§9.9.2), PCS update intervals (§9.7.3) — use the `Clock` trait. In tests, `SimulatedClock::advance(3600)` instantly fast-forwards one hour, firing all callbacks deterministically without waiting.
 
 ## 16.4 InMemoryRelay
 
-Full ADR-004 relay protocol implemented in-memory. No WebSocket, no network I/O. Stores blobs by `routing_id`, manages subscriptions, enforces TTL, delivers to subscribers. Backed by a `BlobStore` trait for swappable storage.
+Simplified in-memory relay for testing. No WebSocket, no network I/O. Stores blobs in a `HashMap` keyed by blob ID, manages subscriptions via `SubscriptionRegistry`, enforces TTL, and delivers to subscribers with configurable fault injection. All operations are synchronous (no async); the relay is intended to be shared via `Arc<Mutex<InMemoryRelay>>`.
 
-### 16.4.1 BlobStore Trait
+### 16.4.1 StoredBlob
 
-Defined in `scp-transport/native/` (not `scp-testing`), so the relay server can swap between backends without changing relay logic.
-
-```rust
-/// scp-transport/src/native/blob_store.rs
-
-/// Storage backend for relay blobs.
-/// Implementations: InMemoryBlobStore (testing/dev), SqliteBlobStore (small deployments),
-/// RedbBlobStore (medium relays), and other backends (PostgreSQL, S3) without changing relay logic.
-/// See §17.7 for the full first-party adapter roster.
-#[async_trait]
-pub trait BlobStore: Send + Sync {
-    /// Store a blob. Returns the blob_id (SHA-256 of blob content).
-    /// `expires_at` is the Unix timestamp when this blob should be deleted.
-    async fn store(
-        &self,
-        routing_id: &[u8; 32],
-        blob: &[u8],
-        recipient_hint: Option<[u8; 32]>,
-        blob_ttl: u32,
-        expires_at: u64,
-    ) -> Result<[u8; 32], BlobStoreError>;
-
-    /// Retrieve a blob by routing_id and blob_id.
-    async fn get(
-        &self,
-        routing_id: &[u8; 32],
-        blob_id: &[u8; 32],
-    ) -> Result<Option<StoredBlob>, BlobStoreError>;
-
-    /// List blobs for a routing_id, optionally filtered by `since` timestamp.
-    /// Returns blobs in ascending `stored_at` order (oldest first, per ADR-004 backfill ordering).
-    async fn list(
-        &self,
-        routing_id: &[u8; 32],
-        since: Option<u64>,
-        limit: Option<u32>,
-    ) -> Result<Vec<StoredBlob>, BlobStoreError>;
-
-    /// Delete a specific blob. Returns true if the blob existed.
-    async fn delete(&self, blob_id: &[u8; 32]) -> Result<bool, BlobStoreError>;
-
-    /// Delete all blobs whose `expires_at` <= `now`. Returns count deleted.
-    async fn expire(&self, now: u64) -> Result<u64, BlobStoreError>;
-}
-
-/// A blob stored in the relay.
-pub struct StoredBlob {
-    pub routing_id: [u8; 32],
-    pub blob_id: [u8; 32],
-    pub recipient_hint: Option<[u8; 32]>,
-    pub blob_ttl: u32,
-    pub stored_at: u64,
-    pub expires_at: u64,
-    pub blob: Vec<u8>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum BlobStoreError {
-    #[error("storage full")]
-    StorageFull,
-    #[error("blob too large: {size} bytes (max {max})")]
-    BlobTooLarge { size: usize, max: usize },
-    #[error("internal error: {0}")]
-    Internal(String),
-}
-```
-
-### 16.4.2 InMemoryBlobStore
-
-Reference `BlobStore` implementation in `scp-testing`. HashMap-backed, no persistence. Used by `InMemoryRelay` and as the reference for `blob_store_conformance!()`.
-
-```rust
-/// scp-testing/src/relay/blob_store.rs
-
-pub struct InMemoryBlobStore {
-    /// Blobs keyed by blob_id, with routing_id index.
-    blobs: RwLock<HashMap<[u8; 32], StoredBlob>>,
-    /// Secondary index: routing_id -> Vec<blob_id>, ordered by stored_at.
-    routing_index: RwLock<HashMap<[u8; 32], Vec<[u8; 32]>>>,
-    /// Clock for timestamping.
-    clock: Arc<dyn Clock>,
-}
-
-impl InMemoryBlobStore {
-    pub fn new(clock: Arc<dyn Clock>) -> Self;
-}
-```
-
-### 16.4.3 InMemoryRelay
+Blobs are stored directly in the relay's internal `HashMap`. No separate `BlobStore` trait — the relay manages its own storage inline.
 
 ```rust
 /// scp-testing/src/relay/mod.rs
 
+/// A blob stored in the in-memory relay.
+#[derive(Clone, Debug)]
+pub struct StoredBlob {
+    pub routing_id: [u8; 32],
+    pub blob_id: [u8; 32],
+    pub data: Vec<u8>,
+    pub ttl_secs: Option<u64>,
+    pub stored_at: u64,
+}
+```
+
+### 16.4.2 InMemoryRelay
+
+```rust
+/// scp-testing/src/relay/mod.rs
+
+/// In-memory relay for testing. Stores blobs and delivers to subscribers.
+/// Supports fault injection via BehaviorMode.
 pub struct InMemoryRelay {
-    store: Arc<dyn BlobStore>,
+    behavior: BehaviorMode,
     subscriptions: SubscriptionRegistry,
-    behavior: RwLock<BehaviorMode>,
-    clock: Arc<dyn Clock>,
-    rng: Mutex<StdRng>,
+    blobs: HashMap<[u8; 32], StoredBlob>,
+    message_counter: AtomicU64,
 }
 
 impl InMemoryRelay {
-    pub fn new(clock: Arc<dyn Clock>, seed: u64) -> Self;
-    pub fn with_behavior(clock: Arc<dyn Clock>, behavior: BehaviorMode, seed: u64) -> Self;
+    /// Creates a new relay with BehaviorMode::Normal (no fault injection).
+    pub fn new() -> Self;
 
-    /// Change behavior at runtime (simulate evolving adversarial conditions).
-    pub fn set_behavior(&self, behavior: BehaviorMode);
+    /// Creates a new relay with the specified behavior mode.
+    pub fn with_behavior(behavior: BehaviorMode) -> Self;
 
-    /// Current behavior mode.
-    pub fn behavior(&self) -> BehaviorMode;
+    /// Returns a reference to the current behavior mode.
+    pub const fn behavior(&self) -> &BehaviorMode;
 
-    /// Process a client message per ADR-004 protocol.
-    /// Returns the relay response(s).
-    pub async fn handle(&self, sender: SubscriberId, msg: ClientMessage) -> Vec<RelayMessage>;
+    /// Replaces the current behavior mode.
+    pub fn set_behavior(&mut self, behavior: BehaviorMode);
 
-    /// Run TTL expiry using the current clock time.
-    pub async fn expire_blobs(&self) -> u64;
+    /// Stores a blob and delivers it to subscribers according to the current
+    /// behavior mode. Returns the blob ID (SHA-256 of `data`).
+    pub fn store(
+        &mut self,
+        routing_id: [u8; 32],
+        data: Vec<u8>,
+        ttl_secs: Option<u64>,
+        timestamp: u64,
+    ) -> [u8; 32];
 
-    /// Number of stored blobs (for assertions).
-    pub async fn blob_count(&self) -> usize;
+    /// Retrieves a stored blob by its blob ID.
+    pub fn get(&self, blob_id: &[u8; 32]) -> Option<&StoredBlob>;
 
-    /// Number of active subscriptions.
+    /// Returns all blobs stored under the given routing ID.
+    pub fn query(&self, routing_id: &[u8; 32]) -> Vec<&StoredBlob>;
+
+    /// Deletes a blob by its blob ID. Returns `true` if removed.
+    /// Under BehaviorMode::DeletionNonCompliant, always returns `false`.
+    pub fn delete(&mut self, blob_id: &[u8; 32]) -> bool;
+
+    /// Subscribes to messages for the given routing ID.
+    /// Returns a (SubscriberId, Receiver) pair.
+    pub fn subscribe(
+        &mut self,
+        routing_id: [u8; 32],
+    ) -> (SubscriberId, mpsc::UnboundedReceiver<RelayMessage>);
+
+    /// Removes a subscriber from a specific routing ID.
+    pub fn unsubscribe(&mut self, routing_id: &[u8; 32], subscriber_id: SubscriberId) -> bool;
+
+    /// Removes all blobs whose TTL has expired relative to `now`.
+    /// Returns the number of blobs removed.
+    pub fn expire_blobs(&mut self, now: u64) -> usize;
+
+    /// Returns the number of stored blobs.
+    pub fn blob_count(&self) -> usize;
+
+    /// Returns the total number of active subscriptions.
     pub fn subscription_count(&self) -> usize;
 }
 ```
 
-### 16.4.4 BehaviorMode
+The relay applies fault injection during `store()`: after persisting the blob, it delivers to subscribers through the configured `BehaviorMode`. The `Composite` variant applies the first delivery-affecting mode, preventing duplicate deliveries.
 
-Each variant maps 1:1 to a relay threat from §9.9.1. Modes can be changed at runtime.
+### 16.4.3 BehaviorMode
+
+Each variant maps to a relay threat from §9.9.1. Modes can be changed at runtime via `set_behavior()`. The `Default` implementation is `Normal`.
 
 ```rust
 /// scp-testing/src/relay/behavior.rs
 
-/// Relay fault injection modes mapped to §9.9.1 threat model.
-#[derive(Debug, Clone)]
+/// Fault injection modes for simulated relays.
+#[derive(Clone, Debug, Default)]
 pub enum BehaviorMode {
-    /// Honest relay. No faults.
+    /// No faults — faithful relay behavior.
+    #[default]
     Normal,
-
-    /// §9.9.1 "Drop messages (suppression)."
-    /// Drops messages matching a predicate.
+    /// Drop messages periodically.
     Suppressing(SuppressionConfig),
-
-    /// §9.9.1 "Equivocate: show different message histories to different members."
-    /// Delivers different subsets of blobs to different subscribers.
+    /// Send different content to different subscribers.
     Equivocating(EquivocationConfig),
-
-    /// §9.9.1 "Delay messages."
-    /// Configurable latency before delivery.
+    /// Add latency to deliveries.
     Delayed(DelayConfig),
-
-    /// §9.9.1 "Replay messages."
-    /// Re-delivers previously seen blobs.
+    /// Replay old messages.
     Replaying(ReplayConfig),
-
-    /// §9.9.4 "Suppress MLS Commits."
-    /// Targeted suppression of MLS Commit messages.
-    /// Identified by a caller-provided predicate on blob content hash patterns.
+    /// Suppress MLS commit messages specifically.
     CommitSuppressing(CommitSuppressionConfig),
-
-    /// ADR-004 DELETE is best-effort. This mode ignores DELETE requests,
-    /// simulating a non-compliant relay.
+    /// Ignore DELETE requests (blob persists).
     DeletionNonCompliant,
-
-    /// Combine multiple modes. Applied in order; each mode's transform
-    /// feeds into the next.
-    Composite(Vec<BehaviorMode>),
+    /// Compose multiple behaviors.
+    Composite(Vec<Self>),
 }
 
-/// Configures which messages are suppressed.
-#[derive(Debug, Clone)]
+impl BehaviorMode {
+    /// Returns `true` if this is the Normal variant.
+    pub const fn is_normal(&self) -> bool;
+}
+
+/// Configuration for periodic message suppression.
+#[derive(Clone, Debug)]
 pub struct SuppressionConfig {
-    /// Drop messages to/from specific routing_ids.
-    pub by_routing_id: Vec<[u8; 32]>,
-    /// Drop messages to/from specific subscriber IDs.
-    pub by_subscriber: Vec<SubscriberId>,
-    /// Drop every Nth message (0 = disabled).
-    pub every_nth: u32,
-    /// Drop messages randomly with this probability (0.0-1.0).
-    pub random_drop_rate: f64,
+    /// Drop every Nth message (1-indexed). A value of 3 means
+    /// messages 3, 6, 9, ... are dropped.
+    pub drop_nth: u32,
 }
 
-/// Configures equivocation behavior.
-#[derive(Debug, Clone)]
+/// Configuration for equivocation (serving divergent content to
+/// different subscribers).
+#[derive(Clone, Debug)]
 pub struct EquivocationConfig {
-    /// Map from subscriber ID to the set of routing_ids whose blobs are hidden from them.
-    /// Subscribers not in this map see all blobs.
-    pub hidden_from: HashMap<SubscriberId, Vec<[u8; 32]>>,
+    /// Begin serving divergent content after this many messages
+    /// have been delivered. Odd-indexed subscribers see flipped data.
+    pub diverge_after: u32,
 }
 
-/// Configures delivery delay.
-#[derive(Debug, Clone)]
+/// Configuration for delivery delay injection.
+#[derive(Clone, Debug)]
 pub struct DelayConfig {
     /// Minimum delay in milliseconds.
     pub min_ms: u64,
     /// Maximum delay in milliseconds.
     pub max_ms: u64,
-    // Jitter is derived from the relay's seeded RNG.
 }
 
-/// Configures message replay.
-#[derive(Debug, Clone)]
+/// Configuration for message replay attacks.
+#[derive(Clone, Debug)]
 pub struct ReplayConfig {
-    /// Probability of replaying a previously delivered blob on each delivery (0.0-1.0).
-    pub replay_probability: f64,
-    /// Maximum number of times a single blob can be replayed.
-    pub max_replays_per_blob: u32,
+    /// Number of additional times each message is replayed
+    /// (1 = delivered twice total).
+    pub replay_count: u32,
 }
 
-/// Configures selective MLS Commit suppression (§9.9.4).
-#[derive(Debug, Clone)]
+/// Configuration for selective MLS commit suppression (§9.9.4).
+#[derive(Clone, Debug)]
 pub struct CommitSuppressionConfig {
-    /// Predicate: suppress blobs from these routing_ids that match
-    /// the commit blob size heuristic (Commits tend to be larger than
-    /// application messages due to tree update path).
-    pub target_routing_ids: Vec<[u8; 32]>,
-    /// Suppress only delivery to these specific subscribers.
-    /// If empty, suppress delivery to all subscribers.
-    pub suppress_for: Vec<SubscriberId>,
+    /// Probability of suppressing an MLS commit message,
+    /// in the range [0.0, 1.0].
+    pub suppress_probability: f64,
 }
-
-/// Unique identifier for a subscriber connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SubscriberId(pub u64);
 ```
 
-### 16.4.5 SubscriptionRegistry
+### 16.4.4 SubscriptionRegistry
 
 ```rust
 /// scp-testing/src/relay/subscription.rs
 
-/// Tracks active subscriptions and delivers blobs to subscribers.
+/// Opaque identifier for a subscription channel.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SubscriberId(pub u64);
+
+/// A message delivered through the relay subscription system.
+#[derive(Clone, Debug)]
+pub struct RelayMessage {
+    pub routing_id: [u8; 32],
+    pub blob_id: [u8; 32],
+    pub data: Vec<u8>,
+    pub stored_at: u64,
+}
+
+/// Fan-out registry that maps routing IDs to subscriber channels.
+/// All methods take `&mut self` (no internal RwLock — the relay's
+/// Mutex provides synchronization).
 pub struct SubscriptionRegistry {
-    /// Map from routing_id to set of (SubscriberId, Sender<RelayMessage>).
-    subscriptions: RwLock<HashMap<[u8; 32], Vec<(SubscriberId, mpsc::UnboundedSender<RelayMessage>)>>>,
+    subscribers: HashMap<[u8; 32], Vec<(SubscriberId, mpsc::UnboundedSender<RelayMessage>)>>,
     next_id: AtomicU64,
 }
 
 impl SubscriptionRegistry {
     pub fn new() -> Self;
 
-    /// Register a new subscriber, returning their ID and a receiver stream.
-    pub fn register(&self) -> (SubscriberId, mpsc::UnboundedReceiver<RelayMessage>);
+    /// Subscribes to messages for the given routing ID.
+    /// Returns a (SubscriberId, Receiver) pair.
+    pub fn subscribe(
+        &mut self,
+        routing_id: [u8; 32],
+    ) -> (SubscriberId, mpsc::UnboundedReceiver<RelayMessage>);
 
-    /// Subscribe a subscriber to a routing_id.
-    pub fn subscribe(&self, subscriber: SubscriberId, routing_id: [u8; 32]);
+    /// Removes a specific subscriber from a routing ID.
+    /// Returns `true` if the subscriber was found and removed.
+    pub fn unsubscribe(&mut self, routing_id: &[u8; 32], subscriber_id: SubscriberId) -> bool;
 
-    /// Unsubscribe a subscriber from a routing_id.
-    pub fn unsubscribe(&self, subscriber: SubscriberId, routing_id: &[u8; 32]);
+    /// Delivers a message to all subscribers of the given routing ID.
+    /// Dead channels are silently removed. Returns the number delivered.
+    pub fn deliver(&mut self, routing_id: &[u8; 32], message: &RelayMessage) -> usize;
 
-    /// Deliver a blob to all subscribers of a routing_id.
-    /// Returns the number of subscribers delivered to.
-    pub async fn deliver(&self, routing_id: &[u8; 32], message: RelayMessage) -> usize;
+    /// Delivers a message to a specific subscriber, regardless of routing ID.
+    /// Returns `true` if found and sent successfully.
+    pub fn deliver_to(&mut self, subscriber_id: SubscriberId, message: RelayMessage) -> bool;
 
-    /// Deliver a blob to a specific subscriber (directed delivery via recipient_hint).
-    pub async fn deliver_to(
-        &self,
-        subscriber: SubscriberId,
-        message: RelayMessage,
-    ) -> bool;
+    /// Removes a subscriber from all routing IDs.
+    /// Returns the number of routing IDs the subscriber was removed from.
+    pub fn disconnect(&mut self, subscriber_id: SubscriberId) -> usize;
 
-    /// Number of active subscriptions across all routing_ids.
+    /// Total number of active subscriptions across all routing IDs.
     pub fn count(&self) -> usize;
 
-    /// Remove a subscriber entirely (disconnect).
-    pub fn disconnect(&self, subscriber: SubscriberId);
+    /// Number of subscribers for a specific routing ID.
+    pub fn count_for_routing_id(&self, routing_id: &[u8; 32]) -> usize;
+
+    /// Returns a reference to the subscriber list for a routing ID.
+    /// Used internally by InMemoryRelay for per-subscriber fault injection.
+    pub fn subscribers_for(
+        &self,
+        routing_id: &[u8; 32],
+    ) -> Option<&Vec<(SubscriberId, mpsc::UnboundedSender<RelayMessage>)>>;
 }
 ```
 
 ## 16.5 InMemoryTransport
 
-Implements `TransportAdapter` (ADR-005) backed by `Arc<InMemoryRelay>`. No WebSocket. Used by `SimulatedIdentity` instances to communicate through in-memory relays.
+Implements `TransportAdapter` (ADR-005) backed by `Arc<Mutex<InMemoryRelay>>`. No WebSocket. Envelopes are serialized to MessagePack before being stored in the relay, and deserialized back when queried. The relay mutex is held only for the duration of each individual operation (store, subscribe, query, etc.), never across await points.
 
 ```rust
 /// scp-testing/src/transport.rs
 
+/// In-memory TransportAdapter backed by an InMemoryRelay.
 pub struct InMemoryTransport {
-    relay: Arc<InMemoryRelay>,
-    subscriber_id: SubscriberId,
-    receiver: Mutex<Option<mpsc::UnboundedReceiver<RelayMessage>>>,
+    /// Shared relay instance behind a std::sync::Mutex.
+    relay: Arc<Mutex<InMemoryRelay>>,
+    /// Clock timestamp supplier. Returns epoch seconds for the relay's
+    /// stored_at field. Defaults to 0 if no clock is configured.
+    timestamp_fn: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
 impl InMemoryTransport {
-    /// Create a transport connected to the given in-memory relay.
-    pub fn new(relay: Arc<InMemoryRelay>) -> Self;
+    /// Creates a new transport backed by the given relay.
+    /// Stored timestamps default to 0.
+    pub fn new(relay: Arc<Mutex<InMemoryRelay>>) -> Self;
+
+    /// Creates a new transport with a clock function for timestamps.
+    /// The timestamp_fn is called once per send() to obtain stored_at.
+    pub fn with_clock(
+        relay: Arc<Mutex<InMemoryRelay>>,
+        timestamp_fn: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Self;
 }
 
-#[async_trait]
 impl TransportAdapter for InMemoryTransport {
-    async fn send(&self, envelope: &OuterEnvelope) -> Result<BlobId, TransportError> {
-        // Translate OuterEnvelope to ClientMessage::Publish, call relay.handle().
-    }
+    fn send(&self, envelope: &OuterEnvelope)
+        -> Pin<Box<dyn Future<Output = Result<BlobId, TransportError>> + Send + '_>>;
 
-    async fn subscribe(
-        &self,
-        routing_id: &RoutingId,
-        since: Option<u64>,
-    ) -> Result<Pin<Box<dyn Stream<Item = TransportEvent> + Send>>, TransportError> {
-        // Register subscription with relay, return stream that filters
-        // RelayMessage::Blob for the given routing_id, wraps in TransportEvent, and deserializes.
-    }
+    fn subscribe(&self, routing_id: &RoutingId, since: Option<u64>)
+        -> Pin<Box<dyn Future<Output = Result<SubscriptionStream, TransportError>> + Send + '_>>;
 
-    async fn unsubscribe(&self, routing_id: &RoutingId) -> Result<(), TransportError> {
-        // Unsubscribe from relay.
-    }
+    fn unsubscribe(&self, routing_id: &RoutingId)
+        -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
 
-    async fn query(
-        &self,
-        routing_id: &RoutingId,
-        since: Option<u64>,
-    ) -> Result<Vec<TransportEvent>, TransportError> {
-        // Translate to ClientMessage::Query, collect results as TransportEvent.
-    }
+    fn query(&self, routing_id: &RoutingId, since: Option<u64>)
+        -> Pin<Box<dyn Future<Output = Result<Vec<OuterEnvelope>, TransportError>> + Send + '_>>;
 
-    async fn delete(&self, blob_id: &BlobId) -> Result<(), TransportError> {
-        // Translate to ClientMessage::Delete.
-    }
+    fn delete(&self, blob_id: &BlobId)
+        -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
 }
 ```
 
+The `subscribe()` implementation wraps the relay's `mpsc::UnboundedReceiver<RelayMessage>` into a `Stream<Item = TransportEvent>`, deserializing each relay message's MessagePack bytes back into an `OuterEnvelope`. The `unsubscribe()` is a no-op at the relay level — the stream terminates when the caller drops it, cleaning up the mpsc sender on the next delivery attempt.
+
 ## 16.6 SimulatedIdentity
 
-Wraps a real `Identity` (ADR-003) with in-memory platform adapters (ADR-006) and `InMemoryTransport` instances. Represents a single participant in the simulation.
+Wraps identity primitives (DID, key custody, storage, protocol store) into a single container for convenient test setup. Does NOT create real MLS groups, transport connections, or sender key stores — those are complex and should be used directly in integration tests. This is a lightweight identity container, not a full participant harness.
 
 ```rust
 /// scp-testing/src/simulator/identity.rs
 
+/// A test identity with custody, storage, and protocol store pre-wired.
 pub struct SimulatedIdentity {
-    /// The real SCP identity (DID, keys, document).
-    pub identity: Identity,
-    /// In-memory key custody (ADR-006).
-    pub key_custody: Arc<InMemoryKeyCustody>,
-    /// In-memory storage (ADR-006). Retained for direct conformance testing
-    /// via `storage_conformance!()`.
-    pub storage: Arc<InMemoryStorage>,
-    /// Protocol-layer storage (§17.4). Wraps `self.storage` and provides typed
-    /// domain methods for context state, membership, event logs, nonces, tools,
-    /// sender keys, and all other protocol-level persistence.
-    /// Used by protocol-level tests (§16.13.7, §16.13.8).
-    pub protocol_store: Arc<ProtocolStore>,
-    /// Transport manager with InMemoryTransport instances.
-    pub transport: TransportManager,
-    /// Clock shared with the simulator.
-    pub clock: Arc<SimulatedClock>,
-    /// Map from relay name to the InMemoryTransport connected to it.
-    pub relay_transports: HashMap<String, Arc<InMemoryTransport>>,
+    /// The DID for this identity.
+    did: DID,
+    /// Key custody provider.
+    custody: Arc<InMemoryKeyCustody>,
+    /// Direct storage access for tests.
+    storage: InMemoryStorage,
+    /// Protocol store wrapping its own storage instance.
+    protocol_store: ProtocolStore<InMemoryStorage>,
+    /// Human-readable label for this identity.
+    label: String,
 }
 
 impl SimulatedIdentity {
-    /// DID string for this identity.
-    pub fn did(&self) -> &str;
+    /// Creates a new simulated identity. The ProtocolStore is created from a
+    /// fresh InMemoryStorage instance. The `storage` parameter is retained
+    /// separately for direct test access.
+    pub fn new(
+        label: impl Into<String>,
+        did: DID,
+        custody: Arc<InMemoryKeyCustody>,
+        storage: InMemoryStorage,
+    ) -> Self;
 
-    /// Send a message in a context.
-    pub async fn send(
-        &self,
-        context_id: &ContextId,
-        payload: &[u8],
-    ) -> Result<(), SimulationError>;
+    /// Returns a reference to this identity's DID.
+    pub const fn did(&self) -> &DID;
 
-    /// Receive the next message from a context.
-    /// Returns None if no message is available.
-    pub async fn recv(
-        &self,
-        context_id: &ContextId,
-    ) -> Result<Option<ReceivedMessage>, SimulationError>;
+    /// Returns the human-readable label for this identity.
+    pub fn label(&self) -> &str;
 
-    /// Drain all pending messages from a context.
-    pub async fn drain(
-        &self,
-        context_id: &ContextId,
-    ) -> Result<Vec<ReceivedMessage>, SimulationError>;
+    /// Returns a reference to the key custody provider.
+    pub const fn custody(&self) -> &Arc<InMemoryKeyCustody>;
 
-    /// Access the event log for a context.
-    pub fn event_log(&self, context_id: &ContextId) -> Option<&EventLog>;
+    /// Returns a reference to the direct storage instance.
+    pub const fn storage(&self) -> &InMemoryStorage;
 
-    /// Access MLS group state for a context (for assertions).
-    pub fn mls_epoch(&self, context_id: &ContextId) -> Option<u64>;
+    /// Returns a reference to the protocol store.
+    pub const fn protocol_store(&self) -> &ProtocolStore<InMemoryStorage>;
 }
 ```
 

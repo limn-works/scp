@@ -81,7 +81,12 @@ done
 if [ "$DEV_MODE" = true ]; then
     ALL_TARGETS=("$TARGET_MACOS_ARM")
     log_mode="dev (macOS arm64 only)"
+    # Dev builds enable in-memory custody for testing. Production builds
+    # (iOS XCFramework, Android .aar) MUST NOT enable this feature.
+    # See GitHub issue #88.
+    EXTRA_FEATURES="--features allow_in_memory_custody"
 else
+    EXTRA_FEATURES=""
     ALL_TARGETS=(
         "$TARGET_IOS"
         "$TARGET_IOS_SIM_ARM"
@@ -139,10 +144,12 @@ done
 # ---------------------------------------------------------------------------
 
 log "Building host dylib for uniffi-bindgen (aarch64-apple-darwin)"
+# shellcheck disable=SC2086
 cargo build \
     --release \
     --target "$TARGET_MACOS_ARM" \
-    --manifest-path "$FFI_CRATE_DIR/Cargo.toml"
+    --manifest-path "$FFI_CRATE_DIR/Cargo.toml" \
+    $EXTRA_FEATURES
 
 HOST_DYLIB="$TARGET_DIR/$TARGET_MACOS_ARM/release/libscp_ffi_uniffi.dylib"
 if [ ! -f "$HOST_DYLIB" ]; then
@@ -214,10 +221,12 @@ for target in "${ALL_TARGETS[@]}"; do
         continue
     fi
     log "  Building for $target"
+    # shellcheck disable=SC2086
     cargo build \
         --release \
         --target "$target" \
-        --manifest-path "$FFI_CRATE_DIR/Cargo.toml"
+        --manifest-path "$FFI_CRATE_DIR/Cargo.toml" \
+        $EXTRA_FEATURES
 done
 
 # ---------------------------------------------------------------------------

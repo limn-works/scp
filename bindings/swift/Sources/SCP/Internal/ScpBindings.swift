@@ -1224,6 +1224,10 @@ public func FfiConverterTypeIdentity_lower(_ value: Identity) -> UnsafeMutableRa
  * Exposes connection status and relay URL without leaking connection state.
  * The actual transport (WebSocket, multi-relay routing) is managed internally.
  *
+ * Holds a reference to the underlying `NativeRelayAdapter` established by
+ * `transport_connect`. The adapter represents a live WebSocket connection
+ * to an SCP relay.
+ *
  * Generated as `class TransportManager` in both Swift and Kotlin.
  *
  * See ADR-005 (Transport Abstraction).
@@ -1237,6 +1241,9 @@ public protocol TransportManagerProtocol: AnyObject, Sendable {
     
     /**
      * Returns the current transport connection status record.
+     *
+     * Reflects actual connection state: `connected` is `true` only if the
+     * underlying relay adapter is still held.
      */
     func status()  -> TransportStatus
     
@@ -1246,6 +1253,10 @@ public protocol TransportManagerProtocol: AnyObject, Sendable {
  *
  * Exposes connection status and relay URL without leaking connection state.
  * The actual transport (WebSocket, multi-relay routing) is managed internally.
+ *
+ * Holds a reference to the underlying `NativeRelayAdapter` established by
+ * `transport_connect`. The adapter represents a live WebSocket connection
+ * to an SCP relay.
  *
  * Generated as `class TransportManager` in both Swift and Kotlin.
  *
@@ -1315,6 +1326,9 @@ open func isConnected() -> Bool  {
     
     /**
      * Returns the current transport connection status record.
+     *
+     * Reflects actual connection state: `connected` is `true` only if the
+     * underlying relay adapter is still held.
      */
 open func status() -> TransportStatus  {
     return try!  FfiConverterTypeTransportStatus_lift(try! rustCall() {
@@ -7825,6 +7839,11 @@ public func toolVerify(handle: ContextHandle, toolId: String)async throws  -> To
 /**
  * Connects to an SCP relay.
  *
+ * Establishes a WebSocket connection to the specified relay URL using
+ * [`NativeRelayAdapter::connect_sourced`] with `Explicit` source
+ * (requires `wss://`). The adapter is stored in the returned
+ * `TransportManager` handle.
+ *
  * # Arguments
  *
  * * `relay_url` — The URL of the SCP relay (e.g., `"wss://relay.example.com"`).
@@ -7835,7 +7854,9 @@ public func toolVerify(handle: ContextHandle, toolId: String)async throws  -> To
  *
  * # Errors
  *
- * Returns `ScpError::Transport` if the connection fails (unreachable relay,
+ * Returns `ScpError::Transport` if the URL scheme is not permitted
+ * (only `wss://` is accepted for explicit connections) or if the
+ * WebSocket connection cannot be established (unreachable relay,
  * protocol mismatch, timeout, authentication failure).
  */
 public func transportConnect(relayUrl: String)async throws  -> TransportManager  {
@@ -7853,7 +7874,41 @@ public func transportConnect(relayUrl: String)async throws  -> TransportManager 
         )
 }
 /**
+ * Disconnects from the current SCP relay.
+ *
+ * Clears the relay adapter from the `TransportManager` handle. After this
+ * call, the `TransportManager` reports `connected: false` and the adapter's
+ * WebSocket connection is released when the last reference is dropped.
+ *
+ * This is idempotent — calling it when already disconnected is a no-op.
+ *
+ * # Arguments
+ *
+ * * `manager` — The `TransportManager` returned by `transport_connect`.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Transport` if the internal mutex is poisoned.
+ */
+public func transportDisconnect(manager: TransportManager)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_transport_disconnect(FfiConverterTypeTransportManager_lower(manager)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
  * Returns the current transport connection status.
+ *
+ * Reflects actual connection state: `connected` is `true` only if the
+ * underlying relay adapter is still held by the manager.
  *
  * # Errors
  *
@@ -8298,10 +8353,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_tool_verify() != 15916) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_transport_connect() != 32081) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_transport_connect() != 25975) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_transport_status() != 40821) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_transport_disconnect() != 29342) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_transport_status() != 49151) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_trust_create_challenge() != 37813) {
@@ -8367,7 +8425,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_is_connected() != 6252) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_status() != 2514) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_status() != 35920) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_ucantoken_audience() != 59140) {
