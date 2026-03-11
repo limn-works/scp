@@ -59,6 +59,16 @@ function parseResolutionPath(raw: Record<string, unknown>): ResolutionPath {
   };
 }
 
+/** The 6 valid TrustLevel kind values per §22.7. */
+const VALID_TRUST_LEVEL_KINDS = new Set([
+  "DirectExchange",
+  "LocalPetname",
+  "DomainVerified",
+  "AttestationVerified",
+  "DiscoveryContextVerified",
+  "MultiLayerCorroborated",
+]);
+
 /**
  * Parses a trust level from the bridge JSON. The NAPI bridge emits trust
  * levels as `{ "kind": "..." }` objects (discriminated unions per §22.7).
@@ -66,11 +76,18 @@ function parseResolutionPath(raw: Record<string, unknown>): ResolutionPath {
  *
  * Also handles legacy string values (e.g. `"DomainVerified"`) by wrapping
  * them into the discriminated union shape.
+ *
+ * Throws on unrecognized values -- §22.7 defines exactly 6 variants.
  */
 function parseTrustLevel(raw: unknown): TrustLevel {
   if (raw != null && typeof raw === "object" && "kind" in raw) {
     const obj = raw as Record<string, unknown>;
     const kind = obj.kind as string;
+    if (!VALID_TRUST_LEVEL_KINDS.has(kind)) {
+      throw new Error(
+        `Unknown TrustLevel kind: "${kind}". Expected one of: ${[...VALID_TRUST_LEVEL_KINDS].join(", ")}`,
+      );
+    }
     if (kind === "MultiLayerCorroborated") {
       const rawSources = (obj.sources ?? []) as Array<Record<string, unknown>>;
       return {
@@ -82,13 +99,19 @@ function parseTrustLevel(raw: unknown): TrustLevel {
   }
   // Handle plain string trust levels from the bridge.
   if (typeof raw === "string") {
+    if (!VALID_TRUST_LEVEL_KINDS.has(raw)) {
+      throw new Error(
+        `Unknown TrustLevel kind: "${raw}". Expected one of: ${[...VALID_TRUST_LEVEL_KINDS].join(", ")}`,
+      );
+    }
     if (raw === "MultiLayerCorroborated") {
       return { kind: "MultiLayerCorroborated", sources: [] };
     }
     return { kind: raw } as TrustLevel;
   }
-  // Fallback for unexpected input.
-  return { kind: "DiscoveryContextVerified" };
+  throw new Error(
+    `Invalid TrustLevel value: expected object with "kind" or string, got ${typeof raw}`,
+  );
 }
 
 /**
