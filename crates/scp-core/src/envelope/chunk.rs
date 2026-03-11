@@ -66,7 +66,6 @@ pub const MAX_TOTAL_CHUNKS: u32 = 262_144;
 /// [`InnerEnvelope`]: super::inner::InnerEnvelope
 /// [`OuterEnvelope`]: super::outer::OuterEnvelope
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ChunkEnvelope {
     /// Unique identifier for the complete message. All chunks of the same
     /// message share this value. 32 bytes, derived via SHA-256.

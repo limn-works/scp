@@ -104,7 +104,6 @@ const fn default_inner_version() -> u16 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct InnerEnvelope {
     /// Protocol version (§13.2.1). SCP/1.0 = `0x0100`.
     /// Part of the signature commitment — changing this changes the signed bytes.
@@ -1588,5 +1587,49 @@ mod tests {
             let deserialized: InnerEnvelope = rmp_serde::from_slice(&bytes).unwrap();
             assert_eq!(deserialized.version, SCP_INNER_ENVELOPE_VERSION);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Forward compatibility: unknown fields ignored (§13.5.1, #593)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn inner_envelope_ignores_unknown_fields() {
+        let (custody, signing_key) = setup().await;
+
+        let envelope = create_inner_envelope(
+            &InnerEnvelopeParams {
+                version: SCP_INNER_ENVELOPE_VERSION,
+                context_id: "ctx-fwd",
+                sender_did: "did:dht:fwd-compat",
+                epoch: 1,
+                generation: 0,
+                sequence: 1,
+                timestamp: 1_700_000_000,
+                message_type: MessageType::Content,
+                payload: b"forward compat test",
+                provenance: None,
+                signing_key_id: SigningKeyId::Active,
+            },
+            &custody,
+            &signing_key,
+        )
+        .await
+        .unwrap();
+
+        // Serialize to JSON, inject an unknown field, deserialize back.
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::to_value(&envelope).unwrap()).unwrap();
+        map.insert("future_protocol_extension".into(), "v2-data".into());
+
+        let result = serde_json::from_value::<InnerEnvelope>(serde_json::Value::Object(map));
+        assert!(
+            result.is_ok(),
+            "wire-format types must ignore unknown fields per §13.5.1: {:?}",
+            result.unwrap_err()
+        );
+        let decoded = result.unwrap();
+        assert_eq!(decoded.context_id, "ctx-fwd");
+        assert_eq!(decoded.sender_did, "did:dht:fwd-compat");
     }
 }

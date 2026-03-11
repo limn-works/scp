@@ -109,7 +109,6 @@ const NONCE_DEDUP_CAPACITY: usize = 10_000;
 ///
 /// Signature payload: `SHA-256(context_id || sender_did || "key_epoch" || epoch_BE || signer_key_ref)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SenderKeyEpochAdvance {
     /// The DID of the sender who rotated their key.
     pub sender_did: String,
@@ -135,7 +134,6 @@ pub struct SenderKeyEpochAdvance {
 /// The responder rejects requests with duplicate nonces within a 5-minute
 /// window and echoes the nonce in the response for binding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SenderKeyRequest {
     /// The DID of the member requesting the key.
     pub requester_did: String,
@@ -167,7 +165,6 @@ pub struct SenderKeyRequest {
 /// nonce from the corresponding [`SenderKeyRequest`] to bind the response to
 /// the originating request and prevent response substitution attacks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SenderKeyResponse {
     /// The DID of the sender whose key is being distributed.
     pub sender_did: String,
@@ -195,7 +192,6 @@ pub struct SenderKeyResponse {
 /// Signature payload (via canonical hash):
 /// `SHA-256("SCP-BLOCK-NOTIFICATION-V1:" || context_id || blocker_did || blocked_did || signing_key_id || timestamp_BE)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BlockNotification {
     /// The type discriminator for deserialization.
     #[serde(rename = "type")]

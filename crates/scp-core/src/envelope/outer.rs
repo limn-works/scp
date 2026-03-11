@@ -45,7 +45,6 @@ const fn default_outer_version() -> u16 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct OuterEnvelope {
     /// Protocol version (§13.2.3). SCP/1.0 = `0x0100`.
     /// Used for deserialization routing — tells the recipient which version's

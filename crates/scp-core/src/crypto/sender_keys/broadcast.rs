@@ -166,7 +166,6 @@ pub struct BroadcastKeyEpochAdvance {
 ///
 /// [`encrypt_sender_layer`]: super::encrypt::encrypt_sender_layer
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BroadcastEnvelope {
     /// Protocol version (§13.2.2). SCP/1.0 = `0x0100`.
     /// Part of the signature commitment.
@@ -1415,35 +1414,34 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // deny_unknown_fields defense (#427 item 4)
+    // Forward compatibility: unknown fields ignored (§13.5.1, #593)
     // -----------------------------------------------------------------------
 
     #[test]
     #[allow(clippy::unwrap_used)]
-    fn broadcast_envelope_rejects_unknown_fields() {
-        // BroadcastEnvelope has #[serde(deny_unknown_fields)] (#427 item 4).
-        // Verify that injecting an unknown field into MessagePack is rejected
-        // during deserialization. We build a valid envelope, serialize it to
-        // a serde_json::Value map, inject the extra field, then deserialize
-        // back. JSON round-trips through the custom serde modules correctly.
-        let key = generate_broadcast_key("did:dht:deny-test");
-        let envelope = test_seal(&key, b"deny-test-payload");
+    fn broadcast_envelope_ignores_unknown_fields() {
+        // Spec §13.5.1 mandates that implementations MUST ignore unknown
+        // fields for forward compatibility. Verify that injecting an unknown
+        // field into the serialized representation does NOT cause
+        // deserialization to fail.
+        let key = generate_broadcast_key("did:dht:fwd-compat-test");
+        let envelope = test_seal(&key, b"fwd-compat-payload");
 
         // Serialize to JSON Value (all custom serde modules support JSON).
         let mut map: serde_json::Map<String, serde_json::Value> =
             serde_json::from_value(serde_json::to_value(&envelope).unwrap()).unwrap();
-        map.insert("evil_extra_field".into(), "malicious".into());
+        map.insert("future_protocol_field".into(), "v2-data".into());
 
         let result = serde_json::from_value::<BroadcastEnvelope>(serde_json::Value::Object(map));
         assert!(
-            result.is_err(),
-            "deny_unknown_fields must reject unknown keys"
+            result.is_ok(),
+            "wire-format types must ignore unknown fields per §13.5.1: {:?}",
+            result.unwrap_err()
         );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("unknown field"),
-            "error should mention unknown field: {err}"
-        );
+        let decoded = result.unwrap();
+        assert_eq!(decoded.context_id, envelope.context_id);
+        assert_eq!(decoded.author_did, envelope.author_did);
+        assert_eq!(decoded.sequence, envelope.sequence);
     }
 
     // -----------------------------------------------------------------------

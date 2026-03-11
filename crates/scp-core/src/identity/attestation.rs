@@ -151,7 +151,6 @@ impl VerificationMethod {
 ///
 /// Records which external platform identity is being claimed by the issuer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AttestationClaim {
     /// Platform identifier (e.g., "x.com", "github.com", "discord.com").
     pub platform: String,
@@ -199,7 +198,6 @@ impl AttestationClaim {
 /// Contains the verification method, method-specific proof data, the
 /// timestamp of last verification, and an optional third-party verifier DID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AttestationEvidence {
     /// Verification method used to establish the link.
     pub method: VerificationMethod,
@@ -245,7 +243,6 @@ impl AttestationEvidence {
 /// DID document and check the `AttestationRevocations` service endpoint
 /// (§18.2.2) for the attestation's ID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AttestationRevocation {
     /// Revocation check method. Currently always `"did_document"`.
     pub method: Cow<'static, str>,
@@ -290,7 +287,6 @@ impl AttestationRevocation {
 /// 4. The attestation is not on the issuer's revocation list (§18.2.2).
 /// 5. `evidence.verified_at` is within the method's renewal interval (§3.5.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct IdentityLinkAttestation {
     /// Deterministic ID: `hex(SHA-256(issuer || platform || handle || issued_at))`.
     pub id: String,
@@ -889,18 +885,22 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // deny_unknown_fields
+    // Forward compatibility: unknown fields ignored (§13.5.1, #593)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn attestation_rejects_unknown_fields_json() {
+    fn attestation_ignores_unknown_fields_json() {
         let attestation = make_attestation();
         let mut json: serde_json::Value = serde_json::to_value(&attestation).unwrap();
         json.as_object_mut()
             .unwrap()
-            .insert("unknown_field".to_owned(), serde_json::Value::Bool(true));
+            .insert("future_field".to_owned(), serde_json::Value::Bool(true));
         let result = serde_json::from_value::<IdentityLinkAttestation>(json);
-        assert!(result.is_err(), "should reject unknown fields");
+        assert!(
+            result.is_ok(),
+            "wire-format types must ignore unknown fields per §13.5.1: {:?}",
+            result.unwrap_err()
+        );
     }
 
     // -----------------------------------------------------------------------
