@@ -378,10 +378,20 @@ fn parse_wasm_discovery_method(s: Option<&str>) -> Result<serde_json::Value, JsE
         "none" | "None" => Ok(serde_json::json!("None")),
         _ if s.starts_with("shared_context:") => {
             let ctx_id = &s["shared_context:".len()..];
+            if ctx_id.is_empty() {
+                return Err(JsError::new(
+                    "[SCP-VALID-7216] invalid discovery_method 'shared_context:': context ID must not be empty",
+                ));
+            }
             Ok(serde_json::json!({"SharedContext": ctx_id}))
         }
         _ if s.starts_with("registry:") => {
             let ctx_id = &s["registry:".len()..];
+            if ctx_id.is_empty() {
+                return Err(JsError::new(
+                    "[SCP-VALID-7216] invalid discovery_method 'registry:': context ID must not be empty",
+                ));
+            }
             Ok(serde_json::json!({"Registry": ctx_id}))
         }
         other => Err(JsError::new(&format!(
@@ -654,5 +664,29 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn parse_discovery_method_rejects_empty_shared_context_id() {
+        let result = parse_wasm_discovery_method(Some("shared_context:"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_discovery_method_rejects_empty_registry_id() {
+        let result = parse_wasm_discovery_method(Some("registry:"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_discovery_method_accepts_valid_ids() {
+        let shared = parse_wasm_discovery_method(Some("shared_context:ctx-123")).unwrap();
+        assert_eq!(shared, serde_json::json!({"SharedContext": "ctx-123"}));
+
+        let registry = parse_wasm_discovery_method(Some("registry:reg-456")).unwrap();
+        assert_eq!(registry, serde_json::json!({"Registry": "reg-456"}));
+
+        let none = parse_wasm_discovery_method(None).unwrap();
+        assert_eq!(none, serde_json::json!("None"));
     }
 }

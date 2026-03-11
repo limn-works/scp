@@ -252,10 +252,27 @@ fn parse_discovery_method(s: Option<&str>) -> napi::Result<DiscoveryMethod> {
         "none" | "None" => Ok(DiscoveryMethod::None),
         _ if s.starts_with("shared_context:") => {
             let ctx_id = &s["shared_context:".len()..];
+            if ctx_id.is_empty() {
+                return Err(ScpNapiError::Validation {
+                    message:
+                        "invalid discovery_method 'shared_context:': context ID must not be empty"
+                            .to_owned(),
+                    code: "SCP-VALID-7216".to_owned(),
+                }
+                .into());
+            }
             Ok(DiscoveryMethod::SharedContext(ctx_id.to_owned()))
         }
         _ if s.starts_with("registry:") => {
             let ctx_id = &s["registry:".len()..];
+            if ctx_id.is_empty() {
+                return Err(ScpNapiError::Validation {
+                    message: "invalid discovery_method 'registry:': context ID must not be empty"
+                        .to_owned(),
+                    code: "SCP-VALID-7216".to_owned(),
+                }
+                .into());
+            }
             Ok(DiscoveryMethod::Registry(ctx_id.to_owned()))
         }
         other => Err(ScpNapiError::Validation {
@@ -263,7 +280,7 @@ fn parse_discovery_method(s: Option<&str>) -> napi::Result<DiscoveryMethod> {
                 "invalid discovery_method '{other}': expected 'none', \
                  'shared_context:<context_id>', or 'registry:<context_id>'"
             ),
-            code: "SCP-VALID-7003".to_owned(),
+            code: "SCP-VALID-7216".to_owned(),
         }
         .into()),
     }
@@ -310,5 +327,33 @@ mod tests {
     fn check_chain_depth_exceeds_limit() {
         assert!(!provenance_check_chain_depth(4, None));
         assert!(!provenance_check_chain_depth(2, Some(1)));
+    }
+
+    #[test]
+    fn parse_discovery_method_rejects_empty_shared_context_id() {
+        let result = parse_discovery_method(Some("shared_context:"));
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("context ID must not be empty"));
+    }
+
+    #[test]
+    fn parse_discovery_method_rejects_empty_registry_id() {
+        let result = parse_discovery_method(Some("registry:"));
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("context ID must not be empty"));
+    }
+
+    #[test]
+    fn parse_discovery_method_accepts_valid_ids() {
+        let shared = parse_discovery_method(Some("shared_context:ctx-123")).unwrap();
+        assert!(matches!(shared, DiscoveryMethod::SharedContext(id) if id == "ctx-123"));
+
+        let registry = parse_discovery_method(Some("registry:reg-456")).unwrap();
+        assert!(matches!(registry, DiscoveryMethod::Registry(id) if id == "reg-456"));
+
+        let none = parse_discovery_method(None).unwrap();
+        assert!(matches!(none, DiscoveryMethod::None));
     }
 }
