@@ -1074,11 +1074,7 @@ fn recompute_tree_from_leaves(leaves: &[[u8; 32]]) -> Vec<Vec<[u8; 32]>> {
 /// Returns `SHA-256("")` for an empty set (spec §25.8 Vector 15).
 fn compute_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
     if leaves.is_empty() {
-        // SHA-256("") per spec §25.8 Vector 15.
-        let hash = Sha256::digest(b"");
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&hash);
-        return out;
+        return crate::tree::empty_tree_root();
     }
     if leaves.len() == 1 {
         return leaves[0];
@@ -1091,7 +1087,7 @@ fn compute_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
         return top[0];
     }
 
-    [0u8; 32]
+    unreachable!("recompute_tree_from_leaves always produces a single root for non-empty input")
 }
 
 /// Computes `SHA-256(0x01 || left || right)` for an interior node.

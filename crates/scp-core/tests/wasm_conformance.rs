@@ -542,7 +542,7 @@ fn merkle_roots_identical_at_each_step() {
     let mut core_log = EventLog::new("ctx-conformance".to_owned());
     let mut wasm_log = wasm_mirror::WasmEventLog::new();
 
-    // Both empty logs should return the same zero root.
+    // Both empty logs should return the same root: SHA-256("") per spec §25.8.
     assert_eq!(
         core_tree::root(&core_log),
         wasm_log.root(),
