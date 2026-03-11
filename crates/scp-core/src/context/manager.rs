@@ -3579,12 +3579,16 @@ impl ContextManager {
             for event in &conflict_events {
                 match event {
                     GovernanceEvent::ConflictDetected { .. } => {
-                        self.event_log
-                            .append_context_event(&context_id_bytes, "GovernanceConflictDetected")?;
+                        self.event_log.append_context_event(
+                            &context_id_bytes,
+                            "GovernanceConflictDetected",
+                        )?;
                     }
                     GovernanceEvent::ConflictResolved { .. } => {
-                        self.event_log
-                            .append_context_event(&context_id_bytes, "GovernanceConflictResolved")?;
+                        self.event_log.append_context_event(
+                            &context_id_bytes,
+                            "GovernanceConflictResolved",
+                        )?;
                     }
                     _ => {}
                 }
@@ -3701,12 +3705,16 @@ impl ContextManager {
             for event in &conflict_events {
                 match event {
                     GovernanceEvent::ConflictDetected { .. } => {
-                        self.event_log
-                            .append_context_event(&context_id_bytes, "GovernanceConflictDetected")?;
+                        self.event_log.append_context_event(
+                            &context_id_bytes,
+                            "GovernanceConflictDetected",
+                        )?;
                     }
                     GovernanceEvent::ConflictResolved { .. } => {
-                        self.event_log
-                            .append_context_event(&context_id_bytes, "GovernanceConflictResolved")?;
+                        self.event_log.append_context_event(
+                            &context_id_bytes,
+                            "GovernanceConflictResolved",
+                        )?;
                     }
                     _ => {}
                 }
