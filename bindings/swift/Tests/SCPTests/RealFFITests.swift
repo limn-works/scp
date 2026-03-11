@@ -584,6 +584,8 @@ struct RealFFIBridgeTrustTests {
             // Expected: Ed25519 signature verification fails with synthetic key
             if case let .Validation(message, _) = error {
                 #expect(message.contains("signature") || message.contains("public key"))
+            } else {
+                Issue.record("Expected .Validation error, got: \(error)")
             }
         }
     }
@@ -617,6 +619,8 @@ struct RealFFIBridgeTrustTests {
         } catch let error as ScpError {
             if case let .Validation(message, _) = error {
                 #expect(!message.isEmpty)
+            } else {
+                Issue.record("Expected .Validation error, got: \(error)")
             }
         }
     }
