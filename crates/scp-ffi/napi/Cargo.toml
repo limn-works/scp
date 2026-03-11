@@ -35,6 +35,9 @@ scp-platform = { path = "../../scp-platform", features = ["testing"] }
 scp-mcp = { path = "../../scp-mcp" }
 scp-transport = { path = "../../scp-transport" }
 
+[dev-dependencies]
+scp-ffi-common = { path = "../common", features = ["testing"] }
+
 [build-dependencies]
 napi-build = "2"
 cc = "1"

@@ -290,7 +290,7 @@ pub fn query_trust_event_counts(context_id: &str, _did: &str) -> (u64, u64) {
     let map = ucan_registry();
     match map.get(context_id) {
         Some(entry) => {
-            let total = entry.event_log.leaves().len() as u64;
+            let total = u64::try_from(entry.event_log.leaves().len()).unwrap_or(u64::MAX);
             (total, 0)
         }
         None => (0, 0),
