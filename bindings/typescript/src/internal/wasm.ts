@@ -35,6 +35,7 @@ import type {
   BridgeTransportHandle,
   MessageCallback,
 } from "./bridge";
+import { safeJsonParse } from "./json-utils";
 
 // ---------------------------------------------------------------------------
 // WASM module types
@@ -395,15 +396,30 @@ export function createWasmBridge(): Bridge {
       // Derive agent key state from verificationMethodsJson — check for an
       // `#agent` verification method, consistent with the NAPI bridge which
       // uses `document.has_agent_key()` / `document.agent_verification_method()`.
-      const verificationMethods: VerificationMethod[] = JSON.parse(doc.verificationMethodsJson);
+      const verificationMethods: VerificationMethod[] = safeJsonParse(
+        doc.verificationMethodsJson,
+        "identity_resolve",
+      ) as VerificationMethod[];
       const agentVm = verificationMethods.find((vm) => vm.id.endsWith("#agent"));
       return {
         id: doc.id,
-        verificationMethods,
-        authentication: JSON.parse(doc.authenticationJson),
-        assertionMethods: JSON.parse(doc.assertionMethodsJson),
-        alsoKnownAs: JSON.parse(doc.alsoKnownAsJson),
-        serviceEndpoints: JSON.parse(doc.servicesJson),
+        verificationMethods: verificationMethods as DIDDocument["verificationMethods"],
+        authentication: safeJsonParse(
+          doc.authenticationJson,
+          "identity_resolve",
+        ) as DIDDocument["authentication"],
+        assertionMethods: safeJsonParse(
+          doc.assertionMethodsJson,
+          "identity_resolve",
+        ) as DIDDocument["assertionMethods"],
+        alsoKnownAs: safeJsonParse(
+          doc.alsoKnownAsJson,
+          "identity_resolve",
+        ) as DIDDocument["alsoKnownAs"],
+        serviceEndpoints: safeJsonParse(
+          doc.servicesJson,
+          "identity_resolve",
+        ) as DIDDocument["serviceEndpoints"],
         hasAgentKey: agentVm !== undefined,
         ...(agentVm !== undefined && {
           agentPublicKey: agentVm.publicKeyMultibase,
@@ -497,7 +513,7 @@ export function createWasmBridge(): Bridge {
     async contextMemberDids(handle: BridgeContextHandle): Promise<readonly string[]> {
       const wasm = getWasm();
       const json = wasm.context_member_dids(handle);
-      return JSON.parse(json) as string[];
+      return safeJsonParse(json, "context_member_dids") as string[];
     },
 
     async contextMemberRole(handle: BridgeContextHandle, did: string): Promise<MemberRole | null> {
@@ -653,7 +669,7 @@ export function createWasmBridge(): Bridge {
       const wasm = getWasm();
       // context_drain_events is synchronous in the WASM export — no await needed.
       const json = wasm.context_drain_events(handle);
-      return JSON.parse(json) as string[];
+      return safeJsonParse(json, "context_drain_events") as string[];
     },
 
     // Tools -- delegates to WASM runtime registry
@@ -691,7 +707,10 @@ export function createWasmBridge(): Bridge {
       return {
         toolId: result.toolId,
         passed: result.passed,
-        failures: JSON.parse(result.failuresJson),
+        failures: safeJsonParse(
+          result.failuresJson,
+          "tool_verify",
+        ) as ToolVerificationResult["failures"],
       };
     },
 
@@ -735,7 +754,7 @@ export function createWasmBridge(): Bridge {
         encoded: result.encoded,
         issuer: result.issuer,
         audience: result.audience,
-        capabilities: JSON.parse(result.capabilitiesJson) as string[],
+        capabilities: safeJsonParse(result.capabilitiesJson, "ucan_mint") as string[],
       };
       if (result.expiresAt != null) {
         return { ...token, expiresAt: result.expiresAt };
@@ -769,7 +788,7 @@ export function createWasmBridge(): Bridge {
         encoded: result.encoded,
         issuer: result.issuer,
         audience: result.audience,
-        capabilities: JSON.parse(result.capabilitiesJson) as string[],
+        capabilities: safeJsonParse(result.capabilitiesJson, "ucan_delegate") as string[],
       };
       if (result.expiresAt != null) {
         return { ...token, expiresAt: result.expiresAt };
@@ -785,18 +804,18 @@ export function createWasmBridge(): Bridge {
       const wasm = getWasm();
       const filterJson = filter ? JSON.stringify(filter) : undefined;
       const resultJson = await wasm.event_log_query(handle, filterJson);
-      const events: Array<{
+      const events = safeJsonParse(resultJson, "event_log_query") as Array<{
         eventType: string;
         actorDid: string;
         timestamp: number;
         payloadJson: string;
         sequence: number;
-      }> = JSON.parse(resultJson);
+      }>;
       return events.map((e) => ({
         eventType: e.eventType,
         actorDid: e.actorDid,
         timestamp: e.timestamp,
-        payload: JSON.parse(e.payloadJson),
+        payload: safeJsonParse(e.payloadJson, "event_log_query") as Event["payload"],
         sequence: e.sequence,
       }));
     },
@@ -808,7 +827,7 @@ export function createWasmBridge(): Bridge {
       return {
         verified: result.verified,
         proofType: result.proofType as "inclusion" | "absence",
-        details: JSON.parse(result.detailsJson),
+        details: safeJsonParse(result.detailsJson, "event_log_verify") as Proof["details"],
       };
     },
 

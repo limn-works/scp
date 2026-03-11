@@ -16,6 +16,7 @@
 import type { Context } from "./context";
 import { mapBridgeError, TransportError } from "./errors";
 import { BRIDGE_TARGET } from "./internal/bridge";
+import { safeJsonParse } from "./internal/json-utils";
 import type { McpClientConfig, McpServerConfig, ToolDefinition } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -250,7 +251,9 @@ export async function connectMcp(config: McpClientConfig): Promise<McpClient> {
           return tools.map((t: NativeToolInfo) => ({
             name: t.name,
             description: t.description || "",
-            inputSchema: JSON.parse(t.inputSchemaJson || "{}") as Readonly<Record<string, unknown>>,
+            inputSchema: safeJsonParse(t.inputSchemaJson || "{}", "mcpClientListTools") as Readonly<
+              Record<string, unknown>
+            >,
             outputSchema: {} as Readonly<Record<string, unknown>>,
             operator: "",
           }));
@@ -275,7 +278,7 @@ export async function connectMcp(config: McpClientConfig): Promise<McpClient> {
             invokerDid ?? "",
           );
           return {
-            content: JSON.parse(result.contentJson),
+            content: safeJsonParse(result.contentJson, "mcpClientInvoke"),
             isError: result.isError,
             source: result.source,
             invokedBy: result.invokedBy,
@@ -352,7 +355,9 @@ export async function connectMcpStdio(
         return tools.map((t: NativeToolInfo) => ({
           name: t.name,
           description: t.description || "",
-          inputSchema: JSON.parse(t.inputSchemaJson || "{}") as Readonly<Record<string, unknown>>,
+          inputSchema: safeJsonParse(t.inputSchemaJson || "{}", "mcpClientListTools") as Readonly<
+            Record<string, unknown>
+          >,
           outputSchema: {} as Readonly<Record<string, unknown>>,
           operator: "",
         }));
@@ -377,7 +382,7 @@ export async function connectMcpStdio(
           invokerDid ?? "",
         );
         return {
-          content: JSON.parse(result.contentJson),
+          content: safeJsonParse(result.contentJson, "mcpClientInvoke"),
           isError: result.isError,
           source: result.source,
           invokedBy: result.invokedBy,

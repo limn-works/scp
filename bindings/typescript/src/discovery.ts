@@ -9,6 +9,7 @@
 
 import { mapBridgeError } from "./errors";
 import { getBridge } from "./internal/bridge";
+import { safeJsonParse } from "./internal/json-utils";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -47,7 +48,7 @@ export async function parseAddress(address: string): Promise<ParsedAddress> {
   try {
     const bridge = await getBridge();
     const result = await bridge.discoveryParseAddress(address);
-    return JSON.parse(result) as ParsedAddress;
+    return safeJsonParse(result, "discoveryParseAddress") as ParsedAddress;
   } catch (error) {
     throw mapBridgeError(error);
   }
@@ -103,7 +104,7 @@ export async function discoverContexts(query: string): Promise<DiscoveryResult[]
   try {
     const bridge = await getBridge();
     const raw = await bridge.contextDiscover(query);
-    const parsed: Array<Record<string, unknown>> = JSON.parse(raw);
+    const parsed = safeJsonParse(raw, "contextDiscover") as Array<Record<string, unknown>>;
     // NAPI Rust returns snake_case keys; map to the camelCase DiscoveryResult interface.
     const results: DiscoveryResult[] = parsed.map((item) => ({
       contextId: (item.context_id ?? item.contextId) as string,
