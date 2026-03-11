@@ -537,17 +537,37 @@ const PERSISTED_IDENTITY_VERSION: u32 = 1;
 
 /// Returns the default version for deserialization of legacy data that predates
 /// the `version` field.
+///
+/// **Must always return `1`** (the version when the struct was introduced).
+/// Returning the current `PERSISTED_IDENTITY_VERSION` would silently re-tag
+/// old data as the current version when the constant is bumped.
 const fn persisted_identity_default_version() -> u32 {
-    PERSISTED_IDENTITY_VERSION
+    1
 }
 
 /// Serializable snapshot of an [`ScpIdentity`] and its [`DidDocument`].
 ///
 /// Used by [`ApplicationNodeBuilder::identity_with_storage`] to persist a newly
 /// created identity so that subsequent restarts produce the same DID.
+///
+/// # Storage format
+///
+/// Stored as raw JSON under [`IDENTITY_STORAGE_KEY`] via the `Storage` trait
+/// directly (NOT through [`ProtocolStore::store_value`], which wraps values in
+/// a `StoredValue` envelope). This key lives outside `ProtocolStore`'s `context/`
+/// namespace and must only be read via direct `Storage::retrieve`.
+///
+/// # Concurrency
+///
+/// `ApplicationNode` is expected to be a singleton per process. No locking
+/// is applied around the retrieve-then-store sequence; concurrent builders
+/// against the same storage may race.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PersistedIdentity {
     /// Schema version for forward-compatible deserialization.
+    ///
+    /// On read, unknown versions (> `PERSISTED_IDENTITY_VERSION`) are rejected
+    /// to prevent silent data corruption from downgraded binaries.
     #[serde(default = "persisted_identity_default_version")]
     version: u32,
     identity: ScpIdentity,
@@ -1993,11 +2013,23 @@ async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: Storage>(
                     NodeError::Storage(format!("failed to deserialize persisted identity: {e}"))
                 })?;
 
-                // 2a. Validate that persisted key handles are resolvable in the
-                //     provided custody backend.  A mismatch (e.g. fresh in-memory
-                //     custody after restart) is caught here rather than surfacing
-                //     as an opaque signing failure later.
-                key_custody
+                // 2a. Reject unknown future versions to prevent silent corruption
+                //     from downgraded binaries reading data written by newer code.
+                if persisted.version > PERSISTED_IDENTITY_VERSION {
+                    return Err(NodeError::Storage(format!(
+                        "persisted identity version {} is newer than supported version {}; \
+                         upgrade the binary or delete the stored identity",
+                        persisted.version, PERSISTED_IDENTITY_VERSION
+                    )));
+                }
+
+                // 2b. Validate that persisted key handles are resolvable in the
+                //     provided custody backend AND that the returned public keys
+                //     match the DID document's verification methods.  A mismatch
+                //     (e.g. fresh in-memory custody after restart, or a different
+                //     custody backend with colliding handle IDs) is caught here
+                //     rather than surfacing as an opaque signing failure later.
+                let identity_pub = key_custody
                     .public_key(&persisted.identity.identity_key)
                     .await
                     .map_err(|e| {
@@ -2005,6 +2037,26 @@ async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: Storage>(
                             "persisted identity key handle not found in custody: {e}"
                         ))
                     })?;
+
+                // Verify the identity key matches the #0 verification method in
+                // the DID document (defense in depth).
+                if let Some(vm0) = persisted
+                    .document
+                    .verification_method
+                    .iter()
+                    .find(|vm| vm.id.ends_with("#0"))
+                {
+                    let expected_multibase =
+                        format!("z{}", bs58::encode(identity_pub.as_bytes()).into_string());
+                    if vm0.public_key_multibase != expected_multibase {
+                        return Err(NodeError::Storage(format!(
+                            "custody identity key does not match DID document #0 verification method \
+                             (custody: {expected_multibase}, document: {})",
+                            vm0.public_key_multibase
+                        )));
+                    }
+                }
+
                 key_custody
                     .public_key(&persisted.identity.active_signing_key)
                     .await
@@ -4879,8 +4931,8 @@ mod tests {
         let bytes = serde_json::to_vec(&legacy_json).unwrap();
         let persisted: PersistedIdentity = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
-            persisted.version, PERSISTED_IDENTITY_VERSION,
-            "missing version field should default to current version"
+            persisted.version, 1,
+            "missing version field should default to 1 (the version when the struct was introduced)"
         );
     }
 

@@ -27,6 +27,7 @@ rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std"] }
 rustls-pemfile = "2"
 base64 = { workspace = true }
+bs58 = { workspace = true }
 rmp-serde = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -51,7 +52,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 x509-parser = "0.16"
 
 [dev-dependencies]
-bs58 = { workspace = true }
 ed25519-dalek = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
