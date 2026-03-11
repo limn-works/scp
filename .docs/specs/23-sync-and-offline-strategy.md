@@ -206,7 +206,7 @@ If the transaction fails, neither the MLS group state nor the grace window entri
 
 **Recovery on startup.** On node startup after a crash, the SDK MUST:
 
-1. Load all persisted grace window entries from `ProtocolStore`.
+1. Load all persisted grace window entries from the `ContextSnapshot` blob (which includes grace entries alongside other context state).
 2. For each entry, compare the persisted expiration timestamp against the current wall-clock time.
 3. If the grace period has expired during downtime, immediately destroy the corresponding old epoch keys (remove the grace entry and any cached key material for that epoch). These keys MUST NOT be retained past their expiration -- forward secrecy requires prompt destruction.
 4. If the grace period has NOT yet expired, retain the keys and restart the grace timer from the persisted expiration timestamp (not from recovery time). This ensures the total grace window duration is preserved regardless of crash timing.

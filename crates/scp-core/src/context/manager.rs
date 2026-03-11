@@ -10432,6 +10432,198 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // EpochGraceStore needs_reconnect tests (§23.11)
+    // -----------------------------------------------------------------------
+
+    /// §23.11: Grace entry with epoch > MLS epoch triggers `needs_reconnect`.
+    #[tokio::test]
+    async fn restore_context_sets_needs_reconnect_on_grace_inconsistency() {
+        use crate::context::roles::{ContextRoleState, default_ceiling};
+        use crate::crypto::mls::epoch_grace::GraceEntry;
+
+        let persistence = Arc::new(MockContextPersistence::default());
+
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
+            ..ContextParams::default()
+        };
+
+        let ceiling = default_ceiling();
+        let role_state = ContextRoleState::new(
+            "grace-incon-ctx",
+            "did:key:author1",
+            ceiling,
+            vec![],
+        )
+        .unwrap();
+        let membership = MembershipState::new();
+
+        // Grace entry referencing epoch 5, but MLS epoch is only 3.
+        // This simulates a partial write that escaped the transaction boundary.
+        let snapshot = super::ContextSnapshot {
+            context_id: "grace-incon-ctx".to_owned(),
+            state: ContextState::Active,
+            context_params: params.clone(),
+            membership,
+            role_state,
+            executed_proposals: HashSet::new(),
+            ttl_remaining_secs: None,
+            registered_tools: Vec::new(),
+            write_revoked_members: HashSet::new(),
+            read_revoked_members: HashSet::new(),
+            read_exclusion_list: HashSet::new(),
+            tool_interfaces: Vec::new(),
+            threshold_signers: Vec::new(),
+            threshold_value: 0,
+            pruning_policy: None,
+            governance_model_config: None,
+            economic_policy: None,
+            approved_proposals: HashMap::new(),
+            governance_freeze: None,
+            pending_ceiling_modification: None,
+            mls_epoch: 3,
+            grace_entries: vec![GraceEntry {
+                epoch: 5, // epoch 5 > mls_epoch 3 → inconsistency
+                expires_at_unix_secs: u64::MAX, // far-future expiry
+            }],
+            needs_reconnect: false,
+        };
+
+        let bc_snapshot = test_broadcast_snapshot("grace-incon-ctx");
+        persistence
+            .persist_context("grace-incon-ctx", &snapshot)
+            .unwrap();
+        persistence
+            .persist_broadcast("grace-incon-ctx", &bc_snapshot)
+            .unwrap();
+
+        let manager = ContextManager::with_persistence(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            Box::new(MockContextPersistence {
+                contexts: std::sync::Mutex::new(persistence.contexts.lock().unwrap().clone()),
+                broadcasts: std::sync::Mutex::new(persistence.broadcasts.lock().unwrap().clone()),
+            }),
+            noop_key_resolver(),
+        );
+
+        let handle = ContextHandle::new("grace-incon-ctx".to_owned(), params);
+        handle.transition_to(&ContextState::Active).await.unwrap();
+        manager
+            .restore_context("grace-incon-ctx", &handle)
+            .await
+            .unwrap();
+
+        // The context should be marked as needing reconnection.
+        assert!(
+            manager.context_needs_reconnect("grace-incon-ctx").await,
+            "inconsistent grace entries should set needs_reconnect"
+        );
+
+        // After clearing, the flag should be false.
+        assert!(manager.clear_needs_reconnect("grace-incon-ctx").await);
+        assert!(
+            !manager.context_needs_reconnect("grace-incon-ctx").await,
+            "needs_reconnect should be cleared"
+        );
+    }
+
+    /// §23.11: Consistent grace entries do NOT set `needs_reconnect`.
+    #[tokio::test]
+    async fn restore_context_no_reconnect_when_grace_consistent() {
+        use crate::context::roles::{ContextRoleState, default_ceiling};
+        use crate::crypto::mls::epoch_grace::GraceEntry;
+
+        let persistence = Arc::new(MockContextPersistence::default());
+
+        let params = ContextParams {
+            mode: ContextMode::Broadcast,
+            memory_scope: crate::context::MemoryScope::Full,
+            ..ContextParams::default()
+        };
+
+        let ceiling = default_ceiling();
+        let role_state = ContextRoleState::new(
+            "grace-ok-ctx",
+            "did:key:author1",
+            ceiling,
+            vec![],
+        )
+        .unwrap();
+        let membership = MembershipState::new();
+
+        // Grace entry epoch 2, MLS epoch 3 → consistent (epoch <= mls_epoch).
+        // Use a far-future but safe expiry (now + 1 hour) to avoid overflow.
+        let future_expiry = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let snapshot = super::ContextSnapshot {
+            context_id: "grace-ok-ctx".to_owned(),
+            state: ContextState::Active,
+            context_params: params.clone(),
+            membership,
+            role_state,
+            executed_proposals: HashSet::new(),
+            ttl_remaining_secs: None,
+            registered_tools: Vec::new(),
+            write_revoked_members: HashSet::new(),
+            read_revoked_members: HashSet::new(),
+            read_exclusion_list: HashSet::new(),
+            tool_interfaces: Vec::new(),
+            threshold_signers: Vec::new(),
+            threshold_value: 0,
+            pruning_policy: None,
+            governance_model_config: None,
+            economic_policy: None,
+            approved_proposals: HashMap::new(),
+            governance_freeze: None,
+            pending_ceiling_modification: None,
+            mls_epoch: 3,
+            grace_entries: vec![GraceEntry {
+                epoch: 2, // epoch 2 <= mls_epoch 3 → consistent
+                expires_at_unix_secs: future_expiry,
+            }],
+            needs_reconnect: false,
+        };
+
+        let bc_snapshot = test_broadcast_snapshot("grace-ok-ctx");
+        persistence
+            .persist_context("grace-ok-ctx", &snapshot)
+            .unwrap();
+        persistence
+            .persist_broadcast("grace-ok-ctx", &bc_snapshot)
+            .unwrap();
+
+        let manager = ContextManager::with_persistence(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            Box::new(MockContextPersistence {
+                contexts: std::sync::Mutex::new(persistence.contexts.lock().unwrap().clone()),
+                broadcasts: std::sync::Mutex::new(persistence.broadcasts.lock().unwrap().clone()),
+            }),
+            noop_key_resolver(),
+        );
+
+        let handle = ContextHandle::new("grace-ok-ctx".to_owned(), params);
+        handle.transition_to(&ContextState::Active).await.unwrap();
+        manager
+            .restore_context("grace-ok-ctx", &handle)
+            .await
+            .unwrap();
+
+        // Consistent grace entries should NOT set needs_reconnect.
+        assert!(
+            !manager.context_needs_reconnect("grace-ok-ctx").await,
+            "consistent grace entries should not set needs_reconnect"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Caller identity validation tests (#234)
     // -----------------------------------------------------------------------
 
