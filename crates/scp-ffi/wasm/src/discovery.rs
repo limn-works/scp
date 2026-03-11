@@ -226,7 +226,7 @@ pub fn discovery_create_query(
     }
 
     let max = match max_results {
-        Some(v) if v < 0.0 => {
+        Some(v) if v < 0.0 || !v.is_finite() => {
             return Err(JsError::new(
                 "[SCP-VALID-7040] max_results must be non-negative",
             ));
@@ -249,10 +249,67 @@ pub fn discovery_create_query(
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(all(test, target_arch = "wasm32"))]
+#[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Pure helper tests — no wasm-bindgen dependency
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_local_part_valid() {
+        assert!(validate_local_part("alice").is_ok());
+        assert!(validate_local_part("alice.bob").is_ok());
+        assert!(validate_local_part("alice_bob").is_ok());
+        assert!(validate_local_part("alice-bob").is_ok());
+        assert!(validate_local_part("a123").is_ok());
+    }
+
+    #[test]
+    fn validate_local_part_too_long() {
+        let long = "a".repeat(65);
+        assert!(validate_local_part(&long).is_err());
+    }
+
+    #[test]
+    fn validate_scope_rejects_control_chars() {
+        assert!(validate_scope("scope\x00bad").is_err());
+        assert!(validate_scope("scope\ttab").is_err());
+        assert!(validate_scope("scope\nnewline").is_err());
+        assert!(validate_scope("scope\rreturn").is_err());
+        assert!(validate_scope("scope\x7Fdel").is_err());
+    }
+
+    #[test]
+    fn validate_scope_rejects_zero_width_chars() {
+        assert!(validate_scope("scope\u{200B}zwsp").is_err());
+        assert!(validate_scope("scope\u{200C}zwnj").is_err());
+        assert!(validate_scope("scope\u{200D}zwj").is_err());
+        assert!(validate_scope("\u{FEFF}scope").is_err());
+        assert!(validate_scope("scope\u{2060}wj").is_err());
+    }
+
+    #[test]
+    fn validate_scope_accepts_valid() {
+        assert!(validate_scope("photography").is_ok());
+        assert!(validate_scope("example.com").is_ok());
+        assert!(validate_scope("did:key:z6MkTest").is_ok());
+        assert!(validate_scope("_").is_ok());
+    }
+
+    #[test]
+    fn classify_scope_types() {
+        assert_eq!(classify_scope("_"), "Unscoped");
+        assert_eq!(classify_scope("example.com"), "DomainHandle");
+        assert_eq!(classify_scope("did:key:z6MkTest"), "AttestationHandle");
+        assert_eq!(classify_scope("photography"), "DiscoveryHandle");
+    }
+
+    // -----------------------------------------------------------------------
+    // Bridge function tests — JsError works on native targets
+    // -----------------------------------------------------------------------
 
     #[test]
     fn parse_discovery_handle() {
@@ -352,57 +409,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_local_part_valid() {
-        assert!(validate_local_part("alice").is_ok());
-        assert!(validate_local_part("alice.bob").is_ok());
-        assert!(validate_local_part("alice_bob").is_ok());
-        assert!(validate_local_part("alice-bob").is_ok());
-        assert!(validate_local_part("a123").is_ok());
-    }
-
-    #[test]
-    fn validate_local_part_too_long() {
-        let long = "a".repeat(65);
-        assert!(validate_local_part(&long).is_err());
-    }
-
-    #[test]
-    fn validate_scope_rejects_control_chars() {
-        // Null byte
-        assert!(validate_scope("scope\x00bad").is_err());
-        // Tab
-        assert!(validate_scope("scope\ttab").is_err());
-        // Newline
-        assert!(validate_scope("scope\nnewline").is_err());
-        // Carriage return
-        assert!(validate_scope("scope\rreturn").is_err());
-        // DEL (0x7F)
-        assert!(validate_scope("scope\x7Fdel").is_err());
-    }
-
-    #[test]
-    fn validate_scope_rejects_zero_width_chars() {
-        // Zero-width space (U+200B)
-        assert!(validate_scope("scope\u{200B}zwsp").is_err());
-        // Zero-width non-joiner (U+200C)
-        assert!(validate_scope("scope\u{200C}zwnj").is_err());
-        // Zero-width joiner (U+200D)
-        assert!(validate_scope("scope\u{200D}zwj").is_err());
-        // BOM (U+FEFF)
-        assert!(validate_scope("\u{FEFF}scope").is_err());
-        // Word joiner (U+2060)
-        assert!(validate_scope("scope\u{2060}wj").is_err());
-    }
-
-    #[test]
-    fn validate_scope_accepts_valid() {
-        assert!(validate_scope("photography").is_ok());
-        assert!(validate_scope("example.com").is_ok());
-        assert!(validate_scope("did:key:z6MkTest").is_ok());
-        assert!(validate_scope("_").is_ok());
-    }
-
-    #[test]
     fn parse_scope_control_char_fails() {
         assert!(discovery_parse_address("alice@scope\x00bad".to_owned()).is_err());
     }
@@ -432,5 +438,18 @@ mod tests {
     fn create_query_f64_min_max_results_errors() {
         let result = discovery_create_query(Some("alice@photo".to_owned()), None, Some(f64::MIN));
         assert!(result.is_err(), "f64::MIN max_results should error");
+    }
+
+    #[test]
+    fn create_query_nan_max_results_errors() {
+        let result = discovery_create_query(Some("alice@photo".to_owned()), None, Some(f64::NAN));
+        assert!(result.is_err(), "NaN max_results should error");
+    }
+
+    #[test]
+    fn create_query_positive_infinity_max_results_errors() {
+        let result =
+            discovery_create_query(Some("alice@photo".to_owned()), None, Some(f64::INFINITY));
+        assert!(result.is_err(), "INFINITY max_results should error");
     }
 }

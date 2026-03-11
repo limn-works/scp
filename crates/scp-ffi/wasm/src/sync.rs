@@ -43,19 +43,18 @@ const RECONNECTION_DEDUP_WINDOW_SECS: u64 = 30;
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Validates that an f64 timestamp is non-negative.
+/// Validates that an f64 timestamp is non-negative and finite.
 ///
-/// Returns the value cast to `u64` on success, or a `JsValue` validation error
-/// on failure. This matches the NAPI bridge behavior (SCP-VALID-7040) instead
-/// of silently clamping negatives to zero.
-fn validate_non_negative_timestamp(value: f64, name: &str) -> Result<u64, JsValue> {
-    if value < 0.0 {
+/// Returns the value cast to `u64` on success, or a [`ScpWasmError`] validation
+/// error on failure. Call sites convert to `JsValue` via `.map_err(|e| e.into_js().into())`.
+/// This separation allows native-target tests to exercise the validation logic
+/// without invoking wasm-bindgen.
+fn validate_non_negative_timestamp(value: f64, name: &str) -> Result<u64, ScpWasmError> {
+    if value < 0.0 || !value.is_finite() {
         return Err(ScpWasmError::Validation {
             message: format!("{name} must be non-negative, got {value}"),
             code: "SCP-VALID-7040".to_owned(),
-        }
-        .into_js()
-        .into());
+        });
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     Ok(value as u64)
@@ -98,8 +97,9 @@ fn classify(duration_secs: u64, tier_1: u64, tier_2: u64) -> &'static str {
 /// ```
 #[wasm_bindgen]
 pub fn sync_classify_offline(last_relay_contact: f64, now: f64) -> Result<String, JsValue> {
-    let last = validate_non_negative_timestamp(last_relay_contact, "last_relay_contact")?;
-    let current = validate_non_negative_timestamp(now, "now")?;
+    let last = validate_non_negative_timestamp(last_relay_contact, "last_relay_contact")
+        .map_err(ScpWasmError::into_js)?;
+    let current = validate_non_negative_timestamp(now, "now").map_err(ScpWasmError::into_js)?;
     let duration_secs = current.saturating_sub(last);
     Ok(classify(duration_secs, TIER_1_THRESHOLD_SECS, TIER_2_THRESHOLD_SECS).to_owned())
 }
@@ -169,10 +169,13 @@ pub fn sync_classify_offline_custom(
     tier_1_threshold_secs: f64,
     tier_2_threshold_secs: f64,
 ) -> Result<String, JsValue> {
-    let last = validate_non_negative_timestamp(last_relay_contact, "last_relay_contact")?;
-    let current = validate_non_negative_timestamp(now, "now")?;
-    let t1 = validate_non_negative_timestamp(tier_1_threshold_secs, "tier_1_threshold_secs")?;
-    let t2 = validate_non_negative_timestamp(tier_2_threshold_secs, "tier_2_threshold_secs")?;
+    let last = validate_non_negative_timestamp(last_relay_contact, "last_relay_contact")
+        .map_err(ScpWasmError::into_js)?;
+    let current = validate_non_negative_timestamp(now, "now").map_err(ScpWasmError::into_js)?;
+    let t1 = validate_non_negative_timestamp(tier_1_threshold_secs, "tier_1_threshold_secs")
+        .map_err(ScpWasmError::into_js)?;
+    let t2 = validate_non_negative_timestamp(tier_2_threshold_secs, "tier_2_threshold_secs")
+        .map_err(ScpWasmError::into_js)?;
     let duration_secs = current.saturating_sub(last);
     Ok(classify(duration_secs, t1, t2).to_owned())
 }
@@ -186,49 +189,63 @@ pub fn sync_classify_offline_custom(
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------------
+    // classify (pure logic — no wasm-bindgen dependency)
+    // -----------------------------------------------------------------------
+
     #[test]
     fn classify_short_zero_seconds() {
-        let result = sync_classify_offline(1_000_000.0, 1_000_000.0).unwrap();
-        assert_eq!(result, "short");
+        assert_eq!(
+            classify(0, TIER_1_THRESHOLD_SECS, TIER_2_THRESHOLD_SECS),
+            "short"
+        );
     }
 
     #[test]
     fn classify_short_at_boundary() {
-        // Exactly 4 hours = 14400 seconds
-        let result = sync_classify_offline(1_000_000.0, 1_014_400.0).unwrap();
-        assert_eq!(result, "short");
+        assert_eq!(
+            classify(14_400, TIER_1_THRESHOLD_SECS, TIER_2_THRESHOLD_SECS),
+            "short"
+        );
     }
 
     #[test]
     fn classify_extended_just_over() {
-        let result = sync_classify_offline(1_000_000.0, 1_014_401.0).unwrap();
-        assert_eq!(result, "extended");
+        assert_eq!(
+            classify(14_401, TIER_1_THRESHOLD_SECS, TIER_2_THRESHOLD_SECS),
+            "extended"
+        );
     }
 
     #[test]
     fn classify_extended_at_boundary() {
-        let result = sync_classify_offline(1_000_000.0, 1_604_800.0).unwrap();
-        assert_eq!(result, "extended");
+        assert_eq!(
+            classify(604_800, TIER_1_THRESHOLD_SECS, TIER_2_THRESHOLD_SECS),
+            "extended"
+        );
     }
 
     #[test]
     fn classify_long_just_over() {
-        let result = sync_classify_offline(1_000_000.0, 1_604_801.0).unwrap();
-        assert_eq!(result, "long");
+        assert_eq!(
+            classify(604_801, TIER_1_THRESHOLD_SECS, TIER_2_THRESHOLD_SECS),
+            "long"
+        );
     }
 
     #[test]
     fn classify_handles_clock_skew() {
         // now < last_relay_contact => saturating_sub => 0 => Short
-        let result = sync_classify_offline(2_000_000.0, 1_000_000.0).unwrap();
-        assert_eq!(result, "short");
+        let duration = 1_000_000u64.saturating_sub(2_000_000);
+        assert_eq!(
+            classify(duration, TIER_1_THRESHOLD_SECS, TIER_2_THRESHOLD_SECS),
+            "short"
+        );
     }
 
     #[test]
     fn classify_custom_thresholds() {
-        // Custom: 1 hour, 3 days
-        let result = sync_classify_offline_custom(0.0, 3601.0, 3600.0, 259_200.0).unwrap();
-        assert_eq!(result, "extended");
+        assert_eq!(classify(3601, 3600, 259_200), "extended");
     }
 
     #[test]
@@ -240,37 +257,64 @@ mod tests {
         assert_eq!(json["reorder_buffer_capacity"], 100);
     }
 
+    // -----------------------------------------------------------------------
+    // validate_non_negative_timestamp — returns ScpWasmError (no JsValue)
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn classify_negative_last_relay_contact_errors() {
-        let result = sync_classify_offline(-100.0, 0.0);
+    fn validate_timestamp_accepts_zero() {
+        assert_eq!(validate_non_negative_timestamp(0.0, "ts").unwrap(), 0);
+    }
+
+    #[test]
+    fn validate_timestamp_accepts_positive() {
+        assert_eq!(validate_non_negative_timestamp(42.0, "ts").unwrap(), 42);
+    }
+
+    #[test]
+    fn validate_timestamp_rejects_negative() {
+        let result = validate_non_negative_timestamp(-100.0, "last_relay_contact");
         assert!(result.is_err(), "negative last_relay_contact should error");
     }
 
     #[test]
-    fn classify_negative_now_errors() {
-        let result = sync_classify_offline(0.0, -1.0);
+    fn validate_timestamp_rejects_negative_now() {
+        let result = validate_non_negative_timestamp(-1.0, "now");
         assert!(result.is_err(), "negative now should error");
     }
 
     #[test]
-    fn classify_custom_negative_threshold_errors() {
-        let result = sync_classify_offline_custom(0.0, 100.0, -3600.0, 259_200.0);
-        assert!(result.is_err(), "negative threshold should error");
-    }
-
-    #[test]
-    fn classify_f64_min_boundary_errors() {
-        let result = sync_classify_offline(f64::MIN, 1_000_000.0);
+    fn validate_timestamp_rejects_f64_min() {
+        let result = validate_non_negative_timestamp(f64::MIN, "ts");
         assert!(result.is_err(), "f64::MIN should error");
-        let result2 = sync_classify_offline(0.0, f64::MIN);
-        assert!(result2.is_err(), "f64::MIN as now should error");
     }
 
     #[test]
-    fn classify_neg_infinity_boundary_errors() {
-        let result = sync_classify_offline(f64::NEG_INFINITY, 1_000_000.0);
+    fn validate_timestamp_rejects_neg_infinity() {
+        let result = validate_non_negative_timestamp(f64::NEG_INFINITY, "ts");
         assert!(result.is_err(), "NEG_INFINITY should error");
-        let result2 = sync_classify_offline(0.0, f64::NEG_INFINITY);
-        assert!(result2.is_err(), "NEG_INFINITY as now should error");
+    }
+
+    #[test]
+    fn validate_timestamp_rejects_nan() {
+        let result = validate_non_negative_timestamp(f64::NAN, "ts");
+        assert!(result.is_err(), "NaN should error");
+    }
+
+    #[test]
+    fn validate_timestamp_rejects_positive_infinity() {
+        let result = validate_non_negative_timestamp(f64::INFINITY, "ts");
+        assert!(result.is_err(), "INFINITY should error");
+    }
+
+    #[test]
+    fn validate_timestamp_error_contains_code() {
+        let result = validate_non_negative_timestamp(-42.0, "ts");
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("SCP-VALID-7040"),
+            "error should contain SCP-VALID-7040, got: {msg}"
+        );
     }
 }

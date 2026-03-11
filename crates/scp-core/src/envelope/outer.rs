@@ -618,6 +618,72 @@ mod tests {
             Some(&serde_json::json!("scp/2.0")),
         );
     }
+
+    /// #593-F1: Extensions must survive a MessagePack roundtrip — the actual wire
+    /// format. Previous tests only exercised JSON. This test proves that
+    /// `#[serde(flatten)]` extensions survive `rmp_serde` encode → decode.
+    #[test]
+    fn outer_envelope_extensions_survive_msgpack_roundtrip() {
+        // A wrapper struct that has all OuterEnvelope fields plus one extra.
+        // Serializing this to MessagePack simulates a newer protocol version
+        // adding a field that older versions don't know about.
+        #[derive(serde::Serialize)]
+        struct ExtendedOuterEnvelope {
+            version: u16,
+            #[serde(with = "serde_bytes")]
+            routing_id: Vec<u8>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            recipient_hint: Option<Vec<u8>>,
+            blob_ttl: u32,
+            #[serde(with = "serde_bytes")]
+            encrypted_blob: Vec<u8>,
+            /// Field unknown to the current OuterEnvelope definition.
+            v2_routing_priority: serde_json::Value,
+        }
+
+        let extended = ExtendedOuterEnvelope {
+            version: SCP_OUTER_ENVELOPE_VERSION,
+            routing_id: vec![0xBB; 32],
+            recipient_hint: Some(vec![0xCC; 32]),
+            blob_ttl: 7200,
+            encrypted_blob: vec![0xDE, 0xAD],
+            v2_routing_priority: serde_json::json!({"level": "high", "ttl_override": 9000}),
+        };
+
+        // Step 1: Serialize the extended struct to MessagePack (named fields).
+        let msgpack_bytes = rmp_serde::to_vec_named(&extended).unwrap();
+
+        // Step 2: Deserialize as the standard OuterEnvelope.
+        let decoded: OuterEnvelope = rmp_serde::from_slice(&msgpack_bytes).unwrap();
+
+        // Step 3: Known fields must be correct.
+        assert_eq!(decoded.version, SCP_OUTER_ENVELOPE_VERSION);
+        assert_eq!(decoded.routing_id, vec![0xBB; 32]);
+        assert_eq!(
+            decoded.recipient_hint.as_deref(),
+            Some(vec![0xCC; 32].as_slice())
+        );
+        assert_eq!(decoded.blob_ttl, 7200);
+        assert_eq!(decoded.encrypted_blob, vec![0xDE, 0xAD]);
+
+        // Step 4: The unknown field must survive in extensions.
+        assert!(
+            decoded.extensions.contains_key("v2_routing_priority"),
+            "unknown field must be preserved in extensions after msgpack roundtrip, got: {:?}",
+            decoded.extensions
+        );
+        let ext = &decoded.extensions["v2_routing_priority"];
+        assert_eq!(ext["level"], "high");
+        assert_eq!(ext["ttl_override"], 9000);
+
+        // Step 5: Re-serialize and re-deserialize — the extension must persist.
+        let re_encoded = rmp_serde::to_vec_named(&decoded).unwrap();
+        let re_decoded: OuterEnvelope = rmp_serde::from_slice(&re_encoded).unwrap();
+        assert!(
+            re_decoded.extensions.contains_key("v2_routing_priority"),
+            "unknown field must survive msgpack serialize → deserialize → serialize → deserialize"
+        );
+    }
 }
 
 /// Integration tests for the high-level seal/open envelope operations.

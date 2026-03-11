@@ -24,6 +24,7 @@ fn test_signing_key() -> [u8; 32] {
 /// Create a minimal outer envelope for testing.
 fn test_envelope() -> OuterEnvelope {
     OuterEnvelope {
+        version: scp_core::envelope::outer::SCP_OUTER_ENVELOPE_VERSION,
         routing_id: vec![0xAA; 32],
         recipient_hint: None,
         blob_ttl: 3600,

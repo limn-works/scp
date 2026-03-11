@@ -462,7 +462,7 @@ pub fn event_log_checkpoint(
 ///
 /// Returns `napi::Error` with `SCP-VALID-7040` if the value is negative.
 fn validate_non_negative_epoch(epoch: f64) -> napi::Result<u64> {
-    if epoch < 0.0 {
+    if epoch < 0.0 || !epoch.is_finite() {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: format!("epoch must be non-negative, got {epoch}"),
             code: "SCP-VALID-7040".to_owned(),

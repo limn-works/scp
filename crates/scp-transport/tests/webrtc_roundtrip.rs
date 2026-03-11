@@ -170,6 +170,7 @@ impl DataChannelProvider for MockDataChannelProvider {
 
 fn test_envelope() -> OuterEnvelope {
     OuterEnvelope {
+        version: scp_core::envelope::outer::SCP_OUTER_ENVELOPE_VERSION,
         routing_id: vec![0xBB; 32],
         recipient_hint: None,
         blob_ttl: 7200,
@@ -262,6 +263,7 @@ async fn webrtc_payload_too_large_rejected() {
     let (adapter, _) = make_adapter();
 
     let large_envelope = OuterEnvelope {
+        version: scp_core::envelope::outer::SCP_OUTER_ENVELOPE_VERSION,
         routing_id: vec![0xDD; 32],
         recipient_hint: None,
         blob_ttl: 3600,
