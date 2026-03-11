@@ -1125,14 +1125,12 @@ impl ContextManager {
     /// low probability and acceptable for v1 -- the worst case is a
     /// single extra key-epoch replay on restart, which the pull-based
     /// key distribution protocol already handles idempotently.
-    fn persist_context_snapshot(&self, context_id: &str, snapshot: &ContextSnapshot) {
+    fn persist_context_snapshot(&self, context_id: &str, mut snapshot: ContextSnapshot) {
         if let Some(ref persistence) = self.persistence {
             // Export MLS crypto state alongside the context snapshot (#645).
-            // Clone the snapshot and populate the `mls_crypto_state` field with
-            // the opaque blob from the crypto provider. Best-effort: if export
-            // fails, persist without crypto state (the context will need
-            // reconnection on restore, matching §23.11 fallback).
-            let mut snapshot = snapshot.clone();
+            // Populate `mls_crypto_state` in-place on the owned snapshot (#711).
+            // Best-effort: if export fails, persist without crypto state (the
+            // context will need reconnection on restore, matching §23.11 fallback).
             let ctx_id_bytes = context_id_to_bytes(context_id);
             match self.crypto.export_crypto_state(&ctx_id_bytes) {
                 Ok(state) => snapshot.mls_crypto_state = state,
@@ -1206,7 +1204,7 @@ impl ContextManager {
                     .as_ref()
                     .map(BroadcastContext::to_snapshot);
                 drop(contexts);
-                self.persist_context_snapshot(context_id, &snapshot);
+                self.persist_context_snapshot(context_id, snapshot);
                 if let Some(ref bcs) = bc_snapshot {
                     self.persist_broadcast_snapshot(context_id, bcs);
                 }
@@ -1710,7 +1708,7 @@ impl ContextManager {
             if let Some(ctx) = contexts.get(&context_id) {
                 let snap = Self::snapshot_context(ctx);
                 drop(contexts);
-                self.persist_context_snapshot(&context_id, &snap);
+                self.persist_context_snapshot(&context_id, snap);
             }
         }
 
@@ -2185,7 +2183,7 @@ impl ContextManager {
             if let Some(ctx) = contexts.get(&context_id) {
                 let snapshot = Self::snapshot_context(ctx);
                 drop(contexts);
-                self.persist_context_snapshot(&context_id, &snapshot);
+                self.persist_context_snapshot(&context_id, snapshot);
             }
         }
 
@@ -2305,7 +2303,7 @@ impl ContextManager {
             if let Some(ctx) = contexts.get(&context_id) {
                 let snapshot = Self::snapshot_context(ctx);
                 drop(contexts);
-                self.persist_context_snapshot(&context_id, &snapshot);
+                self.persist_context_snapshot(&context_id, snapshot);
             }
         }
 
@@ -2464,7 +2462,7 @@ impl ContextManager {
             if let Some(ctx) = contexts.get(&context_id) {
                 let snapshot = Self::snapshot_context(ctx);
                 drop(contexts);
-                self.persist_context_snapshot(&context_id, &snapshot);
+                self.persist_context_snapshot(&context_id, snapshot);
             }
         }
 
@@ -2628,7 +2626,7 @@ impl ContextManager {
             if let Some(ctx) = contexts.get(context_id) {
                 let ctx_snapshot = Self::snapshot_context(ctx);
                 drop(contexts);
-                self.persist_context_snapshot(context_id, &ctx_snapshot);
+                self.persist_context_snapshot(context_id, ctx_snapshot);
             }
         }
 
@@ -2704,7 +2702,7 @@ impl ContextManager {
             if let Some(ctx) = contexts.get(context_id) {
                 let ctx_snapshot = Self::snapshot_context(ctx);
                 drop(contexts);
-                self.persist_context_snapshot(context_id, &ctx_snapshot);
+                self.persist_context_snapshot(context_id, ctx_snapshot);
             }
         }
 
@@ -3093,7 +3091,7 @@ impl ContextManager {
                 if self.has_persistence() {
                     let snapshot = Self::snapshot_context(ctx);
                     drop(contexts);
-                    self.persist_context_snapshot(context_id, &snapshot);
+                    self.persist_context_snapshot(context_id, snapshot);
                 }
             }
         }
@@ -3620,7 +3618,7 @@ impl ContextManager {
             if let Some(ctx) = contexts.get(context_id) {
                 let snapshot = Self::snapshot_context(ctx);
                 drop(contexts);
-                self.persist_context_snapshot(context_id, &snapshot);
+                self.persist_context_snapshot(context_id, snapshot);
             }
         }
 
@@ -3757,7 +3755,7 @@ impl ContextManager {
             if let Some(ctx) = contexts.get(context_id) {
                 let snapshot = Self::snapshot_context(ctx);
                 drop(contexts);
-                self.persist_context_snapshot(context_id, &snapshot);
+                self.persist_context_snapshot(context_id, snapshot);
             }
         }
 
@@ -4003,7 +4001,7 @@ impl ContextManager {
             if let Some(ctx) = contexts.get(context_id) {
                 let snapshot = Self::snapshot_context(ctx);
                 drop(contexts);
-                self.persist_context_snapshot(context_id, &snapshot);
+                self.persist_context_snapshot(context_id, snapshot);
             }
         }
 
@@ -4132,7 +4130,7 @@ impl ContextManager {
         };
 
         // Persist context and broadcast state for crash recovery.
-        if let Some(ref ctx_snapshot) = ctx_snapshot {
+        if let Some(ctx_snapshot) = ctx_snapshot {
             self.persist_context_snapshot(context_id, ctx_snapshot);
         }
         if let Some(ref bc_snap) = bc_snapshot {
@@ -4236,7 +4234,7 @@ impl ContextManager {
         };
 
         // Persist context and broadcast state for crash recovery.
-        if let Some(ref ctx_snapshot) = ctx_snapshot {
+        if let Some(ctx_snapshot) = ctx_snapshot {
             self.persist_context_snapshot(context_id, ctx_snapshot);
         }
         if let Some(ref bc_snap) = bc_snapshot {
@@ -4301,7 +4299,7 @@ impl ContextManager {
             }
         };
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
@@ -4350,7 +4348,7 @@ impl ContextManager {
             }
         };
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
@@ -4397,7 +4395,7 @@ impl ContextManager {
             }
         };
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
@@ -4443,7 +4441,7 @@ impl ContextManager {
             }
         };
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
@@ -4474,7 +4472,7 @@ impl ContextManager {
             }
         };
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
@@ -4542,7 +4540,7 @@ impl ContextManager {
             }
         };
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
@@ -4594,7 +4592,7 @@ impl ContextManager {
         };
 
         if applied {
-            if let Some(ref snapshot) = snapshot {
+            if let Some(snapshot) = snapshot {
                 self.persist_context_snapshot(context_id, snapshot);
             }
             self.event_log
@@ -4651,7 +4649,7 @@ impl ContextManager {
             }
         };
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
@@ -4730,7 +4728,7 @@ impl ContextManager {
                 .await;
         }
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
@@ -4789,7 +4787,7 @@ impl ContextManager {
             }
         };
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
@@ -4897,7 +4895,7 @@ impl ContextManager {
             }
         };
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
@@ -4973,7 +4971,7 @@ impl ContextManager {
             }
         };
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
@@ -5043,7 +5041,7 @@ impl ContextManager {
             }
         };
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
@@ -5080,7 +5078,7 @@ impl ContextManager {
             }
         };
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
@@ -5126,7 +5124,7 @@ impl ContextManager {
             }
         };
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
@@ -5231,7 +5229,7 @@ impl ContextManager {
             }
         };
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
@@ -5305,7 +5303,7 @@ impl ContextManager {
             }
         };
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
@@ -5400,7 +5398,7 @@ impl ContextManager {
             (snap, bc_snap)
         };
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         if let Some(ref bc_snap) = bc_snapshot {
@@ -5469,7 +5467,7 @@ impl ContextManager {
             }
         };
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
@@ -5528,7 +5526,7 @@ impl ContextManager {
             (snap, bc_snap)
         };
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         if let Some(ref snap) = bc_snapshot {
@@ -5627,7 +5625,7 @@ impl ContextManager {
             }
         };
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
@@ -5677,7 +5675,7 @@ impl ContextManager {
             }
         };
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
@@ -5725,7 +5723,7 @@ impl ContextManager {
             }
         };
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
@@ -5778,7 +5776,7 @@ impl ContextManager {
             }
         };
 
-        if let Some(ref snapshot) = snapshot {
+        if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
@@ -5956,7 +5954,7 @@ impl ContextManager {
             if let Some(ctx) = contexts.get(&context_id) {
                 let snapshot = Self::snapshot_context(ctx);
                 drop(contexts);
-                self.persist_context_snapshot(&context_id, &snapshot);
+                self.persist_context_snapshot(&context_id, snapshot);
             }
         }
 
@@ -6046,7 +6044,7 @@ impl ContextManager {
             if let Some(ctx) = contexts.get(&context_id) {
                 let snapshot = Self::snapshot_context(ctx);
                 drop(contexts);
-                self.persist_context_snapshot(&context_id, &snapshot);
+                self.persist_context_snapshot(&context_id, snapshot);
             }
         }
 
@@ -6106,7 +6104,7 @@ impl ContextManager {
         if self.has_persistence() {
             let ctx_snapshot = Self::snapshot_context(ctx);
             drop(contexts);
-            self.persist_context_snapshot(context_id, &ctx_snapshot);
+            self.persist_context_snapshot(context_id, ctx_snapshot);
         }
 
         Ok(unanimous)
@@ -6139,7 +6137,7 @@ impl ContextManager {
             if let Some(ctx) = contexts.get(context_id) {
                 let snapshot = Self::snapshot_context(ctx);
                 drop(contexts);
-                self.persist_context_snapshot(context_id, &snapshot);
+                self.persist_context_snapshot(context_id, snapshot);
             }
         }
     }
