@@ -401,6 +401,9 @@ pub enum SyncEvent {
         /// Whether the checkpoint matched the local state.
         consistent: bool,
     },
+    /// Outbound queue overflow: oldest messages were dropped to stay within
+    /// per-context (1,000) or global (10,000) bounds. See spec section 23.2.
+    QueueOverflow(crate::store::queue::QueueOverflowInfo),
 }
 
 impl std::fmt::Display for SyncEvent {
@@ -429,6 +432,11 @@ impl std::fmt::Display for SyncEvent {
                 } else {
                     "INCONSISTENT"
                 },
+            ),
+            Self::QueueOverflow(info) => write!(
+                f,
+                "QueueOverflow in context {}: {} messages dropped ({})",
+                info.context_id, info.messages_dropped, info.overflow_kind,
             ),
         }
     }
@@ -867,6 +875,11 @@ mod tests {
                 sender_did: DID::from("did:key:carol"),
                 consistent: true,
             },
+            SyncEvent::QueueOverflow(crate::store::queue::QueueOverflowInfo {
+                context_id: "ctx-4".to_owned(),
+                messages_dropped: 5,
+                overflow_kind: crate::store::queue::OverflowKind::PerContext,
+            }),
         ];
         for event in &events {
             let json = serde_json::to_string(event).unwrap();
@@ -892,5 +905,13 @@ mod tests {
             consistent: false,
         };
         assert!(cp.to_string().contains("INCONSISTENT"));
+
+        let overflow = SyncEvent::QueueOverflow(crate::store::queue::QueueOverflowInfo {
+            context_id: "ctx-1".to_owned(),
+            messages_dropped: 3,
+            overflow_kind: crate::store::queue::OverflowKind::Global,
+        });
+        assert!(overflow.to_string().contains("QueueOverflow"));
+        assert!(overflow.to_string().contains('3'));
     }
 }
