@@ -5914,7 +5914,7 @@ impl ContextManager {
         }
 
         if result.has_failures() {
-            let msg = result.errors.join("; ");
+            let msg = result.errors().join("; ");
             return Err(
                 if !result.mls_destroyed() || !result.sender_key_destroyed() {
                     ContextError::CryptoFailed(msg)
@@ -6042,8 +6042,9 @@ impl ContextManager {
         };
 
         // Clone Arc-wrapped providers so the spawned task can perform
-        // key destruction and event logging on TTL expiry.
+        // key destruction, relay deletion, and event logging on TTL expiry.
         let crypto = Arc::clone(&self.crypto);
+        let transport = Arc::clone(&self.transport);
         let event_log = Arc::clone(&self.event_log);
         let contexts_ref = Arc::clone(&self.contexts);
         let context_id_owned = context_id.to_owned();
@@ -6052,11 +6053,13 @@ impl ContextManager {
             tokio::select! {
                 () = tokio::time::sleep(duration) => {
                     // Timer fired. Run cleanup with exponential backoff
-                    // retries (SCP-169, #612).
+                    // retries (SCP-169, #612). Pass transport so relay
+                    // ciphertext deletion happens on timer-initiated expiry
+                    // (§5.11, #612 finding 2).
                     let result = ttl::run_ttl_expiry_with_retries(
                         &handle,
                         crypto.as_ref(),
-                        None,
+                        Some(transport.as_ref()),
                         event_log.as_ref(),
                         &cancel,
                     ).await;

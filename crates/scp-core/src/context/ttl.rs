@@ -131,7 +131,7 @@ pub struct TtlExpiryError {
     /// Bit 3: event log append.
     completed_steps: u8,
     /// The error messages from failed operations.
-    pub errors: Vec<String>,
+    errors: Vec<String>,
 }
 
 /// Bit positions for [`TtlExpiryError::completed_steps`].
@@ -167,6 +167,12 @@ impl TtlExpiryError {
     #[must_use]
     pub const fn event_logged(&self) -> bool {
         self.completed_steps & STEP_EVENT_LOGGED != 0
+    }
+
+    /// The error messages from failed cleanup operations.
+    #[must_use]
+    pub fn errors(&self) -> &[String] {
+        &self.errors
     }
 
     const fn set_step(&mut self, step: u8) {
@@ -2456,7 +2462,7 @@ mod tests {
         assert!(result.has_failures());
         assert!(!result.is_complete());
         // Error message contains the MLS failure.
-        assert!(result.errors.iter().any(|e| e.contains("MLS group")));
+        assert!(result.errors().iter().any(|e| e.contains("MLS group")));
     }
 
     #[tokio::test]
@@ -2474,7 +2480,7 @@ mod tests {
         assert!(result.sender_key_destroyed());
         assert!(!result.event_logged());
         assert!(result.has_failures());
-        assert!(result.errors.iter().any(|e| e.contains("event log")));
+        assert!(result.errors().iter().any(|e| e.contains("event log")));
     }
 
     #[tokio::test]
@@ -2529,7 +2535,7 @@ mod tests {
 
         assert!(!result.state_transitioned());
         assert!(result.has_failures());
-        assert!(result.errors.iter().any(|e| e.contains("Closed")));
+        assert!(result.errors().iter().any(|e| e.contains("Closed")));
     }
 
     #[tokio::test]
@@ -2715,5 +2721,170 @@ mod tests {
             }
             _ => panic!("expected ExpiryFailed variant"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 6: Retry coverage — cancellation during backoff and partial
+    // cleanup state between retries (#612)
+    // -----------------------------------------------------------------------
+
+    /// Cancelling via the Notify during retry backoff abandons cleanup and
+    /// returns the partial result immediately.
+    #[tokio::test]
+    async fn run_retries_cancellation_during_backoff() {
+        let handle = active_handle("ctx-retry-cancel", MemoryScope::Ephemeral);
+        make_active(&handle).await;
+        // Crypto always fails MLS destruction — forces retries.
+        let crypto = FailingMlsCrypto::default();
+        let event_log = MockEventLog::default();
+        let cancel = Arc::new(Notify::new());
+
+        tokio::time::pause();
+
+        let cancel_clone = Arc::clone(&cancel);
+        let retry_task = tokio::spawn(async move {
+            run_ttl_expiry_with_retries(&handle, &crypto, None, &event_log, &cancel_clone).await
+        });
+
+        // Advance past the initial attempt (immediate) and into the first
+        // backoff delay (500ms base). The first retry fires, then the second
+        // backoff starts at 1000ms. Cancel during that window.
+        tokio::time::advance(Duration::from_millis(600)).await;
+        tokio::task::yield_now().await;
+        // Now in the second retry's backoff. Cancel.
+        cancel.notify_one();
+        tokio::task::yield_now().await;
+
+        let result = retry_task.await.expect("task should complete");
+
+        // Cleanup was abandoned mid-retry. MLS destruction never succeeded.
+        assert!(!result.mls_destroyed());
+        // State transition succeeded on the first attempt.
+        assert!(result.state_transitioned());
+        // The result should indicate incomplete cleanup.
+        assert!(result.has_failures());
+    }
+
+    /// Mock crypto that fails MLS destruction a configurable number of times,
+    /// then succeeds. Used to verify partial cleanup state between retries.
+    struct TransientFailCrypto {
+        remaining_failures: Mutex<u32>,
+        mls_destroyed: Mutex<Vec<[u8; 32]>>,
+        sender_keys_destroyed: Mutex<Vec<[u8; 32]>>,
+    }
+
+    impl TransientFailCrypto {
+        fn new(fail_count: u32) -> Self {
+            Self {
+                remaining_failures: Mutex::new(fail_count),
+                mls_destroyed: Mutex::new(Vec::new()),
+                sender_keys_destroyed: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ContextCryptoProvider for TransientFailCrypto {
+        fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn destroy_mls_group(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            let mut remaining = self.remaining_failures.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                Err(ContextCreationError::CryptoFailed(
+                    "transient MLS failure".into(),
+                ))
+            } else {
+                self.mls_destroyed.lock().unwrap().push(*id);
+                Ok(())
+            }
+        }
+        fn destroy_sender_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            self.sender_keys_destroyed.lock().unwrap().push(*id);
+            Ok(())
+        }
+        fn validate_key_package(
+            &self,
+            _owner_did: &str,
+            _key_package_bytes: Option<&[u8]>,
+        ) -> Result<(), ContextError> {
+            Ok(())
+        }
+        fn add_member(
+            &self,
+            _context_id: &[u8; 32],
+            _member_did: &str,
+            _key_package_bytes: Option<&[u8]>,
+        ) -> Result<(), ContextError> {
+            Ok(())
+        }
+        fn remove_member(
+            &self,
+            _context_id: &[u8; 32],
+            _member_did: &str,
+        ) -> Result<(), ContextError> {
+            Ok(())
+        }
+        fn distribute_sender_key(
+            &self,
+            _context_id: &[u8; 32],
+            _member_did: &str,
+        ) -> Result<(), ContextError> {
+            Ok(())
+        }
+        fn remove_member_sender_key(
+            &self,
+            _context_id: &[u8; 32],
+            _member_did: &str,
+        ) -> Result<(), ContextError> {
+            Ok(())
+        }
+        fn encrypt_message(
+            &self,
+            _context_id: &[u8; 32],
+            _sender_did: &str,
+            payload: &[u8],
+            _epoch: u64,
+            _sequence: u64,
+        ) -> Result<Vec<u8>, ContextError> {
+            Ok(payload.to_vec())
+        }
+    }
+
+    /// Between retries, the partial result preserves which steps succeeded.
+    /// After a transient MLS failure resolves, the retry completes all steps.
+    #[tokio::test]
+    async fn run_retries_partial_cleanup_state_between_retries() {
+        let handle = active_handle("ctx-retry-partial", MemoryScope::Ephemeral);
+        make_active(&handle).await;
+        // Fail MLS destruction twice, succeed on 3rd attempt.
+        let crypto = TransientFailCrypto::new(2);
+        let event_log = MockEventLog::default();
+        let cancel = Notify::new();
+
+        tokio::time::pause();
+
+        let result = run_ttl_expiry_with_retries(&handle, &crypto, None, &event_log, &cancel).await;
+
+        // After the transient failures resolve, cleanup should be complete.
+        assert!(result.is_complete());
+        assert!(result.state_transitioned());
+        assert!(result.mls_destroyed());
+        assert!(result.sender_key_destroyed());
+        assert!(result.event_logged());
+
+        // MLS destruction succeeded once (on the 3rd attempt — first 2 failed).
+        assert_eq!(crypto.mls_destroyed.lock().unwrap().len(), 1);
+        // Sender key destruction succeeded on each attempt (3 total).
+        assert_eq!(crypto.sender_keys_destroyed.lock().unwrap().len(), 3);
     }
 }

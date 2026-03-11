@@ -219,13 +219,6 @@ pub enum WasmContextEvent {
         initiator_did: String,
     },
     Expired,
-    ExpiryFailed {
-        reason: String,
-        state_transitioned: bool,
-        mls_destroyed: bool,
-        sender_key_destroyed: bool,
-        event_logged: bool,
-    },
     GovernanceExecuted {
         action_type: String,
         proposal_id: String,
