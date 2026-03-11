@@ -361,6 +361,16 @@ pub struct ContextSnapshot {
     /// before reconnection occurs.
     #[serde(default)]
     pub needs_reconnect: bool,
+    /// Opaque MLS crypto state blob exported by
+    /// [`ContextCryptoProvider::export_crypto_state`]. Contains MLS group
+    /// tree, epoch secrets, sender keys, and wrapping keys. Restored via
+    /// [`ContextCryptoProvider::restore_crypto_state`] during
+    /// [`ContextManager::restore_context`].
+    ///
+    /// Empty if no crypto state was exported (e.g., broadcast-only contexts
+    /// or mock providers). See issue #645.
+    #[serde(default)]
+    pub mls_crypto_state: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,13 +1031,30 @@ impl ContextManager {
     /// single extra key-epoch replay on restart, which the pull-based
     /// key distribution protocol already handles idempotently.
     fn persist_context_snapshot(&self, context_id: &str, snapshot: &ContextSnapshot) {
-        if let Some(ref persistence) = self.persistence
-            && let Err(e) = persistence.persist_context(context_id, snapshot)
-        {
-            // Best-effort persistence: log but don't fail the operation.
-            // In production, the tracing crate would emit a warning here.
-            // In-memory state remains authoritative.
-            let _ = e; // Suppress unused warning; tracing integration is TBD.
+        if let Some(ref persistence) = self.persistence {
+            // Export MLS crypto state alongside the context snapshot (#645).
+            // Clone the snapshot and populate the `mls_crypto_state` field with
+            // the opaque blob from the crypto provider. Best-effort: if export
+            // fails, persist without crypto state (the context will need
+            // reconnection on restore, matching §23.11 fallback).
+            let mut snapshot = snapshot.clone();
+            let ctx_id_bytes = context_id_to_bytes(context_id);
+            match self.crypto.export_crypto_state(&ctx_id_bytes) {
+                Ok(state) => snapshot.mls_crypto_state = state,
+                Err(e) => {
+                    tracing::warn!(
+                        context_id = %context_id,
+                        error = %e,
+                        "failed to export MLS crypto state for persistence; \
+                         context will need reconnection on restore"
+                    );
+                }
+            }
+            if let Err(e) = persistence.persist_context(context_id, &snapshot) {
+                // Best-effort persistence: log but don't fail the operation.
+                // In-memory state remains authoritative.
+                let _ = e; // Suppress unused warning; tracing integration is TBD.
+            }
         }
     }
 
@@ -1109,6 +1136,9 @@ impl ContextManager {
             mls_epoch: ctx.mls_epoch,
             grace_entries,
             needs_reconnect: ctx.needs_reconnect,
+            // MLS crypto state is populated in `persist_context_snapshot`
+            // where the crypto provider is available. Initialized empty here.
+            mls_crypto_state: Vec::new(),
         }
     }
 
@@ -1270,6 +1300,16 @@ impl ContextManager {
                     }
                 }
             }
+        }
+
+        // Restore MLS crypto state from the persisted snapshot (#645).
+        // This must happen before constructing PerContextState so the crypto
+        // provider has the MLS group and sender keys available for subsequent
+        // encrypt/decrypt operations.
+        if !ctx_snapshot.mls_crypto_state.is_empty() {
+            let ctx_id_bytes = context_id_to_bytes(context_id);
+            self.crypto
+                .restore_crypto_state(&ctx_id_bytes, &ctx_snapshot.mls_crypto_state)?;
         }
 
         let per_context = PerContextState {
@@ -10101,6 +10141,7 @@ mod tests {
             mls_epoch: 0,
             grace_entries: Vec::new(),
             needs_reconnect: false,
+            mls_crypto_state: Vec::new(),
         };
 
         let bc_snapshot = test_broadcast_snapshot("persist-ctx-2");
@@ -10201,6 +10242,7 @@ mod tests {
             mls_epoch: 0,
             grace_entries: Vec::new(),
             needs_reconnect: false,
+            mls_crypto_state: Vec::new(),
         };
 
         persistence
@@ -10289,6 +10331,7 @@ mod tests {
             mls_epoch: 0,
             grace_entries: Vec::new(),
             needs_reconnect: false,
+            mls_crypto_state: Vec::new(),
         };
 
         persistence.persist_context("ttl-ctx", &snapshot).unwrap();
@@ -10356,6 +10399,7 @@ mod tests {
                 mls_epoch: 0,
                 grace_entries: Vec::new(),
                 needs_reconnect: false,
+                mls_crypto_state: Vec::new(),
             };
             persistence.persist_context(ctx_name, &snapshot).unwrap();
         }
@@ -10422,6 +10466,7 @@ mod tests {
             mls_epoch: 0,
             grace_entries: Vec::new(),
             needs_reconnect: false,
+            mls_crypto_state: Vec::new(),
         };
 
         let bc_snapshot = test_broadcast_snapshot("dup-ctx");
@@ -10510,6 +10555,7 @@ mod tests {
                 expires_at_unix_secs: u64::MAX, // far-future expiry
             }],
             needs_reconnect: false,
+            mls_crypto_state: Vec::new(),
         };
 
         let bc_snapshot = test_broadcast_snapshot("grace-incon-ctx");
@@ -10605,6 +10651,7 @@ mod tests {
                 expires_at_unix_secs: future_expiry,
             }],
             needs_reconnect: false,
+            mls_crypto_state: Vec::new(),
         };
 
         let bc_snapshot = test_broadcast_snapshot("grace-ok-ctx");
@@ -11606,6 +11653,7 @@ mod tests {
             mls_epoch: 0,
             grace_entries: Vec::new(),
             needs_reconnect: false,
+            mls_crypto_state: Vec::new(),
         };
 
         let json = serde_json::to_string(&snapshot).expect("serialize");

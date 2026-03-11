@@ -189,6 +189,7 @@ mod tests {
             mls_epoch: 0,
             grace_entries: Vec::new(),
             needs_reconnect: false,
+            mls_crypto_state: Vec::new(),
         }
     }
 

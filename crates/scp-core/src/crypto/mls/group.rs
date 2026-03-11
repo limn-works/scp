@@ -66,7 +66,7 @@ pub(crate) struct ZeroizingSigner(Option<SignatureKeyPair>);
 
 impl ZeroizingSigner {
     /// Wraps a `SignatureKeyPair` in a zeroizing wrapper.
-    const fn new(inner: SignatureKeyPair) -> Self {
+    pub(crate) const fn new(inner: SignatureKeyPair) -> Self {
         Self(Some(inner))
     }
 
