@@ -5579,10 +5579,13 @@ pub fn set_economic_policy(
 ) -> Result<(), ScpError> {
     // Hold the mutex for the entire check-validate-store sequence to prevent
     // TOCTOU races (another thread bypassing the lock between check and store).
-    let mut guard = handle.economic_policy.lock().map_err(|_| ScpError::Context {
-        message: "economic_policy lock is poisoned".to_owned(),
-        code: "SCP-CTX-2012".to_owned(),
-    })?;
+    let mut guard = handle
+        .economic_policy
+        .lock()
+        .map_err(|_| ScpError::Context {
+            message: "economic_policy lock is poisoned".to_owned(),
+            code: "SCP-CTX-2012".to_owned(),
+        })?;
 
     // Check whether the existing policy is locked (§19.3).
     if let Some(ref existing_json) = *guard
