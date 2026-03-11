@@ -180,7 +180,7 @@ impl NapiContextHandle {
         let count = crate::runtime()
             .block_on(manager.member_count(&self.context_id))
             .unwrap_or(0);
-        Ok(count as u64)
+        Ok(u64::try_from(count).unwrap_or(u64::MAX))
     }
 
     /// Returns the optional economic policy string.
@@ -663,7 +663,7 @@ pub fn context_subscribe(
 pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u64> {
     let manager = context_manager();
     let count = manager.member_count(&handle.context_id).await.unwrap_or(0);
-    Ok(count as u64)
+    Ok(u64::try_from(count).unwrap_or(u64::MAX))
 }
 
 /// Returns whether a DID is a member of the context.
@@ -1253,4 +1253,50 @@ pub async fn context_import(data: Vec<u8>) -> napi::Result<String> {
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     Ok(context_id)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use crate::runtime::context_manager;
+    use scp_core::context::membership::KeyPackage;
+    use scp_core::context::params::Capability;
+    use scp_core::context::ContextParams;
+    use scp_identity::DID;
+
+    /// Verifies that `ContextManager::member_count` returns the live member
+    /// count — not a hardcoded value.  After creation the count is 1 (the
+    /// creator); after a join it becomes 2.
+    #[tokio::test]
+    async fn member_count_reflects_actual_membership() {
+        let manager = context_manager();
+        let ctx_id = format!("test-member-count-{}", uuid::Uuid::new_v4());
+        let creator = DID("did:key:z6MkCreator".to_owned());
+
+        let params = ContextParams {
+            ceiling: vec![Capability::new("role:assign")],
+            ..ContextParams::default()
+        };
+
+        let handle = manager
+            .create_context(ctx_id.clone(), params, creator)
+            .await
+            .expect("create_context should succeed");
+
+        let count = manager.member_count(&ctx_id).await.unwrap();
+        assert_eq!(count, 1, "newly created context should have exactly 1 member");
+
+        let kp = KeyPackage::mock(DID("did:key:z6MkJoiner".to_owned()));
+        manager
+            .join_context(&handle, kp)
+            .await
+            .expect("join_context should succeed");
+
+        let count = manager.member_count(&ctx_id).await.unwrap();
+        assert_eq!(count, 2, "after join, context should have 2 members");
+    }
 }
