@@ -2039,8 +2039,7 @@ fn verify_vm_match(
         .iter()
         .find(|vm| vm.id.ends_with(vm_suffix))
     {
-        let expected_multibase =
-            format!("z{}", bs58::encode(public_key.as_bytes()).into_string());
+        let expected_multibase = format!("z{}", bs58::encode(public_key.as_bytes()).into_string());
         if vm.public_key_multibase != expected_multibase {
             return Err(NodeError::Storage(format!(
                 "custody {label} does not match DID document {vm_suffix} verification method \
@@ -2083,11 +2082,9 @@ async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: Storage>(
 
             if let Some(bytes) = existing {
                 // 2. Deserialize the StoredValue<PersistedIdentity> envelope.
-                let envelope: StoredValue<PersistedIdentity> =
-                    rmp_serde::from_slice(&bytes).map_err(|e| {
-                        NodeError::Storage(format!(
-                            "failed to deserialize persisted identity: {e}"
-                        ))
+                let envelope: StoredValue<PersistedIdentity> = rmp_serde::from_slice(&bytes)
+                    .map_err(|e| {
+                        NodeError::Storage(format!("failed to deserialize persisted identity: {e}"))
                     })?;
 
                 // 2a. Reject unknown future versions to prevent silent corruption
