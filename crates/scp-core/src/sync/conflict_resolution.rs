@@ -299,9 +299,10 @@ struct ClassifiedPair {
 
 /// Iterates all proposal pairs and classifies every conflict.
 ///
-/// Returns an empty vec if no pair conflicts. The classification order is
-/// deterministic: `SimultaneousCommit` > `MutualRemoval` > `Regular` (the
-/// caller decides how to act on each kind).
+/// Returns an empty vec if no pair conflicts. Each pair is classified
+/// independently. The vector is ordered by proposal index pairs `(i, j)`,
+/// not by kind. The kinds have a natural priority: `SimultaneousCommit` and
+/// `MutualRemoval` trigger freezes; `Regular` does not.
 fn classify_conflict_pairs(proposals: &[GovernanceProposalSnapshot]) -> Vec<ClassifiedPair> {
     let mut pairs = Vec::new();
     for i in 0..proposals.len() {
@@ -390,6 +391,11 @@ pub fn resolve_metadata_conflict(a: &MetadataOp, b: &MetadataOp) -> ConflictReso
 ///   context enters a governance freeze (ADR-031 section 7).
 ///
 /// No synchronized clock dependency (§9.8.3).
+///
+/// # Note
+///
+/// Only resolves the first regular-conflict pair. Callers should re-invoke
+/// after removing the losing proposal if additional conflicts may exist.
 ///
 /// # Errors
 ///
