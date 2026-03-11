@@ -657,9 +657,7 @@ class Context:
             ) from exc
 
         unblocker = unblocker_did if unblocker_did is not None else self._creator_did
-        _scp_core.py_broadcast_unblock_subscriber(
-            self._handle, subscriber_did, unblocker
-        )
+        _scp_core.py_broadcast_unblock_subscriber(self._handle, subscriber_did, unblocker)
 
     async def broadcast_handle_key_request(
         self,

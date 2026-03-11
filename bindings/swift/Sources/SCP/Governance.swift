@@ -301,8 +301,7 @@ public enum BroadcastBridge {
         )
     }
 
-    public static let defaultUnblockSubscriber: UnblockSubscriberFn = {
-        handle, subscriberDid, unblockerDid in
+    public static let defaultUnblockSubscriber: UnblockSubscriberFn = { handle, subscriberDid, unblockerDid in
         try await broadcastUnblockSubscriber(
             handle: handle, subscriberDid: subscriberDid, unblockerDid: unblockerDid
         )
