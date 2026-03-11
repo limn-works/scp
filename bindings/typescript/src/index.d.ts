@@ -203,27 +203,26 @@ export declare class Context {
 
 // -- UCAN ---------------------------------------------------------------------
 
-export declare function mint(options: {
-  issuer: Identity;
-  audience: string;
-  capabilities: string[];
-  contextId: string;
-}): Promise<UcanToken>;
+export declare function mintUcan(
+  ctx: Context,
+  memberDid: string,
+  capabilities: readonly string[],
+): Promise<UcanToken>;
 
-export declare function validate(
-  contextId: string,
+export declare function validateUcan(
+  ctx: Context,
   token: string,
   capability: string,
 ): Promise<void>;
 
-export declare function revoke(contextId: string, token: string): Promise<void>;
+export declare function revokeUcan(ctx: Context, token: string): Promise<void>;
 
-export declare function delegate(options: {
-  issuer: Identity;
-  audience: string;
-  parentToken: string;
-  capabilities: string[];
-}): Promise<UcanToken>;
+export declare function delegateUcan(
+  ctx: Context,
+  originalToken: UcanToken,
+  targetDid: string,
+  capabilities: readonly string[],
+): Promise<UcanToken>;
 
 // -- Trust --------------------------------------------------------------------
 

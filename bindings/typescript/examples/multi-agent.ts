@@ -2,8 +2,7 @@
  * Multi-agent coordination: multiple agents collaborating in a shared context.
  */
 
-import { Context, Identity } from "@limn-works/scp-ts";
-import { mint } from "@limn-works/scp-ts/ucan";
+import { Context, Identity, mintUcan } from "@limn-works/scp-ts";
 
 async function runAgent(
   name: string,
@@ -44,18 +43,8 @@ async function main(): Promise<void> {
   console.log(`Context created: ${ctx.contextId}`);
 
   // Mint UCANs for each agent (capability delegation)
-  await mint({
-    issuer: coordinator,
-    audience: agentA.did,
-    capabilities: ["msg:send", "msg:receive"],
-    contextId: ctx.contextId,
-  });
-  await mint({
-    issuer: coordinator,
-    audience: agentB.did,
-    capabilities: ["msg:send", "msg:receive"],
-    contextId: ctx.contextId,
-  });
+  await mintUcan(ctx, agentA.did, ["msg:send", "msg:receive"]);
+  await mintUcan(ctx, agentB.did, ["msg:send", "msg:receive"]);
 
   // Run agents concurrently
   await Promise.all([

@@ -2,7 +2,7 @@
  * Tool invocation: register a tool with test vectors and invoke it.
  */
 
-import { Context, Identity, mint } from "@limn-works/scp-ts";
+import { Context, Identity, mintUcan } from "@limn-works/scp-ts";
 import type { ToolDefinition } from "@limn-works/scp-ts";
 
 async function main(): Promise<void> {
@@ -39,12 +39,7 @@ async function main(): Promise<void> {
   });
 
   // Mint a UCAN token for tool invocation (§7.2 — required for all actions)
-  const ucan = await mint({
-    issuer: identity,
-    audience: identity.did,
-    capabilities: ["tool_invoke:*"],
-    contextId: ctx.contextId,
-  });
+  const ucan = await mintUcan(ctx, identity.did, ["tool_invoke:*"]);
 
   // Invoke the tool with the UCAN token
   const result = await ctx.invokeTool("weather", { city: "Berlin" }, identity, ucan.tokenId);
