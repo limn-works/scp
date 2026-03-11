@@ -10,6 +10,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { _validateEconomicPolicyJson } from "../src/context";
 import { ValidationError } from "../src/errors";
 import { _resetBridge } from "../src/internal/bridge";
 import { defineToolDefinition } from "../src/tools";
@@ -757,5 +758,51 @@ describe("Economic policy roundtrip (mock bridge)", () => {
 
     const result = await mockBridge.contextGetEconomicPolicy(ctx);
     expect(result).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 9. EconomicPolicy schema validation tests (#592, finding 7)
+// ---------------------------------------------------------------------------
+
+describe("EconomicPolicy schema validation", () => {
+  it("accepts valid policy JSON", () => {
+    const valid = JSON.stringify({
+      locked: false,
+      cost_schedule: { currency: [85, 83, 68, 0] },
+      payment_adapters: [],
+      pricing_formula: null,
+      payee: "did:dht:z6MkPayee",
+    });
+    // Should not throw.
+    _validateEconomicPolicyJson(valid);
+  });
+
+  it("rejects non-JSON input", () => {
+    expect(() => _validateEconomicPolicyJson("not json")).toThrow(ValidationError);
+  });
+
+  it("rejects JSON array", () => {
+    expect(() => _validateEconomicPolicyJson("[]")).toThrow(/expected an object/);
+  });
+
+  it("rejects missing locked field", () => {
+    const json = JSON.stringify({ cost_schedule: {}, payment_adapters: [], payee: "did:test" });
+    expect(() => _validateEconomicPolicyJson(json)).toThrow(/'locked' must be a boolean/);
+  });
+
+  it("rejects missing cost_schedule", () => {
+    const json = JSON.stringify({ locked: false, payment_adapters: [], payee: "did:test" });
+    expect(() => _validateEconomicPolicyJson(json)).toThrow(/'cost_schedule' must be an object/);
+  });
+
+  it("rejects missing payment_adapters", () => {
+    const json = JSON.stringify({ locked: false, cost_schedule: {}, payee: "did:test" });
+    expect(() => _validateEconomicPolicyJson(json)).toThrow(/'payment_adapters' must be an array/);
+  });
+
+  it("rejects missing payee", () => {
+    const json = JSON.stringify({ locked: false, cost_schedule: {}, payment_adapters: [] });
+    expect(() => _validateEconomicPolicyJson(json)).toThrow(/'payee' must be a string/);
   });
 });

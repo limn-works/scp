@@ -11,7 +11,7 @@
  * See ADR-022 in `.docs/adrs/phase-4.md` and `.docs/scaffold/typescript.md`.
  */
 
-import { ContextError, mapBridgeError } from "./errors";
+import { ContextError, mapBridgeError, ValidationError } from "./errors";
 import type { Identity } from "./identity";
 import type { BridgeContextHandle } from "./internal/bridge";
 import { getBridge } from "./internal/bridge";
@@ -24,6 +24,64 @@ import type {
   ToolDefinition,
   ToolVerificationResult,
 } from "./types";
+
+// ---------------------------------------------------------------------------
+// EconomicPolicy schema validation (§19.3, ADR-034)
+// ---------------------------------------------------------------------------
+
+/**
+ * Validates that a JSON string conforms to the `EconomicPolicy` schema.
+ *
+ * Defense-in-depth for the WASM path: the WASM bridge can only validate
+ * that the input is well-formed JSON (ADR-034 prevents importing scp-core
+ * types). This function checks required fields and basic types so schema
+ * violations are caught before crossing the FFI boundary.
+ *
+ * @throws {ValidationError} if the JSON is malformed or missing required fields.
+ * @internal Exported as `_validateEconomicPolicyJson` for testing.
+ */
+export function _validateEconomicPolicyJson(json: string): void {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    throw new ValidationError("invalid economic policy JSON: syntax error", "SCP-VALID-7001");
+  }
+
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new ValidationError("invalid economic policy JSON: expected an object", "SCP-VALID-7001");
+  }
+
+  const obj = parsed as Record<string, unknown>;
+
+  if (typeof obj.locked !== "boolean") {
+    throw new ValidationError(
+      "invalid economic policy JSON: 'locked' must be a boolean",
+      "SCP-VALID-7001",
+    );
+  }
+
+  if (typeof obj.cost_schedule !== "object" || obj.cost_schedule === null) {
+    throw new ValidationError(
+      "invalid economic policy JSON: 'cost_schedule' must be an object",
+      "SCP-VALID-7001",
+    );
+  }
+
+  if (!Array.isArray(obj.payment_adapters)) {
+    throw new ValidationError(
+      "invalid economic policy JSON: 'payment_adapters' must be an array",
+      "SCP-VALID-7001",
+    );
+  }
+
+  if (typeof obj.payee !== "string") {
+    throw new ValidationError(
+      "invalid economic policy JSON: 'payee' must be a string",
+      "SCP-VALID-7001",
+    );
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Context
@@ -496,16 +554,22 @@ export class Context implements AsyncDisposable {
   /**
    * Sets the economic policy for this context.
    *
-   * Validates the JSON before storing. The policy controls per-tool-invoke
-   * costs, per-period budgets, and other economic governance parameters.
+   * Validates the JSON against the `EconomicPolicy` schema before storing.
+   * The policy controls per-tool-invoke costs, per-period budgets, and other
+   * economic governance parameters.
+   *
+   * Schema validation is performed at the SDK layer as defense-in-depth:
+   * the NAPI bridge validates via Rust deserialization, but the WASM bridge
+   * can only check JSON syntax (ADR-034 prevents scp-core type imports).
    *
    * @param policyJson - The economic policy as a JSON string conforming to
    *   the `EconomicPolicy` schema (spec section 19).
    * @throws {ContextError} If the context has been disposed.
-   * @throws {ValidationError} If the JSON is invalid.
+   * @throws {ValidationError} If the JSON is invalid or missing required fields.
    */
   async setEconomicPolicy(policyJson: string): Promise<void> {
     this.assertActive();
+    _validateEconomicPolicyJson(policyJson);
     try {
       const bridge = await getBridge();
       await bridge.contextSetEconomicPolicy(this._handle, policyJson);
