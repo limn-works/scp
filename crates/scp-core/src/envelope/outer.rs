@@ -642,7 +642,7 @@ mod tests {
         );
     }
 
-    /// #593-F1: Extensions must survive a MessagePack roundtrip — the actual wire
+    /// #593-F1: Extensions must survive a `MessagePack` roundtrip — the actual wire
     /// format. Previous tests only exercised JSON. This test proves that
     /// `#[serde(flatten)]` extensions survive `rmp_serde` encode → decode.
     #[test]
@@ -660,7 +660,7 @@ mod tests {
             blob_ttl: u32,
             #[serde(with = "serde_bytes")]
             encrypted_blob: Vec<u8>,
-            /// Field unknown to the current OuterEnvelope definition.
+            /// Field unknown to the current `OuterEnvelope` definition.
             v2_routing_priority: serde_json::Value,
         }
 
@@ -765,12 +765,6 @@ mod tests {
     fn serde_bounded_bytes_fires_with_flatten_present() {
         use crate::serde_util::{BOUNDED_BYTES_MAX, MAX_ENVELOPE_SIZE};
 
-        // Build a struct with an oversized encrypted_blob that's still
-        // within MAX_ENVELOPE_SIZE. BOUNDED_BYTES_MAX = 512 KiB,
-        // MAX_ENVELOPE_SIZE = 576 KiB. Use BOUNDED_BYTES_MAX + 1 bytes
-        // for the blob.
-        let oversized_blob = vec![0xAAu8; BOUNDED_BYTES_MAX + 1];
-
         // Construct a valid msgpack map with the oversized blob.
         // We use a helper struct to ensure correct serde_bytes encoding.
         #[derive(serde::Serialize)]
@@ -782,6 +776,12 @@ mod tests {
             #[serde(with = "serde_bytes")]
             encrypted_blob: Vec<u8>,
         }
+
+        // Build a struct with an oversized encrypted_blob that's still
+        // within MAX_ENVELOPE_SIZE. BOUNDED_BYTES_MAX = 512 KiB,
+        // MAX_ENVELOPE_SIZE = 576 KiB. Use BOUNDED_BYTES_MAX + 1 bytes
+        // for the blob.
+        let oversized_blob = vec![0xAAu8; BOUNDED_BYTES_MAX + 1];
 
         let crafted = OversizedEnvelope {
             version: SCP_OUTER_ENVELOPE_VERSION,
