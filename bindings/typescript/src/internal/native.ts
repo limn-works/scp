@@ -496,7 +496,7 @@ export function createNativeBridge(): Bridge {
           u: string,
           p: string[] | undefined,
         ) => Promise<string>
-      )(handle, toolId, inputJson, identityDid, ucanToken ?? "", undefined);
+      )(handle, toolId, inputJson, identityDid, ucanToken, undefined);
       return result;
     },
 
