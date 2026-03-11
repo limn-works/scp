@@ -6301,19 +6301,19 @@ impl ContextManager {
                 let contexts = Arc::clone(&contexts);
                 let ctx_id = ctx_id.clone();
                 async move {
-                    // Phase 1: Acquire lock, snapshot data, release lock.
-                    let (gov_ctx, departed, epoch_resets, mls_epoch, recovery_in_progress) = {
+                    // Phase 1: Acquire lock, snapshot data, process proposals,
+                    // detect deadlock, release lock.
+                    let (result, conditions, mls_epoch, recovery_in_progress) = {
                         let mut contexts_guard = contexts.lock().await;
                         let Some(ctx) = contexts_guard.get_mut(&ctx_id) else {
                             return false; // Context removed — stop the loop.
                         };
 
-                        if !ctx // Stop if no longer active.
-                            .handle
-                            .try_read_state()
-                            .is_some_and(|s| matches!(s, super::ContextState::Active))
-                        {
-                            return false;
+                        // Use blocking async read — `try_read_state()` returns
+                        // `None` on transient write-contention which would
+                        // permanently stop this task.
+                        if !matches!(ctx.handle.state().await, super::ContextState::Active) {
+                            return false; // No longer active — stop the loop.
                         }
 
                         let gov_ctx = Self::build_governance_context(ctx);
@@ -6334,23 +6334,6 @@ impl ContextManager {
                         let mls_epoch = ctx.mls_epoch;
                         let recovery_in_progress =
                             ctx.deadlock_detection_state.recovery_in_progress;
-
-                        (
-                            gov_ctx,
-                            departed,
-                            epoch_resets,
-                            mls_epoch,
-                            recovery_in_progress,
-                        )
-                        // Lock dropped here.
-                    };
-
-                    // Phase 2: Process proposals, update detection state, detect deadlock.
-                    let (result, conditions) = {
-                        let mut contexts_guard = contexts.lock().await;
-                        let Some(ctx) = contexts_guard.get_mut(&ctx_id) else {
-                            return false;
-                        };
 
                         // Snapshot active voters BEFORE processing proposals so
                         // voters on about-to-resolve proposals are still visible.
@@ -6380,11 +6363,11 @@ impl ContextManager {
                             &ctx.deadlock_detection_state,
                         );
 
-                        (result, conditions)
+                        (result, conditions, mls_epoch, recovery_in_progress)
                         // Lock dropped here.
                     };
 
-                    // Phase 3: Build context events (no lock needed).
+                    // Phase 2: Build context events (no lock needed).
                     let ctx_events = Self::translate_timeout_events(
                         &result.events,
                         mls_epoch,
@@ -6392,7 +6375,7 @@ impl ContextManager {
                         recovery_in_progress,
                     );
 
-                    // Phase 4: Write results back and update recovery state.
+                    // Phase 3: Write results back and update recovery state.
                     let needs_write = !ctx_events.is_empty()
                         || (conditions.is_empty() && recovery_in_progress)
                         || (!conditions.is_empty() && !recovery_in_progress);
