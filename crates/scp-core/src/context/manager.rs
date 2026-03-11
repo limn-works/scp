@@ -24,7 +24,8 @@ use super::builder::{
     create_context as builder_create_context,
 };
 use super::governance::timeout::{
-    DeadlockDetectionState, GovernanceTimeoutTask, process_pending_proposals,
+    DeadlockDetectionState, GovernanceTimeoutTask, collect_active_voters,
+    process_pending_proposals, update_detection_state,
 };
 use super::governance::{
     CheckpointAttestationStatus, ContextCheckpoint, CosignedCheckpoint, GovernanceAction,
@@ -5911,17 +5912,14 @@ impl ContextManager {
                 let contexts = Arc::clone(&contexts);
                 let ctx_id = ctx_id.clone();
                 async move {
-                    // Phase 1: Acquire lock, extract data, release lock.
-                    // This minimizes the critical section so other ContextManager
-                    // operations are not blocked during processing.
-                    let (gov_ctx, departed, mls_epoch, recovery_in_progress, deadlock_state) = {
+                    // Phase 1: Acquire lock, snapshot data, release lock.
+                    let (gov_ctx, departed, mls_epoch, recovery_in_progress) = {
                         let mut contexts_guard = contexts.lock().await;
                         let Some(ctx) = contexts_guard.get_mut(&ctx_id) else {
                             return false; // Context removed — stop the loop.
                         };
 
-                        // Stop if context is no longer active.
-                        if !ctx
+                        if !ctx // Stop if no longer active.
                             .handle
                             .try_read_state()
                             .is_some_and(|s| matches!(s, super::ContextState::Active))
@@ -5929,9 +5927,7 @@ impl ContextManager {
                             return false;
                         }
 
-                        // Build governance context snapshot.
                         let gov_ctx = Self::build_governance_context(ctx);
-
                         // Detect departed members since last tick.
                         let current_members: HashSet<DID> =
                             ctx.membership.members().map(|m| m.did.clone()).collect();
@@ -5945,29 +5941,24 @@ impl ContextManager {
                         let mls_epoch = ctx.mls_epoch;
                         let recovery_in_progress =
                             ctx.deadlock_detection_state.recovery_in_progress;
-                        let deadlock_state = ctx.deadlock_detection_state.clone();
 
                         (
                             gov_ctx,
                             departed,
                             mls_epoch,
                             recovery_in_progress,
-                            deadlock_state,
                         )
                         // Lock dropped here.
                     };
 
-                    // Phase 2: Process proposals and detect deadlock outside the lock.
-                    // Re-acquire briefly to call engine methods that need &mut.
+                    // Phase 2: Process proposals, update detection state, detect deadlock.
                     let (result, conditions) = {
                         let mut contexts_guard = contexts.lock().await;
                         let Some(ctx) = contexts_guard.get_mut(&ctx_id) else {
                             return false;
                         };
 
-                        // Process pending proposals for timeout and departures.
-                        // Epoch reset members are handled by other code paths when
-                        // epoch resets actually occur; the timeout loop passes empty.
+                        // Process pending proposals for timeout/departures.
                         let result = process_pending_proposals(
                             ctx.governance_engine.as_mut(),
                             &gov_ctx,
@@ -5975,18 +5966,28 @@ impl ContextManager {
                             &[],
                         );
 
+                        // Update deadlock detection state before detecting
+                        // deadlock so missed-window counters reflect this tick.
+                        let active_voters = collect_active_voters(ctx.governance_engine.as_ref());
+                        update_detection_state(
+                            &mut ctx.deadlock_detection_state,
+                            ctx.governance_engine.as_ref(),
+                            &gov_ctx,
+                            &active_voters,
+                        );
+
                         // Detect deadlock conditions (ADR-031 §10).
                         let conditions = super::governance::timeout::detect_deadlock(
                             ctx.governance_engine.as_ref(),
                             &gov_ctx,
-                            &deadlock_state,
+                            &ctx.deadlock_detection_state,
                         );
 
                         (result, conditions)
                         // Lock dropped here.
                     };
 
-                    // Phase 3: Build context events from results (no lock needed).
+                    // Phase 3: Build context events (no lock needed).
                     let ctx_events = Self::translate_timeout_events(
                         &result.events,
                         mls_epoch,
@@ -5994,8 +5995,7 @@ impl ContextManager {
                         recovery_in_progress,
                     );
 
-                    // Phase 4: Re-acquire lock briefly to write results back
-                    // and update deadlock recovery state.
+                    // Phase 4: Write results back and update recovery state.
                     let needs_write = !ctx_events.is_empty()
                         || (conditions.is_empty() && recovery_in_progress)
                         || (!conditions.is_empty() && !recovery_in_progress);
