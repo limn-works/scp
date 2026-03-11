@@ -1819,7 +1819,7 @@ impl WasmContextManager {
                 ctx.write_revoked_members.insert(did.clone());
                 ctx.push_event(WasmContextEvent::WriteAccessRevoked { did: did.clone() });
                 Ok(
-                    serde_json::json!({"action": "WriteAccessRevoked", "did": did, "scope": "Full", "reason": reason}),
+                    serde_json::json!({"action": "WriteAccessRevoked", "did": did, "scope": "full", "reason": reason}),
                 )
             }
             WasmGovernanceAction::RevokeReadAccess { did, scope } => {
