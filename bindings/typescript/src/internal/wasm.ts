@@ -581,6 +581,17 @@ export function createWasmBridge(): Bridge {
     },
 
     // TTL operations
+    async contextTtlRemaining(handle: BridgeContextHandle): Promise<number | null> {
+      const wasm = getWasm();
+      const remaining = wasm.context_ttl_remaining(handle);
+      return remaining ?? null;
+    },
+
+    async contextExtendTtl(handle: BridgeContextHandle, additionalSecs: number): Promise<void> {
+      const wasm = getWasm();
+      await wasm.context_extend_ttl(handle, additionalSecs);
+    },
+
     async contextHandleTtlExpiry(handle: BridgeContextHandle): Promise<void> {
       const wasm = getWasm();
       await wasm.context_handle_ttl_expiry(handle);

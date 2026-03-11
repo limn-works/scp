@@ -495,6 +495,42 @@ export class Context implements AsyncDisposable {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // TTL
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Returns the remaining TTL in seconds, or `null` if no TTL is configured.
+   *
+   * @returns Remaining seconds, or `null` for persistent contexts.
+   * @throws {ContextError} If the context has been disposed.
+   */
+  async ttlRemaining(): Promise<number | null> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.contextTtlRemaining(this._handle);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Extends the TTL by the given number of seconds.
+   *
+   * @param additionalSecs - Number of seconds to add to the TTL.
+   * @throws {ContextError} If the context has been disposed or extension fails.
+   */
+  async extendTtl(additionalSecs: number): Promise<void> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      await bridge.contextExtendTtl(this._handle, additionalSecs);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
   /**
    * Leaves the context.
    *

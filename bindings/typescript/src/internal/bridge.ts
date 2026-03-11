@@ -119,6 +119,8 @@ export interface Bridge {
   ): Promise<string>;
 
   // TTL operations
+  contextTtlRemaining(handle: BridgeContextHandle): Promise<number | null>;
+  contextExtendTtl(handle: BridgeContextHandle, additionalSecs: number): Promise<void>;
   contextHandleTtlExpiry(handle: BridgeContextHandle): Promise<void>;
   contextProposeTtlExtension(
     handle: BridgeContextHandle,

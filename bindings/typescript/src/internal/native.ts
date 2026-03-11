@@ -358,6 +358,20 @@ export function createNativeBridge(): Bridge {
     },
 
     // TTL operations
+    async contextTtlRemaining(handle: BridgeContextHandle): Promise<number | null> {
+      const result = await (
+        addon.contextTtlRemaining as (h: BridgeContextHandle) => Promise<number | null>
+      )(handle);
+      return result;
+    },
+
+    async contextExtendTtl(handle: BridgeContextHandle, additionalSecs: number): Promise<void> {
+      await (addon.contextExtendTtl as (h: BridgeContextHandle, s: number) => Promise<void>)(
+        handle,
+        additionalSecs,
+      );
+    },
+
     async contextHandleTtlExpiry(handle: BridgeContextHandle): Promise<void> {
       await (addon.contextHandleTtlExpiry as (h: BridgeContextHandle) => Promise<void>)(handle);
     },
