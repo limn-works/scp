@@ -3230,18 +3230,19 @@ mod tests {
         // AC9: When .domain() is set and TLS provisioning fails (ACME),
         // automatic fallthrough to Tiers 1-3 (§10.12.8 step 4).
         // AC11: Verify that NAT is probed on fallthrough.
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
-        /// Mock NAT strategy that records whether it was called.
+        /// Mock NAT strategy that records whether it was called and what port it received.
         struct RecordingNatStrategy {
             called: Arc<AtomicBool>,
+            received_port: Arc<AtomicU16>,
             tier: ReachabilityTier,
         }
 
         impl NatStrategy for RecordingNatStrategy {
             fn select_tier(
                 &self,
-                _relay_port: u16,
+                relay_port: u16,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<ReachabilityTier, NodeError>>
@@ -3250,12 +3251,14 @@ mod tests {
                 >,
             > {
                 self.called.store(true, Ordering::SeqCst);
+                self.received_port.store(relay_port, Ordering::SeqCst);
                 let tier = self.tier.clone();
                 Box::pin(async move { Ok(tier) })
             }
         }
 
         let nat_called = Arc::new(AtomicBool::new(false));
+        let nat_port = Arc::new(AtomicU16::new(0));
         let external_addr = SocketAddr::from(([198, 51, 100, 7], 32891));
 
         let custody = Arc::new(InMemoryKeyCustody::new());
@@ -3267,6 +3270,7 @@ mod tests {
             .tls_provider(Arc::new(FailingTlsProvider))
             .nat_strategy(Arc::new(RecordingNatStrategy {
                 called: Arc::clone(&nat_called),
+                received_port: Arc::clone(&nat_port),
                 tier: ReachabilityTier::Stun { external_addr },
             }))
             .generate_identity_with(custody, did_method)
@@ -3285,6 +3289,14 @@ mod tests {
         assert!(
             nat_called.load(Ordering::SeqCst),
             "NAT strategy should have been called on ACME failure fallthrough"
+        );
+
+        // Verify the HTTP port (not relay port) was passed to NAT strategy.
+        assert_eq!(
+            nat_port.load(Ordering::SeqCst),
+            DEFAULT_HTTP_BIND_ADDR.port(),
+            "NAT strategy should receive the HTTP port ({}), not the relay port",
+            DEFAULT_HTTP_BIND_ADDR.port()
         );
 
         // Verify the relay URL uses ws:// (not wss://).
