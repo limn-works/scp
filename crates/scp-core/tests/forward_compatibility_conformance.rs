@@ -631,3 +631,118 @@ mod attestation_types {
         assert_eq!(decoded.id, "test-id-001");
     }
 }
+
+// ===========================================================================
+// §13.5.1 — ContextParams: unknown fields MUST be ignored
+// ===========================================================================
+
+mod context_params {
+    use super::*;
+    use scp_core::context::params::ContextParams;
+
+    /// §13.5.1: `ContextParams` is explicitly named as a type that MUST ignore
+    /// unknown fields. Verify msgpack deserialization with extra fields succeeds.
+    #[test]
+    fn unknown_fields_are_ignored_msgpack() {
+        let params = ContextParams::default();
+        let bytes = rmp_serde::to_vec_named(&params).unwrap();
+        let with_extras = inject_unknown_msgpack_fields(&bytes, &future_msgpack_fields());
+
+        let result: Result<ContextParams, _> = rmp_serde::from_slice(&with_extras);
+        assert!(
+            result.is_ok(),
+            "ContextParams must ignore unknown fields per §13.5.1, got: {:?}",
+            result.unwrap_err()
+        );
+        let decoded = result.unwrap();
+        // Verify known fields are preserved at their defaults
+        assert!(!decoded.discoverable);
+        assert!(decoded.ttl.is_none());
+        assert!(decoded.economic_policy.is_none());
+        assert!(decoded.template_id.is_none());
+        assert!(decoded.min_protocol_version.is_none());
+    }
+
+    /// §13.5.1: `ContextParams` MUST ignore unknown fields in JSON as well.
+    #[test]
+    fn unknown_fields_are_ignored_json() {
+        let params = ContextParams::default();
+        let json = serde_json::to_string(&params).unwrap();
+        let with_extras = inject_unknown_json_fields(&json, &future_json_fields());
+
+        let result: Result<ContextParams, _> = serde_json::from_str(&with_extras);
+        assert!(
+            result.is_ok(),
+            "ContextParams must ignore unknown JSON fields per §13.5.1, got: {:?}",
+            result.unwrap_err()
+        );
+        let decoded = result.unwrap();
+        assert!(!decoded.discoverable);
+        assert!(decoded.ttl.is_none());
+    }
+}
+
+// ===========================================================================
+// §13.5.1 — Access key wire types: unknown fields MUST be ignored
+// ===========================================================================
+
+mod access_key_types {
+    use super::*;
+    use scp_core::crypto::access_keys::wire::{AccessKeyRequest, AccessKeyResponse};
+
+    /// §13.9 item 3: `AccessKeyRequest` MUST ignore unknown fields.
+    #[test]
+    fn request_ignores_unknown_fields_msgpack() {
+        let request = AccessKeyRequest {
+            requester_did: "did:dht:requester".to_string(),
+            context_id: "ctx-access-test".to_string(),
+            wrapping_pubkey: vec![0xBB; 32],
+            nonce: [0xCC; 16],
+            timestamp: 1_700_000_000,
+            signature: vec![0xDD; 64],
+        };
+        let bytes = rmp_serde::to_vec_named(&request).unwrap();
+        let with_extras = inject_unknown_msgpack_fields(&bytes, &future_msgpack_fields());
+
+        let result: Result<AccessKeyRequest, _> = rmp_serde::from_slice(&with_extras);
+        assert!(
+            result.is_ok(),
+            "AccessKeyRequest must ignore unknown fields per §13.5.1, got: {:?}",
+            result.unwrap_err()
+        );
+        let decoded = result.unwrap();
+        assert_eq!(decoded.requester_did, "did:dht:requester");
+        assert_eq!(decoded.context_id, "ctx-access-test");
+        assert_eq!(decoded.wrapping_pubkey, vec![0xBB; 32]);
+        assert_eq!(decoded.nonce, [0xCC; 16]);
+        assert_eq!(decoded.timestamp, 1_700_000_000);
+        assert_eq!(decoded.signature, vec![0xDD; 64]);
+    }
+
+    /// §13.9 item 3: `AccessKeyResponse` MUST ignore unknown fields.
+    #[test]
+    fn response_ignores_unknown_fields_msgpack() {
+        let response = AccessKeyResponse {
+            context_id: "ctx-access-test".to_string(),
+            member_did: "did:dht:member".to_string(),
+            epoch: 5,
+            hpke_sealed_key: vec![0xEE; 60],
+            ephemeral_pubkey: vec![0xFF; 32],
+        };
+        let bytes = rmp_serde::to_vec_named(&response).unwrap();
+        let with_extras = inject_unknown_msgpack_fields(&bytes, &future_msgpack_fields());
+
+        let result: Result<AccessKeyResponse, _> = rmp_serde::from_slice(&with_extras);
+        assert!(
+            result.is_ok(),
+            "AccessKeyResponse must ignore unknown fields per §13.5.1, got: {:?}",
+            result.unwrap_err()
+        );
+        let decoded = result.unwrap();
+        assert_eq!(decoded.context_id, "ctx-access-test");
+        assert_eq!(decoded.member_did, "did:dht:member");
+        assert_eq!(decoded.epoch, 5);
+        assert_eq!(decoded.hpke_sealed_key, vec![0xEE; 60]);
+        assert_eq!(decoded.ephemeral_pubkey, vec![0xFF; 32]);
+    }
+}
