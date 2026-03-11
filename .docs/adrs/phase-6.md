@@ -2720,6 +2720,8 @@ ADR-029 section 5c defines the conflict scenario: two admins both offline simult
 3. A `GovernanceConflict` event is appended to the event log recording both proposal IDs, the winner, and the resolution method.
 4. If the losing proposer still wants their action, they must re-propose with awareness of the winning proposal's effects.
 
+**Mutual removal (always GovernanceFreeze).** When two proposals each remove the other's proposer (`RemoveMember { did: B }` proposed by A, and `RemoveMember { did: A }` proposed by B), the conflict always triggers a governance freeze regardless of leaf index ordering. Rationale: executing the first removal invalidates the authority of the second proposer, creating a paradox — if A's removal of B wins by log order, B no longer has authority to have proposed removing A, but B's proposal is already committed. This circular dependency cannot be resolved by simple ordering. The freeze includes ALL conflicting proposals in the set, not just the mutual-removal pair, so that no conflicts are silently dropped.
+
 **Simultaneous commit (same sequence number).** If two conflicting proposals land at the exact same event log sequence (extremely rare — requires both to be appended in the same batch), the protocol enters a `GovernanceConflict` state:
 
 1. The context is frozen for new governance actions — no new proposals accepted EXCEPT `ResolveConflict`. Message sending and tool invocation continue normally.

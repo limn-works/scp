@@ -17,6 +17,10 @@
 //!   Merkle tree leaf index (lower index = earlier = wins).
 //! - **Governance conflicts:** The proposal with the lower event log sequence
 //!   number wins. The losing proposal is invalidated.
+//! - **Mutual removal:** Two proposals that each remove the other's proposer
+//!   always trigger a governance freeze regardless of leaf index ordering
+//!   (ADR-031 section 7). Executing one removal invalidates the authority of
+//!   the other proposer, creating a paradox.
 //! - **Simultaneous commit (same sequence):** The context enters a governance
 //!   freeze state requiring explicit resolution (ADR-031 section 7).
 //! - **Deadlock:** Detected when the governance model requires votes from
@@ -269,6 +273,68 @@ pub fn actions_conflict(
 }
 
 // ---------------------------------------------------------------------------
+// Conflict pair classification (shared by resolve_governance_conflict and
+// detect_deadlock — Finding 5, issue #576)
+// ---------------------------------------------------------------------------
+
+/// Classification of a single conflicting pair of proposals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictPairKind {
+    /// Both proposals landed at the same leaf index (simultaneous commit).
+    SimultaneousCommit,
+    /// Each proposer removes the other — logical deadlock regardless of
+    /// leaf index ordering (ADR-031 section 7).
+    MutualRemoval,
+    /// An ordinary conflict resolvable by Merkle log order.
+    Regular,
+}
+
+/// A classified conflict pair: indices into the proposal slice plus its kind.
+#[derive(Debug, Clone, Copy)]
+struct ClassifiedPair {
+    i: usize,
+    j: usize,
+    kind: ConflictPairKind,
+}
+
+/// Iterates all proposal pairs and classifies every conflict.
+///
+/// Returns an empty vec if no pair conflicts. The classification order is
+/// deterministic: `SimultaneousCommit` > `MutualRemoval` > `Regular` (the
+/// caller decides how to act on each kind).
+fn classify_conflict_pairs(proposals: &[GovernanceProposalSnapshot]) -> Vec<ClassifiedPair> {
+    let mut pairs = Vec::new();
+    for i in 0..proposals.len() {
+        for j in (i + 1)..proposals.len() {
+            if !actions_conflict(
+                &proposals[i].action,
+                &proposals[i].proposer_did,
+                &proposals[j].action,
+                &proposals[j].proposer_did,
+            ) {
+                continue;
+            }
+
+            let kind = if proposals[i].leaf_index == proposals[j].leaf_index {
+                ConflictPairKind::SimultaneousCommit
+            } else if is_mutual_removal(
+                &proposals[i].action,
+                &proposals[i].proposer_did,
+                &proposals[j].action,
+                &proposals[j].proposer_did,
+            ) {
+                ConflictPairKind::MutualRemoval
+            } else {
+                ConflictPairKind::Regular
+            };
+
+            pairs.push(ClassifiedPair { i, j, kind });
+        }
+    }
+    pairs
+}
+
+// ---------------------------------------------------------------------------
 // Metadata conflict resolution
 // ---------------------------------------------------------------------------
 
@@ -345,81 +411,46 @@ pub fn resolve_governance_conflict(
         });
     }
 
-    // Find all conflicting pairs.
-    let mut conflicting_pairs: Vec<(usize, usize)> = Vec::new();
-    for i in 0..proposals.len() {
-        for j in (i + 1)..proposals.len() {
-            if actions_conflict(
-                &proposals[i].action,
-                &proposals[i].proposer_did,
-                &proposals[j].action,
-                &proposals[j].proposer_did,
-            ) {
-                conflicting_pairs.push((i, j));
-            }
-        }
-    }
+    // Classify all conflicting pairs using the shared helper.
+    let classified = classify_conflict_pairs(proposals);
 
-    if conflicting_pairs.is_empty() {
+    if classified.is_empty() {
         return Err(ConflictResolutionError::NotConflicting {
             reason: "no conflicting action pairs found".to_owned(),
         });
     }
 
-    // Check for simultaneous commits (same leaf index) among any conflicting pair.
-    let simultaneous: Vec<ProposalId> = conflicting_pairs
-        .iter()
-        .filter(|(i, j)| proposals[*i].leaf_index == proposals[*j].leaf_index)
-        .flat_map(|(i, j)| vec![proposals[*i].proposal_id, proposals[*j].proposal_id])
-        .collect();
+    // If ANY pair is a simultaneous commit or mutual removal, the context
+    // must freeze. Include ALL conflicting proposals in the freeze — not
+    // just the pair(s) that triggered it — so no conflicts are silently
+    // dropped (Finding 4, issue #576).
+    let has_freeze_trigger = classified.iter().any(|p| {
+        matches!(
+            p.kind,
+            ConflictPairKind::SimultaneousCommit | ConflictPairKind::MutualRemoval
+        )
+    });
 
-    if !simultaneous.is_empty() {
-        // Deduplicate proposal IDs.
-        let mut deduped = simultaneous;
-        deduped.sort_unstable();
-        deduped.dedup();
+    if has_freeze_trigger {
+        let mut all_ids: Vec<ProposalId> = classified
+            .iter()
+            .flat_map(|p| [proposals[p.i].proposal_id, proposals[p.j].proposal_id])
+            .collect();
+        all_ids.sort_unstable();
+        all_ids.dedup();
         return Ok(ConflictResolutionStrategy::GovernanceFreeze {
-            conflicting_proposals: deduped,
+            conflicting_proposals: all_ids,
         });
     }
 
-    // Mutual removal: each proposer removes the other. Even with different
-    // leaf indices this is a logical deadlock — executing the first removal
-    // invalidates the authority of the second proposer, creating a paradox.
-    // Consistent with `detect_deadlock`, return GovernanceFreeze.
-    let mutual_removal_ids: Vec<ProposalId> = conflicting_pairs
-        .iter()
-        .filter(|(i, j)| {
-            is_mutual_removal(
-                &proposals[*i].action,
-                &proposals[*i].proposer_did,
-                &proposals[*j].action,
-                &proposals[*j].proposer_did,
-            )
-        })
-        .flat_map(|(i, j)| vec![proposals[*i].proposal_id, proposals[*j].proposal_id])
-        .collect();
-
-    if !mutual_removal_ids.is_empty() {
-        let mut deduped = mutual_removal_ids;
-        deduped.sort_unstable();
-        deduped.dedup();
-        return Ok(ConflictResolutionStrategy::GovernanceFreeze {
-            conflicting_proposals: deduped,
-        });
-    }
-
-    // All conflicting pairs have different leaf indices and are not mutual
-    // removals. Resolve by finding the pair with the smallest gap and using
-    // the lower leaf index as winner.
-    //
-    // For simplicity (and per ADR-031 section 7), we resolve the first
-    // conflicting pair — the proposal with the lower leaf index wins.
-    let (i, j) = conflicting_pairs[0];
-    let (winner, loser) = if proposals[i].leaf_index < proposals[j].leaf_index {
-        (&proposals[i], &proposals[j])
+    // All conflicting pairs are Regular (different leaf indices, no mutual
+    // removal). Resolve the first conflicting pair — the proposal with the
+    // lower leaf index wins (ADR-031 section 7).
+    let first = &classified[0];
+    let (winner, loser) = if proposals[first.i].leaf_index < proposals[first.j].leaf_index {
+        (&proposals[first.i], &proposals[first.j])
     } else {
-        (&proposals[j], &proposals[i])
+        (&proposals[first.j], &proposals[first.i])
     };
 
     Ok(ConflictResolutionStrategy::MerkleOrdered {
@@ -443,6 +474,9 @@ pub fn resolve_governance_conflict(
 /// remove the other's proposer, creating a circular dependency that cannot
 /// be resolved by simple ordering.
 ///
+/// Uses [`classify_conflict_pairs`] — the same classification logic as
+/// [`resolve_governance_conflict`] — to avoid divergence risk.
+///
 /// See ADR-031 sections 7 and 10.
 #[must_use]
 pub fn detect_deadlock(proposals: &[GovernanceProposalSnapshot]) -> bool {
@@ -450,38 +484,12 @@ pub fn detect_deadlock(proposals: &[GovernanceProposalSnapshot]) -> bool {
         return false;
     }
 
-    for i in 0..proposals.len() {
-        for j in (i + 1)..proposals.len() {
-            if !actions_conflict(
-                &proposals[i].action,
-                &proposals[i].proposer_did,
-                &proposals[j].action,
-                &proposals[j].proposer_did,
-            ) {
-                continue;
-            }
-
-            // Same leaf index = simultaneous commit = deadlock.
-            if proposals[i].leaf_index == proposals[j].leaf_index {
-                return true;
-            }
-
-            // Mutual removal: each proposer removes the other. Even with
-            // different leaf indices, this is a logical deadlock because
-            // executing the first removal invalidates the authority of
-            // the second proposer.
-            if is_mutual_removal(
-                &proposals[i].action,
-                &proposals[i].proposer_did,
-                &proposals[j].action,
-                &proposals[j].proposer_did,
-            ) {
-                return true;
-            }
-        }
-    }
-
-    false
+    classify_conflict_pairs(proposals).iter().any(|p| {
+        matches!(
+            p.kind,
+            ConflictPairKind::SimultaneousCommit | ConflictPairKind::MutualRemoval
+        )
+    })
 }
 
 /// Checks whether two actions constitute mutual removal (each proposer
@@ -1234,7 +1242,7 @@ mod tests {
     }
 
     #[test]
-    fn governance_conflict_mutual_removal_same_leaf_index_triggers_freeze() {
+    fn governance_conflict_same_leaf_index_mutual_removal_caught_by_simultaneous_commit() {
         // Mutual removal with same leaf index — should still freeze (caught
         // by the simultaneous-commit check before the mutual-removal check).
         let p1 = gov_proposal(
@@ -1264,6 +1272,58 @@ mod tests {
                 assert_eq!(conflicting_proposals.len(), 2);
             }
             other => panic!("expected GovernanceFreeze, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn governance_conflict_mixed_mutual_removal_and_regular_freezes_all() {
+        // Finding 3+4 (issue #576): 3 proposals where p1/p2 are mutual
+        // removal and p1/p3 have a regular conflict (role change on same
+        // DID). The freeze must include ALL three proposals — not just the
+        // mutual-removal pair — so that p3's conflict is not invisible.
+        let p1 = gov_proposal(
+            1,
+            "did:dht:alice",
+            GovernanceAction::RemoveMember {
+                did: did("did:dht:bob"),
+                reason: None,
+            },
+            3,
+        );
+        let p2 = gov_proposal(
+            2,
+            "did:dht:bob",
+            GovernanceAction::RemoveMember {
+                did: did("did:dht:alice"),
+                reason: None,
+            },
+            7,
+        );
+        // p3 conflicts with p1: Alice removes Bob (p1) while Carol changes
+        // Bob's role (p3) — RemoveMember vs ChangeRole on same DID.
+        let p3 = gov_proposal(
+            3,
+            "did:dht:carol",
+            GovernanceAction::ChangeRole {
+                did: did("did:dht:bob"),
+                new_role: "observer".to_owned(),
+            },
+            10,
+        );
+        let result = resolve_governance_conflict(&[p1, p2, p3]);
+        assert!(result.is_ok());
+        match result.ok() {
+            Some(ConflictResolutionStrategy::GovernanceFreeze {
+                conflicting_proposals,
+            }) => {
+                // All three proposals should be included — p1/p2 (mutual
+                // removal) AND p1/p3 (remove vs role change).
+                assert_eq!(conflicting_proposals.len(), 3);
+                assert!(conflicting_proposals.contains(&proposal_id(1)));
+                assert!(conflicting_proposals.contains(&proposal_id(2)));
+                assert!(conflicting_proposals.contains(&proposal_id(3)));
+            }
+            other => panic!("expected GovernanceFreeze with 3 proposals, got {other:?}"),
         }
     }
 
