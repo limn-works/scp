@@ -2966,3 +2966,54 @@ fn wasm_and_core_revocation_cid_match_after_jwt_roundtrip() {
          — cross-bridge revocation will fail silently"
     );
 }
+
+// ===========================================================================
+// SCP_PROTOCOL_VERSION constant sync conformance (#707)
+//
+// The WASM bridge defines its own SCP_PROTOCOL_VERSION constant because it
+// cannot depend on scp-core (ADR-034). This test ensures both values match.
+// ===========================================================================
+
+/// WASM bridge's `SCP_PROTOCOL_VERSION` — must match scp-core's constant.
+/// Verbatim from `scp-ffi-wasm/src/manager.rs`.
+const WASM_SCP_PROTOCOL_VERSION: u16 = 0x0100;
+
+#[test]
+fn scp_protocol_version_wasm_matches_core() {
+    assert_eq!(
+        scp_core::envelope::SCP_PROTOCOL_VERSION,
+        WASM_SCP_PROTOCOL_VERSION,
+        "WASM bridge SCP_PROTOCOL_VERSION (0x{:04X}) differs from scp-core (0x{:04X}) — \
+         update crates/scp-ffi/wasm/src/manager.rs to match",
+        WASM_SCP_PROTOCOL_VERSION,
+        scp_core::envelope::SCP_PROTOCOL_VERSION,
+    );
+}
+
+/// Verify that the decode/encode helpers in scp-core match the WASM bridge's
+/// inline shift-and-mask logic.
+#[test]
+fn protocol_version_decode_encode_wasm_matches_core() {
+    // WASM decode: (packed >> 8) as u8, (packed & 0xFF) as u8
+    let wasm_major = (WASM_SCP_PROTOCOL_VERSION >> 8) as u8;
+    let wasm_minor = (WASM_SCP_PROTOCOL_VERSION & 0xFF) as u8;
+
+    let (core_major, core_minor) = scp_core::context::params::decode_protocol_version(
+        scp_core::envelope::SCP_PROTOCOL_VERSION,
+    );
+
+    assert_eq!(
+        (wasm_major, wasm_minor),
+        (core_major, core_minor),
+        "WASM inline version decoding differs from core decode_protocol_version"
+    );
+
+    // WASM encode: ((major as u16) << 8) | (minor as u16)
+    let wasm_encoded = (u16::from(wasm_major) << 8) | u16::from(wasm_minor);
+    let core_encoded = scp_core::context::params::encode_protocol_version(core_major, core_minor);
+
+    assert_eq!(
+        wasm_encoded, core_encoded,
+        "WASM inline version encoding differs from core encode_protocol_version"
+    );
+}

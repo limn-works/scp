@@ -461,56 +461,10 @@ impl PerContextState {
     ///
     /// Returns `Ok(())` if compatible (or if no minimum is set). Returns an
     /// error if the context requires a higher protocol version than the SDK
-    /// supports, or if the major versions differ.
+    /// supports, if the major versions differ, or if the version data is
+    /// malformed (non-numeric values are rejected, not silently defaulted).
     fn check_version_compatibility(&self) -> Result<(), ScpWasmError> {
-        let Some(min_ver) = self.params_json["minProtocolVersion"].as_array() else {
-            return Ok(());
-        };
-        if min_ver.len() < 2 {
-            return Err(ScpWasmError::Context {
-                message: format!(
-                    "malformed minProtocolVersion: expected [major, minor] array with at \
-                     least 2 elements, got {min_ver:?}"
-                ),
-                code: "SCP-CTX-2015".to_owned(),
-            });
-        }
-        let raw_major = min_ver
-            .first()
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(1);
-        let req_major = u8::try_from(raw_major).map_err(|_| ScpWasmError::Context {
-            message: format!(
-                "malformed minProtocolVersion: major version {raw_major} exceeds u8 range"
-            ),
-            code: "SCP-CTX-2015".to_owned(),
-        })?;
-        let raw_minor = min_ver
-            .get(1)
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        let req_minor = u8::try_from(raw_minor).map_err(|_| ScpWasmError::Context {
-            message: format!(
-                "malformed minProtocolVersion: minor version {raw_minor} exceeds u8 range"
-            ),
-            code: "SCP-CTX-2015".to_owned(),
-        })?;
-        let sdk_major = (SCP_PROTOCOL_VERSION >> 8) as u8;
-        let sdk_minor = (SCP_PROTOCOL_VERSION & 0xFF) as u8;
-
-        // Exact major match is intentional: different major versions have
-        // incompatible wire formats per §13.1. This rejects both lower AND
-        // higher majors.
-        if sdk_major != req_major || sdk_minor < req_minor {
-            return Err(ScpWasmError::Context {
-                message: format!(
-                    "protocol version incompatible: context requires {req_major}.{req_minor}, \
-                     SDK supports {sdk_major}.{sdk_minor}"
-                ),
-                code: "SCP-CTX-2016".to_owned(),
-            });
-        }
-        Ok(())
+        parse_and_check_min_protocol_version(&self.params_json)
     }
 }
 
@@ -584,6 +538,81 @@ fn validate_imported_did(value: &str, field_name: &str) -> Result<(), ScpWasmErr
     Ok(())
 }
 
+/// Parses and validates `minProtocolVersion` from a params JSON value, then
+/// checks that this SDK's `SCP_PROTOCOL_VERSION` is compatible.
+///
+/// Returns `Ok(())` if no `minProtocolVersion` is present or if the SDK
+/// version satisfies the minimum. Returns an error if:
+/// - The array has fewer than 2 elements.
+/// - Either element is not a number (rejects silent downgrades).
+/// - Either element exceeds `u8` range.
+/// - The SDK version is incompatible per §13.1/§13.4.
+///
+/// Used by both `PerContextState::check_version_compatibility` (join/subscribe
+/// paths) and `WasmContextManager::create_context` (creation defense-in-depth).
+fn parse_and_check_min_protocol_version(params: &serde_json::Value) -> Result<(), ScpWasmError> {
+    let Some(min_ver) = params["minProtocolVersion"].as_array() else {
+        return Ok(());
+    };
+    if min_ver.len() < 2 {
+        return Err(ScpWasmError::Context {
+            message: format!(
+                "malformed minProtocolVersion: expected [major, minor] array with at \
+                 least 2 elements, got {min_ver:?}"
+            ),
+            code: "SCP-CTX-2015".to_owned(),
+        });
+    }
+    let raw_major = min_ver
+        .first()
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| ScpWasmError::Context {
+            message: format!(
+                "malformed minProtocolVersion: major version is not a number: {:?}",
+                min_ver.first()
+            ),
+            code: "SCP-CTX-2015".to_owned(),
+        })?;
+    let req_major = u8::try_from(raw_major).map_err(|_| ScpWasmError::Context {
+        message: format!(
+            "malformed minProtocolVersion: major version {raw_major} exceeds u8 range"
+        ),
+        code: "SCP-CTX-2015".to_owned(),
+    })?;
+    let raw_minor = min_ver
+        .get(1)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| ScpWasmError::Context {
+            message: format!(
+                "malformed minProtocolVersion: minor version is not a number: {:?}",
+                min_ver.get(1)
+            ),
+            code: "SCP-CTX-2015".to_owned(),
+        })?;
+    let req_minor = u8::try_from(raw_minor).map_err(|_| ScpWasmError::Context {
+        message: format!(
+            "malformed minProtocolVersion: minor version {raw_minor} exceeds u8 range"
+        ),
+        code: "SCP-CTX-2015".to_owned(),
+    })?;
+    let sdk_major = (SCP_PROTOCOL_VERSION >> 8) as u8;
+    let sdk_minor = (SCP_PROTOCOL_VERSION & 0xFF) as u8;
+
+    // Exact major match is intentional: different major versions have
+    // incompatible wire formats per §13.1. This rejects both lower AND
+    // higher majors.
+    if sdk_major != req_major || sdk_minor < req_minor {
+        return Err(ScpWasmError::Context {
+            message: format!(
+                "protocol version incompatible: context requires {req_major}.{req_minor}, \
+                 SDK supports {sdk_major}.{sdk_minor}"
+            ),
+            code: "SCP-CTX-2016".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 impl Default for WasmContextManager {
     fn default() -> Self {
         Self::new()
@@ -643,6 +672,12 @@ impl WasmContextManager {
             .to_owned();
         let economic_policy = params["economicPolicy"].as_str().map(str::to_owned);
         let ceiling_strings = Self::build_ceiling_strings(&ceiling);
+
+        // Parse and validate minProtocolVersion from params (spec §13.4).
+        // This mirrors the NAPI bridge's parsing in context_create. Malformed
+        // values produce errors (not silent downgrades). Defense-in-depth: the
+        // creator's SDK version must satisfy the minimum it sets.
+        parse_and_check_min_protocol_version(params)?;
 
         // Initialize broadcast state for Broadcast mode.
         let broadcast = if mode == "Broadcast" {
@@ -2794,18 +2829,33 @@ impl WasmContextManager {
     /// Returns context metadata for the handle.
     #[must_use]
     pub fn context_metadata(&self, context_id: &str) -> Option<ContextMetadata> {
-        self.contexts.get(context_id).map(|ctx| ContextMetadata {
-            context_id: context_id.to_owned(),
-            state: ctx.state.clone(),
-            creator_did: ctx.creator_did.clone(),
-            mode: ctx.mode.clone(),
-            ceiling: ctx.ceiling_strings.iter().cloned().collect(),
-            ceiling_policy: ctx.ceiling_policy.clone(),
-            ttl_seconds: ctx.ttl_seconds,
-            promotion_policy: ctx.promotion_policy.clone(),
-            governance: ctx.governance.clone(),
-            member_count: ctx.members.len() as u64,
-            economic_policy: ctx.economic_policy.clone(),
+        self.contexts.get(context_id).map(|ctx| {
+            // Extract min_protocol_version from params_json. The values were
+            // validated at create_context / import_context time, so this is
+            // infallible for well-formed contexts.
+            let min_protocol_version =
+                ctx.params_json["minProtocolVersion"]
+                    .as_array()
+                    .and_then(|arr| {
+                        let major = u8::try_from(arr.first()?.as_u64()?).ok()?;
+                        let minor = u8::try_from(arr.get(1)?.as_u64()?).ok()?;
+                        Some((major, minor))
+                    });
+
+            ContextMetadata {
+                context_id: context_id.to_owned(),
+                state: ctx.state.clone(),
+                creator_did: ctx.creator_did.clone(),
+                mode: ctx.mode.clone(),
+                ceiling: ctx.ceiling_strings.iter().cloned().collect(),
+                ceiling_policy: ctx.ceiling_policy.clone(),
+                ttl_seconds: ctx.ttl_seconds,
+                promotion_policy: ctx.promotion_policy.clone(),
+                governance: ctx.governance.clone(),
+                member_count: ctx.members.len() as u64,
+                economic_policy: ctx.economic_policy.clone(),
+                min_protocol_version,
+            }
         })
     }
 
@@ -3083,6 +3133,11 @@ impl WasmContextManager {
             });
         }
 
+        // Defense-in-depth: validate and check minProtocolVersion from the
+        // imported snapshot's params. Rejects malformed version data and
+        // imported contexts that require a newer SDK than we support.
+        parse_and_check_min_protocol_version(&snap.params_json)?;
+
         if self.contexts.contains_key(&context_id) {
             return Err(ScpWasmError::Context {
                 message: format!(
@@ -3168,6 +3223,8 @@ pub struct ContextMetadata {
     pub governance: String,
     pub member_count: u64,
     pub economic_policy: Option<String>,
+    /// Minimum protocol version as `[major, minor]`, or `None` if unset.
+    pub min_protocol_version: Option<(u8, u8)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3683,4 +3740,90 @@ mod tests {
             assert_eq!(code, "SCP-PERM-3000");
         }
     }
+
+    // -----------------------------------------------------------------------
+    // min_protocol_version tests (#707)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_and_check_min_protocol_version_none_passes() {
+        let params = serde_json::json!({});
+        assert!(parse_and_check_min_protocol_version(&params).is_ok());
+    }
+
+    #[test]
+    fn parse_and_check_min_protocol_version_valid_passes() {
+        let params = serde_json::json!({ "minProtocolVersion": [1, 0] });
+        assert!(parse_and_check_min_protocol_version(&params).is_ok());
+    }
+
+    #[test]
+    fn parse_and_check_min_protocol_version_rejects_higher_minor() {
+        let params = serde_json::json!({ "minProtocolVersion": [1, 99] });
+        let err = parse_and_check_min_protocol_version(&params).unwrap_err();
+        assert!(
+            matches!(err, ScpWasmError::Context { ref code, .. } if code == "SCP-CTX-2016"),
+            "expected SCP-CTX-2016, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_and_check_min_protocol_version_rejects_different_major() {
+        let params = serde_json::json!({ "minProtocolVersion": [2, 0] });
+        let err = parse_and_check_min_protocol_version(&params).unwrap_err();
+        assert!(
+            matches!(err, ScpWasmError::Context { ref code, .. } if code == "SCP-CTX-2016"),
+            "expected SCP-CTX-2016, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_and_check_min_protocol_version_rejects_string_major() {
+        // Non-numeric major should error, not silently downgrade to (1, 0).
+        let params = serde_json::json!({ "minProtocolVersion": ["2", "0"] });
+        let err = parse_and_check_min_protocol_version(&params).unwrap_err();
+        assert!(
+            matches!(err, ScpWasmError::Context { ref code, .. } if code == "SCP-CTX-2015"),
+            "expected SCP-CTX-2015, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_and_check_min_protocol_version_rejects_string_minor() {
+        // Non-numeric minor should error, not silently downgrade to (1, 0).
+        let params = serde_json::json!({ "minProtocolVersion": [1, "0"] });
+        let err = parse_and_check_min_protocol_version(&params).unwrap_err();
+        assert!(
+            matches!(err, ScpWasmError::Context { ref code, .. } if code == "SCP-CTX-2015"),
+            "expected SCP-CTX-2015, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_and_check_min_protocol_version_rejects_short_array() {
+        let params = serde_json::json!({ "minProtocolVersion": [1] });
+        let err = parse_and_check_min_protocol_version(&params).unwrap_err();
+        assert!(
+            matches!(err, ScpWasmError::Context { ref code, .. } if code == "SCP-CTX-2015"),
+            "expected SCP-CTX-2015, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_and_check_min_protocol_version_rejects_overflow() {
+        let params = serde_json::json!({ "minProtocolVersion": [256, 0] });
+        let err = parse_and_check_min_protocol_version(&params).unwrap_err();
+        assert!(
+            matches!(err, ScpWasmError::Context { ref code, .. } if code == "SCP-CTX-2015"),
+            "expected SCP-CTX-2015, got: {err:?}"
+        );
+    }
+
+    // The following tests validate integration behavior (create_context
+    // validates minProtocolVersion, metadata surfaces it). They cannot run on
+    // native targets because WasmEventLog::append_event calls
+    // time::now_ms() which requires a WASM runtime. Coverage is provided by:
+    // - The parse_and_check_* tests above (unit tests, no WASM runtime needed).
+    // - The scp-core wasm_conformance tests (SCP_PROTOCOL_VERSION sync).
+    // - The scp-core manager tests (create_context version check at core layer).
 }
