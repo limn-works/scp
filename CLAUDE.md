@@ -177,7 +177,7 @@ crates/              # Rust workspace — the protocol core
 
 bindings/            # Language SDK wrappers — the developer-facing API
 ├── python/          # scp_sdk package (wraps PyO3 bridge)
-├── typescript/      # @limn-works/scp-ts (wraps NAPI bridge + WASM fallback)
+├── typescript/      # @scp/sdk package (wraps NAPI bridge + WASM fallback)
 ├── swift/           # SCP Swift package (wraps UniFFI bridge)
-└── kotlin/          # scp-kt (wraps UniFFI bridge) — Android extensions
+└── kotlin/          # scp-sdk-kotlin (wraps UniFFI bridge) — Android extensions
 ```
