@@ -390,6 +390,8 @@ export function createWasmBridge(): Bridge {
     async identityResolve(did: string): Promise<DIDDocument> {
       const wasm = getWasm();
       const doc = await wasm.identity_resolve(did);
+      // WASM WasmDIDDocument does not expose agent key fields — default to false.
+      // Agent key state is tracked on WasmIdentity, not on the document.
       return {
         id: doc.id,
         verificationMethods: JSON.parse(doc.verificationMethodsJson),
@@ -397,6 +399,7 @@ export function createWasmBridge(): Bridge {
         assertionMethods: JSON.parse(doc.assertionMethodsJson),
         alsoKnownAs: JSON.parse(doc.alsoKnownAsJson),
         serviceEndpoints: JSON.parse(doc.servicesJson),
+        hasAgentKey: false,
       };
     },
 

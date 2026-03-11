@@ -146,10 +146,12 @@ export function createNativeBridge(): Bridge {
           assertionMethods: string[];
           alsoKnownAs: string[];
           serviceEndpoints: string[];
+          hasAgentKey: boolean;
+          agentPublicKey: string | null;
         }>
       )(did);
 
-      return {
+      const result: DIDDocument = {
         id: doc.id,
         verificationMethods: doc.verificationMethods.map((vm) => ({
           id: vm.id,
@@ -161,7 +163,10 @@ export function createNativeBridge(): Bridge {
         assertionMethods: doc.assertionMethods,
         alsoKnownAs: doc.alsoKnownAs,
         serviceEndpoints: doc.serviceEndpoints,
+        hasAgentKey: doc.hasAgentKey,
+        ...(doc.agentPublicKey != null ? { agentPublicKey: doc.agentPublicKey } : {}),
       };
+      return result;
     },
 
     async identityRotateKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {

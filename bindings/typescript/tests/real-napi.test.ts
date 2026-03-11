@@ -76,6 +76,12 @@ if (bridge === null) {
       expect(doc.id).toBe(handle.did);
       // The document should have at least one authentication method.
       expect(doc.authentication.length).toBeGreaterThanOrEqual(1);
+      // Verification methods must have non-empty publicKeyMultibase (issue #547).
+      expect(doc.verificationMethods.length).toBeGreaterThanOrEqual(1);
+      expect(doc.verificationMethods[0].publicKeyMultibase).toBeTruthy();
+      expect(doc.verificationMethods[0].publicKeyMultibase.startsWith("z")).toBe(true);
+      // Agent key fields must be present (Finding 0, issue #547).
+      expect(typeof doc.hasAgentKey).toBe("boolean");
     });
 
     test("rotates an identity key and preserves the DID", async () => {
