@@ -2656,6 +2656,36 @@ impl WasmContextManager {
     }
 
     // -----------------------------------------------------------------------
+    // Economic policy operations (§19.3, ADR-033)
+    // -----------------------------------------------------------------------
+
+    /// Sets the economic policy for a context by direct mutation.
+    ///
+    /// This is the standalone setter matching the `PyO3` bridge pattern.
+    /// Does not go through governance actions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not active.
+    pub fn set_economic_policy(
+        &mut self,
+        context_id: &str,
+        policy_json: String,
+    ) -> Result<(), ScpWasmError> {
+        let ctx = self.require_active_context_mut(context_id)?;
+        ctx.economic_policy = Some(policy_json);
+        Ok(())
+    }
+
+    /// Returns the economic policy for a context, or `None`.
+    #[must_use]
+    pub fn get_economic_policy(&self, context_id: &str) -> Option<String> {
+        self.contexts
+            .get(context_id)
+            .and_then(|ctx| ctx.economic_policy.clone())
+    }
+
+    // -----------------------------------------------------------------------
     // TTL operations
     // -----------------------------------------------------------------------
 

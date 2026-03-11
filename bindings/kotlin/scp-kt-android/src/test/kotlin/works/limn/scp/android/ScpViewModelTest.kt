@@ -167,6 +167,8 @@ private class TestNativeBindings : NativeBindings {
     override fun contextSend(contextHandle: Long, payload: ByteArray) { /* no-op */ }
     override fun contextSubscribe(contextHandle: Long, callback: MessageCallback): Long = 0L
     override fun contextUnsubscribe(subscriptionHandle: Long) { /* no-op */ }
+    override fun contextSetEconomicPolicy(contextHandle: Long, policyJson: String) { /* no-op */ }
+    override fun contextGetEconomicPolicy(contextHandle: Long): String? = null
 
     // MembershipBindings
     override fun contextMemberCount(contextHandle: Long): Long? = 0L

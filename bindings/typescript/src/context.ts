@@ -490,6 +490,47 @@ export class Context implements AsyncDisposable {
   }
 
   // ---------------------------------------------------------------------------
+  // Economic policy (section 19)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Sets the economic policy for this context.
+   *
+   * Validates the JSON before storing. The policy controls per-tool-invoke
+   * costs, per-period budgets, and other economic governance parameters.
+   *
+   * @param policyJson - The economic policy as a JSON string conforming to
+   *   the `EconomicPolicy` schema (spec section 19).
+   * @throws {ContextError} If the context has been disposed.
+   * @throws {ValidationError} If the JSON is invalid.
+   */
+  async setEconomicPolicy(policyJson: string): Promise<void> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      await bridge.contextSetEconomicPolicy(this._handle, policyJson);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  /**
+   * Returns the economic policy for this context as a JSON string.
+   *
+   * @returns The economic policy JSON, or `null` if no policy is set.
+   * @throws {ContextError} If the context has been disposed.
+   */
+  async getEconomicPolicy(): Promise<string | null> {
+    this.assertActive();
+    try {
+      const bridge = await getBridge();
+      return await bridge.contextGetEconomicPolicy(this._handle);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Governance
   // ---------------------------------------------------------------------------
 

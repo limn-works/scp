@@ -53,6 +53,39 @@ public enum ContextBridge {
     public static let defaultJoin: JoinFn = { handle, identity in
         try await contextJoin(handle: handle, identity: identity)
     }
+
+    /// The closure type for setting economic policy. Injected for testability.
+    public typealias SetEconomicPolicyFn = @Sendable (
+        _ handle: any ContextHandleProtocol,
+        _ policyJson: String
+    ) throws -> Void
+
+    /// The closure type for getting economic policy. Injected for testability.
+    public typealias GetEconomicPolicyFn = @Sendable (
+        _ handle: any ContextHandleProtocol
+    ) throws -> String?
+
+    /// Default set economic policy function — delegates to UniFFI ``setEconomicPolicy``.
+    public static let defaultSetEconomicPolicy: SetEconomicPolicyFn = { handle, policyJson in
+        guard let ctxHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "invalid handle type for setEconomicPolicy",
+                code: "SCP-CTX-2001"
+            )
+        }
+        try setEconomicPolicy(handle: ctxHandle, policyJson: policyJson)
+    }
+
+    /// Default get economic policy function — delegates to UniFFI ``getEconomicPolicy``.
+    public static let defaultGetEconomicPolicy: GetEconomicPolicyFn = { handle in
+        guard let ctxHandle = handle as? ContextHandle else {
+            throw ScpError.Context(
+                message: "invalid handle type for getEconomicPolicy",
+                code: "SCP-CTX-2001"
+            )
+        }
+        return try getEconomicPolicy(handle: ctxHandle)
+    }
 }
 
 // MARK: - MessageListenerAdapter
@@ -165,6 +198,8 @@ public actor Context {
     private let subscribeFn: ContextBridge.SubscribeFn
     private let leaveFn: ContextBridge.LeaveFn
     private let closeFn: ContextBridge.CloseFn
+    private let setEconomicPolicyFn: ContextBridge.SetEconomicPolicyFn
+    private let getEconomicPolicyFn: ContextBridge.GetEconomicPolicyFn
 
     // MARK: - Initialization
 
@@ -193,7 +228,11 @@ public actor Context {
         sendFn: @escaping ContextBridge.SendFn,
         subscribeFn: @escaping ContextBridge.SubscribeFn,
         leaveFn: @escaping ContextBridge.LeaveFn,
-        closeFn: @escaping ContextBridge.CloseFn
+        closeFn: @escaping ContextBridge.CloseFn,
+        setEconomicPolicyFn: @escaping ContextBridge.SetEconomicPolicyFn
+            = ContextBridge.defaultSetEconomicPolicy,
+        getEconomicPolicyFn: @escaping ContextBridge.GetEconomicPolicyFn
+            = ContextBridge.defaultGetEconomicPolicy
     ) {
         self.handle = handle
         if let contextId {
@@ -224,6 +263,8 @@ public actor Context {
         self.subscribeFn = subscribeFn
         self.leaveFn = leaveFn
         self.closeFn = closeFn
+        self.setEconomicPolicyFn = setEconomicPolicyFn
+        self.getEconomicPolicyFn = getEconomicPolicyFn
     }
 
     // MARK: - deinit
@@ -269,7 +310,11 @@ public actor Context {
         sendFn: @escaping ContextBridge.SendFn,
         subscribeFn: @escaping ContextBridge.SubscribeFn,
         leaveFn: @escaping ContextBridge.LeaveFn,
-        closeFn: @escaping ContextBridge.CloseFn
+        closeFn: @escaping ContextBridge.CloseFn,
+        setEconomicPolicyFn: @escaping ContextBridge.SetEconomicPolicyFn
+            = ContextBridge.defaultSetEconomicPolicy,
+        getEconomicPolicyFn: @escaping ContextBridge.GetEconomicPolicyFn
+            = ContextBridge.defaultGetEconomicPolicy
     ) async throws -> Context {
         let handle = try await createFn(contextId, ceiling)
         return Context(
@@ -277,7 +322,9 @@ public actor Context {
             sendFn: sendFn,
             subscribeFn: subscribeFn,
             leaveFn: leaveFn,
-            closeFn: closeFn
+            closeFn: closeFn,
+            setEconomicPolicyFn: setEconomicPolicyFn,
+            getEconomicPolicyFn: getEconomicPolicyFn
         )
     }
 
@@ -300,6 +347,37 @@ public actor Context {
             )
         }
         try await sendFn(handle, payload)
+    }
+
+    /// Sets the economic policy for this context (spec section 19).
+    ///
+    /// Validates the JSON against the `EconomicPolicy` schema before storing.
+    ///
+    /// - Parameter policyJson: The economic policy as a JSON string.
+    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active,
+    ///   or ``ScpError/Validation(message:code:)`` if the JSON is invalid.
+    public func setEconomicPolicy(_ policyJson: String) throws {
+        guard state == .active else {
+            throw ScpError.Context(
+                message: "Context is not active",
+                code: "SCP-CTX-2001"
+            )
+        }
+        try setEconomicPolicyFn(handle, policyJson)
+    }
+
+    /// Returns the economic policy for this context as a JSON string, or `nil`.
+    ///
+    /// - Returns: The economic policy JSON string, or `nil` if no policy is set.
+    /// - Throws: ``ScpError/Context(message:code:)`` if the context is not active.
+    public func getEconomicPolicy() throws -> String? {
+        guard state == .active else {
+            throw ScpError.Context(
+                message: "Context is not active",
+                code: "SCP-CTX-2001"
+            )
+        }
+        return try getEconomicPolicyFn(handle)
     }
 
     /// An `AsyncStream` of incoming messages in this context.

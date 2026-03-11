@@ -575,6 +575,12 @@ class StubNativeBindings : NativeBindings {
         lastUnsubscribeHandle = subscriptionHandle
     }
 
+    var lastEconomicPolicy: String? = null
+    override fun contextSetEconomicPolicy(contextHandle: Long, policyJson: String) {
+        lastEconomicPolicy = policyJson
+    }
+    override fun contextGetEconomicPolicy(contextHandle: Long): String? = lastEconomicPolicy
+
     // MembershipBindings
     override fun contextMemberCount(contextHandle: Long): Long? = 1L
     override fun contextIsMember(contextHandle: Long, did: String): Boolean = true

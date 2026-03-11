@@ -130,6 +130,13 @@ interface ContextBindings {
     ): Long
 
     fun contextUnsubscribe(subscriptionHandle: Long)
+
+    fun contextSetEconomicPolicy(
+        contextHandle: Long,
+        policyJson: String,
+    )
+
+    fun contextGetEconomicPolicy(contextHandle: Long): String?
 }
 
 /**
@@ -593,6 +600,26 @@ class ContextBridge internal constructor(
         contextHandle: Long,
         payload: ByteArray,
     ): Unit = bridge.ffiCall { bindings.contextSend(contextHandle, payload) }
+
+    /**
+     * Set the economic policy for a context (§19.3).
+     *
+     * @param contextHandle Handle from context create or join.
+     * @param policyJson JSON-encoded economic policy.
+     */
+    suspend fun setEconomicPolicy(
+        contextHandle: Long,
+        policyJson: String,
+    ): Unit = bridge.ffiCall { bindings.contextSetEconomicPolicy(contextHandle, policyJson) }
+
+    /**
+     * Get the economic policy for a context.
+     *
+     * @param contextHandle Handle from context create or join.
+     * @return JSON-encoded economic policy, or null if none is set.
+     */
+    suspend fun getEconomicPolicy(contextHandle: Long): String? =
+        bridge.ffiCall { bindings.contextGetEconomicPolicy(contextHandle) }
 
     /**
      * Subscribe to incoming messages on a context as a cold [Flow].

@@ -487,6 +487,9 @@ class StubEventContextBindings : EventContextBindings {
         messageUnsubscribeCount++
     }
 
+    override fun contextSetEconomicPolicy(contextHandle: Long, policyJson: String) = Unit
+    override fun contextGetEconomicPolicy(contextHandle: Long): String? = null
+
     override fun contextSubscribeEvents(contextHandle: Long, callback: EventCallback): Long {
         lastEventCallback = callback
         eventSubscribeCount++

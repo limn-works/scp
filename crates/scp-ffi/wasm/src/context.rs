@@ -620,6 +620,51 @@ pub fn broadcast_handle_key_request(
 }
 
 // ---------------------------------------------------------------------------
+// Economic policy bridge (§19.3, ADR-033)
+// ---------------------------------------------------------------------------
+
+/// Sets the economic policy on a context (§19.3).
+///
+/// Validates the JSON string before storing. Does not go through
+/// governance — this is a direct setter for local state matching the
+/// `PyO3` `py_set_economic_policy` pattern.
+///
+/// # Errors
+///
+/// Returns a `JsError` if the JSON is invalid.
+#[wasm_bindgen]
+pub fn context_set_economic_policy(
+    handle: &WasmContextHandle,
+    policy_json: String,
+) -> Result<(), JsError> {
+    // Validate JSON is well-formed and parses as a generic JSON value.
+    // WASM cannot import scp-core's EconomicPolicy (ADR-034), so we
+    // validate that the JSON is syntactically valid. Schema validation
+    // is the SDK wrapper's responsibility in the WASM path.
+    let _val: serde_json::Value = serde_json::from_str(&policy_json).map_err(|e| {
+        ScpWasmError::Validation {
+            message: format!("invalid economic policy JSON: {e}"),
+            code: "SCP-VALID-7001".to_owned(),
+        }
+        .into_js()
+    })?;
+
+    let context_id = handle.context_id();
+    with_manager(|mgr| mgr.set_economic_policy(&context_id, policy_json))
+        .map_err(ScpWasmError::into_js)?;
+    Ok(())
+}
+
+/// Returns the economic policy for a context as a JSON string, or `null`.
+#[wasm_bindgen]
+pub fn context_get_economic_policy(handle: &WasmContextHandle) -> Option<String> {
+    let context_id = handle.context_id();
+    with_manager(|mgr| Ok(mgr.get_economic_policy(&context_id)))
+        .ok()
+        .flatten()
+}
+
+// ---------------------------------------------------------------------------
 // Context export/import bridge functions (#424)
 // ---------------------------------------------------------------------------
 
